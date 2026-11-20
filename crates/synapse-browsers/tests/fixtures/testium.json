@@ -1,0 +1,31 @@
+{
+  "id": "testium",
+  "label": "Testium (test-only fixture kind)",
+  "family": "chromium",
+  "process_names": ["testium.exe"],
+  "exe_path_markers": [],
+  "exe_candidates": ["%SYNAPSE_TESTIUM_ROOT%\\Application\\testium.exe"],
+  "app_paths_name": "testium.exe",
+  "user_data_root": "%SYNAPSE_TESTIUM_ROOT%\\User Data",
+  "profile_layout": "multi",
+  "window_title_suffixes": [" - Testium"],
+  "tab_target_prefix": "testium-tab:",
+  "endpoint_base": "synapse-bridge://testium",
+  "health_key": "testium_bridge",
+  "registration_token_file": "browser-bridge-token-testium.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "testium://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "browser-extension\\testium"
+  },
+  "policy": null,
+  "native_messaging_cleanup_roots": [],
+  "protected_extension_ids": [],
+  "cdp_product_tokens": ["Testium"],
+  "unsupported_capabilities": ["evaluateScript"],
+  "debugger_api_expected": true,
+  "install_ui": null,
+  "winget_id": null
+}

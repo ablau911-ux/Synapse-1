@@ -1,11 +1,18 @@
 pub(crate) mod auto_wait;
 mod click;
+#[cfg(test)]
+pub(crate) use click::dispatch_189_test_support;
 mod clipboard;
 mod config;
 mod focus_window;
+pub(crate) mod foreground_deferral;
+mod foreground_own_focus;
+pub(crate) use foreground_own_focus::restore_foreground_taken_by_target;
+pub(crate) mod foreground_type_monitor;
 mod pad;
 pub(crate) mod postcondition;
 pub(crate) mod press;
+pub(crate) mod process_descendants;
 mod release_all;
 mod scroll;
 mod set_field_text;
@@ -36,39 +43,59 @@ pub(crate) const FOREGROUND_CONTEXT_RESTORE_STABILITY_MS: u64 =
     FOREGROUND_RESTORE_STABILITY_INTERVAL_MS * FOREGROUND_RESTORE_STABILITY_SAMPLES as u64;
 
 pub(crate) use click::ForegroundClickPolicy;
-pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget};
-pub(crate) use click::{
-    ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA, CLICK_TIER_FOREGROUND,
-    CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params, act_click_with_handle_and_lease,
-    attach_click_tier_attempts, click_params_can_route_background_first,
-    click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
-    click_tier_failed,
+#[allow(unused_imports)]
+pub use click::{
+    ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget, act_click_with_handle,
 };
+pub(crate) use click::{
+    carry_remote_click_delivery, remote_bridge_click_error, remote_cdp_click_failure,
+    remote_click_error, remote_click_with,
+};
+// Used only by the server-side #189 router tests since the router ladder was removed.
+pub(crate) use click::{
+    ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA, ClaimedPointTarget,
+    FOREGROUND_AUTH_CLAIMED_TARGET, PointClickRoute, act_click_claimed_point_postmessage,
+    act_click_with_handle_and_lease, attach_click_tier_attempts, claimed_background_point_possible,
+    click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
+    click_tier_failed, current_point_click_route, point_click_resolves_root,
+    unclaimed_point_target_error,
+};
+#[cfg(test)]
+pub(crate) use click::{
+    CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, click_metadata_refusal_error,
+};
+pub(crate) use click::{ClaimFacts, ForegroundClickAuth, authorize_foreground_click};
+// #2332: the point click verdict reads the clicked child control.
+#[cfg(windows)]
+pub(crate) use click::hwnd_message_readback_for_root;
 pub use clipboard::{ActClipboardParams, ActClipboardResponse};
 pub(crate) use clipboard::{
     SharedSessionClipboardBuffers, act_clipboard_session_buffer, new_session_clipboards,
 };
 pub use config::M2ServiceConfig;
-pub(crate) use focus_window::act_focus_window_with_boundary;
 pub use focus_window::{
-    ActFocusWindowParams, ActFocusWindowResponse, act_focus_window_request_details,
-    act_focus_window_target_hwnd,
+    ActFocusWindowParams, ActFocusWindowResponse, act_focus_window,
+    act_focus_window_request_details, act_focus_window_target_hwnd,
 };
-pub(crate) use pad::act_pad_with_handle_and_boundary;
-pub use pad::{ActPadParams, ActPadResponse};
+#[cfg(test)]
+pub(crate) use focus_window::{
+    FORBIDDEN_ACTIVATION_MESSAGE, ForbiddenActivationGuard, forbid_activation_for_test,
+};
+pub use pad::{ActPadParams, ActPadResponse, act_pad_with_handle};
 pub use postcondition::default_verify_timeout_ms;
 pub use press::action_from_press_params;
 pub use press::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
+    act_keymap_with_handle, act_press_with_handle,
 };
 pub(crate) use press::{
     HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
     act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
-    act_press_with_handle_and_boundary, delete_key_action, hwnd_keyboard_target_state,
-    resolve_keymap_press, select_all_chord_action,
+    delete_key_action, hwnd_keyboard_target_state, resolve_keymap_press, select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
-pub(crate) use scroll::act_scroll_with_handle_and_boundary;
+pub(crate) use scroll::act_scroll_with_handle_bound_target;
+pub(crate) use scroll::root_hwnd_at_point;
 pub use scroll::{ActScrollParams, ActScrollPoint, ActScrollResponse};
 #[cfg(windows)]
 pub(crate) use set_field_text::act_set_field_text_web;
@@ -82,18 +109,20 @@ pub(crate) use set_field_text::{
     finish_replace_response, params_with_resolved_element, required_element_id,
     set_field_text_route, validate_set_field_text_params,
 };
-pub(crate) use set_value::act_set_value_with_boundary;
-pub use set_value::{ActSetValueParams, ActSetValueResponse, act_set_value_request_details};
+pub use set_value::{
+    ActSetValueParams, ActSetValueResponse, act_set_value, act_set_value_request_details,
+};
 pub use stroke::{
     ActStrokeParams, ActStrokeResponse, act_stroke_error_details, act_stroke_request_details,
-    act_stroke_validation_failure_details, validate_act_stroke_params,
+    act_stroke_validation_failure_details, act_stroke_with_handle, validate_act_stroke_params,
 };
-pub(crate) use stroke::{
-    ActStrokePlan, act_stroke_cdp_target, act_stroke_with_handle_and_boundary,
+pub(crate) use stroke::{ActStrokePlan, ActStrokeTarget, act_stroke_cdp_target};
+pub use type_text::{ActTypeParams, ActTypeResponse, TypeBackend, act_type_with_handle};
+pub(crate) use type_text::{
+    MAX_ACT_TYPE_UTF16_UNITS, emitted_text, resolve_type_delivery_target,
+    validate_foreground_type_text_budget, validate_type_params,
 };
-pub use type_text::action_from_type_params;
-pub use type_text::{ActTypeParams, ActTypeResponse, TypeBackend};
-pub(crate) use type_text::{act_type_with_handle_and_boundary, emitted_text};
+pub use type_text::{action_from_foreground_type_params, action_from_type_params};
 
 pub(crate) use auto_wait::{default_auto_wait_timeout_ms, validate_auto_wait_timeout};
 use config::RECORDING_BACKEND_ENV;
@@ -127,6 +156,23 @@ impl ForegroundInputLeaseGuard {
         }
     }
 
+    /// Keep the lease held after this guard drops; it then ends only when its
+    /// TTL expires. For work that outlives the tool call (the queue-full
+    /// diagnostic's cursor blocker, #195), where releasing on drop would let
+    /// another session take the lease mid-stroke.
+    pub(crate) fn hold_until_ttl_expiry(&mut self, reason_code: &'static str) {
+        if self.release_on_drop {
+            self.release_on_drop = false;
+            tracing::info!(
+                code = "INPUT_LEASE_HELD_UNTIL_TTL",
+                tool = self.tool,
+                session_id = %self.session_id,
+                reason_code,
+                "readback=input_lease outcome=release_on_drop_disabled"
+            );
+        }
+    }
+
     pub(crate) fn disable_context_restore(&mut self, reason_code: &'static str) {
         if self.context_restore.take().is_some() {
             tracing::info!(
@@ -148,14 +194,25 @@ impl Drop for ForegroundInputLeaseGuard {
         if !self.release_on_drop {
             return;
         }
-        match lease::release(&self.session_id) {
-            Ok(status) => {
+        // #205: release only a lease that is still the action's own auto lease.
+        // An explicit `lease_acquire` (or handoff) during the action converts it,
+        // and this release must then leave it alone.
+        match lease::release_auto(&self.session_id) {
+            Ok(true) => {
                 tracing::info!(
                     code = "INPUT_LEASE_AUTO_RELEASED",
                     tool = self.tool,
                     session_id = %self.session_id,
-                    held = status.held,
+                    held = false,
                     "readback=input_lease outcome=auto_released"
+                );
+            }
+            Ok(false) => {
+                tracing::info!(
+                    code = "INPUT_LEASE_AUTO_RELEASE_SKIPPED",
+                    tool = self.tool,
+                    session_id = %self.session_id,
+                    "readback=input_lease outcome=auto_release_noop"
                 );
             }
             Err(error) => {
@@ -180,6 +237,8 @@ struct ForegroundInputContextSnapshot {
     foreground_title: Option<String>,
     cursor_capture_error: Option<String>,
     foreground_capture_error: Option<String>,
+    /// OS foreground the lane itself created with its own focus step (#217).
+    own_focus: Option<foreground_own_focus::OwnFocus>,
 }
 
 impl ForegroundInputContextSnapshot {
@@ -216,6 +275,7 @@ impl ForegroundInputContextSnapshot {
             foreground_title,
             cursor_capture_error,
             foreground_capture_error,
+            own_focus: None,
         };
         snapshot.log_capture(tool, session_id);
         snapshot
@@ -407,11 +467,6 @@ impl ForegroundInputContextSnapshot {
                 actual_process_started_at_100ns = ?readiness.actual_process_started_at_100ns,
                 exit_code = ?readiness.exit_code,
                 wait_status = ?readiness.wait_status,
-                wait_result = ?readiness.wait_result,
-                identity_read_error = ?readiness.identity_read_error,
-                wait_error = ?readiness.wait_error,
-                exit_code_read_error = ?readiness.exit_code_read_error,
-                handle_close_error = ?readiness.handle_close_error,
                 foreground_title = ?self.foreground_title,
                 "foreground window restore skipped because prior HWND/PID is not restorable"
             );
@@ -431,11 +486,6 @@ impl ForegroundInputContextSnapshot {
                     "actual_process_started_at_100ns": readiness.actual_process_started_at_100ns,
                     "exit_code": readiness.exit_code,
                     "wait_status": readiness.wait_status,
-                    "wait_result": readiness.wait_result,
-                    "identity_read_error": readiness.identity_read_error,
-                    "wait_error": readiness.wait_error,
-                    "exit_code_read_error": readiness.exit_code_read_error,
-                    "handle_close_error": readiness.handle_close_error,
                     "prior_title": self.foreground_title,
                 }),
             );
@@ -476,79 +526,18 @@ impl ForegroundInputContextSnapshot {
             }
         };
 
-        match foreground_restore_current_decision(hwnd, expected_pid, current.hwnd, current.pid) {
-            ForegroundRestoreCurrentDecision::AlreadyCurrent => {
-                tracing::info!(
-                    code = "INPUT_LEASE_CONTEXT_FOREGROUND_ALREADY_CURRENT",
-                    tool,
-                    session_id,
-                    foreground_hwnd = hwnd,
-                    foreground_pid = expected_pid,
-                    foreground_title = ?self.foreground_title,
-                    current_hwnd = current.hwnd,
-                    current_pid = current.pid,
-                    current_title = %current.window_title,
-                    "readback=foreground_window outcome=already_current"
-                );
-                record_foreground_restore_context_event(
-                    tool,
-                    session_id,
-                    "already_current",
-                    "INPUT_LEASE_CONTEXT_FOREGROUND_ALREADY_CURRENT",
-                    "foreground_already_current",
-                    Some(json!({
-                        "hwnd": current.hwnd,
-                        "pid": current.pid,
-                        "process_name": current.process_name,
-                        "window_title": current.window_title,
-                    })),
-                    None,
-                    json!({
-                        "prior_hwnd": hwnd,
-                        "expected_pid": expected_pid,
-                        "expected_process_started_at_100ns": expected_process_started_at_100ns,
-                        "prior_title": self.foreground_title,
-                    }),
-                );
-                return "already_current";
-            }
-            ForegroundRestoreCurrentDecision::SkipHumanMoved => {
-                tracing::warn!(
-                    code = error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
-                    tool,
-                    session_id,
-                    reason_code = "foreground_restore_skipped_human_moved",
-                    prior_hwnd = hwnd,
-                    expected_pid,
-                    prior_title = ?self.foreground_title,
-                    current_hwnd = current.hwnd,
-                    current_pid = current.pid,
-                    current_title = %current.window_title,
-                    "foreground window restore skipped because current foreground moved after lease capture"
-                );
-                record_foreground_restore_context_event(
-                    tool,
-                    session_id,
-                    "skipped_human_moved",
-                    error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
-                    "foreground_restore_skipped_human_moved",
-                    Some(json!({
-                        "hwnd": current.hwnd,
-                        "pid": current.pid,
-                        "process_name": current.process_name,
-                        "window_title": current.window_title,
-                    })),
-                    None,
-                    json!({
-                        "prior_hwnd": hwnd,
-                        "expected_pid": expected_pid,
-                        "expected_process_started_at_100ns": expected_process_started_at_100ns,
-                        "prior_title": self.foreground_title,
-                    }),
-                );
-                return "skipped_human_moved";
-            }
-        }
+        let current = foreground_own_focus::CurrentForeground {
+            hwnd: current.hwnd,
+            pid: current.pid,
+            title: current.window_title,
+        };
+        self.restore_foreground_for_current(
+            tool,
+            session_id,
+            &current,
+            foreground_own_focus::live_owner_chain,
+            || self.restore_own_focus(tool, session_id, hwnd, expected_pid),
+        )
     }
 
     fn capture_reason_code(&self) -> &'static str {
@@ -569,16 +558,13 @@ struct ForegroundWindowRestoreReadiness {
     actual_process_started_at_100ns: Option<u64>,
     exit_code: Option<u32>,
     wait_status: Option<&'static str>,
-    wait_result: Option<u32>,
-    identity_read_error: Option<String>,
-    wait_error: Option<String>,
-    exit_code_read_error: Option<String>,
-    handle_close_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ForegroundRestoreCurrentDecision {
     AlreadyCurrent,
+    /// Foreground is the window the lane itself focused: restore the prior one.
+    RestoreOwnFocus,
     SkipHumanMoved,
 }
 
@@ -605,9 +591,30 @@ fn record_foreground_restore_context_event(
     foreground_read_error: Option<Value>,
     detail: Value,
 ) {
-    // The daemon lifecycle ledger is a process-global singleton. This production
-    // path records every foreground-restore decision into that ledger so the
-    // daemon has durable context when an input lease refuses or skips action.
+    // The daemon lifecycle ledger is a process-global singleton. In this crate's
+    // own unit-test binary, tests run in parallel and this production side-effect
+    // would write into whichever ledger the `daemon_lifecycle` tests momentarily
+    // have configured — corrupting their assertions and poisoning `last_error`
+    // (which flips `health_payload().ok` false for any concurrent health-reading
+    // test). The recording itself is covered directly by
+    // `daemon_lifecycle::tests::records_context_event_to_physical_files`, and the
+    // real daemon (integration tests, production) is built without `cfg(test)` and
+    // records normally. So suppress only this unasserted side-effect under test.
+    #[cfg(test)]
+    {
+        let _ = (
+            tool,
+            session_id,
+            status,
+            code,
+            reason_code,
+            foreground,
+            foreground_read_error,
+            detail,
+        );
+        return;
+    }
+    #[cfg(not(test))]
     {
         let detail = json!({
             "code": code,
@@ -654,7 +661,7 @@ fn foreground_window_restore_readiness(
     use std::ffi::c_void;
 
     use windows::Win32::{
-        Foundation::{CloseHandle, FILETIME, HWND, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, FILETIME, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::Threading::{
             GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -662,22 +669,9 @@ fn foreground_window_restore_readiness(
         UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
     };
 
-    let Some(native_hwnd) = synapse_core::win32_hwnd::hwnd_from_wire(hwnd) else {
-        return ForegroundWindowRestoreReadiness {
-            alive: false,
-            reason_code: "prior_foreground_hwnd_noncanonical",
-            actual_pid: None,
-            actual_process_started_at_100ns: None,
-            exit_code: None,
-            wait_status: None,
-            wait_result: None,
-            identity_read_error: None,
-            wait_error: None,
-            exit_code_read_error: None,
-            handle_close_error: None,
-        };
-    };
-    let hwnd = HWND(native_hwnd as *mut c_void);
+    let hwnd = HWND(hwnd as *mut c_void);
+    // SAFETY: HWND is a plain handle value that is never dereferenced; IsWindow only validates
+    // it and returns FALSE for a stale or invalid handle.
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return ForegroundWindowRestoreReadiness {
             alive: false,
@@ -686,15 +680,12 @@ fn foreground_window_restore_readiness(
             actual_process_started_at_100ns: None,
             exit_code: None,
             wait_status: None,
-            wait_result: None,
-            identity_read_error: None,
-            wait_error: None,
-            exit_code_read_error: None,
-            handle_close_error: None,
         };
     }
 
     let mut process_id = 0_u32;
+    // SAFETY: the out-pointer refers to the live local `process_id`; a stale HWND makes the
+    // call fail cleanly and leave `process_id` at 0, which is handled below.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
     if process_id == 0 {
         return ForegroundWindowRestoreReadiness {
@@ -704,11 +695,6 @@ fn foreground_window_restore_readiness(
             actual_process_started_at_100ns: None,
             exit_code: None,
             wait_status: None,
-            wait_result: None,
-            identity_read_error: None,
-            wait_error: None,
-            exit_code_read_error: None,
-            handle_close_error: None,
         };
     }
     if process_id != expected_pid {
@@ -719,42 +705,34 @@ fn foreground_window_restore_readiness(
             actual_process_started_at_100ns: None,
             exit_code: None,
             wait_status: None,
-            wait_result: None,
-            identity_read_error: None,
-            wait_error: None,
-            exit_code_read_error: None,
-            handle_close_error: None,
         };
     }
-    let handle = match unsafe {
+    // SAFETY: OpenProcess takes only plain integer arguments; on success the returned handle is
+    // owned by this function and closed exactly once below, on failure we return early.
+    let Ok(handle) = (unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
             false,
             process_id,
         )
-    } {
-        Ok(handle) => handle,
-        Err(error) => {
-            return ForegroundWindowRestoreReadiness {
-                alive: false,
-                reason_code: "prior_foreground_process_unavailable",
-                actual_pid: Some(process_id),
-                actual_process_started_at_100ns: None,
-                exit_code: None,
-                wait_status: None,
-                wait_result: None,
-                identity_read_error: Some(error.to_string()),
-                wait_error: None,
-                exit_code_read_error: None,
-                handle_close_error: None,
-            };
-        }
+    }) else {
+        return ForegroundWindowRestoreReadiness {
+            alive: false,
+            reason_code: "prior_foreground_process_unavailable",
+            actual_pid: Some(process_id),
+            actual_process_started_at_100ns: None,
+            exit_code: None,
+            wait_status: None,
+        };
     };
+    let mut exit_code = 0_u32;
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    let (actual_process_started_at_100ns, identity_read_error) = match unsafe {
+    // SAFETY: `handle` is the open process handle from above (not yet closed) and the four
+    // out-pointers refer to live local FILETIME values for the duration of the call.
+    let actual_process_started_at_100ns = unsafe {
         GetProcessTimes(
             handle,
             std::ptr::addr_of_mut!(creation),
@@ -762,27 +740,19 @@ fn foreground_window_restore_readiness(
             std::ptr::addr_of_mut!(kernel),
             std::ptr::addr_of_mut!(user),
         )
-    } {
-        Ok(()) => (Some(filetime_ticks(creation)), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
+    }
+    .is_ok()
+    .then_some(filetime_ticks(creation));
+    // SAFETY: `handle` is the open process handle from above (not yet closed); a zero timeout
+    // makes this a non-blocking state poll.
     let wait_result = unsafe { WaitForSingleObject(handle, 0) };
-    // GetLastError is thread-local but is overwritten by later Win32 calls, so
-    // capture WAIT_FAILED diagnostics immediately at the destructive boundary.
-    let wait_error =
-        (wait_result == WAIT_FAILED).then(|| windows::core::Error::from_thread().to_string());
-    let (exit_code, exit_code_read_error) = if wait_result == WAIT_OBJECT_0 {
-        let mut exit_code = 0_u32;
-        match unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } {
-            Ok(()) => (Some(exit_code), None),
-            Err(error) => (None, Some(error.to_string())),
-        }
-    } else {
-        (None, None)
-    };
-    let handle_close_error = unsafe { CloseHandle(handle) }
-        .err()
-        .map(|error| error.to_string());
+    // SAFETY: `handle` is still open and the out-pointer refers to the live local `exit_code`.
+    let exit_code = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) }
+        .is_ok()
+        .then_some(exit_code);
+    // SAFETY: `handle` was opened by OpenProcess above and is closed exactly once here; it is
+    // not used afterwards.
+    let _ = unsafe { CloseHandle(handle) };
 
     let (alive, reason_code, wait_status) = if actual_process_started_at_100ns.is_none() {
         (
@@ -796,30 +766,18 @@ fn foreground_window_restore_readiness(
             "prior_foreground_process_identity_changed",
             Some("identity_mismatch"),
         )
-    } else if wait_result == WAIT_TIMEOUT && handle_close_error.is_none() {
-        (true, "prior_foreground_alive", Some("timeout_nonsignaled"))
     } else if wait_result == WAIT_TIMEOUT {
-        (
-            false,
-            "prior_foreground_process_handle_close_failed",
-            Some("timeout_nonsignaled_handle_close_failed"),
-        )
+        (true, "prior_foreground_alive", Some("timeout_nonsignaled"))
     } else if wait_result == WAIT_OBJECT_0 {
         (
             false,
             "prior_foreground_process_exited",
             Some("object_signaled"),
         )
-    } else if wait_result == WAIT_FAILED {
-        (
-            false,
-            "prior_foreground_process_wait_failed",
-            Some("win32_wait_failed"),
-        )
     } else {
         (
             false,
-            "prior_foreground_process_wait_unexpected",
+            "prior_foreground_process_wait_failed",
             Some("unexpected_wait_result"),
         )
     };
@@ -830,11 +788,6 @@ fn foreground_window_restore_readiness(
         actual_process_started_at_100ns,
         exit_code,
         wait_status,
-        wait_result: Some(wait_result.0),
-        identity_read_error,
-        wait_error,
-        exit_code_read_error,
-        handle_close_error,
     }
 }
 
@@ -845,24 +798,16 @@ fn process_started_at_100ns(pid: u32) -> Option<u64> {
         System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
 
-    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(handle) => handle,
-        Err(error) => {
-            tracing::warn!(
-                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
-                reason_code = "foreground_process_identity_open_failed",
-                pid,
-                detail = %error,
-                "foreground process identity capture could not open the prior owner"
-            );
-            return None;
-        }
-    };
+    // SAFETY: OpenProcess takes only plain integer arguments; on success the returned handle is
+    // owned by this function and closed exactly once below, on failure we return early.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    let started_at_100ns = match unsafe {
+    // SAFETY: `handle` is the open process handle from above (not yet closed) and the four
+    // out-pointers refer to live local FILETIME values for the duration of the call.
+    let started_at_100ns = unsafe {
         GetProcessTimes(
             handle,
             std::ptr::addr_of_mut!(creation),
@@ -870,29 +815,12 @@ fn process_started_at_100ns(pid: u32) -> Option<u64> {
             std::ptr::addr_of_mut!(kernel),
             std::ptr::addr_of_mut!(user),
         )
-    } {
-        Ok(()) => Some(filetime_ticks(creation)),
-        Err(error) => {
-            tracing::warn!(
-                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
-                reason_code = "foreground_process_identity_read_failed",
-                pid,
-                detail = %error,
-                "foreground process identity capture could not read process times"
-            );
-            None
-        }
-    };
-    if let Err(error) = unsafe { CloseHandle(handle) } {
-        tracing::error!(
-            code = error_codes::TOOL_INTERNAL_ERROR,
-            detail_code = "FOREGROUND_PROCESS_IDENTITY_HANDLE_CLOSE_FAILED",
-            pid,
-            detail = %error,
-            "foreground process identity capture failed to close its process handle"
-        );
-        return None;
     }
+    .is_ok()
+    .then_some(filetime_ticks(creation));
+    // SAFETY: `handle` was opened by OpenProcess above and is closed exactly once here; it is
+    // not used afterwards.
+    let _ = unsafe { CloseHandle(handle) };
     started_at_100ns
 }
 
@@ -914,11 +842,6 @@ fn foreground_window_restore_readiness(
         actual_process_started_at_100ns: None,
         exit_code: None,
         wait_status: None,
-        wait_result: None,
-        identity_read_error: None,
-        wait_error: None,
-        exit_code_read_error: None,
-        handle_close_error: None,
     }
 }
 
@@ -942,9 +865,6 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
     session_id: Option<&str>,
     ttl_ms: u64,
 ) -> Result<ForegroundInputLeaseGuard, ErrorData> {
-    let mcp_request_guarded = crate::server::operator_panic_boundary::is_mcp_request_guarded();
-    let operator_panic_epoch =
-        arm_operator_panic_action_admission(tool, "before_lease_validation")?;
     validate_foreground_input_lease_ttl_ms(tool, ttl_ms)?;
     let session_id = session_id.ok_or_else(|| {
         crate::m1::mcp_error(
@@ -952,45 +872,8 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
             format!("{tool} requires an MCP session id before using the foreground input tier"),
         )
     })?;
-    ensure_operator_panic_action_admission(
-        tool,
-        "immediately_before_lease_acquire",
-        operator_panic_epoch,
-    )?;
-    if mcp_request_guarded {
-        crate::server::operator_panic_boundary::ensure_mcp_mutation(
-            "immediately_before_foreground_lease_acquire",
-        )?;
-    }
-    match lease::try_acquire(session_id, lease::ttl_from_ms(ttl_ms)) {
+    match lease::try_acquire_auto(session_id, lease::ttl_from_ms(ttl_ms)) {
         LeaseOutcome::Acquired(status) => {
-            let boundary_result = ensure_operator_panic_action_admission(
-                tool,
-                "immediately_after_lease_acquire",
-                operator_panic_epoch,
-            )
-            .and_then(|()| {
-                if mcp_request_guarded {
-                    crate::server::operator_panic_boundary::ensure_mcp_mutation(
-                        "immediately_after_foreground_lease_acquire",
-                    )
-                } else {
-                    Ok(())
-                }
-            });
-            if let Err(error) = boundary_result {
-                let released = lease::release_if_owner(session_id);
-                let lease_after_cleanup = lease::status();
-                tracing::warn!(
-                    code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-                    tool,
-                    session_id,
-                    released,
-                    lease_after_cleanup = ?lease_after_cleanup,
-                    "operator panic superseded a newly acquired foreground lease; exact owner cleanup ran"
-                );
-                return Err(error);
-            }
             tracing::info!(
                 code = "INPUT_LEASE_ACTION_ACQUIRED",
                 tool,
@@ -1005,33 +888,6 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
             ))
         }
         LeaseOutcome::Renewed(status) => {
-            let boundary_result = ensure_operator_panic_action_admission(
-                tool,
-                "immediately_after_lease_renew",
-                operator_panic_epoch,
-            )
-            .and_then(|()| {
-                if mcp_request_guarded {
-                    crate::server::operator_panic_boundary::ensure_mcp_mutation(
-                        "immediately_after_foreground_lease_renew",
-                    )
-                } else {
-                    Ok(())
-                }
-            });
-            if let Err(error) = boundary_result {
-                let released = lease::release_if_owner(session_id);
-                let lease_after_cleanup = lease::status();
-                tracing::warn!(
-                    code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-                    tool,
-                    session_id,
-                    released,
-                    lease_after_cleanup = ?lease_after_cleanup,
-                    "operator panic superseded a renewed foreground lease; exact owner cleanup ran"
-                );
-                return Err(error);
-            }
             tracing::info!(
                 code = "INPUT_LEASE_ACTION_RENEWED",
                 tool,
@@ -1094,85 +950,6 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
     }
 }
 
-/// Arms an action mutation against the physical operator-panic generation.
-/// A sticky K1/K2 accounting incident keeps this gate closed even when no
-/// generation counter is currently changing.
-pub(crate) fn arm_operator_panic_action_admission(
-    tool: &'static str,
-    stage: &'static str,
-) -> Result<u64, ErrorData> {
-    let epoch = synapse_action::operator_panic_epoch();
-    ensure_operator_panic_action_admission(tool, stage, epoch)?;
-    Ok(epoch)
-}
-
-/// Rechecks a previously armed action immediately before or after a mutation
-/// boundary. Both epoch supersession and sticky pending state are terminal.
-pub(crate) fn ensure_operator_panic_action_admission(
-    tool: &'static str,
-    stage: &'static str,
-    epoch_at_arm: u64,
-) -> Result<(), ErrorData> {
-    let readback = synapse_action::operator_panic_safety_readback();
-    if !readback.pending && readback.epoch == epoch_at_arm {
-        return Ok(());
-    }
-    tracing::warn!(
-        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-        detail_code = "ACTION_OPERATOR_PANIC_ADMISSION_CLOSED",
-        tool,
-        stage,
-        epoch_at_arm,
-        epoch_after = readback.epoch,
-        outstanding_generations = readback.outstanding_generations,
-        outstanding_finalizations = readback.outstanding_finalizations,
-        accounting_incident = readback.accounting_incident,
-        "physical operator panic closed action mutation admission"
-    );
-    Err(ErrorData::new(
-        ErrorCode(-32099),
-        format!("{tool} was superseded by the physical operator panic control"),
-        Some(json!({
-            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-            "detail_code": "ACTION_OPERATOR_PANIC_ADMISSION_CLOSED",
-            "tool": tool,
-            "stage": stage,
-            "operator_panic_epoch_at_arm": epoch_at_arm,
-            "operator_panic": readback,
-            "source_of_truth": "synapse_action::operator_panic_safety_readback",
-            "remediation": "inspect the operator-panic K1/K2 audit and physical lease/input readbacks; action admission remains closed while safety is pending or accounting is unresolved",
-        })),
-    ))
-}
-
-/// Copyable permit carried from raw-action preflight to the last reversible
-/// point before a physical M2 mutation. Unlike a pending-only check, the armed
-/// epoch also rejects a panic wave that began and fully finalized while the
-/// request was awaiting actionability, target resolution, or readback prep.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct OperatorPanicActionBoundary {
-    tool: &'static str,
-    epoch_at_arm: u64,
-    require_mcp_boundary: bool,
-}
-
-impl OperatorPanicActionBoundary {
-    pub(crate) const fn from_armed(tool: &'static str, epoch_at_arm: u64) -> Self {
-        Self {
-            tool,
-            epoch_at_arm,
-            require_mcp_boundary: true,
-        }
-    }
-
-    pub(crate) fn ensure(self, stage: &'static str) -> Result<(), ErrorData> {
-        if self.require_mcp_boundary {
-            crate::server::operator_panic_boundary::ensure_mcp_mutation(stage)?;
-        }
-        ensure_operator_panic_action_admission(self.tool, stage, self.epoch_at_arm)
-    }
-}
-
 fn validate_foreground_input_lease_ttl_ms(
     tool: &'static str,
     ttl_ms: u64,
@@ -1211,8 +988,39 @@ fn validate_foreground_input_lease_ttl_ms(
     ))
 }
 
+/// #315: a target window's live top-level root through the one `synapse_a11y`
+/// HWND rule; a closed window is `TARGET_WINDOW_NOT_FOUND`. `context` names
+/// the caller in the error message.
+pub(crate) fn live_target_root(hwnd: i64, context: &str) -> Result<i64, ErrorData> {
+    synapse_action::delivery_target::live_root_hwnd(hwnd, context)
+        .map_err(|error| action_error_to_mcp(&error))
+}
+
 pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
     match error {
+        ActionError::ClickDispatch { source, delivered } => {
+            let mut error = action_error_to_mcp(source);
+            if let Some(data) = error.data.as_mut().and_then(Value::as_object_mut) {
+                data.insert(
+                    "click_dispatch_stage".to_owned(),
+                    json!(if *delivered { "readback" } else { "dispatch" }),
+                );
+                data.insert("router_escalation_allowed".to_owned(), json!(false));
+            }
+            if *delivered {
+                postcondition::mark_input_delivered(error)
+            } else {
+                postcondition::mark_input_possibly_delivered(error)
+            }
+        }
+        // #189: proven pre-dispatch; the source keeps its own code and shape.
+        ActionError::ClickNotDispatched { source, .. } => {
+            let mut error = action_error_to_mcp(source);
+            if let Value::Object(data) = error.data.get_or_insert_with(|| json!({})) {
+                data.insert("dispatch_not_started".to_owned(), json!(true));
+            }
+            error
+        }
         ActionError::ForegroundLeaseBusy {
             detail,
             holder_session_id,
@@ -1244,7 +1052,6 @@ pub struct M2State {
     retained_emitter: Option<ActionEmitter>,
     emitter_cancel: Option<CancellationToken>,
     emitter_task: Option<JoinHandle<ActionStateSnapshot>>,
-    emitter_task_externally_owned: bool,
     emitter_done: Option<watch::Receiver<Option<ActionStateSnapshot>>>,
 }
 
@@ -1421,7 +1228,6 @@ impl M2State {
                 retained_emitter: None,
                 emitter_cancel: None,
                 emitter_task: Some(emitter_task),
-                emitter_task_externally_owned: false,
                 emitter_done: Some(done_rx),
             };
         }
@@ -1437,7 +1243,6 @@ impl M2State {
             retained_emitter: Some(emitter),
             emitter_cancel: None,
             emitter_task: None,
-            emitter_task_externally_owned: false,
             emitter_done: None,
         }
     }
@@ -1457,11 +1262,6 @@ impl M2State {
         self.emitter_task
             .as_ref()
             .is_some_and(|task| !task.is_finished())
-            || (self.emitter_task_externally_owned
-                && self
-                    .emitter_done
-                    .as_ref()
-                    .is_some_and(|done| done.borrow().is_none()))
     }
 
     #[must_use]
@@ -1472,14 +1272,6 @@ impl M2State {
     #[must_use]
     pub fn emitter_done_receiver(&self) -> Option<watch::Receiver<Option<ActionStateSnapshot>>> {
         self.emitter_done.clone()
-    }
-
-    pub(crate) fn take_emitter_task(&mut self) -> Option<JoinHandle<ActionStateSnapshot>> {
-        let task = self.emitter_task.take();
-        if task.is_some() {
-            self.emitter_task_externally_owned = true;
-        }
-        task
     }
 
     #[must_use]
@@ -1540,10 +1332,6 @@ impl fmt::Debug for M2State {
             .field("retained_emitter", &self.emitter_retained())
             .field("emitter_cancel", &self.emitter_cancel.is_some())
             .field("emitter_task", &self.emitter_running())
-            .field(
-                "emitter_task_externally_owned",
-                &self.emitter_task_externally_owned,
-            )
             .field("emitter_done", &self.emitter_done.is_some())
             .field("emitter_available", &self.emitter_available())
             .finish()
@@ -1573,3 +1361,22 @@ pub fn shared_m2_state_from_config_with_shutdown_reason(
 pub fn recording_backend_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "m2/tests/foreground_own_focus_217.rs"]
+mod foreground_own_focus_217_tests;
+
+#[cfg(test)]
+#[path = "m2/tests/foreground_restore_wiring_217.rs"]
+mod foreground_restore_wiring_217;
+
+#[cfg(test)]
+#[path = "m2/tests/foreground_type_monitor_188.rs"]
+mod foreground_type_monitor_188_tests;
+
+#[cfg(all(test, windows))]
+#[path = "m2/tests/native_race_windows_62.rs"]
+mod native_race_windows_62;

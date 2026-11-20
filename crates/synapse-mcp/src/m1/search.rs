@@ -3,6 +3,9 @@ use synapse_core::{AccessibleNode, DetectedEntity};
 use crate::m1::{FindParams, FindResult, FindResultKind};
 
 pub fn element_match(node: &AccessibleNode, params: &FindParams) -> Option<FindResult> {
+    if !synapse_perception::is_usable_element(node) {
+        return None;
+    }
     if params.in_window.is_some() && params.in_window.as_ref() != node.parent.as_ref() {
         return None;
     }
@@ -90,16 +93,16 @@ fn element_query_score(node: &AccessibleNode, query: &str) -> Option<f32> {
     if terms.is_empty() {
         return None;
     }
-    let haystack = format!(
-        "{} {} {}",
-        node.name,
-        node.role,
-        node.automation_id.as_deref().unwrap_or_default()
-    )
-    .to_ascii_lowercase();
     let matched = terms
         .iter()
-        .filter(|term| haystack.contains(term.as_str()))
+        .filter(|term| {
+            contains_ascii_token(&node.name, term)
+                || contains_ascii_token(&node.role, term)
+                || node
+                    .automation_id
+                    .as_deref()
+                    .is_some_and(|value| contains_ascii_token(value, term))
+        })
         .count();
     if matched == 0 {
         return None;
@@ -108,6 +111,12 @@ fn element_query_score(node: &AccessibleNode, query: &str) -> Option<f32> {
     let coverage = matched as f32 / terms.len() as f32;
     let density = matched.min(3) as f32 / 3.0;
     Some(0.35f32.mul_add(coverage, 0.15 * density))
+}
+
+fn contains_ascii_token(value: &str, needle: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case(needle))
 }
 
 fn query_terms(query: &str) -> Vec<String> {

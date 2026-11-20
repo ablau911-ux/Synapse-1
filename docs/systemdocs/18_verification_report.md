@@ -15,7 +15,7 @@
 
 | Metric | Value | How measured |
 |---|---|---|
-| Workspace crates | 14 | `Cargo.toml` `[workspace].members` |
+| Workspace crates | 15 | `Cargo.toml` `[workspace].members` |
 | Rust source files (`crates/**/*.rs`) | 586 | `find crates -name '*.rs' | wc -l` |
 | Lines of Rust (approx, `crates/**/*.rs`) | ~47,805 | `wc -l` total |
 | MCP tool macros (`#[tool(` occurrences) | 238 | grep over `crates/synapse-mcp/src` |
@@ -44,6 +44,7 @@
 | synapse-perception | 19 |
 | synapse-profiles | 13 |
 | synapse-audio | 12 |
+| synapse-everquest | 9 |
 | synapse-models | 8 |
 | synapse-telemetry | 5 |
 | synapse-test-utils | 3 |
@@ -55,7 +56,7 @@
 
 | Item | Raw signal | Documented figure | Explanation |
 |---|---|---|---|
-| MCP tools | 238 `#[tool(` macros | 206 distinct tools (doc 16) | Some tools are feature-gated (`storage_*` debug tools behind `SYNAPSE_DEBUG_TOOLS`); macro count also includes router plumbing. |
+| MCP tools | 238 `#[tool(` macros | 206 distinct tools (doc 16) | Some tools are feature-gated (25-tool EverQuest pack behind `SYNAPSE_ENABLE_EVERQUEST`; `storage_*` debug tools behind `SYNAPSE_DEBUG_TOOLS`); macro count also includes router plumbing. |
 | MCP tools (README) | 81 (badge) | 206 | The README badge is **stale**. |
 | Test functions | 2,163 (`#[test]`+`#[tokio::test]`) | "~1,590" estimate in an earlier draft of doc 17 | The grep-measured **2,163** is authoritative; doc 17's prose figure was a conservative estimate. |
 
@@ -80,7 +81,7 @@
 | Test run executed in this pass | No — tests were not executed (building requires `libclang.dll` on PATH per project memory; Windows-gated tests require an interactive desktop). |
 | Pass/fail | Not determined from source. |
 | Run command | `cargo test --workspace` (Windows-only tests are `#[ignore]`d; run with `-- --ignored`). |
-| Shipping gate | Manual Full State Verification ("FSV") performed by the agent on the configured Windows host; surfaces in code only as `minimum_manual_fsv` manifest metadata. It is never automated. |
+| Shipping gate | Manual Full State Verification ("FSV") performed by a human on Windows; surfaces in code only as `minimum_manual_fsv` manifest metadata. |
 
 See [17_test_suite.md](17_test_suite.md) for the test inventory and categories.
 
@@ -103,6 +104,7 @@ See [17_test_suite.md](17_test_suite.md) for the test inventory and categories.
 | Frame channel | capacity 2, drop-oldest | [05](05_capture_subsystem.md) |
 | Double-click delay | clamp(`GetDoubleClickTime`/4, 30..150) ms | [09](09_action_subsystem.md) |
 | Bigram typing speedup | 0.75× over 50 common English bigrams | [09](09_action_subsystem.md) |
+| EQ surprise threshold | divergence 0.50 | [12](12_everquest_domain.md) |
 | Registered ML models | 1 (RT-DETRv2-S COCO) | [13](13_models_subsystem.md) |
 | ORT version | 2.0.0-rc.12 | `Cargo.toml` |
 | rmcp version | 1.7.0 | `Cargo.toml` |
@@ -139,6 +141,7 @@ find crates -path '*/tests/*.rs' -o -name 'tests.rs' | wc -l  # 160
 | 09 | action_subsystem.md | ✅ |
 | 10 | reflex_subsystem.md | ✅ |
 | 11 | profiles_subsystem.md | ✅ |
+| 12 | everquest_domain.md | ✅ |
 | 13 | models_subsystem.md | ✅ |
 | 14 | core_telemetry_overlay.md | ✅ |
 | 15 | mcp_server_architecture.md | ✅ |

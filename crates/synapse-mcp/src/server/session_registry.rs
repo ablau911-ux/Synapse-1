@@ -14,12 +14,30 @@ pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 
 #[derive(Debug)]
 pub(crate) struct SessionRegistry {
+    next_cleanup_retry_at_ms: u64,
+    cleanup_retry_cursor: Option<String>,
+    next_retention_at_ms: u64,
+    retention_cursor: Option<String>,
+    pruned_total: u64,
+    revision: u64,
     stale_after_ms: u64,
     entries: BTreeMap<String, SessionRegistryEntry>,
+    activity_persistence: BTreeMap<String, ActivityPersistence>,
+}
+
+#[derive(Debug)]
+struct ActivityPersistence {
+    persisted_at_ms: u64,
+    attempted_at_ms: u64,
+    pending: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SessionRegistryEntry {
+    closure_journal_failed: bool,
+    trusted_local_agent: bool,
+    pub(crate) cleanup_failed: bool,
+    revision: u64,
     pub session_id: String,
     pub transport: String,
     pub client_name: Option<String>,
@@ -145,13 +163,25 @@ pub(crate) struct SpawnedAgentControlRead {
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self {
+            next_cleanup_retry_at_ms: 0,
+            cleanup_retry_cursor: None,
+            next_retention_at_ms: 0,
+            retention_cursor: None,
+            pruned_total: 0,
+            revision: 0,
             stale_after_ms: DEFAULT_STALE_AFTER_MS,
             entries: BTreeMap::new(),
+            activity_persistence: BTreeMap::new(),
         }
     }
 }
 
 impl SessionRegistry {
+    fn next_revision(&mut self) -> u64 {
+        self.revision = self.revision.saturating_add(1);
+        self.revision
+    }
+
     pub(crate) fn set_stale_after(&mut self, ttl: Option<Duration>) {
         self.stale_after_ms = ttl
             .map(duration_millis_u64)
@@ -161,6 +191,197 @@ impl SessionRegistry {
 
     pub(crate) const fn stale_after_ms(&self) -> u64 {
         self.stale_after_ms
+    }
+
+    /// Reserve at most one best-effort write per TTL/4 (capped at 60 seconds).
+    /// Both request heartbeats and periodic refresh use this in-memory gate.
+    pub(crate) fn reserve_activity_persistence(
+        &mut self,
+        session_id: &str,
+        now_unix_ms: u64,
+    ) -> Option<u64> {
+        let entry = self.entries.get(session_id)?;
+        if entry.closed_at_unix_ms.is_some() {
+            return None;
+        }
+        let interval_ms = (self.stale_after_ms / 4).clamp(1, 60_000);
+        let activity = self
+            .activity_persistence
+            .entry(session_id.to_owned())
+            .or_insert(ActivityPersistence {
+                persisted_at_ms: entry.started_at_unix_ms,
+                attempted_at_ms: entry.started_at_unix_ms,
+                pending: false,
+            });
+        if activity.pending
+            || now_unix_ms.saturating_sub(activity.attempted_at_ms) < interval_ms
+            || entry
+                .last_seen_unix_ms
+                .saturating_sub(activity.persisted_at_ms)
+                < interval_ms
+        {
+            return None;
+        }
+        activity.attempted_at_ms = now_unix_ms;
+        activity.pending = true;
+        Some(entry.last_seen_unix_ms)
+    }
+
+    pub(crate) fn finish_activity_persistence(
+        &mut self,
+        session_id: &str,
+        persisted_at_ms: Option<u64>,
+    ) {
+        if let Some(activity) = self.activity_persistence.get_mut(session_id) {
+            activity.pending = false;
+            if let Some(at) = persisted_at_ms {
+                activity.persisted_at_ms = activity.persisted_at_ms.max(at);
+            }
+        }
+    }
+
+    pub(crate) fn seed_activity_persistence(&mut self, session_id: &str, persisted_at_ms: u64) {
+        self.activity_persistence.insert(
+            session_id.to_owned(),
+            ActivityPersistence {
+                persisted_at_ms,
+                attempted_at_ms: persisted_at_ms,
+                pending: false,
+            },
+        );
+    }
+
+    pub(crate) fn expired_retention_candidates(
+        &mut self,
+        now_unix_ms: u64,
+    ) -> Vec<SessionRegistryEntry> {
+        if now_unix_ms < self.next_retention_at_ms {
+            return Vec::new();
+        }
+        self.next_retention_at_ms = now_unix_ms.saturating_add(30_000);
+        let start = self
+            .retention_cursor
+            .clone()
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let candidates: Vec<_> = self
+            .entries
+            .range((start, std::ops::Bound::Unbounded))
+            .map(|(_, entry)| entry)
+            .filter(|entry| {
+                now_unix_ms.saturating_sub(
+                    entry
+                        .last_seen_unix_ms
+                        .max(entry.closed_at_unix_ms.unwrap_or(0)),
+                ) > self.stale_after_ms
+            })
+            .take(256)
+            .cloned()
+            .collect();
+        self.retention_cursor = if candidates.len() == 256 {
+            candidates.last().map(|entry| entry.session_id.clone())
+        } else {
+            None
+        };
+        candidates
+    }
+
+    /// A reinitialization with the same stored timestamp still changes revision.
+    /// Saturated revisions are pinned rather than allowing an ABA comparison.
+    pub(crate) fn prune_expired_candidate(
+        &mut self,
+        candidate: &SessionRegistryEntry,
+        now_unix_ms: u64,
+    ) -> bool {
+        let eligible = self
+            .entries
+            .get(&candidate.session_id)
+            .is_some_and(|current| {
+                !current.cleanup_failed
+                    && current.revision != u64::MAX
+                    && current.revision == candidate.revision
+                    && now_unix_ms.saturating_sub(
+                        current
+                            .last_seen_unix_ms
+                            .max(current.closed_at_unix_ms.unwrap_or(0)),
+                    ) > self.stale_after_ms
+            });
+        if eligible {
+            self.entries.remove(&candidate.session_id);
+            self.activity_persistence.remove(&candidate.session_id);
+            self.pruned_total = self.pruned_total.saturating_add(1);
+        }
+        eligible
+    }
+
+    pub(crate) fn retention_counts(&self) -> (usize, u64) {
+        (self.entries.len(), self.pruned_total)
+    }
+
+    pub(crate) fn record_cleanup_result(&mut self, session_id: &str, success: bool) {
+        let revision = self.next_revision();
+        if let Some(entry) = self.entries.get_mut(session_id) {
+            entry.cleanup_failed = !success || entry.closure_journal_failed;
+            entry.revision = revision;
+        }
+    }
+
+    pub(crate) fn closure_journal_failed(&self, session_id: &str) -> bool {
+        self.entries
+            .get(session_id)
+            .is_some_and(|entry| entry.closure_journal_failed)
+    }
+
+    pub(crate) fn record_closure_journal_result(&mut self, session_id: &str, success: bool) {
+        let revision = self.next_revision();
+        if let Some(entry) = self.entries.get_mut(session_id) {
+            entry.closure_journal_failed = !success;
+            if !success {
+                entry.cleanup_failed = true;
+            }
+            entry.revision = revision;
+        }
+    }
+
+    pub(crate) fn cleanup_retry_unchanged(&self, candidate: &SessionRegistryEntry) -> bool {
+        self.entries
+            .get(&candidate.session_id)
+            .is_some_and(|current| {
+                current.cleanup_failed
+                    && current.revision != u64::MAX
+                    && current.revision == candidate.revision
+            })
+    }
+
+    pub(crate) fn failed_cleanup_entries(&self) -> Vec<SessionRegistryEntry> {
+        self.entries
+            .values()
+            .filter(|entry| entry.cleanup_failed)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn failed_cleanup_retry_ids(&mut self, now_unix_ms: u64) -> Vec<String> {
+        if now_unix_ms < self.next_cleanup_retry_at_ms {
+            return Vec::new();
+        }
+        self.next_cleanup_retry_at_ms = now_unix_ms.saturating_add(30_000);
+        let start = self
+            .cleanup_retry_cursor
+            .clone()
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let ids: Vec<_> = self
+            .entries
+            .range((start, std::ops::Bound::Unbounded))
+            .filter(|(_, entry)| entry.cleanup_failed)
+            .take(256)
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.cleanup_retry_cursor = if ids.len() == 256 {
+            ids.last().cloned()
+        } else {
+            None
+        };
+        ids
     }
 
     /// Records (or refreshes) a session as initialized. Returns `true` when
@@ -174,6 +395,7 @@ impl SessionRegistry {
         transport: &str,
         now_unix_ms: u64,
     ) -> bool {
+        let revision = self.next_revision();
         let client_name = state.initialize_params.client_info.name.clone();
         let client_version = state.initialize_params.client_info.version.clone();
         let protocol_version = Some(format!("{:?}", state.initialize_params.protocol_version));
@@ -184,6 +406,10 @@ impl SessionRegistry {
             .or_insert_with(|| {
                 newly_visible = true;
                 SessionRegistryEntry {
+                    closure_journal_failed: false,
+                    trusted_local_agent: false,
+                    cleanup_failed: false,
+                    revision: 0,
                     session_id: session_id.to_owned(),
                     transport: transport.to_owned(),
                     client_name: None,
@@ -204,21 +430,38 @@ impl SessionRegistry {
         entry.client_version = Some(client_version);
         entry.protocol_version = protocol_version;
         entry.agent_kind = infer_agent_kind(&client_name);
+        entry.trusted_local_agent = false;
+        entry.revision = revision;
         entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
         entry.closed_at_unix_ms = None;
         newly_visible
     }
 
+    /// Test hook: a session id rehydrated after a restart starts later than
+    /// rows it stored before the restart (#228).
+    #[cfg(test)]
+    pub(crate) fn set_started_at_for_test(&mut self, session_id: &str, started_at_unix_ms: u64) {
+        if let Some(entry) = self.entries.get_mut(session_id) {
+            entry.started_at_unix_ms = started_at_unix_ms;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_seen(
         &mut self,
         session_id: &str,
         action: Option<String>,
         now_unix_ms: u64,
     ) {
+        let revision = self.next_revision();
         let entry = self
             .entries
             .entry(session_id.to_owned())
             .or_insert_with(|| SessionRegistryEntry {
+                closure_journal_failed: false,
+                trusted_local_agent: false,
+                cleanup_failed: false,
+                revision: 0,
                 session_id: session_id.to_owned(),
                 transport: "http".to_owned(),
                 client_name: None,
@@ -232,7 +475,30 @@ impl SessionRegistry {
                 last_reason_code: None,
                 spawned_agent: None,
             });
+        entry.revision = revision;
         entry.last_seen_unix_ms = now_unix_ms;
+        if let Some(action) = action {
+            entry.last_action = Some(action);
+            entry.last_reason_code = None;
+        }
+    }
+
+    /// A request header may refresh an initialized session, but cannot create one.
+    pub(crate) fn record_request_seen(
+        &mut self,
+        session_id: &str,
+        action: Option<String>,
+        now_unix_ms: u64,
+    ) {
+        let revision = self.next_revision();
+        let Some(entry) = self.entries.get_mut(session_id) else {
+            return;
+        };
+        if entry.closed_at_unix_ms.is_some() {
+            return;
+        }
+        entry.revision = revision;
+        entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
         if let Some(action) = action {
             entry.last_action = Some(action);
             entry.last_reason_code = None;
@@ -252,10 +518,15 @@ impl SessionRegistry {
         now_unix_ms: u64,
         reason_code: Option<&str>,
     ) -> bool {
+        let revision = self.next_revision();
         let entry = self
             .entries
             .entry(session_id.to_owned())
             .or_insert_with(|| SessionRegistryEntry {
+                closure_journal_failed: false,
+                trusted_local_agent: false,
+                cleanup_failed: false,
+                revision: 0,
                 session_id: session_id.to_owned(),
                 transport: "http".to_owned(),
                 client_name: None,
@@ -270,6 +541,7 @@ impl SessionRegistry {
                 spawned_agent: None,
             });
         let transitioned = entry.closed_at_unix_ms.is_none();
+        entry.revision = revision;
         entry.last_seen_unix_ms = now_unix_ms;
         entry.closed_at_unix_ms = Some(now_unix_ms);
         entry.last_reason_code = reason_code.map(ToOwned::to_owned);
@@ -282,10 +554,15 @@ impl SessionRegistry {
         spawned_agent: SpawnedAgentRead,
         now_unix_ms: u64,
     ) {
+        let revision = self.next_revision();
         let entry = self
             .entries
             .entry(session_id.to_owned())
             .or_insert_with(|| SessionRegistryEntry {
+                closure_journal_failed: false,
+                trusted_local_agent: false,
+                cleanup_failed: false,
+                revision: 0,
                 session_id: session_id.to_owned(),
                 transport: "http".to_owned(),
                 client_name: None,
@@ -302,6 +579,7 @@ impl SessionRegistry {
         if entry.agent_kind == "unknown" {
             entry.agent_kind = spawned_agent.cli.clone();
         }
+        entry.revision = revision;
         entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
         entry.spawned_agent = Some(spawned_agent);
     }
@@ -316,6 +594,7 @@ impl SessionRegistry {
         spawn_id: Option<&str>,
         now_unix_ms: u64,
     ) -> Vec<String> {
+        let revision = self.next_revision();
         let mut target_session_ids = BTreeSet::new();
         if let Some(session_id) = session_id.filter(|value| !value.is_empty())
             && self.entries.contains_key(session_id)
@@ -343,6 +622,7 @@ impl SessionRegistry {
                 continue;
             }
             let previous = entry.last_seen_unix_ms;
+            entry.revision = revision;
             entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
             if entry.last_seen_unix_ms != previous {
                 refreshed.push(session_id);
@@ -351,15 +631,19 @@ impl SessionRegistry {
         refreshed
     }
 
-    /// Returns the inferred agent kind for a live session (`"local-model"`,
-    /// `"codex"`, `"claude"`, or `"unknown"`), or `None` if the session has no
-    /// registry entry yet. Used by the MCP tool-profile resolver to grant the
-    /// Synapse-spawned local-model harness the full-capability tool surface
-    /// while leaving other agents on the least-privilege default (#1031).
-    pub(crate) fn agent_kind_for(&self, session_id: &str) -> Option<String> {
+    pub(crate) fn trust_local_agent(&mut self, session_id: &str) {
+        if let Some(entry) = self.entries.get_mut(session_id)
+            && entry.closed_at_unix_ms.is_none()
+            && entry.agent_kind == "local-model"
+        {
+            entry.trusted_local_agent = true;
+        }
+    }
+
+    pub(crate) fn is_trusted_local_agent(&self, session_id: &str) -> bool {
         self.entries
             .get(session_id)
-            .map(|entry| entry.agent_kind.clone())
+            .is_some_and(|entry| entry.closed_at_unix_ms.is_none() && entry.trusted_local_agent)
     }
 
     pub(crate) fn reads(&self, now_unix_ms: u64) -> Vec<SessionRegistryRead> {

@@ -1,9 +1,18 @@
+pub mod capture_owner;
+#[cfg(windows)]
+mod cdp_coverage;
 mod detection;
+mod element_window_crop;
+pub(crate) mod find_cost;
 mod ocr;
+mod ocr_app_text;
 mod search;
 mod sources;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use rmcp::{ErrorData, handler::server::common, model::JsonObject, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -20,23 +29,28 @@ use synapse_core::{
 use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode};
 
 pub use detection::populate_detection_from_state;
+pub(crate) use detection::stable_capture_origin;
 use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_config};
+pub(crate) use element_window_crop::crop_element_to_window_frame;
+use find_cost::PerceptionPurpose;
 #[cfg(windows)]
 pub use ocr::ocr_result_from_web_bitmap;
 pub use ocr::{
-    ReadTextCaptureSource, ResolvedReadTextRequest, effective_ocr_backend, enforce_require_text,
+    ReadTextCaptureSource, ResolvedReadTextRequest, effective_ocr_backend,
     read_text_request_uncached, resolve_read_text_request,
 };
 #[cfg(windows)]
 pub use ocr::{read_text_request_for_captured_bitmap, read_text_request_from_bgra};
+pub use ocr_app_text::AppTextCheck;
 use search::{element_match, entity_match};
+pub(crate) use sources::synthetic_notepad_input;
 pub use sources::{
     ClipboardTimelineSample, FsRecentTracker, FsTimelineEvent,
     hidden_desktop_input_from_worker_snapshot, populate_clipboard_summary, populate_fs_recent,
     timeline_clipboard_enabled, timeline_file_activity_enabled,
 };
 use sources::{
-    element_input_from_id, platform_input, synthetic_notepad_input, window_input_from_hwnd,
+    element_input_from_id, platform_input, window_input_for_purpose, window_input_from_hwnd,
 };
 
 pub type SharedM1State = Arc<Mutex<M1State>>;
@@ -47,6 +61,8 @@ const MIN_CAPTURE_UPDATE_INTERVAL_MS_U32: u32 = 16;
 pub struct M1State {
     pub capture_config: CaptureConfig,
     pub capture_controller: CaptureController,
+    /// Session that owns the active continuous capture (#112).
+    pub capture_owner: capture_owner::CaptureOwnership,
     pub capture_generation: u64,
     pub active_capture_config: ObservationCaptureConfig,
     pub perception_mode: PerceptionMode,
@@ -62,6 +78,8 @@ pub struct M1State {
     /// on ambient host focus at run time.
     pub force_no_foreground: bool,
     pub last_observed_foreground: Option<ForegroundContext>,
+    pub everquest_log_cursor: Option<EverQuestLogCursorState>,
+    pub everquest_event_seq: u64,
     pub fs_recent_tracker: FsRecentTracker,
 }
 
@@ -81,6 +99,7 @@ impl M1State {
         Self {
             capture_config: CaptureConfig::default().with_env_backend(),
             capture_controller: CaptureController::new(),
+            capture_owner: capture_owner::CaptureOwnership::default(),
             capture_generation: 0,
             active_capture_config: default_observation_capture_config(),
             perception_mode: PerceptionMode::Auto,
@@ -92,6 +111,8 @@ impl M1State {
             force_observe_internal,
             force_no_foreground,
             last_observed_foreground: None,
+            everquest_log_cursor: None,
+            everquest_event_seq: 0,
             fs_recent_tracker: FsRecentTracker::from_env(),
         }
     }
@@ -130,7 +151,7 @@ impl M1State {
         let active_config = handle.config();
         let latest_frame = stats.latest_frame();
         CaptureRuntimeReadback {
-            status: "running".to_owned(),
+            status: capture_status_label(handle.is_running()).to_owned(),
             target: Some(observation_target_from_capture_target(
                 &handle.target().target,
             )),
@@ -159,16 +180,29 @@ impl M1State {
     }
 }
 
+/// Runtime status of a retained capture handle: a handle whose worker ended
+/// (failed or stopped) must not read as `running` (#122).
+#[must_use]
+pub(crate) const fn capture_status_label(worker_running: bool) -> &'static str {
+    if worker_running { "running" } else { "stopped" }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EverQuestLogCursorState {
+    pub path: PathBuf,
+    pub offset: u64,
+}
+
 impl Default for M1State {
     fn default() -> Self {
         Self::from_env()
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveParams {
-    #[serde(default)]
+    #[serde(default = "default_observe_slots")]
     pub include: Vec<ObserveSlot>,
     #[serde(default)]
     pub depth: Option<u32>,
@@ -184,11 +218,35 @@ pub struct ObserveParams {
     /// session's active target; when both are absent, observe falls back to the
     /// global foreground (back-compat).
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema)]
+fn default_observe_slots() -> Vec<ObserveSlot> {
+    vec![
+        ObserveSlot::Focused,
+        ObserveSlot::Elements,
+        ObserveSlot::Entities,
+        ObserveSlot::Hud,
+        ObserveSlot::Events,
+        ObserveSlot::Diagnostics,
+    ]
+}
+
+impl Default for ObserveParams {
+    fn default() -> Self {
+        Self {
+            include: default_observe_slots(),
+            depth: None,
+            max_elements: None,
+            element_offset: None,
+            subtree_root: None,
+            since_event_seq: None,
+            window_hwnd: None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserveSlot {
     Focused,
@@ -225,7 +283,6 @@ pub struct FindParams {
     #[serde(default)]
     pub in_window: Option<ElementId>,
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -242,6 +299,11 @@ pub enum FindScope {
 #[serde(deny_unknown_fields)]
 pub struct FindResponse {
     pub results: Vec<FindResult>,
+    /// Reason code when the accessibility snapshot behind these results was
+    /// partial (depth, node or deadline truncation, incomplete WebView
+    /// content). Absent when coverage was complete (#77).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a11y_coverage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -289,18 +351,11 @@ pub struct ReadTextParams {
     /// Explicit per-call window override (HWND). Takes precedence over the
     /// session's active target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub backend: OcrBackend,
     #[serde(default)]
     pub lang_hint: Option<String>,
-    /// When true, a clean OCR pass that finds no glyphs returns the typed
-    /// `OCR_NO_TEXT` error (fail-closed absence) instead of the default #1557
-    /// empty-observation success (`no_text: true`, empty text). Default false:
-    /// an empty region is a valid observation, not a failure.
-    #[serde(default)]
-    pub require_text: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -312,7 +367,6 @@ pub struct CaptureScreenshotParams {
     /// Explicit per-call window override (HWND). Takes precedence over the
     /// session's active target. When set, `region` is client-relative.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub overwrite: bool,
@@ -396,7 +450,6 @@ pub struct ScreenshotParams {
     /// Explicit per-call window override (HWND). Takes precedence over the
     /// session's active target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub overwrite: bool,
@@ -438,7 +491,6 @@ pub struct CaptureGifParams {
     pub interval_ms: Option<u64>,
     /// Window HWND to record. Defaults to this session's bound target window.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Downscale (aspect-preserving) so each frame's longest edge never exceeds
     /// this. Default 800; set 0 to disable.
@@ -478,7 +530,6 @@ pub struct BrowserScreenshotParams {
     /// Browser HWND that owns the target. Required only when passing an
     /// explicit `cdp_target_id` without an active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub scope: BrowserScreenshotScope,
@@ -601,6 +652,40 @@ pub struct BrowserScreenshotResponse {
     /// not a viewport/clip/element capture. Absent on a normal bridge capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// D7: the page's `document.visibilityState` before a background
+    /// (chrome.debugger) capture. Absent on a visible-tab capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility_before: Option<String>,
+    /// D7: set when a hidden tab was rendered in a temporary unfocused window
+    /// beside its own window and then returned; the page was re-laid out at
+    /// that window's size (see `viewport_width_css`/`viewport_height_css`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_window: Option<BrowserScreenshotRenderWindow>,
+}
+
+/// D7: the temporary render window a hidden tab was captured in.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct BrowserScreenshotRenderWindow {
+    /// Chrome window id of the temporary window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<i64>,
+    /// Side of the tab's own window it was placed on (right/left/below/above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    /// Render window width in CSS px.
+    pub width: f64,
+    /// Render window height in CSS px.
+    pub height: f64,
+    /// Chrome window id the tab came from and was returned to.
+    pub origin_window_id: i64,
+    /// Tab index in its own window, before and after.
+    pub origin_index: u32,
+    /// Number of spots tried before the page reported visible.
+    pub placements_tried: u32,
+    /// The tab is back in its own window at its index with the prior active tab.
+    pub returned: bool,
+    /// The temporary window is gone.
+    pub render_window_closed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -615,7 +700,6 @@ pub struct BrowserPdfParams {
     /// Browser HWND that owns the target. Required only when passing an explicit
     /// `cdp_target_id` without an active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub landscape: bool,
@@ -712,7 +796,6 @@ pub struct BrowserDownloadsParams {
     /// session target is set, the current human foreground Chromium window is
     /// used only as an explicit bridge discovery source and reported back.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Chrome download id. Use this for exact save/move of a prior list/wait row.
     #[serde(default)]
@@ -850,7 +933,6 @@ pub struct HiddenDesktopPipFrameParams {
     #[serde(default)]
     pub watched_session_id: Option<String>,
     /// Hidden-desktop top-level window HWND to capture.
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: i64,
     /// Output PNG/JPEG frame path. This is the read-only viewer surface.
     pub path: String,
@@ -922,16 +1004,9 @@ pub struct SetCaptureTargetParams {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureTargetParam {
     Primary,
-    Monitor {
-        monitor_index: u32,
-    },
-    Window {
-        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
-        window_hwnd: i64,
-    },
-    ElementWindow {
-        element_id: ElementId,
-    },
+    Monitor { monitor_index: u32 },
+    Window { window_hwnd: i64 },
+    ElementWindow { element_id: ElementId },
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -973,14 +1048,34 @@ pub struct SetPerceptionModeResponse {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SetTargetParam {
     Window {
-        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
     },
     Cdp {
-        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
         cdp_target_id: String,
     },
+}
+
+/// A window handle or a selector in the same format as target set.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AutomationInputTargetParam {
+    Hwnd(i64),
+    Selector(SetTargetParam),
+}
+
+impl AutomationInputTargetParam {
+    pub(crate) fn resolve(&self) -> Result<synapse_core::types::StoredInputTarget, ErrorData> {
+        let hwnd = match self {
+            Self::Hwnd(hwnd) => *hwnd,
+            Self::Selector(
+                SetTargetParam::Window { window_hwnd } | SetTargetParam::Cdp { window_hwnd, .. },
+            ) => *window_hwnd,
+        };
+        synapse_action::InputDeliveryTarget::resolve_window(hwnd, "automation_configuration")
+            .map(|target| target.stored())
+            .map_err(|error| crate::m2::action_error_to_mcp(&error))
+    }
 }
 
 impl<'de> Deserialize<'de> for SetTargetParam {
@@ -1101,7 +1196,6 @@ pub struct CdpOpenTabParams {
     /// Browser HWND with a reachable CDP endpoint. If omitted, the caller must
     /// already have a session window/CDP target set.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Initial URL for the background tab. Empty string opens about:blank.
     pub url: String,
@@ -1168,7 +1262,6 @@ pub struct CdpTargetInfoParams {
     /// Browser HWND whose target table contains the CDP/Chrome bridge target.
     /// If omitted, the active session CDP target is used.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// CDP TargetID / Chrome bridge target id to read. If omitted, the active
     /// session CDP target is used.
@@ -1237,7 +1330,6 @@ pub struct BrowserTabsParams {
     /// target's window is used; if the session has no target, this explicit
     /// discovery behavior is available only for `list` and `select`.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Target id for `select`, `activate`, or `close`.
     #[serde(default)]
@@ -1250,6 +1342,7 @@ pub struct BrowserTabsParams {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserTabEntry {
+    pub incognito: bool,
     /// Ready to pass to `set_target` to bind this tab.
     pub target: TargetWire,
     pub window_hwnd: i64,
@@ -1266,30 +1359,6 @@ pub struct BrowserTabEntry {
     pub highlighted: bool,
     pub pinned: bool,
     pub target_attached: bool,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserTabsActivationVisualReadback {
-    pub status: String,
-    pub source_of_truth: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_window_title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_window_title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub before_bitmap_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_bitmap_sha256: Option<String>,
-    pub before_bitmap_width: u32,
-    pub before_bitmap_height: u32,
-    pub after_bitmap_width: u32,
-    pub after_bitmap_height: u32,
-    pub visual_changed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_title_matched_window_title: Option<bool>,
-    pub attempts: u32,
-    pub elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1316,8 +1385,6 @@ pub struct BrowserTabsMutation {
     pub active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlighted: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub activation_visual_readback: Option<BrowserTabsActivationVisualReadback>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_cdp_target_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1385,7 +1452,6 @@ pub struct BrowserNavParams {
     /// Browser HWND whose target table contains the tab. If omitted, the active
     /// session CDP target or owned `cdp_target_id` is used.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Chrome bridge/CDP target id. If omitted, the active session CDP target is used.
     #[serde(default)]
@@ -1421,7 +1487,6 @@ pub struct BrowserAdoptActiveTabParams {
     /// explicit adoption tool passively uses the current human OS foreground
     /// Chromium window.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -1610,6 +1675,11 @@ pub struct CdpBridgeHostReadback {
     pub expected_service_worker_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_service_worker_path: Option<String>,
+    /// `BRIDGE_CODE_STAMP` of the running worker vs the installed file (#237).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_code_stamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_code_stamp: Option<String>,
     pub extension_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_user_agent: Option<String>,
@@ -1726,7 +1796,6 @@ pub struct CdpNavigateTabParams {
     /// Browser HWND whose target table contains the CDP target. If omitted, the
     /// caller must already have an active CDP session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// CDP TargetID to navigate. If omitted, the active session CDP target is used.
     #[serde(default)]
@@ -1801,7 +1870,6 @@ pub struct CdpActivateTabParams {
     /// Browser HWND whose target table contains the CDP target. If omitted, the
     /// caller must already have an active CDP session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// CDP TargetID to activate. If omitted, the active session CDP target is used.
     #[serde(default)]
@@ -1854,7 +1922,6 @@ pub struct BrowserEvaluateParams {
     /// Browser HWND that owns the target. Required only when passing an explicit
     /// `cdp_target_id` without an active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional element id (from `find`/`observe`) to scope evaluation to a DOM
     /// element. When set, `expression` MUST be a function and is called
@@ -1871,27 +1938,18 @@ pub struct BrowserEvaluateParams {
     /// passed as `Runtime.callFunctionOn` arguments.
     #[serde(default)]
     pub args: Option<Vec<serde_json::Value>>,
-    /// Await a returned promise/thenable before resolving. Defaults to true. The
-    /// camelCase spelling `awaitPromise` (the raw CDP field name) is accepted as
-    /// an alias so a promise-returning expression can turn awaiting off without
-    /// having the field rejected (issue #1596).
-    #[serde(default, alias = "awaitPromise")]
+    /// Await a returned promise/thenable before resolving. Defaults to true.
+    #[serde(default)]
     pub await_promise: Option<bool>,
     /// Serialize the result by value as JSON. Defaults to true. Set false to
     /// receive only the type/description handle for non-serializable values
-    /// (DOM nodes, functions). The camelCase alias `returnByValue` is accepted.
-    #[serde(default, alias = "returnByValue")]
+    /// (DOM nodes, functions).
+    #[serde(default)]
     pub return_by_value: Option<bool>,
-    /// Bounded wall-clock budget in milliseconds for the expression to finish.
-    /// Defaults to 5000; accepted range is 50..=120000. When the expression is
-    /// still running at the deadline the call fails with a structured
-    /// `BROWSER_EVALUATE_TIMEOUT` error (carrying the elapsed and budget ms and
-    /// distinct from a thrown JS exception) so an agent can retry with a larger
-    /// budget rather than guessing (issue #1596). The camelCase alias `timeoutMs`
-    /// is accepted.
-    #[serde(default, alias = "timeoutMs")]
-    #[schemars(range(min = 50, max = 120000))]
-    pub timeout_ms: Option<u32>,
+    /// Longest time the script may run, in milliseconds (default 5000).
+    #[serde(default)]
+    #[schemars(range(min = 50, max = 120_000))]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Response for `browser_evaluate`. The evaluated value plus the page context it
@@ -1966,7 +2024,6 @@ pub struct BrowserExposeBindingParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional execution context name for Runtime.addBinding, matching CDP
     /// `executionContextName` / init-script `worldName`.
@@ -2067,7 +2124,6 @@ pub struct BrowserAddInitScriptParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// JavaScript source for `operation=add`. It runs before page scripts on
     /// subsequent new documents/navigations for this page target.
@@ -2129,7 +2185,6 @@ pub struct BrowserAddScriptTagParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Remote script URL to load into a `<script src=...>`.
     #[serde(default)]
@@ -2158,7 +2213,6 @@ pub struct BrowserAddStyleTagParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Remote stylesheet URL to load into a `<link rel=stylesheet href=...>`.
     #[serde(default)]
@@ -2225,7 +2279,6 @@ pub struct BrowserWaitForParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Text to wait for. If supplied without `state`, the tool waits for it to
     /// appear. Omit text for a plain timeout wait.
@@ -2299,7 +2352,6 @@ pub struct BrowserWaitForLoadStateParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2364,7 +2416,6 @@ pub struct BrowserWaitForUrlParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2467,7 +2518,6 @@ pub struct BrowserWaitForRequestParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2534,7 +2584,6 @@ pub struct BrowserWaitForNetworkResponseParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2591,7 +2640,6 @@ pub struct BrowserWaitForFunctionParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional JSON arguments forwarded to function predicates.
     #[serde(default)]
@@ -2729,7 +2777,6 @@ pub struct BrowserWaitForSelectorParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND that owns the target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum matches to inspect per poll (default 50, capped at 500).
     #[serde(default)]
@@ -2867,7 +2914,6 @@ pub struct BrowserContentParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum HTML bytes to return (UTF-16 length cap, default 2 MiB). The HTML
     /// is truncated in-page; `truncated`/`html_len` report the original size.
@@ -2912,7 +2958,6 @@ pub struct BrowserSetContentParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Full replacement HTML for the target's main frame.
     pub html: String,
@@ -2966,7 +3011,6 @@ pub struct BrowserConsoleMessagesParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only entries with `seq >= since_seq` (delta semantics). Pass the
     /// prior response's `next_cursor` to receive only entries added since.
@@ -3061,7 +3105,6 @@ pub struct BrowserInspectParams {
     /// Browser HWND that owns the target. Required only when the active session
     /// target is absent.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum bytes per HTML/text field (UTF-16 length cap, default 256 KiB).
     #[serde(default)]
@@ -3101,6 +3144,8 @@ pub struct ElementInspection {
     /// The element's `value` property when it has one (inputs/textarea/select);
     /// `null` otherwise.
     pub input_value: Option<String>,
+    #[serde(default)]
+    pub is_password: bool,
     pub is_visible: bool,
     pub is_enabled: bool,
     pub is_checked: bool,
@@ -3146,7 +3191,6 @@ pub struct BrowserScrollIntoViewParams {
     /// Browser HWND that owns the target. Required only when the active session
     /// target is absent.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -3302,7 +3346,6 @@ pub struct BrowserLocateParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum element ids to return (default 50, capped at 500). `match_count`
     /// always reports the full number of matches.
@@ -3411,8 +3454,6 @@ pub fn set_target_input_schema() -> Arc<JsonObject> {
                             },
                             "window_hwnd": {
                                 "type": "integer",
-                                "minimum": 1,
-                                "maximum": 4294967295_u64,
                                 "description": "Native top-level window HWND to bind to this MCP session."
                             }
                         }
@@ -3429,8 +3470,6 @@ pub fn set_target_input_schema() -> Arc<JsonObject> {
                             },
                             "window_hwnd": {
                                 "type": "integer",
-                                "minimum": 1,
-                                "maximum": 4294967295_u64,
                                 "description": "Native browser window HWND whose CDP endpoint owns the target."
                             },
                             "cdp_target_id": {
@@ -3455,25 +3494,21 @@ struct EmptyParams {}
 
 #[must_use]
 pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
-    let mut include = if params.include.is_empty() {
-        ObserveInclude::default()
-    } else {
-        ObserveInclude {
-            focused: false,
-            elements: false,
-            entities: false,
-            hud: false,
-            audio: false,
-            events: false,
-            clipboard: false,
-            fs: false,
-            diagnostics: false,
-            interactable_only: false,
-            max_subtree_depth: 2,
-            max_subtree_nodes: 60,
-            element_offset: 0,
-            max_entities: 60,
-        }
+    let mut include = ObserveInclude {
+        focused: false,
+        elements: false,
+        entities: false,
+        hud: false,
+        audio: false,
+        events: false,
+        clipboard: false,
+        fs: false,
+        diagnostics: false,
+        interactable_only: false,
+        max_subtree_depth: 2,
+        max_subtree_nodes: 60,
+        element_offset: 0,
+        max_entities: 60,
     };
     for slot in &params.include {
         match slot {
@@ -3498,45 +3533,69 @@ pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
     include
 }
 
+/// Maximum depth used for public UIA snapshots.  `find` and interactable
+/// `observe` share this bound so they never silently describe different
+/// candidate surfaces for the same target.
+pub(crate) const MAX_PUBLIC_A11Y_SNAPSHOT_DEPTH: u32 = 16;
+
 /// A11y gather depth for one observe call. Interactable mode defaults to the
 /// maximum walk depth (form fields live deep in real trees); everything else
 /// keeps the historical default of 2. An explicit `depth` always wins.
 #[must_use]
 pub fn observe_gather_depth(params: &ObserveParams) -> u32 {
     let default_depth = if params.include.contains(&ObserveSlot::Interactable) {
-        6
+        MAX_PUBLIC_A11Y_SNAPSHOT_DEPTH
     } else {
         2
     };
-    params.depth.unwrap_or(default_depth).min(6)
+    params
+        .depth
+        .unwrap_or(default_depth)
+        .min(MAX_PUBLIC_A11Y_SNAPSHOT_DEPTH)
 }
 
 pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, ErrorData> {
-    if state.force_observe_internal {
+    let mut input = foreground_perception_input(
+        depth,
+        state.perception_mode,
+        state.synthetic.as_ref(),
+        state.force_observe_internal,
+        state.force_no_perception,
+        PerceptionPurpose::Observe,
+    )?;
+    input.capture_config = Some(state.active_capture_config.clone());
+    input.capture_runtime = Some(state.capture_runtime_readback());
+    Ok(input)
+}
+
+fn foreground_perception_input(
+    depth: u32,
+    mode: PerceptionMode,
+    synthetic: Option<&ObservationInput>,
+    force_observe_internal: bool,
+    force_no_perception: bool,
+    purpose: PerceptionPurpose,
+) -> Result<ObservationInput, ErrorData> {
+    if force_observe_internal {
         return Err(mcp_error(
             error_codes::OBSERVE_INTERNAL,
             "forced observe internal error",
         ));
     }
-    if state.force_no_perception {
+    if force_no_perception {
         return Err(mcp_error(
             error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
             "no perception source is available",
         ));
     }
-    if let Some(input) = &state.synthetic {
+    if let Some(input) = synthetic {
         let mut input = input_limited_to_depth(input.clone(), depth);
-        if state.perception_mode != PerceptionMode::Auto {
-            input.mode_override = Some(state.perception_mode);
+        if mode != PerceptionMode::Auto {
+            input.mode_override = Some(mode);
         }
-        input.capture_config = Some(state.active_capture_config.clone());
-        input.capture_runtime = Some(state.capture_runtime_readback());
         return Ok(input);
     }
-    let mut input = platform_input(depth, state.perception_mode)?;
-    input.capture_config = Some(state.active_capture_config.clone());
-    input.capture_runtime = Some(state.capture_runtime_readback());
-    Ok(input)
+    platform_input(depth, mode, purpose)
 }
 
 /// Builds an observation input for a global-only observe — one whose requested
@@ -3646,6 +3705,14 @@ pub async fn enrich_input_with_cdp_for_target(
         {
             Ok(snapshot) => {
                 let count = u32::try_from(snapshot.nodes.len()).unwrap_or(u32::MAX);
+                settle_cdp_snapshot_status(
+                    input,
+                    snapshot.nodes.len(),
+                    snapshot.total_ax_nodes,
+                    max_nodes,
+                    snapshot.blocked_frame_targets.len(),
+                    snapshot.frame_snapshot_errors.len(),
+                );
                 for mut node in snapshot.nodes {
                     // Clamp web-node depth to the requested observe depth so deeply
                     // nested DOM elements still survive the element depth filter;
@@ -3671,7 +3738,7 @@ pub async fn enrich_input_with_cdp_for_target(
                     code = "A11Y_CDP_DOM_ATTACHED",
                     endpoint = %endpoint,
                     hwnd,
-                    page_url = %snapshot.page_url,
+                    page_url = %crate::server::url_redaction::RedactedUrl(&snapshot.page_url),
                     target_id = %snapshot.target_id,
                     session_id = %snapshot.session_id,
                     requested_target_id = target_id_hint.unwrap_or_default(),
@@ -3700,12 +3767,26 @@ pub async fn enrich_input_with_cdp_for_target(
                     diagnostics.reason_code = Some(error.code().to_owned());
                     diagnostics.detail = Some(error.to_string());
                 }
+                if !synapse_a11y::is_chromium_family(&input.foreground.process_name)
+                    && matches!(input.a11y_status, synapse_core::SensorStatus::Healthy)
+                {
+                    input.a11y_status = synapse_core::SensorStatus::DegradedSensorFailed {
+                        reason_code: sources::A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE
+                            .to_owned(),
+                    };
+                }
             }
         }
         return;
     }
 
     if cdp.status != CdpStatus::Unreachable {
+        return;
+    }
+
+    // The extension snapshot fallback belongs to normal Chrome only. Keep a
+    // WebView2 host's missing-debug-port diagnosis intact for the caller.
+    if !synapse_a11y::is_chromium_family(&input.foreground.process_name) {
         return;
     }
 
@@ -3725,6 +3806,36 @@ pub async fn enrich_input_with_cdp_for_target(
         diagnostics.reason_code = Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned());
         diagnostics.detail = Some(detail);
     }
+}
+
+/// Settles the observe accessibility status after a CDP DOM snapshot returned
+/// `returned_nodes` nodes (of `total_ax_nodes` exposed, under the `max_nodes`
+/// budget) with the given blocked-frame and frame-error counts.
+///
+/// A sparse UIA scan was provisional: an unblocked, non-empty CDP page tree
+/// clears that old failure. Controls beyond the node budget were never
+/// returned, so the shared coverage verdict then says so (#77).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn settle_cdp_snapshot_status(
+    input: &mut ObservationInput,
+    returned_nodes: usize,
+    total_ax_nodes: u32,
+    max_nodes: usize,
+    blocked_frame_targets: usize,
+    frame_snapshot_errors: usize,
+) {
+    if returned_nodes > 0
+        && blocked_frame_targets == 0
+        && frame_snapshot_errors == 0
+        && matches!(
+            &input.a11y_status,
+            synapse_core::SensorStatus::DegradedSensorFailed { reason_code }
+                if sources::cdp_tree_supersedes_sparse_uia(reason_code)
+        )
+    {
+        input.a11y_status = synapse_core::SensorStatus::Healthy;
+    }
+    cdp_coverage::apply_cdp_budget_coverage(input, returned_nodes, total_ax_nodes, max_nodes);
 }
 
 #[cfg(windows)]
@@ -3763,6 +3874,7 @@ fn is_browser_url(value: &str) -> bool {
 const BROWSER_OCR_CHROME_TOP_PX: i32 = 96;
 const BROWSER_OCR_TILE_HEIGHT_PX: i32 = 600;
 const BROWSER_OCR_MAX_TILES: usize = 8;
+const BROWSER_OCR_WINDOW_CAPTURE_TIMEOUT_MS: u64 = 1_000;
 const BROWSER_OVERLAY_OCR_MIN_ACTION_TOKENS: usize = 2;
 const BROWSER_OVERLAY_OCR_MIN_NEW_TOKENS_WITH_ACTION: usize = 3;
 const OCR_RUNTIME_RECT_PREFIX: &str = "0c0c01";
@@ -3772,6 +3884,22 @@ const OCR_RUNTIME_RECT_PREFIX: &str = "0c0c01";
 /// nodes and upgrades `web_path` to `ocr` only when OCR actually returned text.
 #[cfg(windows)]
 pub fn enrich_input_with_browser_ocr(input: &mut ObservationInput, max_nodes: usize) {
+    enrich_browser_ocr_for_purpose(input, max_nodes, PerceptionPurpose::Observe);
+}
+
+pub(crate) fn enrich_find_input_with_browser_ocr(input: &mut ObservationInput, max_nodes: usize) {
+    #[cfg(windows)]
+    enrich_browser_ocr_for_purpose(input, max_nodes, PerceptionPurpose::Find);
+    #[cfg(not(windows))]
+    let _ = (input, max_nodes);
+}
+
+#[cfg(windows)]
+fn enrich_browser_ocr_for_purpose(
+    input: &mut ObservationInput,
+    max_nodes: usize,
+    purpose: PerceptionPurpose,
+) {
     if max_nodes == 0 {
         return;
     }
@@ -3779,9 +3907,9 @@ pub fn enrich_input_with_browser_ocr(input: &mut ObservationInput, max_nodes: us
     let should_overlay_ocr = should_attempt_browser_overlay_ocr(input);
     log_browser_ocr_guard(input, should_full_ocr, should_overlay_ocr);
     if should_full_ocr {
-        enrich_input_with_full_browser_ocr(input, max_nodes);
+        enrich_input_with_full_browser_ocr(input, max_nodes, purpose);
     } else if should_overlay_ocr {
-        enrich_input_with_overlay_browser_ocr(input, max_nodes);
+        enrich_input_with_overlay_browser_ocr(input, max_nodes, purpose);
     }
 }
 
@@ -3814,14 +3942,108 @@ fn log_browser_ocr_guard(
     );
 }
 
+/// Captures the observe target's whole window frame once so browser-OCR tiles
+/// read the target's own pixels (#130). The returned bitmap's `region` is the
+/// stable DWM capture bounds proven by matching bounds reads around the
+/// capture — the same alignment `populate_detection_from_state` relies on, and
+/// deliberately NOT `window_bounds` (GetWindowRect style), which differs from
+/// the WGC frame by the invisible DWM resize border. Fails closed on capture
+/// failure or bounds drift.
 #[cfg(windows)]
-fn enrich_input_with_full_browser_ocr(input: &mut ObservationInput, max_nodes: usize) {
-    use synapse_core::{SensorStatus, WebPerceptionPath};
+pub(crate) fn browser_ocr_target_frame(
+    input: &ObservationInput,
+) -> Option<std::sync::Arc<synapse_capture::CapturedBgraBitmap>> {
+    let (hwnd, pid, frame) = input.target_window_frame.get_or_init(|| {
+        (
+            input.foreground.hwnd,
+            input.foreground.pid,
+            capture_observation_target_frame(input.foreground.hwnd).map(std::sync::Arc::new),
+        )
+    });
+    if *hwnd != input.foreground.hwnd || *pid != input.foreground.pid {
+        return None;
+    }
+    frame.clone()
+}
 
-    if !matches!(
-        input.capture_status,
-        SensorStatus::Healthy | SensorStatus::DegradedLatency { .. }
-    ) {
+/// Proves DWM bounds and geometry generation around the observation's only capture.
+#[cfg(windows)]
+fn capture_observation_target_frame(hwnd: i64) -> Option<synapse_capture::CapturedBgraBitmap> {
+    let bounds_before = synapse_capture::window_capture_bounds(hwnd)
+        .map_err(|error| {
+            tracing::debug!(
+                code = error.code(),
+                hwnd,
+                error = %error,
+                "browser OCR target bounds read failed"
+            );
+            error
+        })
+        .ok()?;
+    let epoch_before = synapse_capture::geometry_epoch(hwnd);
+    let captured = synapse_capture::window_full_frame_to_bgra_bitmap(
+        hwnd,
+        BROWSER_OCR_WINDOW_CAPTURE_TIMEOUT_MS,
+    )
+    .map_err(|error| {
+        tracing::debug!(
+            code = error.code(),
+            hwnd,
+            error = %error,
+            "browser OCR target window capture failed"
+        );
+        error
+    })
+    .ok()?;
+    let bounds_after = synapse_capture::window_capture_bounds(hwnd).ok()?;
+    let origin = crate::m1::detection::stable_capture_origin(
+        bounds_before,
+        bounds_after,
+        captured.bitmap.width,
+        captured.bitmap.height,
+    )?;
+    // Geometry epoch: bounds equality cannot see a move-and-return, so the
+    // per-window generation counter must also be unchanged across the capture.
+    let epoch_after = synapse_capture::geometry_epoch_quiescent(hwnd);
+    if epoch_after != epoch_before {
+        tracing::warn!(
+            code = "M1_BROWSER_OCR_GEOMETRY_EPOCH_ADVANCED",
+            hwnd,
+            epoch_before,
+            epoch_after,
+            "target changed geometry during browser OCR capture (move, resize, or move-and-return); rejecting frame for origin mapping"
+        );
+        return None;
+    }
+    let mut bitmap = captured.bitmap;
+    bitmap.region = origin;
+    Some(bitmap)
+}
+
+#[cfg(windows)]
+fn browser_ocr_capture_allowed(input: &ObservationInput, purpose: PerceptionPurpose) -> bool {
+    use synapse_core::SensorStatus;
+
+    match input.capture_status {
+        SensorStatus::Healthy | SensorStatus::DegradedLatency { .. } => true,
+        // Find skips the eager baseline in Auto. The selected OCR fallback
+        // captures through browser_ocr_target_frame, just as detection does.
+        SensorStatus::Unavailable => {
+            matches!(purpose, PerceptionPurpose::Find) && input.mode_override.is_none()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn enrich_input_with_full_browser_ocr(
+    input: &mut ObservationInput,
+    max_nodes: usize,
+    purpose: PerceptionPurpose,
+) {
+    use synapse_core::WebPerceptionPath;
+
+    if !browser_ocr_capture_allowed(input, purpose) {
         tracing::warn!(
             code = "A11Y_BROWSER_OCR_SKIPPED_CAPTURE_UNAVAILABLE",
             hwnd = input.foreground.hwnd,
@@ -3830,7 +4052,9 @@ fn enrich_input_with_full_browser_ocr(input: &mut ObservationInput, max_nodes: u
         );
         return;
     }
-    let Some(content_region) = browser_content_region(input.foreground.window_bounds) else {
+    // Degenerate-geometry early exit before paying for the target capture;
+    // the real content region is re-derived from the captured frame below.
+    if browser_content_region(input.foreground.window_bounds).is_none() {
         tracing::warn!(
             code = "A11Y_BROWSER_OCR_SKIPPED_EMPTY_REGION",
             hwnd = input.foreground.hwnd,
@@ -3838,24 +4062,66 @@ fn enrich_input_with_full_browser_ocr(input: &mut ObservationInput, max_nodes: u
             "browser OCR fallback skipped because the browser content region is empty"
         );
         return;
-    };
+    }
 
     let started = std::time::Instant::now();
     let mut words = Vec::new();
     let mut attempted_tiles = 0usize;
     let mut failed_tiles = 0usize;
+    // #130: OCR the target window's own DWM surface, never the screen rectangle
+    // at the window's coordinates — a covered/backgrounded target would otherwise
+    // leak whatever window is on top into the target's elements.
+    let Some(frame) = browser_ocr_target_frame(input) else {
+        tracing::warn!(
+            code = "A11Y_BROWSER_OCR_SKIPPED_TARGET_CAPTURE_FAILED",
+            hwnd = input.foreground.hwnd,
+            "browser OCR fallback skipped because the target window could not be captured"
+        );
+        return;
+    };
+    // #130 review: derive tiles from the frame's own DWM-anchored bounds, not
+    // `window_bounds` (GetWindowRect), so the invisible resize border can
+    // neither shift the cropped rows nor offset reported word positions.
+    let Some(content_region) = browser_content_region(frame.region) else {
+        tracing::warn!(
+            code = "A11Y_BROWSER_OCR_SKIPPED_EMPTY_REGION",
+            hwnd = input.foreground.hwnd,
+            frame_region = ?frame.region,
+            "browser OCR fallback skipped because the captured frame has no content region"
+        );
+        return;
+    };
     for tile in browser_ocr_tiles(content_region) {
         attempted_tiles += 1;
-        match synapse_perception::read_text(tile) {
-            Ok(mut tile_words) => words.append(&mut tile_words),
-            Err(error) => {
+        let cropped = frame.crop_screen_rect(tile);
+        match cropped {
+            Some(crop) => {
+                match synapse_perception::read_text_from_bgra_bitmap(
+                    crop.region,
+                    crop.width,
+                    crop.height,
+                    &crop.bytes,
+                ) {
+                    Ok(mut tile_words) => words.append(&mut tile_words),
+                    Err(error) => {
+                        failed_tiles = failed_tiles.saturating_add(1);
+                        tracing::debug!(
+                            code = error.code(),
+                            hwnd = input.foreground.hwnd,
+                            tile = ?tile,
+                            error = %error,
+                            "browser OCR tile produced no text"
+                        );
+                    }
+                }
+            }
+            None => {
                 failed_tiles = failed_tiles.saturating_add(1);
                 tracing::debug!(
-                    code = error.code(),
+                    code = "A11Y_BROWSER_OCR_TILE_OUTSIDE_FRAME",
                     hwnd = input.foreground.hwnd,
                     tile = ?tile,
-                    error = %error,
-                    "browser OCR tile produced no text"
+                    "browser OCR tile fell outside the captured window frame"
                 );
             }
         }
@@ -3892,13 +4158,14 @@ fn enrich_input_with_full_browser_ocr(input: &mut ObservationInput, max_nodes: u
 }
 
 #[cfg(windows)]
-fn enrich_input_with_overlay_browser_ocr(input: &mut ObservationInput, max_nodes: usize) {
-    use synapse_core::{SensorStatus, WebPerceptionPath};
+fn enrich_input_with_overlay_browser_ocr(
+    input: &mut ObservationInput,
+    max_nodes: usize,
+    purpose: PerceptionPurpose,
+) {
+    use synapse_core::WebPerceptionPath;
 
-    if !matches!(
-        input.capture_status,
-        SensorStatus::Healthy | SensorStatus::DegradedLatency { .. }
-    ) {
+    if !browser_ocr_capture_allowed(input, purpose) {
         tracing::warn!(
             code = "A11Y_BROWSER_OCR_OVERLAY_SKIPPED_CAPTURE_UNAVAILABLE",
             hwnd = input.foreground.hwnd,
@@ -3916,7 +4183,7 @@ fn enrich_input_with_overlay_browser_ocr(input: &mut ObservationInput, max_nodes
         );
         return;
     };
-    let Some(probe_region) = browser_overlay_probe_region(content_region) else {
+    let Some(mut probe_region) = browser_overlay_probe_region(content_region) else {
         tracing::warn!(
             code = "A11Y_BROWSER_OCR_OVERLAY_SKIPPED_EMPTY_PROBE",
             hwnd = input.foreground.hwnd,
@@ -3927,9 +4194,37 @@ fn enrich_input_with_overlay_browser_ocr(input: &mut ObservationInput, max_nodes
     };
 
     let started = std::time::Instant::now();
-    let words = match synapse_perception::read_text(probe_region) {
-        Ok(words) => words,
-        Err(error) => {
+    // #130: the overlay probe reads the target window's own surface, so a
+    // covered target cannot surface the covering window's modal text.
+    let words = match browser_ocr_target_frame(input).and_then(|frame| {
+        // #130 review: same DWM-anchored realignment as the full OCR path, so
+        // the invisible resize border cannot shift the modal probe region.
+        let content = browser_content_region(frame.region)?;
+        let probe = browser_overlay_probe_region(content)?;
+        frame.crop_screen_rect(probe).map(|crop| {
+            // #130 review round 3: thread the clamped intersection — not
+            // the unclamped probe — out of the capture, so token
+            // filtering, action neighborhoods, and compactness all judge
+            // the OCR words against the region they were anchored to.
+            let anchored = crop.region;
+            synapse_perception::read_text_from_bgra_bitmap(
+                anchored,
+                crop.width,
+                crop.height,
+                &crop.bytes,
+            )
+            .map(|words| (words, anchored))
+        })
+    }) {
+        // #130 review round 2: thread the corrected DWM-anchored probe out of
+        // the capture and shadow the window-rect-derived region, so token
+        // filtering, action neighborhoods, and compactness all judge the OCR
+        // words against the region they were actually anchored to.
+        Some(Ok((words, corrected_probe))) => {
+            probe_region = corrected_probe;
+            words
+        }
+        Some(Err(error)) => {
             input.sensor_latency_ms.insert(
                 "ocr_overlay".to_owned(),
                 started.elapsed().as_secs_f32() * 1000.0,
@@ -3940,6 +4235,15 @@ fn enrich_input_with_overlay_browser_ocr(input: &mut ObservationInput, max_nodes
                 probe_region = ?probe_region,
                 error = %error,
                 "browser overlay OCR probe produced no text"
+            );
+            return;
+        }
+        None => {
+            tracing::debug!(
+                code = "A11Y_BROWSER_OCR_OVERLAY_TARGET_CAPTURE_FAILED",
+                hwnd = input.foreground.hwnd,
+                probe_region = ?probe_region,
+                "browser overlay OCR probe skipped; target window capture or crop failed"
             );
             return;
         }
@@ -4330,6 +4634,7 @@ fn browser_ocr_nodes(
                 patterns: Vec::new(),
                 children_count: 0,
                 depth: 1,
+                control_state: None,
             }
         })
         .collect()
@@ -4509,31 +4814,64 @@ fn focused_from_accessible_node(node: &AccessibleNode) -> FocusedElement {
 /// but `find` must reach deeply-nested controls (e.g. a UWP app's display text
 /// at depth ~5, or toolbar tool buttons), so it requests a deep snapshot. The
 /// snapshot's node-budget/deadline bounds the cost.
-const FIND_SNAPSHOT_DEPTH: u32 = 16;
+const FIND_SNAPSHOT_DEPTH: u32 = MAX_PUBLIC_A11Y_SNAPSHOT_DEPTH;
 
 /// Upper bound on CDP web nodes folded into a `find` snapshot. Web pages have
 /// far more nodes than native windows, and `find` walks deeper than `observe`.
 const FIND_CDP_MAX_NODES: usize = 300;
 
-/// Builds the perception input a `find` query searches (foreground or a specific
-/// window), including detection entities. Split from matching so the async `find`
-/// handler can fold in CDP web nodes (#685) before matching.
-pub fn build_find_input(
-    state: &mut M1State,
+/// Upper bound on the CDP DOM nodes one `observe` call may enumerate, however
+/// large `element_offset + max_elements` is (#62): the offset is accepted up to
+/// 100k, so without this cap a caller could force a ~100k-node walk per call.
+pub const MAX_OBSERVE_CDP_GATHER_NODES: usize = 3_000;
+
+/// State a find needs before entering the window snapshot path.
+pub(crate) struct FindStateSnapshot {
+    pub(crate) mode: PerceptionMode,
+    synthetic: Option<ObservationInput>,
+    force_observe_internal: bool,
+    force_no_perception: bool,
+}
+
+impl From<&M1State> for FindStateSnapshot {
+    fn from(state: &M1State) -> Self {
+        Self {
+            mode: state.perception_mode,
+            synthetic: state.synthetic.clone(),
+            force_observe_internal: state.force_observe_internal,
+            force_no_perception: state.force_no_perception,
+        }
+    }
+}
+
+pub(crate) const fn detection_needs_pixels(mode: PerceptionMode) -> bool {
+    matches!(mode, PerceptionMode::PixelOnly | PerceptionMode::Hybrid)
+}
+
+/// Builds the window or foreground snapshot a find searches. Detection and
+/// browser enrichment run separately from this input build.
+pub(crate) fn build_find_input(
+    state: &FindStateSnapshot,
     params: &FindParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
     // Precedence matches observe: explicit window_hwnd > session target > foreground.
-    let mut input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
-        let mut input = window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, state.perception_mode)?;
-        input.capture_config = Some(state.active_capture_config.clone());
-        input.capture_runtime = Some(state.capture_runtime_readback());
-        input
-    } else {
-        current_input(state, FIND_SNAPSHOT_DEPTH)?
-    };
-    populate_detection_from_state(state, &mut input);
-    Ok(input)
+    if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
+        return window_input_for_purpose(
+            hwnd,
+            FIND_SNAPSHOT_DEPTH,
+            state.mode,
+            PerceptionPurpose::Find,
+        );
+    }
+    foreground_perception_input(
+        FIND_SNAPSHOT_DEPTH,
+        state.mode,
+        state.synthetic.as_ref(),
+        state.force_observe_internal,
+        state.force_no_perception,
+        PerceptionPurpose::Find,
+    )
 }
 
 /// Maximum CDP web nodes a `find` query folds in. Exposed so the async handler
@@ -4552,7 +4890,7 @@ pub const fn find_snapshot_depth() -> u32 {
 /// Matches a prepared input against the `find` query.
 #[must_use]
 pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindResponse {
-    let limit = params.limit.unwrap_or(5).clamp(1, 20);
+    let limit = params.limit.unwrap_or(5).min(20);
     let mut results = Vec::new();
     if matches!(
         params.scope.unwrap_or_default(),
@@ -4562,6 +4900,7 @@ pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindRe
             input
                 .elements
                 .iter()
+                .filter(|node| synapse_perception::is_usable_element(node))
                 .filter_map(|node| element_match(node, params)),
         );
     }
@@ -4578,8 +4917,17 @@ pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindRe
     }
     results.sort_by(|left, right| right.score.total_cmp(&left.score));
     results.truncate(limit);
+    let a11y_coverage = match &input.a11y_status {
+        synapse_core::SensorStatus::DegradedSensorFailed { reason_code }
+            if sources::is_a11y_coverage_reason(reason_code) =>
+        {
+            Some(reason_code.clone())
+        }
+        _ => None,
+    };
     FindResponse {
         results,
+        a11y_coverage,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
     }
@@ -4621,6 +4969,21 @@ pub fn set_capture_target_in_state(
         backend: capture_backend_name(resolved.backend).to_owned(),
         capture_runtime: state.capture_runtime_readback(),
     })
+}
+
+pub fn stop_capture_target_in_state(
+    state: &mut M1State,
+) -> Result<(bool, CaptureRuntimeReadback), ErrorData> {
+    let stopped = state.capture_controller.stop();
+    state.capture_owner.clear();
+    state.capture_generation = state.capture_controller.generation();
+    state.active_capture_config = observation_capture_from_capture_config(
+        &state.capture_config,
+        state.capture_generation,
+        "manual_stop".to_owned(),
+    );
+    let stopped = stopped.map_err(|err| mcp_error(err.code(), err.to_string()))?;
+    Ok((stopped, state.capture_runtime_readback()))
 }
 
 pub fn apply_profile_runtime_config_in_state(
@@ -4691,60 +5054,6 @@ pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
         message,
         Some(json!({ "code": code })),
     )
-}
-
-/// Rejects malformed native window handles before target resolution or any
-/// hidden-desktop worker dispatch. This deliberately validates only the handle
-/// shape: a canonical HWND owned by another Windows desktop must be checked for
-/// liveness inside that desktop's worker.
-pub(crate) fn validate_window_hwnd_shape(tool: &str, hwnd: i64) -> Result<i64, ErrorData> {
-    validate_hwnd_shape(tool, "window_hwnd", hwnd)
-}
-
-/// Validates the canonical Win32 USER-handle wire representation for an HWND
-/// field whose public name may differ (for example `act_focus_window.hwnd`).
-pub(crate) fn validate_hwnd_shape(
-    tool: &str,
-    field: &'static str,
-    hwnd: i64,
-) -> Result<i64, ErrorData> {
-    if window_hwnd_shape_is_canonical(hwnd) {
-        return Ok(hwnd);
-    }
-
-    let source_of_truth = "resolved MCP window target before desktop-worker dispatch";
-    let remediation = "pass a canonical 1..=u32::MAX HWND from the relevant target/window/session-launch readback; for normal windows use target operation=list, or omit window_hwnd when the tool documents session-target/foreground resolution";
-    tracing::warn!(
-        code = error_codes::TOOL_PARAMS_INVALID,
-        tool,
-        field,
-        actual_value = hwnd,
-        accepted_range = "1..=u32::MAX",
-        source_of_truth,
-        remediation,
-        "window HWND shape validation failed before target resolution or worker dispatch"
-    );
-
-    Err(ErrorData::new(
-        rmcp::model::ErrorCode(-32099),
-        format!(
-            "{tool} {field} must be an integer in the canonical Windows USER-handle range 1..=4294967295; got {hwnd}"
-        ),
-        Some(json!({
-            "code": error_codes::TOOL_PARAMS_INVALID,
-            "tool": tool,
-            "field": field,
-            "accepted_range": "1..=u32::MAX",
-            "actual_value": hwnd,
-            "source_of_truth": source_of_truth,
-            "remediation": remediation,
-        })),
-    ))
-}
-
-#[must_use]
-pub(crate) fn window_hwnd_shape_is_canonical(hwnd: i64) -> bool {
-    synapse_core::win32_hwnd::hwnd_from_wire(hwnd).is_some()
 }
 
 fn default_observation_capture_config() -> ObservationCaptureConfig {
@@ -4848,8 +5157,7 @@ fn capture_target_from_param(param: CaptureTargetParam) -> Result<CaptureTarget,
             Ok(CaptureTarget::Monitor { monitor_index })
         }
         CaptureTargetParam::Window { window_hwnd } => {
-            validate_window_hwnd_shape("set_capture_target", window_hwnd)
-                .map(|hwnd| CaptureTarget::Window { hwnd })
+            Ok(CaptureTarget::Window { hwnd: window_hwnd })
         }
         CaptureTargetParam::ElementWindow { element_id } => {
             let rect = synapse_a11y::element_bounding_rect(&element_id).map_err(|err| {

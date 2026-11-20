@@ -1,3 +1,4 @@
+use super::action_history::{TimelineHistorySearchParams, TimelineHistorySearchResponse};
 use super::{
     ErrorData, Json, Parameters, SynapseService, tool, tool_profiles::ToolProfileKind, tool_router,
 };
@@ -51,6 +52,8 @@ pub enum TimelineOperation {
     Get,
     Search,
     Stats,
+    /// Phase 7 part 4: search the history of finished mutating tool calls.
+    HistorySearch,
 }
 
 impl TimelineOperation {
@@ -59,6 +62,7 @@ impl TimelineOperation {
             Self::Get => "get",
             Self::Search => "search",
             Self::Stats => "stats",
+            Self::HistorySearch => "history_search",
         }
     }
 }
@@ -73,6 +77,8 @@ pub struct TimelineParams {
     pub search: Option<TimelineSearchParams>,
     #[serde(default)]
     pub stats: Option<TimelineStatsParams>,
+    #[serde(default)]
+    pub history_search: Option<TimelineHistorySearchParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -87,6 +93,8 @@ pub struct TimelineResponse {
     pub search: Option<TimelineSearchResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<TimelineStatsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_search: Option<TimelineHistorySearchResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -186,7 +194,7 @@ pub struct PrivacyResponse {
 #[tool_router(router = timeline_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for timeline get/search/stats in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to the real timeline_get/timeline_search/timeline_stats paths and returns CF_TIMELINE/readback metadata."
+        description = "Facade for timeline get/search/stats in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to the real timeline_get/timeline_search/timeline_stats paths and returns CF_TIMELINE/readback metadata. operation=history_search searches the 90-day history of finished mutating tool calls (CF_KV action-history/v1/), newest first."
     )]
     pub async fn timeline(
         &self,
@@ -308,11 +316,39 @@ impl SynapseService {
                     |out| out.stats = Some(response),
                 )))
             }
+            TimelineOperation::HistorySearch => {
+                let spec = params
+                    .0
+                    .history_search
+                    .ok_or_else(|| missing_timeline_spec("history_search"))?;
+                let response = self.timeline_history_search(&spec)?;
+                Ok(Json(timeline_response(
+                    operation,
+                    format!(
+                        "{} {} history_search matched={} scanned={} truncated={}",
+                        response.cf_name,
+                        response.key_prefix,
+                        response.matched,
+                        response.scanned,
+                        response.truncated
+                    ),
+                    |out| {
+                        // The rows come from CF_KV action-history/v1/, not the timeline store.
+                        out.source_of_truth = format!(
+                            "{} {} + delegated timeline operation={}",
+                            response.cf_name,
+                            response.key_prefix,
+                            operation.as_str()
+                        );
+                        out.history_search = Some(response);
+                    },
+                )))
+            }
         }
     }
 
     #[tool(
-        description = "Facade for episode reads in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to the real episode_list/episode_get paths and returns CF_EPISODES plus CF_TIMELINE evidence readback metadata."
+        description = "Facade for episode reads in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Delegates to the real episode_list/episode_get paths and returns CF_EPISODES plus CF_TIMELINE evidence readback metadata."
     )]
     pub async fn episode(
         &self,
@@ -385,7 +421,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Profile-gated privacy facade for timeline recorder pause/resume/exclusions plus timeline redaction/purge in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutations require an explicit break_glass/full_capability profile and return physical CF_KV/CF_TIMELINE/hygiene readback metadata."
+        description = "Profile-gated privacy facade for timeline recorder pause/resume/exclusions plus timeline redaction/purge in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutations require an explicit break_glass/full_capability profile and return physical CF_KV/CF_TIMELINE/hygiene readback metadata."
     )]
     pub async fn privacy(
         &self,
@@ -618,6 +654,7 @@ fn validate_timeline_facade_params(params: &TimelineParams) -> Result<(), ErrorD
             ("get", params.get.is_some()),
             ("search", params.search.is_some()),
             ("stats", params.stats.is_some()),
+            ("history_search", params.history_search.is_some()),
         ],
     )
 }
@@ -815,6 +852,7 @@ fn timeline_response(
         get: None,
         search: None,
         stats: None,
+        history_search: None,
     };
     populate(&mut response);
     response

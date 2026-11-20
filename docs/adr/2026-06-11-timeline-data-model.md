@@ -109,10 +109,9 @@ is a schema-level decision, not a recorder courtesy.
 
 - The existing TTL compaction filter applies automatically (it reads
   `DEFAULTS`).
-- `periodic_compaction_seconds = 86_400` is set on CF_TIMELINE options so
-  every SST file passes the TTL filter at least daily — the long-retention
-  correctness fix described in Context. Other CFs keep their behavior
-  (short TTLs + write churn + GC/pressure compaction already cover them).
+- `periodic_compaction_seconds = 86_400` is set on every TTL-governed CF.
+  This makes cold SST files eligible for periodic compaction daily; the
+  actual filter pass can occur later under RocksDB scheduling and load.
 - The existing GC engine enforces the byte caps (evict-oldest beyond soft
   cap, `STORAGE_CF_HARD_CAP_REACHED` at hard cap). Sizing: event-driven
   recording is a few hundred bytes per row; a heavy interactive day is
@@ -157,8 +156,9 @@ silent drops, and pause supports a Recall-style auto-resume deadline.
   `storage_gc_once`) cover CF_TIMELINE with no further changes.
 - Existing databases gain the CF on next open; no migration, no version
   bump. Rolling back the binary leaves an unused CF behind (harmless).
-- The TTL filter's JSON `ts_ns` scan is reused unchanged; the typed
-  envelope guarantees the field exists in every row.
+- The TTL filter deserializes the root `ts_ns` field only. Missing,
+  malformed, wrong-type, or duplicate root timestamps are retained
+  fail-closed and reported by a bounded-cardinality encounter counter.
 - Long-retention plaintext content now lives in the daemon's RocksDB.
   This is the operator-decided posture; the purge/pause/exclusion controls
   (#843) are the user-freedom counterweight, not consent machinery.

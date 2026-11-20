@@ -50,14 +50,20 @@ WIN_CARGO="$WIN_HOME_WSL/.cargo/bin/cargo.exe"
 WIN_EXE_WSL="$WIN_HOME_WSL/.cargo/bin/synapse-mcp.exe"   # /mnt path used by WSL clients
 WIN_EXE_WIN="$WIN_USERPROFILE\\.cargo\\bin\\synapse-mcp.exe"
 
+# Single-quote a value for safe embedding in generated shell code (#259: quote all paths).
+synapse_sq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 install_synapse_token_loader() {
   local loader="$HOME/.config/synapse/mcp-env.sh"
   mkdir -p "$(dirname "$loader")"
   cat > "$loader" <<EOF
 # Synapse MCP bearer token bridge for WSL agent clients.
 # Source this from shell startup before launching Codex/Claude HTTP MCP clients.
-_synapse_mcp_token_path="$TOKEN_WSL"
-_synapse_mcp_surface_path="$SURFACE_WSL"
+# #259: sourcing is idempotent. It only exports the bearer token and defines codex(); it
+# creates no files, sets no traps and exports no start-snapshot variables.
+_synapse_mcp_token_path=$(synapse_sq "$TOKEN_WSL")
 
 if [ ! -r "\$_synapse_mcp_token_path" ]; then
     printf '%s\n' "SYNAPSE_MCP_TOKEN_UNREADABLE path=\$_synapse_mcp_token_path remediation=start the Windows synapse-mcp daemon or repair token generation" >&2
@@ -70,29 +76,89 @@ else
     fi
     unset _synapse_mcp_token
 fi
+unset _synapse_mcp_token_path
 
-if [ ! -r "\$_synapse_mcp_surface_path" ]; then
-    printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_MISSING path=\$_synapse_mcp_surface_path remediation=run scripts/synapse-setup.ps1 to write the current daemon tools/list fingerprint before starting Codex" >&2
-else
-    _synapse_mcp_surface_hash="\$(sed -n 's/.*"tool_surface_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F][0-9a-fA-F]*\)".*/\1/p' "\$_synapse_mcp_surface_path" | head -n 1)"
-    _synapse_mcp_surface_count="\$(sed -n 's/.*"tool_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "\$_synapse_mcp_surface_path" | head -n 1)"
-    if [ -z "\$_synapse_mcp_surface_hash" ]; then
-        printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=\$_synapse_mcp_surface_path remediation=delete the invalid snapshot and rerun scripts/synapse-setup.ps1" >&2
+# #259: each codex start gets its own snapshot codex-tool-surface-o<shell PID>-<random>.json.
+# The start-snapshot variables reach only the codex child. After codex exits, the snapshot is
+# deleted, then proven orphans are pruned: o<pid> only if /proc is readable, /proc/<pid> is
+# gone and the file is older than the grace minutes; legacy <n>-<n> names only past the
+# retention hours; anything else is kept. Codex's exit status is returned unchanged.
+codex() {
+    _synapse_codex_surface=$(synapse_sq "$SURFACE_WSL")
+    _synapse_codex_dir="\$HOME/.config/synapse/codex-start-snapshots"
+    _synapse_codex_grace=$(synapse_sq "$SNAPSHOT_GRACE_MINUTES")
+    _synapse_codex_retention=$(synapse_sq "$SNAPSHOT_RETENTION_HOURS")
+    _synapse_codex_own=
+    _synapse_codex_hash=
+    _synapse_codex_count=
+    if [ ! -r "\$_synapse_codex_surface" ]; then
+        printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_MISSING path=\$_synapse_codex_surface remediation=run scripts/synapse-setup.ps1 to write the current daemon tools/list fingerprint before starting Codex" >&2
     else
-        _synapse_mcp_start_dir="\$HOME/.config/synapse/codex-start-snapshots"
-        _synapse_mcp_start_surface="\$_synapse_mcp_start_dir/codex-tool-surface-\$\$-\$(date +%s).json"
-        if ! mkdir -p "\$_synapse_mcp_start_dir" || ! cp "\$_synapse_mcp_surface_path" "\$_synapse_mcp_start_surface"; then
-            printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=\$_synapse_mcp_start_surface remediation=repair permissions on \$_synapse_mcp_start_dir before starting Codex" >&2
+        _synapse_codex_hash="\$(sed -n 's/.*"tool_surface_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F][0-9a-fA-F]*\)".*/\1/p' "\$_synapse_codex_surface" | head -n 1)" || _synapse_codex_hash=
+        _synapse_codex_count="\$(sed -n 's/.*"tool_count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "\$_synapse_codex_surface" | head -n 1)" || _synapse_codex_count=
+        if [ -z "\$_synapse_codex_hash" ]; then
+            printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=\$_synapse_codex_surface remediation=delete the invalid snapshot and rerun scripts/synapse-setup.ps1" >&2
         else
-        export SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START="\$_synapse_mcp_surface_hash"
-        export SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START="\$_synapse_mcp_surface_count"
-        export SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="\$_synapse_mcp_start_surface"
+            _synapse_codex_nonce="\$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || _synapse_codex_nonce=
+            [ -n "\$_synapse_codex_nonce" ] || _synapse_codex_nonce="\$(date +%s)"
+            _synapse_codex_try="\$_synapse_codex_dir/codex-tool-surface-o\$\$-\$_synapse_codex_nonce.json"
+            if mkdir -p "\$_synapse_codex_dir" && (set -C; cat "\$_synapse_codex_surface" > "\$_synapse_codex_try") 2>/dev/null; then
+                _synapse_codex_own="\$_synapse_codex_try"
+            else
+                printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=\$_synapse_codex_try remediation=repair permissions on \$_synapse_codex_dir before starting Codex" >&2
+            fi
         fi
     fi
-    unset _synapse_mcp_surface_hash _synapse_mcp_surface_count _synapse_mcp_start_dir _synapse_mcp_start_surface
-fi
-
-unset _synapse_mcp_token_path _synapse_mcp_surface_path
+    # The invocations sit in if-conditions so a caller's set -e cannot abort before cleanup.
+    if [ -n "\$_synapse_codex_own" ]; then
+        if SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START="\$_synapse_codex_hash" \\
+            SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START="\$_synapse_codex_count" \\
+            SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="\$_synapse_codex_own" \\
+            command codex "\$@"; then
+            _synapse_codex_status=0
+        else
+            _synapse_codex_status=\$?
+        fi
+    else
+        if command codex "\$@"; then _synapse_codex_status=0; else _synapse_codex_status=\$?; fi
+    fi
+    [ -z "\$_synapse_codex_own" ] || rm -f -- "\$_synapse_codex_own"
+    for _synapse_codex_old in "\$_synapse_codex_dir"/codex-tool-surface-*.json; do
+        [ -f "\$_synapse_codex_old" ] || continue
+        _synapse_codex_tail="\${_synapse_codex_old##*/codex-tool-surface-}"
+        case "\$_synapse_codex_tail" in
+            o[0-9]*-*.json)
+                _synapse_codex_owner="\${_synapse_codex_tail#o}"
+                _synapse_codex_owner="\${_synapse_codex_owner%%-*}"
+                # Owner and grace are validated separately as non-empty decimals before any
+                # /proc lookup; a malformed owner proves nothing, so the file is kept.
+                case "\$_synapse_codex_owner" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                case "\$_synapse_codex_grace" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                if [ -d /proc/self ] && [ ! -d "/proc/\$_synapse_codex_owner" ] \\
+                    && [ -n "\$(find "\$_synapse_codex_old" -prune -mmin +"\$_synapse_codex_grace" 2>/dev/null)" ]; then
+                    rm -f -- "\$_synapse_codex_old"
+                fi
+                ;;
+            [0-9]*)
+                case "\$_synapse_codex_retention" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                if [ -n "\$(find "\$_synapse_codex_old" -prune -mmin +"\$((_synapse_codex_retention * 60))" 2>/dev/null)" ]; then
+                    rm -f -- "\$_synapse_codex_old"
+                fi
+                ;;
+        esac
+    done
+    set -- "\$_synapse_codex_status"
+    unset _synapse_codex_surface _synapse_codex_dir _synapse_codex_grace _synapse_codex_retention _synapse_codex_own
+    unset _synapse_codex_hash _synapse_codex_count _synapse_codex_nonce _synapse_codex_try _synapse_codex_status
+    unset _synapse_codex_old _synapse_codex_tail _synapse_codex_owner
+    return "\$1"
+}
 EOF
   chmod 600 "$loader"
 
@@ -202,6 +268,16 @@ TOK="$(tr -d '\r\n' < "$TOKEN_WSL")"
 [ -n "$TOK" ] || die "Token at $TOKEN_WSL is empty."
 SURFACE_WSL="$(wslpath "$("$CMD" /c 'echo %APPDATA%' 2>/dev/null | tr -d '\r')")/synapse/codex-tool-surface.json"
 [ -f "$SURFACE_WSL" ] || die "Codex tool-surface snapshot not found at $SURFACE_WSL — the Windows setup did not complete."
+# #259: setup persisted the start-snapshot pruning limits as Windows User variables; read the
+# registry value directly (interop children may hold a pre-setup environment block).
+read_windows_user_env() {
+  "$PWSH" -NoProfile -NonInteractive -Command "[Environment]::GetEnvironmentVariable('$1','User')" 2>/dev/null | tr -d '\r\n'
+}
+SNAPSHOT_RETENTION_HOURS="$(read_windows_user_env SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS)" || SNAPSHOT_RETENTION_HOURS=""
+SNAPSHOT_GRACE_MINUTES="$(read_windows_user_env SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES)" || SNAPSHOT_GRACE_MINUTES=""
+case "$SNAPSHOT_RETENTION_HOURS:$SNAPSHOT_GRACE_MINUTES" in
+  *[!0-9:]*|:*|*:) die "Windows User SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS/GRACE_MINUTES missing or invalid ('$SNAPSHOT_RETENTION_HOURS'/'$SNAPSHOT_GRACE_MINUTES') — the Windows setup did not complete." ;;
+esac
 install_synapse_token_loader
 
 # --- 4. Wire WSL-side clients to Streamable HTTP ----------------------------
@@ -218,9 +294,10 @@ fi
 
 # Codex (WSL): Streamable HTTP -> shared Windows daemon.
 CODEX_CFG="$HOME/.codex/config.toml"
-if command -v codex >/dev/null 2>&1; then
-  codex mcp remove synapse >/dev/null 2>&1 || true
-  codex mcp add synapse --url "http://$BIND/mcp" --bearer-token-env-var SYNAPSE_BEARER_TOKEN
+if [ -n "$(type -P codex)" ]; then
+  # #259: the sourced loader defines a codex() function; wire the real binary.
+  command codex mcp remove synapse >/dev/null 2>&1 || true
+  command codex mcp add synapse --url "http://$BIND/mcp" --bearer-token-env-var SYNAPSE_BEARER_TOKEN
   ensure_codex_synapse_policy "$CODEX_CFG" "$BIND"
   say "Codex (WSL) wired -> Streamable HTTP daemon with required=true and default_tools_approval_mode=approve."
 elif [ -f "$CODEX_CFG" ]; then

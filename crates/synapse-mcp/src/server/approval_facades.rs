@@ -169,7 +169,7 @@ pub struct EscalationResponse {
 #[tool_router(router = approval_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for durable approval queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Claude permission-prompt compatibility may omit operation only when sending the direct gate payload shape. Mutating operations delegate to the real approval_request/approval_decide/approval_gate/agent_ask_operator paths and return physical CF_KV readback metadata."
+        description = "Facade for durable approval queue operations in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Claude permission-prompt compatibility may omit operation only when sending the direct gate payload shape. Mutating operations delegate to the real approval_request/approval_decide/approval_gate/agent_ask_operator paths and return physical CF_KV readback metadata."
     )]
     pub async fn approval(
         &self,
@@ -341,7 +341,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for AFK escalation policy, list, and acknowledgement operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations delegate to the real escalation implementation and return physical CF_KV readback metadata."
+        description = "Facade for AFK escalation policy, list, and acknowledgement operations in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations delegate to the real escalation implementation and return physical CF_KV readback metadata."
     )]
     pub async fn escalation(
         &self,

@@ -1,10 +1,10 @@
-import { asRecord, rawText, timeAgo } from "@/lib/utils";
+import { asRecord, dashboardHeaders, rawText, timeAgo } from "@/lib/utils";
 
 export const DASHBOARD_LIVE_SCOPES = ["fleet", "agent", "tasks", "system", "audit"] as const;
 
 export type DashboardPanelScope = (typeof DASHBOARD_LIVE_SCOPES)[number];
 
-export type DashboardLiveStatus = "connecting" | "open" | "disconnected";
+export type DashboardLiveStatus = "idle" | "connecting" | "open" | "disconnected";
 
 export interface DashboardEventSubscription {
   ok: boolean;
@@ -70,10 +70,12 @@ export interface DashboardLiveControllerOptions {
 export function initialDashboardLiveState(
   scopes: readonly DashboardPanelScope[] = DASHBOARD_LIVE_SCOPES
 ): DashboardLiveState {
-  return scopes.reduce((state, scope) => {
+  // Route changes render before the new subscription effect runs. Keep every
+  // scope present even when this controller subscribes to only the active route.
+  return DASHBOARD_LIVE_SCOPES.reduce((state, scope) => {
     state[scope] = {
       scope,
-      status: "connecting",
+      status: scopes.includes(scope) ? "connecting" : "idle",
       eventCount: 0,
       resyncCount: 0
     };
@@ -143,6 +145,7 @@ export function dashboardLiveLabel(
   nowMs: number
 ): { text: string; tone: "ok" | "warning" | "danger" | "muted" } {
   if (!state) return { text: "SSE pending", tone: "muted" };
+  if (state.status === "idle") return { text: "SSE pending", tone: "muted" };
   if (state.status === "disconnected") return { text: "SSE disconnected", tone: "danger" };
   if (state.status === "connecting") return { text: "SSE connecting", tone: "warning" };
   if (state.lastResyncUnixMs && nowMs - state.lastResyncUnixMs < 15000) {
@@ -159,7 +162,7 @@ export async function subscribeDashboardEvents(
     method: "POST",
     cache: "no-store",
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...dashboardHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify({ scope })
   });
   const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
@@ -202,6 +205,8 @@ export function createDashboardLiveController(options: DashboardLiveControllerOp
 
   const emit = () => options.onStateChange?.(cloneLiveState(state));
   const updateScope = (scope: DashboardPanelScope, patch: Partial<DashboardLiveScopeState>) => {
+    // A late async failure after stop() must not overwrite a newer controller's live state.
+    if (stopped) return;
     state = {
       ...state,
       [scope]: {

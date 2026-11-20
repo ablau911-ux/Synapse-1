@@ -105,7 +105,7 @@ pub(super) fn release_keys_with(enigo: &mut Enigo, keys: &[Key]) -> Result<(), A
 
 fn emit_key(enigo: &mut Enigo, key: &Key, direction: Direction) -> Result<(), ActionError> {
     if !matches!(direction, Direction::Release) {
-        super::delivery_guard::ensure_keyboard_press("enigo key press")?;
+        super::delivery_guard::ensure_delivery(super::delivery_guard::InputKind::Keyboard)?;
     }
     if key.use_scancode {
         let KeyCode::HidCode { value } = &key.code else {

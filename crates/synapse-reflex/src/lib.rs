@@ -12,8 +12,13 @@ mod runtime;
 pub mod scheduler;
 mod storage;
 
+#[cfg(test)]
+mod tests;
+
 pub use action_combo_bridge::install_action_combo_scheduler;
+pub(crate) use audit::enqueue_audit;
 pub use audit::write_audit;
+pub use audit::{AuditEnqueueError, AuditProducer, AuditProducerStats};
 pub use bus::{
     DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EVENTS_DROPPED_METRIC, EventBus,
     EventBusError, EventBusResult, PublishReport, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle,
@@ -21,7 +26,8 @@ pub use bus::{
 pub use conflict::{REFLEX_STARVED_KIND, STARVATION_AFTER};
 pub use dispatch::{
     REFLEX_ACTION_DENIED_STEP_STATUS, REFLEX_ACTION_PERMISSION_DENIED_KIND, ReflexActionGate,
-    ReflexActionGateHandle, ReflexActionPermissionDenied,
+    ReflexActionGateHandle, ReflexActionPermissionDenied, ReflexForegroundTypeGuard,
+    ReflexForegroundTypeGuardHandle,
 };
 pub use error::{ReflexError, ReflexResult};
 pub use kinds::aim_track::{

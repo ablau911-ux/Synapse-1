@@ -81,6 +81,9 @@ pub struct ReflexRegisterParams {
     pub backend: Backend,
     #[serde(default)]
     pub exclusive: bool,
+    /// Stored OS-input window. Delivery requires the registering session's live window claim.
+    #[serde(default)]
+    pub input_target: Option<crate::m1::AutomationInputTargetParam>,
 }
 
 impl ReflexRegisterParams {
@@ -153,12 +156,27 @@ pub fn requires_a11y_event_bridge(params: &ReflexRegisterParams) -> bool {
             .is_some_and(ReflexWhenParam::requires_a11y_event_bridge)
 }
 
+#[cfg(test)]
 pub fn register_reflex(
     runtime: &Arc<Mutex<ReflexRuntime>>,
     params: ReflexRegisterParams,
 ) -> Result<ReflexRegisterResponse, ErrorData> {
+    register_reflex_for_session(runtime, params, None)
+}
+
+pub(crate) fn register_reflex_for_session(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: ReflexRegisterParams,
+    owner: Option<String>,
+) -> Result<ReflexRegisterResponse, ErrorData> {
+    let target = params
+        .input_target
+        .as_ref()
+        .map(crate::m1::AutomationInputTargetParam::resolve)
+        .transpose()?;
     let reflex = scheduled_reflex_from_params(params)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        .with_input_target(target, owner);
     let mut runtime = runtime.lock().map_err(|_err| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,

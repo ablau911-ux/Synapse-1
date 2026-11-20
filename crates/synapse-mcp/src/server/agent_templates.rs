@@ -21,7 +21,6 @@ use std::collections::BTreeMap;
 use rmcp::{RoleServer, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 use synapse_storage::{Db, cf};
 
@@ -73,7 +72,7 @@ pub(crate) struct SpawnTemplate {
     pub directory: Option<String>,
     /// The prompt, used verbatim (no placeholder substitution).
     pub prompt: String,
-    /// sha256 of the canonical operator fields (name/description/model/
+    /// Keyed digest (`hmac-sha256:`) of the canonical operator fields (name/description/model/
     /// directory/prompt). Stable provenance anchor recorded on each spawn.
     pub config_hash: String,
     pub created_unix_ms: u64,
@@ -295,20 +294,13 @@ fn validate_put_params(params: &AgentTemplatePutParams) -> Result<(), ErrorData>
     Ok(())
 }
 
-/// Lowercase-hex sha256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
+/// Keyed `hmac-sha256:` digest (#174): the template prompt and description are
+/// operator/agent text, so the provenance anchor is not a plain SHA-256. Equal
+/// config gives an equal hash within one install; hashes stored before #174 are
+/// only displayed, never recomputed or compared, so they stay as written.
 fn config_hash(config: &CanonicalTemplateConfig<'_>) -> String {
     let bytes = serde_json::to_vec(config).unwrap_or_default();
-    sha256_hex(&bytes)
+    crate::content_digest::keyed_prefixed_digest(&bytes)
 }
 
 /// Builds the stored record for a put, preserving `created_unix_ms` across edits.
@@ -390,7 +382,7 @@ fn row_readback(row_key: &str, bytes: &[u8]) -> TemplateRowReadback {
         cf_name: cf::CF_KV.to_owned(),
         row_key: row_key.to_owned(),
         value_len_bytes: bytes.len() as u64,
-        value_sha256: sha256_hex(bytes),
+        value_sha256: crate::content_digest::keyed_prefixed_digest(bytes),
     }
 }
 
@@ -527,6 +519,11 @@ impl SynapseService {
         &self,
         params: AgentTemplateListParams,
     ) -> Result<AgentTemplateListResponse, ErrorData> {
+        if !(1..=MAX_LIST_TEMPLATES).contains(&params.max) {
+            return Err(params_error(format!(
+                "agent_template_list max must be in 1..={MAX_LIST_TEMPLATES}"
+            )));
+        }
         let db = self.agent_template_db()?;
         let prefix = template_prefix();
         let rows = db
@@ -716,3 +713,7 @@ impl SynapseService {
         self.agent_template_delete_impl(params.0).map(Json)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/template_bounds_100.rs"]
+mod template_bounds_100_tests;

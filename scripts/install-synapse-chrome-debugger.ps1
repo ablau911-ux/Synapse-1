@@ -1,14 +1,18 @@
 param(
     [string]$SynapseNativeHostExe = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
-    [string]$ExtensionId = "leoocgnkjnplbfdbklajepahofecgfbk",
-    [string]$TokenPath = "$env:APPDATA\synapse\token.txt",
+    # Chromium-family browser row (crates\synapse-browsers\browsers\<id>.json).
+    # Every browser-specific name, path and registry key below comes from it.
+    [string]$Browser = 'chrome',
+    [string]$BrowsersDir,
+    # Defaults to the row's extension.id.
+    [string]$ExtensionId = '',
     # Maintenance/self-heal entry point: run ONLY the one-way removal of any
     # debugger/nativeMessaging blockers Synapse wrote into the Chrome
     # ExtensionSettings policy, print the result, and exit.
     [switch]$RemoveExternalDebuggerPolicyOnly,
-    # Preserve unrelated extensions by default. A Synapse install/rollback
-    # does not authorize changing another extension's permissions.
-    [switch]$PreserveExternalDebuggerExtensions = $true,
+    # Deprecated no-op kept so existing callers still bind: other extensions
+    # are always preserved; setup never writes blockers for them.
+    [switch]$PreserveExternalDebuggerExtensions,
     # Default behavior auto-loads the bundled unpacked extension into the
     # already-open active Chrome profile when the profile row is absent.
     [switch]$SkipAutoInstall,
@@ -17,10 +21,36 @@ param(
     # the already-open Chrome extensions page UI to invoke its Reload button.
     [switch]$ReloadExistingExtensionViaUi,
     [ValidateRange(5, 300)]
-    [int]$AutoInstallTimeoutSeconds = 90
+    [int]$AutoInstallTimeoutSeconds = 90,
+    # Setup entry point (#251): the caller verifies the live bridge identity
+    # itself once its daemon is running, so this run reports the check as
+    # deferred (ok=false, runtime_verification.deferred=true) together with the
+    # expected identity instead of reading a daemon that is stopped or about to
+    # be replaced.
+    [switch]$DeferLiveVerification
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'synapse-browser-rows.ps1')
+. (Join-Path $PSScriptRoot 'synapse-bridge-live-identity.ps1')
+$script:BrowserRow = Get-SynapseBrowserRow -Browser $Browser -BrowsersDir $BrowsersDir
+if ([string]$script:BrowserRow.family -ne 'chromium') {
+    throw "SYNAPSE_BROWSER_BRIDGE_FAMILY_MISMATCH browser=$Browser family=$($script:BrowserRow.family) installer=chromium remediation=use scripts\install-synapse-browser-bridge.ps1 -Browser $Browser"
+}
+if ([string]::IsNullOrWhiteSpace($ExtensionId)) {
+    $ExtensionId = [string]$script:BrowserRow.extension.id
+}
+$script:BrowserProcessNames = @($script:BrowserRow.process_names | ForEach-Object { [string]$_ })
+$script:BrowserProcessWmiFilter = (@($script:BrowserProcessNames | ForEach-Object { "Name='$_'" }) -join ' OR ')
+$script:BrowserExtensionsPageUrl = [string]$script:BrowserRow.extension.extensions_page_url
+$script:BrowserUserDataRoot = Expand-SynapseBrowserPath -Path ([string]$script:BrowserRow.user_data_root)
+if ([string]::IsNullOrWhiteSpace($script:BrowserUserDataRoot)) {
+    throw "SYNAPSE_BROWSER_USER_DATA_ROOT_UNRESOLVED browser=$Browser user_data_root=$($script:BrowserRow.user_data_root)"
+}
+$script:BrowserInstallUiDeveloperMode = @($script:BrowserRow.install_ui.developer_mode_names)[0]
+$script:BrowserInstallUiLoadUnpacked = @($script:BrowserRow.install_ui.load_unpacked_names)[0]
+# `^Extensions( - <suffix>)?$` built from the row's window title suffixes.
+$script:BrowserExtensionsWindowTitlePattern = '^Extensions(' + ((@($script:BrowserRow.window_title_suffixes) | ForEach-Object { [regex]::Escape([string]$_) }) -join '|') + ')?$'
 if ($SkipAutoInstall -and $ReloadExistingExtensionViaUi) {
     throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_RELOAD_CONFLICT skip_auto_install=true reload_existing_extension_via_ui=true remediation=choose either the read-only skip path or the existing-extension UI reload path; setup must not silently ignore one of these mutually exclusive modes"
 }
@@ -62,62 +92,6 @@ function Get-SynapseFileSha256 {
     }
 }
 
-function Get-SynapseSha256HexLower {
-    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($Bytes)
-        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
-    } finally {
-        $sha.Dispose()
-    }
-}
-
-function Get-SynapseChromeBridgeRegisterToken {
-    param([Parameter(Mandatory = $true)][string]$BearerToken)
-    $domainBytes = [System.Text.Encoding]::UTF8.GetBytes('synapse.chrome_bridge.register.v1')
-    $tokenBytes = [System.Text.Encoding]::UTF8.GetBytes($BearerToken)
-    $bytes = New-Object byte[] ($domainBytes.Length + 1 + $tokenBytes.Length)
-    [System.Buffer]::BlockCopy($domainBytes, 0, $bytes, 0, $domainBytes.Length)
-    $bytes[$domainBytes.Length] = 0
-    [System.Buffer]::BlockCopy($tokenBytes, 0, $bytes, ($domainBytes.Length + 1), $tokenBytes.Length)
-    Get-SynapseSha256HexLower -Bytes $bytes
-}
-
-function Get-SynapseChromeBridgeBearerToken {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_MISSING path=$Path remediation=run scripts\synapse-setup.ps1 so the daemon bearer token exists before deploying the Chrome bridge"
-    }
-    $raw = Get-Content -Raw -LiteralPath $Path
-    $token = if ($null -eq $raw) { '' } else { $raw.Trim() }
-    if ($token.Length -lt 16) {
-        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_INVALID path=$Path length=$($token.Length) remediation=delete the invalid daemon bearer token and rerun scripts\synapse-setup.ps1"
-    }
-    return $token
-}
-
-function Set-SynapseChromeBridgeRegisterToken {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ServiceWorkerPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RegisterToken
-    )
-    if ($RegisterToken -notmatch '^[0-9a-f]{64}$') {
-        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_INVALID remediation=derived register token must be 64 lowercase hex chars"
-    }
-    $text = Get-Content -Raw -LiteralPath $ServiceWorkerPath
-    $pattern = 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"[^"]*";'
-    if ($text -notmatch $pattern) {
-        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_PLACEHOLDER_MISSING path=$ServiceWorkerPath remediation=service_worker.js must declare BRIDGE_REGISTER_TOKEN so setup can inject the derived daemon registration credential"
-    }
-    $replacement = 'const BRIDGE_REGISTER_TOKEN = "' + $RegisterToken + '";'
-    $updated = [System.Text.RegularExpressions.Regex]::Replace($text, $pattern, $replacement, 1)
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($ServiceWorkerPath, $updated, $encoding)
-}
-
 function Get-RegistryAclDiagnostic {
     param(
         [Parameter(Mandatory = $true)]
@@ -156,11 +130,16 @@ function Get-RegistryAclDiagnostic {
 }
 
 function Get-ChromePolicyRoot {
+    # The row's ExtensionSettings policy root; $null when the browser row
+    # declares no policy (popup shield then relies on management suppression).
     param(
         [ValidateSet('HKCU', 'HKLM')]
         [string]$Hive
     )
-    return "${Hive}:\Software\Policies\Google\Chrome"
+    if ($null -eq $script:BrowserRow.policy) {
+        return $null
+    }
+    return "${Hive}:\$($script:BrowserRow.policy.root)"
 }
 
 function Get-ChromePolicyHiveCandidates {
@@ -235,6 +214,10 @@ function Remove-SynapseChromeExternalDebuggerPolicy {
     $results = @()
     foreach ($hive in (Get-ChromePolicyHiveCandidates -Hive 'Auto')) {
         $policyRoot = Get-ChromePolicyRoot -Hive $hive
+        if ($null -eq $policyRoot) {
+            $results += [pscustomobject]@{ hive = $hive; path = $null; changed = $false; reason = 'row_declares_no_policy_root' }
+            continue
+        }
         if (-not (Test-Path -LiteralPath $policyRoot)) {
             $results += [pscustomobject]@{ hive = $hive; path = $policyRoot; changed = $false; reason = 'policy_root_absent' }
             continue
@@ -336,17 +319,61 @@ function Remove-SynapseChromeExternalDebuggerPolicy {
     return @($results)
 }
 
-function Set-SynapseChromeExternalDebuggerPolicy {
+function Get-SynapsePolicyShieldGuardedState {
+    # Canonical snapshot of the ExtensionSettings fields that can disable the
+    # bridge's chrome.debugger (Edge 154+: runtime_blocked_hosts on an extension
+    # holding the debugger permission; any build: a debugger blocked_permissions)
+    # for the two guarded entries: the bridge's own id and the "*" default.
     param(
-        [object[]]$Extensions
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Settings,
+        [Parameter(Mandatory = $true)]
+        [string]$BridgeExtensionId
     )
 
+    $parts = foreach ($guardedId in @('*', $BridgeExtensionId)) {
+        $entry = if ($Settings.Contains($guardedId)) { $Settings[$guardedId] } else { $null }
+        $hosts = '<absent>'
+        $blocksDebugger = $false
+        if ($entry -is [System.Collections.IDictionary]) {
+            if ($entry.Contains('runtime_blocked_hosts')) {
+                $hosts = '[' + (@($entry['runtime_blocked_hosts'] | ForEach-Object { [string]$_ }) -join ',') + ']'
+            }
+            if ($entry.Contains('blocked_permissions')) {
+                $blocksDebugger = @($entry['blocked_permissions']) -contains 'debugger'
+            }
+        }
+        "id=$guardedId runtime_blocked_hosts=$hosts blocks_debugger=$blocksDebugger"
+    }
+    return (@($parts) -join ';')
+}
+
+function Set-SynapseChromeExternalDebuggerPolicy {
+    param(
+        [object[]]$Extensions,
+        # The bridge's own id: shielded for nativeMessaging only, never debugger.
+        [Parameter(Mandatory = $true)]
+        [string]$BridgeExtensionId,
+        # The row's protected_extension_ids: never hazards, never shielded.
+        [string[]]$ProtectedExtensionIds = @()
+    )
+
+    # '^[a-p]{32}$' also keeps the "*" default entry out of the shield.
     $hazards = @($Extensions | Where-Object {
         $id = [string]$_.extension_id
-        $id -match '^[a-p]{32}$'
+        ($id -match '^[a-p]{32}$') -and (@($ProtectedExtensionIds) -notcontains $id)
     } | Sort-Object extension_id -Unique)
 
     $policyRoot = Get-ChromePolicyRoot -Hive 'HKCU'
+    if ($null -eq $policyRoot) {
+        return [pscustomobject]@{
+            hive = 'HKCU'
+            path = $null
+            changed = $false
+            reason = 'row_declares_no_policy_root'
+            shielded_entries = @()
+        }
+    }
     if ($hazards.Count -eq 0) {
         return [pscustomobject]@{
             hive = 'HKCU'
@@ -383,6 +410,7 @@ function Set-SynapseChromeExternalDebuggerPolicy {
     $changed = $false
     $shieldedEntries = @()
     $unchangedEntries = @()
+    $guardedBefore = Get-SynapsePolicyShieldGuardedState -Settings $settings -BridgeExtensionId $BridgeExtensionId
 
     foreach ($hazard in $hazards) {
         $id = [string]$hazard.extension_id
@@ -403,6 +431,15 @@ function Set-SynapseChromeExternalDebuggerPolicy {
         })
         if ($hazardPermissions.Count -eq 0) {
             $hazardPermissions = @('debugger', 'nativeMessaging')
+        }
+        if ($id -ceq $BridgeExtensionId) {
+            # Blocking debugger on the bridge itself would disable its
+            # target-scoped chrome.debugger CDP input lane.
+            $hazardPermissions = @($hazardPermissions | Where-Object { $_ -ne 'debugger' })
+            if ($hazardPermissions.Count -eq 0) {
+                $unchangedEntries += $id
+                continue
+            }
         }
         $nextBlocked = @($blocked + $hazardPermissions | Where-Object {
             -not [string]::IsNullOrWhiteSpace([string]$_)
@@ -437,6 +474,10 @@ function Set-SynapseChromeExternalDebuggerPolicy {
     }
 
     if ($changed) {
+        $guardedAfter = Get-SynapsePolicyShieldGuardedState -Settings $settings -BridgeExtensionId $BridgeExtensionId
+        if ($guardedAfter -cne $guardedBefore) {
+            throw "SYNAPSE_CHROME_POLICY_SHIELD_GUARDED_ENTRY_CHANGED before=$guardedBefore after=$guardedAfter remediation=the popup shield must never add runtime_blocked_hosts or a debugger block to the bridge's own ExtensionSettings entry or the * default (either disables chrome.debugger.attach for the bridge); nothing was written"
+        }
         $json = ConvertTo-CompressedJson -Value $settings
         try {
             New-ItemProperty -LiteralPath $policyRoot -Name ExtensionSettings -PropertyType String -Value $json -Force | Out-Null
@@ -485,28 +526,17 @@ function Get-SynapseNativeHostRegistryTargets {
         [string]$HostName
     )
 
-    @(
-        [pscustomobject]@{
-            hive = 'HKCU'
-            registry_view = '64'
-            path = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
-        },
-        [pscustomobject]@{
-            hive = 'HKLM'
-            registry_view = '64'
-            path = "HKLM:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
-        },
-        [pscustomobject]@{
-            hive = 'HKCU'
-            registry_view = '32'
-            path = "HKCU:\Software\Wow6432Node\Google\Chrome\NativeMessagingHosts\$HostName"
-        },
-        [pscustomobject]@{
-            hive = 'HKLM'
-            registry_view = '32'
-            path = "HKLM:\Software\Wow6432Node\Google\Chrome\NativeMessagingHosts\$HostName"
+    # Stale-key cleanup only (the bridge never uses native messaging); the
+    # roots come from the row's native_messaging_cleanup_roots.
+    foreach ($root in @($script:BrowserRow.native_messaging_cleanup_roots)) {
+        foreach ($hive in @('HKCU', 'HKLM')) {
+            [pscustomobject]@{
+                hive = $hive
+                registry_view = if ([string]$root -match '\\Wow6432Node\\') { '32' } else { '64' }
+                path = "${hive}:\$root\$HostName"
+            }
         }
-    )
+    }
 }
 
 function Read-SynapseNativeHostRegistryEntries {
@@ -620,58 +650,97 @@ if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_DECLARED_BUILD_SHA256\s*=\s*"
     throw "SYNAPSE_CHROME_EXTENSION_BUILD_SHA_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_DECLARED_BUILD_SHA256 for declared build metadata; physical integrity comes from service_worker_sha256"
 }
 $bridgeDeclaredBuildSha256 = [string]$Matches[1]
-if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"";') {
-    throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_NOT_EMPTY path=$sourceServiceWorkerPath remediation=repo service_worker.js must keep BRIDGE_REGISTER_TOKEN empty; setup injects the host-local derived credential only into the deployed copy"
-}
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
 }
-$stableExtensionRoot = Join-Path $env:LOCALAPPDATA 'synapse\chrome-extension'
-# Keep the installed unpacked-extension path stable across daemon upgrades and
-# rollbacks. Build identity and the physical worker hash still detect drift;
-# changing directories would unnecessarily require another Load unpacked flow.
-$extensionDir = Join-Path $stableExtensionRoot 'active'
+$stableExtensionRoot = Join-Path $env:LOCALAPPDATA ('synapse\' + [string]$script:BrowserRow.extension.deploy_subdir)
+$extensionDir = Join-Path $stableExtensionRoot $bridgeBuildId
 $stableRootFull = [System.IO.Path]::GetFullPath($stableExtensionRoot)
 $extensionDirFull = [System.IO.Path]::GetFullPath($extensionDir)
 if (-not $extensionDirFull.StartsWith($stableRootFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_PATH_INVALID root=$stableRootFull path=$extensionDirFull"
 }
-New-Item -ItemType Directory -Force -Path $extensionDirFull | Out-Null
-Get-ChildItem -LiteralPath $extensionSourceDir -Force | Copy-Item -Destination $extensionDirFull -Recurse -Force
-$extensionDir = $extensionDirFull
-$manifestPath = Join-Path $extensionDir 'manifest.json'
-if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-    throw "SYNAPSE_CHROME_EXTENSION_STABLE_MANIFEST_MISSING source=$sourceManifestPath deployed=$manifestPath"
+function Install-SynapseChromeBridgeFiles {
+    param([string]$SourceDir, [string]$Destination, [object]$BrowserRow, [scriptblock]$ProvisionAuth)
+    $sourceServiceWorkerPath = Join-Path $SourceDir 'service_worker.js'
+    $manifestPath = Join-Path $SourceDir 'manifest.json'
+    $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+    Assert-SynapseChromeBridgeManifest -Manifest $extensionManifest -Path $manifestPath
+    $codeStampPlaceholder = 'const BRIDGE_CODE_STAMP = "unstamped";'
+    $sourceWorker = [IO.File]::ReadAllText($sourceServiceWorkerPath)
+    $placeholderCount = ([regex]::Matches($sourceWorker, [regex]::Escape($codeStampPlaceholder))).Count
+    if ($placeholderCount -ne 1) { throw "SYNAPSE_CHROME_EXTENSION_CODE_STAMP_PLACEHOLDER_INVALID path=$sourceServiceWorkerPath count=$placeholderCount" }
+    $extensionDirFull = [IO.Path]::GetFullPath($Destination)
+    # Hash only source runtime files, so stale destination files cannot affect identity.
+    $bridgeCodeStamp = Get-SynapseChromeRuntimeStamp -SourceDir $SourceDir
+    New-Item -ItemType Directory -Force -Path $extensionDirFull | Out-Null
+    Get-ChildItem -LiteralPath $SourceDir -Force | Copy-Item -Destination $extensionDirFull -Recurse -Force
+    $stamped = $sourceWorker.Replace($codeStampPlaceholder, "const BRIDGE_CODE_STAMP = `"$bridgeCodeStamp`";")
+    [IO.File]::WriteAllText((Join-Path $extensionDirFull 'service_worker.js'), $stamped, [Text.UTF8Encoding]::new($false))
+    $bridgeAuthProvisioning = & $ProvisionAuth $extensionDirFull $BrowserRow
+    $bridgeConfigPath = Join-Path $extensionDirFull 'bridge-config.json'
+    $config = New-SynapseBridgeConfig -Row $BrowserRow
+    [IO.File]::WriteAllText($bridgeConfigPath, (ConvertTo-Json -Depth 4 -InputObject $config), [Text.UTF8Encoding]::new($false))
+    $readback = Get-Content -Raw -LiteralPath $bridgeConfigPath | ConvertFrom-Json
+    if ([string]$readback.browserKind -cne [string]$BrowserRow.id -or
+        [string]$readback.tabTargetPrefix -cne [string]$BrowserRow.tab_target_prefix -or
+        [string]$readback.expectedExtensionId -cne [string]$BrowserRow.extension.id) {
+        throw "SYNAPSE_BROWSER_BRIDGE_CONFIG_READBACK_FAILED path=$bridgeConfigPath browser=$($BrowserRow.id)"
+    }
+    [pscustomobject]@{ source_dir=$SourceDir; deployed_dir=$extensionDirFull
+        manifest_sha256=Get-SynapseFileSha256 -Path (Join-Path $extensionDirFull 'manifest.json')
+        service_worker_sha256=Get-SynapseFileSha256 -Path (Join-Path $extensionDirFull 'service_worker.js')
+        code_stamp=$bridgeCodeStamp; registration_auth=$bridgeAuthProvisioning }
 }
-$deployedServiceWorkerPath = Join-Path $extensionDir 'service_worker.js'
-if (-not (Test-Path -LiteralPath $deployedServiceWorkerPath -PathType Leaf)) {
-    throw "SYNAPSE_CHROME_EXTENSION_STABLE_SERVICE_WORKER_MISSING source=$sourceServiceWorkerPath deployed=$deployedServiceWorkerPath"
+
+function Get-SynapseChromeRuntimeStamp {
+param([string]$SourceDir)
+$sourceServiceWorkerPath = Join-Path $SourceDir 'service_worker.js'
+# #237: stamp the executable JavaScript closure, including imported adapters.
+# The running worker reports this stamp, so the daemon can detect (and reload)
+# a Chrome-cached older worker that the on-disk hash check cannot see.
+$codeStampPlaceholder = 'const BRIDGE_CODE_STAMP = "unstamped";'
+$deployedServiceWorkerPath = Join-Path $SourceDir 'service_worker.js'
+$deployedServiceWorkerText = [System.IO.File]::ReadAllText($deployedServiceWorkerPath)
+$placeholderCount = ([regex]::Matches($deployedServiceWorkerText, [regex]::Escape($codeStampPlaceholder))).Count
+if ($placeholderCount -ne 1) {
+    throw "SYNAPSE_CHROME_EXTENSION_CODE_STAMP_PLACEHOLDER_INVALID path=$sourceServiceWorkerPath count=$placeholderCount remediation=service_worker.js must declare exactly one $codeStampPlaceholder"
 }
-$bridgeBearerToken = Get-SynapseChromeBridgeBearerToken -Path $TokenPath
-$bridgeRegisterToken = Get-SynapseChromeBridgeRegisterToken -BearerToken $bridgeBearerToken
-Set-SynapseChromeBridgeRegisterToken -ServiceWorkerPath $deployedServiceWorkerPath -RegisterToken $bridgeRegisterToken
-$bridgeRegisterTokenSha256 = Get-SynapseSha256HexLower -Bytes ([System.Text.Encoding]::UTF8.GetBytes($bridgeRegisterToken))
-$extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-$extensionDeploy = [pscustomobject]@{
-    source_dir = $extensionSourceDir
-    deployed_dir = $extensionDir
-    stable_root = $stableRootFull
-    build_id = $bridgeBuildId
-    declared_build_sha256 = $bridgeDeclaredBuildSha256
-    build_sha256 = $bridgeDeclaredBuildSha256
-    manifest_sha256 = Get-SynapseFileSha256 -Path $manifestPath
-    service_worker_sha256 = Get-SynapseFileSha256 -Path $deployedServiceWorkerPath
-    bridge_register_token_injected = $true
-    bridge_register_token_sha256 = $bridgeRegisterTokenSha256
+# Relative paths + per-file hashes make identity independent of checkout root.
+# Generated bridge-config.json is data with separate identity/readback validation.
+$runtimePaths = [string[]]@(Get-ChildItem -LiteralPath $SourceDir -Recurse -File -Filter '*.js' | ForEach-Object {
+    $_.FullName.Substring($SourceDir.TrimEnd('\', '/').Length + 1).Replace('\', '/')
+})
+[Array]::Sort($runtimePaths, [StringComparer]::Ordinal)
+$runtimeRows = foreach ($relative in $runtimePaths) {
+    $digest = (Get-SynapseFileSha256 -Path (Join-Path $SourceDir $relative)).ToLowerInvariant()
+    "$relative`0$digest`n"
 }
+$runtimeSha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $runtimeBytes = [System.Text.Encoding]::UTF8.GetBytes(($runtimeRows -join ''))
+    $bridgeCodeStamp = ([BitConverter]::ToString($runtimeSha.ComputeHash($runtimeBytes))).Replace('-', '').ToLowerInvariant()
+} finally {
+    $runtimeSha.Dispose()
+}
+return $bridgeCodeStamp
+}
+
+function Assert-SynapseChromeBridgeManifest {
+param([object]$Manifest, [string]$Path)
+$extensionManifest = $Manifest
+$manifestPath = $Path
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
 $hostPermissions = @($extensionManifest.host_permissions)
+if (@($extensionManifest.web_accessible_resources).Where({ $null -ne $_ }).Count -gt 0) {
+    throw 'SYNAPSE_CHROME_BRIDGE_AUTH_WEB_ACCESSIBLE the private bridge must not declare web_accessible_resources; refusing to replace installed files'
+}
 if ($optionalPermissions -contains 'debugger') {
     throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_DEBUGGER_PERMISSION_FORBIDDEN path=$manifestPath remediation=the Synapse bridge must request debugger as a required permission so target-scoped CDP input support is deterministic after auto-install"
 }
 if (-not ($requiredPermissions -contains 'debugger')) {
-    throw "SYNAPSE_CHROME_EXTENSION_DEBUGGER_PERMISSION_REQUIRED path=$manifestPath remediation=manual FSV of normal-profile hover/tap/active-tab drag and viewport emulation requires the bundled bridge to expose narrow chrome.debugger lanes for already-open Chrome tabs; inactive-tab drag uses the bundled chrome.scripting synthetic mouse path"
+    throw "SYNAPSE_CHROME_EXTENSION_DEBUGGER_PERMISSION_REQUIRED path=$manifestPath remediation=normal-profile hover/tap/active-tab drag and viewport emulation FSV require the bundled bridge to expose narrow chrome.debugger lanes for already-open Chrome tabs; inactive-tab drag uses the bundled chrome.scripting synthetic mouse path"
 }
 if ($requiredPermissions -contains 'nativeMessaging') {
     throw "SYNAPSE_CHROME_EXTENSION_NATIVE_MESSAGING_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must use direct localhost HTTP registration plus WebSocket command delivery; nativeMessaging can launch a visible cmd.exe wrapper on Windows"
@@ -699,6 +768,59 @@ if ($optionalPermissions -contains 'alarms') {
 }
 if ($hostPermissions -notcontains 'http://127.0.0.1:7700/*') {
     throw "SYNAPSE_CHROME_EXTENSION_LOCALHOST_PERMISSION_MISSING path=$manifestPath remediation=normal bridge requires host_permissions http://127.0.0.1:7700/* for direct daemon registration and message posting"
+}
+}
+
+$extensionDeploy = Install-SynapseChromeBridgeFiles -SourceDir $extensionSourceDir -Destination $extensionDirFull -BrowserRow $script:BrowserRow -ProvisionAuth {
+    param($Path, $Row)
+    & (Join-Path $PSScriptRoot 'provision-synapse-chrome-auth.ps1') -ExtensionDir $Path -Browser $Browser -BrowsersDir $BrowsersDir
+}
+$extensionDir = $extensionDeploy.deployed_dir
+$manifestPath = Join-Path $extensionDir 'manifest.json'
+$extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+$requiredPermissions = @($extensionManifest.permissions)
+$optionalPermissions = @($extensionManifest.optional_permissions)
+$hostPermissions = @($extensionManifest.host_permissions)
+$bridgeAuthProvisioning = $extensionDeploy.registration_auth
+$bridgeConfigPath = Join-Path $extensionDir 'bridge-config.json'
+$extensionDeploy | Add-Member -NotePropertyName stable_root -NotePropertyValue $stableRootFull
+$extensionDeploy | Add-Member -NotePropertyName build_id -NotePropertyValue $bridgeBuildId
+$extensionDeploy | Add-Member -NotePropertyName declared_build_sha256 -NotePropertyValue $bridgeDeclaredBuildSha256
+$extensionDeploy | Add-Member -NotePropertyName build_sha256 -NotePropertyValue $bridgeDeclaredBuildSha256
+
+function Get-SynapseChromeInstallOutcome {
+    param([object]$AutoInstall)
+    [pscustomobject]@{ ok=($null -ne $AutoInstall -and $AutoInstall.ok -eq $true); reason=if ($null -ne $AutoInstall) { $AutoInstall.reason } else { 'runtime_not_verified' } }
+}
+
+function Read-SynapseChromeBridgeLiveOutcome {
+    # Transport, profile switch, session cleanup and comparison live in
+    # synapse-bridge-live-identity.ps1, shared with setup's post-start check.
+    param([object]$Expected)
+    $tokenPath = Join-Path $env:APPDATA 'synapse\token.txt'
+    try {
+        $daemonToken = if (Test-Path -LiteralPath $tokenPath -PathType Leaf) { [IO.File]::ReadAllText($tokenPath).Trim() } else { ([string]$env:SYNAPSE_BEARER_TOKEN).Trim() }
+    } catch { return [pscustomobject]@{ok=$false;reason='daemon_health_credential_unavailable'} }
+    try { return Read-SynapseBridgeLiveOutcome -Expected $Expected -Token $daemonToken }
+    finally { $daemonToken = $null }
+}
+
+function Get-SynapseChromeRuntimeOutcome {
+    # Truthful runtime outcome (#251): an auto-install that deferred, skipped or
+    # failed keeps its own reason and never opens a daemon session; a caller
+    # that verifies after its own daemon start gets a deferred outcome; only a
+    # live identity readback can produce ok=true.
+    param([object]$AutoInstall, [object]$Expected, [switch]$DeferLive)
+    $reason = if ($null -ne $AutoInstall) { [string]$AutoInstall.reason } else { 'auto_install_readback_missing' }
+    if ($null -eq $AutoInstall -or $reason -match 'deferred|skipped|no_profile|failed') {
+        $outcome = [pscustomobject]@{ok=$false;deferred=($reason -match '_deferred_to_daemon');reason=$reason}
+    } elseif ($DeferLive) {
+        $outcome = [pscustomobject]@{ok=$false;deferred=$true;reason='live_runtime_verification_deferred_to_caller'}
+    } else {
+        $outcome = Read-SynapseChromeBridgeLiveOutcome -Expected $Expected
+    }
+    $outcome | Add-Member -NotePropertyName expected_identity -NotePropertyValue $Expected -Force
+    return $outcome
 }
 
 function Initialize-SynapseChromeBridgeAutoInstallInterop {
@@ -736,6 +858,15 @@ function Get-SynapseActiveChromeProfileName {
         [string]$ExtensionDir
     )
 
+    if ([string]$script:BrowserRow.profile_layout -ceq 'single') {
+        # Single-profile layout (Opera / Opera GX): the user-data root itself is
+        # the one profile; its directory name is the profile name.
+        if (-not (Test-Path -LiteralPath $ChromeUserDataRoot -PathType Container)) {
+            return $null
+        }
+        return [string](Get-Item -LiteralPath $ChromeUserDataRoot).Name
+    }
+
     $localStatePath = Join-Path $ChromeUserDataRoot 'Local State'
     $candidates = New-Object System.Collections.Generic.List[string]
     if (Test-Path -LiteralPath $localStatePath -PathType Leaf) {
@@ -771,10 +902,7 @@ function Get-SynapseActiveChromeProfileName {
         }
 
         $installedProfiles = @()
-        foreach ($profileDir in @(Get-ChildItem -LiteralPath $ChromeUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
-            if ([string]$profileDir.Name -eq 'Snapshots') {
-                continue
-            }
+        foreach ($profileDir in @(Get-SynapseBrowserProfileDirs -Row $script:BrowserRow -UserDataRoot $ChromeUserDataRoot)) {
             $row = Test-SynapseChromeBridgeProfileRow `
                 -ChromeUserDataRoot $ChromeUserDataRoot `
                 -ProfileName $profileDir.Name `
@@ -835,7 +963,7 @@ function Test-SynapseChromeBridgeProfileRow {
         [string]$ExtensionDir
     )
 
-    $profilePath = Join-Path $ChromeUserDataRoot $ProfileName
+    $profilePath = Resolve-SynapseBrowserProfilePath -Row $script:BrowserRow -UserDataRoot $ChromeUserDataRoot -ProfileName $ProfileName
     foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
         $prefPath = Join-Path $profilePath $prefFileName
         if (-not (Test-Path -LiteralPath $prefPath -PathType Leaf)) {
@@ -949,118 +1077,6 @@ function ConvertTo-SynapseComparablePath {
     return $full.TrimEnd($trimChars)
 }
 
-function Get-SynapseChromeBridgeReferencedManifestPaths {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ChromeUserDataRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$ExtensionId
-    )
-
-    $paths = @()
-    if (-not (Test-Path -LiteralPath $ChromeUserDataRoot -PathType Container)) {
-        return @()
-    }
-    foreach ($profileDir in @(Get-ChildItem -LiteralPath $ChromeUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
-        if ([string]$profileDir.Name -eq 'Snapshots') {
-            continue
-        }
-        foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
-            $prefPath = Join-Path $profileDir.FullName $prefFileName
-            if (-not (Test-Path -LiteralPath $prefPath -PathType Leaf)) {
-                continue
-            }
-            try {
-                $pref = Get-Content -Raw -LiteralPath $prefPath | ConvertFrom-Json -ErrorAction Stop
-            } catch {
-                continue
-            }
-            if (-not $pref.extensions -or -not $pref.extensions.settings) {
-                continue
-            }
-            $property = $pref.extensions.settings.PSObject.Properties[$ExtensionId]
-            if (-not $property) {
-                continue
-            }
-            $setting = $property.Value
-            if ($setting.PSObject.Properties.Name -notcontains 'path') {
-                continue
-            }
-            $manifestPath = ConvertTo-SynapseComparablePath -Path ([string]$setting.path)
-            if (-not [string]::IsNullOrWhiteSpace($manifestPath)) {
-                $paths += $manifestPath
-            }
-        }
-    }
-    @($paths | Sort-Object -Unique)
-}
-
-function Remove-SynapseStaleChromeBridgeBuildDirs {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$StableRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$CurrentExtensionDir,
-        [Parameter(Mandatory = $true)]
-        [string]$ChromeUserDataRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$ExtensionId
-    )
-
-    if (-not (Test-Path -LiteralPath $StableRoot -PathType Container)) {
-        return [pscustomobject]@{
-            attempted = $false
-            reason = 'stable_root_missing'
-            stable_root = $StableRoot
-            current_extension_dir = $CurrentExtensionDir
-            referenced_paths = @()
-            preserved_dirs = @()
-            removed_dirs = @()
-            failed_dirs = @()
-        }
-    }
-
-    $current = ConvertTo-SynapseComparablePath -Path $CurrentExtensionDir
-    $referencedPaths = @(Get-SynapseChromeBridgeReferencedManifestPaths `
-        -ChromeUserDataRoot $ChromeUserDataRoot `
-        -ExtensionId $ExtensionId)
-    $preserved = @()
-    $removed = @()
-    $failed = @()
-
-    foreach ($dir in @(Get-ChildItem -LiteralPath $StableRoot -Directory -ErrorAction SilentlyContinue)) {
-        if ([string]$dir.Name -notlike 'synapse-chrome-bridge-*') {
-            continue
-        }
-        $dirPath = ConvertTo-SynapseComparablePath -Path $dir.FullName
-        if ($dirPath -ieq $current) {
-            $preserved += [pscustomobject]@{ path = $dir.FullName; reason = 'current_build' }
-            continue
-        }
-        if (@($referencedPaths | Where-Object { $_ -ieq $dirPath }).Count -gt 0) {
-            $preserved += [pscustomobject]@{ path = $dir.FullName; reason = 'referenced_by_chrome_profile' }
-            continue
-        }
-        try {
-            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop
-            $removed += $dir.FullName
-        } catch {
-            $failed += [pscustomobject]@{ path = $dir.FullName; error = $_.Exception.Message }
-        }
-    }
-
-    [pscustomobject]@{
-        attempted = $true
-        reason = 'removed_unreferenced_stale_build_dirs'
-        stable_root = $StableRoot
-        current_extension_dir = $CurrentExtensionDir
-        referenced_paths = @($referencedPaths)
-        preserved_dirs = @($preserved)
-        removed_dirs = @($removed)
-        failed_dirs = @($failed)
-    }
-}
-
 function Get-SynapseCommandLineSwitchValue {
     param(
         [AllowNull()]
@@ -1166,7 +1182,7 @@ function Get-SynapseChromeTopLevelWindows {
     )
 
     Initialize-SynapseChromeBridgeAutoInstallInterop
-    $chromeProcessRows = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
+    $chromeProcessRows = @(Get-CimInstance Win32_Process -Filter $script:BrowserProcessWmiFilter -ErrorAction SilentlyContinue |
         ForEach-Object {
             $commandLine = [string]$_.CommandLine
             $profileMatch = Get-SynapseChromeProcessProfileMatch -CommandLine $commandLine -ChromeUserDataRoot $ChromeUserDataRoot
@@ -1506,10 +1522,29 @@ function Read-SynapseChromeExtensionDetailsUiState {
     }
 }
 
-function Assert-SynapseHumanNotInFullscreenForUiRepair {
+function Resolve-SynapseUiRepairHumanStateGate {
+    # #2271: may foreground chrome://extensions UI repair run now? Pure: takes the
+    # SHQueryUserNotificationState HRESULT and its QUERY_USER_NOTIFICATION_STATE value.
+    param([int]$HResult, [int]$State)
+    if ($HResult -ne 0) {
+        return [pscustomobject]@{ Allowed = $false; Code = 'SYNAPSE_CHROME_BRIDGE_UI_REPAIR_HUMAN_STATE_UNREADABLE' }
+    }
+    # Allowlist: 5 = QUNS_ACCEPTS_NOTIFICATIONS, 6 = QUNS_QUIET_TIME (a normal desktop).
+    if ($State -in @(5, 6)) {
+        return [pscustomobject]@{ Allowed = $true; Code = '' }
+    }
+    # 2 = QUNS_BUSY, 3 = QUNS_RUNNING_D3D_FULL_SCREEN, 4 = QUNS_PRESENTATION_MODE, 7 = QUNS_APP.
+    if ($State -in @(2, 3, 4, 7)) {
+        return [pscustomobject]@{ Allowed = $false; Code = 'SYNAPSE_CHROME_BRIDGE_UI_REPAIR_REFUSED_HUMAN_FULLSCREEN' }
+    }
+    # 1 = QUNS_NOT_PRESENT (locked, screen saver, inactive session) and any unknown value.
+    return [pscustomobject]@{ Allowed = $false; Code = 'SYNAPSE_CHROME_BRIDGE_UI_REPAIR_REFUSED_HUMAN_STATE' }
+}
+
+function Assert-SynapseHumanAllowsForegroundUiRepair {
+    # Thin OS layer for Resolve-SynapseUiRepairHumanStateGate; runs before any
+    # ShowWindowAsync/SetForegroundWindow of the UI repair paths.
     param([Parameter(Mandatory = $true)][string]$Stage)
-    # #2271: chrome://extensions UI repair calls SetForegroundWindow. Never steal the
-    # foreground from a fullscreen game, a busy fullscreen app or a presentation.
     if (-not ('SynapseChromeBridgeHumanGuard.Shell' -as [type])) {
         Add-Type -Namespace SynapseChromeBridgeHumanGuard -Name Shell -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("shell32.dll")]
@@ -1518,12 +1553,9 @@ public static extern int SHQueryUserNotificationState(out int state);
     }
     $state = 0
     $hr = [SynapseChromeBridgeHumanGuard.Shell]::SHQueryUserNotificationState([ref]$state)
-    if ($hr -ne 0) {
-        throw "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_HUMAN_STATE_UNREADABLE stage=$Stage hresult=$hr remediation=foreground UI repair refuses when the human notification state cannot be read; the bridge worker reconnects on its own 30 s wake alarm"
-    }
-    # 2=QUNS_BUSY 3=QUNS_RUNNING_D3D_FULL_SCREEN 4=QUNS_PRESENTATION_MODE
-    if ($state -in @(2, 3, 4)) {
-        throw "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_REFUSED_HUMAN_FULLSCREEN stage=$Stage user_notification_state=$state remediation=the human is in a fullscreen/busy/presentation app; foreground chrome://extensions repair is refused. The bridge worker re-registers on its own wake alarm (it ends a maintenance pause when /health reports a new daemon pid); re-read health later"
+    $gate = Resolve-SynapseUiRepairHumanStateGate -HResult $hr -State $state
+    if (-not $gate.Allowed) {
+        throw "$($gate.Code) stage=$Stage hresult=$hr user_notification_state=$state remediation=foreground chrome://extensions UI repair never runs while the human is fullscreen, busy, presenting, away/locked, or the state is unreadable; the bridge worker re-registers on its own wake alarm, re-read bridge health later"
     }
 }
 
@@ -1558,19 +1590,37 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
     })
     $windows = @($candidateWindows | Where-Object { $_.chrome_profile_eligible -eq $true })
     if ($windows.Count -eq 0) {
+        # No eligible interactive Chrome window means the extension row is already
+        # installed from disk state, but the live UI reload cannot run. This is a
+        # bridge repair problem, not a daemon/install contract failure (#132):
+        # a missing window must not abort setup after the daemon is healthy. The
+        # profile row is unchanged, the daemon can reconverge the extension code
+        # in place via browser_debugger.reload_bridge once a live bridge host
+        # exists, and the deferred reason below surfaces in bridge health.
         $rejected = Format-SynapseChromeWindowRejectSummary -Windows $candidateWindows
-        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW active_profile=$ActiveProfile user_data_root=$ChromeUserDataRoot rejected_windows=$rejected remediation=open the already-authenticated Chrome profile for this user-data root; setup refuses to launch a second Chrome window or drive a dedicated automation profile"
+        return [pscustomobject]@{
+            attempted = $false
+            changed = $false
+            reason = 'existing_extension_ui_reload_no_eligible_chrome_window_deferred_to_daemon'
+            active_profile = $ActiveProfile
+            required_foreground = $false
+            bridge_self_reload_command = 'browser_debugger.reload_bridge'
+            rejected_windows = $rejected
+            remediation = 'open the already-authenticated Chrome profile for this user-data root and rerun setup, or call browser_debugger.reload_bridge through the live daemon once a bridge host exists; setup refuses to launch a second Chrome window or drive a dedicated automation profile'
+            before = $Before
+            after = $Before
+        }
     }
 
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
+    Assert-SynapseHumanAllowsForegroundUiRepair -Stage 'existing_ui_reload'
     [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 9) | Out-Null
-    Assert-SynapseHumanNotInFullscreenForUiRepair -Stage 'existing_ui_reload'
     [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 
     Set-SynapseChromeAddressBarUrl `
         -Window $chromeWindow `
-        -Url "chrome://extensions/?id=$ExtensionId"
+        -Url "$($script:BrowserExtensionsPageUrl)/?id=$ExtensionId"
 
     $details = Wait-SynapseUntil -Deadline $deadline -Probe {
         $currentWindow = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
@@ -1633,11 +1683,31 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
         chrome_window_pid = $chromeWindow.pid
         chrome_window_user_data_dir = $chromeWindow.chrome_user_data_dir
         chrome_window_profile_match_reason = $chromeWindow.chrome_profile_match_reason
-        extension_details_url = "chrome://extensions/?id=$ExtensionId"
+        extension_details_url = "$($script:BrowserExtensionsPageUrl)/?id=$ExtensionId"
         ui_before = $details.ui_before
         ui_after = $uiAfter
         before = $Before
         after = $after
+    }
+}
+
+# #132: record a repair this run deferred to the daemon so daemon bridge health
+# can name it (`deferred_repair=<reason>`); any non-deferred result clears it.
+function Set-SynapseChromeBridgeDeferredRepairMarker {
+    param(
+        [Parameter(Mandatory = $true)]
+        $AutoInstall,
+        [Parameter(Mandatory = $true)]
+        [string]$MarkerPath
+    )
+
+    $reason = [string]$AutoInstall.reason
+    if ($reason -match '^[A-Za-z0-9_]+_deferred_to_daemon[A-Za-z0-9_]*$') {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $MarkerPath) | Out-Null
+        [System.IO.File]::WriteAllText($MarkerPath, $reason)
+    }
+    elseif (Test-Path -LiteralPath $MarkerPath) {
+        Remove-Item -LiteralPath $MarkerPath -Force
     }
 }
 
@@ -1705,14 +1775,45 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     }
 
     # Same extension ID already loaded, enabled, and fully permissioned, but registered
-    # from a directory other than the current stable dir (e.g. a repo-checkout install).
-    # Registration is now credentialed with a host-local token injected only into the
-    # deployed stable copy. Reloading a non-stable source copy would keep an
-    # uncredentialed worker alive, so normal setup must migrate the loaded unpacked
-    # extension to the stable directory through Chrome's Load unpacked flow.
+    # from a directory other than the current stable dir (e.g. a pre-#1307 repo-checkout
+    # install). The bridge extension ID is derived from the manifest key and is therefore
+    # path-independent: a working same-ID host IS the Synapse bridge no matter which
+    # directory Chrome loaded it from. Chrome cannot relocate an already-loaded unpacked
+    # extension in place — the only ways to change its load directory are re-running
+    # "Load unpacked" (the fragile chrome://extensions UI-Automation path) or a Chrome
+    # relaunch, and there is no supported in-place mechanism for an off-Web-Store
+    # extension. Driving UI Automation to "re-install" a bridge that is already loaded and
+    # healthy is precisely the failure mode that broke the daemon handoff (see #1313), so
+    # we refuse to do it. The stable directory has already been deployed for future
+    # first-time installs; the live daemon reconverges the extension's code in place via
+    # the public browser_debugger.reload_bridge facade after handoff, and the
+    # post-handoff /health check is the live
+    # source of truth that fails loud if the bridge is not actually serving. We surface
+    # the pending path migration in the readback so health and operators can see that the
+    # bridge is still loaded from a non-stable directory.
     if ($before.installed -and $before.enabled_and_permissioned -and $before.manifest_dir_exists) {
-        Write-Warning ("SYNAPSE_CHROME_BRIDGE_NONSTABLE_PATH_REQUIRES_STABLE_RELOAD active_profile={0} loaded_manifest_path={1} expected_stable_path={2} reason=credentialed_register_token_only_injected_into_stable_extension" -f `
-            $activeProfile, $before.manifest_path, $ExtensionDir)
+        if ($ReloadExistingExtensionViaUi) {
+            return Invoke-SynapseChromeBridgeExistingUiReload `
+                -ChromeUserDataRoot $ChromeUserDataRoot `
+                -ExtensionId $ExtensionId `
+                -ExtensionDir $ExtensionDir `
+                -ActiveProfile $activeProfile `
+                -Before $before `
+                -TimeoutSeconds $TimeoutSeconds
+        }
+        return [pscustomobject]@{
+            attempted = $true
+            changed = $false
+            reason = 'existing_ready_extension_nonstable_path_code_reload_deferred_to_daemon'
+            active_profile = $activeProfile
+            required_foreground = $false
+            bridge_self_reload_command = 'browser_debugger.reload_bridge'
+            path_migration_pending = $true
+            loaded_manifest_path = $before.manifest_path
+            expected_stable_path = $ExtensionDir
+            before = $before
+            after = $before
+        }
     }
 
     Initialize-SynapseChromeBridgeAutoInstallInterop
@@ -1726,8 +1827,8 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_NO_ELIGIBLE_CHROME_WINDOW active_profile=$activeProfile user_data_root=$ChromeUserDataRoot rejected_windows=$rejected remediation=open the already-authenticated Chrome profile for this user-data root; setup refuses to drive ms-playwright-mcp, remote-debugging, unreadable, or other dedicated Chrome user-data-dir windows"
     }
     $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
+    Assert-SynapseHumanAllowsForegroundUiRepair -Stage 'first_install_ui'
     [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 5) | Out-Null
-    Assert-SynapseHumanNotInFullscreenForUiRepair -Stage 'first_install_ui'
     [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 
@@ -1740,7 +1841,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         } catch {
             $restoreClipboard = $false
         }
-        Set-Clipboard -Value 'chrome://extensions'
+        Set-Clipboard -Value $script:BrowserExtensionsPageUrl
         Send-SynapseNativeKeyTap -VirtualKey 0x1B
         Start-Sleep -Milliseconds 200
         Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x4C))
@@ -1756,19 +1857,19 @@ function Invoke-SynapseChromeBridgeAutoInstall {
             if ($currentWindow.Count -eq 0) {
                 return $null
             }
-            if ($currentWindow[0].title -notmatch '^Extensions( - Google Chrome)?$') {
+            if ($currentWindow[0].title -notmatch $script:BrowserExtensionsWindowTitlePattern) {
                 return $null
             }
             $button = Find-SynapseAutomationElementByName `
                 -Root $currentWindow[0].element `
-                -Name 'Load unpacked' `
+                -Name $script:BrowserInstallUiLoadUnpacked `
                 -ControlType ([System.Windows.Automation.ControlType]::Button)
             if ($button) {
                 return [pscustomobject]@{ window = $currentWindow[0]; button = $button }
             }
             $developerMode = Find-SynapseAutomationElementByName `
                 -Root $currentWindow[0].element `
-                -Name 'Developer mode' `
+                -Name $script:BrowserInstallUiDeveloperMode `
                 -ControlType $null
             if ($developerMode) {
                 try {
@@ -1829,15 +1930,10 @@ function Invoke-SynapseChromeBridgeAutoInstall {
                 -ExtensionDir $ExtensionDir
             throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_PROFILE_ROW_MISSING active_profile=$activeProfile timeout_s=$TimeoutSeconds installed=$($latest.installed) manifest_path=$($latest.manifest_path) expected_path=$ExtensionDir remediation=Chrome did not persist the Synapse unpacked extension row after Select Folder"
         }
-        $installReason = if ($before.installed -and -not $before.manifest_path_matches) {
-            'migrated_existing_extension_to_credentialed_stable_path'
-        } else {
-            'installed_unpacked_extension_in_active_profile'
-        }
         return [pscustomobject]@{
             attempted = $true
             changed = $true
-            reason = $installReason
+            reason = 'installed_unpacked_extension_in_active_profile'
             active_profile = $activeProfile
             chrome_window_hwnd = $chromeWindow.hwnd
             chrome_window_pid = $chromeWindow.pid
@@ -1870,7 +1966,7 @@ if (Test-Path -LiteralPath $hostManifestPath -PathType Leaf) {
     throw "SYNAPSE_CHROME_NATIVE_HOST_MANIFEST_REMOVE_FAILED path=$hostManifestPath remediation=normal bridge must use direct localhost WebSocket command delivery only"
 }
 
-$chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+$chromeProcesses = @(Get-CimInstance Win32_Process -Filter $script:BrowserProcessWmiFilter -ErrorAction SilentlyContinue | ForEach-Object {
     $commandLine = [string]$_.CommandLine
     $hasRemoteDebuggingPipe = $commandLine -match '(^|\s)--remote-debugging-pipe(\s|=|$)'
     $hasRemoteDebuggingPort = $commandLine -match '(^|\s)--remote-debugging-port(\s|=|$)'
@@ -1902,12 +1998,20 @@ $chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -
     }
 })
 
-$chromeUserDataRoot = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
+$chromeUserDataRoot = $script:BrowserUserDataRoot
+$chromePolicyBootstrapCleanup = @(Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds @())
+$bootstrapFailures = @($chromePolicyBootstrapCleanup | Where-Object { ([string]$_.reason) -match '^(write_failed:|parse_error:)' })
+if ($bootstrapFailures.Count -gt 0) {
+    throw "SYNAPSE_CHROME_BRIDGE_BOOTSTRAP_POLICY_CLEANUP_FAILED remediation=remove stale Synapse-authored blockers from the configured browser policy before installation; do not weaken registry ACLs"
+}
 $chromeBridgeAutoInstall = Invoke-SynapseChromeBridgeAutoInstall `
     -ChromeUserDataRoot $chromeUserDataRoot `
     -ExtensionId $ExtensionId `
     -ExtensionDir $extensionDir `
     -TimeoutSeconds $AutoInstallTimeoutSeconds
+Set-SynapseChromeBridgeDeferredRepairMarker `
+    -AutoInstall $chromeBridgeAutoInstall `
+    -MarkerPath (Join-Path $env:APPDATA 'synapse\chrome-bridge-deferred-repair.txt')
 $profileDirs = @()
 $synapseChromeProfileReadback = @()
 $staleSynapseActivePermissions = @()
@@ -1968,13 +2072,7 @@ function Test-ExternalPopupRiskEnabled {
     return $HasActiveOrManifestHazard
 }
 if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
-    $profileDirs = @(Get-ChildItem -LiteralPath $chromeUserDataRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -ne 'Snapshots' -and (
-                (Test-Path -LiteralPath (Join-Path $_.FullName 'Preferences') -PathType Leaf) -or
-                (Test-Path -LiteralPath (Join-Path $_.FullName 'Secure Preferences') -PathType Leaf)
-            )
-        })
+    $profileDirs = @(Get-SynapseBrowserProfileDirs -Row $script:BrowserRow -UserDataRoot $chromeUserDataRoot)
     foreach ($profileDir in $profileDirs) {
         $extensionRuntimeById = @{}
         foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
@@ -1997,6 +2095,7 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                 continue
             }
             foreach ($extensionProperty in $pref.extensions.settings.PSObject.Properties) {
+                if (Test-SynapseBrowserProtectedExtensionId -Row $script:BrowserRow -ExtensionId ([string]$extensionProperty.Name)) { continue }
                 $setting = $extensionProperty.Value
                 $runtimeState = Get-ChromeExtensionRuntimeState -Setting $setting
                 if ($prefFileName -eq 'Preferences') {
@@ -2152,11 +2251,6 @@ $synapseChromeProfileInstallState = [pscustomobject]@{
     cdp_bridge_reload_can_install_absent_extension = $false
     remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\synapse\chrome-extension\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension'
 }
-$staleBridgeBuildCleanup = Remove-SynapseStaleChromeBridgeBuildDirs `
-    -StableRoot $stableRootFull `
-    -CurrentExtensionDir $extensionDir `
-    -ChromeUserDataRoot $chromeUserDataRoot `
-    -ExtensionId $ExtensionId
 $externalNativeMessagingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.CommandLine -match 'chrome\.nativeMessaging' -and
@@ -2229,31 +2323,30 @@ $synapseSelfShieldRow = [pscustomobject]@{
 
 # External extensions and native-messaging hosts that use debugger/nativeMessaging
 # can surface layout-changing Chrome popups independently of Synapse's tabs-only
-# bridge. Setup tries to apply a reversible HKCU ExtensionSettings shield for
-# those permissions by default. If this host denies that policy write, the
-# installed bridge must suppress the hazards through chrome.management or normal
-# tabs/scripting commands fail closed before queueing any Chrome command.
+# bridge. They belong to the owner: setup reports them and never blocks,
+# disables or re-permissions them; the bridge only observes them through
+# chrome.management.
 #
 # As a one-way remediation we remove stale Synapse-authored blockers from prior
 # builds, then write the current self-shield for the Synapse extension ID. The
 # current bridge intentionally requests debugger for a narrow target-scoped CDP
 # input lane, so the self-shield blocks nativeMessaging only.
-$chromePolicyCleanup = Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds @(
-    @($externalHazardExtensionIds)
-)
+$chromePolicyCleanup = @(@($chromePolicyBootstrapCleanup); @(Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds @($externalHazardExtensionIds)))
+# Other extensions belong to the owner: setup never writes blockers for them
+# (upstream #2265). Only the Synapse self-shield row is written.
 $policyShieldExtensions = @($synapseSelfShieldRow)
-if (-not $PreserveExternalDebuggerExtensions) {
-    $policyShieldExtensions += @($allExternalDebuggerOrNativeExtensions)
-}
-$chromePolicyPopupShield = Set-SynapseChromeExternalDebuggerPolicy -Extensions $policyShieldExtensions
+$chromePolicyPopupShield = Set-SynapseChromeExternalDebuggerPolicy `
+    -Extensions $policyShieldExtensions `
+    -BridgeExtensionId $ExtensionId `
+    -ProtectedExtensionIds @($script:BrowserRow.protected_extension_ids | ForEach-Object { [string]$_ })
 # The popup shield writes HKCU\Software\Policies\Google\Chrome\ExtensionSettings — a
 # Chrome MANAGED-POLICY key. On a correctly-secured Windows install that key is
 # admin-only (owner SYSTEM, standard users get ReadKey) BY DESIGN, precisely so a
 # non-admin process cannot grant itself Chrome policy. A non-elevated setup therefore
 # cannot write it, and that denial is expected hardening — not a misconfiguration to
-# "repair". Other extensions are now observed, never automatically disabled.
-# Synapse's own active nativeMessaging permission remains a separate runtime
-# gate. Making an admin-only, defense-in-depth policy write a hard
+# "repair". The shield now covers only Synapse's own nativeMessaging permission,
+# which the daemon also gates at runtime; other extensions are only observed.
+# Making an admin-only, defense-in-depth policy write a hard
 # dependency would brick `synapse-update` on every properly-secured machine. So a
 # write-denied shield is surfaced LOUDLY (with exact failure + remediation) but is
 # non-fatal; only an UNEXPECTED shield failure (not the known admin-only policy-root
@@ -2270,7 +2363,7 @@ if ($unexpectedBlockingShieldRows.Count -gt 0) {
 }
 if ($popupShieldWriteDeniedRows.Count -gt 0) {
     $deniedDetail = ConvertTo-CompressedJson -Value $popupShieldWriteDeniedRows -Depth 10
-    Write-Warning "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING Chrome managed-policy access is administrator-only; its ACL was not changed. Unrelated extensions are preserved. Synapse's own active nativeMessaging permission remains separately gated by the daemon. detail=$deniedDetail"
+    Write-Warning "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING the HKCU Chrome managed-policy key is admin-only on this host, so the non-elevated popup shield could not be written. This is not fatal: the self-shield only covers Synapse's own nativeMessaging permission, which the daemon gates separately at runtime; other extensions are never blocked or disabled. To also apply the self-shield, run setup once from an elevated PowerShell. detail=$deniedDetail"
 }
 
 if ($staleSynapseActivePermissions.Count -gt 0) {
@@ -2282,8 +2375,36 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call browser_debugger.reload_bridge through the real Synapse MCP public facade when the live bridge advertises reloadSelf, otherwise keep normal browser commands failed closed until Chrome reloads the extension or restarts the already-open profile"
 }
 
+$bridgeOrigin = "$($script:BrowserRow.extension.origin_scheme)://$ExtensionId/"
+# Identity is the running code (#237 stamp: running worker, then the worker on
+# disk in the folder Chrome loaded), not the load folder. A stale worker or an
+# older build fails closed on extension_code_stamp; the same code loaded from a
+# non-standard folder passes with a warning naming that folder (#251 round 3).
+$expectedLiveIdentity = New-SynapseBridgeExpectedIdentity -Row $script:BrowserRow -DetailedValues ([ordered]@{
+    extension_code_stamp=$extensionDeploy.code_stamp; expected_code_stamp=$extensionDeploy.code_stamp
+    extension_id=$ExtensionId; origin=$bridgeOrigin; transport='direct_http'
+    extension_build_id=$bridgeBuildId; extension_version=[string]$extensionManifest.version; extension_protocol_version='1'
+    extension_service_worker_sha256=$extensionDeploy.service_worker_sha256
+    expected_extension_service_worker_sha256=$extensionDeploy.service_worker_sha256
+    extension_service_worker_sha256_status='ok'; extension_service_worker_sha256_source="$($script:BrowserRow.extension.origin_scheme)://$ExtensionId/service_worker.js"
+    active_profile=$activeChromeProfile; active_profile_installed='true'; tab_control_available='true'; extension_stale='false'
+}) -DetailedAdvisory ([ordered]@{
+    active_profile_extension_path=$extensionDir; expected_extension_service_worker_path=(Join-Path $extensionDir 'service_worker.js')
+}) -RowValues ([ordered]@{
+    extension_code_stamp=$extensionDeploy.code_stamp
+    browser_kind=[string]$script:BrowserRow.id; extension_browser_kind=[string]$script:BrowserRow.id
+    extension_id=$ExtensionId; origin=$bridgeOrigin; transport='direct_http'
+    extension_build_id=$bridgeBuildId; tab_control_available='true'
+})
+# A UI reload registers asynchronously; its caller waits for registration and
+# then verifies, so that path defers like -DeferLiveVerification (#251).
+$runtimeOutcome = Get-SynapseChromeRuntimeOutcome -AutoInstall $chromeBridgeAutoInstall -Expected $expectedLiveIdentity `
+    -DeferLive:($DeferLiveVerification -or $ReloadExistingExtensionViaUi)
+$installOutcome = Get-SynapseChromeInstallOutcome -AutoInstall $runtimeOutcome
 [pscustomobject]@{
-    ok = $true
+    ok = $installOutcome.ok
+    reason = $installOutcome.reason
+    runtime_verification = $runtimeOutcome
     native_host = $hostName
     native_manifest = $null
     registry_key = $registryPath
@@ -2293,13 +2414,15 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     extension_dir = $extensionDir
     extension_deploy = $extensionDeploy
     daemon_bridge_transport = 'direct_localhost_websocket'
-    daemon_bridge_origin = "chrome-extension://$ExtensionId"
+    daemon_bridge_origin = "$($script:BrowserRow.extension.origin_scheme)://$ExtensionId"
+    browser_kind = [string]$script:BrowserRow.id
+    bridge_config_path = $bridgeConfigPath
     bridge_self_reload_command = 'browser_debugger.reload_bridge'
     bridge_build_id_expected = $bridgeBuildId
     bridge_declared_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_service_worker_sha256_expected = $extensionDeploy.service_worker_sha256
-    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'operatorPanicDisable', 'operatorPanicCleanup', 'operatorPanicReadback', 'operatorPanicEnable', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
+    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.downloads_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_downloads_waits_page_screenshots_and_chrome_debugger_runtime_evaluate_init_scripts_handle_dialog_file_upload_cdp_input_hover_tap_drag_page_print_to_pdf_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'
     attach_popup_prevention = 'normal_bridge_debugger_permission_scoped_to_Runtime_evaluate_Page_addScriptToEvaluateOnNewDocument_Runtime_addBinding_Page_handleJavaScriptDialog_DOM_setFileInputFiles_Page_fileChooserOpened_cdpInput_hover_tap_active_drag_pagePdf_printToPDF_viewportEmulation_deviceEmulation_geolocationEmulation_localeEmulation_mediaEmulation_and_networkConditions_inactive_synthetic_drag_no_helper_windows_no_nativeMessaging_permission_plus_external_popup_risk_suppression'
@@ -2326,14 +2449,13 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     current_chrome_processes = $chromeProcesses
     chrome_policy_cleanup = $chromePolicyCleanup
     chrome_policy_popup_shield = $chromePolicyPopupShield
-    external_popup_risk_blocks_popup_free_commands = ($allExternalDebuggerOrNativeExtensions.Count -gt 0)
-    external_popup_risk_scope = 'runtime_bridge_management_suppression_or_fail_closed'
-    external_popup_risk_block_reason = if ($allExternalDebuggerOrNativeExtensions.Count -gt 0) { 'external_debugger_or_native_hazards_require_chrome_management_suppression_or_policy_shield' } else { 'none' }
+    external_popup_risk_blocks_popup_free_commands = $false
+    external_popup_risk_scope = 'diagnostic_only_other_extensions_preserved'
+    external_popup_risk_block_reason = 'none'
     external_popup_risk_bridge_management_required = ($allExternalDebuggerOrNativeExtensions.Count -gt 0)
     external_popup_risk_bridge_management_permission_present = ($requiredPermissions -contains 'management')
     synapse_chrome_auto_install = $chromeBridgeAutoInstall
     synapse_chrome_profile_install_state = $synapseChromeProfileInstallState
-    stale_bridge_build_cleanup = $staleBridgeBuildCleanup
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     synapse_stale_granted_permission_warning = [pscustomobject]@{
         warning = ($staleSynapseGrantedPermissions.Count -gt 0)

@@ -54,6 +54,8 @@ use super::episodes::{
 };
 use super::hygiene::{HygieneTaintRecord, read_taint_record_from_db};
 use super::profile_authoring::{RoutineAutomationRecord, load_routine_automation_record};
+use super::routine_id_migration::migrate_legacy_routine_ids_retained;
+use super::routine_identity_ledger::{RetainedIdentityRows, validate_identity_records};
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, required},
@@ -403,7 +405,7 @@ fn decode_state_row(key: &[u8], value: &[u8]) -> Result<RoutineStateRecord, Erro
 }
 
 /// Loads every `CF_ROUTINE_STATE` row, budget-guarded.
-fn load_all_state_rows(
+pub(super) fn load_all_state_rows(
     db: &Db,
     scanned_rows: &mut u64,
 ) -> Result<BTreeMap<String, RoutineStateRecord>, ErrorData> {
@@ -464,6 +466,31 @@ pub(crate) fn load_state_row(
         ));
     }
     decode_state_row(row_key, value).map(Some)
+}
+
+/// Error for an operation that needs a mined template but found none in
+/// `CF_ROUTINES` (#98). A successful read of both stores that finds nothing is
+/// `ROUTINE_NOT_FOUND`; an id with only an operator state row is the
+/// `ROUTINE_NOT_MINED` precondition. A failed state read is returned as-is.
+pub(crate) fn unmined_routine_error(db: &Db, routine_id: &str, needed_for: &str) -> ErrorData {
+    match load_state_row(db, routine_id) {
+        Err(error) => error,
+        Ok(None) => mcp_error(
+            error_codes::ROUTINE_NOT_FOUND,
+            format!(
+                "ROUTINE_NOT_FOUND: routine_id {routine_id} exists in neither CF_ROUTINES nor \
+                 CF_ROUTINE_STATE; run routine_list to see what exists"
+            ),
+        ),
+        Ok(Some(_)) => mcp_error(
+            error_codes::ROUTINE_NOT_MINED,
+            format!(
+                "ROUTINE_NOT_MINED: routine_id {routine_id} has an operator state row but no \
+                 mined template in CF_ROUTINES, so there is nothing to {needed_for}. Run \
+                 routine_mine, or routine_list to see what currently exists"
+            ),
+        ),
+    }
 }
 
 /// Point lookup of one `CF_ROUTINES` row by routine id.
@@ -657,13 +684,90 @@ fn reconcile_state_rows(
     Ok(counters)
 }
 
-/// Mines routines from `CF_EPISODES` and (unless `dry_run`) replaces
-/// `CF_ROUTINES` atomically. Shared by the MCP tool and the periodic job.
-#[allow(clippy::too_many_lines)]
+/// Mines routines from CF_EPISODES under one ownership/commit path, including
+/// empty sources. Ledger evidence is read before any migration or deletion.
 pub fn mine_and_store_routines(
     db: &Arc<Db>,
     params: &RoutineMineParams,
 ) -> Result<RoutineMineResponse, ErrorData> {
+    validate_mine_range(params)?;
+    let config = build_config(params)?;
+    let _mining = MINE_LOCK
+        .lock()
+        .map_err(|_| internal("routine mining lock poisoned"))?;
+    check_mine_pressure(db, params.dry_run)?;
+    let mut scanned = 0;
+    let mined_at = now_ts_ns();
+    let (range, mut mining) = mine_source_rows(db, params, &config, mined_at, &mut scanned)?;
+    let previous: Vec<_> = load_all_routine_records(db, &mut scanned)?
+        .into_values()
+        .collect();
+    validate_identity_records(&previous)?;
+    validate_identity_records(&mining.routines)?;
+    let retained = RetainedIdentityRows::load(db)?;
+    synapse_core::routine_identity::reconcile_routine_identities_retained(
+        &previous,
+        retained.retained(),
+        &mut mining.routines,
+    );
+    finish_mining(
+        db,
+        params.dry_run,
+        &previous,
+        &retained,
+        range,
+        mining,
+        &mut scanned,
+    )
+}
+
+fn finish_mining(
+    db: &Arc<Db>,
+    dry_run: bool,
+    previous: &[RoutineRecord],
+    retained: &RetainedIdentityRows,
+    range: (u64, u64),
+    mining: synapse_core::routines::RoutineMining,
+    scanned: &mut u64,
+) -> Result<RoutineMineResponse, ErrorData> {
+    // Encode even in preview: invalid keys must fail before the write split.
+    let rows = encode_mined_rows(&mining.routines)?;
+    let (deleted, state) = if dry_run {
+        (0, StateReconcileCounters::default())
+    } else {
+        commit_mined_rows(db, previous, retained, &mining.routines, rows, scanned)?
+    };
+    log_mining_outcome(range, mining.routines.len(), dry_run, deleted, state);
+    Ok(mining_response(
+        range, mining, *scanned, dry_run, deleted, state,
+    ))
+}
+
+fn log_mining_outcome(
+    range: (u64, u64),
+    routines: usize,
+    dry_run: bool,
+    deleted: u64,
+    state: StateReconcileCounters,
+) {
+    tracing::info!(
+        code = if dry_run {
+            "ROUTINE_MINE_DRY_RUN"
+        } else {
+            "ROUTINE_MINE_REPLACED"
+        },
+        range_start_ns = range.0,
+        range_end_ns = range.1,
+        routines,
+        routines_deleted = deleted,
+        state_rows_created = state.created,
+        state_rows_updated = state.updated,
+        state_rows_marked_unmined = state.marked_unmined,
+        "routine_mine completed with reconciled ownership"
+    );
+}
+
+fn validate_mine_range(params: &RoutineMineParams) -> Result<(), ErrorData> {
     if let (Some(start), Some(end)) = (params.start_ts_ns, params.end_ts_ns)
         && start >= end
     {
@@ -671,162 +775,116 @@ pub fn mine_and_store_routines(
             "routine_mine start_ts_ns {start} must be < end_ts_ns {end}"
         )));
     }
-    let config = build_config(params)?;
+    Ok(())
+}
 
-    let _mining = MINE_LOCK
-        .lock()
-        .map_err(|_poisoned| internal("routine mining lock poisoned"))?;
-
-    if !params.dry_run
+fn check_mine_pressure(db: &Db, dry_run: bool) -> Result<(), ErrorData> {
+    if !dry_run
         && !(db.pressure_permits_write(cf::CF_ROUTINES)
             && db.pressure_permits_write(cf::CF_ROUTINE_STATE))
     {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
-                "routine_mine refused under disk pressure: cf_names={}/{} pressure_level={:?}; \
-                 nothing was deleted or written",
+                "routine_mine refused under disk pressure: cf_names={}/{} pressure_level={:?}; nothing was deleted or written",
                 cf::CF_ROUTINES,
                 cf::CF_ROUTINE_STATE,
                 db.pressure_level()
             ),
         ));
     }
+    Ok(())
+}
 
-    let mut scanned_rows = 0_u64;
-    let range_start = match params.start_ts_ns {
+fn mine_source_rows(
+    db: &Arc<Db>,
+    params: &RoutineMineParams,
+    config: &RoutineMiningConfig,
+    mined_at: u64,
+    scanned: &mut u64,
+) -> Result<((u64, u64), synapse_core::routines::RoutineMining), ErrorData> {
+    let start = match params.start_ts_ns {
         Some(start) => start,
-        None => match first_episode_ts(db, &mut scanned_rows)? {
-            Some(ts_ns) => ts_ns,
-            None => {
-                // Empty episode store: an honest empty mine. A non-dry run
-                // still clears stale routines (derived state must reflect
-                // its source) and reconciles the state store so no row
-                // still claims to be present in the last mine.
-                let stale_keys = existing_routine_keys(db, &mut scanned_rows)?;
-                let deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
-                let state_counters = if params.dry_run {
-                    StateReconcileCounters::default()
-                } else {
-                    if !stale_keys.is_empty() {
-                        db.mutate_batch_pressure_bypass(
-                            cf::CF_ROUTINES,
-                            stale_keys,
-                            Vec::<(Vec<u8>, Vec<u8>)>::new(),
-                        )
-                        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-                    }
-                    let counters = reconcile_state_rows(db, &[], now_ts_ns(), &mut scanned_rows)?;
-                    reindex_armed_routine_schedule_due_indexes(db)?;
-                    counters
-                };
-                return Ok(RoutineMineResponse {
-                    range_start_ns: 0,
-                    range_end_ns: 0,
-                    scanned_episode_rows: scanned_rows,
-                    considered_episodes: 0,
-                    eligible_episodes: 0,
-                    filtered_agent_episodes: 0,
-                    filtered_short_episodes: 0,
-                    filtered_no_app_episodes: 0,
-                    active_days: 0,
-                    candidates_evaluated: 0,
-                    candidates_truncated: 0,
-                    occurrences_skipped_over_cap: 0,
-                    clusters_rejected_low_support: 0,
-                    clusters_rejected_dispersed: 0,
-                    clusters_rejected_low_confidence: 0,
-                    candidates_rejected_as_subpattern: 0,
-                    routines_dropped_over_cap: 0,
-                    routines_written: 0,
-                    routines_deleted: if params.dry_run { 0 } else { deleted },
-                    state_rows_created: state_counters.created,
-                    state_rows_updated: state_counters.updated,
-                    state_rows_marked_unmined: state_counters.marked_unmined,
-                    dry_run: params.dry_run,
-                    routines: Vec::new(),
-                });
-            }
+        None => match first_episode_ts(db, scanned)? {
+            Some(start) => start,
+            None => return Ok(((0, 0), synapse_core::routines::RoutineMining::default())),
         },
     };
-    let range_end = params.end_ts_ns.unwrap_or_else(now_ts_ns);
-    if range_start >= range_end {
+    let end = params.end_ts_ns.unwrap_or(mined_at);
+    if start >= end {
         return Err(invalid(format!(
-            "routine_mine effective range is empty: start {range_start} >= end {range_end}"
+            "routine_mine effective range is empty: start {start} >= end {end}"
         )));
     }
-    let range_start_snapped = local_day_start(range_start)?;
-    let range_end_snapped = next_local_day_start(local_day_start(range_end.saturating_sub(1))?)?;
-
-    let days = mining_days(
-        db,
-        range_start_snapped,
-        range_end_snapped,
-        &mut scanned_rows,
-    )?;
-    let mined_at = now_ts_ns();
-    let mining = mine_routines(&days, mined_at, &config).map_err(|error| {
+    let range = (
+        local_day_start(start)?,
+        next_local_day_start(local_day_start(end.saturating_sub(1))?)?,
+    );
+    let days = mining_days(db, range.0, range.1, scanned)?;
+    let mining = mine_routines(&days, mined_at, config).map_err(|error| {
         internal(format!(
-            "routine_mine engine failed for range [{range_start_snapped}, {range_end_snapped}): {error}"
+            "routine_mine engine failed for range {range:?}: {error}"
         ))
     })?;
+    Ok((range, mining))
+}
 
-    let mut new_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(mining.routines.len());
-    for routine in &mining.routines {
-        let key = routine_codec::routine_key(&routine.routine_id)
-            .map_err(|error| internal(format!("engine produced an invalid routine id: {error}")))?;
-        let value =
-            encode_json(routine).map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        new_rows.push((key, value));
-    }
-    let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
-    let mut deleted = 0_u64;
-    let mut state_counters = StateReconcileCounters::default();
-    if params.dry_run {
-        tracing::info!(
-            code = "ROUTINE_MINE_DRY_RUN",
-            range_start_ns = range_start_snapped,
-            range_end_ns = range_end_snapped,
-            routines = written,
-            "routine_mine dry run computed without mutating CF_ROUTINES"
-        );
-    } else {
-        let stale_keys = existing_routine_keys(db, &mut scanned_rows)?;
-        deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
-        db.mutate_batch_pressure_bypass(cf::CF_ROUTINES, stale_keys, new_rows)
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "routine_mine failed to replace CF_ROUTINES: {error}; \
-                         the previous routines are unchanged"
-                    ),
-                )
+type MinedRow = (Vec<u8>, Vec<u8>);
+
+fn encode_mined_rows(routines: &[RoutineRecord]) -> Result<Vec<MinedRow>, ErrorData> {
+    routines
+        .iter()
+        .map(|routine| {
+            let key = routine_codec::routine_key(&routine.routine_id).map_err(|error| {
+                internal(format!("engine produced an invalid routine id: {error}"))
             })?;
-        // CF_ROUTINES and CF_ROUTINE_STATE are separate flushed batches; if
-        // this reconcile fails the error is loud, lifecycle rows are intact,
-        // and the next mining run repairs the presence bookkeeping.
-        state_counters = reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
-        reindex_armed_routine_schedule_due_indexes(db)?;
-        tracing::info!(
-            code = "ROUTINE_MINE_REPLACED",
-            range_start_ns = range_start_snapped,
-            range_end_ns = range_end_snapped,
-            routines_written = written,
-            routines_deleted = deleted,
-            active_days = mining.active_days,
-            candidates = mining.candidates_evaluated,
-            state_rows_created = state_counters.created,
-            state_rows_updated = state_counters.updated,
-            state_rows_marked_unmined = state_counters.marked_unmined,
-            "routine_mine replaced the routine store"
-        );
-    }
+            let value =
+                encode_json(routine).map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            Ok((key, value))
+        })
+        .collect()
+}
 
-    Ok(RoutineMineResponse {
-        range_start_ns: range_start_snapped,
-        range_end_ns: range_end_snapped,
-        scanned_episode_rows: scanned_rows,
+fn commit_mined_rows(
+    db: &Arc<Db>,
+    previous: &[RoutineRecord],
+    retained: &RetainedIdentityRows,
+    mined: &[RoutineRecord],
+    rows: Vec<MinedRow>,
+    scanned: &mut u64,
+) -> Result<(u64, StateReconcileCounters), ErrorData> {
+    // Preserve recoverable ownership before replacing even an empty source.
+    // The ledger batch is the pass's single admission point (capacity and
+    // disk pressure): it commits before any other mutation, so a refusal
+    // leaves every row unchanged. Migration then decides against the same
+    // pre-write ownership snapshot; it cannot bypass the ledger.
+    retained.persist(db, previous, mined)?;
+    migrate_legacy_routine_ids_retained(db, mined, retained, scanned)?;
+    let stale = existing_routine_keys(db, scanned)?;
+    let deleted = u64::try_from(stale.len()).unwrap_or(u64::MAX);
+    db.mutate_batch_pressure_bypass(cf::CF_ROUTINES, stale, rows)
+        .map_err(|error| mcp_error(error.code(), format!(
+            "routine_mine failed to replace CF_ROUTINES: {error}; the previous routines are unchanged"
+        )))?;
+    // Separate flushed batches: subsequent mining repairs presence bookkeeping.
+    let mined_at = mined.first().map_or_else(now_ts_ns, |row| row.ts_ns);
+    let state = reconcile_state_rows(db, mined, mined_at, scanned)?;
+    reindex_armed_routine_schedule_due_indexes(db)?;
+    Ok((deleted, state))
+}
+
+fn mining_response(
+    range: (u64, u64),
+    mining: synapse_core::routines::RoutineMining,
+    scanned: u64,
+    dry_run: bool,
+    deleted: u64,
+    state: StateReconcileCounters,
+) -> RoutineMineResponse {
+    RoutineMineResponse {
+        range_start_ns: range.0,
+        range_end_ns: range.1,
+        scanned_episode_rows: scanned,
         considered_episodes: mining.considered_episodes,
         eligible_episodes: mining.eligible_episodes,
         filtered_agent_episodes: mining.filtered_agent_episodes,
@@ -841,14 +899,18 @@ pub fn mine_and_store_routines(
         clusters_rejected_low_confidence: mining.clusters_rejected_low_confidence,
         candidates_rejected_as_subpattern: mining.candidates_rejected_as_subpattern,
         routines_dropped_over_cap: mining.routines_dropped_over_cap,
-        routines_written: if params.dry_run { 0 } else { written },
+        routines_written: if dry_run {
+            0
+        } else {
+            u64::try_from(mining.routines.len()).unwrap_or(u64::MAX)
+        },
         routines_deleted: deleted,
-        state_rows_created: state_counters.created,
-        state_rows_updated: state_counters.updated,
-        state_rows_marked_unmined: state_counters.marked_unmined,
-        dry_run: params.dry_run,
+        state_rows_created: state.created,
+        state_rows_updated: state.updated,
+        state_rows_marked_unmined: state.marked_unmined,
+        dry_run,
         routines: mining.routines,
-    })
+    }
 }
 
 /// Default and maximum `routine_list` page sizes.
@@ -887,7 +949,7 @@ fn synthesized_default_state(routine: &RoutineRecord) -> RoutineStateRecord {
 }
 
 /// Loads every `CF_ROUTINES` row, budget-guarded.
-fn load_all_routine_records(
+pub(super) fn load_all_routine_records(
     db: &Db,
     scanned_rows: &mut u64,
 ) -> Result<BTreeMap<String, RoutineRecord>, ErrorData> {
@@ -1340,11 +1402,14 @@ pub fn inspect_routine(
         (Some(state), _) => state,
         (None, Some(record)) => synthesized_default_state(record),
         (None, None) => {
-            return Err(invalid(format!(
-                "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
+            return Err(mcp_error(
+                error_codes::ROUTINE_NOT_FOUND,
+                format!(
+                    "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
                  CF_ROUTINE_STATE; run routine_list to see what exists",
-                params.routine_id
-            )));
+                    params.routine_id
+                ),
+            ));
         }
     };
     let taint = read_taint_record_from_db(db, "routine", &params.routine_id)?;
@@ -1506,12 +1571,11 @@ pub fn export_routine_label(
     }
 
     let Some(record) = load_routine_record(db, &params.routine_id)? else {
-        return Err(invalid(format!(
-            "ROUTINE_NOT_MINED: routine_id {} is not present in CF_ROUTINES, so it has no \
-             mined template (apps/documents/schedule) to name. Run routine_mine, or \
-             routine_list to see what currently exists",
-            params.routine_id
-        )));
+        return Err(unmined_routine_error(
+            db,
+            &params.routine_id,
+            "name (no apps/documents/schedule template)",
+        ));
     };
 
     let state = load_state_row(db, &params.routine_id)?;
@@ -1773,7 +1837,7 @@ pub fn record_routine_feedback(
 
     if !db.pressure_permits_write(cf::CF_ROUTINE_STATE) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "routine_feedback refused under disk pressure: cf_name={} pressure_level={:?}; \
                  the feedback is unchanged",
@@ -1791,11 +1855,14 @@ pub fn record_routine_feedback(
         None => match &mined {
             Some(record) => synthesized_default_state(record),
             None => {
-                return Err(invalid(format!(
-                    "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
+                return Err(mcp_error(
+                    error_codes::ROUTINE_NOT_FOUND,
+                    format!(
+                        "ROUTINE_NOT_FOUND: routine_id {} exists in neither CF_ROUTINES nor \
                      CF_ROUTINE_STATE; run routine_list to see what exists",
-                    params.routine_id
-                )));
+                        params.routine_id
+                    ),
+                ));
             }
         },
     };
@@ -2024,10 +2091,13 @@ fn routine_state_for_update_response(
         Some(state) => state,
         None => {
             let Some(record) = load_routine_record(db, routine_id)? else {
-                return Err(invalid(format!(
-                    "ROUTINE_NOT_FOUND: routine_id {routine_id} exists in neither CF_ROUTINES nor \
+                return Err(mcp_error(
+                    error_codes::ROUTINE_NOT_FOUND,
+                    format!(
+                        "ROUTINE_NOT_FOUND: routine_id {routine_id} exists in neither CF_ROUTINES nor \
                      CF_ROUTINE_STATE; run routine_list to see what exists"
-                )));
+                    ),
+                ));
             };
             synthesized_default_state(&record)
         }
@@ -2094,7 +2164,7 @@ pub fn update_routine(
 
     if !db.pressure_permits_write(cf::CF_ROUTINE_STATE) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "routine_update refused under disk pressure: cf_name={} pressure_level={:?}; \
                  the lifecycle is unchanged",
@@ -2185,3 +2255,7 @@ pub fn update_routine(
         armed,
     })
 }
+
+#[cfg(test)]
+#[path = "tests/routine_missing_98.rs"]
+mod routine_missing_98_tests;

@@ -4,8 +4,13 @@ pub const OBSERVE_INTERNAL: &str = "OBSERVE_INTERNAL";
 pub const CAPTURE_GRAPHICS_API_UNSUPPORTED: &str = "CAPTURE_GRAPHICS_API_UNSUPPORTED";
 pub const CAPTURE_PRINTWINDOW_DISABLED: &str = "CAPTURE_PRINTWINDOW_DISABLED";
 pub const CAPTURE_PRINTWINDOW_BLACK: &str = "CAPTURE_PRINTWINDOW_BLACK";
+pub const CAPTURE_WGC_FRAME_TIMEOUT: &str = "CAPTURE_WGC_FRAME_TIMEOUT";
+pub const CAPTURE_TARGET_MINIMIZED: &str = "CAPTURE_TARGET_MINIMIZED";
 pub const CAPTURE_TARGET_LOST: &str = "CAPTURE_TARGET_LOST";
 pub const CAPTURE_NO_DIRTY_REGIONS: &str = "CAPTURE_NO_DIRTY_REGIONS";
+pub const CAPTURE_FRAME_UNAVAILABLE: &str = "CAPTURE_FRAME_UNAVAILABLE";
+// A live capture is owned by another live session; stop/retarget refused (#112).
+pub const CAPTURE_OWNED_BY_OTHER_SESSION: &str = "CAPTURE_OWNED_BY_OTHER_SESSION";
 pub const A11Y_NOT_AVAILABLE: &str = "A11Y_NOT_AVAILABLE";
 pub const A11Y_ELEMENT_STALE: &str = "A11Y_ELEMENT_STALE";
 pub const A11Y_NO_FOREGROUND: &str = "A11Y_NO_FOREGROUND";
@@ -15,8 +20,15 @@ pub const A11Y_CDP_AXTREE_FAILED: &str = "A11Y_CDP_AXTREE_FAILED";
 pub const A11Y_CDP_EXTENSION_UNAVAILABLE: &str = "A11Y_CDP_EXTENSION_UNAVAILABLE";
 pub const A11Y_CDP_EXTENSION_DETACHED: &str = "A11Y_CDP_EXTENSION_DETACHED";
 pub const A11Y_CDP_EXTENSION_TIMEOUT: &str = "A11Y_CDP_EXTENSION_TIMEOUT";
+pub const A11Y_CDP_STROKE_TIMEOUT: &str = "A11Y_CDP_STROKE_TIMEOUT";
 pub const A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED: &str = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 pub const CHROME_BRIDGE_EXTENSION_STALE: &str = "CHROME_BRIDGE_EXTENSION_STALE";
+// Multi-browser bridge: no declared browser row owns the window/target, or a
+// row matches ambiguously; the command is refused, never routed by guess.
+pub const BROWSER_BRIDGE_KIND_UNRESOLVED: &str = "BROWSER_BRIDGE_KIND_UNRESOLVED";
+// Multi-browser bridge: the routed browser row declares the command's
+// capability unsupported (`unsupported_capabilities`); refused before queueing.
+pub const BROWSER_BRIDGE_CAPABILITY_UNSUPPORTED: &str = "BROWSER_BRIDGE_CAPABILITY_UNSUPPORTED";
 pub const CHROME_SCRIPTING_EXECUTE_FAILED: &str = "CHROME_SCRIPTING_EXECUTE_FAILED";
 pub const BROWSER_URL_SCHEME_UNSUPPORTED: &str = "BROWSER_URL_SCHEME_UNSUPPORTED";
 pub const CHROME_DOM_SELECTOR_INVALID: &str = "CHROME_DOM_SELECTOR_INVALID";
@@ -26,11 +38,6 @@ pub const CHROME_DOM_ELEMENT_NOT_ACTIONABLE: &str = "CHROME_DOM_ELEMENT_NOT_ACTI
 pub const CHROME_DOM_ACTION_UNSUPPORTED: &str = "CHROME_DOM_ACTION_UNSUPPORTED";
 pub const CHROME_DOM_ACTION_POSTCONDITION_FAILED: &str = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
 pub const BROWSER_WAIT_TIMEOUT: &str = "BROWSER_WAIT_TIMEOUT";
-/// Emitted when an evaluate expression outlives its `timeout_ms` budget.
-///
-/// Distinct from `A11Y_CDP_AXTREE_FAILED`, which signals a thrown JS exception.
-/// The message carries the elapsed and budget milliseconds so an agent can retry
-/// with a larger `timeout_ms` rather than guessing.
 pub const BROWSER_EVALUATE_TIMEOUT: &str = "BROWSER_EVALUATE_TIMEOUT";
 pub const BROWSER_NAVIGATION_FAILED: &str = "BROWSER_NAVIGATION_FAILED";
 pub const A11Y_UIA_WORKER_TIMEOUT: &str = "A11Y_UIA_WORKER_TIMEOUT";
@@ -41,6 +48,7 @@ pub const DETECTION_MODEL_INFER_FAILED: &str = "DETECTION_MODEL_INFER_FAILED";
 pub const DETECTION_NO_FRAME: &str = "DETECTION_NO_FRAME";
 pub const OCR_NO_TEXT: &str = "OCR_NO_TEXT";
 pub const OCR_BACKEND_UNAVAILABLE: &str = "OCR_BACKEND_UNAVAILABLE";
+pub const OCR_LANGUAGE_UNSUPPORTED: &str = "OCR_LANGUAGE_UNSUPPORTED";
 // Per-agent active target (epic #720): each MCP session can bind its own window/CDP
 // target so observe/find/read_text perceive it without stealing the global foreground.
 pub const TARGET_WINDOW_NOT_FOUND: &str = "TARGET_WINDOW_NOT_FOUND";
@@ -50,6 +58,7 @@ pub const TARGET_CO_OWNED: &str = "TARGET_CO_OWNED";
 pub const TARGET_CLAIM_NOT_FOUND: &str = "TARGET_CLAIM_NOT_FOUND";
 pub const TARGET_CLAIM_ADOPT_REFUSED: &str = "TARGET_CLAIM_ADOPT_REFUSED";
 pub const TARGET_CLAIM_OWNER_ACTIVE: &str = "TARGET_CLAIM_OWNER_ACTIVE";
+pub const TARGET_CLAIM_LIMIT_REACHED: &str = "TARGET_CLAIM_LIMIT_REACHED";
 pub const HUD_NO_ACTIVE_PROFILE: &str = "HUD_NO_ACTIVE_PROFILE";
 pub const HUD_FIELD_NOT_DEFINED: &str = "HUD_FIELD_NOT_DEFINED";
 pub const HUD_EXTRACTION_FAILED: &str = "HUD_EXTRACTION_FAILED";
@@ -61,6 +70,12 @@ pub const AUDIO_STT_MODEL_NOT_LOADED: &str = "AUDIO_STT_MODEL_NOT_LOADED";
 pub const ACTION_QUEUE_FULL: &str = "ACTION_QUEUE_FULL";
 pub const ACTION_RATE_LIMITED: &str = "ACTION_RATE_LIMITED";
 pub const ACTION_BACKEND_UNAVAILABLE: &str = "ACTION_BACKEND_UNAVAILABLE";
+/// OS input (keyboard, text, pointer) was refused because the action has no
+/// intended target window (root HWND + pid); Synapse never sends OS input to
+/// whatever window happens to be foreground (#294).
+pub const ACTION_INPUT_TARGET_REQUIRED: &str = "ACTION_INPUT_TARGET_REQUIRED";
+/// Native keyboard focus did not become ready before the input deadline.
+pub const ACTION_INPUT_TARGET_NOT_READY: &str = "ACTION_INPUT_TARGET_NOT_READY";
 pub const ACTION_TARGET_INVALID: &str = "ACTION_TARGET_INVALID";
 pub const ACTION_HOLD_EXCEEDED_MAX: &str = "ACTION_HOLD_EXCEEDED_MAX";
 pub const ACTION_VIGEM_NOT_INSTALLED: &str = "ACTION_VIGEM_NOT_INSTALLED";
@@ -69,16 +84,6 @@ pub const ACTION_ELEMENT_NOT_RESOLVED: &str = "ACTION_ELEMENT_NOT_RESOLVED";
 pub const ACTION_ELEMENT_PATTERN_UNSUPPORTED: &str = "ACTION_ELEMENT_PATTERN_UNSUPPORTED";
 pub const TRANSIENT_ELEMENT_EXPIRED: &str = "TRANSIENT_ELEMENT_EXPIRED";
 pub const ACTION_FOREGROUND_LOST: &str = "ACTION_FOREGROUND_LOST";
-/// OS input (keyboard/text) was refused because no intended target window
-/// (root HWND + pid) was resolved for the action; Synapse never types into
-/// whatever window happens to be foreground.
-pub const ACTION_INPUT_TARGET_REQUIRED: &str = "ACTION_INPUT_TARGET_REQUIRED";
-/// The human is in a fullscreen/D3D, busy, or presentation-mode foreground app
-/// that is not the action target; focus changes and OS input are refused.
-pub const ACTION_HUMAN_FULLSCREEN_FOREGROUND: &str = "ACTION_HUMAN_FULLSCREEN_FOREGROUND";
-/// The human's foreground window belongs to a different process than the
-/// target; a capture/action that would need to steal focus was refused.
-pub const ACTION_HUMAN_FOREGROUND_PROTECTED: &str = "ACTION_HUMAN_FOREGROUND_PROTECTED";
 pub const ACTION_NO_OBSERVED_DELTA: &str = "ACTION_NO_OBSERVED_DELTA";
 pub const ACTION_VERIFY_SURFACE_UNAVAILABLE: &str = "ACTION_VERIFY_SURFACE_UNAVAILABLE";
 pub const ACTION_POSTCONDITION_FAILED: &str = "ACTION_POSTCONDITION_FAILED";
@@ -112,6 +117,19 @@ pub const FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED: &str = "FOREGROUND_RESTORE_SKI
 pub const ACTION_ELEMENT_VALUE_READ_ONLY: &str = "ACTION_ELEMENT_VALUE_READ_ONLY";
 pub const ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED: &str =
     "ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED";
+// User-workspace awareness (#258): an action that would move the human's real
+// foreground, cursor or keyboard focus is refused before delivery while the
+// human used a physical keyboard/mouse within the quiet window
+// (SYNAPSE_USER_ACTIVE_QUIET_MS), or while physical input monitoring is not
+// running, so activity cannot be known (fail closed).
+pub const USER_ACTIVE: &str = "USER_ACTIVE";
+pub const USER_ACTIVITY_UNKNOWN: &str = "USER_ACTIVITY_UNKNOWN";
+// Owner-away mode: real keyboard/mouse input is never delivered while the
+// workstation is locked (also not for an owner-approved call).
+pub const USER_WORKSTATION_LOCKED: &str = "USER_WORKSTATION_LOCKED";
+// Owner-away mode: the owner's physical input arrived while an agent held the
+// foreground input lease; the release interrupt stopped the agent's input.
+pub const USER_RETURNED: &str = "USER_RETURNED";
 
 // === Reflex (06 section 8.3) ===
 pub const REFLEX_CAP_REACHED: &str = "REFLEX_CAP_REACHED";
@@ -160,15 +178,18 @@ pub const TOOL_PARAMS_INVALID: &str = "TOOL_PARAMS_INVALID";
 pub const TOOL_INTERNAL_ERROR: &str = "TOOL_INTERNAL_ERROR";
 pub const HTTP_BIND_NON_LOOPBACK_REFUSED: &str = "HTTP_BIND_NON_LOOPBACK_REFUSED";
 pub const HTTP_TOKEN_INVALID: &str = "HTTP_TOKEN_INVALID";
+pub const HTTP_CONNECTION_CAPACITY: &str = "HTTP_CONNECTION_CAPACITY";
 pub const HTTP_ORIGIN_REFUSED: &str = "HTTP_ORIGIN_REFUSED";
 pub const HTTP_SESSION_INVALID: &str = "HTTP_SESSION_INVALID";
 pub const DAEMON_RESTARTING: &str = "DAEMON_RESTARTING";
+pub const REQUEST_CANCELLED: &str = "REQUEST_CANCELLED";
 pub const REPLAY_TARGET_INVALID: &str = "REPLAY_TARGET_INVALID";
 pub const REPLAY_FORMAT_INVALID: &str = "REPLAY_FORMAT_INVALID";
 
 // === Storage (06 section 8.6) ===
 pub const STORAGE_OPEN_FAILED: &str = "STORAGE_OPEN_FAILED";
 pub const STORAGE_WRITE_FAILED: &str = "STORAGE_WRITE_FAILED";
+pub const STORAGE_WRITE_SHED: &str = "STORAGE_WRITE_SHED";
 pub const STORAGE_READ_FAILED: &str = "STORAGE_READ_FAILED";
 pub const STORAGE_CORRUPTED: &str = "STORAGE_CORRUPTED";
 pub const STORAGE_SCHEMA_MISMATCH: &str = "STORAGE_SCHEMA_MISMATCH";
@@ -177,10 +198,32 @@ pub const STORAGE_DISK_PRESSURE_LEVEL_2: &str = "STORAGE_DISK_PRESSURE_LEVEL_2";
 pub const STORAGE_DISK_PRESSURE_LEVEL_3: &str = "STORAGE_DISK_PRESSURE_LEVEL_3";
 pub const STORAGE_DISK_PRESSURE_LEVEL_4: &str = "STORAGE_DISK_PRESSURE_LEVEL_4";
 pub const STORAGE_CF_HARD_CAP_REACHED: &str = "STORAGE_CF_HARD_CAP_REACHED";
-pub const STORAGE_GC_UNSAFE_EVICTION_REFUSED: &str = "STORAGE_GC_UNSAFE_EVICTION_REFUSED";
+pub const STORAGE_NAMESPACE_QUOTA_REACHED: &str = "STORAGE_NAMESPACE_QUOTA_REACHED";
 
 // === Episodes (derived activity spans, issues #846/#847) ===
 pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
+
+// === Routines (issue #98) ===
+// Successful CF_ROUTINES and CF_ROUTINE_STATE lookups established that the
+// requested routine is absent. Physical read/decode failures retain their
+// storage error codes.
+pub const ROUTINE_NOT_FOUND: &str = "ROUTINE_NOT_FOUND";
+// The routine id has an operator `CF_ROUTINE_STATE` row but no mined
+// `CF_ROUTINES` template, so an operation that needs the template (label
+// export, plan compile, automate) cannot proceed. A precondition failure, not
+// a parameter or storage error (#98).
+pub const ROUTINE_NOT_MINED: &str = "ROUTINE_NOT_MINED";
+// The routine exists but has no armed-automation row, so disarm (or an armed
+// run) has nothing to act on. Distinct from ROUTINE_NOT_FOUND (#98).
+pub const ARMED_ROUTINE_NOT_FOUND: &str = "ARMED_ROUTINE_NOT_FOUND";
+
+// === Suggestions (issue #97) ===
+// A successful CF_KV suggestion lookup established that the requested
+// suggestion is absent. Physical read/decode failures retain their storage
+// error codes.
+pub const SUGGESTION_NOT_FOUND: &str = "SUGGESTION_NOT_FOUND";
+// Plan steps ran, but execution finalization failed; retrying could repeat effects.
+pub const EXECUTION_FINALIZATION_FAILED: &str = "EXECUTION_FINALIZATION_FAILED";
 
 // === Agent spawn templates (#909) ===
 pub const AGENT_TEMPLATE_NOT_FOUND: &str = "AGENT_TEMPLATE_NOT_FOUND";

@@ -13,6 +13,7 @@ use crate::{
     ReflexError,
     conflict::{ConflictCandidate, ConflictLoser, resolve_conflicts},
     dispatch::ReflexActionDispatchContext,
+    enqueue_audit,
     kinds::{
         aim_track::{
             AimTrackContext, AimTrackOutput, AimTrackParams, AimTrackTargetSnapshot,
@@ -28,7 +29,6 @@ use crate::{
         },
     },
     scheduler::ScheduledReflexDriver,
-    write_audit,
 };
 
 pub(super) fn step_stateful_controllers(
@@ -88,11 +88,15 @@ pub(super) fn step_stateful_controllers(
                 }
                 StatefulOutcome::Idle => {}
                 StatefulOutcome::Blocked { error } => {
+                    if matches!(error, ReflexError::InputTarget { .. }) {
+                        super::mark_reflex_error(runtime, index, &error);
+                        continue;
+                    }
                     *dispatch_blocked = true;
                     if error.code() == error_codes::REFLEX_ACTION_PERMISSION_DENIED {
                         super::mark_reflex_action_denied(runtime, index);
                     } else {
-                        super::mark_reflex_error(runtime, index, error.code());
+                        super::mark_reflex_error(runtime, index, &error);
                     }
                     warn_stateful_dispatch_blocked(index, &error);
                     return;
@@ -358,7 +362,7 @@ fn step_combo(
     index: usize,
     elapsed: Duration,
 ) -> Option<StatefulOutcome> {
-    let dispatch_context = dispatch_context(runtime);
+    let dispatch_context = dispatch_context(runtime, index);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
     let controller = runtime.combo_states.get_mut(index)?.as_mut()?;
     let context = ComboContext {
@@ -386,7 +390,7 @@ fn step_path_follow(
     index: usize,
     elapsed: Duration,
 ) -> Option<StatefulOutcome> {
-    let dispatch_context = dispatch_context(runtime);
+    let dispatch_context = dispatch_context(runtime, index);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
     let context = PathFollowContext {
         tick_elapsed: elapsed,
@@ -428,7 +432,7 @@ fn step_path_follow(
     }
 }
 
-fn dispatch_context(runtime: &RuntimeState) -> ReflexActionDispatchContext {
+fn dispatch_context(runtime: &RuntimeState, index: usize) -> ReflexActionDispatchContext {
     ReflexActionDispatchContext::new(
         runtime.action_handle.clone(),
         runtime.action_gate.clone(),
@@ -436,6 +440,7 @@ fn dispatch_context(runtime: &RuntimeState) -> ReflexActionDispatchContext {
         runtime.audit_context.clone(),
         runtime.tick_index,
     )
+    .with_reflex_target(&runtime.reflexes[index].reflex)
 }
 
 fn step_aim_track(
@@ -444,7 +449,7 @@ fn step_aim_track(
     elapsed: Duration,
 ) -> Option<StatefulOutcome> {
     runtime.aim_track_states.get(index)?.as_ref()?;
-    let dispatch_context = dispatch_context(runtime);
+    let dispatch_context = dispatch_context(runtime, index);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
     let cursor = match synapse_action::backend::software::cursor_position() {
         Ok(cursor) => cursor,
@@ -506,7 +511,7 @@ fn step_hold_move(
     events: &[Event],
     elapsed: Duration,
 ) -> Option<StatefulOutcome> {
-    let dispatch_context = dispatch_context(runtime);
+    let dispatch_context = dispatch_context(runtime, index);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
     let controller = runtime.hold_move_states.get_mut(index)?.as_mut()?;
     let mut actions = 0_usize;
@@ -582,7 +587,7 @@ fn step_hold_button(
     events: &[Event],
     elapsed: Duration,
 ) -> Option<StatefulOutcome> {
-    let dispatch_context = dispatch_context(runtime);
+    let dispatch_context = dispatch_context(runtime, index);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
     let controller = runtime.hold_button_states.get_mut(index)?.as_mut()?;
     let mut actions = 0_usize;
@@ -642,7 +647,7 @@ fn write_path_follow_tick_audit(
     if records.is_empty() {
         return;
     }
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(db) = runtime.audit_producer.as_ref() else {
         return;
     };
     let steps = records
@@ -678,7 +683,7 @@ fn write_path_follow_tick_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
+    if let Err(error) = enqueue_audit(db, &audit) {
         tracing::warn!(
             component = "reflex_path_follow",
             reflex_id = %audit.reflex_id,
@@ -719,7 +724,7 @@ fn write_aim_track_correction_audit(
     smoothed_delta: (f64, f64),
     snapshot: &AimTrackTargetSnapshot,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(db) = runtime.audit_producer.as_ref() else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -750,7 +755,7 @@ fn write_aim_track_correction_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
+    if let Err(error) = enqueue_audit(db, &audit) {
         tracing::warn!(
             component = "reflex_aim_track",
             reflex_id = %audit.reflex_id,

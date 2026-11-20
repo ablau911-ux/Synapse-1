@@ -8,7 +8,7 @@ use crate::{
 use super::{
     MODEL_SOT, MODEL_TOOL,
     errors::{facade_delegate_error, missing_spec},
-    policy::{require_maintenance_profile, session_or_stdio},
+    policy::{require_maintenance_profile_for_session, session_or_stdio},
     response::model_response,
     types::{ModelOperation, ModelParams, ModelResponse, ModelStatusResponse},
     validation::validate_model_params,
@@ -18,15 +18,43 @@ pub(super) async fn handle(
     params: Parameters<ModelParams>,
     request_context: RequestContext<RoleServer>,
 ) -> Result<Json<ModelResponse>, ErrorData> {
-    validate_model_params(&params.0)?;
-    let operation = params.0.operation;
+    let operation = begin(&params.0)?;
+    let session_id = crate::server::context::mcp_session_id_from_request_context(&request_context)?;
+    run(service, params, operation, session_id.as_deref()).await
+}
+
+impl SynapseService {
+    /// The `model` facade for an already-resolved MCP session id (`None` =
+    /// stdio). Test seam: the tool path without a `RequestContext`.
+    pub(crate) async fn model_for_session(
+        &self,
+        params: ModelParams,
+        session_id: Option<&str>,
+    ) -> Result<Json<ModelResponse>, ErrorData> {
+        let operation = begin(&params)?;
+        run(self, Parameters(params), operation, session_id).await
+    }
+}
+
+fn begin(params: &ModelParams) -> Result<ModelOperation, ErrorData> {
+    validate_model_params(params)?;
+    let operation = params.operation;
     tracing::info!(
         code = "MCP_TOOL_INVOCATION",
         kind = MODEL_TOOL,
         operation = operation.as_str(),
         "tool.invocation kind=model"
     );
-    let by_session = session_or_stdio(&request_context)?;
+    Ok(operation)
+}
+
+async fn run(
+    service: &SynapseService,
+    params: Parameters<ModelParams>,
+    operation: ModelOperation,
+    session_id: Option<&str>,
+) -> Result<Json<ModelResponse>, ErrorData> {
+    let by_session = session_or_stdio(session_id);
     let db = service.m3_storage().map_err(|error| {
         facade_delegate_error(
             MODEL_TOOL,
@@ -37,6 +65,16 @@ pub(super) async fn handle(
             "repair M3 storage and retry the model registry operation",
         )
     })?;
+    if requires_maintenance_profile(operation) {
+        require_maintenance_profile_for_session(
+            service,
+            session_id,
+            MODEL_TOOL,
+            operation.as_str(),
+            mutation_target(&params.0),
+            MODEL_SOT,
+        )?;
+    }
     match operation {
         ModelOperation::List => {
             let spec = params.0.list.unwrap_or(LocalModelListParams {
@@ -137,14 +175,6 @@ pub(super) async fn handle(
                 .0
                 .register
                 .ok_or_else(|| missing_spec(MODEL_TOOL, "register"))?;
-            require_maintenance_profile(
-                service,
-                &request_context,
-                MODEL_TOOL,
-                operation.as_str(),
-                &spec.name,
-                MODEL_SOT,
-            )?;
             service.require_m3_permissions(
                 MODEL_TOOL,
                 &crate::m3::local_models::required_permissions_register(&spec),
@@ -173,14 +203,6 @@ pub(super) async fn handle(
                 .0
                 .update
                 .ok_or_else(|| missing_spec(MODEL_TOOL, "update"))?;
-            require_maintenance_profile(
-                service,
-                &request_context,
-                MODEL_TOOL,
-                operation.as_str(),
-                &spec.name,
-                MODEL_SOT,
-            )?;
             service.require_m3_permissions(
                 MODEL_TOOL,
                 &crate::m3::local_models::required_permissions_update(&spec),
@@ -208,14 +230,6 @@ pub(super) async fn handle(
                 .0
                 .remove
                 .ok_or_else(|| missing_spec(MODEL_TOOL, "remove"))?;
-            require_maintenance_profile(
-                service,
-                &request_context,
-                MODEL_TOOL,
-                operation.as_str(),
-                &spec.name,
-                MODEL_SOT,
-            )?;
             service.require_m3_permissions(
                 MODEL_TOOL,
                 &crate::m3::local_models::required_permissions_remove(&spec),
@@ -241,6 +255,30 @@ pub(super) async fn handle(
             )))
         }
     }
+}
+
+/// Operations that write registry or probe-evidence rows are refused outside a
+/// maintenance profile; `list` and `status` stay read-only for `normal_agent`.
+pub(super) const fn requires_maintenance_profile(operation: ModelOperation) -> bool {
+    matches!(
+        operation,
+        ModelOperation::Probe
+            | ModelOperation::Register
+            | ModelOperation::Update
+            | ModelOperation::Remove
+    )
+}
+
+/// Registry row name the operation targets, for the policy-denial readback.
+fn mutation_target(params: &ModelParams) -> &str {
+    let name = match params.operation {
+        ModelOperation::Probe => params.probe.as_ref().map(|spec| spec.name.as_str()),
+        ModelOperation::Register => params.register.as_ref().map(|spec| spec.name.as_str()),
+        ModelOperation::Update => params.update.as_ref().map(|spec| spec.name.as_str()),
+        ModelOperation::Remove => params.remove.as_ref().map(|spec| spec.name.as_str()),
+        ModelOperation::List | ModelOperation::Status => None,
+    };
+    name.unwrap_or("model")
 }
 
 fn model_status(list: &LocalModelListResponse) -> ModelStatusResponse {
@@ -272,3 +310,6 @@ fn model_status(list: &LocalModelListResponse) -> ModelStatusResponse {
             .count(),
     }
 }
+#[cfg(test)]
+#[path = "../tests/model_probe_profile_58.rs"]
+mod model_probe_profile_58_tests;

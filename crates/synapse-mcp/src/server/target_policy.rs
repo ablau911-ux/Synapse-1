@@ -30,8 +30,8 @@ const KEY_LAUNCH_TARGET: &str = "launch.target";
 const KEY_LAUNCH_WORLD: &str = "launch.world";
 const KEY_LAUNCH_LOGFILE: &str = "launch.logfile";
 const KEY_BENCHMARK_GAMEID: &str = "benchmark_world_gameid";
-const KEY_RUNTIME_LIVE_SERVER_EXE: &str = "runtime.live_server.exe";
-const KEY_RUNTIME_LIVE_SERVER_NAME: &str = "runtime.live_server.name";
+const KEY_RUNTIME_EVERQUEST_EXE: &str = "runtime.everquest.exe";
+const KEY_RUNTIME_EVERQUEST_SERVER: &str = "runtime.everquest.server";
 
 /// Opt-in enforcement of the legacy game-target `supported_use` policy.
 ///
@@ -44,7 +44,7 @@ const KEY_RUNTIME_LIVE_SERVER_NAME: &str = "runtime.live_server.name";
 /// always active.
 const ENFORCE_SUPPORTED_USE_ENV: &str = "SYNAPSE_ENFORCE_SUPPORTED_USE";
 
-fn supported_use_enforced() -> bool {
+pub(super) fn supported_use_enforced() -> bool {
     env::var_os(ENFORCE_SUPPORTED_USE_ENV).is_some_and(|raw| {
         matches!(
             raw.to_string_lossy().trim().to_ascii_lowercase().as_str(),
@@ -105,7 +105,19 @@ pub(super) fn ensure_supported_use_allows(
     foreground: &ForegroundContext,
     tool: &'static str,
 ) -> Result<(), ErrorData> {
-    if !supported_use_enforced() {
+    ensure_supported_use_allows_with(runtime, foreground, tool, supported_use_enforced())
+}
+
+/// Test seam for [`ensure_supported_use_allows`]: `enforced` replaces the
+/// process-global `SYNAPSE_ENFORCE_SUPPORTED_USE` read, which a test cannot
+/// set under `unsafe_code = "forbid"`.
+pub(super) fn ensure_supported_use_allows_with(
+    runtime: &ProfileRuntime,
+    foreground: &ForegroundContext,
+    tool: &'static str,
+    enforced: bool,
+) -> Result<(), ErrorData> {
+    if !enforced {
         // Default posture: general Windows computer-control. The legacy
         // game world/server gate is opt-in via SYNAPSE_ENFORCE_SUPPORTED_USE.
         return Ok(());
@@ -114,32 +126,9 @@ pub(super) fn ensure_supported_use_allows(
         .resolve_foreground(&foreground_window(foreground))
         .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?
         .map(|resolution| resolution.profile_id);
-    let active_profile_id = runtime
-        .active_profile_id()
-        .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?;
-    let active_profile = match active_profile_id {
-        Some(profile_id) => runtime
-            .profile(&profile_id)
-            .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?,
-        None => None,
-    };
-    let profile = match active_profile {
-        Some(profile) if has_supported_use_policy(&profile) => profile,
-        _ => {
-            let Some(profile_id) = observed_profile_id.clone() else {
-                return Ok(());
-            };
-            let Some(profile) = runtime
-                .profile(&profile_id)
-                .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?
-            else {
-                return Ok(());
-            };
-            if !has_supported_use_policy(&profile) {
-                return Ok(());
-            }
-            profile
-        }
+    let Some(profile) = supported_use_policy_profile(runtime, observed_profile_id.as_ref(), tool)?
+    else {
+        return Ok(());
     };
     if observed_profile_id.as_deref() != Some(profile.id.as_str()) {
         return Err(target_policy_denied_error(
@@ -177,6 +166,89 @@ pub(super) fn ensure_supported_use_allows(
         }
         Err(denial) => Err(target_policy_denied_error(tool, denial)),
     }
+}
+
+/// The profile whose `supported_use` policy governs this dispatch: the active
+/// profile when it carries a policy, else the profile the foreground resolved
+/// to when that one carries a policy. `None` means no policy applies.
+fn supported_use_policy_profile(
+    runtime: &ProfileRuntime,
+    observed_profile_id: Option<&ProfileId>,
+    tool: &'static str,
+) -> Result<Option<Profile>, ErrorData> {
+    let active_profile_id = runtime
+        .active_profile_id()
+        .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?;
+    let active_profile = match active_profile_id {
+        Some(profile_id) => runtime
+            .profile(&profile_id)
+            .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?,
+        None => None,
+    };
+    if let Some(profile) = active_profile
+        && has_supported_use_policy(&profile)
+    {
+        return Ok(Some(profile));
+    }
+    let Some(profile_id) = observed_profile_id else {
+        return Ok(None);
+    };
+    let Some(profile) = runtime
+        .profile(profile_id)
+        .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    Ok(has_supported_use_policy(&profile).then_some(profile))
+}
+
+/// Live-server deny-list check for the degraded "no foreground window" path
+/// (#203). With enforcement on, a locked screen or desktop focus must not
+/// switch the live-server tool deny-list off: the tools it names are exactly
+/// the unattended ones the policy exists to block. Only the active profile is
+/// known here (there is no foreground to resolve), so evaluate it directly.
+pub(super) fn ensure_supported_use_allows_without_foreground(
+    runtime: &ProfileRuntime,
+    tool: &'static str,
+) -> Result<(), ErrorData> {
+    if !supported_use_enforced() {
+        return Ok(());
+    }
+    let Some(profile_id) = runtime
+        .active_profile_id()
+        .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?
+    else {
+        return Ok(());
+    };
+    let Some(profile) = runtime
+        .profile(&profile_id)
+        .map_err(|error| target_policy_internal_error(tool, &error.to_string()))?
+    else {
+        return Ok(());
+    };
+    match live_server_no_foreground_denial(&profile.id, &profile.metadata, tool) {
+        Some(denial) => Err(target_policy_denied_error(tool, denial)),
+        None => Ok(()),
+    }
+}
+
+fn live_server_no_foreground_denial(
+    profile_id: &ProfileId,
+    metadata: &BTreeMap<String, String>,
+    tool: &str,
+) -> Option<Box<TargetPolicyDenial>> {
+    if !metadata_bool(metadata, KEY_LIVE_SERVER_ALLOWED) {
+        return None;
+    }
+    let detail = live_server_denied_tool_detail(tool)?;
+    Some(Box::new(TargetPolicyDenial {
+        reason: "live_server_tool_not_foreground_input",
+        detail: detail.to_owned(),
+        profile_id: profile_id.clone(),
+        foreground_pid: 0,
+        foreground_process_path: String::new(),
+        evidence: DenialEvidence::default(),
+    }))
 }
 
 fn evaluate_supported_use_with_optional_process_for_tool(
@@ -362,8 +434,7 @@ fn evaluate_operator_attended_live_server(
         ));
     }
 
-    if let Some(expected_exe) =
-        optional_expanded_path(&profile.metadata, KEY_RUNTIME_LIVE_SERVER_EXE)
+    if let Some(expected_exe) = optional_expanded_path(&profile.metadata, KEY_RUNTIME_EVERQUEST_EXE)
         && !same_path_text(&expected_exe, Path::new(&foreground.process_path))
     {
         return Err(denial(
@@ -378,12 +449,12 @@ fn evaluate_operator_attended_live_server(
             DenialEvidence::default(),
         ));
     }
-    if metadata_trimmed(&profile.metadata, KEY_RUNTIME_LIVE_SERVER_NAME).is_none() {
+    if metadata_trimmed(&profile.metadata, KEY_RUNTIME_EVERQUEST_SERVER).is_none() {
         return Err(denial(
             profile,
             foreground,
             "live_server_name_missing",
-            format!("{KEY_RUNTIME_LIVE_SERVER_NAME} metadata is required"),
+            format!("{KEY_RUNTIME_EVERQUEST_SERVER} metadata is required"),
             DenialEvidence::default(),
         ));
     }
@@ -410,6 +481,9 @@ fn live_server_denied_tool_detail(tool: &str) -> Option<&'static str> {
         ),
         "reflex_register" => Some(
             "reflex_register is denied for operator-attended live-server profiles because background reflex dispatch is not supervised foreground input",
+        ),
+        "reflex_dispatch" => Some(
+            "reflex_dispatch is denied for operator-attended live-server profiles because background reflex dispatch is not supervised foreground input",
         ),
         _ => None,
     }
@@ -911,3 +985,11 @@ fn target_policy_internal_error(tool: &'static str, detail: &str) -> ErrorData {
         })),
     )
 }
+
+#[cfg(test)]
+#[path = "tests/live_server_no_foreground_203.rs"]
+mod live_server_no_foreground_203;
+
+#[cfg(test)]
+#[path = "tests/reflex_dispatch_live_server_204.rs"]
+mod reflex_dispatch_live_server_204;

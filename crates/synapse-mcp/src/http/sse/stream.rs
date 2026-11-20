@@ -9,10 +9,9 @@ use axum::{
 };
 use futures_util::stream;
 use synapse_core::Event;
-use synapse_reflex::SUBSCRIBER_QUEUE_CAPACITY;
 
 use super::{
-    SUBSCRIPTION_ID_HEADER, replay,
+    SUBSCRIPTION_ID_HEADER, SseState, replay,
     ring::{BufferedEvent, Subscription},
 };
 
@@ -23,6 +22,7 @@ pub(super) enum SseFrame {
     SubscriptionStarted {
         subscription_id: String,
         lossy: bool,
+        buffer_capacity: usize,
     },
     Event {
         subscription_id: String,
@@ -32,8 +32,36 @@ pub(super) enum SseFrame {
     },
 }
 
+/// #173: held by the live stream; dropping the stream (client disconnect,
+/// page reload, server shutdown) detaches it so orphaned subscriptions are
+/// released instead of leaking toward the subscription cap.
+#[derive(Debug)]
+pub(super) struct StreamGuard {
+    subscription: Arc<Subscription>,
+    state: SseState,
+}
+
+impl StreamGuard {
+    pub(super) fn attach(state: &SseState, subscription: &Arc<Subscription>) -> Self {
+        subscription.attachment().attach();
+        Self {
+            subscription: Arc::clone(subscription),
+            state: state.clone(),
+        }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if self.subscription.attachment().detach() {
+            self.state.schedule_orphan_reap();
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LiveStreamState {
+    _guard: StreamGuard,
     subscription: Arc<Subscription>,
     pending: VecDeque<SseFrame>,
     last_sent_seq: Option<u64>,
@@ -43,9 +71,10 @@ pub(super) fn sse_response(
     subscription: Arc<Subscription>,
     frames: VecDeque<SseFrame>,
     last_sent_seq: Option<u64>,
+    guard: StreamGuard,
 ) -> Response {
     let subscription_id = subscription.id().to_owned();
-    let stream = live_stream(subscription, frames, last_sent_seq);
+    let stream = live_stream(subscription, frames, last_sent_seq, guard);
     let mut response = Sse::new(stream).into_response();
     if let Ok(header_value) = HeaderValue::from_str(&subscription_id) {
         response
@@ -59,9 +88,11 @@ fn live_stream(
     subscription: Arc<Subscription>,
     pending: VecDeque<SseFrame>,
     last_sent_seq: Option<u64>,
+    guard: StreamGuard,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static {
     stream::unfold(
         LiveStreamState {
+            _guard: guard,
             subscription,
             pending,
             last_sent_seq,
@@ -87,10 +118,15 @@ fn live_stream(
 }
 
 impl SseFrame {
-    pub(super) fn subscription_started(subscription_id: &str, lossy: bool) -> Self {
+    pub(super) fn subscription_started(
+        subscription_id: &str,
+        lossy: bool,
+        buffer_capacity: usize,
+    ) -> Self {
         Self::SubscriptionStarted {
             subscription_id: subscription_id.to_owned(),
             lossy,
+            buffer_capacity,
         }
     }
 
@@ -115,9 +151,10 @@ impl SseFrame {
             Self::SubscriptionStarted {
                 subscription_id,
                 lossy,
-            } => SseEvent::default()
-                .event("subscription_started")
-                .data(subscription_started_data(&subscription_id, lossy).to_string()),
+                buffer_capacity,
+            } => SseEvent::default().event("subscription_started").data(
+                subscription_started_data(&subscription_id, lossy, buffer_capacity).to_string(),
+            ),
             Self::Event {
                 subscription_id,
                 stream_seq,
@@ -134,11 +171,15 @@ impl SseFrame {
     }
 }
 
-fn subscription_started_data(subscription_id: &str, lossy: bool) -> serde_json::Value {
+fn subscription_started_data(
+    subscription_id: &str,
+    lossy: bool,
+    buffer_capacity: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "subscription_id": subscription_id,
         "lossy": lossy,
-        "buffer_capacity": SUBSCRIBER_QUEUE_CAPACITY,
+        "buffer_capacity": buffer_capacity,
     })
 }
 

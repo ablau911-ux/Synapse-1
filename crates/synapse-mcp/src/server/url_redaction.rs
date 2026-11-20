@@ -2,13 +2,33 @@ const URL_REDACTION_MARKER: &str = "redacted";
 
 use serde_json::Value;
 
+/// Whether a loopback URL keeps its path. Public readback keeps it so an agent
+/// can check which page its own tab shows (#299); the daemon log does not.
+#[derive(Clone, Copy)]
+enum LoopbackPath {
+    Keep,
+    Redact,
+}
+
+/// Public readback form: credentials, query and fragment are always redacted;
+/// the path is redacted too, except on loopback hosts (`localhost`,
+/// `*.localhost`, 127.0.0.0/8, `::1`), where it is kept (#299).
 pub(crate) fn redact_url_for_public_readback(url: &str) -> String {
+    redact_url(url, LoopbackPath::Keep)
+}
+
+/// Daemon-log form (#185): every path is redacted, loopback ones included.
+fn redact_url_for_log(url: &str) -> String {
+    redact_url(url, LoopbackPath::Redact)
+}
+
+fn redact_url(url: &str, loopback: LoopbackPath) -> String {
     if url.is_empty() {
         return String::new();
     }
 
     if let Some(rest) = strip_scheme_prefix(url, "view-source") {
-        return format!("view-source:{}", redact_url_for_public_readback(rest));
+        return format!("view-source:{}", redact_url(rest, loopback));
     }
 
     for scheme in ["data", "javascript", "mailto", "blob", "filesystem"] {
@@ -26,8 +46,31 @@ pub(crate) fn redact_url_for_public_readback(url: &str) -> String {
     }
 
     match reqwest::Url::parse(url) {
-        Ok(parsed) => redact_parsed_url(parsed),
+        Ok(parsed) => redact_parsed_url_with(parsed, loopback),
         Err(_error) => redact_query_and_fragment_without_parse(url),
+    }
+}
+
+/// Log-field wrapper (#185): `url = %RedactedUrl(&target.url)` writes the
+/// public-readback form, never query strings, fragments, credentials or
+/// `data:`/`javascript:` payloads, into the daemon log.
+pub(crate) struct RedactedUrl<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for RedactedUrl<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&redact_url_for_log(self.0))
+    }
+}
+
+/// [`RedactedUrl`] for an optional URL; absent prints `<none>`.
+pub(crate) struct RedactedUrlOpt<'a>(pub(crate) Option<&'a str>);
+
+impl std::fmt::Display for RedactedUrlOpt<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(url) => RedactedUrl(url).fmt(formatter),
+            None => formatter.write_str("<none>"),
+        }
     }
 }
 
@@ -49,16 +92,16 @@ pub(crate) fn redact_url_fields_for_public_readback(value: &mut Value) -> usize 
                 is_public_url_field(key) && value_has_content_bearing_url(child)
             });
             for (key, child) in fields {
-                if is_public_title_field(key) {
-                    if let Some(title) = child.as_str() {
-                        let public =
-                            redact_title_value_for_public_readback(title, has_content_bearing_url);
-                        if public != title {
-                            *child = Value::String(public);
-                            redacted += 1;
-                        }
-                        continue;
+                if is_public_title_field(key)
+                    && let Some(title) = child.as_str()
+                {
+                    let public =
+                        redact_title_value_for_public_readback(title, has_content_bearing_url);
+                    if public != title {
+                        *child = Value::String(public);
+                        redacted += 1;
                     }
+                    continue;
                 }
                 if is_public_url_field(key) {
                     if let Some(url) = child.as_str() {
@@ -122,10 +165,15 @@ fn strip_scheme_prefix<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     candidate.eq_ignore_ascii_case(scheme).then_some(rest)
 }
 
-fn redact_parsed_url(mut parsed: reqwest::Url) -> String {
+fn redact_parsed_url(parsed: reqwest::Url) -> String {
+    redact_parsed_url_with(parsed, LoopbackPath::Redact)
+}
+
+fn redact_parsed_url_with(mut parsed: reqwest::Url, loopback: LoopbackPath) -> String {
     let _ = parsed.set_username("");
     let _ = parsed.set_password(None);
-    if parsed.path() != "/" && !parsed.path().is_empty() {
+    let keep_path = matches!(loopback, LoopbackPath::Keep) && has_loopback_host(&parsed);
+    if !keep_path && parsed.path() != "/" && !parsed.path().is_empty() {
         parsed.set_path(&format!("/{URL_REDACTION_MARKER}"));
     }
     if parsed.query().is_some() {
@@ -135,6 +183,19 @@ fn redact_parsed_url(mut parsed: reqwest::Url) -> String {
         parsed.set_fragment(Some(URL_REDACTION_MARKER));
     }
     parsed.to_string()
+}
+
+/// `localhost`, any `*.localhost` name (RFC 6761), or a loopback IP literal.
+fn has_loopback_host(parsed: &reqwest::Url) -> bool {
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost")
 }
 
 fn redact_about_url(rest: &str) -> String {
@@ -253,3 +314,11 @@ fn is_public_title_field(key: &str) -> bool {
     let lowered = key.to_ascii_lowercase();
     lowered == "title" || lowered.ends_with("_title") || lowered.ends_with("title")
 }
+
+#[cfg(test)]
+#[path = "tests/redacted_url_log_185.rs"]
+mod redacted_url_log_185_tests;
+
+#[cfg(test)]
+#[path = "tests/loopback_url_readback_299.rs"]
+mod loopback_url_readback_299_tests;

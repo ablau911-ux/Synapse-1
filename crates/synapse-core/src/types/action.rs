@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{Backend, ElementId, PathSpec, Point};
 
+/// Root window and owning process captured when an automation is configured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoredInputTarget {
+    pub root_hwnd: i64,
+    pub pid: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {

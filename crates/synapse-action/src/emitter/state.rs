@@ -32,6 +32,8 @@ pub struct EmitState {
     pub(crate) pad_state: HashMap<PadId, GamepadReport>,
     active_backend: Option<ResolvedBackend>,
     delivery_target: Option<crate::InputDeliveryTarget>,
+    /// Release epoch read when the action now executing was enqueued (#188).
+    enqueued_release_epoch: Option<u64>,
 }
 
 impl EmitState {
@@ -48,6 +50,7 @@ impl EmitState {
             pad_state: HashMap::new(),
             active_backend: None,
             delivery_target: None,
+            enqueued_release_epoch: None,
         }
     }
 
@@ -180,10 +183,22 @@ impl EmitState {
         self.active_backend = None;
     }
 
-    /// Sets the intended OS-input window for the action being dispatched; the
-    /// software backend verifies the live foreground against it before every
-    /// input batch.
-    pub const fn set_delivery_target(&mut self, target: Option<crate::InputDeliveryTarget>) {
+    /// Records the release epoch read when the action about to execute was
+    /// enqueued, so a backend can stop it for an interrupt raised while it was
+    /// still queued (#188). `None` means the action has no enqueue epoch (for
+    /// example an internal auto-release) and the backend reads its own.
+    pub(crate) const fn set_enqueued_release_epoch(&mut self, epoch: Option<u64>) {
+        self.enqueued_release_epoch = epoch;
+    }
+
+    /// The enqueue release epoch of the action now executing, if any.
+    #[must_use]
+    pub const fn enqueued_release_epoch(&self) -> Option<u64> {
+        self.enqueued_release_epoch
+    }
+
+    /// Sets the intended OS-input window for the current dispatch.
+    pub fn set_delivery_target(&mut self, target: Option<crate::InputDeliveryTarget>) {
         self.delivery_target = target;
     }
 

@@ -1,13 +1,19 @@
+pub mod action_history;
+mod confidence_source;
 pub mod defaults;
 pub mod episodes;
 pub mod error_codes;
 pub mod filter;
 pub mod intent;
+pub mod ledger;
+pub mod metric_labels;
 pub mod retention;
+pub mod route_memory;
+pub mod routine_identity;
 pub mod routines;
 pub mod types;
-pub mod win32_hwnd;
 
+pub use confidence_source::ConfidenceSource;
 pub use defaults::{DEFAULT_AIM_TRACK_EMA_ALPHA, SCHEMA_VERSION};
 pub use types::{
     AGENT_EVENT_MAX_ID_CHARS, AGENT_EVENT_MAX_REASON_CHARS, AGENT_EVENT_RECORD_VERSION,
@@ -16,7 +22,7 @@ pub use types::{
     AccessibleQuery, AccessibleQueryScope, AccessibleSubtree, Action, AgentEndState,
     AgentEventKind, AgentEventRecord, AgentTranscriptRecord, AimCurve, AimNaturalParams, AimStyle,
     AimTarget, AudioContext, AudioCue, AudioEvent, Backend, BillableUsage, ButtonAction,
-    CaptureRuntimeReadback, CdpCapability, CdpDiagnostics, CdpStatus, ChromeBridgeDetail,
+    CaptureFrameCursor, CaptureRuntimeReadback, CdpCapability, CdpDiagnostics, CdpStatus,
     ClipboardSummary, ComboInput, ComboStep, CostBreakdown, CostOutcome,
     DEFAULT_HUD_CONFIDENCE_THRESHOLD, DataPredicate, DetectedEntity, Detection, DetectionBatch,
     DirectionEstimate, EVENT_FILTER_MAX_DEPTH, ElementId, ElementIdParseError, ElementIdParts,
@@ -28,7 +34,7 @@ pub use types::{
     KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MODEL_PRICE_MAX_ID_CHARS,
     MODEL_PRICE_VERSION, ModelPrice, MouseButton, MouseTarget, Observation,
     ObservationCaptureConfig, ObservationCaptureTarget, ObservationDiagnostics,
-    ObservationElementsPage, OcrBackend, OcrConfidenceSource, OcrResult, OcrWord,
+    ObservationElementsPage, OcrBackend, OcrCacheWriteNotice, OcrResult, OcrWord,
     PERCEIVED_TEXT_UNTRUSTED_NOTICE, PROFILE_SCHEMA_VERSION, PadButton, PadId, PathPoint, PathSpec,
     PerceptionMode, Point, Profile, ProfileBackends, ProfileCapture, ProfileCaptureTarget,
     ProfileDetection, ProfileId, ProfileMatch, ProfileOcr, ProfileUseScope, RealityAudit,
@@ -36,12 +42,23 @@ pub use types::{
     RealityDeltaValidationError, RealityDriftItem, RealityDriftStatus, RealitySourceSurface,
     RealityTargetKind, RealityTargetRef, Rect, RedactionPolicy, RedactionSummary, ReflexAimAxis,
     ReflexButtonTarget, ReflexId, ReflexKind, ReflexLifetime, ReflexRegistration, ReflexState,
-    ReflexStatus, ReflexThen, SensorStatus, SessionId, Size, SourceRef, Stick, StoredAppContext,
-    StoredAuditContext, StoredBackendPolicy, StoredEvent, StoredObservation,
-    StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession,
-    StrokeMotionModel, StrokeTiming, SubscriptionId, SubsystemHealth, SuspectedInjectionAnnotation,
-    SuspectedInjectionSpan, TranscriptModelUsage, TranscriptParseStatus, TranscriptRole,
-    TranscriptSource, TranscriptToolCall, TranscriptUsage, Trigger, UiaPattern, VelocityProfile,
-    WebPerceptionPath, WindowEdge, default_hud_confidence_threshold, element_id, entity_id,
-    new_reflex_id, new_session_id, new_subscription_id,
+    ReflexStatus, ReflexThen, SensorStatus, SessionId, Size, SnapshotScope, SnapshotStopReason,
+    SourceRef, Stick, StoredAppContext, StoredAuditContext, StoredBackendPolicy, StoredEvent,
+    StoredObservation, StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit,
+    StoredReflexStep, StoredSession, StrokeMotionModel, StrokeTiming, SubscriptionId,
+    SubsystemHealth, SuspectedInjectionAnnotation, SuspectedInjectionSpan, TranscriptModelUsage,
+    TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
+    Trigger, UiaPattern, VelocityProfile, WebPerceptionPath, WindowEdge,
+    default_hud_confidence_threshold, element_id, entity_id, new_reflex_id, new_session_id,
+    new_subscription_id,
 };
+
+#[cfg(test)]
+#[path = "confidence_source_table.rs"]
+mod confidence_source_table;
+
+#[cfg(test)]
+#[path = "route_memory_table.rs"]
+// The frozen table's row tuples are its own; it is never edited.
+#[allow(clippy::type_complexity)]
+mod route_memory_table;

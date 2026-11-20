@@ -10,6 +10,7 @@ use synapse_core::{error_codes, retention::RetentionTtl};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, encode_json};
 
+use super::episodes::hex_encode;
 use crate::m1::mcp_error;
 
 pub const AUDIT_RETENTION_MODE: &str = "AUDIT_RETENTION";
@@ -862,16 +863,6 @@ fn set_field(row: &mut Value, field: &str, value: Value) {
     if let Some(object) = row.as_object_mut() {
         object.insert(field.to_owned(), value);
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn storage_error(error: synapse_storage::StorageError) -> ErrorData {

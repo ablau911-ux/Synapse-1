@@ -31,30 +31,6 @@ impl From<AuditCommandQueryParams> for CommandAuditQueryParams {
 pub(super) fn summarize_command_query(
     response: CommandAuditQueryResponse,
 ) -> Result<AuditCommandQueryResponse, ErrorData> {
-    if response.partial || response.next_start_key_hex.is_some() {
-        return Err(ErrorData::new(
-            ErrorCode(-32099),
-            "audit operation=command_query reached a partial CF_ACTION_LOG page".to_owned(),
-            Some(json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "tool": AUDIT_TOOL,
-                "operation": "command_query",
-                "source_id": response.cf_name,
-                "source_of_truth": AUDIT_SOT,
-                "page_complete": false,
-                "scanned_rows": response.scanned_rows,
-                "limit": response.limit,
-                "scan_limit": response.scan_limit,
-                "has_next_page": response.next_start_key_hex.is_some(),
-                // Surface the continuation cursor so a partial page is pageable from the
-                // public surface (#1515). This is a resume key, NOT a row-count proof, so it
-                // does not weaken the fail-closed "partial pages carry no success counts"
-                // contract enforced below (matched_rows/returned_count stay absent).
-                "next_start_key_hex": response.next_start_key_hex,
-                "remediation": "scope the read with start_ts_ns (it seeks CF_ACTION_LOG by ascending timestamp, so recent-activity queries complete in one page), or page forward by passing this next_start_key_hex back as start_key_hex until page_complete is true; a partial page intentionally omits matched/returned row counts",
-            })),
-        ));
-    }
     if response.corrupt_row_count > 0 {
         return Err(ErrorData::new(
             ErrorCode(-32099),
@@ -70,6 +46,12 @@ pub(super) fn summarize_command_query(
             })),
         ));
     }
+    // Newest-first responses have no input start key and no start timestamp.
+    // Forward paging keeps its existing start key and continuation cursor.
+    let newest_first = response.filters.start_ts_ns.is_none() && response.start_key_hex.is_none();
+    let oldest_returned_ts_ns = newest_first
+        .then(|| response.rows.last().map(|row| row.ts_ns))
+        .flatten();
     Ok(AuditCommandQueryResponse {
         source_of_truth: response.source_of_truth.to_owned(),
         cf_name: response.cf_name.to_owned(),
@@ -79,12 +61,17 @@ pub(super) fn summarize_command_query(
         matched_rows: response.matched_rows,
         returned_count: response.returned_count,
         corrupt_row_count: response.corrupt_row_count,
-        noncanonical_key_count: response.noncanonical_key_count,
         complete: response.exhausted,
-        scan_order: response.scan_order.to_owned(),
-        has_older: response.has_older,
-        oldest_returned_ts_ns: response.oldest_returned_ts_ns,
+        scan_order: if newest_first {
+            "newest_first"
+        } else {
+            "oldest_first"
+        }
+        .to_owned(),
+        has_older: newest_first && !response.exhausted,
+        oldest_returned_ts_ns,
         start_key_hex: response.start_key_hex,
+        next_start_key_hex: response.next_start_key_hex,
         rows: response
             .rows
             .into_iter()
@@ -108,3 +95,11 @@ pub(super) fn summarize_command_query(
             .collect(),
     })
 }
+
+#[cfg(test)]
+#[path = "query_tail_table_595.rs"]
+mod query_tail_table_595;
+
+#[cfg(test)]
+#[path = "command_query_tests.rs"]
+mod tests;

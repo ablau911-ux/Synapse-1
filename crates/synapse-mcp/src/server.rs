@@ -1,14 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    future::Future,
-    sync::{
-        Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicU8, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
 };
 
-use futures_util::FutureExt as _;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{
@@ -21,9 +17,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use synapse_action::{ActionHandle, ActionStateSnapshot, RecordingBackend};
 use synapse_core::{Health, SubsystemHealth, error_codes, types::TimelineActor};
-use tokio::sync::{Notify, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 use crate::{
     http::sse::SseState,
@@ -77,9 +72,10 @@ use crate::{
         ActScrollResponse, ActSetValueParams, ActSetValueResponse, ActStrokeParams,
         ActStrokeResponse, ActTypeParams, ActTypeResponse, M2ServiceConfig, ReleaseAllParams,
         ReleaseAllResponse, SharedM2State, SharedSessionClipboardBuffers,
-        act_click_with_handle_and_lease, act_clipboard_session_buffer,
-        act_focus_window_request_details, act_focus_window_target_hwnd,
-        act_set_value_request_details, act_stroke_validation_failure_details,
+        act_click_with_handle_and_lease, act_clipboard_session_buffer, act_focus_window,
+        act_focus_window_request_details, act_focus_window_target_hwnd, act_keymap_with_handle,
+        act_pad_with_handle, act_press_with_handle, act_set_value, act_set_value_request_details,
+        act_stroke_validation_failure_details, act_stroke_with_handle, act_type_with_handle,
         new_session_clipboards, release_all_with_handles,
         shared_m2_state_from_config_with_shutdown_reason, shared_m2_state_from_env,
         validate_act_stroke_params,
@@ -153,7 +149,7 @@ use crate::{
             ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
             ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,
             cancel_file_jsonl_tail_watcher, cancel_reflex, history_reflexes,
-            install_file_jsonl_tail_watcher, list_reflexes, register_reflex,
+            install_file_jsonl_tail_watcher, list_reflexes,
         },
         replay::{ReplayRecordParams, ReplayRecordResponse, record_replay},
         routines::{
@@ -165,11 +161,12 @@ use crate::{
         storage::{
             StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,
             StorageInspectResponse, StoragePressureSampleParams, StoragePressureSampleResponse,
-            StoragePutProbeRowsParams, StoragePutProbeRowsResponse, apply_storage_pressure_sample,
-            inspect_storage, put_probe_rows, run_storage_gc_once,
+            StoragePutProbeRowsParams, StoragePutProbeRowsResponse, inspect_storage,
+            put_probe_rows,
         },
         subscribe::{
-            SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams, SubscribeResponse,
+            SubscribeCancelParams, SubscribeCancelResponse, SubscribeFacadeParams,
+            SubscribeFacadeResponse, SubscribeOperation, cancel_owned_subscription,
             cancel_subscription, subscribe_to_events,
         },
         timeline::{
@@ -189,19 +186,18 @@ use crate::{
         ActRunShellStatusResponse, ActSpawnAgentCli, ActSpawnAgentLogPaths, ActSpawnAgentParams,
         ActSpawnAgentRequest, ActSpawnAgentResponse, ActSpawnAgentTarget,
         AgentSpawnTaskStartedParams, AgentSpawnTaskStartedResponse, LaunchWindowState,
-        M4ServiceConfig, MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, RunShellAuthorization,
-        ShellExecutionContext, assign_owned_process_job, authorize_run_shell,
-        authorize_run_shell_start, cancel_shell_job, execute_combo_with_boundary,
-        launch_for_session_with_boundary, launch_process_history_row,
+        M4ServiceConfig, MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, RUN_SHELL_IDEMPOTENCY_LEGACY_SCAN_LIMIT,
+        RUN_SHELL_IDEMPOTENCY_PREFIX, RunShellAuthorization, ShellExecutionContext,
+        assign_owned_process_job, authorize_run_shell, authorize_run_shell_start, cancel_shell_job,
+        execute_combo, launch_for_session, launch_process_history_row,
         launch_process_history_row_key, launch_request_details,
         prepare_run_shell_params_for_context, prepare_run_shell_start_params_for_context,
-        required_combo_permissions, run_authorized_shell_with_boundary,
-        run_shell_idempotency_completed_row, run_shell_idempotency_replay,
+        required_combo_permissions, run_authorized_shell, run_shell_idempotency_completed_row,
+        run_shell_idempotency_recover_after_restart, run_shell_idempotency_replay,
         run_shell_idempotency_reservation_row, run_shell_idempotency_row_key,
-        run_shell_request_details, run_shell_start_request_details,
-        shell_execution_context_for_session, shell_job_status,
-        start_authorized_shell_job_with_boundary, validate_agent_spawn_params,
-        validate_run_shell_execution_plan,
+        run_shell_idempotency_select_legacy_row, run_shell_request_details,
+        run_shell_start_request_details, shell_execution_context_for_session, shell_job_status,
+        start_authorized_shell_job, validate_agent_spawn_params, validate_run_shell_execution_plan,
     },
 };
 
@@ -214,6 +210,8 @@ pub(crate) mod agent_events;
 mod agent_facades;
 mod agent_mailbox;
 pub(crate) mod agent_query;
+mod agent_scope;
+pub(crate) mod agent_spawn_switch;
 pub(crate) mod agent_state;
 pub(crate) mod agent_stats;
 pub(crate) mod agent_tasks;
@@ -225,12 +223,25 @@ mod audit_context;
 mod audit_replay_facades;
 pub(crate) mod codex_app_server_bridge;
 pub(crate) mod command_audit;
+#[cfg(windows)]
+pub(crate) mod console_type;
 mod context;
 pub(crate) use context::AgentTranscriptSnapshotRow;
 pub(crate) use context::{
     APPROVAL_DECISION_EVENT_KIND, APPROVAL_REQUEST_EVENT_KIND, APPROVAL_TIMEOUT_EVENT_KIND,
 };
+pub(crate) use lease_tools::DASHBOARD_LEASE_SOURCE_OF_TRUTH;
+mod act_foreground_deadline;
+mod act_foreground_focus;
+mod act_foreground_slot;
+mod act_foreground_unwind;
+mod act_outcome;
+mod act_request_audit;
 mod background_router;
+/// #189: the real target_act status oracle, shared with m2 click tests outside `server`.
+#[cfg(test)]
+pub(crate) use background_router::dispatch_status_189_tests;
+mod action_history;
 mod browser_assert;
 mod browser_batch;
 mod browser_clock_events;
@@ -243,24 +254,50 @@ mod browser_files;
 mod browser_frames;
 mod browser_network;
 mod browser_storage;
+mod browser_window_guard;
 mod capture_gif;
 mod data_cleaning;
+mod diagnostic_rate_limit_reset;
 pub(crate) mod drain;
 pub(crate) mod escalation;
+mod everquest_autocombat;
+mod everquest_contextgraph;
+mod everquest_domain;
+mod everquest_episode_export;
+mod everquest_guard;
+mod everquest_log;
+mod everquest_map_sensor;
+mod everquest_memory;
+mod everquest_outcome;
+mod everquest_predictive_model;
+mod everquest_route;
+mod everquest_scorecard;
+mod everquest_state;
+mod everquest_surprise;
+mod everquest_tools;
+mod everquest_trajectory;
+mod everquest_ui_context;
+mod everquest_world_model;
+mod everquest_world_summary;
 mod handler;
-mod health;
-pub(crate) use health::HealthParams;
+pub(crate) mod health;
+mod param_hints;
+pub(crate) use health::HttpHealthTelemetry;
 mod hygiene_report;
 mod intent_tools;
 mod lease_tools;
+mod livecapture;
+mod livecapture_ownership;
+#[cfg(feature = "livefeed")]
+mod livefeed;
 mod m1_tools;
 mod m2_tools;
+pub(crate) use m2_tools::foreground_click_actionability;
 mod m3_tools;
 pub(crate) mod m4_tools;
 mod notify_tools;
 mod operational_facades;
-pub(crate) mod operator_panic_boundary;
-mod param_hints;
+pub(crate) mod output_path_policy;
 mod permission_gate;
 pub(crate) mod permission_policy;
 mod plan_tools;
@@ -269,21 +306,50 @@ mod routine_assist_facades;
 mod routine_feedback;
 mod routine_labeling;
 mod schema_sanitize;
+mod seat_owner_idle;
+mod seat_tools;
+mod session_ambient_scan;
 pub(crate) mod session_continuity;
 pub(crate) mod session_lifecycle;
 pub(crate) mod session_registry;
 mod session_tools;
+pub(crate) mod shell_profile_policy;
 pub(crate) mod suggestions;
 pub(crate) mod target_claims;
 mod target_policy;
 pub(crate) mod terminal_capture;
+pub(crate) mod terminated_sessions;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "server/tests/g4_unit_support.rs"]
+pub(crate) mod g4_unit_support;
+#[cfg(all(test, windows))]
+#[path = "server/tests/own_window_fixture.rs"]
+pub(crate) mod own_window_fixture;
 pub(crate) mod timeline_digest;
 mod timeline_facades;
 mod timeline_query;
 mod tool_profiles;
-pub(crate) mod url_redaction;
+mod tools_list_cache;
+#[cfg(test)]
+#[path = "server/tests/user_active_258_support.rs"]
+pub(crate) mod user_active_258_support;
+pub(crate) use crate::chrome_debugger_bridge::url_redaction;
+mod browser_evaluate_budget;
+mod delivery_claim;
+// #107 part d: the point click route (`m2::click::point_post`) reports through it too.
+pub(crate) mod native_click_evidence;
+// 300f / #107d: `target_act` and the point click route refuse an element of another window.
+pub(crate) mod element_root;
+mod owner_override;
+pub(crate) mod user_active_gate;
+mod user_activity;
 mod verification;
+mod videoanalyze;
 mod workspace_blackboard;
+mod workspace_wait;
 
 use session_registry::{SessionRegistry, SharedSessionRegistry};
 use target_claims::SharedTargetClaims;
@@ -308,6 +374,10 @@ pub(crate) enum SessionTarget {
 /// held only to clone an entry out — never across a perception `.await` — so
 /// target reads never serialize behind another session's snapshot.
 pub(crate) type SharedSessionTargets = Arc<Mutex<HashMap<String, SessionTarget>>>;
+/// Serializes lease ownership transitions across public tools, session
+/// teardown, and dashboard recovery. Physical lease mutation and its durable
+/// lifecycle edge must be one process-local critical section.
+pub(crate) type SharedLeaseTransitionGate = Arc<AsyncMutex<()>>;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct CdpTargetOwner {
@@ -329,299 +399,10 @@ pub(crate) struct CdpTargetOwner {
 /// may be observed by explicit `set_target` but are never closed by Synapse.
 pub(crate) type SharedCdpTargetOwners = Arc<Mutex<HashMap<String, CdpTargetOwner>>>;
 
-/// Leak-safe keyed transaction gates for authority mutations. The registry
-/// keeps only weak references and prunes dead entries whenever a gate is
-/// resolved, so reconnect/session churn cannot grow it without bound.
-type SharedSessionAuthorityGates = Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
-
-const AUTHORITY_CANCELLATION_GRACE: Duration = Duration::from_secs(1);
-const AUTHORITY_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-const AUTHORITY_TASK_PHASE_REGISTERED: u8 = 0;
-const AUTHORITY_TASK_PHASE_RUNNING: u8 = 1;
-const AUTHORITY_TASK_PHASE_ROLLBACK_COMPLETE: u8 = 2;
-const AUTHORITY_TASK_PHASE_COMPLETED: u8 = 3;
-const AUTHORITY_TASK_PHASE_PANICKED: u8 = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuthorityCancellationPolicy {
-    /// The complete future owns only rollback-safe destructors, so shutdown
-    /// may drop it and then reap the exact Tokio task.
-    DropFutureAfterSignal,
-    /// The future owns storage-backed rollback/final-audit state. Shutdown may
-    /// signal it, but only that exact owner may drive the state to terminal
-    /// readback; the supervisor must retain it rather than drop or abort it.
-    CooperativeTerminalReadback,
-}
-
-impl AuthorityCancellationPolicy {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DropFutureAfterSignal => "drop_future_after_signal",
-            Self::CooperativeTerminalReadback => "cooperative_terminal_readback",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct AuthorityTaskControl {
-    abort_handle: tokio::task::AbortHandle,
-    cancellation: CancellationToken,
-    cancellation_policy: AuthorityCancellationPolicy,
-    phase: Arc<AtomicU8>,
-}
-
-#[derive(Clone, Debug)]
-enum AuthorityTaskExit {
-    Completed,
-    CancelledAfterRollback,
-    Panicked(String),
-    StartGateClosed,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct AuthorityTransactionJoinError {
-    kind: AuthorityTransactionJoinErrorKind,
-    detail: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuthorityTransactionJoinErrorKind {
-    Cancelled,
-    Panicked,
-}
-
-impl AuthorityTransactionJoinError {
-    pub(crate) const fn is_cancelled(&self) -> bool {
-        matches!(self.kind, AuthorityTransactionJoinErrorKind::Cancelled)
-    }
-
-    pub(crate) const fn is_panic(&self) -> bool {
-        matches!(self.kind, AuthorityTransactionJoinErrorKind::Panicked)
-    }
-
-    fn cancelled(detail: impl Into<String>) -> Self {
-        Self {
-            kind: AuthorityTransactionJoinErrorKind::Cancelled,
-            detail: detail.into(),
-        }
-    }
-
-    fn panicked(detail: impl Into<String>) -> Self {
-        Self {
-            kind: AuthorityTransactionJoinErrorKind::Panicked,
-            detail: detail.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for AuthorityTransactionJoinError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
-    }
-}
-
-impl std::error::Error for AuthorityTransactionJoinError {}
-
-#[derive(Clone)]
-struct AuthorityFinalizerSupervisor {
-    /// Tracks the exact join-owner task for each authority transaction. The
-    /// join owner does not finish until it has awaited the transaction's Tokio
-    /// JoinHandle and persisted the outcome in `join_failures`.
-    tasks: TaskTracker,
-    admission_closed: Arc<Mutex<bool>>,
-    transactions: Arc<Mutex<BTreeMap<u64, AuthorityTaskControl>>>,
-    join_failures: Arc<Mutex<Vec<String>>>,
-    next_task_id: Arc<AtomicU64>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct AuthorityFinalizerDrainReadback {
-    pub(crate) admission_closed: bool,
-    pub(crate) tracker_closed: bool,
-    pub(crate) registered_tasks_before: usize,
-    pub(crate) cancellation_signals_sent: usize,
-    pub(crate) abort_requests_sent: usize,
-    pub(crate) registered_tasks_after: usize,
-    pub(crate) tracked_tasks_after: usize,
-}
-
-impl AuthorityFinalizerDrainReadback {
-    /// Physical lifetime locks may be released only after both independent
-    /// ownership Sources of Truth agree that no authority transaction remains.
-    /// Other drain failures still make shutdown fail, but they do not require
-    /// retaining the lifetime locks once ownership is proven empty.
-    pub(crate) const fn safe_to_unlock(&self) -> bool {
-        self.admission_closed
-            && self.tracker_closed
-            && self.registered_tasks_after == 0
-            && self.tracked_tasks_after == 0
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct AuthorityFinalizerDrainFailure {
-    pub(crate) readback: AuthorityFinalizerDrainReadback,
-    detail: String,
-}
-
-impl std::fmt::Display for AuthorityFinalizerDrainFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}; readback={:?}", self.detail, self.readback)
-    }
-}
-
-impl std::error::Error for AuthorityFinalizerDrainFailure {}
-
-fn authority_task_phase_name(phase: u8) -> &'static str {
-    match phase {
-        AUTHORITY_TASK_PHASE_REGISTERED => "registered",
-        AUTHORITY_TASK_PHASE_RUNNING => "running",
-        AUTHORITY_TASK_PHASE_ROLLBACK_COMPLETE => "rollback_complete",
-        AUTHORITY_TASK_PHASE_COMPLETED => "completed",
-        AUTHORITY_TASK_PHASE_PANICKED => "panicked",
-        _ => "unknown",
-    }
-}
-
-fn drop_authority_owned<T>(owned: T) -> Result<(), String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(owned)))
-        .map_err(crate::daemon_lifecycle::consume_panic_payload)
-}
-
-fn transactions_phase(
-    transactions: &Arc<Mutex<BTreeMap<u64, AuthorityTaskControl>>>,
-    task_id: u64,
-) -> &'static str {
-    match transactions.lock() {
-        Ok(transactions) => transactions
-            .get(&task_id)
-            .map_or("registry_entry_missing", |control| {
-                authority_task_phase_name(control.phase.load(Ordering::Acquire))
-            }),
-        Err(poisoned) => poisoned
-            .get_ref()
-            .get(&task_id)
-            .map_or("registry_poisoned_entry_missing", |control| {
-                authority_task_phase_name(control.phase.load(Ordering::Acquire))
-            }),
-    }
-}
-
-fn push_authority_join_failure(failures: &Arc<Mutex<Vec<String>>>, failure: String) {
-    match failures.lock() {
-        Ok(mut failures) => failures.push(failure),
-        Err(poisoned) => {
-            let mut failures = poisoned.into_inner();
-            failures.push("authority transaction join-failure ledger lock poisoned".to_owned());
-            failures.push(failure);
-        }
-    }
-}
-
-fn snapshot_authority_controls(
-    transactions: &Arc<Mutex<BTreeMap<u64, AuthorityTaskControl>>>,
-    errors: &mut Vec<String>,
-) -> (usize, Vec<(u64, AuthorityTaskControl)>) {
-    match transactions.lock() {
-        Ok(transactions) => (
-            transactions.len(),
-            transactions
-                .iter()
-                .map(|(task_id, control)| (*task_id, control.clone()))
-                .collect(),
-        ),
-        Err(poisoned) => {
-            errors.push(
-                "authority transaction registry lock poisoned during shutdown snapshot".to_owned(),
-            );
-            let transactions = poisoned.into_inner();
-            (
-                transactions.len(),
-                transactions
-                    .iter()
-                    .map(|(task_id, control)| (*task_id, control.clone()))
-                    .collect(),
-            )
-        }
-    }
-}
-
-fn authority_registry_len(
-    transactions: &Arc<Mutex<BTreeMap<u64, AuthorityTaskControl>>>,
-    errors: &mut Vec<String>,
-    phase: &'static str,
-) -> usize {
-    match transactions.lock() {
-        Ok(transactions) => transactions.len(),
-        Err(poisoned) => {
-            errors.push(format!(
-                "authority transaction registry lock poisoned during {phase}"
-            ));
-            poisoned.into_inner().len()
-        }
-    }
-}
-
-fn take_authority_join_failures(failures: &Arc<Mutex<Vec<String>>>, errors: &mut Vec<String>) {
-    match failures.lock() {
-        Ok(mut failures) => errors.extend(failures.drain(..)),
-        Err(poisoned) => {
-            errors.push(
-                "authority transaction join-failure ledger lock poisoned during shutdown readback"
-                    .to_owned(),
-            );
-            errors.extend(poisoned.into_inner().drain(..));
-        }
-    }
-}
-
-impl Default for AuthorityFinalizerSupervisor {
-    fn default() -> Self {
-        Self {
-            tasks: TaskTracker::new(),
-            admission_closed: Arc::new(Mutex::new(false)),
-            transactions: Arc::new(Mutex::new(BTreeMap::new())),
-            join_failures: Arc::new(Mutex::new(Vec::new())),
-            next_task_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-}
-
-impl std::fmt::Debug for AuthorityFinalizerSupervisor {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AuthorityFinalizerSupervisor")
-            .field("task_count", &self.tasks.len())
-            .field(
-                "registered_transaction_count",
-                &self
-                    .transactions
-                    .lock()
-                    .map_or(usize::MAX, |tasks| tasks.len()),
-            )
-            .field(
-                "admission_closed",
-                &self
-                    .admission_closed
-                    .lock()
-                    .map_or(None, |closed| Some(*closed)),
-            )
-            .field(
-                "join_failure_count",
-                &self
-                    .join_failures
-                    .lock()
-                    .map_or(usize::MAX, |failures| failures.len()),
-            )
-            .field("next_task_id", &self.next_task_id.load(Ordering::SeqCst))
-            .field("closed", &self.tasks.is_closed())
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SynapseService {
     started_at: Instant,
+    initialized_peers: Arc<Mutex<Vec<rmcp::service::Peer<rmcp::RoleServer>>>>,
     tool_router: ToolRouter<Self>,
     m1_state: SharedM1State,
     m2_state: SharedM2State,
@@ -634,26 +415,128 @@ pub struct SynapseService {
     session_registry: SharedSessionRegistry,
     mailbox_notify: Arc<Notify>,
     target_claims: SharedTargetClaims,
-    session_authority_gates: SharedSessionAuthorityGates,
-    authority_finalizers: AuthorityFinalizerSupervisor,
     session_processes: session_lifecycle::SharedSessionProcessResources,
     terminated_sessions: session_lifecycle::SharedTerminatedSessions,
+    lease_transition_gate: SharedLeaseTransitionGate,
+    seat_supervisor: Arc<synapse_seats::SeatSupervisor>,
+    browser_seat_backend_available: bool,
+    browser_seat_backend_detail: String,
+    #[cfg(feature = "livefeed")]
+    pub(super) livefeed_camera: Arc<synapse_livefeed::Camera>,
+}
+
+const SYNAPSE_SEATS_CHROMIUM_ENV: &str = "SYNAPSE_SEATS_CHROMIUM";
+const SYNAPSE_SEATS_ROOT_ENV: &str = "SYNAPSE_SEATS_ROOT";
+const SEAT_MAX_COUNT: usize = 4;
+const SEAT_QUEUE_CAPACITY: usize = 16;
+const SEAT_REQUEST_TIMEOUT_MS: u64 = 15_000;
+const SEAT_BROWSER_STARTUP_TIMEOUT_MS: u64 = 10_000;
+
+struct SeatSupervisorRuntime {
+    supervisor: Arc<synapse_seats::SeatSupervisor>,
+    browser_available: bool,
+    browser_detail: String,
+}
+
+fn shared_seat_supervisor() -> anyhow::Result<SeatSupervisorRuntime> {
+    let runtime_root = if let Some(configured) = std::env::var_os(SYNAPSE_SEATS_ROOT_ENV) {
+        let root = PathBuf::from(configured);
+        if root.as_os_str().is_empty() {
+            anyhow::bail!("{SYNAPSE_SEATS_ROOT_ENV} must not be empty");
+        }
+        root
+    } else {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        local_app_data.join("synapse").join("seats")
+    };
+    let chromium = seat_chromium_executable()?;
+    let supervisor = synapse_seats::SeatSupervisor::new(synapse_seats::SeatSupervisorConfig {
+        browser: synapse_seats::BrowserRuntimeConfig {
+            chromium_executable: chromium.path,
+            runtime_root,
+            startup_timeout_ms: SEAT_BROWSER_STARTUP_TIMEOUT_MS,
+        },
+        max_seats: SEAT_MAX_COUNT,
+        per_seat_queue_capacity: SEAT_QUEUE_CAPACITY,
+        request_timeout_ms: SEAT_REQUEST_TIMEOUT_MS,
+    })
+    .map(Arc::new)
+    .map_err(|error| anyhow::anyhow!("initialize isolated browser-seat supervisor: {error}"))?;
+    Ok(SeatSupervisorRuntime {
+        supervisor,
+        browser_available: chromium.available,
+        browser_detail: chromium.detail,
+    })
+}
+
+struct SeatChromiumRuntime {
+    path: PathBuf,
+    available: bool,
+    detail: String,
+}
+
+fn seat_chromium_executable() -> anyhow::Result<SeatChromiumRuntime> {
+    if let Some(configured) = std::env::var_os(SYNAPSE_SEATS_CHROMIUM_ENV) {
+        let path = PathBuf::from(configured);
+        if !path.is_file() {
+            anyhow::bail!(
+                "{SYNAPSE_SEATS_CHROMIUM_ENV} must name an existing Chromium executable: {}",
+                path.display()
+            );
+        }
+        return Ok(SeatChromiumRuntime {
+            detail: format!(
+                "configured isolated Chromium executable: {}",
+                path.display()
+            ),
+            path,
+            available: true,
+        });
+    }
+    // Iron Law 9: candidates come from the Chromium rows of browsers/*.json
+    // (App Paths, then `exe_candidates`), in row order.
+    let registry = synapse_browsers::BrowserRegistry::global();
+    let is_file = |path: &std::path::Path| path.is_file();
+    let locator = synapse_browsers::BrowserExecutableLocator::new(
+        &crate::chrome_debugger_bridge::registry_reader::WindowsRegistryReader,
+        &synapse_browsers::process_env_var,
+        &is_file,
+    );
+    let chromium_rows = || {
+        registry
+            .rows()
+            .iter()
+            .filter(|row| row.family == synapse_browsers::BrowserFamily::Chromium)
+    };
+    if let Some(located) = chromium_rows().find_map(|row| locator.locate(row)) {
+        return Ok(SeatChromiumRuntime {
+            detail: format!(
+                "installed isolated Chromium executable: {} source_of_truth={}",
+                located.path.display(),
+                located.source_of_truth
+            ),
+            path: located.path,
+            available: true,
+        });
+    }
+    let path = chromium_rows()
+        .find_map(|row| locator.first_candidate(row))
+        .unwrap_or_default();
+    Ok(SeatChromiumRuntime {
+        detail: format!(
+            "no Chromium executable found; set {SYNAPSE_SEATS_CHROMIUM_ENV} (checked {})",
+            path.display()
+        ),
+        path,
+        available: false,
+    })
 }
 
 fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
-    // The process-global bridge callback must never become a hidden lifetime
-    // owner of the daemon DB. A failed startup or completed shutdown drops the
-    // last strong M3 owner; later bridge events observe that physical state
-    // instead of keeping RocksDB alive past the daemon locks.
-    let m3_state = Arc::downgrade(m3_state);
+    let m3_state = Arc::clone(m3_state);
     crate::chrome_debugger_bridge::set_browser_navigation_sink(Arc::new(move |event| {
-        let Some(m3_state) = m3_state.upgrade() else {
-            tracing::warn!(
-                code = "TIMELINE_BROWSER_NAV_SINK_OWNER_GONE",
-                "browser-navigation event arrived after the daemon M3 owner was released"
-            );
-            return;
-        };
         let recorder = match m3_state.lock() {
             Ok(state) => state.activity_recorder.clone(),
             Err(_error) => {
@@ -667,7 +550,10 @@ fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
         if let Some(recorder) = recorder {
             let _ = recorder.record_browser_navigation(BrowserNavigationEvent {
                 actor: TimelineActor::Human,
-                app: Some("chrome.exe".to_owned()),
+                // Iron Law 9: the image name comes from the reporting host's row.
+                app: synapse_browsers::BrowserRegistry::global()
+                    .by_id(event.browser_kind.as_str())
+                    .and_then(|row| row.process_names.first().cloned()),
                 source: event.source,
                 event: event.event,
                 action: None,
@@ -707,10 +593,12 @@ impl SynapseService {
     }
 
     pub fn try_new() -> anyhow::Result<Self> {
+        let seat_runtime = shared_seat_supervisor()?;
         let m3_state = shared_m3_state_from_env()?;
         install_chrome_browser_navigation_sink(&m3_state);
-        Ok(Self {
+        let service = Self {
             started_at: Instant::now(),
+            initialized_peers: Arc::default(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_env()?,
@@ -723,11 +611,56 @@ impl SynapseService {
             session_registry: Arc::new(Mutex::new(SessionRegistry::default())),
             mailbox_notify: Arc::new(Notify::new()),
             target_claims: Arc::new(Mutex::new(target_claims::TargetClaimRegistry::default())),
-            session_authority_gates: Arc::new(Mutex::new(HashMap::new())),
-            authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
-            terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
-        })
+            terminated_sessions: Arc::default(),
+            lease_transition_gate: Arc::new(AsyncMutex::new(())),
+            seat_supervisor: seat_runtime.supervisor,
+            browser_seat_backend_available: seat_runtime.browser_available,
+            browser_seat_backend_detail: seat_runtime.browser_detail,
+            #[cfg(feature = "livefeed")]
+            livefeed_camera: Arc::default(),
+        };
+        service
+            .reconcile_persisted_session_leases_on_startup()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "reconcile persisted input leases at daemon startup: {}",
+                    error.message
+                )
+            })?;
+        Ok(service)
+    }
+
+    /// Test-only constructor rooted at an isolated directory (#143).
+    ///
+    /// `new()`/`try_new()` read `M3ServiceConfig::from_env()`, which falls back
+    /// to the production `%LOCALAPPDATA%\synapse\db` when `SYNAPSE_DB` is
+    /// unset, and startup lease reconciliation then opens that RocksDB. Tests
+    /// must never touch (or contend for the lock on) the live daemon's DB.
+    #[cfg(test)]
+    pub(crate) fn try_new_isolated_for_tests(root: &std::path::Path) -> anyhow::Result<Self> {
+        let max_subscriptions =
+            std::num::NonZeroUsize::new(synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO.get())
+                .ok_or_else(|| anyhow::anyhow!("max subscriptions must be nonzero"))?;
+        Self::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(root.join("db")),
+                Some(root.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                max_subscriptions,
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
     }
 
     pub fn try_with_m2_shutdown_reason_and_m3_config(
@@ -738,6 +671,7 @@ impl SynapseService {
         m3_config: M3ServiceConfig,
         m4_config: M4ServiceConfig,
     ) -> anyhow::Result<Self> {
+        let seat_runtime = shared_seat_supervisor()?;
         let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
         let m3_state = shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
             m3_config,
@@ -747,8 +681,9 @@ impl SynapseService {
             sse_state,
         )?;
         install_chrome_browser_navigation_sink(&m3_state);
-        Ok(Self {
+        let service = Self {
             started_at: Instant::now(),
+            initialized_peers: Arc::default(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_config_with_shutdown_reason(
@@ -766,11 +701,24 @@ impl SynapseService {
             session_registry: Arc::new(Mutex::new(SessionRegistry::default())),
             mailbox_notify: Arc::new(Notify::new()),
             target_claims: Arc::new(Mutex::new(target_claims::TargetClaimRegistry::default())),
-            session_authority_gates: Arc::new(Mutex::new(HashMap::new())),
-            authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
-            terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
-        })
+            terminated_sessions: Arc::default(),
+            lease_transition_gate: Arc::new(AsyncMutex::new(())),
+            seat_supervisor: seat_runtime.supervisor,
+            browser_seat_backend_available: seat_runtime.browser_available,
+            browser_seat_backend_detail: seat_runtime.browser_detail,
+            #[cfg(feature = "livefeed")]
+            livefeed_camera: Arc::default(),
+        };
+        service
+            .reconcile_persisted_session_leases_on_startup()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "reconcile persisted input leases at daemon startup: {}",
+                    error.message
+                )
+            })?;
+        Ok(service)
     }
 
     pub fn try_with_m2_shutdown_reason_and_sse_state_and_m3_config(
@@ -782,6 +730,7 @@ impl SynapseService {
         m3_config: M3ServiceConfig,
         m4_config: M4ServiceConfig,
     ) -> anyhow::Result<Self> {
+        let seat_runtime = shared_seat_supervisor()?;
         let m3_state = shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
             m3_config,
             shutdown_cancel.clone(),
@@ -790,8 +739,9 @@ impl SynapseService {
             sse_state,
         )?;
         install_chrome_browser_navigation_sink(&m3_state);
-        Ok(Self {
+        let service = Self {
             started_at: Instant::now(),
+            initialized_peers: Arc::default(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_config_with_shutdown_reason(
@@ -809,11 +759,24 @@ impl SynapseService {
             session_registry: Arc::new(Mutex::new(SessionRegistry::default())),
             mailbox_notify: Arc::new(Notify::new()),
             target_claims: Arc::new(Mutex::new(target_claims::TargetClaimRegistry::default())),
-            session_authority_gates: Arc::new(Mutex::new(HashMap::new())),
-            authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
-            terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
-        })
+            terminated_sessions: Arc::default(),
+            lease_transition_gate: Arc::new(AsyncMutex::new(())),
+            seat_supervisor: seat_runtime.supervisor,
+            browser_seat_backend_available: seat_runtime.browser_available,
+            browser_seat_backend_detail: seat_runtime.browser_detail,
+            #[cfg(feature = "livefeed")]
+            livefeed_camera: Arc::default(),
+        };
+        service
+            .reconcile_persisted_session_leases_on_startup()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "reconcile persisted input leases at daemon startup: {}",
+                    error.message
+                )
+            })?;
+        Ok(service)
     }
 
     pub fn m2_emitter_done_receiver(&self) -> Option<watch::Receiver<Option<ActionStateSnapshot>>> {
@@ -823,661 +786,16 @@ impl SynapseService {
             .and_then(|state| state.emitter_done_receiver())
     }
 
-    pub(crate) fn take_m2_emitter_task(
-        &self,
-    ) -> Result<Option<tokio::task::JoinHandle<ActionStateSnapshot>>, String> {
-        self.m2_state
-            .lock()
-            .map_err(|_poisoned| {
-                "m2 state lock poisoned while taking the daemon emitter task owner".to_owned()
-            })
-            .map(|mut state| state.take_emitter_task())
-    }
-
     pub(crate) fn m3_state_handle(&self) -> SharedM3State {
         Arc::clone(&self.m3_state)
     }
 
+    pub(crate) fn lease_transition_gate(&self) -> SharedLeaseTransitionGate {
+        Arc::clone(&self.lease_transition_gate)
+    }
+
     pub(crate) fn drain_state_handle(&self) -> drain::DaemonDrainState {
         self.drain_state.clone()
-    }
-
-    fn session_authority_gate(
-        &self,
-        session_id: &str,
-    ) -> Result<Arc<tokio::sync::Mutex<()>>, ErrorData> {
-        let mut gates = self.session_authority_gates.lock().map_err(|_error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "session authority gate registry lock poisoned",
-            )
-        })?;
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(session_id).and_then(Weak::upgrade) {
-            return Ok(gate);
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        gates.insert(session_id.to_owned(), Arc::downgrade(&gate));
-        Ok(gate)
-    }
-
-    /// Serialize every authority mutation for one MCP session. The returned
-    /// owned guard is cancellation-safe and does not borrow the registry.
-    pub(crate) async fn lock_session_authority(
-        &self,
-        session_id: &str,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorData> {
-        self.lock_session_authority_after_resolve(session_id, || {})
-            .await
-    }
-
-    /// Resolve the exact keyed gate, report that admission has reached the
-    /// queue boundary, then wait for ownership. The observer makes causal
-    /// concurrency tests independent of scheduler timing while production
-    /// callers use [`Self::lock_session_authority`].
-    pub(crate) async fn lock_session_authority_after_resolve<F>(
-        &self,
-        session_id: &str,
-        on_resolved: F,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorData>
-    where
-        F: FnOnce(),
-    {
-        let gate = self.session_authority_gate(session_id)?;
-        on_resolved();
-        Ok(gate.lock_owned().await)
-    }
-
-    pub(crate) async fn lock_session_authority_for_tool(
-        &self,
-        tool_name: &str,
-        session_id: &str,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorData> {
-        self.lock_session_authority_for_tool_after_resolve(tool_name, session_id, || {})
-            .await
-    }
-
-    pub(crate) async fn lock_session_authority_for_tool_after_resolve<F>(
-        &self,
-        tool_name: &str,
-        session_id: &str,
-        on_resolved: F,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorData>
-    where
-        F: FnOnce(),
-    {
-        let guard = self
-            .lock_session_authority_after_resolve(session_id, on_resolved)
-            .await?;
-        self.reject_terminated_session_tool_call(tool_name, session_id)?;
-        Ok(guard)
-    }
-
-    /// Lock multiple session authority domains in lexical order. Handoff uses
-    /// this to cover both the old and new lease owner without lock inversion.
-    pub(crate) async fn lock_session_authorities(
-        &self,
-        session_ids: &[&str],
-    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, ErrorData> {
-        let mut session_ids = session_ids.to_vec();
-        session_ids.sort_unstable();
-        session_ids.dedup();
-        let mut guards = Vec::with_capacity(session_ids.len());
-        for session_id in session_ids {
-            guards.push(self.lock_session_authority(session_id).await?);
-        }
-        Ok(guards)
-    }
-
-    /// Start one complete authority transaction under daemon supervision. The
-    /// caller owns only a result receiver; the supervisor retains the exact
-    /// Tokio task join through a tracked join-owner. Dropping the caller keeps
-    /// the transaction alive through physical cleanup and durable final audit.
-    /// Admission is serialized with shutdown close so no transaction can
-    /// appear after a successful empty+closed drain.
-    #[allow(dead_code)] // Drop-safe policy seam is exercised by causal shutdown regressions.
-    pub(crate) fn spawn_authority_transaction<F>(
-        &self,
-        future: F,
-    ) -> Result<
-        impl Future<Output = Result<F::Output, AuthorityTransactionJoinError>> + Send + 'static,
-        ErrorData,
-    >
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.spawn_authority_transaction_with_policy(
-            |_cancellation| future,
-            AuthorityCancellationPolicy::DropFutureAfterSignal,
-        )
-    }
-
-    /// Start an authority transaction whose exact async owner must perform
-    /// storage-backed rollback and terminal audit after shutdown cancellation.
-    /// The factory receives the supervisor's cancellation token. Unlike the
-    /// drop-safe variant, shutdown never drops or aborts this future: a task
-    /// that does not finish inside the bounded drain remains registered so the
-    /// daemon lifetime locks cannot be released over live authority.
-    pub(crate) fn spawn_cooperative_authority_transaction<M, F>(
-        &self,
-        make_future: M,
-    ) -> Result<
-        impl Future<Output = Result<F::Output, AuthorityTransactionJoinError>> + Send + 'static,
-        ErrorData,
-    >
-    where
-        M: FnOnce(CancellationToken) -> F,
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.spawn_authority_transaction_with_policy(
-            make_future,
-            AuthorityCancellationPolicy::CooperativeTerminalReadback,
-        )
-    }
-
-    fn spawn_authority_transaction_with_policy<M, F>(
-        &self,
-        make_future: M,
-        cancellation_policy: AuthorityCancellationPolicy,
-    ) -> Result<
-        impl Future<Output = Result<F::Output, AuthorityTransactionJoinError>> + Send + 'static,
-        ErrorData,
-    >
-    where
-        M: FnOnce(CancellationToken) -> F,
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "authority transaction scheduled outside a Tokio runtime",
-            ));
-        }
-        let admission_closed =
-            self.authority_finalizers
-                .admission_closed
-                .lock()
-                .map_err(|_error| {
-                    mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        "authority transaction admission lock poisoned",
-                    )
-                })?;
-        if *admission_closed {
-            return Err(mcp_error(
-                error_codes::DAEMON_RESTARTING,
-                "authority transaction supervisor is closed for daemon shutdown",
-            ));
-        }
-        let mut transactions = self
-            .authority_finalizers
-            .transactions
-            .lock()
-            .map_err(|_error| {
-                self.drain_state_handle()
-                    .mark_draining("authority_transaction_registry_poisoned");
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "authority transaction registry lock poisoned",
-                )
-            })?;
-        let task_id = self
-            .authority_finalizers
-            .next_task_id
-            .fetch_add(1, Ordering::Relaxed);
-        let cancellation = CancellationToken::new();
-        let future = make_future(cancellation.clone());
-        let phase = Arc::new(AtomicU8::new(AUTHORITY_TASK_PHASE_REGISTERED));
-        let (start_sender, start_receiver) = oneshot::channel::<()>();
-        let (result_sender, result_receiver) = oneshot::channel();
-        let (reaped_sender, reaped_receiver) = oneshot::channel();
-        let transaction_cancellation = cancellation.clone();
-        let transaction_phase = Arc::clone(&phase);
-        let transaction_cancellation_policy = cancellation_policy;
-        let transaction = tokio::spawn(async move {
-            if start_receiver.await.is_err() {
-                transaction_phase.store(AUTHORITY_TASK_PHASE_ROLLBACK_COMPLETE, Ordering::Release);
-                let _send_result = result_sender.send(Err(
-                    AuthorityTransactionJoinError::cancelled(format!(
-                        "authority transaction {task_id} start gate closed before admission completed"
-                    )),
-                ));
-                return AuthorityTaskExit::StartGateClosed;
-            }
-            transaction_phase.store(AUTHORITY_TASK_PHASE_RUNNING, Ordering::Release);
-            let mut future = Box::pin(std::panic::AssertUnwindSafe(future).catch_unwind());
-            let supervisor_cancellation = async move {
-                if transaction_cancellation_policy
-                    == AuthorityCancellationPolicy::DropFutureAfterSignal
-                {
-                    transaction_cancellation.cancelled().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
-            tokio::select! {
-                biased;
-                _ = supervisor_cancellation => {
-                    // Dropping the complete transaction future runs the exact
-                    // synchronous profile/lease/audit rollback guards. Store
-                    // the completion phase only after every Drop returned.
-                    match drop_authority_owned(future) {
-                        Ok(()) => {
-                            transaction_phase.store(
-                                AUTHORITY_TASK_PHASE_ROLLBACK_COMPLETE,
-                                Ordering::Release,
-                            );
-                            if result_sender
-                                .send(Err(AuthorityTransactionJoinError::cancelled(format!(
-                                    "authority transaction {task_id} cancelled for daemon shutdown after rollback"
-                                ))))
-                                .is_err()
-                            {
-                                tracing::debug!(
-                                    code = "AUTHORITY_TRANSACTION_CALLER_GONE",
-                                    task_id,
-                                    outcome = "cancelled_after_rollback",
-                                    "authority transaction caller dropped before shutdown cancellation completed"
-                                );
-                            }
-                            AuthorityTaskExit::CancelledAfterRollback
-                        }
-                        Err(drop_panic) => {
-                            let detail = format!(
-                                "authority transaction {task_id} rollback destructor panicked during shutdown cancellation: {drop_panic}"
-                            );
-                            transaction_phase.store(
-                                AUTHORITY_TASK_PHASE_PANICKED,
-                                Ordering::Release,
-                            );
-                            let _send_result = result_sender.send(Err(
-                                AuthorityTransactionJoinError::panicked(detail.clone()),
-                            ));
-                            AuthorityTaskExit::Panicked(detail)
-                        }
-                    }
-                }
-                outcome = future.as_mut() => {
-                    match outcome {
-                        Ok(output) => {
-                            // A completed async future can retain locals until
-                            // the future object itself is dropped. Contain a
-                            // faulty destructor before publishing completion.
-                            match drop_authority_owned(future) {
-                                Ok(()) => {
-                                    transaction_phase.store(
-                                        AUTHORITY_TASK_PHASE_COMPLETED,
-                                        Ordering::Release,
-                                    );
-                                    if result_sender.send(Ok(output)).is_err() {
-                                        tracing::debug!(
-                                            code = "AUTHORITY_TRANSACTION_CALLER_GONE",
-                                            task_id,
-                                            outcome = "completed",
-                                            "authority transaction completed after its caller disconnected"
-                                        );
-                                    }
-                                    AuthorityTaskExit::Completed
-                                }
-                                Err(future_drop_panic) => {
-                                    let output_drop_panic = drop_authority_owned(output).err();
-                                    let detail = match output_drop_panic {
-                                        Some(output_drop_panic) => format!(
-                                            "authority transaction {task_id} future destructor panicked after completion: {future_drop_panic}; completed output destructor also panicked: {output_drop_panic}"
-                                        ),
-                                        None => format!(
-                                            "authority transaction {task_id} future destructor panicked after completion: {future_drop_panic}"
-                                        ),
-                                    };
-                                    transaction_phase.store(
-                                        AUTHORITY_TASK_PHASE_PANICKED,
-                                        Ordering::Release,
-                                    );
-                                    let _send_result = result_sender.send(Err(
-                                        AuthorityTransactionJoinError::panicked(detail.clone()),
-                                    ));
-                                    AuthorityTaskExit::Panicked(detail)
-                                }
-                            }
-                        }
-                        Err(payload) => {
-                            // Consume the payload through the daemon-wide
-                            // hardened decoder. Unknown payload destructors are
-                            // user code and can panic a second time; the decoder
-                            // contains that destructor panic so the supervisor
-                            // can still publish phase/result and reap the exact
-                            // owned task.
-                            let poll_panic =
-                                crate::daemon_lifecycle::consume_panic_payload(payload);
-                            let detail = match drop_authority_owned(future) {
-                                Ok(()) => poll_panic,
-                                Err(drop_panic) => format!(
-                                    "{poll_panic}; authority transaction {task_id} future destructor also panicked: {drop_panic}"
-                                ),
-                            };
-                            transaction_phase.store(
-                                AUTHORITY_TASK_PHASE_PANICKED,
-                                Ordering::Release,
-                            );
-                            if result_sender
-                                .send(Err(AuthorityTransactionJoinError::panicked(
-                                    detail.clone(),
-                                )))
-                                .is_err()
-                            {
-                                tracing::error!(
-                                    code = error_codes::TOOL_INTERNAL_ERROR,
-                                    detail_code = "AUTHORITY_TRANSACTION_DETACHED_PANIC",
-                                    task_id,
-                                    panic = %detail,
-                                    "detached authority transaction panicked after its caller disconnected"
-                                );
-                            }
-                            AuthorityTaskExit::Panicked(detail)
-                        }
-                    }
-                }
-            }
-        });
-        let abort_handle = transaction.abort_handle();
-        transactions.insert(
-            task_id,
-            AuthorityTaskControl {
-                abort_handle,
-                cancellation,
-                cancellation_policy,
-                phase,
-            },
-        );
-
-        let transaction_registry = Arc::clone(&self.authority_finalizers.transactions);
-        let join_failures = Arc::clone(&self.authority_finalizers.join_failures);
-        let drain_state = self.drain_state_handle();
-        self.authority_finalizers.tasks.spawn(async move {
-            let join_result = transaction.await;
-            let failure = match join_result {
-                Ok(AuthorityTaskExit::Completed | AuthorityTaskExit::CancelledAfterRollback) => {
-                    None
-                }
-                Ok(AuthorityTaskExit::Panicked(detail)) => Some(format!(
-                    "authority transaction {task_id} panicked: {detail}"
-                )),
-                Ok(AuthorityTaskExit::StartGateClosed) => Some(format!(
-                    "authority transaction {task_id} start gate closed before execution"
-                )),
-                Err(error) => {
-                    let phase = transactions_phase(&transaction_registry, task_id);
-                    let cancelled = error.is_cancelled();
-                    let panicked = error.is_panic();
-                    let detail = if panicked {
-                        match error.try_into_panic() {
-                            Ok(payload) => {
-                                crate::daemon_lifecycle::consume_panic_payload(payload)
-                            }
-                            Err(error) => format!("panic payload unavailable: {error}"),
-                        }
-                    } else {
-                        error.to_string()
-                    };
-                    Some(format!(
-                        "authority transaction {task_id} join failed: cancelled={cancelled} panicked={panicked} phase={phase} detail={detail}",
-                    ))
-                }
-            };
-            let reap_result = match transaction_registry.lock() {
-                Ok(mut transactions) => {
-                    if transactions.remove(&task_id).is_some() {
-                        Ok(())
-                    } else {
-                        let detail = format!(
-                            "authority transaction {task_id} registry entry was missing after exact task join"
-                        );
-                        push_authority_join_failure(&join_failures, detail.clone());
-                        drain_state.mark_draining("authority_transaction_registry_entry_missing");
-                        Err(AuthorityTransactionJoinError::panicked(detail))
-                    }
-                }
-                Err(poisoned) => {
-                    poisoned.into_inner().remove(&task_id);
-                    let detail = format!(
-                        "authority transaction registry lock poisoned while reaping task {task_id}"
-                    );
-                    push_authority_join_failure(&join_failures, detail.clone());
-                    drain_state.mark_draining("authority_transaction_registry_poisoned");
-                    Err(AuthorityTransactionJoinError::panicked(detail))
-                }
-            };
-            if let Some(failure) = failure {
-                push_authority_join_failure(&join_failures, failure.clone());
-                drain_state.mark_draining("authority_transaction_join_failed");
-                tracing::error!(
-                    code = error_codes::TOOL_INTERNAL_ERROR,
-                    detail_code = "AUTHORITY_TRANSACTION_JOIN_FAILED",
-                    task_id,
-                    error = %failure,
-                    "supervised authority transaction failed before a clean join"
-                );
-            }
-            if reaped_sender.send(reap_result).is_err() {
-                tracing::debug!(
-                    code = "AUTHORITY_TRANSACTION_CALLER_GONE",
-                    task_id,
-                    outcome = "joined_and_registry_reaped",
-                    "authority transaction join/reap acknowledgement outlived its caller"
-                );
-            }
-        });
-        drop(transactions);
-        if start_sender.send(()).is_err() {
-            self.drain_state_handle()
-                .mark_draining("authority_transaction_start_gate_failed");
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("authority transaction {task_id} failed to open its start gate"),
-            ));
-        }
-        drop(admission_closed);
-        Ok(async move {
-            let result = result_receiver.await.unwrap_or_else(|error| {
-                Err(AuthorityTransactionJoinError::cancelled(format!(
-                    "authority transaction {task_id} result channel closed before a supervised outcome: {error}"
-                )))
-            });
-            match reaped_receiver.await {
-                Ok(Ok(())) => result,
-                Ok(Err(reap_error)) => {
-                    if let Ok(output) = result {
-                        let _drop_result = drop_authority_owned(output);
-                    }
-                    Err(reap_error)
-                }
-                Err(error) => {
-                    let mut detail = format!(
-                        "authority transaction {task_id} join/reap acknowledgement channel closed before registry removal was proven: {error}"
-                    );
-                    if let Ok(output) = result
-                        && let Err(drop_panic) = drop_authority_owned(output)
-                    {
-                        detail.push_str(&format!(
-                            "; completed output destructor also panicked: {drop_panic}"
-                        ));
-                    }
-                    Err(AuthorityTransactionJoinError::panicked(detail))
-                }
-            }
-        })
-    }
-
-    /// Close admission to the daemon's supervised authority-transaction set
-    /// and wait until every previously registered mutation/cleanup/audit task
-    /// exits. `TaskTracker::close` does not reject later spawns; the same mutex
-    /// therefore orders the explicit admission bit against registration.
-    pub(crate) async fn drain_authority_finalizers(
-        &self,
-    ) -> Result<AuthorityFinalizerDrainReadback, AuthorityFinalizerDrainFailure> {
-        let mut errors = Vec::new();
-        match self.authority_finalizers.admission_closed.lock() {
-            Ok(mut admission_closed) => {
-                *admission_closed = true;
-            }
-            Err(poisoned) => {
-                self.drain_state_handle()
-                    .mark_draining("authority_transaction_admission_poisoned");
-                // A poisoned mutex still owns its protected value. Recover the
-                // guard solely to close admission, then report the poison after
-                // every previously admitted task has been drained.
-                *poisoned.into_inner() = true;
-                errors.push(
-                    "authority transaction admission lock poisoned during shutdown drain"
-                        .to_owned(),
-                );
-                tracing::error!(
-                    code = error_codes::TOOL_INTERNAL_ERROR,
-                    "authority transaction admission lock poisoned during shutdown drain"
-                );
-            }
-        }
-        self.authority_finalizers.tasks.close();
-        let (registered_tasks_before, controls) =
-            snapshot_authority_controls(&self.authority_finalizers.transactions, &mut errors);
-        for (task_id, control) in &controls {
-            tracing::info!(
-                code = "AUTHORITY_TRANSACTION_CANCELLATION_REQUESTED",
-                task_id,
-                phase = authority_task_phase_name(control.phase.load(Ordering::Acquire)),
-                cancellation_policy = control.cancellation_policy.as_str(),
-                "signalling cancellation to a supervised authority transaction"
-            );
-            control.cancellation.cancel();
-        }
-        let cancellation_signals_sent = controls.len();
-        let mut abort_requests_sent = 0_usize;
-        if tokio::time::timeout(
-            AUTHORITY_CANCELLATION_GRACE,
-            self.authority_finalizers.tasks.wait(),
-        )
-        .await
-        .is_err()
-        {
-            let (remaining_before_abort, remaining_controls) =
-                snapshot_authority_controls(&self.authority_finalizers.transactions, &mut errors);
-            let mut cooperative_owners_retained = 0_usize;
-            for (task_id, control) in remaining_controls {
-                if control.cancellation_policy
-                    == AuthorityCancellationPolicy::CooperativeTerminalReadback
-                {
-                    cooperative_owners_retained += 1;
-                    tracing::error!(
-                        code = error_codes::ACTION_POSTCONDITION_FAILED,
-                        detail_code = "AUTHORITY_TRANSACTION_COOPERATIVE_OWNER_RETAINED",
-                        task_id,
-                        phase = authority_task_phase_name(control.phase.load(Ordering::Acquire)),
-                        cancellation_policy = control.cancellation_policy.as_str(),
-                        "storage-backed authority owner did not reach terminal readback inside cancellation grace; retaining its exact task and daemon lifetime locks"
-                    );
-                    continue;
-                }
-                tracing::error!(
-                    code = error_codes::TOOL_INTERNAL_ERROR,
-                    detail_code = "AUTHORITY_TRANSACTION_ABORT_REQUIRED",
-                    task_id,
-                    phase = authority_task_phase_name(control.phase.load(Ordering::Acquire)),
-                    cancellation_policy = control.cancellation_policy.as_str(),
-                    "authority transaction did not join inside cancellation grace; aborting its exact owned Tokio task"
-                );
-                control.abort_handle.abort();
-                abort_requests_sent += 1;
-            }
-            errors.push(format!(
-                "authority cancellation grace expired with {remaining_before_abort} transaction(s) still registered; aborted {abort_requests_sent} drop-safe task(s) and retained {cooperative_owners_retained} storage-backed owner(s)"
-            ));
-            if abort_requests_sent > 0
-                && tokio::time::timeout(
-                    AUTHORITY_ABORT_JOIN_TIMEOUT,
-                    self.authority_finalizers.tasks.wait(),
-                )
-                .await
-                .is_err()
-            {
-                errors.push(format!(
-                    "authority task join owners did not finish within {} ms after exact task abort",
-                    AUTHORITY_ABORT_JOIN_TIMEOUT.as_millis()
-                ));
-            }
-        }
-        let admission_closed = match self.authority_finalizers.admission_closed.lock() {
-            Ok(admission_closed) => *admission_closed,
-            Err(poisoned) => **poisoned.get_ref(),
-        };
-        let registered_tasks_after = authority_registry_len(
-            &self.authority_finalizers.transactions,
-            &mut errors,
-            "shutdown final readback",
-        );
-        let readback = AuthorityFinalizerDrainReadback {
-            admission_closed,
-            tracker_closed: self.authority_finalizers.tasks.is_closed(),
-            registered_tasks_before,
-            cancellation_signals_sent,
-            abort_requests_sent,
-            registered_tasks_after,
-            tracked_tasks_after: self.authority_finalizers.tasks.len(),
-        };
-        // Join owners remove their registry row, publish any join failure, and
-        // only then leave the TaskTracker. Consume the failure ledger after
-        // both owner counts are read: when `tracked_tasks_after == 0`, every
-        // possible publisher has completed, so a failure cannot appear in the
-        // gap between ledger consumption and the zero-owner verdict. A
-        // non-zero readback already fails closed and a later drain can consume
-        // any outcome published by the retained owner.
-        take_authority_join_failures(&self.authority_finalizers.join_failures, &mut errors);
-        tracing::info!(
-            code = "AUTHORITY_TRANSACTIONS_DRAINED",
-            admission_closed = readback.admission_closed,
-            tracker_closed = readback.tracker_closed,
-            registered_tasks_before = readback.registered_tasks_before,
-            cancellation_signals_sent = readback.cancellation_signals_sent,
-            abort_requests_sent = readback.abort_requests_sent,
-            registered_tasks_after = readback.registered_tasks_after,
-            tracked_tasks_after = readback.tracked_tasks_after,
-            safe_to_unlock = readback.safe_to_unlock(),
-            "all supervised authority transactions completed through cleanup and audit"
-        );
-        if !readback.admission_closed {
-            errors.push("authority transaction admission remained open after drain".to_owned());
-        }
-        if !readback.tracker_closed {
-            errors.push("authority transaction task tracker remained open after drain".to_owned());
-        }
-        if readback.registered_tasks_after != 0 {
-            errors.push(format!(
-                "{} authority transaction registry entry/entries remained after drain",
-                readback.registered_tasks_after
-            ));
-        }
-        if readback.tracked_tasks_after != 0 {
-            errors.push(format!(
-                "{} authority transaction task(s) remained after drain",
-                readback.tracked_tasks_after
-            ));
-        }
-        if errors.is_empty() {
-            Ok(readback)
-        } else {
-            let failure = AuthorityFinalizerDrainFailure {
-                readback,
-                detail: errors.join("; "),
-            };
-            tracing::error!(
-                code = "AUTHORITY_TRANSACTIONS_DRAIN_FAILED",
-                error = %failure,
-                "authority transaction shutdown drain did not reach a trustworthy state"
-            );
-            Err(failure)
-        }
     }
 
     pub(crate) fn shutdown_cancel_token(&self) -> Result<CancellationToken, ErrorData> {
@@ -1512,6 +830,21 @@ impl SynapseService {
         &self.session_registry
     }
 
+    pub(crate) const fn seat_supervisor_ref(&self) -> &Arc<synapse_seats::SeatSupervisor> {
+        &self.seat_supervisor
+    }
+
+    pub(crate) fn seat_supervisor_handle(&self) -> Arc<synapse_seats::SeatSupervisor> {
+        Arc::clone(&self.seat_supervisor)
+    }
+
+    pub(crate) fn browser_seat_backend_status(&self) -> (bool, &str) {
+        (
+            self.browser_seat_backend_available,
+            self.browser_seat_backend_detail.as_str(),
+        )
+    }
+
     pub(crate) fn mailbox_notify_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.mailbox_notify)
     }
@@ -1525,7 +858,13 @@ impl SynapseService {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
-        self.restore_session_target_if_needed(session_id)
+        // #299: a call that names an agent sees only that agent's target; while
+        // agents of this session hold targets, a call that names none sees none.
+        match agent_scope::lookup(session_id)? {
+            agent_scope::TargetLookup::Agent(target) => Ok(target),
+            agent_scope::TargetLookup::AgentsActive => Ok(None),
+            agent_scope::TargetLookup::Session => self.restore_session_target_if_needed(session_id),
+        }
     }
 
     /// Resolves the foreground-equivalent target owned by one MCP session.
@@ -1552,18 +891,15 @@ impl SynapseService {
         explicit_cdp_target_id: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<Option<SessionTarget>, ErrorData> {
-        let target = match explicit_action_target(explicit_window_hwnd, explicit_cdp_target_id)? {
-            Some(target) => Ok(Some(target)),
+        match explicit_action_target(explicit_window_hwnd, explicit_cdp_target_id)? {
+            Some(target) => {
+                if let Some(session_id) = session_id {
+                    agent_scope::ensure_access(session_id, &target)?;
+                }
+                Ok(Some(target))
+            }
             None => self.session_target(session_id),
-        }?;
-        if let Some(target) = target.as_ref() {
-            let hwnd = match target {
-                SessionTarget::Window { hwnd } => *hwnd,
-                SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
-            };
-            crate::m1::validate_window_hwnd_shape("action_target_override", hwnd)?;
         }
-        Ok(target)
     }
 
     pub(crate) fn unscoped_action_handle(&self) -> anyhow::Result<ActionHandle> {
@@ -1574,23 +910,11 @@ impl SynapseService {
     }
 
     fn tool_router() -> ToolRouter<Self> {
-        Self::build_tool_router(debug_tools_enabled())
-    }
-
-    /// Builds the full tool router, then removes the synthetic debug-only
-    /// fault-injector / synthetic-write routes unless `debug_enabled`.
-    ///
-    /// Split out from [`Self::tool_router`] so the gating decision is a pure
-    /// function of an explicit bool and can be unit-tested deterministically
-    /// via [`rmcp::handler::server::router::tool::ToolRouter::has_route`],
-    /// without mutating the process-global `SYNAPSE_DEBUG_TOOLS` env var (which
-    /// would race with other tests). See [`DEBUG_ONLY_TOOL_ROUTES`] for the
-    /// gated set and its rationale (#1348, #1595).
-    fn build_tool_router(debug_enabled: bool) -> ToolRouter<Self> {
         let mut router = Self::m1_tool_router()
             + Self::m2_tool_router()
             + Self::lease_tool_router()
             + Self::session_tool_router()
+            + Self::user_activity_tool_router()
             + Self::agent_mailbox_tool_router()
             + Self::agent_cost_tool_router()
             + Self::cost_facade_tool_router()
@@ -1625,6 +949,8 @@ impl SynapseService {
             + Self::background_router_tool_router()
             + Self::browser_batch_tool_router()
             + Self::capture_gif_tool_router()
+            + Self::livecapture_tool_router()
+            + Self::videoanalyze_tool_router()
             + Self::verification_tool_router()
             + Self::browser_assert_tool_router()
             + Self::browser_clock_events_tool_router()
@@ -1638,45 +964,55 @@ impl SynapseService {
             + Self::browser_network_tool_router()
             + Self::browser_storage_tool_router()
             + Self::tool_profile_tool_router();
-        // Gate the synthetic test/support tools off the default agent
-        // surface; they remain reachable only when SYNAPSE_DEBUG_TOOLS is set.
-        // `remove_route` drops the route from the router entirely, so the tool
-        // is unreachable even by an unbound call (the tool-profile visibility
-        // filter only runs once a session is bound — see
-        // `tools_for_session_profile`), matching the least-privilege /
-        // exclude-by-default posture: a gated tool cannot be called even when
-        // explicitly named. Every test that drives these sets
+        #[cfg(feature = "livefeed")]
+        {
+            router += Self::livefeed_tool_router();
+        }
+        // The EverQuest domain pack (25 tools) is off the general-agent surface
+        // unless the operator opts in (SYNAPSE_ENABLE_EVERQUEST). No capability
+        // is lost — visibility is gated. rmcp builds the tool list once per
+        // service, so a startup opt-in flag is the gating mechanism (dynamic
+        // per-profile re-listing would require tools/list_changed plumbing).
+        if everquest_enabled() {
+            router = router
+                + Self::everquest_tool_router()
+                + Self::everquest_autocombat_tool_router()
+                + Self::everquest_contextgraph_tool_router()
+                + Self::everquest_domain_tool_router()
+                + Self::everquest_episode_export_tool_router()
+                + Self::everquest_guard_tool_router()
+                + Self::everquest_state_tool_router()
+                + Self::everquest_map_sensor_tool_router()
+                + Self::everquest_memory_tool_router()
+                + Self::everquest_outcome_tool_router()
+                + Self::everquest_predictive_model_tool_router()
+                + Self::everquest_route_tool_router()
+                + Self::everquest_scorecard_tool_router()
+                + Self::everquest_surprise_tool_router()
+                + Self::everquest_trajectory_tool_router()
+                + Self::everquest_world_model_tool_router()
+                + Self::everquest_world_summary_tool_router();
+        }
+        // Gate the synthetic fault-injectors off the default agent surface;
+        // they remain available only when SYNAPSE_DEBUG_TOOLS is set, mirroring
+        // the EverQuest opt-in model — no capability is lost, visibility is gated.
+        // `storage_pressure_sample` simulates disk pressure, and the two
+        // `action_diagnostic_*` tools force ACTION_RATE_LIMITED / ACTION_QUEUE_FULL
+        // to exercise the action emitter's backpressure paths (#1348). They have
+        // no production callers and every test that drives them sets
         // SYNAPSE_DEBUG_TOOLS=1.
-        if !debug_enabled {
-            for route in DEBUG_ONLY_TOOL_ROUTES {
-                router.remove_route(route);
-            }
+        //
+        // NOTE: `storage_put_probe_rows` is intentionally NOT gated here — it is a
+        // default-granted real diagnostic write tool (normal_agent surface, see
+        // tool_profiles tests) used by storage-GC FSV to seed bounded probe rows.
+        if !debug_tools_enabled() {
+            router.remove_route("storage_pressure_sample");
+            router.remove_route("action_diagnostic_rate_limit_override");
+            router.remove_route("action_diagnostic_queue_full_setup");
         }
         router
     }
 }
-
-/// Synthetic test/support tool routes that must NOT ship on the normal,
-/// default agent surface; they are only registered when `SYNAPSE_DEBUG_TOOLS` is
-/// set (see [`SynapseService::build_tool_router`]).
-///
-/// - `storage_put_probe_rows` — writes bounded synthetic probe rows into a real
-///   RocksDB column family; a synthetic-write diagnostic used by storage/GC and
-///   timeline regression checks to seed rows, never a production capability
-///   (#1595). Manual FSV remains separate.
-/// - `storage_pressure_sample` — simulates disk pressure to exercise the storage
-///   pressure signal.
-/// - `action_diagnostic_rate_limit_override` / `action_diagnostic_queue_full_setup`
-///   — force `ACTION_RATE_LIMITED` / `ACTION_QUEUE_FULL` to exercise the action
-///   emitter's backpressure paths.
-///
-/// All four have no production callers (#1348, #1595).
-pub(crate) const DEBUG_ONLY_TOOL_ROUTES: &[&str] = &[
-    "storage_put_probe_rows",
-    "storage_pressure_sample",
-    "action_diagnostic_rate_limit_override",
-    "action_diagnostic_queue_full_setup",
-];
 
 /// Pure decision for [`SynapseService::action_session_target_override`] (#984):
 /// maps explicit per-call routing params to a [`SessionTarget`], or `Ok(None)`
@@ -1689,9 +1025,6 @@ pub(crate) fn explicit_action_target(
     explicit_window_hwnd: Option<i64>,
     explicit_cdp_target_id: Option<&str>,
 ) -> Result<Option<SessionTarget>, ErrorData> {
-    let explicit_window_hwnd = explicit_window_hwnd
-        .map(|hwnd| crate::m1::validate_window_hwnd_shape("action_target_override", hwnd))
-        .transpose()?;
     let explicit_cdp_target_id = explicit_cdp_target_id
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -1715,8 +1048,33 @@ fn debug_tools_enabled() -> bool {
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+/// Whether the EverQuest domain tool pack should be advertised.
+fn everquest_enabled() -> bool {
+    std::env::var("SYNAPSE_ENABLE_EVERQUEST")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 impl Default for SynapseService {
     fn default() -> Self {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "server/tests/emergency_handlers_94.rs"]
+mod emergency_handlers_94;
+#[cfg(test)]
+#[path = "server/tests/g7a_support.rs"]
+mod g7a_support;
+
+#[cfg(test)]
+#[path = "server/g7b_support.rs"]
+pub(crate) mod g7b_support;
+
+#[cfg(test)]
+#[path = "server/storage_maintenance_observer.rs"]
+mod storage_maintenance_observer;
+
+#[cfg(test)]
+#[path = "server/tests/emergency_reservation_identity_95.rs"]
+mod emergency_reservation_identity_95;

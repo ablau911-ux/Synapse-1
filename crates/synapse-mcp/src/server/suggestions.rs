@@ -28,7 +28,7 @@ use crate::m3::plan::{
 };
 use crate::m3::plan_execution::{
     PlanExecutionRecord, PlanExecutionStatus, PlanStepExecutionReport, PlanStepExecutionStatus,
-    build_plan_execution_record, plan_execution_id, write_plan_execution,
+    build_plan_execution_record, plan_execution_id, write_completed_plan_execution,
 };
 use crate::m3::suggestions::{
     SuggestionAcceptParams, SuggestionAcceptResponse, SuggestionListParams, SuggestionListResponse,
@@ -36,7 +36,6 @@ use crate::m3::suggestions::{
     accept_suggestion_for_execution, assist_plan_for_suggestion, list_suggestions,
     load_suggestion_by_id, record_suggestion_execution_feedback, required_permissions_accept,
     required_permissions_list, required_permissions_tick, suggestion_tick,
-    validate_stored_assist_target_hwnd,
 };
 use crate::m4::{ActLaunchParams, LaunchWindowState};
 
@@ -216,7 +215,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Accept one live suggestion and execute its compiled setup plan (#860). Loads or compiles the routine plan, marks the durable suggestion/v1 row accepted, runs supported steps through background-first routes (act_launch for apps, cdp_open_tab for browser hosts), refuses unsupported/ambiguous steps loudly, verifies each mutating step's postcondition, persists a plan_execution/v1 report, and records routine feedback with the execution outcome. Assist report-only mitigations are recorded as skipped unless a scoped correction is actually attempted and verified. dry_run returns the same routing report without mutating storage or launching/opening anything."
+        description = "Accept one live suggestion and execute its compiled setup plan (#860). Loads or compiles the routine plan, marks the durable suggestion/v1 row accepted, runs supported steps through background-first routes (act_launch for apps, cdp_open_tab for browser hosts), refuses unsupported/ambiguous steps loudly, verifies each mutating step's postcondition, records report-only assist mitigations as skipped, persists a plan_execution/v1 report, and records routine feedback with the execution outcome. dry_run returns the same routing report without mutating storage or launching/opening anything."
     )]
     pub async fn suggestion_accept(
         &self,
@@ -274,7 +273,7 @@ impl SynapseService {
         let db = self.m3_storage()?;
         let Some(existing) = load_suggestion_by_id(&db, &params.suggestion_id)? else {
             return Err(crate::m1::mcp_error(
-                error_codes::STORAGE_READ_FAILED,
+                error_codes::SUGGESTION_NOT_FOUND,
                 format!(
                     "SUGGESTION_NOT_FOUND: suggestion_id {} is not in CF_KV",
                     params.suggestion_id
@@ -288,8 +287,7 @@ impl SynapseService {
         }
         let plan = load_or_compile_plan(&db, &existing.routine_id, !params.dry_run)?;
         let accepted_ts_ns = now_ts_ns();
-        let started_ts_ns = accepted_ts_ns;
-        let execution_id = plan_execution_id(&existing.suggestion_id, started_ts_ns);
+        let execution_id = plan_execution_id(&existing.suggestion_id, accepted_ts_ns);
         let plan_ref = format!("{PLAN_REF_PREFIX}{}", plan.routine_id);
         let accepted = accept_suggestion_for_execution(
             &db,
@@ -300,52 +298,8 @@ impl SynapseService {
             params.dry_run,
         )?;
 
-        let options = PlanExecutionOptions::suggestion_accept(&params);
-        let steps = self
-            .execute_plan_steps(&plan, &options, session_id.as_deref())
-            .await;
-        let completed_ts_ns = now_ts_ns();
-        let execution = build_plan_execution_record(
-            execution_id,
-            accepted.suggestion_id.clone(),
-            session_id,
-            accepted_ts_ns,
-            started_ts_ns,
-            completed_ts_ns,
-            params.dry_run,
-            plan.clone(),
-            steps,
-        );
-        if !params.dry_run {
-            write_plan_execution(&db, &execution)?;
-            let feedback_note = format!(
-                "suggestion_accept execution_status={} execution_id={} succeeded_steps={} failed_or_refused_steps={}",
-                execution.status.as_str(),
-                execution.execution_id,
-                execution
-                    .steps
-                    .iter()
-                    .filter(|step| step.status == PlanStepExecutionStatus::Succeeded)
-                    .count(),
-                execution
-                    .steps
-                    .iter()
-                    .filter(|step| step.status.is_terminal_failure())
-                    .count()
-            );
-            record_suggestion_execution_feedback(
-                &db,
-                &accepted.routine_id,
-                RoutineFeedbackOutcome::Accepted,
-                completed_ts_ns,
-                &feedback_note,
-            )?;
-        }
-        Ok(SuggestionAcceptResponse {
-            suggestion: accepted,
-            plan,
-            execution,
-        })
+        self.execute_accepted_suggestion(&db, accepted, plan, &params, session_id, accepted_ts_ns)
+            .await
     }
 
     async fn assist_suggestion_accept_impl(
@@ -356,9 +310,8 @@ impl SynapseService {
         session_id: Option<String>,
     ) -> Result<SuggestionAcceptResponse, ErrorData> {
         let accepted_ts_ns = now_ts_ns();
-        let started_ts_ns = accepted_ts_ns;
         let plan = assist_plan_for_suggestion(&existing, accepted_ts_ns)?;
-        let execution_id = plan_execution_id(&existing.suggestion_id, started_ts_ns);
+        let execution_id = plan_execution_id(&existing.suggestion_id, accepted_ts_ns);
         let plan_ref = format!(
             "assist-opportunity/v1/{}",
             existing
@@ -374,38 +327,41 @@ impl SynapseService {
             &execution_id,
             params.dry_run,
         )?;
-        let options = PlanExecutionOptions::suggestion_accept(&params);
-        let steps = if params.dry_run {
-            plan.steps
-                .iter()
-                .map(|step| dry_run_step_report(step, &options))
-                .collect()
-        } else {
+        self.execute_accepted_suggestion(&db, accepted, plan, &params, session_id, accepted_ts_ns)
+            .await
+    }
+
+    async fn execute_accepted_suggestion(
+        &self,
+        db: &std::sync::Arc<synapse_storage::Db>,
+        accepted: SuggestionRecord,
+        plan: PlanDocument,
+        params: &SuggestionAcceptParams,
+        session_id: Option<String>,
+        accepted_ts_ns: u64,
+    ) -> Result<SuggestionAcceptResponse, ErrorData> {
+        let options = PlanExecutionOptions::suggestion_accept(params);
+        let steps = if accepted.source == SuggestionSource::AssistOpportunity && !params.dry_run {
             self.execute_assist_plan_steps(&accepted, &plan, &options)
                 .await
+        } else {
+            self.execute_plan_steps(&plan, &options, session_id.as_deref())
+                .await
         };
-        let completed_ts_ns = now_ts_ns();
         let execution = build_plan_execution_record(
-            execution_id,
+            plan_execution_id(&accepted.suggestion_id, accepted_ts_ns),
             accepted.suggestion_id.clone(),
             session_id,
             accepted_ts_ns,
-            started_ts_ns,
-            completed_ts_ns,
+            accepted_ts_ns,
+            now_ts_ns(),
             params.dry_run,
             plan.clone(),
             steps,
         );
         if !params.dry_run {
-            write_plan_execution(&db, &execution)?;
-            tracing::info!(
-                code = "ASSIST_SUGGESTION_ACCEPTED",
-                suggestion_id = %accepted.suggestion_id,
-                source_event_id = accepted.source_event_id.as_deref().unwrap_or(""),
-                execution_id = %execution.execution_id,
-                execution_status = execution.status.as_str(),
-                "assist suggestion accepted and execution report persisted"
-            );
+            finish_suggestion_execution(db, &accepted, &execution)
+                .map_err(|error| finalization_error(error, json!({ "execution": execution })))?;
         }
         Ok(SuggestionAcceptResponse {
             suggestion: accepted,
@@ -429,10 +385,12 @@ impl SynapseService {
                 runs.push(dry_run_tick_run(&due_run));
                 continue;
             }
-            let claimed = claim_armed_run(&db, &due_run, now)?;
+            let claimed = claim_armed_run(&db, &due_run, now)
+                .map_err(|error| armed_tick_error(error, &runs))?;
             let completed = self
                 .execute_claimed_armed_run(&db, &params, claimed, session_id.clone())
-                .await?;
+                .await
+                .map_err(|error| armed_tick_error(error, &runs))?;
             runs.push(tick_run_from_record(&completed));
         }
 
@@ -462,17 +420,7 @@ impl SynapseService {
         let plan = match load_or_compile_plan(db, &run.routine_id, true) {
             Ok(plan) => plan,
             Err(error) => {
-                return complete_armed_run(
-                    db,
-                    run,
-                    ArmedRoutineRunStatus::Failed,
-                    None,
-                    None,
-                    None,
-                    error_data_code(&error),
-                    Some(error.message.to_string()),
-                    json!({ "error_data": error.data }),
-                );
+                return fail_claimed_armed_run(db, run, None, error);
             }
         };
         let started_ts_ns = now_ts_ns();
@@ -490,76 +438,14 @@ impl SynapseService {
             started_ts_ns,
             completed_ts_ns,
             false,
-            plan.clone(),
+            plan,
             steps,
         );
-        write_plan_execution(db, &execution)?;
-
-        let approval_id = match queue_armed_run_review(
-            db,
-            &run,
-            &execution,
-            session_id.as_deref().unwrap_or("armed-routine-runner"),
-        ) {
-            Ok(approval_id) => Some(approval_id),
-            Err(error) => {
-                return complete_armed_run(
-                    db,
-                    run,
-                    ArmedRoutineRunStatus::Failed,
-                    Some(format!("{PLAN_REF_PREFIX}{}", plan.routine_id)),
-                    Some(execution.execution_id),
-                    None,
-                    error_data_code(&error),
-                    Some(error.message.to_string()),
-                    json!({
-                        "plan_execution_status": execution.status.as_str(),
-                        "approval_request_error": error.data,
-                    }),
-                );
-            }
-        };
-
-        let status = match execution.status {
-            PlanExecutionStatus::Succeeded => ArmedRoutineRunStatus::Succeeded,
-            PlanExecutionStatus::Failed
-            | PlanExecutionStatus::Skipped
-            | PlanExecutionStatus::DryRun => ArmedRoutineRunStatus::Failed,
-        };
-        let (error_code, error) = if status == ArmedRoutineRunStatus::Failed {
-            (
-                Some("ARMED_ROUTINE_PLAN_EXECUTION_FAILED".to_owned()),
-                Some(format!(
-                    "plan execution {} ended with status {}",
-                    execution.execution_id,
-                    execution.status.as_str()
-                )),
-            )
-        } else {
-            (None, None)
-        };
-        complete_armed_run(
+        finish_claimed_armed_run(
             db,
             run,
-            status,
-            Some(format!("{PLAN_REF_PREFIX}{}", plan.routine_id)),
-            Some(execution.execution_id),
-            approval_id,
-            error_code,
-            error,
-            json!({
-                "plan_execution_status": execution.status.as_str(),
-                "succeeded_steps": execution
-                    .steps
-                    .iter()
-                    .filter(|step| step.status == PlanStepExecutionStatus::Succeeded)
-                    .count(),
-                "failed_or_refused_steps": execution
-                    .steps
-                    .iter()
-                    .filter(|step| step.status.is_terminal_failure())
-                    .count(),
-            }),
+            &execution,
+            session_id.as_deref().unwrap_or("armed-routine-runner"),
         )
     }
 
@@ -641,13 +527,6 @@ impl SynapseService {
                 ),
             );
         };
-        let hwnd = match validate_stored_assist_target_hwnd(
-            &format!("CF_KV suggestion row {}", suggestion.suggestion_id),
-            hwnd,
-        ) {
-            Ok(hwnd) => hwnd,
-            Err(error) => return error_step_report(started, step, &error),
-        };
         match synapse_a11y::foreground_context(hwnd) {
             Ok(context) => {
                 let process_matches = mitigation
@@ -684,31 +563,13 @@ impl SynapseService {
                     },
                     "postcondition": mitigation.postcondition,
                 });
-                if process_matches && pid_matches {
-                    step_report(
-                        started,
-                        step,
-                        PlanStepExecutionStatus::Skipped,
-                        evidence,
-                        Some("ASSIST_CORRECTION_REPORT_ONLY"),
-                        Some(
-                            "assist produced a scoped target readback report only; no correction was attempted because no verifiable desired state was available"
-                                .to_owned(),
-                        ),
+                let (status, error_code, error) =
+                    crate::m3::plan_execution::AssistReadbackOutcome::new(
+                        process_matches,
+                        pid_matches,
                     )
-                } else {
-                    step_report(
-                        started,
-                        step,
-                        PlanStepExecutionStatus::Failed,
-                        evidence,
-                        Some("ASSIST_TARGET_READBACK_MISMATCH"),
-                        Some(
-                            "assist target HWND resolved, but process/pid no longer match the detector evidence"
-                                .to_owned(),
-                        ),
-                    )
-                }
+                    .into_parts();
+                step_report(started, step, status, evidence, error_code, error)
             }
             Err(error) => step_report(
                 started,
@@ -774,10 +635,9 @@ impl SynapseService {
         session_id: Option<&str>,
     ) -> PlanStepExecutionReport {
         let started = now_ts_ns();
-        let preflight = match self.ensure_supported_use_allows_action("act_launch") {
-            Ok(preflight) => preflight,
-            Err(error) => return error_step_report(started, step, &error),
-        };
+        if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
+            return error_step_report(started, step, &error);
+        }
         let launch = ActLaunchParams {
             target: step.source_app.clone(),
             args: Vec::new(),
@@ -795,7 +655,7 @@ impl SynapseService {
             desktop: session_id.map(|_| "agent:session".to_owned()),
         };
         let result = self
-            .act_launch_for_session_id(launch, session_id.map(ToOwned::to_owned), &preflight)
+            .act_launch_for_session_id(launch, session_id.map(ToOwned::to_owned), None)
             .await;
         match result {
             Ok(response) => {
@@ -916,13 +776,6 @@ impl SynapseService {
 }
 
 fn validate_suggestion_accept_params(params: &SuggestionAcceptParams) -> Result<(), ErrorData> {
-    if let Some(browser_window_hwnd) = params.browser_window_hwnd {
-        crate::m1::validate_hwnd_shape(
-            "suggestion_accept",
-            "browser_window_hwnd",
-            browser_window_hwnd,
-        )?;
-    }
     if params.suggestion_id.trim().is_empty() {
         return Err(crate::m1::mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -938,6 +791,172 @@ fn validate_suggestion_accept_params(params: &SuggestionAcceptParams) -> Result<
         ));
     }
     Ok(())
+}
+
+fn finish_suggestion_execution(
+    db: &std::sync::Arc<synapse_storage::Db>,
+    accepted: &SuggestionRecord,
+    execution: &PlanExecutionRecord,
+) -> Result<(), ErrorData> {
+    write_completed_plan_execution(db, execution)?;
+    #[cfg(test)]
+    suggestion_feedback_pressure_273_tests::raise_pressure_before_feedback(db, accepted);
+    if accepted.source == SuggestionSource::AssistOpportunity {
+        tracing::info!(
+            code = "ASSIST_SUGGESTION_ACCEPTED",
+            suggestion_id = %accepted.suggestion_id,
+            source_event_id = accepted.source_event_id.as_deref().unwrap_or(""),
+            execution_id = %execution.execution_id,
+            execution_status = execution.status.as_str(),
+            "assist suggestion accepted and execution report persisted"
+        );
+        return Ok(());
+    }
+    let (succeeded, failed_or_refused) = execution_step_counts(execution);
+    let feedback_note = format!(
+        "suggestion_accept execution_status={} execution_id={} succeeded_steps={} failed_or_refused_steps={}",
+        execution.status.as_str(),
+        execution.execution_id,
+        succeeded,
+        failed_or_refused
+    );
+    record_suggestion_execution_feedback(
+        db,
+        &accepted.routine_id,
+        RoutineFeedbackOutcome::Accepted,
+        execution.completed_ts_ns,
+        &feedback_note,
+    )
+}
+
+#[cfg(test)]
+#[path = "tests/suggestion_feedback_pressure_273.rs"]
+mod suggestion_feedback_pressure_273_tests;
+
+fn finalization_error(mut error: ErrorData, evidence: Value) -> ErrorData {
+    let code = error_data_code(&error)
+        .filter(|code| code != error_codes::STORAGE_WRITE_SHED)
+        .unwrap_or_else(|| error_codes::EXECUTION_FINALIZATION_FAILED.to_owned());
+    error.data = Some(json!({
+        "code": code,
+        "retryable": false,
+        "cause": error.data,
+        "evidence": evidence,
+    }));
+    error.message = format!(
+        "Finalization failed after acceptance or claim; do not replay execution: {}",
+        error.message
+    )
+    .into();
+    error
+}
+
+fn armed_tick_error(error: ErrorData, runs: &[ArmedRoutineTickRun]) -> ErrorData {
+    if runs.is_empty() {
+        error
+    } else {
+        finalization_error(
+            error,
+            json!({
+                "completed_runs": runs,
+                "source_of_truth": ARMED_ROUTINE_SOURCE_OF_TRUTH,
+            }),
+        )
+    }
+}
+
+fn armed_execution_evidence(execution: &PlanExecutionRecord) -> Value {
+    let (succeeded, failed_or_refused) = execution_step_counts(execution);
+    json!({
+        "plan_execution_status": execution.status.as_str(),
+        "succeeded_steps": succeeded,
+        "failed_or_refused_steps": failed_or_refused,
+        "execution": execution,
+    })
+}
+
+fn execution_step_counts(execution: &PlanExecutionRecord) -> (usize, usize) {
+    (
+        execution
+            .steps
+            .iter()
+            .filter(|step| step.status == PlanStepExecutionStatus::Succeeded)
+            .count(),
+        execution
+            .steps
+            .iter()
+            .filter(|step| step.status.is_terminal_failure())
+            .count(),
+    )
+}
+
+fn fail_claimed_armed_run(
+    db: &std::sync::Arc<synapse_storage::Db>,
+    run: ArmedRoutineRunRecord,
+    execution: Option<&PlanExecutionRecord>,
+    error: ErrorData,
+) -> Result<ArmedRoutineRunRecord, ErrorData> {
+    let mut evidence = execution.map_or_else(|| json!({}), armed_execution_evidence);
+    evidence["error_data"] = json!(error.data);
+    let error = finalization_error(error, evidence.clone());
+    complete_armed_run(
+        db,
+        run,
+        ArmedRoutineRunStatus::Failed,
+        execution.map(|record| format!("{PLAN_REF_PREFIX}{}", record.routine_id)),
+        execution.map(|record| record.execution_id.clone()),
+        None,
+        error_data_code(&error),
+        Some(error.message.to_string()),
+        evidence.clone(),
+    )
+    .map_err(|error| finalization_error(error, evidence))
+}
+
+fn finish_claimed_armed_run(
+    db: &std::sync::Arc<synapse_storage::Db>,
+    run: ArmedRoutineRunRecord,
+    execution: &PlanExecutionRecord,
+    by_session: &str,
+) -> Result<ArmedRoutineRunRecord, ErrorData> {
+    if let Err(error) = write_completed_plan_execution(db, execution) {
+        return fail_claimed_armed_run(db, run, Some(execution), error);
+    }
+    let approval_id = match queue_armed_run_review(db, &run, execution, by_session) {
+        Ok(approval_id) => Some(approval_id),
+        Err(error) => return fail_claimed_armed_run(db, run, Some(execution), error),
+    };
+    let (status, error_code, error) = armed_execution_outcome(execution);
+    complete_armed_run(
+        db,
+        run,
+        status,
+        Some(format!("{PLAN_REF_PREFIX}{}", execution.routine_id)),
+        Some(execution.execution_id.clone()),
+        approval_id,
+        error_code,
+        error,
+        armed_execution_evidence(execution),
+    )
+    .map_err(|error| finalization_error(error, armed_execution_evidence(execution)))
+}
+
+fn armed_execution_outcome(
+    execution: &PlanExecutionRecord,
+) -> (ArmedRoutineRunStatus, Option<String>, Option<String>) {
+    if execution.status == PlanExecutionStatus::Succeeded {
+        (ArmedRoutineRunStatus::Succeeded, None, None)
+    } else {
+        (
+            ArmedRoutineRunStatus::Failed,
+            Some("ARMED_ROUTINE_PLAN_EXECUTION_FAILED".to_owned()),
+            Some(format!(
+                "plan execution {} ended with status {}",
+                execution.execution_id,
+                execution.status.as_str()
+            )),
+        )
+    }
 }
 
 fn queue_armed_run_review(
@@ -1150,3 +1169,11 @@ fn url_host_matches(url: &str, expected_host: &str) -> bool {
         .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == expected)
 }
+
+#[cfg(test)]
+#[path = "tests/suggestion_handler_97.rs"]
+mod suggestion_handler_97_tests;
+
+#[cfg(test)]
+#[path = "tests/suggestion_read_io_97.rs"]
+mod suggestion_read_io_97_tests;

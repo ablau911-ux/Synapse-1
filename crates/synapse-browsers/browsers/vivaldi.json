@@ -1,0 +1,37 @@
+{
+  "id": "vivaldi",
+  "label": "Vivaldi",
+  "family": "chromium",
+  "process_names": ["vivaldi.exe"],
+  "exe_path_markers": [],
+  "exe_candidates": [
+    "%LOCALAPPDATA%\\Vivaldi\\Application\\vivaldi.exe",
+    "%ProgramFiles%\\Vivaldi\\Application\\vivaldi.exe"
+  ],
+  "app_paths_name": "vivaldi.exe",
+  "user_data_root": "%LOCALAPPDATA%\\Vivaldi\\User Data",
+  "profile_layout": "multi",
+  "window_title_suffixes": [" - Vivaldi"],
+  "tab_target_prefix": "vivaldi-tab:",
+  "endpoint_base": "synapse-bridge://vivaldi",
+  "health_key": "vivaldi_bridge",
+  "registration_token_file": "browser-bridge-token-vivaldi.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "vivaldi://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "browser-extension\\vivaldi"
+  },
+  "policy": null,
+  "native_messaging_cleanup_roots": [],
+  "protected_extension_ids": ["mpognobbkildjkofajifpdfhcoklimli"],
+  "cdp_product_tokens": [],
+  "unsupported_capabilities": [],
+  "debugger_api_expected": true,
+  "install_ui": {
+    "developer_mode_names": ["Developer mode"],
+    "load_unpacked_names": ["Load unpacked"]
+  },
+  "winget_id": "Vivaldi.Vivaldi"
+}

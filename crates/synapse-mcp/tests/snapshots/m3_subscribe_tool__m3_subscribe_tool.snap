@@ -1,0 +1,497 @@
+---
+source: crates/synapse-mcp/tests/m3_subscribe_tool.rs
+expression: shape
+---
+{
+  "inputSchema": {
+    "$defs": {
+      "DataPredicate": {
+        "oneOf": [
+          {
+            "properties": {
+              "op": {
+                "const": "eq",
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "ne",
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "lt",
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "le",
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "gt",
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "ge",
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "object",
+                  "array",
+                  "string",
+                  "number",
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "regex",
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "pattern"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "in_set",
+                "type": "string"
+              },
+              "values": {
+                "items": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "op",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "exists",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EventFilter": {
+        "oneOf": [
+          {
+            "properties": {
+              "op": {
+                "const": "all",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "none",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "op": {
+                "const": "kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "source",
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/$defs/EventSource"
+              }
+            },
+            "required": [
+              "op",
+              "source"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "args": {
+                "items": {
+                  "$ref": "#/$defs/EventFilter"
+                },
+                "type": "array"
+              },
+              "op": {
+                "const": "and",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "args"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "args": {
+                "items": {
+                  "$ref": "#/$defs/EventFilter"
+                },
+                "type": "array"
+              },
+              "op": {
+                "const": "or",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "args"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "arg": {
+                "$ref": "#/$defs/EventFilter"
+              },
+              "op": {
+                "const": "not",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "arg"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "data",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "predicate": {
+                "$ref": "#/$defs/DataPredicate"
+              }
+            },
+            "required": [
+              "op",
+              "path",
+              "predicate"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EventSource": {
+        "enum": [
+          "a11y_uia",
+          "a11y_win_event",
+          "a11y_cdp",
+          "perception",
+          "perception_detection",
+          "perception_hud",
+          "perception_audio",
+          "filesystem",
+          "process",
+          "clipboard",
+          "action_emitter",
+          "reflex",
+          "system"
+        ],
+        "type": "string"
+      },
+      "SubscribeCancelParams": {
+        "additionalProperties": false,
+        "properties": {
+          "subscription_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscription_id"
+        ],
+        "type": "object"
+      },
+      "SubscribeOperation": {
+        "enum": [
+          "events",
+          "events_cancel"
+        ],
+        "type": "string"
+      },
+      "SubscribeParams": {
+        "additionalProperties": false,
+        "properties": {
+          "buffer_size": {
+            "default": 4096,
+            "description": "Per-subscription live queue and SSE replay capacity (1..=4096, default\n4096). When full, each buffer drops its oldest event and reports loss.",
+            "maximum": 4096,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/EventFilter"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "kinds": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "snapshot_first": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "events": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SubscribeParams"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "events_cancel": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SubscribeCancelParams"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "operation": {
+        "$ref": "#/$defs/SubscribeOperation"
+      }
+    },
+    "required": [
+      "operation"
+    ],
+    "title": "SubscribeFacadeParams",
+    "type": "object"
+  },
+  "name": "subscribe",
+  "outputSchema": {
+    "$defs": {
+      "SubscribeCancelReason": {
+        "enum": [
+          "ok",
+          "not_found"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "cancelled": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "reason": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SubscribeCancelReason"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "source_of_truth": {
+        "type": "string"
+      },
+      "started_at": {
+        "format": "date-time",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "subscription_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "source_of_truth"
+    ],
+    "title": "SubscribeFacadeResponse",
+    "type": "object"
+  }
+}

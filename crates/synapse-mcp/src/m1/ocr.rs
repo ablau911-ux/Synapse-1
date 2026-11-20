@@ -1,11 +1,8 @@
 use rmcp::ErrorData;
-use synapse_core::{OcrBackend, OcrConfidenceSource, OcrResult, OcrWord, Rect, error_codes};
-use synapse_perception::{
-    TextRegion, TextRegionConfidenceSource, read_text as platform_read_text,
-    read_text_with_provider,
-};
+use synapse_core::{ConfidenceSource, OcrBackend, OcrResult, OcrWord, Rect, error_codes};
+use synapse_perception::{TextRegion, read_text as platform_read_text, read_text_with_provider};
 
-use crate::m1::{M1State, ReadTextParams, current_input, mcp_error};
+use crate::m1::{M1State, ReadTextParams, current_input, element_window_crop, mcp_error};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadTextCaptureSource {
@@ -29,25 +26,69 @@ pub struct ResolvedReadTextRequest {
     pub effective_backend: OcrBackend,
     pub lang_hint: Option<String>,
     pub synthetic: bool,
-    /// When true, a clean OCR pass that finds zero glyphs stays a hard
-    /// `OCR_NO_TEXT` error instead of the #1557 empty-observation success — for
-    /// callers that want to pin fail-closed absence. Carried on the resolved
-    /// request for completeness; the fail-closed gate is enforced separately by
-    /// [`enforce_require_text`] from the tool params.
-    #[allow(dead_code)]
-    pub require_text: bool,
 }
 
 impl ResolvedReadTextRequest {
     #[must_use]
     pub fn lang(&self) -> String {
-        self.lang_hint
-            .as_deref()
+        #[cfg(windows)]
+        let engine_language = if self.synthetic {
+            None
+        } else {
+            synapse_perception::ocr_engine_language()
+        };
+        #[cfg(not(windows))]
+        let engine_language: Option<String> = None;
+        self.reported_lang(engine_language.as_deref())
+    }
+
+    /// #314: the language the reply names. The OCR engine's own language when
+    /// it is known (the words were read in that language, whatever the hint
+    /// said); otherwise the caller's hint; otherwise `und`.
+    #[must_use]
+    pub fn reported_lang(&self, engine_language: Option<&str>) -> String {
+        engine_language
             .map(str::trim)
             .filter(|lang| !lang.is_empty())
+            .or_else(|| {
+                self.lang_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|lang| !lang.is_empty())
+            })
             .unwrap_or("und")
             .to_owned()
     }
+}
+
+fn validate_winrt_language(hint: Option<&str>, backend: OcrBackend) -> Result<(), ErrorData> {
+    let Some(tag) = hint.map(str::trim).filter(|tag| !tag.is_empty()) else {
+        return Ok(());
+    };
+    if backend != OcrBackend::Winrt {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use windows::{Globalization::Language, Media::Ocr::OcrEngine, core::HSTRING};
+        let language = Language::CreateLanguage(&HSTRING::from(tag)).map_err(|error| {
+            mcp_error(
+                error_codes::OCR_LANGUAGE_UNSUPPORTED,
+                format!("invalid WinRT OCR language {tag:?}: {error}"),
+            )
+        })?;
+        let supported = OcrEngine::IsLanguageSupported(&language)
+            .map_err(|error| mcp_error(error_codes::OCR_BACKEND_UNAVAILABLE, error.to_string()))?;
+        if !supported {
+            return Err(mcp_error(
+                error_codes::OCR_LANGUAGE_UNSUPPORTED,
+                format!("WinRT OCR recognizer is not installed for language {tag:?}"),
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = tag;
+    Ok(())
 }
 
 pub fn resolve_read_text_request(
@@ -55,6 +96,10 @@ pub fn resolve_read_text_request(
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
 ) -> Result<ResolvedReadTextRequest, ErrorData> {
+    validate_winrt_language(
+        params.lang_hint.as_deref(),
+        effective_ocr_backend(params.backend)?,
+    )?;
     let (region, capture_source) = text_region(state, params, target_hwnd)?;
     if !matches!(capture_source, ReadTextCaptureSource::WholeWindow { .. }) {
         validate_ocr_region(region)?;
@@ -66,21 +111,27 @@ pub fn resolve_read_text_request(
         effective_backend: effective_ocr_backend(params.backend)?,
         lang_hint: params.lang_hint.clone(),
         synthetic: state.synthetic.is_some(),
-        require_text: params.require_text,
     })
 }
 
 pub fn read_text_request_uncached(
     request: &ResolvedReadTextRequest,
 ) -> Result<OcrResult, ErrorData> {
+    validate_winrt_language(request.lang_hint.as_deref(), request.effective_backend)?;
     if request.synthetic {
         let provider = SyntheticOcrProvider {
             region: request.region,
         };
-        return ocr_result_or_empty(read_text_with_provider(&provider, request.region), request);
+        let words = read_text_with_provider(&provider, request.region)
+            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+        return Ok(ocr_result_from_text_regions(words, request));
     }
     match request.effective_backend {
-        OcrBackend::Winrt => ocr_result_or_empty(platform_read_text(request.region), request),
+        OcrBackend::Winrt => {
+            let words = platform_read_text(request.region)
+                .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+            Ok(ocr_result_from_text_regions(words, request))
+        }
         OcrBackend::Crnn => Err(crnn_unavailable_error()),
         OcrBackend::Auto => Err(mcp_error(
             error_codes::OCR_BACKEND_UNAVAILABLE,
@@ -94,20 +145,22 @@ pub fn read_text_request_from_bgra(
     request: &ResolvedReadTextRequest,
     captured: &synapse_capture::CapturedBgraBitmap,
 ) -> Result<OcrResult, ErrorData> {
+    validate_winrt_language(request.lang_hint.as_deref(), request.effective_backend)?;
     if request.synthetic {
         return read_text_request_uncached(request);
     }
     let request = read_text_request_for_captured_bitmap(request.clone(), captured)?;
     match request.effective_backend {
-        OcrBackend::Winrt => ocr_result_or_empty(
-            synapse_perception::read_text_from_bgra_bitmap(
+        OcrBackend::Winrt => {
+            let words = synapse_perception::read_text_from_bgra_bitmap(
                 request.region,
                 captured.width,
                 captured.height,
                 &captured.bytes,
-            ),
-            &request,
-        ),
+            )
+            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+            Ok(ocr_result_from_text_regions(words, &request))
+        }
         OcrBackend::Crnn => Err(crnn_unavailable_error()),
         OcrBackend::Auto => Err(mcp_error(
             error_codes::OCR_BACKEND_UNAVAILABLE,
@@ -161,9 +214,8 @@ pub fn read_text_request_for_captured_bitmap(
 ///
 /// # Errors
 ///
-/// `OCR_NO_TEXT` if the bitmap dimensions exceed `i32`; any `WinRT` OCR backend
-/// error from `read_text_from_bgra_bitmap`. A clean pass that finds no glyphs is
-/// a success with `no_text: true` (empty observation), not an error (#1557).
+/// `OCR_NO_TEXT` if the bitmap dimensions exceed `i32` or OCR finds no text;
+/// any `WinRT` OCR backend error from `read_text_from_bgra_bitmap`.
 #[cfg(windows)]
 pub fn ocr_result_from_web_bitmap(
     width: u32,
@@ -171,6 +223,7 @@ pub fn ocr_result_from_web_bitmap(
     bgra: &[u8],
     lang_hint: Option<&str>,
 ) -> Result<OcrResult, ErrorData> {
+    validate_winrt_language(lang_hint, OcrBackend::Winrt)?;
     let w = i32::try_from(width).map_err(|_| {
         mcp_error(
             error_codes::OCR_NO_TEXT,
@@ -184,6 +237,8 @@ pub fn ocr_result_from_web_bitmap(
         )
     })?;
     let region = Rect { x: 0, y: 0, w, h };
+    let words = synapse_perception::read_text_from_bgra_bitmap(region, width, height, bgra)
+        .map_err(|err| mcp_error(err.code(), err.to_string()))?;
     let request = ResolvedReadTextRequest {
         region,
         capture_source: ReadTextCaptureSource::Screen,
@@ -191,12 +246,8 @@ pub fn ocr_result_from_web_bitmap(
         effective_backend: OcrBackend::Winrt,
         lang_hint: lang_hint.map(str::to_owned),
         synthetic: false,
-        require_text: false,
     };
-    ocr_result_or_empty(
-        synapse_perception::read_text_from_bgra_bitmap(region, width, height, bgra),
-        &request,
-    )
+    Ok(ocr_result_from_text_regions(words, &request))
 }
 
 fn text_region(
@@ -206,11 +257,10 @@ fn text_region(
 ) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
     let target_hwnd = params.window_hwnd.or(target_hwnd);
     if let Some(region) = params.region {
-        let capture_source = match target_hwnd {
-            Some(hwnd) => target_window_region_capture_source(hwnd, region)?,
-            None => ReadTextCaptureSource::Screen,
+        return match target_hwnd {
+            Some(hwnd) => target_window_region_capture_source(hwnd, region),
+            None => Ok((region, ReadTextCaptureSource::Screen)),
         };
-        return Ok((region, capture_source));
     }
     if let Some(element_id) = &params.element_id {
         if state.synthetic.is_none() {
@@ -220,7 +270,9 @@ fn text_region(
                     format!("element_id has no live visible OCR region: {err}"),
                 )
             })?;
-            return Ok((region, ReadTextCaptureSource::Screen));
+            // #178: capture the element's own window and crop, never the screen pixels
+            // at the element rect (a covering window would be read instead).
+            return element_window_capture_source(element_id, region);
         }
         let input = current_input(state, 2)?;
         let region = input
@@ -237,15 +289,23 @@ fn text_region(
         return Ok((region, ReadTextCaptureSource::Screen));
     }
 
+    default_text_region(state, target_hwnd)
+}
+
+fn default_text_region(
+    state: &M1State,
+    target_hwnd: Option<i64>,
+) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
     let Some(hwnd) = target_hwnd else {
         let input = current_input(state, 2)?;
-        let region = input.focused.map(|focused| focused.bbox).ok_or_else(|| {
+        let focused = input.focused.ok_or_else(|| {
             mcp_error(
                 error_codes::OCR_NO_TEXT,
                 "read_text requires region, element_id, or a focused element with a visible OCR region",
             )
         })?;
-        return Ok((region, ReadTextCaptureSource::Screen));
+        // #255: focus does not authorize reading pixels from a covering window.
+        return element_window_capture_source(&focused.element_id, focused.bbox);
     };
 
     fail_if_minimized_target_needs_window_capture(hwnd)?;
@@ -274,18 +334,90 @@ fn validate_ocr_region(region: Rect) -> Result<(), ErrorData> {
 }
 
 #[cfg(windows)]
+fn element_capture_root_hwnd(hwnd: i64) -> Result<i64, ErrorData> {
+    synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("read_text could not resolve root of element window {hwnd:#x}: {error}"),
+        )
+    })
+}
+
+/// Resolves a UIA element's screen rectangle into a capture of its top-level root window,
+/// cropped relative to the root frame (#178, #256). Screen-pixel capture would read any window covering the
+/// element, so there is no screen fallback: when the window cannot be captured or does not
+/// contain the element, the request fails with a precise error.
+#[cfg(windows)]
+fn element_window_capture_source(
+    element_id: &synapse_core::ElementId,
+    element_rect: Rect,
+) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
+    let hwnd = element_id
+        .parts()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::OCR_NO_TEXT,
+                format!("read_text element_id {element_id} has no owning window: {error}"),
+            )
+        })?
+        .hwnd;
+    let hwnd = element_capture_root_hwnd(hwnd)?;
+    fail_if_minimized_target_needs_window_capture(hwnd)?;
+    let frame = synapse_capture::window_capture_bounds(hwnd).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "read_text could not resolve capture bounds of element window {hwnd:#x}: {error}"
+            ),
+        )
+    })?;
+    let crop = element_window_crop::crop_element_to_window_frame(element_rect, frame).ok_or_else(
+        || {
+            mcp_error(
+                error_codes::OCR_NO_TEXT,
+                format!(
+                    "read_text element {element_id} rect {element_rect:?} lies outside its window {hwnd:#x} frame {frame:?}; screen capture is refused because a covering window would be read instead"
+                ),
+            )
+        },
+    )?;
+    Ok((
+        crop.screen_region,
+        ReadTextCaptureSource::Window {
+            hwnd,
+            window_region: crop.window_region,
+        },
+    ))
+}
+
+#[cfg(not(windows))]
+fn element_window_capture_source(
+    _element_id: &synapse_core::ElementId,
+    _element_rect: Rect,
+) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
+    Err(mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "read_text element OCR requires Windows window capture",
+    ))
+}
+
+#[cfg(windows)]
+/// Resolves a client-relative OCR region against the target window bitmap and
+/// returns the region actually read (clipped to the client area and the
+/// bitmap, #233), so the reported `region` and the word boxes describe the
+/// captured pixels.
 fn target_window_region_capture_source(
     hwnd: i64,
     client_region: Rect,
-) -> Result<ReadTextCaptureSource, ErrorData> {
+) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
             format!("read_text window_hwnd {hwnd:#x} is not a live window: {error}"),
         )
     })?;
-    let window_region =
-        synapse_capture::client_region_to_window_region(hwnd, client_region).map_err(|error| {
+    let resolved =
+        synapse_capture::client_region_to_window_regions(hwnd, client_region).map_err(|error| {
             mcp_error(
                 error.code(),
                 format!(
@@ -293,17 +425,20 @@ fn target_window_region_capture_source(
                 ),
             )
         })?;
-    Ok(ReadTextCaptureSource::Window {
-        hwnd,
-        window_region,
-    })
+    Ok((
+        resolved.client,
+        ReadTextCaptureSource::Window {
+            hwnd,
+            window_region: resolved.window,
+        },
+    ))
 }
 
 #[cfg(not(windows))]
 fn target_window_region_capture_source(
     _hwnd: i64,
     _window_region: Rect,
-) -> Result<ReadTextCaptureSource, ErrorData> {
+) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
     Err(mcp_error(
         error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
         "read_text target-window OCR requires Windows window capture",
@@ -365,7 +500,6 @@ fn ocr_result_from_text_regions(
         .map(|word| word.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let no_text = regions.is_empty();
     let confidence = aggregate_confidence(&regions);
     let confidence_source = aggregate_confidence_source(&regions);
     OcrResult {
@@ -387,72 +521,9 @@ fn ocr_result_from_text_regions(
         confidence_source,
         region: request.region,
         lang: request.lang(),
-        no_text,
+        cache_write: None,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
-    }
-}
-
-/// The empty-region success readback for #1557: a clean OCR pass that found no
-/// glyphs is a valid observation (`no_text: true`), not a failure.
-fn empty_ocr_result(request: &ResolvedReadTextRequest) -> OcrResult {
-    OcrResult {
-        full_text: String::new(),
-        words: Vec::new(),
-        confidence: 0.0,
-        confidence_source: OcrConfidenceSource::Unsupported,
-        region: request.region,
-        lang: request.lang(),
-        no_text: true,
-        perceived_text_notice: None,
-        suspected_injection: Vec::new(),
-    }
-}
-
-/// The #1557 `require_text` fail-closed gate, applied to a FINAL `OcrResult`.
-///
-/// Kept OUT of [`ocr_result_or_empty`] on purpose: `read_text` caches the raw
-/// empty observation in `CF_OCR_CACHE` (keyed on pixels+backend), so a gate
-/// buried in the OCR pass is silently bypassed on a cache hit — the exact defect
-/// manual FSV caught, where `require_text:true` returned a cached `no_text:true`
-/// success. Enforcing absence here, on the final post-cache result, makes it
-/// fire identically on cache hits and misses, independent of how the perception
-/// layer represented "no glyphs" (`Err(OcrNoText)` vs `Ok(vec![])`). It also
-/// avoids masking a legitimate blank as a hard error mid-pass, which would wrong-
-/// foot the window-capture fallback in `read_text_with_target_hwnd`.
-pub fn enforce_require_text(result: &OcrResult, require_text: bool) -> Result<(), ErrorData> {
-    if require_text && result.no_text {
-        return Err(mcp_error(
-            error_codes::OCR_NO_TEXT,
-            format!(
-                "read_text found no glyphs in OCR region ({}, {}, {}, {}) and require_text was set, so absence is a hard OCR_NO_TEXT failure",
-                result.region.x, result.region.y, result.region.w, result.region.h
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Turns a raw OCR word result into an `OcrResult`, treating the perception
-/// layer's "no glyphs" outcome as a valid empty observation (#1557) instead of a
-/// hard error.
-///
-/// "No glyphs" has two equivalent representations at the perception boundary:
-/// `Err(OcrNoText)` (some backends raise it) and `Ok(vec![])` (WinRT returns an
-/// empty region vector for a clean blank capture). Both collapse to the same
-/// empty observation, which is what gets cached. The `require_text` fail-closed
-/// policy is applied separately by [`enforce_require_text`] on the final
-/// post-cache result, so it is representation- and cache-agnostic. Every other
-/// perception failure (backend unavailable, capture failed, …) stays a typed
-/// hard error exactly as before.
-fn ocr_result_or_empty(
-    words: synapse_perception::PerceptionResult<Vec<TextRegion>>,
-    request: &ResolvedReadTextRequest,
-) -> Result<OcrResult, ErrorData> {
-    match words {
-        Ok(regions) => Ok(ocr_result_from_text_regions(regions, request)),
-        Err(synapse_perception::PerceptionError::OcrNoText { .. }) => Ok(empty_ocr_result(request)),
-        Err(err) => Err(mcp_error(err.code(), err.to_string())),
     }
 }
 
@@ -468,71 +539,36 @@ fn aggregate_confidence(regions: &[TextRegion]) -> f32 {
     sum / f32::from(count)
 }
 
-fn aggregate_confidence_source(regions: &[TextRegion]) -> OcrConfidenceSource {
+fn aggregate_confidence_source(regions: &[TextRegion]) -> ConfidenceSource {
     regions
         .iter()
         .map(|word| word_confidence_source(&word.text, word.confidence, word.confidence_source))
-        .fold(None, |current, source| {
-            Some(match current {
-                None => source,
-                Some(existing) => merge_confidence_sources(existing, source),
-            })
-        })
-        .unwrap_or(OcrConfidenceSource::Unsupported)
+        .reduce(ConfidenceSource::least_trusted)
+        .unwrap_or_default()
 }
 
-fn word_confidence(text: &str, confidence: f32, source: TextRegionConfidenceSource) -> f32 {
-    if matches!(source, TextRegionConfidenceSource::Unsupported) {
-        return 0.0;
+fn word_confidence(text: &str, confidence: f32, source: ConfidenceSource) -> f32 {
+    if source == ConfidenceSource::Unsupported {
+        0.0
+    } else {
+        identifier_aware_confidence(text, confidence)
     }
-    identifier_aware_confidence(text, confidence)
 }
 
 fn word_confidence_source(
     text: &str,
     confidence: f32,
-    source: TextRegionConfidenceSource,
-) -> OcrConfidenceSource {
-    let source = ocr_confidence_source(source);
-    if source == OcrConfidenceSource::Unsupported {
-        return source;
-    }
-    if is_ambiguous_identifier_token(text)
-        && normalize_confidence(confidence) > AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP
+    source: ConfidenceSource,
+) -> ConfidenceSource {
+    if !matches!(
+        source,
+        ConfidenceSource::Unsupported | ConfidenceSource::NotApplicable
+    ) && normalize_confidence(confidence) > AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP
+        && is_ambiguous_identifier_token(text)
     {
-        OcrConfidenceSource::Heuristic
+        ConfidenceSource::Heuristic
     } else {
         source
-    }
-}
-
-fn ocr_confidence_source(source: TextRegionConfidenceSource) -> OcrConfidenceSource {
-    match source {
-        TextRegionConfidenceSource::Engine => OcrConfidenceSource::Engine,
-        TextRegionConfidenceSource::Uia => OcrConfidenceSource::Uia,
-        TextRegionConfidenceSource::Synthetic => OcrConfidenceSource::Synthetic,
-        TextRegionConfidenceSource::Heuristic => OcrConfidenceSource::Heuristic,
-        TextRegionConfidenceSource::Unsupported => OcrConfidenceSource::Unsupported,
-    }
-}
-
-fn merge_confidence_sources(
-    left: OcrConfidenceSource,
-    right: OcrConfidenceSource,
-) -> OcrConfidenceSource {
-    use OcrConfidenceSource::{Engine, Heuristic, Synthetic, Uia, Unsupported};
-    if left == right {
-        left
-    } else if matches!(left, Heuristic) || matches!(right, Heuristic) {
-        Heuristic
-    } else if matches!(left, Unsupported) || matches!(right, Unsupported) {
-        Unsupported
-    } else if matches!(left, Uia) || matches!(right, Uia) {
-        Uia
-    } else if matches!(left, Synthetic) || matches!(right, Synthetic) {
-        Synthetic
-    } else {
-        Engine
     }
 }
 
@@ -619,7 +655,23 @@ impl synapse_perception::OcrProvider for SyntheticOcrProvider {
                 h: 18,
             },
             confidence: 0.99,
-            confidence_source: TextRegionConfidenceSource::Synthetic,
+            confidence_source: ConfidenceSource::Synthetic,
         }])
     }
 }
+
+#[cfg(test)]
+#[path = "ocr_confidence_table.rs"]
+mod ocr_confidence_table;
+
+#[cfg(all(test, windows))]
+#[path = "tests/whole_window_ocr_133.rs"]
+mod whole_window_ocr_133;
+
+#[cfg(all(test, windows))]
+#[path = "tests/element_window_capture_source_178.rs"]
+mod element_window_capture_source_178;
+
+#[cfg(all(test, windows))]
+#[path = "tests/focused_window_capture_source_255.rs"]
+mod focused_window_capture_source_255;

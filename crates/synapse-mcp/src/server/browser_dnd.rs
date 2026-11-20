@@ -10,7 +10,6 @@ use synapse_core::error_codes;
 
 const BROWSER_DRAG_TOOL: &str = "browser_drag";
 const BROWSER_DROP_TOOL: &str = "browser_drop";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_MOUSE_STEPS: u32 = 12;
 const DEFAULT_MOUSE_DURATION_MS: u64 = 350;
 const MAX_SELECTOR_CHARS: usize = 4096;
@@ -82,7 +81,6 @@ pub struct BrowserDndParams {
     /// Browser HWND owning the target. Required only with explicit cdp_target_id
     /// and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Page/action readback wait budget in milliseconds. Defaults to 5000.
     #[serde(default)]
@@ -192,11 +190,13 @@ impl SynapseService {
                 ),
             ));
         }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        let browser_rows = synapse_browsers::BrowserRegistry::global();
+        if !browser_rows.has_bridge_tab_prefix(&cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "{tool} requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "{tool} requires a normal Chrome bridge tab target ({}); got {cdp_target_id:?}",
+                    browser_rows.tab_target_shapes()
                 ),
             ));
         }
@@ -253,9 +253,6 @@ impl SynapseService {
         cdp_target_id: &str,
         dnd: &NormalizedBrowserDndParams,
     ) -> Result<BrowserDndResponse, ErrorData> {
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_drag_drop_before_bridge_input",
-        )?;
         let result = crate::chrome_debugger_bridge::cdp_input(
             crate::chrome_debugger_bridge::ChromeDebuggerCdpInputRequest {
                 hwnd: window_hwnd,
@@ -297,9 +294,6 @@ impl SynapseService {
                 ),
             )
         })?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_drag_drop_after_bridge_input",
-        )?;
 
         Ok(BrowserDndResponse {
             ok: true,

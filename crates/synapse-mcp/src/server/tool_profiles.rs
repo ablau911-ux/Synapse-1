@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +15,7 @@ use synapse_action::lease;
 use synapse_core::error_codes;
 use synapse_storage::cf;
 
+use super::tools_list_cache::{ToolListFlags, ToolsListCache};
 use super::{Json, Parameters, SynapseService, empty_input_schema, mcp_error, tool, tool_router};
 
 const TOOL_PROFILE_PREFIX: &str = "mcp/tool-profile/v1/";
@@ -21,14 +23,10 @@ const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<ses
 const TOOL_PROFILE_ROW_KIND: &str = "mcp_tool_profile";
 const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
-/// #1559: source of truth for the runtime reality-write opt-in overlay.
-const REALITY_WRITE_GRANT_SOURCE_OF_TRUTH: &str =
-    "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows";
-/// #1559: the misleading-contract fix, stated on every reality-write status and
-/// grant/revoke response so a facade profile is never mistaken for a grant.
-const PROFILE_INDEPENDENT_OF_GRANTS_NOTE: &str = "the selected facade tool-visibility profile (e.g. full_capability) is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself; reality-write requires an explicit startup grant (SYNAPSE_MCP_ALLOWED_PERMISSIONS listing WRITE_STORAGE) or a runtime profile operation=grant_reality_write overlay";
-pub(crate) const PUBLIC_TOOL_LIMIT: usize = 40;
-pub(crate) const PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES: usize = 200_000;
+#[cfg(feature = "livefeed")]
+pub(crate) const PUBLIC_TOOL_LIMIT: usize = 44;
+#[cfg(not(feature = "livefeed"))]
+pub(crate) const PUBLIC_TOOL_LIMIT: usize = 43;
 const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
 const PUBLIC_TOOL_REGISTRY_OPERATION: &str = "validate_public_tool_registry";
@@ -44,11 +42,16 @@ pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[
     "health",
     "profile",
     "session",
+    "user_activity",
     "subscribe",
     "observe",
     "find",
     "read_text",
     "screenshot",
+    "livecapture",
+    #[cfg(feature = "livefeed")]
+    "livefeed",
+    "videoanalyze",
     "target",
     "act",
     "shell",
@@ -225,7 +228,7 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
 
 /// Sentinel `operation_enum` for flat, single-purpose facades that expose NO
 /// `operation` discriminator in their input schema (e.g. `health`, `observe`,
-/// `find`, `read_text`, `subscribe`). The schema-parity gate
+/// `find`, `read_text`). The schema-parity gate
 /// `facade_contract_operations_match_live_schema` treats a contract carrying
 /// this sentinel as "the built tool must have no `operation` property", and any
 /// other `operation_enum` value as "the tool's serialized `operation` enum must
@@ -275,52 +278,136 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "hold the required lease/profile permission, provide reason/confirmation, then retry",
             ),
-            op(
-                "grant_reality_write",
-                true,
-                false,
-                "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows",
-                Some("overlay status readback + CF_ACTION_LOG intent/final audit rows"),
-                error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "own the foreground input lease (act operation=lease_acquire), then retry with confirm_break_glass=true and a non-empty reason",
-            ),
-            op(
-                "revoke_reality_write",
-                true,
-                false,
-                "in-memory M3State reality_write_grant overlay + CF_ACTION_LOG audit rows",
-                Some("overlay status readback (cleared) + CF_ACTION_LOG intent/final audit rows"),
-                error_codes::TOOL_INTERNAL_ERROR,
-                "provide an MCP session id; revoke is always permitted (de-escalation) and audited",
-            ),
         ],
     ),
     facade_contract(
         "session",
         "SessionOperation",
-        "MCP session registry + CF_SESSIONS session-target rows",
-        &[op(
-            "list",
-            false,
-            false,
-            "daemon session registry + CF_SESSIONS session-target rows",
-            None,
-            error_codes::HTTP_SESSION_INVALID,
-            "establish an MCP session and retry through the same client transport",
-        )],
+        "MCP session registry + CF_SESSIONS session-target rows + SeatSupervisor owned-seat registry",
+        &[
+            op(
+                "list",
+                false,
+                false,
+                "daemon session registry + CF_SESSIONS session-target rows",
+                None,
+                error_codes::HTTP_SESSION_INVALID,
+                "establish an MCP session and retry through the same client transport",
+            ),
+            // #73: seat_* operations manage session-owned isolated Chromium
+            // seats through the SeatSupervisor; the owner is derived from the
+            // transport-issued MCP session id and can never be caller-supplied.
+            op(
+                "seat_create",
+                true,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                Some("SeatView readback with isolated backend process/profile identity"),
+                "SEAT_BACKEND_UNAVAILABLE",
+                "configure a daemon-owned Chromium executable and retry browser seat creation",
+            ),
+            op(
+                "seat_list",
+                false,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                None,
+                error_codes::HTTP_SESSION_INVALID,
+                "establish an MCP session through the same transport, then retry",
+            ),
+            op(
+                "seat_get",
+                false,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                None,
+                "SEAT_NOT_FOUND",
+                "call session operation=seat_list to read owned seats",
+            ),
+            op(
+                "seat_act",
+                true,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                Some("SeatSupervisor action receipt for the isolated backend"),
+                "SEAT_STALE_GENERATION",
+                "call session operation=seat_get and retry with its current generation",
+            ),
+            op(
+                "seat_capture",
+                true,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                Some("capture receipt advancing the seat frame sequence for the isolated backend"),
+                "SEAT_NOT_FOUND",
+                "call session operation=seat_list to read owned seats",
+            ),
+            op(
+                "seat_pause",
+                true,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                Some("SeatView readback after the pause transition"),
+                "SEAT_STALE_GENERATION",
+                "call session operation=seat_get and retry with its current generation",
+            ),
+            op(
+                "seat_resume",
+                true,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                Some("SeatView readback after the resume transition"),
+                "SEAT_STALE_GENERATION",
+                "call session operation=seat_get and retry with its current generation",
+            ),
+            op(
+                "seat_close",
+                true,
+                false,
+                "SeatSupervisor owned-seat registry + isolated backend readback",
+                Some("SeatView readback plus closed backend process/profile removal"),
+                "SEAT_STALE_GENERATION",
+                "call session operation=seat_get and retry with its current generation",
+            ),
+        ],
     ),
     facade_contract(
         "subscribe",
-        FLAT_FACADE_OPERATION_ENUM,
+        "SubscribeOperation",
         "SSE subscriber registry + MCP session id",
+        &[
+            op(
+                "events",
+                true,
+                false,
+                "SSE subscriber registry + emitted event stream",
+                Some("SseState subscription registry + MCP-session ownership map"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide exactly the events payload with a valid buffer_size from a trusted MCP session and retry",
+            ),
+            op(
+                "events_cancel",
+                true,
+                false,
+                "SSE subscriber registry + MCP session ownership",
+                Some("SseState subscription registry + MCP-session ownership map"),
+                error_codes::SUBSCRIPTION_NOT_FOUND,
+                "cancel only a subscription created by the same live MCP session",
+            ),
+        ],
+    ),
+    facade_contract(
+        "user_activity",
+        "UserActivityOperation",
+        "physical input hook correlated with Windows foreground",
         &[op(
-            "events",
+            "status",
             false,
             false,
-            "SSE subscriber registry + emitted event stream",
+            "physical input hook + GetForegroundWindow",
             None,
-            error_codes::HTTP_SESSION_INVALID,
-            "open a session-scoped subscription against the live daemon and retry",
+            error_codes::TOOL_INTERNAL_ERROR,
+            "inspect physical_input_monitoring, owner_presence (away/active/locked/unknown), last_owner_return_stop_age_ms and user_window provenance",
         )],
     ),
     facade_contract(
@@ -364,6 +451,163 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
             error_codes::CAPTURE_TARGET_INVALID,
             "bind the text source target and retry with a scoped selector when needed",
         )],
+    ),
+    facade_contract(
+        "livecapture",
+        "LiveCaptureParams",
+        "continuous capture owner, inline image bytes, frame cursors and runtime readback",
+        &[
+            op(
+                "start",
+                true,
+                true,
+                "M1 capture runtime + first inline frame",
+                Some("M1 capture runtime + inline frame cursor"),
+                error_codes::CAPTURE_TARGET_INVALID,
+                "select a live native window",
+            ),
+            op(
+                "next",
+                false,
+                true,
+                "ordered inline image bytes + monotonic frame cursors",
+                None,
+                error_codes::CAPTURE_FRAME_UNAVAILABLE,
+                "use the last returned cursor with its original window",
+            ),
+            op(
+                "status",
+                false,
+                false,
+                "M1 capture runtime",
+                None,
+                error_codes::CAPTURE_FRAME_UNAVAILABLE,
+                "start continuous capture",
+            ),
+            op(
+                "stop",
+                true,
+                false,
+                "M1 capture runtime",
+                Some("M1 capture runtime"),
+                error_codes::CAPTURE_FRAME_UNAVAILABLE,
+                "read capture status",
+            ),
+        ],
+    ),
+    #[cfg(feature = "livefeed")]
+    facade_contract(
+        "livefeed",
+        "LivefeedParams",
+        "livefeed camera monitor <m> seq <n>",
+        &[
+            op(
+                "start",
+                true,
+                false,
+                "livefeed camera monitor <m> seq <n>",
+                Some("livefeed camera monitor <m> seq <n>"),
+                "LIVEFEED_ALREADY_RUNNING",
+                "stop the running livefeed camera or pass a valid monitor index",
+            ),
+            op(
+                "stop",
+                true,
+                false,
+                "livefeed camera monitor <m> seq <n>",
+                Some("livefeed camera monitor <m> seq <n>"),
+                "LIVEFEED_CAPTURE_FAILED",
+                "inspect livefeed status and retry stop",
+            ),
+            op(
+                "look",
+                false,
+                false,
+                "livefeed camera monitor <m> seq <n>",
+                None,
+                "LIVEFEED_NOT_RUNNING",
+                "call livefeed operation=start first",
+            ),
+            op(
+                "changes",
+                false,
+                false,
+                "livefeed camera monitor <m> seq <n>",
+                None,
+                "LIVEFEED_NOT_RUNNING",
+                "call livefeed operation=start first, or call look if since_evicted or too_many is true",
+            ),
+            op(
+                "zoom",
+                false,
+                false,
+                "livefeed camera monitor <m> seq <n>",
+                None,
+                "LIVEFEED_BAD_REGION",
+                "pass a positive rect inside the monitor bounds returned by look or status",
+            ),
+            op(
+                "watch",
+                false,
+                false,
+                "livefeed camera monitor <m> seq <first>..<last>",
+                None,
+                "LIVEFEED_NOT_RUNNING",
+                "call livefeed operation=start to begin background monitor capture",
+            ),
+            op(
+                "status",
+                false,
+                false,
+                "livefeed camera monitor <m> seq <n>",
+                None,
+                "LIVEFEED_NOT_RUNNING",
+                "call livefeed operation=start to begin background monitor capture",
+            ),
+        ],
+    ),
+    facade_contract(
+        "videoanalyze",
+        "VideoAnalyzeParams",
+        "local video file metadata + decoded inline frames and timestamps",
+        &[
+            op(
+                "inspect",
+                true,
+                true,
+                "ffprobe stream and container metadata",
+                Some("source/cache file metadata"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide an existing local video file or reachable URL",
+            ),
+            op(
+                "analyze",
+                true,
+                true,
+                "decoded inline JPEG/WAV bytes + timestamps",
+                Some("source/cache file metadata + inline image/audio content"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "select a valid time range in the video",
+            ),
+            op(
+                "motion",
+                true,
+                true,
+                "decoded-frame luma changes + timestamp bins",
+                Some("source/cache file metadata + measured frame counts"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "select a valid video range of at most 60 seconds",
+            ),
+            op(
+                "text_timeline",
+                true,
+                true,
+                "decoded video frame bytes + OCR words, boxes, confidence and timestamps",
+                Some("source/cache file metadata + configured OCR backend output"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "select a valid time range and OCR language configured on this host",
+            ),
+        ],
     ),
     facade_contract(
         "screenshot",
@@ -487,10 +731,10 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "foreground",
                 true,
                 true,
-                "foreground input lease + target/action audit row",
+                "physical user-activity gate (user_activity) + foreground input lease + target/action audit row",
                 Some("foreground lease/profile restore readback + post-action target/UI readback"),
                 error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
-                "provide a non-empty reason and let the facade acquire/restore the audited foreground lane",
+                "provide a non-empty reason and let the facade acquire/restore the audited foreground lane; on USER_ACTIVE/USER_ACTIVITY_UNKNOWN/USER_WORKSTATION_LOCKED (refusal carries owner_presence, retry_after_ms, retry_when) wait for the quiet window, or pass owner_approved=true only when the owner asked for this action; locked is refused even with owner_approved",
             ),
             op(
                 "lease_acquire",
@@ -521,7 +765,29 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                     "lease status readback + CF_SESSIONS persisted lease row deletion + act facade CF_ACTION_LOG command audit row",
                 ),
                 error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
-                "only the owning session can release; call act operation=lease_status to inspect the owner",
+                "returned only when another session holds the lease (an unheld or expired lease is success with already_released=true); call act operation=lease_status to inspect the owner",
+            ),
+            op(
+                "route_memory_status",
+                false,
+                false,
+                "CF_KV route-memory/v1/<exe>/ rows (route memory namespace) + act facade CF_ACTION_LOG command audit row",
+                Some(
+                    "CF_KV route-memory/v1/ prefix scan readback + act facade CF_ACTION_LOG command audit row",
+                ),
+                error_codes::TOOL_PARAMS_INVALID,
+                "omit exe to read every app, or pass the app's process image name such as notepad.exe",
+            ),
+            op(
+                "route_memory_clear",
+                true,
+                false,
+                "CF_KV route-memory/v1/<exe>/ rows (route memory namespace) + act facade CF_ACTION_LOG command audit row",
+                Some(
+                    "CF_KV route-memory/v1/ prefix rescan after delete (deleted_rows, remaining_rows) + act facade CF_ACTION_LOG command audit row",
+                ),
+                error_codes::TOOL_PARAMS_INVALID,
+                "omit exe to clear every app, or pass the app's process image name such as notepad.exe; read back with act operation=route_memory_status",
             ),
         ],
     ),
@@ -537,7 +803,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "durable shell registry/log files or inline child process",
                 Some("durable job row/status readback + output artifact path when backgrounded"),
                 error_codes::TOOL_PARAMS_INVALID,
-                "provide a non-empty executable in command and put arguments in args",
+                "provide command/args; visible GUI launches require the #258 quiet window or owner_approved=true with a non-empty reason (owner_approval_reason also accepted); otherwise use process operation=launch with approval. Script-internal GUI launches are not detected",
             ),
             op(
                 "start",
@@ -548,7 +814,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                     "job status/stdout/stderr artifact paths read back from %LOCALAPPDATA%\\Synapse\\shell-jobs",
                 ),
                 error_codes::TOOL_PARAMS_INVALID,
-                "provide command/args for the durable job and poll with status",
+                "provide command/args and poll status; visible GUI launches require the #258 quiet window or owner_approved=true with a non-empty reason (owner_approval_reason also accepted), before any job row or child PID. Script-internal GUI launches are not detected",
             ),
             op(
                 "status",
@@ -588,10 +854,10 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "launch",
                 true,
                 true,
-                "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
+                "physical user-activity gate for visible GUI launches + process table plus CF_PROCESS_HISTORY/session lifecycle resources",
                 Some("CF_PROCESS_HISTORY row plus live process table readback"),
                 error_codes::TOOL_PARAMS_INVALID,
-                "provide a non-empty target executable/path and use process history/list for readback",
+                "provide a non-empty target executable/path and use process history/list for readback; on USER_ACTIVE/USER_ACTIVITY_UNKNOWN/USER_WORKSTATION_LOCKED (refusal carries owner_presence, retry_after_ms, retry_when) wait for the quiet window, launch on desktop=agent:session, or pass owner_approved=true with a non-empty reason only when the owner asked for this launch; locked is refused even with owner_approved",
             ),
             op(
                 "history",
@@ -867,19 +1133,19 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "evaluate",
                 true,
                 true,
-                "session-owned/adopted target + Runtime.evaluate response (any profile)",
+                "browser_debugger profile row + Runtime.evaluate response",
                 Some("Runtime.evaluate target/url/ready_state/value readback"),
-                error_codes::ACTION_TARGET_INVALID,
-                "name a cdp_target_id this session owns or can adopt (not another session's tab, not the human's focused active tab without target operation=claim)",
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger with reason/confirmation before evaluation",
             ),
             op(
                 "console_messages",
                 false,
                 true,
-                "session-owned raw-CDP target console buffer cursor (any profile)",
+                "browser_debugger profile row + console buffer cursor",
                 None,
-                error_codes::ACTION_TARGET_INVALID,
-                "bind a session-owned raw-CDP target and read its console buffer",
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and read the target console buffer",
             ),
             op(
                 "reload_bridge",
@@ -948,10 +1214,10 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "network",
                 false,
                 true,
-                "session-owned raw-CDP target captured network rows (any profile)",
+                "browser_debugger profile row + captured network rows",
                 None,
-                error_codes::ACTION_TARGET_INVALID,
-                "bind a session-owned raw-CDP target and read its captured network rows",
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and read the captured network rows",
             ),
             op(
                 "network_har",
@@ -1038,7 +1304,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 false,
                 "CF_KV workspace-blackboard exact row",
                 Some("CF_KV exact row readback with value hash/version"),
-                error_codes::STORAGE_WRITE_FAILED,
+                "WORKSPACE_VERSION_CONFLICT",
                 "retry with the observed expected_version or correct the key/value",
             ),
             op(
@@ -1048,7 +1314,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV workspace-blackboard run/prefix scan",
                 None,
                 error_codes::STORAGE_READ_FAILED,
-                "provide a valid run_id/prefix/limit and inspect corrupt_rows_skipped",
+                "provide a valid run_id/prefix/limit, inspect corrupt_rows_skipped, and resume next_cursor until complete",
             ),
             op(
                 "subscribe",
@@ -1074,17 +1340,37 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 false,
                 "CF_KV workspace-blackboard exact row",
                 Some("pre-delete row hash/version or corrupt hash + post-delete absent readback"),
-                error_codes::STORAGE_WRITE_FAILED,
+                "WORKSPACE_VERSION_CONFLICT",
                 "read the row version or corrupt hash, pass the matching guard, then verify the row is absent",
             ),
             op(
                 "wait",
                 false,
                 false,
-                "CF_KV workspace-blackboard exact row polled until present or timeout",
+                "CF_KV workspace-blackboard exact row",
                 None,
                 "WORKSPACE_WAIT_TIMEOUT",
-                "increase timeout_ms or ensure a peer publishes the key with workspace put",
+                "wait again or check the writer; timeout_ms 1..=60000 and poll_interval_ms 1..=500, else TOOL_PARAMS_INVALID",
+            ),
+            op(
+                "ledger_put",
+                true,
+                false,
+                "CF_KV workspace-ledger exact row + <database dir>.ledger.md mirror file",
+                Some(
+                    "CF_KV exact row readback with digest/version + mirror file path, status and digest",
+                ),
+                "WORKSPACE_VERSION_CONFLICT",
+                "read the entry with ledger_list and retry with its expected_version, or fix the scope/topic/summary",
+            ),
+            op(
+                "ledger_list",
+                false,
+                false,
+                "CF_KV workspace-ledger scope/prefix scan",
+                None,
+                error_codes::TOOL_PARAMS_INVALID,
+                "pass an optional non-empty scope and a limit of 1..=500",
             ),
         ],
     ),
@@ -1481,6 +1767,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::STORAGE_READ_FAILED,
                 "fix the stats bounds and inspect recorder control state plus CF_TIMELINE rows",
             ),
+            op(
+                "history_search",
+                false,
+                false,
+                "CF_KV action-history/v1/ prefix scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "narrow the query or time range and inspect CF_KV action-history/v1/ rows",
+            ),
         ],
     ),
     facade_contract(
@@ -1511,7 +1806,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "routine",
         "RoutineOperation",
-        "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows",
+        "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows + CF_REFLEX_AUDIT",
         &[
             op(
                 "mine",
@@ -1584,6 +1879,24 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("armed tick run/audit rows readback"),
                 error_codes::TOOL_PARAMS_INVALID,
                 "fix armed tick filters and inspect armed routine run rows",
+            ),
+            op(
+                "reflex_register",
+                true,
+                false,
+                "CF_REFLEX_AUDIT registration row + scheduler status",
+                Some("reflex id, stored input target, and scheduler status"),
+                error_codes::REFLEX_PARAMS_INVALID,
+                "fix reflex registration params and claim the stored window before dispatch",
+            ),
+            op(
+                "reflex_list",
+                false,
+                false,
+                "scheduler statuses + CF_REFLEX_AUDIT registration and terminal rows",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect reflex scheduler and registration audit rows",
             ),
         ],
     ),
@@ -1749,6 +2062,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "repair storage initialization and read CF metadata again",
             ),
             op(
+                "put_probe_rows",
+                true,
+                false,
+                "RocksDB CF probe rows",
+                Some("CF row-count and size readback after probe row write"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before writing probe rows",
+            ),
+            op(
                 "gc_once",
                 true,
                 false,
@@ -1788,8 +2110,8 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 false,
                 "live model endpoint + CF_KV probe evidence row",
                 Some("registry row and probe-evidence readback"),
-                error_codes::MODEL_TOOLS_UNSUPPORTED,
-                "repair the real backend endpoint/socket/credentials and retry probe",
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before probing; probe persists probe-evidence rows",
             ),
             op(
                 "register",
@@ -1872,10 +2194,10 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "scan_text",
                 true,
                 false,
-                "caller text + optional physical source row",
+                "caller text + optional physical source row (mutates CF_KV hygiene flags only when persist=true)",
                 Some("CF_KV hygiene flag row readback when persist=true"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "run without persist for read-only scoring or switch to maintenance before persisting flags",
+                "persist=true is gated; run without persist for read-only scoring or switch to maintenance before persisting flags",
             ),
             op(
                 "scan_storage",
@@ -2165,6 +2487,26 @@ const fn op(
     }
 }
 
+/// True when `tool` has at least one state-changing operation.
+pub(super) fn tool_has_mutating_operation(tool: &str) -> bool {
+    FACADE_TOOL_CONTRACTS.iter().any(|contract| {
+        contract.tool_name == tool
+            && contract
+                .operations
+                .iter()
+                .any(|operation| operation.mutates_state)
+    })
+}
+
+/// True when `tool` `operation` changes state per its facade contract.
+pub(super) fn operation_mutates_state(tool: &str, operation: &str) -> bool {
+    FACADE_TOOL_CONTRACTS
+        .iter()
+        .filter(|contract| contract.tool_name == tool)
+        .flat_map(|contract| contract.operations)
+        .any(|spec| spec.operation == operation && spec.mutates_state)
+}
+
 const NORMAL_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
 const NORMAL_ALLOWED_PREFIXES: &[&str] = &[];
 
@@ -2189,6 +2531,18 @@ const BROWSER_DEBUGGER_ONLY_EXACT: &[&str] = &[
 ];
 
 const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
+
+/// #58: shell/launch/spawn tools are denylisted from the public surface too;
+/// reported in `denied_break_glass_tools` (audit metadata) but they have no
+/// capability-route entry, so they are kept out of the hazardous route list.
+const BREAK_GLASS_DENIED_EXEC_TOOLS: &[&str] = &[
+    "act_launch",
+    "act_run_shell",
+    "act_run_shell_cancel",
+    "act_run_shell_start",
+    "act_run_shell_status",
+    "act_spawn_agent",
+];
 
 const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
     "act_click",
@@ -2218,7 +2572,7 @@ pub(crate) enum ToolProfileKind {
     BrowserDebugger,
     BreakGlass,
     /// Synapse-spawned local-model agent profile (gemma/DeepSeek/etc., #1031).
-    /// It receives the same <=40 public facade surface as every other profile;
+    /// It receives the same public facade surface (`PUBLIC_TOOL_LIMIT`) as every other profile;
     /// broader authority is enforced inside the facades and action guards rather
     /// than by exposing raw implementation tools in discovery.
     FullCapability,
@@ -2242,6 +2596,15 @@ impl ToolProfileKind {
     /// proof (#999/#1219).
     pub(crate) const fn allows_foreground_tier(self) -> bool {
         matches!(self, Self::BreakGlass | Self::FullCapability)
+    }
+
+    /// Whether setting this profile needs `confirm_break_glass=true` and a
+    /// non-empty reason (the advanced, explicitly-escalated profiles).
+    pub(crate) const fn requires_explicit_confirm(self) -> bool {
+        matches!(
+            self,
+            Self::BrowserDebugger | Self::BreakGlass | Self::FullCapability
+        )
     }
 
     fn label(self) -> &'static str {
@@ -2340,7 +2703,11 @@ pub(crate) struct PublicToolRegistrySnapshot {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FacadeOperationContractSnapshot {
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    #[schemars(default)]
     pub operation: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<&'static str>,
     pub mutates_state: bool,
     pub target_required: bool,
     pub source_of_truth: &'static str,
@@ -2375,7 +2742,6 @@ pub(crate) struct FacadeContractSnapshot {
     pub duplicate_contract_tool_names: Vec<String>,
     pub duplicate_operation_names: Vec<String>,
     pub invalid_contract_reasons: Vec<String>,
-    pub contracts: Vec<FacadeToolContractSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2394,6 +2760,7 @@ pub(crate) struct ToolProfileSnapshot {
     pub denied_break_glass_tools: Vec<String>,
     pub foreground_capability: ToolProfileForegroundCapability,
     pub hidden_tool_routes: Vec<HiddenToolCapabilityRoute>,
+    pub hidden_tool_route_policy: HiddenToolRoutePolicy,
     pub public_tool_registry: PublicToolRegistrySnapshot,
     pub facade_contract: FacadeContractSnapshot,
     pub codex_client_surface: CodexClientSurfaceSnapshot,
@@ -2545,48 +2912,67 @@ pub(crate) struct ToolProfileForegroundCapability {
 #[serde(deny_unknown_fields)]
 pub(crate) struct HiddenToolCapabilityRoute {
     pub hidden_tool: String,
-    pub status: &'static str,
     pub preferred_tools: Vec<String>,
+}
+
+/// The policy shared by every hidden-tool route, stated once per snapshot
+/// rather than repeated on each route row (#231).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HiddenToolRoutePolicy {
+    pub status: &'static str,
     pub agent_logical_foreground_policy: &'static str,
     pub human_os_foreground_policy: &'static str,
     pub break_glass_policy: &'static str,
 }
 
+const HIDDEN_TOOL_ROUTE_POLICY: HiddenToolRoutePolicy = HiddenToolRoutePolicy {
+    status: "routed_or_break_glass",
+    agent_logical_foreground_policy: "use the preferred tools against this session's agent_logical_foreground/foreground_lane",
+    human_os_foreground_policy: "never use the human OS foreground as an implicit fallback",
+    break_glass_policy: "for browser CDP/chrome.debugger instrumentation, call profile operation=set profile=browser_debugger with confirm_break_glass=true and a non-empty reason; for a real OS foreground primitive, first acquire the input lease, then call profile operation=set profile=break_glass with confirm_break_glass=true and a non-empty reason",
+};
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolProfileStatusResponse {
-    pub snapshot: ToolProfileSnapshot,
-    /// #1559: effective M3 permission grants, their config source, and any
-    /// active runtime reality-write overlay — so the effective write posture is
-    /// coherent and `full_capability` is never mistaken for a write grant.
-    pub m3_permissions: M3PermissionStatus,
+    pub snapshot: ProfileSummary,
 }
 
-/// #1559: coherent effective-permission readback.
+/// #579: what a `profile` reply shows of a [`ToolProfileSnapshot`]: the
+/// session, its profile and why it has it, how many tools it sees (the names
+/// are in tools/list), how to escalate, and its foreground-route readiness.
+/// The tool names, hidden-tool routes, public registry, facade contract and
+/// Codex client surface stay in the snapshot, for tools/list, `health` and
+/// `telemetry`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct M3PermissionStatus {
-    pub source_of_truth: &'static str,
-    /// The M3 grant names currently in effect at startup (e.g. READ_STORAGE).
-    pub effective_grant_names: Vec<String>,
-    /// Where those startup grants came from (env / CLI / fail-closed default).
-    pub config_source: &'static str,
-    /// True when a non-expired runtime reality-write overlay is active.
-    pub reality_write_overlay_active: bool,
+pub(crate) struct ProfileSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reality_write_overlay: Option<RealityWriteOverlayReadback>,
-    pub profile_independent_of_grants_note: &'static str,
+    session_id: Option<String>,
+    profile: ToolProfileKind,
+    profile_label: &'static str,
+    source: String,
+    visible_tool_count: usize,
+    visible_tool_sha256: String,
+    hidden_tool_route_policy: HiddenToolRoutePolicy,
+    foreground_route: ToolProfileForegroundRoute,
 }
 
-/// #1559: serialized readback of the active runtime reality-write overlay.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RealityWriteOverlayReadback {
-    pub granted_by: String,
-    pub reason: String,
-    pub granted_at: String,
-    pub expires_at: String,
-    pub remaining_ms: u64,
+impl ProfileSummary {
+    /// The short view of `snapshot` that `profile` replies with.
+    pub(crate) fn of(snapshot: &ToolProfileSnapshot) -> Self {
+        Self {
+            session_id: snapshot.session_id.clone(),
+            profile: snapshot.profile,
+            profile_label: snapshot.profile_label,
+            source: snapshot.source.clone(),
+            visible_tool_count: snapshot.visible_tool_count,
+            visible_tool_sha256: snapshot.visible_tool_sha256.clone(),
+            hidden_tool_route_policy: snapshot.hidden_tool_route_policy.clone(),
+            foreground_route: snapshot.foreground_route.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -2605,13 +2991,6 @@ pub(crate) struct ToolProfileSetParams {
 pub(crate) enum ProfileOperation {
     Status,
     Set,
-    /// #1559: install the runtime reality-write opt-in overlay. Gated exactly
-    /// like an explicit break_glass escalation (confirm_break_glass + non-empty
-    /// reason + this session owns the foreground input lease).
-    GrantRealityWrite,
-    /// #1559: clear the runtime reality-write overlay, restoring the fail-closed
-    /// default. De-escalation, so it needs only an MCP session id (audited).
-    RevokeRealityWrite,
 }
 
 impl ProfileOperation {
@@ -2619,8 +2998,6 @@ impl ProfileOperation {
         match self {
             Self::Status => "status",
             Self::Set => "set",
-            Self::GrantRealityWrite => "grant_reality_write",
-            Self::RevokeRealityWrite => "revoke_reality_write",
         }
     }
 }
@@ -2642,15 +3019,6 @@ pub(crate) struct ProfileParams {
     #[serde(default)]
     #[schemars(default)]
     pub confirm_break_glass: bool,
-    /// When true, operation=status/set return the full before/after
-    /// `ToolProfileSnapshot` (facade contract for every operation, public
-    /// registry, Codex client surface; ~190 KB). Default false returns the
-    /// compact `status_summary`/`set_summary` readback (profile, visible tool
-    /// count + sha, tool-surface delta, policy row key/sha, audit keys, lease
-    /// proof) so routine profile switches stay small.
-    #[serde(default)]
-    #[schemars(default)]
-    pub detail: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2658,51 +3026,10 @@ pub(crate) struct ProfileParams {
 pub(crate) struct ProfileResponse {
     pub operation: ProfileOperation,
     pub source_of_truth: &'static str,
-    /// Full status readback; present only when detail=true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ToolProfileStatusResponse>,
-    /// Full set readback (complete before/after snapshots); present only when
-    /// detail=true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<ToolProfileSetResponse>,
-    /// Compact status readback (default).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_summary: Option<ToolProfileStatusSummary>,
-    /// Compact set readback (default).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub set_summary: Option<ToolProfileSetSummary>,
-    /// #1559: grant/revoke result for the runtime reality-write overlay.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reality_write: Option<RealityWriteGrantResponse>,
-}
-
-/// #1559: result of a `profile operation=grant_reality_write` /
-/// `revoke_reality_write` call. Carries the durable audit readbacks and the
-/// overlay's bounded-TTL expiry so the caller can prove the escalation happened
-/// and see exactly when it lapses.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RealityWriteGrantResponse {
-    pub operation: ProfileOperation,
-    pub source_of_truth: &'static str,
-    /// True when a runtime reality-write overlay is active after this call
-    /// (always false after revoke).
-    pub overlay_active: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_by: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granted_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining_ms: Option<u64>,
-    pub ttl_seconds: u64,
-    pub lease_proof: ToolProfileLeaseProof,
-    pub intent_audit: ToolProfileAuditReadback,
-    pub final_audit: ToolProfileAuditReadback,
-    pub profile_independent_of_grants_note: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2720,141 +3047,18 @@ pub(crate) struct ToolProfileLeaseProof {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolProfileSetResponse {
-    pub before: ToolProfileSnapshot,
-    pub after: ToolProfileSnapshot,
+    pub before: ProfileSummary,
+    pub after: ProfileSummary,
     pub row_readback: ToolProfileRowReadback,
     pub intent_audit: ToolProfileAuditReadback,
     pub final_audit: ToolProfileAuditReadback,
     pub lease_proof: ToolProfileLeaseProof,
 }
 
-const PROFILE_DETAIL_HINT: &str = "compact readback; pass detail=true for the full ToolProfileSnapshot (facade contract, public registry, Codex client surface, hidden routes)";
-
-/// Compact per-snapshot readback used by the default (detail=false) profile
-/// responses. Every field is copied from the same `ToolProfileSnapshot` the
-/// full response would carry, so the compact form never diverges from it.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ToolProfileSnapshotSummary {
-    pub profile: ToolProfileKind,
-    pub profile_label: &'static str,
-    pub source: String,
-    pub implementation_tool_count: usize,
-    pub visible_tool_count: usize,
-    pub visible_tool_sha256: String,
-    pub facade_contract_sha256: String,
-    pub foreground_route: ToolProfileForegroundRoute,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_row_key_hex: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_row_value_sha256: Option<String>,
-}
-
-impl ToolProfileSnapshot {
-    pub(crate) fn summary(&self) -> ToolProfileSnapshotSummary {
-        ToolProfileSnapshotSummary {
-            profile: self.profile,
-            profile_label: self.profile_label,
-            source: self.source.clone(),
-            implementation_tool_count: self.implementation_tool_count,
-            visible_tool_count: self.visible_tool_count,
-            visible_tool_sha256: self.visible_tool_sha256.clone(),
-            facade_contract_sha256: self.facade_contract.facade_contract_sha256.clone(),
-            foreground_route: self.foreground_route.clone(),
-            policy_row_key_hex: self.policy_row.as_ref().map(|row| row.key_hex.clone()),
-            policy_row_value_sha256: self.policy_row.as_ref().map(|row| row.value_sha256.clone()),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ToolProfileStatusSummary {
-    pub source_of_truth: &'static str,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    pub snapshot: ToolProfileSnapshotSummary,
-    pub m3_permissions: M3PermissionStatus,
-    pub detail_hint: &'static str,
-}
-
-impl ToolProfileStatusResponse {
-    pub(crate) fn summary(&self) -> ToolProfileStatusSummary {
-        ToolProfileStatusSummary {
-            source_of_truth: self.snapshot.source_of_truth,
-            session_id: self.snapshot.session_id.clone(),
-            snapshot: self.snapshot.summary(),
-            m3_permissions: self.m3_permissions.clone(),
-            detail_hint: PROFILE_DETAIL_HINT,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ToolProfileSetSummary {
-    pub source_of_truth: &'static str,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    pub before: ToolProfileSnapshotSummary,
-    pub after: ToolProfileSnapshotSummary,
-    pub profile_changed: bool,
-    pub visible_tool_surface_changed: bool,
-    pub tools_newly_visible: Vec<String>,
-    pub tools_newly_hidden: Vec<String>,
-    pub row_readback: ToolProfileAuditReadback,
-    pub intent_audit: ToolProfileAuditReadback,
-    pub final_audit: ToolProfileAuditReadback,
-    pub lease_proof: ToolProfileLeaseProof,
-    pub detail_hint: &'static str,
-}
-
-impl ToolProfileSetResponse {
-    pub(crate) fn summary(&self) -> ToolProfileSetSummary {
-        let before_names = self
-            .before
-            .visible_tool_names
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        let after_names = self
-            .after
-            .visible_tool_names
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        ToolProfileSetSummary {
-            source_of_truth: self.after.source_of_truth,
-            session_id: self.after.session_id.clone(),
-            before: self.before.summary(),
-            after: self.after.summary(),
-            profile_changed: self.before.profile != self.after.profile,
-            visible_tool_surface_changed: self.before.visible_tool_sha256
-                != self.after.visible_tool_sha256,
-            tools_newly_visible: after_names
-                .difference(&before_names)
-                .map(|name| (*name).clone())
-                .collect(),
-            tools_newly_hidden: before_names
-                .difference(&after_names)
-                .map(|name| (*name).clone())
-                .collect(),
-            row_readback: ToolProfileAuditReadback {
-                cf_name: self.row_readback.cf_name,
-                key_hex: self.row_readback.key_hex.clone(),
-                value_len_bytes: self.row_readback.value_len_bytes,
-                value_sha256: self.row_readback.value_sha256.clone(),
-            },
-            intent_audit: self.intent_audit.clone(),
-            final_audit: self.final_audit.clone(),
-            lease_proof: self.lease_proof.clone(),
-            detail_hint: PROFILE_DETAIL_HINT,
-        }
-    }
-}
-
 #[tool_router(router = tool_profile_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, facade contract, and effective M3 permission grants (with config source + any active reality-write overlay). operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease. operation=grant_reality_write installs a bounded-TTL, audited, revocable reality-write opt-in overlay (gated exactly like break_glass: confirm_break_glass=true + non-empty reason + this session owns the foreground input lease); operation=revoke_reality_write clears it. The selected profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself. status/set return a compact status_summary/set_summary by default (profile, visible tool count+sha, tool-surface delta, policy row key/sha, audit keys, lease proof); pass detail=true for the full before/after snapshots."
+        description = "Public profile facade. operation=status returns a short summary of this MCP session's profile (profile, source, visible tool count and sha256, escalation policy, foreground-route readiness); tool names are in tools/list, the tool registry and facade contract in health. operation=set persists a new profile through the same audited readback path as tool_profile_set and returns short before/after summaries with the CF_SESSIONS row readback; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease."
     )]
     pub async fn profile(
         &self,
@@ -2868,33 +3072,13 @@ impl SynapseService {
             "tool.invocation kind=profile"
         );
         let params = params.0;
-        let authority_session_id =
-            super::context::mcp_session_id_from_request_context(&request_context)?;
-        let _authority_gate = if let Some(session_id) = authority_session_id.as_deref() {
-            let gate = self.lock_session_authority(session_id).await?;
-            self.reject_terminated_session_tool_call("profile", session_id)?;
-            Some(gate)
-        } else {
-            None
-        };
         match params.operation {
-            ProfileOperation::Status => {
-                let status = self.tool_profile_status_response(&request_context)?;
-                let (status, status_summary) = if params.detail {
-                    (Some(status), None)
-                } else {
-                    (None, Some(status.summary()))
-                };
-                Ok(Json(ProfileResponse {
-                    operation: ProfileOperation::Status,
-                    source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
-                    status,
-                    set: None,
-                    status_summary,
-                    set_summary: None,
-                    reality_write: None,
-                }))
-            }
+            ProfileOperation::Status => Ok(Json(ProfileResponse {
+                operation: ProfileOperation::Status,
+                source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
+                status: Some(self.tool_profile_status_response(&request_context)?),
+                set: None,
+            })),
             ProfileOperation::Set => {
                 let profile = params.profile.ok_or_else(|| {
                     profile_facade_error(
@@ -2913,68 +3097,13 @@ impl SynapseService {
                         &request_context,
                         "profile",
                         "set",
-                        true,
                     )
                     .await?;
-                let (set, set_summary) = if params.detail {
-                    (Some(set), None)
-                } else {
-                    (None, Some(set.summary()))
-                };
                 Ok(Json(ProfileResponse {
                     operation: ProfileOperation::Set,
                     source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
                     status: None,
-                    set,
-                    status_summary: None,
-                    set_summary,
-                    reality_write: None,
-                }))
-            }
-            ProfileOperation::GrantRealityWrite => {
-                let session_id = super::context::mcp_session_id_from_request_context(
-                    &request_context,
-                )?
-                .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::HTTP_SESSION_INVALID,
-                        "profile operation=grant_reality_write requires an MCP session id so the escalation can be persisted",
-                    )
-                })?;
-                let reality_write = self.apply_reality_write_grant(
-                    &session_id,
-                    params.reason.as_deref(),
-                    params.confirm_break_glass,
-                )?;
-                Ok(Json(ProfileResponse {
-                    operation: ProfileOperation::GrantRealityWrite,
-                    source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-                    status: None,
-                    set: None,
-                    status_summary: None,
-                    set_summary: None,
-                    reality_write: Some(reality_write),
-                }))
-            }
-            ProfileOperation::RevokeRealityWrite => {
-                let session_id = super::context::mcp_session_id_from_request_context(
-                    &request_context,
-                )?
-                .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::HTTP_SESSION_INVALID,
-                        "profile operation=revoke_reality_write requires an MCP session id so the revoke can be persisted",
-                    )
-                })?;
-                let reality_write = self.apply_reality_write_revoke(&session_id)?;
-                Ok(Json(ProfileResponse {
-                    operation: ProfileOperation::RevokeRealityWrite,
-                    source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-                    status: None,
-                    set: None,
-                    status_summary: None,
-                    set_summary: None,
-                    reality_write: Some(reality_write),
+                    set: Some(set),
                 }))
             }
         }
@@ -2993,20 +3122,12 @@ impl SynapseService {
             kind = "tool_profile_status",
             "tool.invocation kind=tool_profile_status"
         );
-        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
-        let _authority_gate = if let Some(session_id) = session_id.as_deref() {
-            let gate = self.lock_session_authority(session_id).await?;
-            self.reject_terminated_session_tool_call("tool_profile_status", session_id)?;
-            Some(gate)
-        } else {
-            None
-        };
         self.tool_profile_status_response(&request_context)
             .map(Json)
     }
 
     #[tool(
-        description = "Set this MCP session's durable tool profile. Every profile keeps discovery on the <=40 public facade surface. browser_debugger, break_glass, and full_capability enable stricter facade operations only when confirm_break_glass=true and reason is non-empty; break_glass/full_capability also require this session to own the foreground input lease."
+        description = "Set this MCP session's durable tool profile. Every profile keeps discovery on the <={PUBLIC_TOOL_LIMIT} public facade surface. browser_debugger, break_glass, and full_capability enable stricter facade operations only when confirm_break_glass=true and reason is non-empty; break_glass/full_capability also require this session to own the foreground input lease."
     )]
     pub async fn tool_profile_set(
         &self,
@@ -3023,7 +3144,6 @@ impl SynapseService {
             &request_context,
             "tool_profile_set",
             "profile_set",
-            false,
         )
         .await
         .map(Json)
@@ -3037,249 +3157,52 @@ impl SynapseService {
     ) -> Result<ToolProfileStatusResponse, ErrorData> {
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         Ok(ToolProfileStatusResponse {
-            snapshot: self.tool_profile_snapshot(session_id.as_deref())?,
-            m3_permissions: self.m3_permission_status()?,
+            snapshot: ProfileSummary::of(&self.tool_profile_snapshot(session_id.as_deref())?),
         })
     }
 
-    /// #1559: coherent effective-permission readback drawn from live M3State —
-    /// startup grants + config source + any active runtime reality-write overlay.
-    pub(super) fn m3_permission_status(&self) -> Result<M3PermissionStatus, ErrorData> {
-        let mut state = self.m3_state.lock().map_err(|_err| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "M3 service state lock poisoned while reading permission status",
-            )
-        })?;
-        // Consult (and lazily clear any expired) overlay so the readback matches
-        // exactly what enforcement would decide right now.
-        let overlay_active = state.reality_write_grant_active();
-        let overlay =
-            state
-                .reality_write_grant_snapshot()
-                .map(|snapshot| RealityWriteOverlayReadback {
-                    granted_by: snapshot.granted_by,
-                    reason: snapshot.reason,
-                    granted_at: snapshot.granted_at.to_rfc3339(),
-                    expires_at: snapshot.expires_at.to_rfc3339(),
-                    remaining_ms: snapshot.remaining_ms,
-                });
-        let effective_grant_names = state
-            .permission_grants
-            .names()
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect();
-        let config_source = state.permission_grants_source;
-        drop(state);
-        Ok(M3PermissionStatus {
-            source_of_truth: "M3State.permission_grants (startup) + in-memory reality_write_grant overlay",
-            effective_grant_names,
-            config_source,
-            reality_write_overlay_active: overlay_active,
-            reality_write_overlay: overlay,
-            profile_independent_of_grants_note: PROFILE_INDEPENDENT_OF_GRANTS_NOTE,
-        })
-    }
-
-    /// #1559: install the runtime reality-write opt-in overlay for a session.
-    /// Gated exactly like an explicit break_glass escalation (confirm + non-empty
-    /// reason + this session owns the foreground input lease) and audited to
-    /// CF_ACTION_LOG (intent + final). Fail-closed: any unmet gate denies and the
-    /// overlay is never installed. Takes `session_id` directly so the facade
-    /// handler and unit tests share one gated path.
-    pub(super) fn apply_reality_write_grant(
-        &self,
-        session_id: &str,
-        reason: Option<&str>,
-        confirm_break_glass: bool,
-    ) -> Result<RealityWriteGrantResponse, ErrorData> {
-        let reason = normalize_reason(reason)?;
-        let lease_proof = break_glass_lease_proof(session_id, ToolProfileKind::BreakGlass);
-        let command_payload = json!({
-            "operation": "grant_reality_write",
-            "reason": reason,
-            "confirm_break_glass": confirm_break_glass,
-        });
-        let command_before = json!({
-            "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-            "lease_proof": lease_proof,
-        });
-        let intent_audit = audit_readback(self.command_audit_intent(
-            super::command_audit::CommandAuditInput::mcp(
-                "profile",
-                "grant_reality_write",
-                Some(session_id.to_owned()),
-                Some(session_id.to_owned()),
-                command_payload.clone(),
-                command_before.clone(),
-                Value::Null,
-                "pending",
-            ),
-        )?);
-
-        if let Err(error) = validate_reality_write_grant_gate(
-            session_id,
-            reason.as_deref(),
-            confirm_break_glass,
-            &lease_proof,
-        ) {
-            let final_audit = self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "profile",
-                    "grant_reality_write",
-                    Some(session_id.to_owned()),
-                    Some(session_id.to_owned()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-                        "overlay_active": false,
-                        "lease_proof": lease_proof,
-                    }),
-                    "error",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&error),
-                ),
-            )?;
-            let _final_audit = audit_readback(final_audit);
-            return Err(error);
-        }
-
-        let snapshot = {
-            let mut state = self.m3_state.lock().map_err(|_err| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "M3 service state lock poisoned while granting reality-write overlay",
-                )
-            })?;
-            state.grant_reality_write(session_id.to_owned(), reason.clone().unwrap_or_default())
-        };
-        tracing::warn!(
-            code = "REALITY_WRITE_GRANTED",
-            session_id = %session_id,
-            reason = reason.as_deref().unwrap_or(""),
-            expires_at = %snapshot.expires_at.to_rfc3339(),
-            ttl_seconds = crate::m3::REALITY_WRITE_GRANT_MAX_TTL.as_secs(),
-            "runtime reality-write overlay granted (#1559)"
-        );
-        let final_audit = audit_readback(self.command_audit_final(
-            super::command_audit::CommandAuditInput::mcp(
-                "profile",
-                "grant_reality_write",
-                Some(session_id.to_owned()),
-                Some(session_id.to_owned()),
-                command_payload,
-                command_before,
-                json!({
-                    "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-                    "overlay_active": true,
-                    "granted_by": session_id,
-                    "expires_at": snapshot.expires_at.to_rfc3339(),
-                    "remaining_ms": snapshot.remaining_ms,
-                    "lease_proof": lease_proof,
-                }),
-                "ok",
-            ),
-        )?);
-
-        Ok(RealityWriteGrantResponse {
-            operation: ProfileOperation::GrantRealityWrite,
-            source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-            overlay_active: true,
-            granted_by: Some(session_id.to_owned()),
-            reason,
-            granted_at: Some(snapshot.granted_at.to_rfc3339()),
-            expires_at: Some(snapshot.expires_at.to_rfc3339()),
-            remaining_ms: Some(snapshot.remaining_ms),
-            ttl_seconds: crate::m3::REALITY_WRITE_GRANT_MAX_TTL.as_secs(),
-            lease_proof,
-            intent_audit,
-            final_audit,
-            profile_independent_of_grants_note: PROFILE_INDEPENDENT_OF_GRANTS_NOTE,
-        })
-    }
-
-    /// #1559: clear the runtime reality-write overlay for a session, restoring
-    /// the fail-closed default with no residue. De-escalation, so it needs only
-    /// an MCP session id; still audited to CF_ACTION_LOG.
-    pub(super) fn apply_reality_write_revoke(
-        &self,
-        session_id: &str,
-    ) -> Result<RealityWriteGrantResponse, ErrorData> {
-        let lease_proof = break_glass_lease_proof(session_id, ToolProfileKind::BreakGlass);
-        let command_payload = json!({ "operation": "revoke_reality_write" });
-        let command_before = json!({ "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH });
-        let intent_audit = audit_readback(self.command_audit_intent(
-            super::command_audit::CommandAuditInput::mcp(
-                "profile",
-                "revoke_reality_write",
-                Some(session_id.to_owned()),
-                Some(session_id.to_owned()),
-                command_payload.clone(),
-                command_before.clone(),
-                Value::Null,
-                "pending",
-            ),
-        )?);
-
-        let revoked = {
-            let mut state = self.m3_state.lock().map_err(|_err| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "M3 service state lock poisoned while revoking reality-write overlay",
-                )
-            })?;
-            state.revoke_reality_write()
-        };
-        tracing::warn!(
-            code = "REALITY_WRITE_REVOKED",
-            session_id = %session_id,
-            was_active = revoked.is_some(),
-            "runtime reality-write overlay revoked (#1559)"
-        );
-        let final_audit = audit_readback(self.command_audit_final(
-            super::command_audit::CommandAuditInput::mcp(
-                "profile",
-                "revoke_reality_write",
-                Some(session_id.to_owned()),
-                Some(session_id.to_owned()),
-                command_payload,
-                command_before,
-                json!({
-                    "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-                    "overlay_active": false,
-                    "was_active": revoked.is_some(),
-                }),
-                "ok",
-            ),
-        )?);
-
-        Ok(RealityWriteGrantResponse {
-            operation: ProfileOperation::RevokeRealityWrite,
-            source_of_truth: REALITY_WRITE_GRANT_SOURCE_OF_TRUTH,
-            overlay_active: false,
-            granted_by: revoked.as_ref().map(|snapshot| snapshot.granted_by.clone()),
-            reason: revoked.as_ref().map(|snapshot| snapshot.reason.clone()),
-            granted_at: None,
-            expires_at: None,
-            remaining_ms: None,
-            ttl_seconds: 0,
-            lease_proof,
-            intent_audit,
-            final_audit,
-            profile_independent_of_grants_note: PROFILE_INDEPENDENT_OF_GRANTS_NOTE,
-        })
-    }
-
-    pub(super) async fn tool_profile_set_response(
+    async fn tool_profile_set_response(
         &self,
         params: ToolProfileSetParams,
         request_context: &RequestContext<RoleServer>,
         audit_tool: &'static str,
         audit_verb: &'static str,
-        authority_gate_held: bool,
+    ) -> Result<ToolProfileSetResponse, ErrorData> {
+        // Held until the profile write finishes, so an escalation of this
+        // session cannot start part-way through it.
+        let _hold = match super::context::mcp_session_id_from_request_context(request_context)? {
+            Some(session_id) => Some(super::act_foreground_slot::admit_session_operation(
+                &session_id,
+                audit_tool,
+            )?),
+            None => None,
+        };
+        self.tool_profile_set_response_inner(params, request_context, audit_tool, audit_verb)
+            .await
+    }
+
+    /// Profile set on behalf of an in-flight `act operation=foreground`
+    /// escalation, which owns the session's profile until it unwinds.
+    pub(super) async fn tool_profile_set_for_foreground(
+        &self,
+        params: ToolProfileSetParams,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<ToolProfileSetResponse, ErrorData> {
+        self.tool_profile_set_response_inner(
+            params,
+            request_context,
+            "act_foreground",
+            "profile_set",
+        )
+        .await
+    }
+
+    async fn tool_profile_set_response_inner(
+        &self,
+        params: ToolProfileSetParams,
+        request_context: &RequestContext<RoleServer>,
+        audit_tool: &'static str,
+        audit_verb: &'static str,
     ) -> Result<ToolProfileSetResponse, ErrorData> {
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?
             .ok_or_else(|| {
@@ -3290,12 +3213,6 @@ impl SynapseService {
                     ),
                 )
             })?;
-        let _authority_gate = if authority_gate_held {
-            None
-        } else {
-            Some(self.lock_session_authority(&session_id).await?)
-        };
-        self.reject_terminated_session_tool_call(audit_tool, &session_id)?;
         let reason = normalize_reason(params.reason.as_deref())?;
         let before = self.tool_profile_snapshot(Some(&session_id))?;
         let lease_proof = break_glass_lease_proof(&session_id, params.profile);
@@ -3443,8 +3360,8 @@ impl SynapseService {
         )?);
 
         Ok(ToolProfileSetResponse {
-            before,
-            after,
+            before: ProfileSummary::of(&before),
+            after: ProfileSummary::of(&after),
             row_readback,
             intent_audit,
             final_audit,
@@ -3508,6 +3425,7 @@ impl SynapseService {
             denied_break_glass_tools,
             foreground_capability: foreground_capability_policy(profile),
             hidden_tool_routes,
+            hidden_tool_route_policy: HIDDEN_TOOL_ROUTE_POLICY,
             public_tool_registry,
             facade_contract,
             codex_client_surface,
@@ -3595,10 +3513,34 @@ impl SynapseService {
         Err(error)
     }
 
+    /// #58: the sessionless stdio admin lane keeps its full tool list, but the
+    /// dangerous raw implementation tools (exec/launch/spawn and hazardous
+    /// input primitives) are refused there; use the `act`/`shell`/`agent`
+    /// facades instead. The documented operator switch `SYNAPSE_DEBUG_TOOLS`
+    /// (raw/full legacy surface) keeps them callable; it is off by default.
+    /// An explicit operator allowlist (`--allow-shell` / `--allow-launch`
+    /// patterns) is also an opt-in for its own exec family; those calls still
+    /// pass the m4 allowlist authorization.
+    pub(crate) fn admit_sessionless_tool_call(&self, tool_name: &str) -> Result<(), ErrorData> {
+        if super::debug_tools_enabled() {
+            return Ok(());
+        }
+        let opt_in = SessionlessOperatorOptIn {
+            shell_patterns: self.m4_config.allow_shell_count() > 0,
+            launch_patterns: self.m4_config.allow_launch_count() > 0,
+        };
+        sessionless_tool_call_denial(tool_name, &self.full_tool_names(), opt_in).map_or(Ok(()), Err)
+    }
+
     fn ensure_tool_profile_assignment(
         &self,
         session_id: &str,
     ) -> Result<ToolProfileRowReadback, ErrorData> {
+        // Read and lazy write are one step under the row write lock, so a
+        // default/refresh write can never land a stale profile over a
+        // concurrent explicit change (e.g. an act_foreground escalation or
+        // its restore).
+        let _write = profile_row_write_lock();
         let is_local_agent = self.session_is_local_model_agent(session_id);
         match self.read_tool_profile_assignment(session_id)? {
             Some(row) => {
@@ -3612,7 +3554,7 @@ impl SynapseService {
                 // Only the *default* normal-agent row self-heals; an explicit
                 // operator profile choice is never silently widened.
                 if is_local_agent && row.record.source == "default_normal_agent" {
-                    return self.write_tool_profile_assignment(
+                    return self.write_tool_profile_assignment_locked(
                         session_id,
                         ToolProfileKind::FullCapability,
                         "default_full_capability_local_agent",
@@ -3621,7 +3563,7 @@ impl SynapseService {
                     );
                 }
                 if !self.tool_profile_assignment_surface_is_current(&row.record)? {
-                    return self.write_tool_profile_assignment(
+                    return self.write_tool_profile_assignment_locked(
                         session_id,
                         row.record.profile,
                         row.record.source.clone(),
@@ -3640,7 +3582,7 @@ impl SynapseService {
                 } else {
                     (ToolProfileKind::NormalAgent, "default_normal_agent")
                 };
-                self.write_tool_profile_assignment(session_id, profile, source, None, None)
+                self.write_tool_profile_assignment_locked(session_id, profile, source, None, None)
             }
         }
     }
@@ -3656,23 +3598,15 @@ impl SynapseService {
             && record.denied_break_glass_tools == denied_break_glass_tools(&allowed_tool_names))
     }
 
-    /// True when `session_id` belongs to a Synapse-spawned local-model agent
-    /// (the `synapse-local-model-agent` MCP client, classified `"local-model"`
-    /// by [`super::session_registry::infer_agent_kind`]). Trust basis: Synapse is
-    /// loopback-only + bearer-token + single-user, so the MCP client identity is
-    /// a sound affordance signal here (it is NOT a cross-tenant security boundary;
-    /// `clientInfo` is self-reported per MCP). Unknown / unclassified sessions
-    /// return false and get the least-privilege default.
+    /// Only the separately authenticated local-model launch may receive this default.
     fn session_is_local_model_agent(&self, session_id: &str) -> bool {
         self.session_registry_ref()
             .lock()
             .ok()
-            .and_then(|registry| registry.agent_kind_for(session_id))
-            .as_deref()
-            == Some("local-model")
+            .is_some_and(|registry| registry.is_trusted_local_agent(session_id))
     }
 
-    pub(super) fn read_tool_profile_assignment(
+    fn read_tool_profile_assignment(
         &self,
         session_id: &str,
     ) -> Result<Option<ToolProfileRowReadback>, ErrorData> {
@@ -3725,7 +3659,56 @@ impl SynapseService {
         }))
     }
 
-    pub(super) fn write_tool_profile_assignment(
+    /// Fail-closed last resort for unwinding an escalation: writes the
+    /// least-privileged profile row directly, without the audit-intent gate
+    /// that may itself be what refused the normal restore. Lowering privilege
+    /// needs no lease or confirmation, so skipping the gate cannot escalate.
+    pub(super) fn force_least_privilege_profile(
+        &self,
+        session_id: &str,
+        reason: String,
+    ) -> Result<ToolProfileRowReadback, ErrorData> {
+        self.write_tool_profile_assignment(
+            session_id,
+            ToolProfileKind::NormalAgent,
+            "act_foreground_fail_closed_unwind",
+            Some(reason),
+            Some(session_id.to_owned()),
+        )
+    }
+
+    fn write_tool_profile_assignment(
+        &self,
+        session_id: &str,
+        profile: ToolProfileKind,
+        source: impl Into<String>,
+        reason: Option<String>,
+        set_by_session_id: Option<String>,
+    ) -> Result<ToolProfileRowReadback, ErrorData> {
+        let _write = profile_row_write_lock();
+        self.write_tool_profile_assignment_locked(
+            session_id,
+            profile,
+            source,
+            reason,
+            set_by_session_id,
+        )
+    }
+
+    /// #258 test seam: writes `session_id`'s profile row directly (no lease,
+    /// confirmation or audit), so a test can reach a route's later gate.
+    #[cfg(test)]
+    pub(crate) fn set_tool_profile_for_test(
+        &self,
+        session_id: &str,
+        profile: ToolProfileKind,
+    ) -> Result<(), ErrorData> {
+        self.write_tool_profile_assignment(session_id, profile, "test", None, None)
+            .map(|_readback| ())
+    }
+
+    /// Writes the row; the caller holds [`profile_row_write_lock`].
+    fn write_tool_profile_assignment_locked(
         &self,
         session_id: &str,
         profile: ToolProfileKind,
@@ -3784,94 +3767,27 @@ impl SynapseService {
         Ok(readback)
     }
 
-    /// Restore the byte-exact profile assignment captured before a temporary
-    /// authority transition, including its provenance and original timestamp.
-    /// This is synchronous so a cancellation/unwind guard can use it from
-    /// `Drop` without depending on another async poll.
-    pub(super) fn restore_tool_profile_assignment_exact(
-        &self,
-        before: &ToolProfileAssignment,
-    ) -> Result<ToolProfileRowReadback, ErrorData> {
-        let encoded = synapse_storage::encode_json(before).map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "encode exact tool profile restore failed for {}: {error}",
-                    before.session_id
-                ),
-            )
-        })?;
-        let expected_sha256 = sha256_hex(&encoded);
-        let db = self.m3_storage()?;
-        let key = tool_profile_key(&before.session_id);
-        db.put_batch_pressure_bypass(cf::CF_SESSIONS, [(key, encoded)])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let readback = self
-            .read_tool_profile_assignment(&before.session_id)?
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "tool profile row missing after exact restore for {}",
-                        before.session_id
-                    ),
-                )
-            })?;
-        if readback.value_sha256 != expected_sha256 {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "tool profile row readback hash mismatch after exact restore for {}",
-                    before.session_id
-                ),
-            ));
-        }
-        tracing::info!(
-            code = "MCP_TOOL_PROFILE_AUTHORITY_GUARD_RESTORED",
-            session_id = before.session_id,
-            profile = before.profile.as_str(),
-            value_sha256 = %readback.value_sha256,
-            "readback=CF_SESSIONS after=authority_guard_profile_row_restored"
-        );
-        Ok(readback)
-    }
-
-    /// Delete a scoped profile row at the authoritative session-teardown
-    /// boundary and prove absence with a separate read. Callers must hold the
-    /// session authority gate.
-    pub(super) fn delete_tool_profile_assignment_for_terminated_session(
-        &self,
-        session_id: &str,
-    ) -> Result<(bool, bool), ErrorData> {
-        let row_existed_before = self.read_tool_profile_assignment(session_id)?.is_some();
-        let db = self.m3_storage()?;
-        db.delete_batch(cf::CF_SESSIONS, [tool_profile_key(session_id)])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let row_exists_after = self.read_tool_profile_assignment(session_id)?.is_some();
-        if row_exists_after {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!("tool profile row still exists after teardown for {session_id}"),
-            ));
-        }
-        tracing::info!(
-            code = "MCP_TOOL_PROFILE_TERMINATED_SESSION_DELETED",
-            session_id,
-            row_existed_before,
-            row_exists_after,
-            "readback=CF_SESSIONS after=terminated_session_profile_absent"
-        );
-        Ok((row_existed_before, row_existed_before && !row_exists_after))
-    }
-
     pub(crate) fn full_sanitized_tools(&self) -> Vec<Tool> {
-        super::schema_sanitize::sanitize_tools(self.tool_router.list_all())
+        self.full_sanitized_tools_shared().as_ref().clone()
+    }
+
+    /// #146: sanitizing every tool schema costs ~100 ms of CPU and ran on the
+    /// async worker for every `tools/list` and profile snapshot; under build
+    /// load that stalled MCP handshakes past client timeouts. The router is
+    /// fixed at construction, but the env flags `SYNAPSE_DEBUG_TOOLS` and
+    /// `SYNAPSE_ENABLE_EVERQUEST` change which routes it registers, so the
+    /// sanitized list is computed once per process per flag combination.
+    pub(crate) fn full_sanitized_tools_shared(&self) -> Arc<Vec<Tool>> {
+        static SANITIZED_TOOLS: ToolsListCache = ToolsListCache::new();
+        SANITIZED_TOOLS.get_or_compute(ToolListFlags::from_env(), || {
+            super::schema_sanitize::sanitize_tools(self.tool_router.list_all())
+        })
     }
 
     fn full_tool_names(&self) -> Vec<String> {
         let mut names = self
-            .full_sanitized_tools()
-            .into_iter()
+            .full_sanitized_tools_shared()
+            .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
         names.sort();
@@ -3886,12 +3802,7 @@ fn validate_profile_set_policy(
     confirm_break_glass: bool,
     lease_proof: &ToolProfileLeaseProof,
 ) -> Result<(), ErrorData> {
-    if !matches!(
-        profile,
-        ToolProfileKind::BrowserDebugger
-            | ToolProfileKind::BreakGlass
-            | ToolProfileKind::FullCapability
-    ) {
+    if !profile.requires_explicit_confirm() {
         return Ok(());
     }
     let profile_label = profile.as_str();
@@ -3935,47 +3846,6 @@ fn validate_profile_set_policy(
     Ok(())
 }
 
-/// #1559: gate for `profile operation=grant_reality_write`. Requires the exact
-/// strictest existing escalation posture — explicit operator confirmation
-/// (`confirm_break_glass=true`), a non-empty reason, and that THIS session owns
-/// the foreground input lease (matching full_capability/break_glass). Fail-closed:
-/// any unmet gate returns an error and the caller never installs the overlay.
-fn validate_reality_write_grant_gate(
-    session_id: &str,
-    reason: Option<&str>,
-    confirm_break_glass: bool,
-    lease_proof: &ToolProfileLeaseProof,
-) -> Result<(), ErrorData> {
-    if !confirm_break_glass {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "profile operation=grant_reality_write requires confirm_break_glass=true",
-        ));
-    }
-    if reason.is_none_or(str::is_empty) {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "profile operation=grant_reality_write requires a non-empty reason",
-        ));
-    }
-    if !lease_proof.caller_is_owner {
-        return Err(ErrorData::new(
-            ErrorCode(-32099),
-            format!(
-                "profile operation=grant_reality_write requires this MCP session to own the foreground input lease; current owner={:?}",
-                lease_proof.owner_session_id
-            ),
-            Some(json!({
-                "code": error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
-                "session_id": session_id,
-                "lease_proof": lease_proof,
-                "resolution": "call act operation=lease_acquire first, then retry profile operation=grant_reality_write with confirm_break_glass=true and a non-empty reason",
-            })),
-        ));
-    }
-    Ok(())
-}
-
 fn break_glass_lease_proof(session_id: &str, profile: ToolProfileKind) -> ToolProfileLeaseProof {
     let status = lease::status();
     ToolProfileLeaseProof {
@@ -3994,7 +3864,23 @@ fn break_glass_lease_proof(session_id: &str, profile: ToolProfileKind) -> ToolPr
     }
 }
 
-fn normalize_reason(raw: Option<&str>) -> Result<Option<String>, ErrorData> {
+/// Join a fixed audit prefix and a caller-supplied detail into a profile reason
+/// that always satisfies the `MAX_PROFILE_REASON_CHARS` bound, truncating the
+/// detail (never the prefix) on a char boundary.
+pub(crate) fn bounded_profile_reason(prefix: &str, detail: &str) -> String {
+    let separator = ": ";
+    let budget = MAX_PROFILE_REASON_CHARS
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(separator.chars().count());
+    let detail: String = detail.trim().chars().take(budget).collect();
+    if detail.is_empty() {
+        prefix.chars().take(MAX_PROFILE_REASON_CHARS).collect()
+    } else {
+        format!("{prefix}{separator}{detail}")
+    }
+}
+
+pub(crate) fn normalize_reason(raw: Option<&str>) -> Result<Option<String>, ErrorData> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -4042,6 +3928,66 @@ fn visible_tool_names_for_profile(
     names
 }
 
+/// Raw shell exec family an explicit `--allow-shell` allowlist opts into.
+const SESSIONLESS_SHELL_OPT_IN_TOOLS: &[&str] = &[
+    "act_run_shell",
+    "act_run_shell_cancel",
+    "act_run_shell_start",
+    "act_run_shell_status",
+];
+
+/// Explicit daemon-start operator opt-ins for the sessionless stdio lane:
+/// configured allowlist patterns (not the permissive `*_ANY` defaults).
+#[derive(Clone, Copy, Debug)]
+struct SessionlessOperatorOptIn {
+    shell_patterns: bool,
+    launch_patterns: bool,
+}
+
+impl SessionlessOperatorOptIn {
+    fn admits(self, tool_name: &str) -> bool {
+        (self.shell_patterns && SESSIONLESS_SHELL_OPT_IN_TOOLS.contains(&tool_name))
+            || (self.launch_patterns && tool_name == "act_launch")
+    }
+}
+
+/// Pure admission check for sessionless (unscoped stdio) calls. Only the
+/// dangerous raw names (exec set + hazardous input primitives) are denied;
+/// everything else, including names the router does not know, is admitted.
+/// An exec family whose own operator allowlist is configured is admitted.
+fn sessionless_tool_call_denial(
+    tool_name: &str,
+    full_tool_names: &[String],
+    opt_in: SessionlessOperatorOptIn,
+) -> Option<ErrorData> {
+    let profile = ToolProfileKind::BreakGlass;
+    let dangerous = BREAK_GLASS_DENIED_EXEC_TOOLS.contains(&tool_name)
+        || BREAK_GLASS_HAZARDOUS_TOOLS.contains(&tool_name);
+    if !dangerous
+        || opt_in.admits(tool_name)
+        || !full_tool_names.iter().any(|name| name == tool_name)
+    {
+        return None;
+    }
+    Some(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "tool {tool_name:?} is a dangerous raw implementation tool and cannot be called directly, including on unscoped stdio"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
+            "tool": tool_name,
+            "session_id": Value::Null,
+            "profile": profile.as_str(),
+            "profile_label": profile.label(),
+            "source": "unscoped_stdio_admin",
+            "source_of_truth": TOOL_PROFILE_SOURCE_OF_TRUTH,
+            "capability_route": hidden_tool_capability_route(tool_name),
+            "resolution": "call the public facade named by capability_route; raw implementation tool names are not callable",
+        })),
+    ))
+}
+
 fn denied_break_glass_tools(visible_tool_names: &[String]) -> Vec<String> {
     let visible = visible_tool_names
         .iter()
@@ -4049,6 +3995,7 @@ fn denied_break_glass_tools(visible_tool_names: &[String]) -> Vec<String> {
         .collect::<BTreeSet<_>>();
     BREAK_GLASS_HAZARDOUS_TOOLS
         .iter()
+        .chain(BREAK_GLASS_DENIED_EXEC_TOOLS.iter())
         .copied()
         .filter(|name| !visible.contains(name))
         .map(str::to_owned)
@@ -4098,19 +4045,19 @@ fn foreground_route_readiness(
 fn foreground_capability_policy(profile: ToolProfileKind) -> ToolProfileForegroundCapability {
     let (preferred_path, real_os_foreground_path) = match profile {
         ToolProfileKind::NormalAgent => (
-            "the <=40 public facade surface is visible; target-scoped work uses target/act/browser operations and raw implementation tools remain hidden",
-            "act operation=foreground acquires the lease, temporarily transitions authority, delegates internally, and verifies profile/lease cleanup; raw foreground primitives remain hidden",
+            "only registered public facade tools are visible in the normal profile; implementation tools require an explicit advanced profile or a facade route",
+            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BrowserControl => (
-            "the <=40 public browser/action facades are visible in the task profile; raw implementation browser tools stay hidden behind those facades",
-            "act operation=foreground is the only public real-foreground escalation route; it owns the lease/profile lifecycle and cleanup readback",
+            "the public browser/action facades are visible in the task profile; raw implementation browser tools stay hidden behind those facades",
+            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BrowserDebugger => (
-            "the browser_debugger facade stays schema-stable and debugger-backed operations are enabled only by this explicit profile; raw debugger tools remain hidden",
-            "act operation=foreground is the only public real-foreground escalation route; browser-debugger authority does not expose raw OS primitives",
+            "the browser_debugger facade is visible by default and its raw CDP/chrome.debugger operations are enabled only by this explicit profile",
+            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => (
-            "the <=40 public facade surface stays visible; broader authority is routed through facade operations and audited action guards",
+            "the public facade surface stays visible; broader authority is routed through facade operations and audited action guards",
             "raw foreground implementation primitives are not discoverable; use act/target facades so lease/target guards and action audit always run",
         ),
     };
@@ -4134,7 +4081,19 @@ fn hidden_tool_capability_routes(visible_tool_names: &[String]) -> Vec<HiddenToo
         .chain(BROWSER_DEBUGGER_ONLY_EXACT.iter())
         .copied()
         .filter(|name| !visible.contains(name))
-        .map(hidden_tool_capability_route)
+        .map(|name| {
+            let mut route = hidden_tool_capability_route(name);
+            if BROWSER_DEBUGGER_ONLY_EXACT.contains(&name) {
+                // Status summarizes the preferred debugger facade. Escalation is
+                // stated once in hidden_tool_route_policy; alternative public
+                // facades are already discoverable in visible_tool_names (#231).
+                // Direct failure diagnostics retain the full capability route.
+                route
+                    .preferred_tools
+                    .retain(|tool| tool.starts_with("browser_debugger "));
+            }
+            route
+        })
         .collect()
 }
 
@@ -4159,7 +4118,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
             "act operation=invoke scroll",
             "browser_dom operation=locate",
             "browser_capture operation=screenshot",
-            "observe operation=current",
+            "observe",
             "target operation=set",
         ],
         "act_stroke" | "act_pad" => vec![
@@ -4192,7 +4151,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
         "hidden_desktop_pip_frame" => {
             vec![
                 "screenshot operation=capture",
-                "observe operation=current",
+                "observe",
                 "session operation=list",
             ]
         }
@@ -4216,7 +4175,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
             "browser_debugger operation=<matching operation>",
             "browser_dom operation=locate",
             "browser_wait operation=for_condition",
-            "browser_storage operation=read",
+            "browser_storage operation=get",
         ],
         tool if BROWSER_DEBUGGER_ONLY_EXACT.contains(&tool) => vec![
             "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why chrome.debugger is required>",
@@ -4232,11 +4191,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
     };
     HiddenToolCapabilityRoute {
         hidden_tool: tool_name.to_owned(),
-        status: "routed_or_break_glass",
         preferred_tools: preferred_tools.into_iter().map(str::to_owned).collect(),
-        agent_logical_foreground_policy: "use the preferred tools against this session's agent_logical_foreground/foreground_lane",
-        human_os_foreground_policy: "never use the human OS foreground as an implicit fallback",
-        break_glass_policy: "for browser CDP/chrome.debugger instrumentation, call profile operation=set profile=browser_debugger with confirm_break_glass=true and a non-empty reason; for a real OS foreground primitive, first acquire the input lease, then call profile operation=set profile=break_glass with confirm_break_glass=true and a non-empty reason",
     }
 }
 
@@ -4370,7 +4325,7 @@ fn public_tool_registry_error(
             "over_limit_by": validation.over_limit_by,
             "duplicate_public_tool_names": validation.duplicate_public_tool_names,
             "forbidden_public_tool_names": validation.forbidden_public_tool_names,
-            "remediation": "edit PUBLIC_TOOL_NAMES so it has at most 40 unique facade names and no implementation-only tools",
+            "remediation": "edit PUBLIC_TOOL_NAMES so it stays within PUBLIC_TOOL_LIMIT with unique facade names and no implementation-only tools",
         })),
     )
 }
@@ -4407,8 +4362,13 @@ fn facade_contract_snapshot_for(
         unknown_contract_tool_names: validation.unknown_contract_tool_names,
         duplicate_contract_tool_names: validation.duplicate_contract_tool_names,
         duplicate_operation_names: validation.duplicate_operation_names,
+        // The per-operation contract list (FACADE_TOOL_CONTRACTS) is summarized
+        // by its sha256, counts and tool names, not inlined: at tens of KB it
+        // overflowed client responses (#231). Operation names and parameters
+        // stay discoverable through tools/list; the per-operation error-code,
+        // remediation and source-of-truth details live only in source, and the
+        // sha256 lets clients detect when that contract changes.
         invalid_contract_reasons: validation.invalid_contract_reasons,
-        contracts,
     })
 }
 
@@ -4425,7 +4385,13 @@ fn facade_contract_snapshots(
                 .operations
                 .iter()
                 .map(|operation| FacadeOperationContractSnapshot {
-                    operation: operation.operation,
+                    operation: if contract.operation_enum == FLAT_FACADE_OPERATION_ENUM {
+                        ""
+                    } else {
+                        operation.operation
+                    },
+                    behavior: (contract.operation_enum == FLAT_FACADE_OPERATION_ENUM)
+                        .then_some(operation.operation),
                     mutates_state: operation.mutates_state,
                     target_required: operation.target_required,
                     source_of_truth: operation.source_of_truth,
@@ -5189,3 +5155,59 @@ fn unix_ms_now() -> u64 {
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "tests/profile_reason_bounds.rs"]
+mod profile_reason_bounds_tests;
+
+#[cfg(test)]
+#[path = "tests/route_metadata.rs"]
+mod route_metadata_tests;
+
+#[cfg(test)]
+#[path = "tests/contract_metadata_58.rs"]
+mod contract_metadata_58_tests;
+
+#[cfg(test)]
+#[path = "tests/flat_behavior_serialization_58.rs"]
+mod flat_behavior_serialization_58;
+
+#[cfg(test)]
+#[path = "tests/facade_contract_schema_parity_135.rs"]
+mod facade_contract_schema_parity_135_tests;
+
+#[cfg(test)]
+#[path = "tests/profile_status_size_231.rs"]
+mod profile_status_size_231_tests;
+
+#[cfg(test)]
+#[path = "profile_summary_table_579.rs"]
+mod profile_summary_table_579;
+
+/// Serializes every CF_SESSIONS tool-profile row write (explicit sets, lazy
+/// default/refresh writes, and act_foreground's fail-closed unwind).
+static PROFILE_ROW_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn profile_row_write_lock() -> MutexGuard<'static, ()> {
+    PROFILE_ROW_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+#[path = "tests/tool_surface_count_descriptions_89.rs"]
+mod tool_surface_count_descriptions_89_tests;
+#[cfg(test)]
+#[path = "tests/tools_list_cache_146.rs"]
+mod tools_list_cache_146_tests;
+#[cfg(test)]
+#[path = "tests/tools_list_cache_flags_146.rs"]
+mod tools_list_cache_flags_146_tests;
+
+#[cfg(test)]
+#[path = "tests/legacy_subscribe_profiles_137.rs"]
+mod legacy_subscribe_profiles_137_tests;
+
+#[cfg(test)]
+#[path = "tests/bridge_health_projection_82.rs"]
+mod bridge_health_projection_82;

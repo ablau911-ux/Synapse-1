@@ -8,7 +8,9 @@ use synapse_audio::{
     direction::estimate_direction,
     ring::{DEFAULT_SAMPLE_RATE_HZ, STEREO_CHANNELS},
 };
-use synapse_core::{AudioContext, AudioEvent, DirectionEstimate, SensorStatus, error_codes};
+use synapse_core::{
+    AudioContext, AudioEvent, ConfidenceSource, DirectionEstimate, SensorStatus, error_codes,
+};
 use synapse_perception::ObservationInput;
 
 use crate::{
@@ -94,7 +96,8 @@ pub struct AudioTranscribeParams {
 pub struct AudioTranscribeResponse {
     pub text: String,
     pub confidence: f32,
-    pub confidence_source: String,
+    #[serde(default)]
+    pub confidence_source: ConfidenceSource,
     pub latency_ms: u64,
     pub model_id: String,
 }
@@ -315,7 +318,7 @@ fn response_from_transcription(transcription: Transcription) -> AudioTranscribeR
     AudioTranscribeResponse {
         text: transcription.text,
         confidence: transcription.confidence,
-        confidence_source: transcription.confidence_source.as_str().to_owned(),
+        confidence_source: transcription.confidence_source,
         latency_ms: u64::try_from(transcription.elapsed_ms).unwrap_or(u64::MAX),
         model_id: WHISPER_TINY_MODEL_ID.to_owned(),
     }

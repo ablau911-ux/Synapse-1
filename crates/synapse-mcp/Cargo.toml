@@ -3,7 +3,7 @@ name = "synapse-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [[bin]]
@@ -13,6 +13,10 @@ path = "src/main.rs"
 [[bin]]
 name = "synapse-chrome-native-host"
 path = "src/bin/synapse-chrome-native-host.rs"
+
+[[bin]]
+name = "synapse-fsv-toast-history"
+path = "src/bin/synapse-fsv-toast-history.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -24,8 +28,8 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
-http.workspace = true
 hyper.workspace = true
+hyper-util.workspace = true
 image.workspace = true
 metrics.workspace = true
 notify.workspace = true
@@ -36,38 +40,65 @@ rmcp = { workspace = true, features = [
 ] }
 regex.workspace = true
 reqwest.workspace = true
-sse-stream.workspace = true
 schemars.workspace = true
 portable-pty = "0.9.0"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+toml.workspace = true
 sysinfo.workspace = true
-tempfile.workspace = true
 synapse-action = { version = "0.1.0", path = "../synapse-action" }
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-audio = { version = "0.1.0", path = "../synapse-audio" }
+synapse-browsers = { version = "0.1.0", path = "../synapse-browsers" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
+synapse-everquest = { version = "0.1.0", path = "../synapse-everquest" }
+synapse-livefeed = { version = "0.1.0", path = "../synapse-livefeed", optional = true }
 synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["directml"] }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }
+synapse-seats = { version = "0.1.0", path = "../synapse-seats" }
 synapse-storage = { version = "0.1.0", path = "../synapse-storage" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
 tokio-util.workspace = true
+tempfile.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
+[features]
+default = ["livefeed"]
+livefeed = ["dep:synapse-livefeed"]
+
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_System_Console"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb.workspace = true
+
+[dev-dependencies]
+# Integration tests decode the written PNG/JPEG to physically verify pixel dimensions.
+image.workspace = true
+insta.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+synapse-test-utils = { version = "0.1.0", path = "../synapse-test-utils" }
+# Integration tests open the daemon's RocksDB directly to verify physical rows.
+synapse-storage = { version = "0.1.0", path = "../synapse-storage", features = ["test-support"] }
+# Tests register a fake seat backend (`BackendKind::Mock`) on the real supervisor (#147).
+synapse-seats = { version = "0.1.0", path = "../synapse-seats", features = ["test-support"] }
+synapse-core = { version = "0.1.0", path = "../synapse-core" }
+# Tests pause/advance tokio time (`start_paused`, `time::advance`) instead of
+# sleeping on the wall clock.
+tokio = { workspace = true, features = ["test-util"] }
+# Tests validate tool arguments against the published `tools/list` JSON Schema
+# like a strict production client (#548/#549). No network/file ref resolution.
+jsonschema = { version = "0.58.6", default-features = false }
 
 [lints.rust]
 unsafe_code = "allow"

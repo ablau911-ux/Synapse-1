@@ -5,6 +5,15 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/**
+ * #167: every dashboard request carries this non-simple header. A web page on
+ * another origin cannot attach it without a CORS preflight the daemon never
+ * answers, so it proves the call came from the dashboard itself.
+ */
+export function dashboardHeaders(): Record<string, string> {
+  return { "X-Synapse-Dashboard": "1" };
+}
+
 export function rawText(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;

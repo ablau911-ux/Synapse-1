@@ -83,7 +83,20 @@ pub fn window_capture_region(_hwnd: i64) -> Result<Rect, CaptureError> {
     Err(capture_backend_unavailable())
 }
 
-pub fn client_region_to_window_region(_hwnd: i64, _region: Rect) -> Result<Rect, CaptureError> {
+pub fn window_capture_bounds(_hwnd: i64) -> Result<Rect, CaptureError> {
+    Err(CaptureError::GraphicsApiUnsupported {
+        detail: "window capture bounds require Windows".to_owned(),
+    })
+}
+
+pub fn window_thread_id(_hwnd: i64) -> Option<u32> {
+    None
+}
+
+pub fn client_region_to_window_regions(
+    _hwnd: i64,
+    _region: Rect,
+) -> Result<crate::ClientWindowRegion, CaptureError> {
     Err(capture_backend_unavailable())
 }
 
@@ -131,4 +144,42 @@ pub fn validate_hwnd_impl(_hwnd: i64) -> Result<(), CaptureError> {
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 pub fn validate_monitor_impl(_monitor_index: u32) -> Result<(), CaptureError> {
     Ok(())
+}
+
+/// Non-Windows stand-in for the geometry-epoch registry. Real screen capture
+/// only exists on Windows, so there is no window geometry to track elsewhere;
+/// the epoch is permanently 0 ("no change observed") and the status reports an
+/// inactive registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryEpochStatus {
+    pub active: bool,
+    pub tracked_windows: usize,
+    pub total_changes: u64,
+}
+
+pub const GEOMETRY_EPOCH_QUIET_MS: u32 = 0;
+pub const GEOMETRY_EPOCH_MAX_WAIT_MS: u32 = 0;
+
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+pub fn geometry_epoch(_hwnd: i64) -> u64 {
+    0
+}
+
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+pub fn geometry_epoch_quiescent(_hwnd: i64) -> u64 {
+    0
+}
+
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+pub fn window_generation(_hwnd: i64) -> u64 {
+    0
+}
+
+#[allow(clippy::missing_const_for_fn)]
+pub fn geometry_epoch_status() -> GeometryEpochStatus {
+    GeometryEpochStatus {
+        active: false,
+        tracked_windows: 0,
+        total_changes: 0,
+    }
 }

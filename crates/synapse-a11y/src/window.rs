@@ -2,10 +2,21 @@ use synapse_core::{ForegroundContext, Point};
 
 use crate::{A11yResult, UIElement, platform};
 
-/// Native-window lifetime cache of a separately verified Chrome bridge identity.
-/// These operations do not grant tab ownership or change foreground state.
-#[cfg(windows)]
-pub use platform::{chrome_window_id, forget_chrome_window_id, remember_chrome_window_id};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowRootIdentity {
+    pub root_hwnd: i64,
+    pub pid: u32,
+}
+
+/// Reads the live root HWND and owning pid of an intended target.
+pub fn window_root_identity(hwnd: i64) -> A11yResult<WindowRootIdentity> {
+    platform::window_root_identity(hwnd)
+}
+
+/// Reads the live foreground root HWND and owning pid.
+pub fn foreground_root_identity() -> A11yResult<WindowRootIdentity> {
+    platform::foreground_root_identity()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForegroundActivationIntent {
@@ -29,6 +40,57 @@ impl ForegroundActivationIntent {
         }
     }
 }
+
+/// One step of a foreground activation attempt (#2322). The platform layer
+/// runs the steps in order and stops at the first one that takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationStep {
+    /// Plain `SetForegroundWindow`.
+    Plain,
+    /// `AttachThreadInput` to the foreground and target threads, then
+    /// `BringWindowToTop` + `SwitchToThisWindow` + `SetForegroundWindow`.
+    /// Sends no input event.
+    AttachAndRaise,
+    /// Injected Alt down/up (`SendInput`) to become the last input receiver,
+    /// then the attach-and-raise step again. The only step that injects input.
+    InputNudge,
+}
+
+impl ActivationStep {
+    /// True for the one step that sends an input event to the session.
+    #[must_use]
+    pub const fn injects_input(self) -> bool {
+        matches!(self, Self::InputNudge)
+    }
+}
+
+/// The ordered activation steps for one request (#2322). Empty while the
+/// workstation is locked: nothing is tried and the request is refused.
+#[must_use]
+pub const fn activation_plan(
+    intent: ForegroundActivationIntent,
+    locked: bool,
+) -> &'static [ActivationStep] {
+    if locked {
+        return &[];
+    }
+    match intent {
+        // A restore puts back a window the human already had; it must not
+        // reset the session idle clock or wake a menu bar with an Alt key.
+        ForegroundActivationIntent::LeaseContextRestore { .. } => {
+            &[ActivationStep::Plain, ActivationStep::AttachAndRaise]
+        }
+        ForegroundActivationIntent::OperatorRequested { .. } => &[
+            ActivationStep::Plain,
+            ActivationStep::AttachAndRaise,
+            ActivationStep::InputNudge,
+        ],
+    }
+}
+
+#[cfg(test)]
+#[path = "window_activation_table_2322.rs"]
+mod window_activation_table_2322;
 
 /// # Errors
 ///
@@ -155,105 +217,15 @@ pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
     platform::is_top_level_window(hwnd)
 }
 
-/// Top-level root HWND plus owning process id: the identity an OS-input or
-/// focus change is allowed to reach.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WindowRootIdentity {
-    pub root_hwnd: i64,
-    pub pid: u32,
-}
-
-/// `SHQueryUserNotificationState` reading for the interactive user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HumanNotificationState {
-    NotPresent,
-    Busy,
-    RunningD3dFullScreen,
-    PresentationMode,
-    AcceptsNotifications,
-    QuietTime,
-    App,
-    Unknown(i32),
-}
-
-impl HumanNotificationState {
-    /// Whether this state means the human is in a fullscreen/busy/presentation
-    /// app whose foreground Synapse must never steal or type into.
-    #[must_use]
-    pub const fn protects_foreground(self) -> bool {
-        matches!(
-            self,
-            Self::Busy | Self::RunningD3dFullScreen | Self::PresentationMode
-        )
-    }
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotPresent => "QUNS_NOT_PRESENT",
-            Self::Busy => "QUNS_BUSY",
-            Self::RunningD3dFullScreen => "QUNS_RUNNING_D3D_FULL_SCREEN",
-            Self::PresentationMode => "QUNS_PRESENTATION_MODE",
-            Self::AcceptsNotifications => "QUNS_ACCEPTS_NOTIFICATIONS",
-            Self::QuietTime => "QUNS_QUIET_TIME",
-            Self::App => "QUNS_APP",
-            Self::Unknown(_) => "QUNS_UNKNOWN",
-        }
-    }
-}
-
-/// Resolves a window to its top-level root HWND and owning pid.
+/// #315: the one liveness check for a raw HWND (`IsWindow` +
+/// [`crate::hwnd_validity`]). A closed window is `TARGET_WINDOW_NOT_FOUND`.
 ///
 /// # Errors
 ///
-/// Returns `A11Y_NO_FOREGROUND` for a dead HWND, or `A11Y_NOT_AVAILABLE` on
-/// non-Windows platforms.
-pub fn window_root_identity(hwnd: i64) -> A11yResult<WindowRootIdentity> {
-    platform::window_root_identity(hwnd)
-}
-
-/// Reads the live OS foreground as a top-level root HWND + pid.
-///
-/// # Errors
-///
-/// Returns `A11Y_NO_FOREGROUND` when there is no foreground window, or
-/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
-pub fn foreground_root_identity() -> A11yResult<WindowRootIdentity> {
-    platform::foreground_root_identity()
-}
-
-/// Reads the top-level root window (and pid) under a physical screen point.
-///
-/// # Errors
-///
-/// Returns `A11Y_NO_FOREGROUND` when no window is under the point, or
-/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
-pub fn window_root_identity_at_point(x: i32, y: i32) -> A11yResult<WindowRootIdentity> {
-    platform::window_root_identity_at_point(x, y)
-}
-
-/// Reads `SHQueryUserNotificationState`.
-///
-/// # Errors
-///
-/// Returns an internal error when the shell query fails, or
-/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
-pub fn human_notification_state() -> A11yResult<HumanNotificationState> {
-    platform::human_notification_state()
-}
-
-/// Refuses a focus change toward `target` while the human is in a protected
-/// fullscreen/busy/presentation foreground app that is not the target.
-///
-/// # Errors
-///
-/// Returns `ACTION_HUMAN_FULLSCREEN_FOREGROUND` on refusal; fails closed when
-/// the live state cannot be read.
-pub fn ensure_human_foreground_allows_focus_change(
-    target: WindowRootIdentity,
-    caller: &'static str,
-) -> A11yResult<WindowRootIdentity> {
-    platform::ensure_human_foreground_allows_focus_change(target, caller)
+/// Returns `TARGET_WINDOW_NOT_FOUND` for a closed window, `A11Y_NO_FOREGROUND`
+/// for a null HWND, or `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn ensure_live_window(hwnd: i64) -> A11yResult<()> {
+    platform::ensure_live_window(hwnd)
 }
 
 /// Returns the top-level root HWND for a native HWND.
@@ -264,6 +236,21 @@ pub fn ensure_human_foreground_allows_focus_change(
 /// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
 pub fn top_level_root_hwnd(hwnd: i64) -> A11yResult<i64> {
     platform::top_level_root_hwnd(hwnd)
+}
+
+/// Per-window DPI scale (`GetDpiForWindow` / 96) for a raw HWND; 1.0 for an
+/// invalid window and on non-Windows platforms (#223).
+#[must_use]
+pub fn window_dpi_scale_for_hwnd(hwnd: i64) -> f32 {
+    platform::window_dpi_scale_for_hwnd(hwnd)
+}
+
+/// `GW_OWNER` chain of a raw HWND as `(owner hwnd, owner pid)`, nearest owner
+/// first, excluding the window itself; bounded and cycle-safe. Empty for a
+/// null, invalid or unowned window, and on non-Windows platforms (#217).
+#[must_use]
+pub fn window_owner_chain(hwnd: i64) -> Vec<(i64, u32)> {
+    platform::window_owner_chain(hwnd)
 }
 
 /// Requests that a top-level native HWND close by posting `WM_CLOSE`.

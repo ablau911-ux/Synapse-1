@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use synapse_core::{ElementId, Rect, win32_hwnd::hwnd_from_wire};
+use synapse_core::{ElementId, Rect};
 use uiautomation::{
     UIAutomation, UIElement,
     patterns::{
@@ -15,8 +15,8 @@ use uiautomation::{
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::{
-        ES_MULTILINE, GWL_STYLE, GetWindowLongW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
-        WM_GETTEXTLENGTH, WM_SETTEXT,
+        ES_MULTILINE, GWL_STYLE, GetWindowLongW, IsWindow, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+        WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
     },
 };
 
@@ -27,9 +27,9 @@ use crate::{
 };
 
 use super::common::{
-    TreeView, cached_bool, cached_hwnd, cached_patterns, cached_role,
-    cached_runtime_id_hex_or_fallback, cached_value, create_cache_request, map_uia_error,
-    with_automation,
+    TreeView, cached_bool, cached_hwnd, cached_maybe_password, cached_patterns, cached_public_name,
+    cached_role, cached_runtime_id_hex_or_fallback, cached_value, create_cache_request,
+    map_uia_error, uia_error_is_stale, with_automation,
 };
 
 const RE_RESOLVE_NODE_BUDGET: usize = 20_000;
@@ -69,13 +69,17 @@ pub(super) fn re_resolve_on_worker(
     let parts = id.parts().map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    let hwnd = hwnd_from_wire(parts.hwnd).ok_or_else(|| A11yError::InvalidElementId {
-        detail: format!(
-            "element id contains non-canonical hwnd {}; expected 1..={}",
-            parts.hwnd,
-            u32::MAX
-        ),
+    let hwnd = isize::try_from(parts.hwnd).map_err(|err| A11yError::InvalidElementId {
+        detail: err.to_string(),
     })?;
+    if !unsafe { IsWindow(Some(HWND(hwnd as *mut c_void))) }.as_bool() {
+        return Err(A11yError::ElementStale {
+            detail: format!(
+                "element id {id} refers to HWND 0x{:x}, which is no longer a live window",
+                parts.hwnd
+            ),
+        });
+    }
     if let Some(found) = find_by_runtime_id_hex(
         automation,
         hwnd,
@@ -109,335 +113,22 @@ pub fn element_bounding_rect(id: &ElementId) -> A11yResult<Rect> {
     })
 }
 
-pub fn click_element_action(id: &ElementId) -> A11yResult<ElementClickAction> {
+/// #107 part d: the live UIA `FrameworkId` of one element (`WPF`, `XAML`,
+/// `WinForm`, `Win32` ...). It is not in the snapshot cache, so it is read
+/// here for the one element a point click picked.
+pub fn element_framework_id(id: &ElementId) -> A11yResult<String> {
     let id = id.clone();
     with_automation(move |automation| {
         let element = re_resolve_on_worker(automation, &id)?;
-        let mut unsupported_reasons = Vec::new();
-        for pattern in click_pattern_order(&element) {
-            let action = match pattern {
-                ClickPatternKind::Invoke => {
-                    try_invoke_pattern(&id, &element, &mut unsupported_reasons)?
-                }
-                ClickPatternKind::Toggle => {
-                    try_toggle_pattern(&id, &element, &mut unsupported_reasons)?
-                }
-                ClickPatternKind::SelectionItem => {
-                    try_selection_item_pattern(&id, &element, &mut unsupported_reasons)?
-                }
-                ClickPatternKind::ExpandCollapse => {
-                    try_expand_collapse_pattern(&id, &element, &mut unsupported_reasons)?
-                }
-                ClickPatternKind::LegacyDefaultAction => {
-                    try_legacy_default_action_pattern(&id, &element, &mut unsupported_reasons)?
-                }
-            };
-            if let Some(action) = action {
-                return Ok(action);
-            }
-        }
-
-        Err(unsupported_click_pattern(
-            &id,
-            &element,
-            &unsupported_reasons,
-        ))
+        element.get_framework_id().map_err(map_uia_error)
     })
 }
 
-fn click_pattern_order(element: &UIElement) -> [ClickPatternKind; 5] {
-    use ClickPatternKind::{ExpandCollapse, Invoke, LegacyDefaultAction, SelectionItem, Toggle};
-
-    let role = cached_role(element).to_ascii_lowercase();
-    if role.contains("check") || role.contains("toggle") {
-        return [
-            Toggle,
-            Invoke,
-            SelectionItem,
-            ExpandCollapse,
-            LegacyDefaultAction,
-        ];
-    }
-    if role.contains("list item") || role.contains("radio") || role.contains("tab item") {
-        return [
-            SelectionItem,
-            Invoke,
-            Toggle,
-            ExpandCollapse,
-            LegacyDefaultAction,
-        ];
-    }
-    if role.contains("combo")
-        || role.contains("menu item")
-        || role.contains("tree item")
-        || role.contains("split button")
-    {
-        return [
-            ExpandCollapse,
-            Invoke,
-            Toggle,
-            SelectionItem,
-            LegacyDefaultAction,
-        ];
-    }
-    [
-        Invoke,
-        Toggle,
-        SelectionItem,
-        ExpandCollapse,
-        LegacyDefaultAction,
-    ]
-}
-
-fn try_invoke_pattern(
-    id: &ElementId,
-    element: &UIElement,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let invoke_pattern: Result<UIInvokePattern, _> = element.get_pattern();
-    match invoke_pattern {
-        Ok(invoke_pattern) => {
-            invoke_pattern
-                .invoke()
-                .map_err(|err| pattern_operation_error(id, "InvokePattern", "invoke", &err))?;
-            Ok(Some(ElementClickAction::Invoked))
-        }
-        Err(err) => {
-            unsupported_reasons.push(format!("InvokePattern not exposed: {err}"));
-            Ok(None)
-        }
-    }
-}
-
-fn try_toggle_pattern(
-    id: &ElementId,
-    element: &UIElement,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let toggle_pattern: Result<UITogglePattern, _> = element.get_pattern();
-    match toggle_pattern {
-        Ok(toggle_pattern) => toggle_pattern_action(id, &toggle_pattern).map(Some),
-        Err(err) => {
-            unsupported_reasons.push(format!("TogglePattern not exposed: {err}"));
-            Ok(None)
-        }
-    }
-}
-
-fn toggle_pattern_action(
-    id: &ElementId,
-    toggle_pattern: &UITogglePattern,
-) -> A11yResult<ElementClickAction> {
-    let before_state = toggle_state_label(toggle_pattern.get_toggle_state().map_err(|err| {
-        pattern_operation_error(id, "TogglePattern", "ToggleState before Toggle", &err)
-    })?);
-    toggle_pattern
-        .toggle()
-        .map_err(|err| pattern_operation_error(id, "TogglePattern", "toggle", &err))?;
-    let after_state = toggle_state_label(toggle_pattern.get_toggle_state().map_err(|err| {
-        pattern_operation_error(id, "TogglePattern", "ToggleState after Toggle", &err)
-    })?);
-    if before_state == after_state {
-        return Err(A11yError::internal(format!(
-            "TogglePattern.toggle returned for element {id}, but ToggleState stayed {after_state}"
-        )));
-    }
-    Ok(ElementClickAction::Toggled {
-        before_state,
-        after_state,
-    })
-}
-
-fn try_selection_item_pattern(
-    id: &ElementId,
-    element: &UIElement,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let selection_item_pattern: Result<UISelectionItemPattern, _> = element.get_pattern();
-    match selection_item_pattern {
-        Ok(selection_item_pattern) => {
-            selection_item_pattern_action(id, &selection_item_pattern).map(Some)
-        }
-        Err(err) => {
-            unsupported_reasons.push(format!("SelectionItemPattern not exposed: {err}"));
-            Ok(None)
-        }
-    }
-}
-
-fn selection_item_pattern_action(
-    id: &ElementId,
-    selection_item_pattern: &UISelectionItemPattern,
-) -> A11yResult<ElementClickAction> {
-    let was_selected = selection_item_pattern.is_selected().map_err(|err| {
-        pattern_operation_error(id, "SelectionItemPattern", "IsSelected before Select", &err)
-    })?;
-    selection_item_pattern
-        .select()
-        .map_err(|err| pattern_operation_error(id, "SelectionItemPattern", "select", &err))?;
-    let is_selected = selection_item_pattern.is_selected().map_err(|err| {
-        pattern_operation_error(id, "SelectionItemPattern", "IsSelected after Select", &err)
-    })?;
-    if !is_selected {
-        return Err(A11yError::internal(format!(
-            "SelectionItemPattern.select returned for element {id}, but IsSelected stayed false"
-        )));
-    }
-    Ok(ElementClickAction::Selected {
-        was_selected,
-        is_selected,
-    })
-}
-
-fn try_expand_collapse_pattern(
-    id: &ElementId,
-    element: &UIElement,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let expand_collapse_pattern: Result<UIExpandCollapsePattern, _> = element.get_pattern();
-    match expand_collapse_pattern {
-        Ok(expand_collapse_pattern) => {
-            expand_collapse_pattern_action(id, &expand_collapse_pattern, unsupported_reasons)
-        }
-        Err(err) => {
-            unsupported_reasons.push(format!("ExpandCollapsePattern not exposed: {err}"));
-            Ok(None)
-        }
-    }
-}
-
-fn expand_collapse_pattern_action(
-    id: &ElementId,
-    expand_collapse_pattern: &UIExpandCollapsePattern,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let before_state =
-        expand_state_from_uia(expand_collapse_pattern.get_state().map_err(|err| {
-            pattern_operation_error(
-                id,
-                "ExpandCollapsePattern",
-                "ExpandCollapseState before action",
-                &err,
-            )
-        })?);
-    match before_state {
-        ExpandState::Collapsed => expand_pattern_action(id, expand_collapse_pattern, before_state),
-        ExpandState::Expanded | ExpandState::PartiallyExpanded => {
-            collapse_pattern_action(id, expand_collapse_pattern, before_state)
-        }
-        ExpandState::LeafNode => {
-            unsupported_reasons
-                .push("ExpandCollapsePattern exposed but current state is LeafNode".to_owned());
-            Ok(None)
-        }
-    }
-}
-
-fn expand_pattern_action(
-    id: &ElementId,
-    expand_collapse_pattern: &UIExpandCollapsePattern,
-    before_state: ExpandState,
-) -> A11yResult<Option<ElementClickAction>> {
-    expand_collapse_pattern
-        .expand()
-        .map_err(|err| pattern_operation_error(id, "ExpandCollapsePattern", "expand", &err))?;
-    let after_state =
-        expand_state_from_uia(expand_collapse_pattern.get_state().map_err(|err| {
-            pattern_operation_error(
-                id,
-                "ExpandCollapsePattern",
-                "ExpandCollapseState after expand",
-                &err,
-            )
-        })?);
-    if after_state == before_state {
-        return Err(A11yError::internal(format!(
-            "ExpandCollapsePattern.expand returned for element {id}, but state stayed {after_state:?}"
-        )));
-    }
-    Ok(Some(ElementClickAction::Expanded {
-        before_state,
-        after_state,
-    }))
-}
-
-fn collapse_pattern_action(
-    id: &ElementId,
-    expand_collapse_pattern: &UIExpandCollapsePattern,
-    before_state: ExpandState,
-) -> A11yResult<Option<ElementClickAction>> {
-    expand_collapse_pattern
-        .collapse()
-        .map_err(|err| pattern_operation_error(id, "ExpandCollapsePattern", "collapse", &err))?;
-    let after_state =
-        expand_state_from_uia(expand_collapse_pattern.get_state().map_err(|err| {
-            pattern_operation_error(
-                id,
-                "ExpandCollapsePattern",
-                "ExpandCollapseState after collapse",
-                &err,
-            )
-        })?);
-    if after_state == before_state {
-        return Err(A11yError::internal(format!(
-            "ExpandCollapsePattern.collapse returned for element {id}, but state stayed {after_state:?}"
-        )));
-    }
-    Ok(Some(ElementClickAction::Collapsed {
-        before_state,
-        after_state,
-    }))
-}
-
-fn try_legacy_default_action_pattern(
-    id: &ElementId,
-    element: &UIElement,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let legacy_pattern: Result<UILegacyIAccessiblePattern, _> = element.get_pattern();
-    match legacy_pattern {
-        Ok(legacy_pattern) => legacy_default_action(id, &legacy_pattern, unsupported_reasons),
-        Err(err) => {
-            unsupported_reasons.push(format!("LegacyIAccessiblePattern not exposed: {err}"));
-            Ok(None)
-        }
-    }
-}
-
-fn legacy_default_action(
-    id: &ElementId,
-    legacy_pattern: &UILegacyIAccessiblePattern,
-    unsupported_reasons: &mut Vec<String>,
-) -> A11yResult<Option<ElementClickAction>> {
-    let default_action = match legacy_pattern.get_default_action() {
-        Ok(value) if !value.trim().is_empty() => value,
-        Ok(_) => {
-            unsupported_reasons
-                .push("LegacyIAccessiblePattern exposed but DefaultAction is empty".to_owned());
-            return Ok(None);
-        }
-        Err(err) => {
-            if stale_provider_error(&err.to_string()) {
-                return Err(pattern_operation_error(
-                    id,
-                    "LegacyIAccessiblePattern",
-                    "DefaultAction read",
-                    &err,
-                ));
-            }
-            unsupported_reasons.push(format!(
-                "LegacyIAccessiblePattern DefaultAction read failed: {err}"
-            ));
-            return Ok(None);
-        }
-    };
-    legacy_pattern.do_default_action().map_err(|err| {
-        pattern_operation_error(id, "LegacyIAccessiblePattern", "DoDefaultAction", &err)
-    })?;
-    Ok(Some(ElementClickAction::LegacyDefaultAction {
-        default_action: Some(default_action),
-    }))
-}
+#[path = "resolve_click.rs"]
+mod click;
+pub use click::{
+    click_element_action, invoke_element_pattern, select_element_option, set_element_checked,
+};
 
 pub fn focus_element(id: &ElementId) -> A11yResult<()> {
     let id = id.clone();
@@ -457,7 +148,7 @@ pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValue
                 detail: format!("element {id} IsEnabled=false before ValuePattern.SetValue"),
             });
         }
-        let is_password = cached_bool(&element, UIProperty::IsPassword);
+        let is_password = cached_maybe_password(&element);
         if let Some(hwnd) = native_text_hwnd(&element)? {
             if native_is_readonly(hwnd) {
                 return Err(A11yError::ElementValueReadOnly {
@@ -589,7 +280,7 @@ pub fn element_value(id: &ElementId) -> A11yResult<ElementValueReadback> {
     let id = id.clone();
     with_automation(move |automation| {
         let element = re_resolve_on_worker(automation, &id)?;
-        let is_password = cached_bool(&element, UIProperty::IsPassword);
+        let is_password = cached_maybe_password(&element);
         if let Some(hwnd) = native_text_hwnd(&element)? {
             let password_len = if is_password {
                 Some(native_text_len(&id, hwnd)?)
@@ -1078,7 +769,7 @@ fn send_native_text_message(
     };
     if send_result.0 == 0 {
         return Err(A11yError::internal(format!(
-            "SendMessageTimeoutW({operation}) failed or timed out after {timeout_ms}ms for native text element {id} hwnd=0x{:x}",
+            "SendMessageTimeoutW({operation}) failed or timed out after {timeout_ms}ms for native element {id} hwnd=0x{:x}",
             hwnd.0 as isize
         )));
     }
@@ -1188,7 +879,7 @@ fn replace_or_append_element_text(
                 detail: format!("element {id} IsEnabled=false before native text insertion"),
             });
         }
-        if cached_bool(&element, UIProperty::IsPassword) {
+        if cached_maybe_password(&element) {
             return Err(A11yError::ElementValueUnsupported {
                 detail: format!(
                     "native text insertion for element {id} requires exact text readback and refuses password targets"
@@ -1220,7 +911,7 @@ pub fn element_metadata(id: &ElementId) -> A11yResult<ElementMetadataReadback> {
             .ok()
             .filter(|value| !value.is_empty());
         Ok(ElementMetadataReadback {
-            name: element.get_cached_name().unwrap_or_default(),
+            name: cached_public_name(&element),
             role: cached_role(&element),
             automation_id,
             bbox: element_rect(&element)?,
@@ -1374,11 +1065,13 @@ const fn vertical_scroll_amount(tick: i32) -> ScrollAmount {
     }
 }
 
+/// #192: dx > 0 scrolls RIGHT (same as Win32 HWHEEL and CDP deltaX), which is
+/// UIA `SmallIncrement` on the horizontal axis.
 const fn horizontal_scroll_amount(tick: i32) -> ScrollAmount {
     if tick > 0 {
-        ScrollAmount::SmallDecrement
-    } else if tick < 0 {
         ScrollAmount::SmallIncrement
+    } else if tick < 0 {
+        ScrollAmount::SmallDecrement
     } else {
         ScrollAmount::NoAmount
     }
@@ -1443,7 +1136,7 @@ fn unsupported_scroll_pattern(
     element: &UIElement,
     unsupported_reasons: &[String],
 ) -> A11yError {
-    let name = element.get_cached_name().unwrap_or_default();
+    let name = cached_public_name(element);
     let role = cached_role(element);
     let automation_id = element.get_cached_automation_id().unwrap_or_default();
     let patterns = cached_patterns(element);
@@ -1509,7 +1202,7 @@ fn pattern_operation_error(
     err: &uiautomation::Error,
 ) -> A11yError {
     let provider_detail = err.to_string();
-    if stale_provider_error(&provider_detail) {
+    if uia_error_is_stale(err) {
         tracing::warn!(
             code = "A11Y_PATTERN_OPERATION_STALE_AFTER_RE_RESOLVE",
             element_id = %id,
@@ -1529,20 +1222,12 @@ fn pattern_operation_error(
     ))
 }
 
-fn stale_provider_error(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    detail.contains("event was unable to invoke any of the subscribers")
-        || detail.contains("element not available")
-        || detail.contains("element is no longer available")
-        || detail.contains("uia_e_elementnotavailable")
-}
-
 fn unsupported_click_pattern(
     id: &ElementId,
     element: &UIElement,
     unsupported_reasons: &[String],
 ) -> A11yError {
-    let name = element.get_cached_name().unwrap_or_default();
+    let name = cached_public_name(element);
     let role = cached_role(element);
     let automation_id = element.get_cached_automation_id().unwrap_or_default();
     tracing::warn!(
@@ -1625,7 +1310,7 @@ fn runtime_id_matches(element: &UIElement, runtime_id_hex_expected: &str, root_h
             tracing::warn!(
                 code = "A11Y_RE_RESOLVE_RUNTIME_ID_FAILED",
                 error = %error,
-                element_name = %element.get_cached_name().unwrap_or_default(),
+                element_name = %cached_public_name(element),
                 element_class = %element.get_cached_classname().unwrap_or_default(),
                 control_type = ?element.get_cached_control_type().ok(),
                 automation_id = %element.get_cached_automation_id().unwrap_or_default(),
@@ -1636,3 +1321,7 @@ fn runtime_id_matches(element: &UIElement, runtime_id_hex_expected: &str, root_h
         }
     }
 }
+
+#[cfg(test)]
+#[path = "uia_scroll_direction_192.rs"]
+mod uia_scroll_direction_192;

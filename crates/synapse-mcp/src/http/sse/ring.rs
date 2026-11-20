@@ -8,17 +8,19 @@ use std::{
 
 use serde::Serialize;
 use synapse_core::Event;
-use synapse_reflex::{EVENTS_DROPPED_METRIC, SUBSCRIBER_QUEUE_CAPACITY, SubscriberHandle};
+use synapse_reflex::{EVENTS_DROPPED_METRIC, SubscriberHandle};
 
-use super::lossy;
+use super::{attach::Attachment, lossy};
 
 #[derive(Debug)]
 pub(super) struct Subscription {
     pub(super) handle: SubscriberHandle,
     ring: Mutex<VecDeque<BufferedEvent>>,
+    capacity: usize,
     next_stream_seq: AtomicU64,
     dropped_total: AtomicU64,
     lossy_pending: AtomicBool,
+    attachment: Attachment,
 }
 
 #[derive(Clone, Debug)]
@@ -41,14 +43,24 @@ pub(super) struct StatsResponse {
 }
 
 impl Subscription {
-    pub(super) fn new(handle: SubscriberHandle) -> Self {
+    pub(super) fn with_capacity(handle: SubscriberHandle, capacity: usize) -> Self {
         Self {
             handle,
-            ring: Mutex::new(VecDeque::with_capacity(SUBSCRIBER_QUEUE_CAPACITY)),
+            ring: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
             next_stream_seq: AtomicU64::new(1),
             dropped_total: AtomicU64::new(0),
             lossy_pending: AtomicBool::new(false),
+            attachment: Attachment::new(),
         }
+    }
+
+    pub(super) const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(super) const fn attachment(&self) -> &Attachment {
+        &self.attachment
     }
 
     pub(super) fn id(&self) -> &str {
@@ -61,7 +73,7 @@ impl Subscription {
             return;
         };
         for event in events {
-            if ring.len() == SUBSCRIBER_QUEUE_CAPACITY {
+            if ring.len() == self.capacity {
                 ring.pop_front();
                 ring_dropped = ring_dropped.saturating_add(1);
             }
@@ -71,11 +83,9 @@ impl Subscription {
         drop(ring);
         if ring_dropped > 0 {
             self.record_dropped(ring_dropped);
-            metrics::counter!(synapse_telemetry::metrics::SSE_BUFFER_OVERFLOWS_TOTAL)
-                .increment(ring_dropped);
             metrics::counter!(
                 EVENTS_DROPPED_METRIC,
-                "subscription_id" => self.id().to_owned()
+                "subscriber_slot" => synapse_core::metric_labels::subscriber_slot_label(self.id())
             )
             .increment(ring_dropped);
         }

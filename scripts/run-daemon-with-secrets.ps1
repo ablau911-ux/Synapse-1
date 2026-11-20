@@ -50,7 +50,8 @@ $ErrorActionPreference = "Stop"
 function Fail($msg) { Write-Error "run-daemon-with-secrets: $msg"; exit 1 }
 
 # --- resolve the synapse-mcp binary (the installed daemon) ---
-$exe = (Get-Command synapse-mcp -ErrorAction SilentlyContinue)?.Source
+$command = Get-Command synapse-mcp -ErrorAction SilentlyContinue
+$exe = if ($null -ne $command) { $command.Source } else { $null }
 if (-not $exe) { $exe = Join-Path $env:USERPROFILE ".cargo\bin\synapse-mcp.exe" }
 if (-not (Test-Path $exe)) { Fail "synapse-mcp binary not found (looked for it on PATH and in ~/.cargo/bin)" }
 

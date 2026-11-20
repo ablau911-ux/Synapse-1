@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const FRAMES_TOOL: &str = "browser_frames";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -26,7 +25,6 @@ pub struct BrowserFramesParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -147,7 +145,7 @@ impl SynapseService {
         cdp_target_id: &str,
     ) -> Result<BrowserFramesResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+            if synapse_browsers::BrowserRegistry::global().has_bridge_tab_prefix(cdp_target_id) {
                 let result = crate::chrome_debugger_bridge::frames(window_hwnd, cdp_target_id)
                     .await
                     .map_err(|error| {
@@ -167,14 +165,18 @@ impl SynapseService {
                     frame_count = result.frame_count,
                     oopif_target_count = result.oopif_target_count,
                     attached_frame_target_count = result.attached_frame_target_count,
-                    target_url = %result.url,
+                    target_url = %crate::server::url_redaction::RedactedUrl(&result.url),
                     "readback=chrome.webNavigation.getAllFrames+chrome.scripting.executeScript outcome=frames_returned"
                 );
                 return Ok(BrowserFramesResponse {
                     session_id: session_id.to_owned(),
                     window_hwnd,
                     transport: "chrome_tabs_extension".to_owned(),
-                    endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.webNavigation".to_owned(),
+                    endpoint: synapse_browsers::BrowserRegistry::global()
+                        .bridge_endpoint_for_target(
+                            cdp_target_id,
+                            synapse_browsers::BridgeLane::WebNavigation,
+                        ),
                     cdp_target_id: result.target_id,
                     page_url: redact_url_for_public_readback(&result.url),
                     page_title: result.title,

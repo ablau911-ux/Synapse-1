@@ -9,6 +9,7 @@ use std::{
 use ort::session::Session;
 use ort::value::{PrimitiveTensorElementType, Tensor};
 use serde::{Deserialize, Serialize};
+use synapse_core::ConfidenceSource;
 use synapse_models::{
     LoadedModel, ModelBackend, ModelDescriptor, ModelLoader, SessionHandle, default_model_dir,
 };
@@ -26,43 +27,20 @@ pub const WHISPER_TINY_INT8_SHA256: &str =
 const SILENCE_RMS_DB: f32 = -70.0;
 const DEFAULT_LANGUAGE: &str = "en";
 const EN_DECODER_PROMPT: [i32; 4] = [50_258, 50_259, 50_359, 50_363];
-const AUDIO_STT_INFERENCES_TOTAL: &str = "audio_stt_inferences_total";
-const AUDIO_STT_LATENCY_MS: &str = "audio_stt_latency_ms";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transcription {
     pub text: String,
     pub confidence: f32,
-    pub confidence_source: TranscriptionConfidenceSource,
+    #[serde(default)]
+    pub confidence_source: ConfidenceSource,
     pub language: String,
     pub audio_seconds: f32,
     pub elapsed_ms: u128,
     pub model_path: PathBuf,
     pub backend: Option<ModelBackend>,
     pub session_id: Option<u64>,
-}
-
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TranscriptionConfidenceSource {
-    NotApplicable,
-    Model,
-    Heuristic,
-    #[default]
-    Unsupported,
-}
-
-impl TranscriptionConfidenceSource {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Model => "model",
-            Self::Heuristic => "heuristic",
-            Self::Unsupported => "unsupported",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -131,6 +109,9 @@ impl WhisperTinyStt {
         language: impl AsRef<str>,
     ) -> AudioResult<Transcription> {
         let seconds = audio_seconds(window);
+        // Validate the language first so silence answers exactly like speech
+        // would: an unsupported language is refused, a blank one is `en`.
+        let language = normalize_language(language.as_ref())?;
         if window.frames == 0 || window.samples.is_empty() || window.rms_db <= SILENCE_RMS_DB {
             return Ok(self.blank(language, seconds));
         }
@@ -149,32 +130,20 @@ impl WhisperTinyStt {
         }
 
         let started = Instant::now();
-        let result = (|| -> AudioResult<(String, ModelBackend, u64)> {
-            let (backend, session_id, session) = self.load_session()?;
-            let text = {
-                let mut session = session.lock().map_err(|_| AudioError::ModelLoadFailed {
-                    path: self.descriptor.path.clone(),
-                    detail: "ORT session lock was poisoned".to_owned(),
-                })?;
-                self.run_session(&mut session, bytes)?
-            };
-            Ok((text, backend, session_id))
-        })();
-        let (text, backend, session_id) = match result {
-            Ok(result) => {
-                record_stt_inference("success", started.elapsed());
-                result
-            }
-            Err(error) => {
-                record_stt_inference("error", started.elapsed());
-                return Err(error);
-            }
+        let (backend, session_id, session) = self.load_session()?;
+        let text = {
+            let mut session = session.lock().map_err(|_| AudioError::ModelLoadFailed {
+                path: self.descriptor.path.clone(),
+                detail: "ORT session lock was poisoned".to_owned(),
+            })?;
+            self.run_session(&mut session, bytes)?
         };
 
+        let (confidence, confidence_source) = transcription_confidence(&text);
         Ok(Transcription {
-            confidence: 0.0,
-            confidence_source: TranscriptionConfidenceSource::Unsupported,
             text,
+            confidence,
+            confidence_source,
             language: language.to_owned(),
             audio_seconds,
             elapsed_ms: started.elapsed().as_millis(),
@@ -284,11 +253,10 @@ impl WhisperTinyStt {
     }
 
     fn blank(&self, language: impl AsRef<str>, audio_seconds: f32) -> Transcription {
-        metrics::counter!(AUDIO_STT_INFERENCES_TOTAL, "outcome" => "not_applicable").increment(1);
         Transcription {
             text: String::new(),
             confidence: 0.0,
-            confidence_source: TranscriptionConfidenceSource::NotApplicable,
+            confidence_source: ConfidenceSource::NotApplicable,
             language: language.as_ref().trim().to_owned(),
             audio_seconds,
             elapsed_ms: 0,
@@ -304,11 +272,6 @@ impl WhisperTinyStt {
             detail,
         }
     }
-}
-
-fn record_stt_inference(outcome: &'static str, elapsed: std::time::Duration) {
-    metrics::counter!(AUDIO_STT_INFERENCES_TOTAL, "outcome" => outcome).increment(1);
-    metrics::histogram!(AUDIO_STT_LATENCY_MS).record(elapsed.as_secs_f64() * 1000.0);
 }
 
 #[must_use]
@@ -331,3 +294,17 @@ fn normalize_language(language: &str) -> AudioResult<&str> {
         })
     }
 }
+
+#[must_use]
+fn transcription_confidence(text: &str) -> (f32, ConfidenceSource) {
+    let source = if text.trim().is_empty() {
+        ConfidenceSource::NotApplicable
+    } else {
+        ConfidenceSource::Unsupported
+    };
+    (0.0, source)
+}
+
+#[cfg(test)]
+#[path = "stt_confidence_table.rs"]
+mod stt_confidence_table;

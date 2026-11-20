@@ -287,20 +287,18 @@ pub struct AuditCommandQueryResponse {
     pub matched_rows: usize,
     pub returned_count: usize,
     pub corrupt_row_count: usize,
-    pub noncanonical_key_count: usize,
     pub complete: bool,
-    /// Iteration direction applied: `"newest_first"` (unwindowed default) or
-    /// `"oldest_first"` (explicit forward paging). #1550.
+    /// Iteration direction: newest_first by default, oldest_first with an explicit start.
     pub scan_order: String,
-    /// True when matches older than this page exist. For newest-first this is an
-    /// honest "more history available", not a failure; page older with
-    /// `end_ts_ns = oldest_returned_ts_ns`.
+    /// Older rows may remain; does not promise older matching rows exist.
     pub has_older: bool,
-    /// Timestamp of the oldest returned row (newest-first only), for paging older.
+    /// Inclusive timestamp bound for another query, not a unique pagination cursor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_returned_ts_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_key_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_start_key_hex: Option<String>,
     pub rows: Vec<AuditCommandQueryRowSummary>,
 }
 
@@ -328,7 +326,6 @@ pub struct AuditCommandQueryRowSummary {
 #[serde(deny_unknown_fields)]
 pub struct AuditLifecycleTailResponse {
     pub path: String,
-    pub segment_count: usize,
     pub limit: usize,
     pub max_line_bytes: usize,
     pub total_lines_read: u64,

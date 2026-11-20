@@ -23,7 +23,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -40,22 +40,62 @@ pub const OPERATOR_LEASE_OWNER_SESSION_ID: &str = "__operator__";
 /// How long the operator owns the real-input resource after panic preemption.
 pub const OPERATOR_PREEMPT_LEASE_TTL_MS: u64 = MAX_LEASE_TTL_MS;
 
+static EMERGENCY_RESERVATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Fences physical grants while emergency cleanup crosses asynchronous work.
+#[must_use]
+pub struct EmergencyReservation {
+    _private: (),
+}
+
+pub fn reserve_emergency_cleanup() -> EmergencyReservation {
+    EMERGENCY_RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    EmergencyReservation { _private: () }
+}
+
+#[must_use]
+pub fn emergency_cleanup_pending() -> bool {
+    EMERGENCY_RESERVATIONS.load(std::sync::atomic::Ordering::SeqCst) != 0
+}
+
+impl Drop for EmergencyReservation {
+    fn drop(&mut self) {
+        EMERGENCY_RESERVATIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn next_lease_generation() -> String {
+    static EPOCH: OnceLock<String> = OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let epoch = EPOCH.get_or_init(|| {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        format!("{}:{started}", std::process::id())
+    });
+    format!(
+        "{epoch}:{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Internal lease record. Stored behind the process-global mutex.
 #[derive(Clone, Debug)]
 struct InputLease {
+    generation: String,
     owner_session_id: String,
     acquired_at: Instant,
     renewed_at: Instant,
     ttl: Duration,
-    operator_panic_generation: Option<u64>,
+    /// `true` while the lease exists only because a foreground action
+    /// auto-acquired it (#205). Such a lease is released by that action; an
+    /// explicit acquire, a handoff or operator preemption clears the flag so the
+    /// action's release becomes a no-op.
+    auto: bool,
 }
 
 impl InputLease {
-    fn is_tagged_operator_panic(&self) -> bool {
-        self.owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID
-            && self.operator_panic_generation.is_some()
-    }
-
     fn is_expired(&self, now: Instant) -> bool {
         now.duration_since(self.renewed_at) >= self.ttl
     }
@@ -66,6 +106,7 @@ impl InputLease {
 
     fn status(&self, now: Instant) -> LeaseStatus {
         LeaseStatus {
+            generation: Some(self.generation.clone()),
             held: true,
             owner_session_id: Some(self.owner_session_id.clone()),
             acquired_at_ms_ago: Some(duration_ms(now.duration_since(self.acquired_at))),
@@ -83,6 +124,9 @@ impl InputLease {
 /// owns the foreground" shape.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeaseStatus {
+    /// Process/acquisition identity for continuity; not part of the wire API.
+    #[serde(skip)]
+    pub generation: Option<String>,
     pub held: bool,
     pub owner_session_id: Option<String>,
     pub acquired_at_ms_ago: Option<u64>,
@@ -91,23 +135,12 @@ pub struct LeaseStatus {
     pub expires_in_ms: Option<u64>,
 }
 
-/// One-lock safety readback of the visible lease plus its private physical
-/// panic-generation tag.
-///
-/// Consumers must use this instead of composing [`status`] and
-/// [`operator_panic_lease_generation`] across two lock acquisitions, because a
-/// concurrent exact finalizer can change the lease between those reads.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct LeaseSafetySnapshot {
-    pub status: LeaseStatus,
-    pub operator_panic_generation: Option<u64>,
-}
-
 impl LeaseStatus {
     /// The canonical "nobody holds the lease" snapshot.
     #[must_use]
     pub const fn unheld() -> Self {
         Self {
+            generation: None,
             held: false,
             owner_session_id: None,
             acquired_at_ms_ago: None,
@@ -145,9 +178,11 @@ pub struct LeaseHandoff {
     pub current: LeaseStatus,
 }
 
-/// Error returned by [`renew`]/[`release`] when the caller is not the holder.
+/// Error returned by input lease operations.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LeaseError {
+    #[error("emergency input cleanup is pending; retry after 100ms")]
+    CleanupBusy { holder: Option<String> },
     #[error("input lease not held by session {session_id:?}; current holder {holder:?}")]
     NotHeld {
         session_id: String,
@@ -160,42 +195,30 @@ impl LeaseError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::CleanupBusy { .. } => error_codes::ACTION_FOREGROUND_LEASE_BUSY,
             Self::NotHeld { .. } => error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
         }
     }
 }
 
-/// Process-global daemon state for the input lease: the current holder slot and
-/// the pending expired-cleanup ledger, bundled so a test can swap both together
-/// behind a single thread-local override.
-struct LeaseCell {
-    slot: Mutex<Option<InputLease>>,
-    expired_cleanup: Mutex<BTreeMap<String, LeaseStatus>>,
+fn slot() -> &'static Mutex<Option<InputLease>> {
+    static LEASE: OnceLock<Mutex<Option<InputLease>>> = OnceLock::new();
+    LEASE.get_or_init(|| Mutex::new(None))
 }
 
-impl LeaseCell {
-    const fn new() -> Self {
-        Self {
-            slot: Mutex::new(None),
-            expired_cleanup: Mutex::new(BTreeMap::new()),
-        }
-    }
+fn expired_cleanup_slot() -> &'static Mutex<BTreeMap<String, LeaseStatus>> {
+    static EXPIRED_CLEANUP: OnceLock<Mutex<BTreeMap<String, LeaseStatus>>> = OnceLock::new();
+    EXPIRED_CLEANUP.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
-
-static GLOBAL_CELL: LeaseCell = LeaseCell::new();
 
 /// Locks the lease slot, recovering from a poisoned mutex rather than panicking:
 /// a foreground lease that panicked mid-action must still be reclaimable.
 fn lock() -> MutexGuard<'static, Option<InputLease>> {
-    GLOBAL_CELL
-        .slot
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    slot().lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn lock_expired_cleanup() -> MutexGuard<'static, BTreeMap<String, LeaseStatus>> {
-    GLOBAL_CELL
-        .expired_cleanup
+    expired_cleanup_slot()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
@@ -213,20 +236,15 @@ pub fn ttl_from_ms(ms: u64) -> Duration {
 /// Drops the stored lease if its TTL has lapsed and records the expired owner
 /// until its held-input ledger has been drained. Caller holds the lease lock.
 fn expire_if_lapsed(guard: &mut Option<InputLease>, now: Instant) -> Option<LeaseStatus> {
-    let operator_panic_safety_pending = crate::hotkey::operator_panic_safety_pending();
     let expired = guard
         .as_ref()
-        .filter(|lease| lease_can_expire(lease, now, operator_panic_safety_pending))
+        .filter(|lease| lease.is_expired(now))
         .map(|lease| lease.status(now));
     if let Some(status) = expired.clone() {
         *guard = None;
         remember_expired_cleanup(&status);
     }
     expired
-}
-
-fn lease_can_expire(lease: &InputLease, now: Instant, operator_panic_safety_pending: bool) -> bool {
-    lease.is_expired(now) && !(lease.is_tagged_operator_panic() && operator_panic_safety_pending)
 }
 
 fn remember_expired_cleanup(status: &LeaseStatus) {
@@ -271,32 +289,96 @@ pub fn complete_expired_cleanup(session_id: &str) -> bool {
     lock_expired_cleanup().remove(session_id).is_some()
 }
 
-/// Attempts to acquire (or renew) the lease for `session_id`.
+/// Attempts to acquire (or renew) the lease for `session_id` as an explicit
+/// holder (see [`try_acquire_explicit`]).
 ///
 /// Refuse-not-block: if another live session holds it, returns
 /// [`LeaseOutcome::Busy`] immediately with the holder and a retry hint.
 #[must_use]
 pub fn try_acquire(session_id: &str, ttl: Duration) -> LeaseOutcome {
+    try_acquire_explicit(session_id, ttl).0
+}
+
+/// Explicit acquire (`lease_acquire`). Also reports whether the caller took
+/// over a lease that one of its own foreground actions had auto-acquired
+/// ([`try_acquire_auto`]): the lease then stops being released by that action
+/// and the caller must treat the call as a fresh acquisition (#205).
+#[must_use]
+pub fn try_acquire_explicit(session_id: &str, ttl: Duration) -> (LeaseOutcome, bool) {
+    acquire(session_id, ttl, AcquireKind::Explicit)
+}
+
+/// Whether a live automatic hold can be promoted by its own session (#205).
+#[must_use]
+pub fn owns_automatic_lease(session_id: &str) -> bool {
+    let now = Instant::now();
+    lock().as_ref().is_some_and(|lease| {
+        lease.auto && lease.owner_session_id == session_id && !lease.is_expired(now)
+    })
+}
+
+/// Acquire/renew on behalf of a foreground action. A lease it newly acquires is
+/// marked auto, so [`release_auto`] ends it when the action finishes; renewing
+/// a lease that is already explicit leaves it explicit.
+#[must_use]
+pub fn try_acquire_auto(session_id: &str, ttl: Duration) -> LeaseOutcome {
+    acquire(session_id, ttl, AcquireKind::Auto).0
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcquireKind {
+    Explicit,
+    Auto,
+}
+
+fn acquire(session_id: &str, ttl: Duration, kind: AcquireKind) -> (LeaseOutcome, bool) {
     let now = Instant::now();
     let mut guard = lock();
+    if emergency_cleanup_pending() {
+        return (
+            LeaseOutcome::Busy {
+                holder: guard
+                    .as_ref()
+                    .map_or_else(LeaseStatus::unheld, |lease| lease.status(now)),
+                retry_after_ms: 100,
+            },
+            false,
+        );
+    }
     if let Some(expired) = expire_if_lapsed(&mut guard, now) {
-        return LeaseOutcome::CleanupPending {
-            expired,
-            retry_after_ms: 100,
-        };
+        return (
+            LeaseOutcome::CleanupPending {
+                expired,
+                retry_after_ms: 100,
+            },
+            false,
+        );
     }
     if let Some(expired) = first_pending_expired_cleanup() {
-        return LeaseOutcome::CleanupPending {
-            expired,
-            retry_after_ms: 100,
-        };
+        return (
+            LeaseOutcome::CleanupPending {
+                expired,
+                retry_after_ms: 100,
+            },
+            false,
+        );
     }
+    let mut converted_from_auto = false;
     let outcome = match guard.as_mut() {
-        Some(lease)
-            if lease.owner_session_id == session_id && !lease.is_tagged_operator_panic() =>
-        {
-            lease.renewed_at = now;
-            lease.ttl = ttl;
+        Some(lease) if lease.owner_session_id == session_id => {
+            // #205: an action's auto-renew over the session's own explicit
+            // lease only ever extends it; it never shortens the explicit TTL.
+            let keep_explicit_expiry =
+                kind == AcquireKind::Auto && !lease.auto && lease.expires_in(now) >= ttl;
+            if !keep_explicit_expiry {
+                lease.renewed_at = now;
+                lease.ttl = ttl;
+            }
+            if kind == AcquireKind::Explicit && lease.auto {
+                lease.generation = next_lease_generation();
+                lease.auto = false;
+                converted_from_auto = true;
+            }
             LeaseOutcome::Renewed(lease.status(now))
         }
         Some(lease) => {
@@ -309,11 +391,12 @@ pub fn try_acquire(session_id: &str, ttl: Duration) -> LeaseOutcome {
         }
         None => {
             let lease = InputLease {
+                generation: next_lease_generation(),
                 owner_session_id: session_id.to_owned(),
                 acquired_at: now,
                 renewed_at: now,
                 ttl,
-                operator_panic_generation: None,
+                auto: kind == AcquireKind::Auto,
             };
             let status = lease.status(now);
             *guard = Some(lease);
@@ -321,7 +404,7 @@ pub fn try_acquire(session_id: &str, ttl: Duration) -> LeaseOutcome {
         }
     };
     drop(guard);
-    outcome
+    (outcome, converted_from_auto)
 }
 
 /// Refreshes the TTL window for the holder. Errors if `session_id` is not the holder.
@@ -333,11 +416,14 @@ pub fn try_acquire(session_id: &str, ttl: Duration) -> LeaseOutcome {
 pub fn renew(session_id: &str, ttl: Option<Duration>) -> Result<LeaseStatus, LeaseError> {
     let now = Instant::now();
     let mut guard = lock();
+    if emergency_cleanup_pending() {
+        return Err(LeaseError::CleanupBusy {
+            holder: guard.as_ref().map(|lease| lease.owner_session_id.clone()),
+        });
+    }
     let _expired = expire_if_lapsed(&mut guard, now);
     match guard.as_mut() {
-        Some(lease)
-            if lease.owner_session_id == session_id && !lease.is_tagged_operator_panic() =>
-        {
+        Some(lease) if lease.owner_session_id == session_id => {
             lease.renewed_at = now;
             if let Some(ttl) = ttl {
                 lease.ttl = ttl;
@@ -351,29 +437,103 @@ pub fn renew(session_id: &str, ttl: Option<Duration>) -> Result<LeaseStatus, Lea
     }
 }
 
-/// Releases the lease on behalf of its holder. Errors if `session_id` is not the holder.
+/// Releases the caller's lease and returns the unheld status plus a flag
+/// indicating whether it was already unheld.
 ///
 /// # Errors
 ///
-/// Returns [`LeaseError::NotHeld`] when the caller does not currently hold the lease.
-pub fn release(session_id: &str) -> Result<LeaseStatus, LeaseError> {
+/// Returns [`LeaseError::NotHeld`] when another session holds the lease.
+pub fn release(session_id: &str) -> Result<(LeaseStatus, bool), LeaseError> {
     let now = Instant::now();
     let mut guard = lock();
     let _expired = expire_if_lapsed(&mut guard, now);
-    let result = match guard.as_ref() {
-        Some(lease)
-            if lease.owner_session_id == session_id && !lease.is_tagged_operator_panic() =>
-        {
+    let holder = guard.as_ref().map(|lease| lease.owner_session_id.as_str());
+    let result = match lease_release_decision(holder, session_id) {
+        LeaseReleaseDecision::Release => {
             *guard = None;
-            Ok(LeaseStatus::unheld())
+            Ok((LeaseStatus::unheld(), false))
         }
-        other => Err(LeaseError::NotHeld {
+        LeaseReleaseDecision::AlreadyReleased => Ok((LeaseStatus::unheld(), true)),
+        LeaseReleaseDecision::NotHolder => Err(LeaseError::NotHeld {
             session_id: session_id.to_owned(),
-            holder: other.map(|lease| lease.owner_session_id.clone()),
+            holder: holder.map(str::to_owned),
         }),
     };
     drop(guard);
     result
+}
+
+/// #2325: what a `release` call by `session_id` does, given the live holder
+/// (after lapsed leases were expired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseReleaseDecision {
+    /// The caller holds the lease: free it.
+    Release,
+    /// Nobody holds the lease (never taken, already released, or expired):
+    /// success, nothing to do.
+    AlreadyReleased,
+    /// Another session holds the lease: refuse, the lease is not the caller's.
+    NotHolder,
+}
+
+/// Pure release rule (#2325).
+#[must_use]
+pub fn lease_release_decision(holder: Option<&str>, session_id: &str) -> LeaseReleaseDecision {
+    match holder {
+        Some(owner) if owner == session_id => LeaseReleaseDecision::Release,
+        Some(_) => LeaseReleaseDecision::NotHolder,
+        None => LeaseReleaseDecision::AlreadyReleased,
+    }
+}
+
+#[cfg(test)]
+#[path = "lease_release_table_2325.rs"]
+mod lease_release_table_2325;
+
+/// Releases the lease on behalf of a foreground action that auto-acquired it.
+///
+/// Returns `Ok(true)` when the lease was released and `Ok(false)` when the
+/// lease is unheld or the caller's lease has become explicit (#205).
+///
+/// # Errors
+///
+/// Returns [`LeaseError::NotHeld`] when another session holds the lease.
+pub fn release_auto(session_id: &str) -> Result<bool, LeaseError> {
+    let now = Instant::now();
+    let mut guard = lock();
+    let _expired = expire_if_lapsed(&mut guard, now);
+    let holder = guard.as_ref().map(|lease| lease.owner_session_id.as_str());
+    let result = match lease_release_decision(holder, session_id) {
+        LeaseReleaseDecision::Release if guard.as_ref().is_some_and(|lease| lease.auto) => {
+            *guard = None;
+            Ok(true)
+        }
+        LeaseReleaseDecision::Release | LeaseReleaseDecision::AlreadyReleased => Ok(false),
+        LeaseReleaseDecision::NotHolder => Err(LeaseError::NotHeld {
+            session_id: session_id.to_owned(),
+            holder: holder.map(str::to_owned),
+        }),
+    };
+    drop(guard);
+    result
+}
+
+/// Marks a lease owned by `session_id` auto again, so the foreground action
+/// that still holds a guard keeps releasing it. For rolling back an explicit
+/// takeover that could not be made durable. Returns `true` when `session_id`
+/// holds the lease.
+#[must_use]
+pub fn restore_auto_if_owner(session_id: &str) -> bool {
+    let mut guard = lock();
+    let mut restored = false;
+    if let Some(lease) = guard.as_mut()
+        && lease.owner_session_id == session_id
+    {
+        lease.auto = true;
+        restored = true;
+    }
+    drop(guard);
+    restored
 }
 
 /// Transfers the currently held lease from `from_session_id` directly to
@@ -391,17 +551,23 @@ pub fn handoff(
 ) -> Result<LeaseHandoff, LeaseError> {
     let now = Instant::now();
     let mut guard = lock();
+    if emergency_cleanup_pending() {
+        return Err(LeaseError::CleanupBusy {
+            holder: guard.as_ref().map(|lease| lease.owner_session_id.clone()),
+        });
+    }
     let _expired = expire_if_lapsed(&mut guard, now);
     match guard.as_mut() {
-        Some(lease)
-            if lease.owner_session_id == from_session_id && !lease.is_tagged_operator_panic() =>
-        {
+        Some(lease) if lease.owner_session_id == from_session_id => {
             let prior = lease.status(now);
+            lease.generation = next_lease_generation();
             to_session_id.clone_into(&mut lease.owner_session_id);
             lease.acquired_at = now;
             lease.renewed_at = now;
             lease.ttl = ttl;
-            lease.operator_panic_generation = None;
+            // A handed-off lease belongs to the recipient explicitly; no action
+            // of the previous holder may release it.
+            lease.auto = false;
             let current = lease.status(now);
             Ok(LeaseHandoff { prior, current })
         }
@@ -419,9 +585,9 @@ pub fn handoff(
 #[must_use]
 pub fn release_if_owner(session_id: &str) -> bool {
     let mut guard = lock();
-    let released = guard.as_ref().is_some_and(|lease| {
-        lease.owner_session_id == session_id && !lease.is_tagged_operator_panic()
-    });
+    let released = guard
+        .as_ref()
+        .is_some_and(|lease| lease.owner_session_id == session_id);
     if released {
         *guard = None;
     }
@@ -432,57 +598,10 @@ pub fn release_if_owner(session_id: &str) -> bool {
 /// Operator override: transfers the lease to the operator (e.g. panic hotkey).
 ///
 /// Returns the prior holder's snapshot, if any, so the preemption can be logged.
-#[must_use]
 pub fn force_preempt(reason: &str) -> Option<LeaseStatus> {
-    force_preempt_with_generation(reason, None)
-}
-
-/// Physical operator-panic override tagged with its exact published
-/// generation. K2 completion uses that tag so an older task can never clear a
-/// newer panic generation's operator lease.
-#[must_use]
-pub fn force_preempt_operator_panic(reason: &str, generation: u64) -> Option<LeaseStatus> {
-    force_preempt_with_generation(reason, Some(generation))
-}
-
-fn force_preempt_with_generation(
-    reason: &str,
-    operator_panic_generation: Option<u64>,
-) -> Option<LeaseStatus> {
     let now = Instant::now();
     let mut guard = lock();
     let prior = guard.as_ref().map(|lease| lease.status(now));
-    if let Some(requested_generation) = operator_panic_generation
-        && let Some(retained_generation) = guard
-            .as_ref()
-            .filter(|lease| lease.is_tagged_operator_panic())
-            .and_then(|lease| lease.operator_panic_generation)
-        && retained_generation > requested_generation
-    {
-        tracing::warn!(
-            reason,
-            requested_operator_panic_generation = requested_generation,
-            retained_operator_panic_generation = retained_generation,
-            "stale operator-panic preemption refused to overwrite a newer tagged lease"
-        );
-        drop(guard);
-        return prior;
-    }
-    if operator_panic_generation.is_none()
-        && guard
-            .as_ref()
-            .is_some_and(InputLease::is_tagged_operator_panic)
-    {
-        tracing::warn!(
-            reason,
-            retained_operator_panic_generation = ?guard
-                .as_ref()
-                .and_then(|lease| lease.operator_panic_generation),
-            "generic fail-closed preemption retained the exact operator-panic lease tag"
-        );
-        drop(guard);
-        return prior;
-    }
     if let Some(prior) = &prior {
         tracing::warn!(
             code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,
@@ -492,94 +611,24 @@ fn force_preempt_with_generation(
         );
     }
     *guard = Some(InputLease {
+        generation: next_lease_generation(),
         owner_session_id: OPERATOR_LEASE_OWNER_SESSION_ID.to_owned(),
         acquired_at: now,
         renewed_at: now,
         ttl: ttl_from_ms(OPERATOR_PREEMPT_LEASE_TTL_MS),
-        operator_panic_generation,
+        auto: false,
     });
     prior
 }
 
-/// Separate exact readback of the generation tag on the current physical
-/// operator-panic lease. Returns `None` for an unheld, expired, agent-owned, or
-/// generic fail-closed operator lease.
-#[must_use]
-pub fn operator_panic_lease_generation() -> Option<u64> {
-    safety_snapshot().operator_panic_generation
-}
-
-/// Reads lease ownership and the exact operator-panic tag under one lock.
-#[must_use]
-pub fn safety_snapshot() -> LeaseSafetySnapshot {
-    let now = Instant::now();
-    let mut guard = lock();
-    let _expired = expire_if_lapsed(&mut guard, now);
-    let operator_panic_generation = guard.as_ref().and_then(|lease| {
-        (lease.owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID)
-            .then_some(lease.operator_panic_generation)
-            .flatten()
-    });
-    let status = guard
-        .as_ref()
-        .map_or_else(LeaseStatus::unheld, |lease| lease.status(now));
-    drop(guard);
-    LeaseSafetySnapshot {
-        status,
-        operator_panic_generation,
-    }
-}
-
-/// Clears only the operator lease installed by the named panic generation.
-/// A newer K1 generation is therefore immune to an older K2 completion.
-pub fn force_clear_operator_panic_generation(generation: u64, reason: &str) -> Option<LeaseStatus> {
-    let now = Instant::now();
-    let mut guard = lock();
-    let _expired = expire_if_lapsed(&mut guard, now);
-    let prior = guard
-        .as_ref()
-        .filter(|lease| {
-            lease.owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID
-                && lease.operator_panic_generation == Some(generation)
-        })
-        .map(|lease| lease.status(now));
-    if prior.is_some() {
-        *guard = None;
-    }
-    drop(guard);
-    if prior.is_some() {
-        tracing::warn!(
-            reason,
-            operator_panic_generation = generation,
-            "exact operator panic generation lease cleared"
-        );
-    }
-    prior
-}
-
-/// Clears the process-global lease unless it is owned by an exact physical
-/// operator-panic generation.
+/// Unconditionally clears the process-global lease.
 ///
 /// This is intentionally separate from [`force_preempt`]: operator preemption
 /// must leave a visible, bounded operator holder so agents fail closed instead
-/// of immediately reacquiring the foreground resource. A tagged panic lease
-/// can only be cleared through [`force_clear_operator_panic_generation`].
+/// of immediately reacquiring the foreground resource.
 pub fn force_clear(reason: &str) -> Option<LeaseStatus> {
     let now = Instant::now();
     let mut guard = lock();
-    if guard
-        .as_ref()
-        .is_some_and(InputLease::is_tagged_operator_panic)
-    {
-        tracing::warn!(
-            reason,
-            retained_operator_panic_generation = ?guard
-                .as_ref()
-                .and_then(|lease| lease.operator_panic_generation),
-            "generic force-clear refused to clear an exact operator-panic lease"
-        );
-        return None;
-    }
     let prior = guard.as_ref().map(|lease| lease.status(now));
     *guard = None;
     drop(guard);
@@ -604,7 +653,7 @@ pub fn force_clear_if_owner(session_id: &str, reason: &str) -> Option<LeaseStatu
     let _expired = expire_if_lapsed(&mut guard, now);
     let prior = guard
         .as_ref()
-        .filter(|lease| lease.owner_session_id == session_id && !lease.is_tagged_operator_panic())
+        .filter(|lease| lease.owner_session_id == session_id)
         .map(|lease| lease.status(now));
     if prior.is_some() {
         *guard = None;
@@ -617,6 +666,24 @@ pub fn force_clear_if_owner(session_id: &str, reason: &str) -> Option<LeaseStatu
             "input lease force-cleared by owner-guarded operator override"
         );
         lock_expired_cleanup().clear();
+    }
+    prior
+}
+
+/// Clears only the exact emergency acquisition represented by `expected`.
+#[must_use]
+pub fn force_clear_if_generation(expected: &LeaseStatus, reason: &str) -> Option<LeaseStatus> {
+    let mut guard = lock();
+    let prior = guard
+        .as_ref()
+        .filter(|lease| {
+            expected.generation.as_deref() == Some(lease.generation.as_str())
+                && expected.owner_session_id.as_deref() == Some(lease.owner_session_id.as_str())
+        })
+        .map(|lease| lease.status(Instant::now()));
+    if prior.is_some() {
+        *guard = None;
+        tracing::warn!(reason, generation = ?expected.generation, "input lease exact generation force-cleared");
     }
     prior
 }

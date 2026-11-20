@@ -51,20 +51,23 @@ pub(crate) const SPAWN_ID_HEADER: &str = "x-synapse-spawn-id";
 /// without a wake signal (covers any missed in-process notification).
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Default max time the gate blocks before declining and returning `deny`.
-/// Kept comfortably under the agent's per-server MCP `timeout` (30 min) so we
-/// return a clean verdict before Claude's client would abort the call.
-const DEFAULT_GATE_TIMEOUT_MS: u64 = 25 * 60 * 1_000;
+/// Default wait before a permission gate returns a timeout denial: the owner
+/// may be away, so the default is the longest wait the MCP client allows.
+const DEFAULT_GATE_TIMEOUT_MS: u64 = MAX_APPROVAL_WAIT_MS;
+/// Keep configured waits below the agent's 30-minute MCP client timeout.
+const MAX_APPROVAL_WAIT_MS: u64 = 25 * 60 * 1_000;
 
 const MAX_PAYLOAD_INPUT_BYTES: usize = 16 * 1024;
 
-fn gate_timeout() -> Duration {
-    let ms = std::env::var("SYNAPSE_APPROVAL_GATE_TIMEOUT_MS")
+fn configured_gate_timeout_ms() -> Option<u64> {
+    std::env::var("SYNAPSE_APPROVAL_GATE_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|ms| *ms >= 1_000)
-        .unwrap_or(DEFAULT_GATE_TIMEOUT_MS);
-    Duration::from_millis(ms)
+        .filter(|ms| (1_000..=MAX_APPROVAL_WAIT_MS).contains(ms))
+}
+
+fn gate_timeout() -> Duration {
+    Duration::from_millis(configured_gate_timeout_ms().unwrap_or(DEFAULT_GATE_TIMEOUT_MS))
 }
 
 /// In-process registry of approval ids a gate call is currently blocked on, so
@@ -157,7 +160,7 @@ pub struct AgentAskOperatorParams {
     /// Optional context shown with the question in the approval inbox.
     #[serde(default)]
     pub context: Option<String>,
-    /// Optional max wait in milliseconds. Defaults to the approval gate timeout.
+    /// Optional max wait in milliseconds. Defaults to the configured wait or 25 minutes.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Spawn id of the asking agent, for attribution when the spawn header is absent.
@@ -182,8 +185,24 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let params = params.0;
-        let tool_name = params.tool_name.clone().unwrap_or_default();
-        let input = params.input.clone().unwrap_or(Value::Null);
+        let tool_name = params.tool_name.as_deref().unwrap_or_default();
+        // Claude's spawn header takes precedence over the local harness fallback.
+        let spawn_id = header_value(&request_context, SPAWN_ID_HEADER).or(params.spawn_id);
+        let missing_fields = missing_gate_fields(
+            params.tool_name.as_deref(),
+            params.tool_use_id.as_deref(),
+            spawn_id.as_deref(),
+        );
+        if !missing_fields.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "approval gate requires non-empty fields: {}",
+                    missing_fields.join(", ")
+                ),
+            ));
+        }
+        let input = params.input.unwrap_or(Value::Null);
         // Raw-shape logging: the permission-prompt-tool contract is undocumented,
         // so we record exactly what Claude sent to verify/repair field mapping.
         tracing::info!(
@@ -202,13 +221,8 @@ impl SynapseService {
 
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
-        // Header (Claude's native path) wins; the explicit param is the
-        // local-harness fallback (#1028) since it shares the bearer token.
-        let spawn_id =
-            header_value(&request_context, SPAWN_ID_HEADER).or_else(|| params.spawn_id.clone());
-
         self.run_gate(
-            &tool_name,
+            tool_name,
             &input,
             params.tool_use_id.as_deref(),
             &by_session,
@@ -532,11 +546,17 @@ impl SynapseService {
                         );
                     }
                 }
-                break Ok(deny_result(&message));
+                break Ok(verdict_result(&json!({
+                    "behavior": "deny",
+                    "status": "timed_out",
+                    "approval_id": approval_id,
+                    "message": message,
+                })));
             }
+            let delay = POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
             tokio::select! {
                 () = waiter.notify().notified() => {}
-                () = tokio::time::sleep(POLL_INTERVAL) => {}
+                () = tokio::time::sleep(delay) => {}
             }
         }
     }
@@ -638,7 +658,10 @@ fn build_question_request(
         dedupe_key: Some(format!(
             "question:{}:{}",
             spawn_id.unwrap_or("unknown"),
-            sha256_hex(question.as_bytes())
+            // Keyed (#174): the question is agent text persisted in the dedupe key.
+            // Pending questions written before this change expire with their
+            // own timeout; a repeat inside that window opens one extra item.
+            crate::content_digest::keyed_prefixed_digest(question.as_bytes())
         )),
         timeout_ms: Some(timeout.as_millis() as u64 + 60_000),
         timeout_decision: Some(ApprovalTimeoutDecision::Declined),
@@ -741,6 +764,25 @@ fn question_unanswered_result(approval_id: &str, status: &str, message: &str) ->
     }))
 }
 
+/// The gate fields that are absent or blank (#303). A gate needs all three:
+/// the tool to judge, the call id that dedupes retries, and the spawn the
+/// approval is attributed to; without them it is refused before any queue row.
+fn missing_gate_fields(
+    tool_name: Option<&str>,
+    tool_use_id: Option<&str>,
+    spawn_id: Option<&str>,
+) -> Vec<&'static str> {
+    [
+        ("tool_name", tool_name),
+        ("tool_use_id", tool_use_id),
+        ("spawn_id", spawn_id),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_none_or(|value| value.trim().is_empty()))
+    .map(|(name, _)| name)
+    .collect()
+}
+
 fn verdict_result(verdict: &Value) -> CallToolResult {
     // The permission-prompt-tool reads the result's TEXT content as JSON.
     let text = verdict.to_string();
@@ -756,29 +798,14 @@ fn default_true() -> bool {
 }
 
 fn question_timeout(value: Option<u64>) -> Result<Duration, ErrorData> {
-    let ms = value.unwrap_or_else(|| gate_timeout().as_millis() as u64);
-    if !(100..=DEFAULT_GATE_TIMEOUT_MS).contains(&ms) {
+    let ms = value.unwrap_or_else(|| configured_gate_timeout_ms().unwrap_or(MAX_APPROVAL_WAIT_MS));
+    if !(100..=MAX_APPROVAL_WAIT_MS).contains(&ms) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "agent_ask_operator timeout_ms must be between 100 and {DEFAULT_GATE_TIMEOUT_MS}"
-            ),
+            format!("agent_ask_operator timeout_ms must be between 100 and {MAX_APPROVAL_WAIT_MS}"),
         ));
     }
     Ok(Duration::from_millis(ms))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-
-    let digest = Sha256::digest(bytes);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn now_unix_ms() -> u64 {
@@ -799,3 +826,7 @@ fn header_value(request_context: &RequestContext<RoleServer>, name: &str) -> Opt
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
 }
+
+#[cfg(test)]
+#[path = "permission_gate_fields_table.rs"]
+mod fields_table;

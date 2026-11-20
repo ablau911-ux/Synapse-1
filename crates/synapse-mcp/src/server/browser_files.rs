@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
-        chrome_debugger_endpoint, require_target_session_id, validate_cdp_target_id,
+        browser_raw_cdp_required_error, cdp_target_id_audit_ref, require_target_session_id,
+        validate_cdp_target_id,
     },
     tool, tool_router,
 };
@@ -21,7 +21,6 @@ use serde_json::json;
 use synapse_core::error_codes;
 
 const TOOL: &str = "browser_file_upload";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_CHOOSER_READ_LIMIT: usize = 20;
 const MAX_CHOOSER_READ_LIMIT: usize = 100;
 const MAX_FILE_UPLOAD_PATHS: usize = 256;
@@ -71,7 +70,6 @@ pub struct BrowserFileUploadParams {
     /// Browser HWND owning the target. Required only with an explicit target and
     /// no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only chooser records with `seq >= since_seq`.
     #[serde(default)]
@@ -258,20 +256,17 @@ impl SynapseService {
         if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        let browser_rows = synapse_browsers::BrowserRegistry::global();
+        if !browser_rows.has_bridge_tab_prefix(cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "{TOOL} requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "{TOOL} requires a normal Chrome bridge tab target ({}); got {cdp_target_id:?}",
+                    browser_rows.tab_target_shapes()
                 ),
             ));
         }
         let operation = browser_file_upload_operation_name(upload.operation);
-        if upload.operation != BrowserFileUploadOperation::ReadChooser {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_file_upload_before_bridge_mutation",
-            )?;
-        }
         let result = crate::chrome_debugger_bridge::file_upload(
             crate::chrome_debugger_bridge::ChromeDebuggerFileUploadRequest {
                 hwnd: window_hwnd,
@@ -295,16 +290,12 @@ impl SynapseService {
                 ),
             )
         })?;
-        if upload.operation != BrowserFileUploadOperation::ReadChooser {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_file_upload_after_bridge_mutation",
-            )?;
-        }
-        let endpoint = result
-            .extension_id
-            .as_deref()
-            .map(chrome_debugger_endpoint)
-            .unwrap_or_else(chrome_debugger_default_endpoint);
+        let endpoint = synapse_browsers::BrowserRegistry::global()
+            .bridge_endpoint_for_reported_target(
+                cdp_target_id,
+                result.extension_id.as_deref(),
+                synapse_browsers::BridgeLane::Tabs,
+            );
         tracing::info!(
             code = "CHROME_BRIDGE_FILE_UPLOAD_READBACK",
             session_id = %session_id,

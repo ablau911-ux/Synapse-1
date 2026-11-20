@@ -1,0 +1,42 @@
+{
+  "id": "opera_gx",
+  "label": "Opera GX",
+  "family": "chromium",
+  "process_names": ["opera.exe"],
+  "exe_path_markers": [
+    "\\Programs\\Opera GX\\",
+    "\\Program Files\\Opera GX\\",
+    "\\Program Files (x86)\\Opera GX\\"
+  ],
+  "exe_candidates": [
+    "%LOCALAPPDATA%\\Programs\\Opera GX\\opera.exe",
+    "%ProgramFiles%\\Opera GX\\opera.exe",
+    "%ProgramFiles(x86)%\\Opera GX\\opera.exe"
+  ],
+  "app_paths_name": null,
+  "user_data_root": "%APPDATA%\\Opera Software\\Opera GX Stable",
+  "profile_layout": "single",
+  "window_title_suffixes": [" - Opera"],
+  "tab_target_prefix": "operagx-tab:",
+  "endpoint_base": "synapse-bridge://opera_gx",
+  "health_key": "opera_gx_bridge",
+  "registration_token_file": "browser-bridge-token-opera_gx.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "opera://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "browser-extension\\opera_gx"
+  },
+  "policy": null,
+  "native_messaging_cleanup_roots": [],
+  "protected_extension_ids": [],
+  "cdp_product_tokens": ["OPR", "Opera"],
+  "unsupported_capabilities": [],
+  "debugger_api_expected": true,
+  "install_ui": {
+    "developer_mode_names": ["Developer mode"],
+    "load_unpacked_names": ["Load unpacked"]
+  },
+  "winget_id": "Opera.OperaGX"
+}

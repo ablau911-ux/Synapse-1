@@ -1,4 +1,4 @@
-pub(crate) mod a11y_events;
+mod a11y_events;
 pub mod activity_recorder;
 pub mod approvals;
 pub mod armed_routines;
@@ -6,12 +6,15 @@ pub mod audio;
 pub mod audit_export;
 pub mod audit_retention;
 pub mod demo_recording;
+mod episode_catch_up;
 pub mod episodes;
 pub mod hygiene;
+mod input_window;
 pub mod intent;
 pub mod intent_events;
 pub mod interaction_cadence;
 pub mod local_models;
+mod mining_window;
 pub mod permissions;
 pub mod plan;
 pub mod plan_execution;
@@ -21,11 +24,16 @@ pub mod profile_quality;
 pub mod profile_registry;
 pub mod reflex;
 pub mod replay;
+mod routine_id_migration;
+mod routine_identity_ledger;
 pub mod routine_miner_job;
 pub mod routines;
 pub mod storage;
+pub mod storage_maintenance;
 pub mod subscribe;
 pub mod suggestions;
+#[cfg(test)]
+mod tests;
 pub mod timeline;
 pub mod timeline_control;
 use anyhow::{Context, Result, bail};
@@ -35,7 +43,6 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 use synapse_action::ActionHandle;
 use synapse_audio::{AudioConfig, AudioError, AudioRuntime, DEFAULT_RING_SECONDS};
@@ -45,7 +52,7 @@ use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
     install_action_combo_scheduler,
 };
-use synapse_storage::{Db, GcTask, GcTaskReadback, PressureProbeReadback, PressureTask};
+use synapse_storage::Db;
 use tokio_util::sync::CancellationToken;
 
 use self::a11y_events::A11yEventBridge;
@@ -162,85 +169,6 @@ impl M3ServiceConfig {
     }
 }
 
-/// Bounded maximum lifetime of a runtime reality-write opt-in overlay (#1559).
-/// The overlay is a break-glass escalation, so it self-expires quickly; a fresh
-/// grant is required after this window regardless of daemon uptime.
-pub const REALITY_WRITE_GRANT_MAX_TTL: Duration = Duration::from_mins(15);
-
-/// In-memory, scoped, reversible, audited reality-write opt-in overlay (#1559).
-///
-/// After #1539 made the stock M3 grant read-only, `full_capability` no longer
-/// yields reality-write capability and there was no usable opt-in. This overlay
-/// is that opt-in: when active (non-expired) it satisfies EXACTLY the
-/// reality-write permission set (`READ_STORAGE`/`WRITE_STORAGE`/`READ_EVENTS`)
-/// and is consulted ONLY by the reality-write enforcement path — it never widens
-/// authority for any other tool or permission. Expiry is authoritative from the
-/// monotonic `Instant` (mirrors the input-lease module), immune to wall-clock
-/// changes; `granted_at`/`expires_at` are wall-clock copies for human readback.
-#[derive(Clone, Debug)]
-pub struct RealityWriteGrant {
-    granted_by: String,
-    reason: String,
-    granted_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    granted_at_instant: Instant,
-    ttl: Duration,
-}
-
-/// Serializable, `Instant`-free copy of an active [`RealityWriteGrant`] for tool
-/// responses and status readback.
-#[derive(Clone, Debug)]
-pub struct RealityWriteGrantSnapshot {
-    pub granted_by: String,
-    pub reason: String,
-    pub granted_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub remaining_ms: u64,
-}
-
-impl RealityWriteGrant {
-    #[must_use]
-    pub fn new(granted_by: String, reason: String) -> Self {
-        let ttl = REALITY_WRITE_GRANT_MAX_TTL;
-        let granted_at = Utc::now();
-        let expires_at = granted_at
-            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(900));
-        Self {
-            granted_by,
-            reason,
-            granted_at,
-            expires_at,
-            granted_at_instant: Instant::now(),
-            ttl,
-        }
-    }
-
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.granted_at_instant.elapsed() < self.ttl
-    }
-
-    #[must_use]
-    pub fn remaining_ms(&self) -> u64 {
-        self.ttl
-            .checked_sub(self.granted_at_instant.elapsed())
-            .map_or(0, |remaining| {
-                u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)
-            })
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> RealityWriteGrantSnapshot {
-        RealityWriteGrantSnapshot {
-            granted_by: self.granted_by.clone(),
-            reason: self.reason.clone(),
-            granted_at: self.granted_at,
-            expires_at: self.expires_at,
-            remaining_ms: self.remaining_ms(),
-        }
-    }
-}
-
 #[derive(Debug)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -256,15 +184,6 @@ pub struct M3State {
     pub shutdown_reason: &'static str,
     pub connection_closed_cancel: Option<CancellationToken>,
     pub permission_grants: PermissionGrants,
-    /// Where the startup `permission_grants` came from (#1559): an explicit
-    /// operator config (`SYNAPSE_MCP_ALLOWED_PERMISSIONS` env / `--allowed-permissions`
-    /// CLI) or the fail-closed read-only default. Reported in status and denial
-    /// remediation so `full_capability` is never mistaken for a write grant.
-    pub permission_grants_source: &'static str,
-    /// Runtime reality-write opt-in overlay (#1559). `None` restores the
-    /// fail-closed default; `Some` (while non-expired) satisfies the reality-write
-    /// permission set for reality tools only. See [`RealityWriteGrant`].
-    pub reality_write_grant: Option<RealityWriteGrant>,
     pub enable_audio: bool,
     pub allow_unknown_profile: bool,
     pub reflex_force_degraded: bool,
@@ -273,8 +192,6 @@ pub struct M3State {
     /// on first reflex use) and reused by the reflex runtime so there is never
     /// a second open of the same path within this process.
     pub db: Option<Arc<Db>>,
-    pub storage_gc_task: Option<GcTask>,
-    pub storage_pressure_task: Option<PressureTask>,
     pub storage_last_error: Option<String>,
     pub reflex_last_error: Option<String>,
     pub profile_last_error: Option<String>,
@@ -294,14 +211,6 @@ pub struct M3State {
     /// detector and the `intent_detect_tick` tool so transitions have one
     /// source of truth. Cheap `Arc` clone hands a handle to either driver.
     pub intent_tracker: intent_events::SharedIntentTracker,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct StorageMaintenanceReadback {
-    pub gc_task_running: bool,
-    pub pressure_task_running: bool,
-    pub gc_task: GcTaskReadback,
-    pub pressure_probe: PressureProbeReadback,
 }
 
 #[derive(Clone, Debug)]
@@ -395,14 +304,6 @@ impl M3State {
         let reflex_force_degraded =
             parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
-        // #1559: record the config source so status/denial remediation can state
-        // exactly how to opt into reality-write, and never imply that an absent
-        // WRITE_STORAGE is present.
-        let permission_grants_source = if allowed_permissions.is_some() {
-            "explicit operator config (SYNAPSE_MCP_ALLOWED_PERMISSIONS env / --allowed-permissions CLI)"
-        } else {
-            "fail-closed read-only default (#1539; no SYNAPSE_MCP_ALLOWED_PERMISSIONS / --allowed-permissions set)"
-        };
         Ok(Self {
             db_path,
             profile_dir,
@@ -415,15 +316,11 @@ impl M3State {
             shutdown_reason,
             connection_closed_cancel,
             permission_grants,
-            permission_grants_source,
-            reality_write_grant: None,
             enable_audio,
             allow_unknown_profile,
             reflex_force_degraded,
             storage_pressure_free_bytes_sample,
             db: None,
-            storage_gc_task: None,
-            storage_pressure_task: None,
             storage_last_error: None,
             reflex_last_error: None,
             profile_last_error: None,
@@ -454,53 +351,6 @@ impl M3State {
     #[must_use]
     pub fn intent_tracker(&self) -> intent_events::SharedIntentTracker {
         Arc::clone(&self.intent_tracker)
-    }
-
-    /// True when a non-expired runtime reality-write overlay is active (#1559).
-    /// Clears the overlay in place when it has lapsed so an expired grant leaves
-    /// NO residue and the fail-closed default is restored automatically.
-    pub fn reality_write_grant_active(&mut self) -> bool {
-        match self.reality_write_grant.as_ref() {
-            Some(grant) if grant.is_active() => true,
-            Some(_expired) => {
-                self.reality_write_grant = None;
-                false
-            }
-            None => false,
-        }
-    }
-
-    /// Installs (or replaces) the runtime reality-write overlay with a fresh
-    /// bounded TTL (#1559). Returns a serializable snapshot for audit/readback.
-    pub fn grant_reality_write(
-        &mut self,
-        granted_by: String,
-        reason: String,
-    ) -> RealityWriteGrantSnapshot {
-        let grant = RealityWriteGrant::new(granted_by, reason);
-        let snapshot = grant.snapshot();
-        self.reality_write_grant = Some(grant);
-        snapshot
-    }
-
-    /// Clears any runtime reality-write overlay (#1559), restoring the
-    /// fail-closed default with no residue. Returns the snapshot of the overlay
-    /// that was active at revoke time, or `None` when nothing active was present.
-    pub fn revoke_reality_write(&mut self) -> Option<RealityWriteGrantSnapshot> {
-        self.reality_write_grant
-            .take()
-            .filter(RealityWriteGrant::is_active)
-            .map(|grant| grant.snapshot())
-    }
-
-    /// Read-only snapshot of an active overlay for status readback (#1559).
-    /// Does not mutate; an expired overlay reports as `None`.
-    #[must_use]
-    pub fn reality_write_grant_snapshot(&self) -> Option<RealityWriteGrantSnapshot> {
-        self.reality_write_grant
-            .as_ref()
-            .filter(|grant| grant.is_active())
-            .map(RealityWriteGrant::snapshot)
     }
 
     pub fn ensure_profile_runtime(
@@ -557,75 +407,6 @@ impl M3State {
         }
     }
 
-    pub fn ensure_storage_maintenance_tasks(
-        &mut self,
-    ) -> std::result::Result<(), synapse_storage::StorageError> {
-        let db = self.ensure_storage()?;
-        if self.storage_pressure_task.is_none() {
-            let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
-            {
-                db.run_pressure_check_with_free_bytes_sample(free_bytes)
-            } else {
-                db.run_pressure_check_once()
-            };
-            if let Err(error) = pressure_result {
-                self.storage_last_error = Some(format!("storage pressure startup probe: {error}"));
-                return Err(error);
-            }
-            match db.spawn_pressure_task() {
-                Ok(task) => {
-                    self.storage_pressure_task = Some(task);
-                }
-                Err(error) => {
-                    self.storage_last_error = Some(format!("storage pressure task start: {error}"));
-                    return Err(error);
-                }
-            }
-        }
-        if self.storage_gc_task.is_none() {
-            match db.spawn_gc_task() {
-                Ok(task) => {
-                    self.storage_gc_task = Some(task);
-                }
-                Err(error) => {
-                    self.storage_last_error = Some(format!("storage GC task start: {error}"));
-                    return Err(error);
-                }
-            }
-        }
-        self.storage_last_error = None;
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn storage_maintenance_readback(&self) -> StorageMaintenanceReadback {
-        let gc_task = self
-            .storage_gc_task
-            .as_ref()
-            .map(GcTask::readback)
-            .unwrap_or_default();
-        let pressure_task_running = self
-            .storage_pressure_task
-            .as_ref()
-            .is_some_and(PressureTask::running);
-        let pressure_probe = self
-            .db
-            .as_ref()
-            .map_or_else(PressureProbeReadback::default, |db| {
-                db.pressure_probe_readback()
-                    .unwrap_or_else(|error| PressureProbeReadback {
-                        last_error: Some(error.to_string()),
-                        ..PressureProbeReadback::default()
-                    })
-            });
-        StorageMaintenanceReadback {
-            gc_task_running: gc_task.running,
-            pressure_task_running,
-            gc_task,
-            pressure_probe,
-        }
-    }
-
     pub fn ensure_reflex_runtime(
         &mut self,
         action_handle: ActionHandle,
@@ -640,8 +421,13 @@ impl M3State {
             });
         }
 
-        self.ensure_storage_maintenance_tasks()?;
         let db = self.ensure_storage()?;
+        if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
+            && let Err(error) = db.run_pressure_check_with_free_bytes_sample(free_bytes)
+        {
+            self.storage_last_error = Some(error.to_string());
+            return Err(error.into());
+        }
         let scheduler_config = synapse_reflex::SchedulerConfig {
             force_degraded: self.reflex_force_degraded,
             ..synapse_reflex::SchedulerConfig::default()
@@ -708,11 +494,6 @@ impl M3State {
         let demo_control = self
             .ensure_demo_record_control()
             .context("hydrate demo record control state for the activity recorder")?;
-        // WinEvent subscription is the last fallible activation step. Complete
-        // it before spawning recorder tasks so a hook-start failure cannot
-        // force synchronous code to drop-and-detach live Tokio owners.
-        let prepared_bridge = A11yEventBridge::prepare()
-            .context("prepare WinEvent bridge for the activity recorder")?;
         let recorder = Arc::new(ActivityRecorder::spawn(
             db,
             config,
@@ -720,13 +501,11 @@ impl M3State {
             demo_control,
             event_bus.clone(),
         )?);
-        let bridge = A11yEventBridge::start_prepared(
-            prepared_bridge,
-            event_bus,
-            Some(Arc::clone(&recorder)),
-        );
         self.activity_recorder = Some(Arc::clone(&recorder));
-        self.a11y_event_bridge = Some(bridge);
+        if let Err(error) = self.ensure_a11y_event_bridge(event_bus) {
+            self.activity_recorder = None;
+            return Err(error).context("start WinEvent bridge for the activity recorder");
+        }
         Ok(())
     }
 
@@ -830,7 +609,7 @@ pub fn default_daemon_db_path() -> PathBuf {
     local_synapse_dir().join("db-daemon")
 }
 
-fn local_synapse_dir() -> PathBuf {
+pub(crate) fn local_synapse_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("synapse")

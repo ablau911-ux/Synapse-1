@@ -9,24 +9,24 @@ use std::{
 use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use synapse_core::{Backend, ProfileId, ProfileUseScope, error_codes, types::RoutineRecord};
 use synapse_profiles::{ProfileError, ProfileRuntime, ProfileStatus};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{Db, cf, decode_json, encode_json};
 
+use super::episodes::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, normalize_replay_path, replay_root, required},
     plan::{PlanDocument, RoutineCompilePlanParams, compile_routine_plan},
-    routines::{load_routine_record, validate_routine_id_param},
+    routines::{load_routine_record, unmined_routine_error, validate_routine_id_param},
 };
 
 const AUTHORING_PREFIX: &str = "profile_authoring/v1/";
 const CANDIDATE_PREFIX: &str = "profile_authoring/v1/candidate/";
-const ROUTINE_AUTOMATION_PREFIX: &str = "routine_automation/v1/";
+pub(super) const ROUTINE_AUTOMATION_PREFIX: &str = "routine_automation/v1/";
 const AUTHORING_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_AUDIT_ROWS: u32 = 500;
 const DEFAULT_MAX_REPLAY_ROWS: u32 = 500;
@@ -464,21 +464,11 @@ pub fn generate_routine_automation_candidate(
     let profile_id = resolve_routine_automation_profile_id(profile_runtime, params)?;
     let profile = profile_status(profile_runtime, &profile_id)?;
     let Some(routine) = load_routine_record(db, &params.routine_id)? else {
-        return Err(authoring_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "ROUTINE_NOT_MINED: routine_id {} is not in CF_ROUTINES; nothing to automate",
-                params.routine_id
-            ),
-            json!({
-                "routine_id": params.routine_id,
-                "cf_name": cf::CF_ROUTINES,
-            }),
-        ));
+        return Err(unmined_routine_error(db, &params.routine_id, "automate"));
     };
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "routine_automate refused under disk pressure: cf_name={} pressure_level={:?}",
                 cf::CF_KV,
@@ -979,7 +969,7 @@ fn resolve_routine_automation_profile_id(
         })
 }
 
-fn routine_automation_key(routine_id: &str) -> String {
+pub(super) fn routine_automation_key(routine_id: &str) -> String {
     format!("{ROUTINE_AUTOMATION_PREFIX}{routine_id}")
 }
 
@@ -1000,7 +990,7 @@ fn write_routine_automation_record(
     db.put_batch_pressure_bypass(cf::CF_KV, [(key.into_bytes(), value)])
         .map_err(|error| {
             mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error.code(),
                 format!(
                     "failed to persist routine automation row for {}: {error}",
                     record.routine_id
@@ -1049,7 +1039,8 @@ fn routine_id_from_candidate(candidate: &ProfileAuthoringCandidate) -> Option<St
 
 fn routine_automation_candidate_id(routine_id: &str, evidence_hash: &str) -> String {
     let suffix = evidence_hash
-        .strip_prefix("sha256:")
+        .strip_prefix("hmac-sha256:")
+        .or_else(|| evidence_hash.strip_prefix("sha256:"))
         .unwrap_or(evidence_hash)
         .chars()
         .take(CANDIDATE_ID_HASH_CHARS)
@@ -1057,6 +1048,7 @@ fn routine_automation_candidate_id(routine_id: &str, evidence_hash: &str) -> Str
     format!("routine-auto.{routine_id}.{suffix}")
 }
 
+// Content evidence is installation-local; legacy candidate keys remain readable.
 fn routine_automation_evidence_hash(
     profile_id: &str,
     routine: &RoutineRecord,
@@ -1084,9 +1076,7 @@ fn routine_automation_evidence_hash(
             format!("routine automation evidence hash encode failed: {error}"),
         )
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
+    Ok(crate::content_digest::keyed_prefixed_digest(&bytes))
 }
 
 fn routine_automation_evidence_summary(
@@ -1989,6 +1979,7 @@ fn expected_improvement(patch: &Value) -> Vec<String> {
     improvements
 }
 
+// Patch and summary can contain private content.
 fn evidence_hash(
     profile_id: &str,
     row_keys: &[String],
@@ -1996,15 +1987,14 @@ fn evidence_hash(
     patch: &Value,
     evidence_summary: &Value,
 ) -> Result<String, ErrorData> {
-    let mut hasher = Sha256::new();
-    hasher.update(profile_id.as_bytes());
+    let mut bytes = profile_id.as_bytes().to_vec();
     for key in row_keys {
-        hasher.update(key.as_bytes());
-        hasher.update([0]);
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
     }
     for audit_id in audit_ids {
-        hasher.update(audit_id.as_bytes());
-        hasher.update([0]);
+        bytes.extend_from_slice(audit_id.as_bytes());
+        bytes.push(0);
     }
     let patch_bytes = serde_json::to_vec(patch).map_err(|error| {
         mcp_error(
@@ -2020,13 +2010,14 @@ fn evidence_hash(
             ),
         )
     })?;
-    hasher.update(patch_bytes);
-    hasher.update(summary_bytes);
-    Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
+    bytes.extend_from_slice(&patch_bytes);
+    bytes.extend_from_slice(&summary_bytes);
+    Ok(crate::content_digest::keyed_prefixed_digest(&bytes))
 }
 
 fn generated_candidate_id(profile_id: &str, evidence_hash: &str) -> String {
     let suffix = evidence_hash
+        .trim_start_matches("hmac-sha256:")
         .trim_start_matches("sha256:")
         .chars()
         .take(CANDIDATE_ID_HASH_CHARS)
@@ -2100,7 +2091,19 @@ fn write_candidate(
 }
 
 fn encode_candidate(candidate: &ProfileAuthoringCandidate) -> Result<Vec<u8>, ErrorData> {
-    encode_json(candidate).map_err(|error| {
+    // Upgrade legacy evidence on the next write, retaining the candidate key
+    // and all automation references. Read-only lookup accepts both versions.
+    let mut candidate = candidate.clone();
+    if candidate.source.evidence_hash.starts_with("sha256:") {
+        candidate.source.evidence_hash = evidence_hash(
+            &candidate.profile_id,
+            &candidate.source.source_row_keys,
+            &candidate.source.source_audit_ids,
+            &candidate.patch,
+            &candidate.evidence_summary,
+        )?;
+    }
+    encode_json(&candidate).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("profile authoring candidate encode failed: {error}"),
@@ -2179,12 +2182,6 @@ fn now_ns() -> u64 {
     u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
+#[cfg(test)]
+#[path = "tests/profile_evidence_digest_174.rs"]
+mod profile_evidence_digest_174_tests;

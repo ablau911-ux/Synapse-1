@@ -68,6 +68,39 @@ pub fn focused_element_node() -> A11yResult<AccessibleNode> {
     platform::focused_element_node()
 }
 
+/// Live UIA parent of the focused date segment (spin button): the parent's
+/// runtime id, its own value, and the values of its spin-button children in
+/// order. Plain data only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FocusedParentReadback {
+    pub parent_id: String,
+    pub parent_value: Option<String>,
+    pub child_spin_values: Vec<String>,
+}
+
+/// Resolves the focused element's parent through the UIA control-view tree
+/// walker when the focused element is a spin button (native date segment).
+/// `Ok(None)` for any other focus target or when no parent exists.
+///
+/// # Errors
+///
+/// Returns a structured UIA error for OS failures, or `A11Y_NOT_AVAILABLE` on
+/// non-Windows platforms.
+pub fn focused_spin_button_parent() -> A11yResult<Option<FocusedParentReadback>> {
+    platform::focused_spin_button_parent()
+}
+
+/// Returns the HWND currently focused within a target window's GUI thread,
+/// if that focus belongs to the target window or an owned child/popup.
+///
+/// # Errors
+///
+/// Returns a structured UIA error when target-thread focus cannot be read,
+/// or `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn focused_hwnd_in_window(hwnd: i64) -> A11yResult<Option<i64>> {
+    platform::focused_hwnd_in_window(hwnd)
+}
+
 /// Returns the UIA element currently focused within a target window's GUI
 /// thread, if that focus belongs to the target window or an owned child/popup.
 ///
@@ -132,6 +165,9 @@ pub fn find_by_name_and_pattern_in_window(
 /// Returns Chromium renderer UIA nodes that UIA raw child walking can omit even
 /// after `--force-renderer-accessibility` activates the renderer tree.
 ///
+/// The flag is `true` when content nodes were dropped (cap reached or a node
+/// read failed), so callers must report partial coverage.
+///
 /// # Errors
 ///
 /// Returns a structured UIA error for OS failures, or `A11Y_NOT_AVAILABLE` on
@@ -140,6 +176,6 @@ pub fn chromium_renderer_accessibility_nodes_from_window(
     hwnd: i64,
     depth: u32,
     max_nodes: usize,
-) -> A11yResult<Vec<AccessibleNode>> {
+) -> A11yResult<(Vec<AccessibleNode>, bool)> {
     platform::chromium_renderer_accessibility_nodes_from_window(hwnd, depth, max_nodes)
 }

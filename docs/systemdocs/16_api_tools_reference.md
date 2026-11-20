@@ -1,6 +1,6 @@
 # 16. API / Tools Reference
 
-> Current production note, 2026-06-30: the default `normal_agent` MCP surface is now facade-first and capped under the 40-tool contract tracked by #1374. This older reference still documents implementation and advanced/profile-gated routes. For the old-to-new public migration table and deprecation policy, see [../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
+> Current production note, 2026-10-16: the `normal_agent` MCP surface is facade-first with 44 tools (per-tool list: README.md "The full tool surface"; `livefeed` is built behind the `livefeed` cargo feature), governed by `PUBLIC_TOOL_LIMIT`, `PUBLIC_TOOL_NAMES`, and `NORMAL_ALLOWED_EXACT` in `server/tool_profiles.rs`. This older reference still documents implementation and advanced/profile-gated routes. For the old-to-new public migration table and deprecation policy, see [../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
 
 **Source files covered:**
 
@@ -16,6 +16,7 @@
 - `crates/synapse-mcp/src/server/intent_tools.rs`, `plan_tools.rs`, `reality.rs`, `suggestions.rs`, `routine_feedback.rs`, `routine_labeling.rs`
 - `crates/synapse-mcp/src/server/timeline_query.rs`, `timeline_digest.rs`, `data_cleaning.rs`
 - `crates/synapse-mcp/src/server/workspace_blackboard.rs`, `tool_profiles.rs`, `notify_tools.rs`, `hygiene_report.rs`, `permission_gate.rs`, `escalation/mod.rs`
+- `crates/synapse-mcp/src/server/everquest_*.rs` (17 files, opt-in domain pack)
 
 > See [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for transport, session lifecycle, and routing internals. Subsystem cross-refs are noted per domain (docs 05–14).
 
@@ -27,9 +28,10 @@ Tools are registered through the **`rmcp`** crate's attribute macros. Each tool 
 
 The full surface is assembled in `SynapseService::tool_router()` (`server.rs:603`) by summing every module router with `+`. Tool **names** are the function names verbatim (e.g. `fn observe` -> tool `observe`). Over MCP they appear to clients as `mcp__synapse__<name>`.
 
-**Total tools documented: 182.**
+**Total tools documented: 207.**
 
 - **Core surface (always registered): ~182 tools.**
+- **EverQuest domain pack: 25 tools**, registered only when `SYNAPSE_ENABLE_EVERQUEST` is set (`server.rs:649`). rmcp builds the tool list once per service, so this is a startup opt-in.
 - **Debug-only:** `storage_put_probe_rows` and `storage_pressure_sample` are removed from the default surface and remain callable only when `SYNAPSE_DEBUG_TOOLS` is set (`server.rs:671`).
 
 Conventions seen throughout:
@@ -37,7 +39,7 @@ Conventions seen throughout:
 - Action tools take `verify_delta` / `verify_timeout_ms` and a `backend` (auto/software/hardware) selector.
 - Many tools persist to RocksDB column families (`CF_KV`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS`, etc.) and return an exact row readback.
 
-> Detail note: where a param table below says "(summarized)" the field list is abbreviated to key/required params; full field sets exist in the named struct.
+> Detail note: where a param table below says "(summarized)" the field list is abbreviated to key/required params; full field sets exist in the named struct. EverQuest tool params are summarized (opt-in pack).
 
 ---
 
@@ -98,11 +100,11 @@ Click/type/value/key/stroke/scroll/pad/clipboard primitives. Foreground tiers re
 | `act_press` | Press keys (CDP/PostMessage software or fg hardware) | `keys` (req), `hold_ms=33`, `backend=Auto`, `window_hwnd?`, `cdp_target_id?`, `auto_wait` | emits keys |
 | `act_keymap` | Press a keymap alias | `alias` (req), `hold_ms=33`, `backend=Auto`, `window_hwnd?`, `cdp_target_id?` | emits keys |
 | `act_stroke` | Move/aim/drag along point/path | `duration_or_speed` (req), `path?`/`target?`/`from?`/`to?`, `button?`, `motion_model=Path`, `backend=Auto` | emits mouse motion |
-| `act_scroll` | Scroll at pointer/point | `dy=0`, `dx=0`, `at?`, `target?`, `smooth=false` | emits scroll |
+| `act_scroll` | Scroll at pointer/point; `dy`/`dx` are wheel notches (one notch = one wheel step), `dy>0` up, `dx>0` right on every route | `dy=0`, `dx=0`, `at?`, `target?`, `smooth=false` | emits scroll |
 | `act_pad` | Apply virtual gamepad report | `report` (req), `pad_id=0`, `controller=X360`, `backend=Vigem`, `hold_ms?` | virtual gamepad |
 | `act_clipboard` | Read/write/clear session virtual clipboard | `verb` (req), `text?`, `format=Text` | virtual clipboard (no OS clipboard by default) |
-| `action_diagnostic_rate_limit_override` | Supporting diagnostic: force rate limiter empty; its return is not an FSV verdict | `confirm`, `ttl_ms=5000` | mutates rate limiter (test) |
-| `action_diagnostic_queue_full_setup` | Supporting diagnostic: saturate action queue; its return is not an FSV verdict | `confirm`, `blocker_duration_ms=5000` | blocks action queue (test) |
+| `action_diagnostic_rate_limit_override` | FSV diag: force rate limiter empty | `confirm`, `ttl_ms=5000` | mutates rate limiter (test) |
+| `action_diagnostic_queue_full_setup` | FSV diag: saturate action queue | `confirm`, `blocker_duration_ms=5000` | blocks action queue (test) |
 | `release_all` | Release all held input state | none | resets input |
 
 ## 16.4 Action / M4 — `m4_tools.rs`
@@ -202,7 +204,7 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 | `escalation_list` | List durable escalations + ladder state | `anchor?`, `status?`, `severity?`, `limit?`, `after_id?` | read-only |
 | `escalation_ack` | Acknowledge an escalation (stop ladder) | `escalation_id` (req), `note?` | writes ack to audit log |
 
-Public <=40-tool clients use the `approval` facade for Claude permission prompts; it accepts Claude's direct `tool_name`/`input` payload and delegates to hidden `approval_gate`.
+Public-surface clients (`PUBLIC_TOOL_LIMIT` tools) use the `approval` facade for Claude permission prompts; it accepts Claude's direct `tool_name`/`input` payload and delegates to hidden `approval_gate`.
 
 ## 16.10 Agents & orchestration
 
@@ -298,7 +300,7 @@ All target a session-owned tab via `cdp_target_id?` + `window_hwnd?` (default ac
 | `browser_fill_form` | browser_field.rs | Fill multiple fields in one ordered call | `fields` (req, 1–200), `continue_on_error=false`, `wait_timeout_ms=5000` |
 | `browser_frames` | browser_frames.rs | Enumerate composed frame tree | target params only |
 | `browser_network` | browser_network.rs | Unified captured-network read (#1348): `mode` selects requests (filtered list), request (one by id w/ body), or websockets (lifecycle/frames) | `mode` (req), one of `requests`/`request`/`websockets` spec objects |
-| `browser_network_har` | browser_network.rs | Record/replay/clear HAR 1.2 | `operation` (Record), `path?`, filters, `include_bodies=true`, `missing_policy=Passthrough` |
+| `browser_network_har` | browser_network.rs | Record/replay/clear HAR 1.2 | `operation` (Record), `path?`, filters, `include_bodies=false`, `overwrite=false`, `missing_policy=Passthrough` |
 | `browser_network_overrides` | browser_network.rs | Set/get/clear extra headers + UA override (raw CDP only) | `operation` (Set), `headers` (req), `user_agent?` |
 | `browser_route` | browser_network.rs | Add/list/remove/clear Fetch route rules | `operation` (AddFulfill), `route_id?`, `url?`, `match_kind` (Glob), `status=200`, `headers`, `body?`/`body_base64?`, `error_reason?`, continue_* |
 | `browser_cookies` | browser_storage.rs | Get/set/clear cookies via chrome.cookies | (get/set/clear verb + cookie fields) |
@@ -361,8 +363,12 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 |------|-------------|------------|--------------|
 | `workspace_put` | Publish a run-scoped entry (optimistic concurrency, artifact verify) | `run_id?`, `key?`, `expected_version?`, `value?`, `artifact?`, `ttl_ms?` | writes CF_KV; publishes `workspace.put` SSE |
 | `workspace_get` | Read one entry by key | `run_id?`, `key?` | read-only (row-hash readback) |
-| `workspace_list` | List entries (corruption-isolated scan) | `run_id?`, `prefix?`, `limit?`, `include_values?` | read-only |
+| `workspace_list` | Key-sorted, corruption-isolated pages | `run_id?`, `prefix?`, `limit?`, `include_values?`, `cursor?` | deletes expired rows examined in the page |
 | `workspace_subscribe` | Per-session SSE subscription for `workspace.put` | `run_id?`, `prefix?`, `snapshot_first?` | opens SSE subscription |
+
+`workspace operation=list` returns `complete`, `has_next`, and an opaque `next_cursor` when more physical rows remain. Keep `run_id` and `prefix` unchanged and pass that cursor unchanged until `complete=true`; an empty page containing only expired or corrupt rows may still have `has_next=true`. Each page examines at most 1,000 raw rows or 8 MiB of encoded values under the prefix, plus one lookahead; a single oversized first row is included to ensure progress. The cursor resumes exclusively after the last examined physical row and is valid only for this daemon lifecycle and run/prefix. This is a live scan: inserts before the cursor are not revisited, while later keys can appear on following pages. `include_values=false` masks inline values but preserves row-hash readbacks.
+
+`run_id` is a logical namespace, not an access boundary (#56). Omitting it selects the current daemon lifecycle run id (`{unix_ms}-{pid}`); any caller holding the daemon bearer token can address any namespace by passing its `run_id` explicitly, which is how multi-agent swarms share one blackboard. Do not store data in the workspace that must be hidden from other local MCP clients. Every row carries a TTL (default 24 h, max 7 d); request-path cleanup removes expired rows in the namespace being written, and a daemon-wide reaper removes expired rows in every namespace (including ended lifecycles' default namespaces) at startup and every 10 minutes (`SYNAPSE_WORKSPACE_REAP_INTERVAL_MS` overrides the period), logging `WORKSPACE_REAPER_SWEPT`. Puts go through the disk-pressure ingestion gate: under pressure they fail with `STORAGE_WRITE_SHED` and nothing is persisted.
 
 ## 16.17 Tool profiles & notifications — `tool_profiles.rs`, `notify_tools.rs`
 
@@ -372,8 +378,46 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 | `tool_profile_set` | Set durable tool profile (normal_agent/browser_control/break_glass) | `profile` (req), `reason?`, `confirm_break_glass?` (break_glass requires reason + held foreground lease) | writes CF_SESSIONS policy |
 | `notify_human` | Raise a Windows toast (verified via Action Center; dedupe) | `title`, `body`, `kind` (req), `dedupe_key?`, `suppress_popup?` | OS toast; reads back Action Center |
 
-## 16.18 Notes & caveats
+## 16.18 EverQuest domain pack — `everquest_*.rs` (opt-in)
 
-- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
+25 tools, registered only when `SYNAPSE_ENABLE_EVERQUEST` is set. See [12_everquest_domain.md](12_everquest_domain.md). All persist typed redacted rows to CF_KV with exact readback; params summarized. Most take an id + optional `profile_id` + state/source-ref overrides.
+
+| Tool | File | Description |
+|------|------|-------------|
+| `everquest_chat_input_state` | everquest_tools.rs | Read chat-input pollution state (foreground/UI/OCR). No params. |
+| `everquest_loc_probe` | everquest_tools.rs | Send `/loc`, verify appended EQ log coordinate. No params. |
+| `everquest_safe_command` | everquest_tools.rs | Send one allowlisted non-social slash command (`command` req). |
+| `everquest_survival_readiness` | everquest_tools.rs | Read+persist survival readiness (no input sent). No params. |
+| `everquest_autocombat` | everquest_autocombat.rs | Bounded operator-attended combat loop. Params: `max_iterations?`, `max_duration_s?`, `hp_floor_percent?`, `mana_floor_percent?`, `target_level_max?`, `stop_at_level?`, `cast_mana_cost_percent?`, `engagement_timeout_s?`, `hotbar_alias?`, `max_roam_steps?`, `max_chase_s?`, `idempotency_key?`. Sends gameplay input. |
+| `everquest_current_state` | everquest_state.rs | Build/persist compact current-state record. No params. |
+| `everquest_route_plan` | everquest_route.rs | Plan+persist a bounded route (no movement). `plan_id` req + overrides. |
+| `everquest_map_sensor` | everquest_map_sensor.rs | Persist calibrated current-map sensor. `sensor_id` req + overrides. |
+| `everquest_planner_guard` | everquest_guard.rs | Evaluate+persist one planner guard decision. `decision_id`, `candidate_kind` req. |
+| `everquest_memory_record` | everquest_memory.rs | Persist hazard/safe-area memory row. `memory_id`, `memory_type`, `memory_kind`, `subject`, `confidence` req. |
+| `everquest_memory_consult` | everquest_memory.rs | Consult memories for a candidate action. `candidate_id`, `candidate_kind` req. |
+| `everquest_world_summary` | everquest_world_summary.rs | Persist compact world-state summary for context injection. |
+| `everquest_world_model_record` | everquest_world_model.rs | Persist a world-model row under approved prefix. |
+| `everquest_world_model_inspect` | everquest_world_model.rs | Inspect approved world-model prefixes/keys/samples. |
+| `everquest_domain_normalize` | everquest_domain.rs | Normalize one state/action/outcome transition. `transition_id`, `state`, `action`, `outcome`, `entity` req. |
+| `everquest_outcome_ingest` | everquest_outcome.rs | Parse EQ log bytes into redacted outcome rows. `start_offset?`, `max_bytes=64KB`, `max_events=64`, `log_path?`, `persist_unknown=true`. |
+| `everquest_trajectory_record` | everquest_trajectory.rs | Persist one ordered trajectory + JSONL provenance. `trajectory_id`, `intent`, `session_id`, `transitions` req. |
+| `everquest_surprise_detect` | everquest_surprise.rs | Compare predicted vs observed; persist surprise row. |
+| `everquest_predictive_model_fit` | everquest_predictive_model.rs | Fit transparent predictive baseline. `model_id` req; `min_confidence=0.60`, `max_trajectories=64`. |
+| `everquest_predictive_model_predict` | everquest_predictive_model.rs | Predict next outcome w/ calibrated abstention. `prediction_id`, `model_id`, `state_row_key`, `candidate_actions` req. |
+| `everquest_action_prior_record` | everquest_scorecard.rs | Persist action-prior prediction/outcome sample. `sample_id`, `prediction_id`, `prediction`, `actual` req. |
+| `everquest_action_prior_scorecard` | everquest_scorecard.rs | Aggregate samples into competence scorecard. `window_id` req; `min_samples=3`, floors/targets. |
+| `everquest_episode_export` | everquest_episode_export.rs | Export redacted trajectory rows to DynamicJEPA episode JSONL. `export_id`, `trajectory_row_keys` req; `output_path?`, `overwrite=false`. |
+| `everquest_contextgraph_ingest` | everquest_contextgraph.rs | Ingest episode JSONL into ContextGraph (external MCP stdio). `ingest_id`, `export_path`, `expected_export_sha256`, `contextgraph_storage_path` req. External call. |
+| `everquest_contextgraph_search` | everquest_contextgraph.rs | Query ContextGraph for memories (require provenance). `search_id`, `query`, `contextgraph_storage_path` req. External call. |
+
+---
+
+## 16.19 Notes & caveats
+
+- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), `browser_cookies`/`browser_storage` (verb-shaped), and all EverQuest tools. Authoritative field sets live in the named `*Params` structs in each source file.
 - **Empty-schema tools** (`input_schema = empty_input_schema()`): `health`, `get_target`, `clear_target`, `control_lease_release`, `control_lease_status`, `tool_profile_status`, `escalation_config_get`.
-- Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`.
+- Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`. The 25 EverQuest tools are the gated set in `server.rs:649-667`.
+
+## Content digests are keyed (#136)
+
+Every `*_sha256` / `text_excerpt` readback that digests content a user typed, read or copied (act type/set_value/press verification, clipboard summaries, browser storage values, OCR/field text) is `HMAC-SHA256` under a per-install key, not a plain SHA-256. The key is generated once and persisted DPAPI-wrapped (`%LOCALAPPDATA%\synapse\content-digest-key.dpapi`, CurrentUser scope), so digests stay comparable across daemon restarts on this install but cannot be tested against candidate values from an offline copy of the database or logs. Consequences: clients can no longer recompute a digest locally and compare it with a readback; browser storage values carry the prefix `hmac-sha256:` instead of `sha256:`. If DPAPI is unavailable the key is memory-only for that process and `CONTENT_DIGEST_KEY_UNPROTECTED` is logged; an existing key file that cannot be read (transient fault, another account) is never overwritten: the process uses an in-memory key and logs `CONTENT_DIGEST_KEY_UNREADABLE` (delete the file to rotate the key on purpose). DPAPI protects against an offline copy of the files, not against another process running as the same Windows user. Digests of non-secret structural data (paths, row payloads, ids) remain plain SHA-256. The `reality` facade rows (CF_KV `reality/*` compact state, baselines, deltas, source refs) are keyed too: focused field value, selected text, window title, element names, HUD raw text, HUD error detail, clipboard excerpt and every content-covering structure hash carry `hmac-sha256:` (rows written before this change carry `sha256:` and compare as changed once after upgrade). Unkeyed on purpose in `reality`: process-path and stored-row-bytes integrity hashes. Hygiene flag rows (`hygiene/flag/v1/*` in CF_KV, #161) persist only the source field, byte offsets, score/heuristics and an `hmac-sha256:` digest of the flagged span and of the source text; the detected span text is never stored. `timeline_redact` re-locates the span by offset, then by a digest-window search over the field. Legacy rows that still carry `span_text` stay readable and are rewritten (and the flag key range compacted) once per process on first hygiene flag access. Known unkeyed remainders: shell request/idempotency fingerprints (`m4`) and `focus_window` foreground-context signatures.

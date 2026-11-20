@@ -16,7 +16,7 @@
 //! number, and parser state. Each cycle reads only bytes past the offset,
 //! consumes complete lines (a trailing partial line waits for the next
 //! cycle unless the source is being finalized), and advances the cursor
-//! only after the transcript rows are durable. Re-ingesting a line is
+//! only after the transcript rows are enqueued. Re-ingesting a line is
 //! idempotent: the same line always lands on the same key. A source file
 //! that shrinks below the cursor offset is a `TRANSCRIPT_SOURCE_TRUNCATED`
 //! sticky error — surfaced loudly, never silently re-read.
@@ -50,17 +50,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use synapse_core::{
     AGENT_TRANSCRIPT_MAX_SUMMARY_CHARS, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS,
     AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS, AgentTranscriptRecord, TranscriptModelUsage,
     TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::{
-    Db,
-    agent_transcripts::{
-        agent_transcript_key, agent_transcript_spawn_prefix, agent_transcript_ts_index_key,
-    },
+    Db, agent_transcripts::agent_transcript_key, agent_transcripts::agent_transcript_spawn_prefix,
     cf, decode_json, encode_json,
 };
 use tokio_util::sync::CancellationToken;
@@ -181,19 +177,6 @@ fn cursor_kv_key(spawn_id: &str) -> Vec<u8> {
 
 fn unix_time_ns_now() -> u64 {
     super::agent_events::unix_time_ns_now()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
 }
 
 /// Truncates `text` to at most `max_chars` characters on a char boundary.
@@ -529,7 +512,6 @@ pub(crate) fn ingest_spawn_dir_once(
     }
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
-    let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     for raw_line in &lines {
@@ -565,25 +547,15 @@ pub(crate) fn ingest_spawn_dir_once(
                 ),
             ));
         }
-        let transcript_key = agent_transcript_key(spawn_id, line_no);
-        ts_index_rows.push((
-            agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
-            transcript_key.clone(),
-        ));
-        rows.push((transcript_key, encoded));
+        rows.push((agent_transcript_key(spawn_id, line_no), encoded));
         cursor.lines_ingested = line_no;
     }
 
     if !rows.is_empty() {
-        db.put_cf_batches_pressure_bypass(vec![
-            (cf::CF_AGENT_TRANSCRIPTS, rows),
-            (cf::CF_KV, ts_index_rows),
-        ])
-        .map_err(|error| {
-            format!(
-                "TRANSCRIPT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines will re-ingest)"
-            )
-        })?;
+        db.put_batch_pressure_bypass(cf::CF_AGENT_TRANSCRIPTS, rows)
+            .map_err(|error| {
+                format!("TRANSCRIPT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines will re-ingest)")
+            })?;
     }
 
     cursor.offset_bytes += consumed_bytes as u64;
@@ -931,7 +903,7 @@ fn parse_line(
         line_no,
         cursor.source,
         raw_line.len() as u64,
-        sha256_hex(raw_line),
+        crate::content_digest::keyed_digest_hex(raw_line),
     );
     let text = match std::str::from_utf8(raw_line) {
         Ok(text) => text,
@@ -1000,7 +972,7 @@ fn parse_line(
 fn set_content(record: &mut AgentTranscriptRecord, content: &str) {
     let (summary, truncated) = bounded_chars(content, AGENT_TRANSCRIPT_MAX_SUMMARY_CHARS);
     record.content_bytes = Some(content.len() as u64);
-    record.content_sha256 = Some(sha256_hex(content.as_bytes()));
+    record.content_sha256 = Some(crate::content_digest::keyed_text_digest_hex(content));
     record.content_summary = Some(summary);
     record.content_truncated = truncated;
 }
@@ -2037,3 +2009,6 @@ fn required_local_u64(object: &Map<String, Value>, field: &str) -> Result<u64, S
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("required u64 field {field:?} is missing or invalid"))
 }
+
+#[cfg(test)]
+mod tests;

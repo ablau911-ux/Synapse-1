@@ -1,7 +1,5 @@
 use rmcp::ErrorData;
-use synapse_action::{
-    ActionBackend, ActionHandle, DoubleClickTiming, EmitState, RecordedInput, RecordingBackend,
-};
+use synapse_action::{ActionHandle, DoubleClickTiming, EmitState, RecordedInput, RecordingBackend};
 use synapse_core::{Action, AimCurve, MouseButton, MouseTarget};
 use tokio::time::{Duration, sleep};
 
@@ -11,18 +9,44 @@ pub(super) async fn execute_actor_actions(
     handle: ActionHandle,
     actions: Vec<Action>,
     timing: DoubleClickTiming,
-    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
+    execute_actor_actions_with(actions, timing, |action| {
+        let handle = handle.clone();
+        async move { handle.execute(action).await }
+    })
+    .await
+}
+
+async fn execute_actor_actions_with<F>(
+    actions: Vec<Action>,
+    timing: DoubleClickTiming,
+    mut execute: impl FnMut(Action) -> F,
+) -> Result<(), ErrorData>
+where
+    F: std::future::Future<Output = Result<(), synapse_action::ActionError>>,
+{
     let action_count = actions.len();
+    let mut button_delivered = false;
     for (action_index, action) in actions.into_iter().enumerate() {
-        boundary.ensure("immediately_before_click_actor_action")?;
-        handle
-            .execute(action)
+        let button = matches!(&action, Action::MouseButton { .. });
+        execute(action)
             .await
-            .map_err(|error| action_error_to_mcp(&error))?;
+            .map_err(|error| actor_click_error(&error, button, button_delivered))?;
+        button_delivered |= button;
         maybe_sleep_between_clicks(action_index, action_count, timing).await;
     }
     Ok(())
+}
+
+fn actor_click_error(error: &synapse_action::ActionError, button: bool, prior: bool) -> ErrorData {
+    let error = action_error_to_mcp(error);
+    if prior {
+        crate::m2::postcondition::mark_input_delivered(error)
+    } else if button {
+        crate::m2::postcondition::mark_input_possibly_delivered(error)
+    } else {
+        super::element::mark_click_not_dispatched(error)
+    }
 }
 
 pub(super) async fn execute_recording(
@@ -30,30 +54,34 @@ pub(super) async fn execute_recording(
     actions: &[Action],
     click_count: u8,
     timing: DoubleClickTiming,
-    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
-    let before_events = recording.events();
-    let before_event_count = before_events.len();
+    let mut new_events = Vec::new();
     let mut emit_state = EmitState::new();
     let action_count = actions.len();
+    let mut button_delivered = false;
     for (action_index, action) in actions.iter().enumerate() {
-        boundary.ensure("immediately_before_recorded_click_action")?;
-        recording
-            .execute(action, &mut emit_state)
-            .map_err(|error| action_error_to_mcp(&error))?;
+        new_events.extend(
+            recording
+                .execute_capturing(action, &mut emit_state)
+                .map_err(|error| {
+                    actor_click_error(
+                        &error,
+                        matches!(action, Action::MouseButton { .. }),
+                        button_delivered,
+                    )
+                })?,
+        );
+        button_delivered |= matches!(action, Action::MouseButton { .. });
         maybe_sleep_between_clicks(action_index, action_count, timing).await;
     }
-    let after_events = recording.events();
-    let new_events = &after_events[before_event_count..];
-    let event_sequence = event_sequence(new_events);
-    let button_event_count = mouse_button_event_count(new_events);
+    let event_sequence = event_sequence(&new_events);
+    let button_event_count = mouse_button_event_count(&new_events);
     let scheduled_inter_click_total_ms =
         u32::from(click_count.saturating_sub(1)) * timing.inter_click_delay_ms;
     tracing::info!(
         code = "M2_ACT_CLICK_RECORDING_READBACK",
         kind = "act_click",
-        before_event_count,
-        after_event_count = after_events.len(),
+        recorded_event_total = recording.event_count(),
         new_event_count = new_events.len(),
         click_count,
         button_event_count,
@@ -61,7 +89,6 @@ pub(super) async fn execute_recording(
         inter_click_delay_ms = timing.inter_click_delay_ms,
         scheduled_inter_click_total_ms,
         event_sequence,
-        ?new_events,
         "readback=recording_backend tool=act_click after_events_readback"
     );
     Ok(())
@@ -113,7 +140,7 @@ fn event_label(event: &RecordedInput) -> String {
         RecordedInput::MouseButtonDown { button } => format!("down:{}", button_label(*button)),
         RecordedInput::MouseButtonUp { button } => format!("up:{}", button_label(*button)),
         RecordedInput::DelayMs { ms } => format!("delay:{ms}"),
-        other => format!("{other:?}"),
+        other => other.log_label(),
     }
 }
 
@@ -143,3 +170,7 @@ const fn button_label(button: MouseButton) -> &'static str {
         MouseButton::X2 => "x2",
     }
 }
+
+#[cfg(test)]
+#[path = "tests/foreground_dispatch_189.rs"]
+mod foreground_dispatch_189;

@@ -143,3 +143,75 @@ pub const DEFAULTS: [RetentionDefault; 17] = [
         hard_cap_mb: 1024,
     },
 ];
+
+/// Logical key + JSON value byte limit for permanent routine identity owners.
+/// Refuse growth instead of evicting evidence that reserves historical ids.
+pub const ROUTINE_IDENTITY_MAX_BYTES: usize = 1024 * 1024;
+
+/// Per-namespace byte budget inside a shared column family (#164).
+///
+/// `CF_KV` has one shared hard cap; without namespace budgets one producer
+/// (mailbox self-sends, 256 KiB workspace values) can fill it and starve every
+/// other writer. A namespace is every key starting with `key_prefix`. The
+/// budget can be overridden with `SYNAPSE_KV_QUOTA_<NAME>_MIB` (see
+/// `synapse-storage`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamespaceQuotaDefault {
+    pub cf: &'static str,
+    pub name: &'static str,
+    pub key_prefix: &'static str,
+    pub quota_mb: u64,
+}
+
+/// Bounded `CF_KV` namespaces. Their budgets sum to less than the `CF_KV`
+/// hard cap, so the remainder stays reserved for everything else.
+pub const KV_NAMESPACE_QUOTAS: [NamespaceQuotaDefault; 5] = [
+    NamespaceQuotaDefault {
+        cf: "CF_KV",
+        name: "mailbox",
+        key_prefix: "agent-mailbox/v1",
+        quota_mb: 16,
+    },
+    NamespaceQuotaDefault {
+        cf: "CF_KV",
+        name: "workspace",
+        key_prefix: "workspace-blackboard/v1",
+        quota_mb: 16,
+    },
+    // Route memory (#2326): per-app tier stats, self-pruned per app.
+    NamespaceQuotaDefault {
+        cf: "CF_KV",
+        name: "route_memory",
+        key_prefix: "route-memory/v1",
+        quota_mb: 4,
+    },
+    // Hand-off and lessons ledger (Phase 7 part 3): rows expire after 90
+    // days and are removed on the next ledger write.
+    NamespaceQuotaDefault {
+        cf: "CF_KV",
+        name: "ledger",
+        key_prefix: "workspace-ledger/v1",
+        quota_mb: 8,
+    },
+    // Action history (Phase 7 part 4): one row per finished mutating tool
+    // call; rows past the retention days are removed on the next write.
+    NamespaceQuotaDefault {
+        cf: "CF_KV",
+        name: "action_history",
+        key_prefix: "action-history/v1",
+        quota_mb: 4,
+    },
+];
+
+/// `CF_KV` key prefixes whose writes are never refused by the shared hard cap
+/// or a namespace budget: MCP sessions, approvals and escalations, shell-job
+/// idempotency markers and agent tasks. These rows are small, bounded by live
+/// state, and the daemon cannot make progress when they fail to write.
+pub const KV_CRITICAL_PREFIXES: [&str; 6] = [
+    "mcp/session/v1/",
+    "mcp/session-lease/v1/",
+    "approval/v1/",
+    "escalation/v1/",
+    "m4/act_run_shell/idempotency/v1/",
+    "agent-task/v1/",
+];

@@ -1,38 +1,34 @@
 use super::{BTreeMap, ErrorData, Health, SubsystemHealth, SynapseService};
 use rmcp::model::Tool;
-use rmcp::schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 use synapse_action::BackendResolutionPolicy;
-use synapse_core::{Backend, ChromeBridgeDetail};
+use synapse_core::Backend;
 
-/// Verbosity control for the `health` tool response.
-///
-/// `health` is called frequently and its verbose per-subsystem `detail` prose
-/// dominates the payload token cost (issue #1554). `Compact` (the default)
-/// keeps every structured verdict field but drops the long human-readable
-/// `detail` blobs, so callers still learn the health conclusion at a fraction
-/// of the wire size. `Full` preserves the complete legacy output for
-/// debugging.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum HealthDetail {
-    /// Drop verbose per-subsystem `detail` prose; keep structured verdicts.
-    #[default]
-    Compact,
-    /// Preserve every `detail` string (the legacy behavior).
-    Full,
+#[path = "health_storage_batcher.rs"]
+mod storage_batcher;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HttpHealthTelemetry {
+    pub active_sessions: usize,
+    pub max_sessions: usize,
+    pub session_capacity_rejections_total: u64,
+    pub active_connections: usize,
+    pub connection_limit: usize,
+    pub connection_admission_rejections_total: u64,
+    pub header_read_timeouts_total: u64,
+    pub inflight_requests: usize,
+    pub duplicate_inflight_rejections_total: u64,
 }
 
-/// Request parameters for the `health` tool.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields, default)]
-pub struct HealthParams {
-    /// `compact` (default) trims verbose per-subsystem detail prose while
-    /// keeping every structured status field; `full` returns the complete
-    /// diagnostic detail for every subsystem.
-    pub detail: HealthDetail,
+type HttpTelemetryReader =
+    std::sync::Arc<dyn Fn(Option<usize>) -> HttpHealthTelemetry + Send + Sync>;
+
+fn http_telemetry_readers() -> &'static std::sync::Mutex<BTreeMap<usize, HttpTelemetryReader>> {
+    static READERS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<usize, HttpTelemetryReader>>> =
+        std::sync::OnceLock::new();
+    READERS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 fn state_lock_health() -> SubsystemHealth {
@@ -54,57 +50,49 @@ fn storage_pressure_status(level: synapse_storage::DiskPressureLevel) -> String 
     .to_owned()
 }
 
-fn storage_maintenance_error(readback: &crate::m3::StorageMaintenanceReadback) -> Option<String> {
-    let mut reasons = Vec::new();
-    if !readback.gc_task_running {
-        reasons.push("storage GC task is not running".to_owned());
-    }
-    if !readback.pressure_task_running {
-        reasons.push("storage pressure task is not running".to_owned());
-    }
-    if !readback.pressure_probe.observed {
-        reasons.push("storage pressure probe has not completed successfully".to_owned());
-    }
-    if let Some(error) = &readback.gc_task.last_error {
-        reasons.push(format!("storage GC last_error={error}"));
-    }
-    if let Some(error) = &readback.pressure_probe.last_error {
-        reasons.push(format!("storage pressure last_error={error}"));
-    }
-    (!reasons.is_empty()).then(|| reasons.join("; "))
-}
-
-fn apply_storage_maintenance_fields(
-    health: &mut SubsystemHealth,
-    readback: &crate::m3::StorageMaintenanceReadback,
-) {
-    health.storage_gc_task_running = Some(readback.gc_task_running);
-    health.storage_pressure_task_running = Some(readback.pressure_task_running);
-    health.storage_pressure_probe_observed = Some(readback.pressure_probe.observed);
-    health.storage_pressure_last_free_bytes = readback.pressure_probe.last_free_bytes;
-    health.storage_pressure_last_level = readback
-        .pressure_probe
-        .last_level
-        .map(|level| format!("{level:?}"));
-    health.storage_gc_last_started_unix_ms = readback.gc_task.last_started_unix_ms;
-    health.storage_gc_last_completed_unix_ms = readback.gc_task.last_completed_unix_ms;
-    health.storage_gc_last_duration_ms = readback.gc_task.last_duration_ms;
-    health.storage_gc_last_error = readback.gc_task.last_error.clone();
-    health.storage_gc_last_unsupported_policy_skips =
-        readback.gc_task.last_unsupported_policy_skips.clone();
-    health.storage_pressure_last_started_unix_ms = readback.pressure_probe.last_started_unix_ms;
-    health.storage_pressure_last_completed_unix_ms = readback.pressure_probe.last_completed_unix_ms;
-    health.storage_pressure_last_duration_ms = readback.pressure_probe.last_duration_ms;
-    health.storage_pressure_last_error = readback.pressure_probe.last_error.clone();
-}
-
 impl SynapseService {
-    pub(crate) fn health_payload_for_session(
+    #[cfg(test)]
+    pub(crate) fn health_payload(&self) -> Health {
+        self.health_payload_with_http_sessions(None)
+    }
+
+    fn http_telemetry_key(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.m3_state) as usize
+    }
+
+    pub(crate) fn install_http_telemetry_reader(
         &self,
-        session_id: Option<&str>,
-        detail: HealthDetail,
+        reader: impl Fn(Option<usize>) -> HttpHealthTelemetry + Send + Sync + 'static,
+    ) {
+        if let Ok(mut readers) = http_telemetry_readers().lock() {
+            readers.insert(self.http_telemetry_key(), std::sync::Arc::new(reader));
+        }
+    }
+
+    pub(crate) fn registered_http_telemetry(
+        &self,
+        active_sessions: Option<usize>,
+    ) -> Option<HttpHealthTelemetry> {
+        let reader = http_telemetry_readers()
+            .lock()
+            .ok()
+            .and_then(|readers| readers.get(&self.http_telemetry_key()).cloned())?;
+        Some(reader(active_sessions))
+    }
+
+    pub(crate) fn health_payload_for_session(&self, session_id: Option<&str>) -> Health {
+        self.health_payload_with_http_sessions_and_session(None, session_id)
+    }
+
+    pub(crate) fn health_payload_with_http_telemetry(
+        &self,
+        telemetry: HttpHealthTelemetry,
     ) -> Health {
-        self.health_payload_with_http_sessions_and_session_detail(None, session_id, detail)
+        self.health_payload_with_http_telemetry_and_session(
+            Some(telemetry),
+            Some(telemetry.active_sessions),
+            None,
+        )
     }
 
     pub(crate) fn health_payload_with_http_sessions(
@@ -114,26 +102,23 @@ impl SynapseService {
         self.health_payload_with_http_sessions_and_session(active_sessions, None)
     }
 
-    /// Non-MCP callers (HTTP `/health`, dashboard, tests) keep the full detail
-    /// so their existing readback is unchanged; only the frequently-called MCP
-    /// `health` tool defaults to compact.
     pub(crate) fn health_payload_with_http_sessions_and_session(
         &self,
         active_sessions: Option<usize>,
         session_id: Option<&str>,
     ) -> Health {
-        self.health_payload_with_http_sessions_and_session_detail(
+        self.health_payload_with_http_telemetry_and_session(
+            self.registered_http_telemetry(active_sessions),
             active_sessions,
             session_id,
-            HealthDetail::Full,
         )
     }
 
-    pub(crate) fn health_payload_with_http_sessions_and_session_detail(
+    fn health_payload_with_http_telemetry_and_session(
         &self,
+        telemetry: Option<HttpHealthTelemetry>,
         active_sessions: Option<usize>,
         session_id: Option<&str>,
-        detail: HealthDetail,
     ) -> Health {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
@@ -141,25 +126,24 @@ impl SynapseService {
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("perception".to_owned(), self.perception_health());
         subsystems.insert("action".to_owned(), self.action_health());
-        subsystems.insert(
-            "agent_spawn".to_owned(),
-            SubsystemHealth {
-                status: if super::m4_tools::agent_spawn_enabled() {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-                .to_owned(),
-                detail: Some("Operator gate: SYNAPSE_AGENT_SPAWN_ENABLED must equal 1 in the daemon environment".to_owned()),
-                ..SubsystemHealth::default()
-            },
-        );
         subsystems.insert("audio".to_owned(), self.audio_health());
+        let detailed_bridge_health = self
+            .tool_profile_snapshot(session_id)
+            .is_ok_and(|snapshot| {
+                snapshot.profile == super::tool_profiles::ToolProfileKind::BrowserDebugger
+            });
         subsystems.insert(
             "chrome_bridge".to_owned(),
-            crate::chrome_debugger_bridge::health_subsystem(),
+            crate::chrome_debugger_bridge::health_subsystem_for_profile(detailed_bridge_health),
         );
-        subsystems.insert("http".to_owned(), self.http_health(active_sessions));
+        // Multi-browser bridge: one row per declared non-chrome browser
+        // (`browsers/*.json` health_key); `not_installed` never degrades `ok`.
+        subsystems
+            .extend(crate::chrome_debugger_bridge::health_rows::browser_bridge_health_subsystems());
+        subsystems.insert(
+            "http".to_owned(),
+            self.http_health(active_sessions, telemetry),
+        );
         subsystems.insert("daemon_drain".to_owned(), self.daemon_drain_health());
         subsystems.insert(
             "daemon_lifecycle".to_owned(),
@@ -170,6 +154,11 @@ impl SynapseService {
             self.public_tool_registry_health(),
         );
         subsystems.insert("facade_contract".to_owned(), self.facade_contract_health());
+        // #269: persistent vs ephemeral digest key + reason code; never `error`.
+        subsystems.insert(
+            "content_digest_key".to_owned(),
+            crate::content_digest::health_subsystem(),
+        );
         let tool_surface = self.tool_surface_fingerprint(session_id);
         if let Some(error) = &tool_surface.error {
             subsystems.insert(
@@ -182,7 +171,6 @@ impl SynapseService {
             );
         }
         let ok = subsystems.values().all(|health| health.status != "error");
-        apply_health_detail(&mut subsystems, detail);
         Health {
             ok,
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -332,6 +320,8 @@ impl SynapseService {
                 };
             }
         };
+        // Plain SHA-256 on purpose (#174): fingerprint of the public tool surface, which
+        // is matched against the host-side tool-surface snapshot hash; no user content.
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         ToolSurfaceFingerprint {
@@ -341,125 +331,102 @@ impl SynapseService {
         }
     }
 
-    /// Report the *exact* tool surface the client is served.
-    ///
-    /// Health's `tool_names`/`tool_count`/`tool_surface_sha256` must mirror what
-    /// `tools/list` actually returns for the same session, or health lies about
-    /// the surface. The served surface (see `ServerHandler::list_tools`) is
-    /// `tools_for_session_profile(session_id)` for every session — including the
-    /// unscoped stdio/admin case where `session_id` is `None` and the full
-    /// break-glass surface (raw `act_*` primitives such as `act_run_shell_status`
-    /// included) is served. Deriving health from that single source of truth
-    /// makes the two surfaces identical by construction, closing the drift class
-    /// where a hand-maintained parallel list (previously a `public_tool_names`
-    /// filter for the `None` case) silently diverged from what was served
-    /// (issue #1612).
     fn health_tool_surface(&self, session_id: Option<&str>) -> Result<Vec<Tool>, ErrorData> {
-        self.tools_for_session_profile(session_id)
+        if session_id.is_some() {
+            return self.tools_for_session_profile(session_id);
+        }
+        let public_snapshot = self.public_tool_registry_snapshot()?;
+        let public_names = public_snapshot
+            .public_tool_names
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut tools = self.full_sanitized_tools();
+        tools.retain(|tool| public_names.contains(tool.name.as_ref()));
+        Ok(tools)
     }
 
     fn storage_health(&self) -> SubsystemHealth {
+        self.storage_health_with(storage_batcher::degraded_detail_for)
+    }
+
+    /// [`Self::storage_health`] with the batcher-degraded reader injected
+    /// (test seam: drives the latched-batcher-failure branch without a real
+    /// failed RocksDB commit).
+    pub(crate) fn storage_health_with(
+        &self,
+        batcher_degraded_for: impl Fn(&synapse_storage::Db) -> Option<String>,
+    ) -> SubsystemHealth {
         match self.m3_state.lock() {
             Ok(state) => {
                 let db_path = state
                     .db_path
                     .as_ref()
                     .map(|path| path.display().to_string());
-                let maintenance = state.storage_maintenance_readback();
                 if let Some(error) = &state.storage_last_error {
-                    let mut health = SubsystemHealth {
+                    return SubsystemHealth {
                         status: "error".to_owned(),
                         detail: Some(error.clone()),
                         db_path,
                         ..SubsystemHealth::default()
                     };
-                    apply_storage_maintenance_fields(&mut health, &maintenance);
-                    return health;
                 }
+                let batcher_degraded = state.db.as_deref().and_then(batcher_degraded_for);
                 let Some(runtime) = &state.reflex_runtime else {
                     if state.db.is_some() {
-                        let maintenance_error = storage_maintenance_error(&maintenance);
-                        let cf_sizes = state.db.as_ref().and_then(|db| {
-                            db.cf_live_data_size_estimates()
-                                .ok()
-                                .map(|(sizes, _)| sizes)
-                        });
-                        let mut health = SubsystemHealth {
-                            status: if maintenance_error.is_some() {
-                                "error".to_owned()
+                        return SubsystemHealth {
+                            status: if batcher_degraded.is_some() {
+                                storage_batcher::DEGRADED_STATUS.to_owned()
                             } else {
                                 "ok".to_owned()
                             },
-                            detail: Some(match maintenance_error {
-                                Some(error) => format!(
-                                    "storage opened at daemon startup (reflex runtime idle); maintenance unhealthy: {error}"
-                                ),
-                                None => "storage opened at daemon startup (reflex runtime idle); maintenance tasks running and pressure probe observed".to_owned(),
-                            }),
+                            detail: Some(batcher_degraded.unwrap_or_else(|| {
+                                "storage opened at daemon startup (reflex runtime idle)".to_owned()
+                            })),
                             db_path,
                             schema_version: Some(synapse_core::SCHEMA_VERSION),
-                            cf_sizes,
                             ..SubsystemHealth::default()
                         };
-                        apply_storage_maintenance_fields(&mut health, &maintenance);
-                        return health;
                     }
-                    let mut health = SubsystemHealth {
+                    return SubsystemHealth {
                         status: "initializing".to_owned(),
                         detail: Some("storage opens on first reflex tool call".to_owned()),
                         db_path,
                         ..SubsystemHealth::default()
                     };
-                    apply_storage_maintenance_fields(&mut health, &maintenance);
-                    return health;
                 };
                 match runtime.lock() {
                     Ok(runtime) => match runtime.storage_cf_live_data_size_estimates() {
-                        Ok(cf_sizes) => {
-                            let maintenance_error = storage_maintenance_error(&maintenance);
-                            let mut health = SubsystemHealth {
-                                status: maintenance_error.as_ref().map_or_else(
-                                    || storage_pressure_status(runtime.storage_pressure_level()),
-                                    |_| "error".to_owned(),
-                                ),
-                                detail: Some(match maintenance_error {
-                                    Some(error) => format!(
-                                        "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance unhealthy: {error}"
-                                    ),
-                                    None => "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance tasks running and pressure probe observed".to_owned(),
-                                }),
-                                db_path: Some(runtime.storage_path().display().to_string()),
-                                schema_version: Some(runtime.schema_version()),
-                                cf_sizes: Some(cf_sizes.0),
-                                ..SubsystemHealth::default()
-                            };
-                            apply_storage_maintenance_fields(&mut health, &maintenance);
-                            health
-                        }
-                        Err(error) => {
-                            let mut health = SubsystemHealth {
-                                status: "error".to_owned(),
-                                detail: Some(error.to_string()),
-                                db_path: Some(runtime.storage_path().display().to_string()),
-                                schema_version: Some(runtime.schema_version()),
-                                ..SubsystemHealth::default()
-                            };
-                            apply_storage_maintenance_fields(&mut health, &maintenance);
-                            health
-                        }
-                    },
-                    Err(_err) => {
-                        let mut health = SubsystemHealth {
-                            status: "error".to_owned(),
-                            detail: Some(
-                                "reflex runtime lock poisoned while reading storage".to_owned(),
-                            ),
-                            db_path,
+                        Ok(cf_sizes) => SubsystemHealth {
+                            status: if batcher_degraded.is_some() {
+                                storage_batcher::DEGRADED_STATUS.to_owned()
+                            } else {
+                                storage_pressure_status(runtime.storage_pressure_level())
+                            },
+                            detail: Some(batcher_degraded.unwrap_or_else(|| {
+                                "storage runtime initialized; cf_sizes use RocksDB live-data estimates"
+                                    .to_owned()
+                            })),
+                            db_path: Some(runtime.storage_path().display().to_string()),
+                            schema_version: Some(runtime.schema_version()),
+                            cf_sizes: Some(cf_sizes.0),
                             ..SubsystemHealth::default()
-                        };
-                        apply_storage_maintenance_fields(&mut health, &maintenance);
-                        health
-                    }
+                        },
+                        Err(error) => SubsystemHealth {
+                            status: "error".to_owned(),
+                            detail: Some(error.to_string()),
+                            db_path: Some(runtime.storage_path().display().to_string()),
+                            schema_version: Some(runtime.schema_version()),
+                            ..SubsystemHealth::default()
+                        },
+                    },
+                    Err(_err) => SubsystemHealth {
+                        status: "error".to_owned(),
+                        detail: Some(
+                            "reflex runtime lock poisoned while reading storage".to_owned(),
+                        ),
+                        db_path,
+                        ..SubsystemHealth::default()
+                    },
                 }
             }
             Err(_err) => state_lock_health(),
@@ -641,14 +608,15 @@ impl SynapseService {
                     SubsystemHealth {
                         status: if emitter_available { "ok" } else { "error" }.to_owned(),
                         detail: Some(format!(
-                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {} {}",
+                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {} {} {}",
                             emitter_available,
                             state.recording_enabled(),
                             operator_hotkey,
                             allow_shell,
                             allow_launch,
                             lease_detail,
-                            search_tools
+                            search_tools,
+                            self.m4_config.agent_spawn().health_detail()
                         )),
                         backend_resolution: Some(backend_resolution_health(source, policy)),
                         run_shell_inline_await_limit_ms: Some(
@@ -738,16 +706,42 @@ impl SynapseService {
         }
     }
 
-    fn http_health(&self, active_sessions: Option<usize>) -> SubsystemHealth {
+    fn http_health(
+        &self,
+        active_sessions: Option<usize>,
+        telemetry: Option<HttpHealthTelemetry>,
+    ) -> SubsystemHealth {
         match self.m3_state.lock() {
             Ok(state) => {
                 if state.shutdown_reason == "http" {
-                    let diagnostics = crate::http::http_transport_diagnostics_detail();
+                    let tombstones = self
+                        .terminated_sessions
+                        .lock()
+                        .ok()
+                        .map(|terminated| terminated.stats());
                     SubsystemHealth {
                         status: "ok".to_owned(),
-                        detail: Some(format!("HTTP transport initialized; {diagnostics}")),
+                        detail: Some("HTTP transport initialized".to_owned()),
                         bind_addr: Some(state.bind.clone()),
-                        active_sessions,
+                        active_sessions: telemetry
+                            .map(|http| http.active_sessions)
+                            .or(active_sessions),
+                        max_sessions: telemetry.map(|http| http.max_sessions),
+                        session_capacity_rejections_total: telemetry
+                            .map(|http| http.session_capacity_rejections_total),
+                        terminated_session_tombstones: tombstones.map(|stats| stats.len),
+                        terminated_session_tombstone_limit: tombstones.map(|stats| stats.capacity),
+                        terminated_session_tombstone_evictions_total: tombstones
+                            .map(|stats| stats.evicted_total),
+                        active_connections: telemetry.map(|http| http.active_connections),
+                        connection_limit: telemetry.map(|http| http.connection_limit),
+                        connection_admission_rejections_total: telemetry
+                            .map(|http| http.connection_admission_rejections_total),
+                        header_read_timeouts_total: telemetry
+                            .map(|http| http.header_read_timeouts_total),
+                        inflight_requests: telemetry.map(|http| http.inflight_requests),
+                        duplicate_inflight_rejections_total: telemetry
+                            .map(|http| http.duplicate_inflight_rejections_total),
                         sse_subscribers: Some(state.sse_state.active_subscription_count()),
                         ..SubsystemHealth::default()
                     }
@@ -771,109 +765,6 @@ struct ToolSurfaceFingerprint {
     names: Vec<String>,
     sha256: String,
     error: Option<String>,
-}
-
-/// Apply the requested detail verbosity to the assembled subsystem map.
-///
-/// `Compact` (the default) drops every verbose per-subsystem `detail` string
-/// but leaves the structured verdict fields (status, counts, schema versions,
-/// timeouts, ...) untouched, so the health conclusion is unchanged — only the
-/// human-readable prose is trimmed. `Full` preserves the `detail` strings.
-///
-/// The `chrome_bridge` subsystem's only structured information historically
-/// lived inside its concatenated `detail` blob, so in both modes we parse that
-/// blob into the typed `ChromeBridgeDetail`. `Full` keeps the original blob and
-/// the fully-parsed struct; `Compact` keeps only the verdict-critical fields
-/// and drops the blob.
-fn apply_health_detail(subsystems: &mut BTreeMap<String, SubsystemHealth>, detail: HealthDetail) {
-    for (name, subsystem) in subsystems.iter_mut() {
-        if name == "chrome_bridge" {
-            let parsed = subsystem.detail.as_deref().map(parse_chrome_bridge_detail);
-            match detail {
-                HealthDetail::Full => {
-                    subsystem.chrome_bridge = parsed;
-                }
-                HealthDetail::Compact => {
-                    subsystem.chrome_bridge = parsed.map(compact_chrome_bridge_detail);
-                    subsystem.detail = None;
-                }
-            }
-        } else if detail == HealthDetail::Compact {
-            subsystem.detail = None;
-        }
-    }
-}
-
-/// Parse the `chrome_bridge` `detail` blob (`key=value` tokens joined by
-/// spaces, with trailing free-text guidance) into the typed
-/// `ChromeBridgeDetail`.
-///
-/// Only whitespace-free `key=value` tokens are consumed, so the trailing
-/// human-readable guidance strings (which contain spaces) are ignored rather
-/// than corrupting fields. Full-mode responses retain the original `detail`
-/// string, so no information is lost even for fields this parser does not
-/// surface.
-fn parse_chrome_bridge_detail(detail: &str) -> ChromeBridgeDetail {
-    let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
-    for token in detail.split_whitespace() {
-        if let Some((key, value)) = token.split_once('=') {
-            if !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-            {
-                // First occurrence wins; blob keys are unique.
-                fields.entry(key).or_insert(value);
-            }
-        }
-    }
-    let bool_field = |key: &str| {
-        fields.get(key).and_then(|value| match *value {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        })
-    };
-    let u64_field = |key: &str| {
-        fields
-            .get(key)
-            .and_then(|value| (*value).parse::<u64>().ok())
-    };
-    let string_field = |key: &str| fields.get(key).map(|value| (*value).to_owned());
-    ChromeBridgeDetail {
-        tab_control_available: bool_field("tab_control_available"),
-        extension_stale: bool_field("extension_stale"),
-        extension_stale_reasons: string_field("extension_stale_reasons"),
-        reason: string_field("reason"),
-        host_count: u64_field("host_count"),
-        queued_count: u64_field("queued_count"),
-        pending_count: u64_field("pending_count"),
-        extension_id: string_field("extension_id"),
-        expected_extension_id: string_field("expected_extension_id"),
-        extension_version: string_field("extension_version"),
-        transport: string_field("transport"),
-        endpoint: string_field("endpoint"),
-    }
-}
-
-/// Reduce a fully-parsed `ChromeBridgeDetail` to the verdict-critical fields
-/// retained in compact health responses. The verbose identity/version/endpoint
-/// fields are dropped (they remain available via `detail=full`).
-fn compact_chrome_bridge_detail(detail: ChromeBridgeDetail) -> ChromeBridgeDetail {
-    ChromeBridgeDetail {
-        tab_control_available: detail.tab_control_available,
-        extension_stale: detail.extension_stale,
-        extension_stale_reasons: detail.extension_stale_reasons,
-        reason: detail.reason,
-        host_count: detail.host_count,
-        queued_count: detail.queued_count,
-        pending_count: detail.pending_count,
-        extension_id: None,
-        expected_extension_id: None,
-        extension_version: None,
-        transport: None,
-        endpoint: None,
-    }
 }
 
 fn canonical_json_bytes(value: Value) -> serde_json::Result<Vec<u8>> {
@@ -954,3 +845,11 @@ const fn backend_config_name(backend: Backend) -> &'static str {
         Backend::Auto => "auto",
     }
 }
+
+#[cfg(test)]
+#[path = "tests/http_health_readback_13.rs"]
+mod http_health_readback_13;
+
+#[cfg(test)]
+#[path = "tests/digest_key_health_269.rs"]
+mod digest_key_health_269;

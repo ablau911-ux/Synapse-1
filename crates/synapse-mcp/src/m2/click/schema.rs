@@ -46,7 +46,6 @@ pub struct ActClickParams {
     #[serde(default)]
     #[schemars(
         default,
-        range(min = 1, max = 4_294_967_295_u64),
         description = "Optional target top-level HWND that verify_delta must use as the physical Source of Truth for point clicks. Intended for target-scoped routers that already validated and bound the native window; stale or conflicting HWNDs fail closed before input."
     )]
     pub verify_target_window_hwnd: Option<i64>,
@@ -65,6 +64,12 @@ pub struct ActClickParams {
     #[serde(skip)]
     #[schemars(skip)]
     pub deprecated_curve_alias_used: bool,
+    /// #2326 internal hint, set only by `target_act` from route memory: enter
+    /// on the coordinate route (postmessage, then the gated foreground tier)
+    /// instead of UIA. Never part of the public JSON contract.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub coordinate_first: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -131,6 +136,11 @@ pub struct ActClickTierAttempt {
     pub error_code: Option<String>,
     pub detail: Option<String>,
     pub required_foreground: bool,
+    /// Why a foreground (SendInput) attempt was allowed: `claimed_target` for
+    /// the #187 claimed-window route, `profile` for break_glass/full
+    /// capability. Absent on background tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_authorization: Option<String>,
 }
 
 pub type ActClickPostcondition = ActPostcondition;
@@ -206,6 +216,7 @@ impl<'de> Deserialize<'de> for ActClickParams {
             auto_wait: raw.auto_wait,
             auto_wait_timeout_ms: raw.auto_wait_timeout_ms,
             deprecated_curve_alias_used,
+            coordinate_first: false,
         })
     }
 }

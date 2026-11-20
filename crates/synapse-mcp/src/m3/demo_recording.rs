@@ -18,7 +18,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use rmcp::{
     ErrorData,
     schemars::{self, JsonSchema},
@@ -36,6 +35,7 @@ use synapse_storage::{
     timeline::{decode_timeline_key, timeline_key, timeline_scan_start},
 };
 
+use super::episodes::{hex_encode, now_ts_ns};
 use crate::m1::mcp_error;
 
 use super::{
@@ -830,6 +830,8 @@ fn resolve_demo_replay_path(path: Option<&str>, demo_id: &str) -> Result<PathBuf
     normalize_replay_path(&replay_root(), path.or(Some(default_path.as_str())))
 }
 
+// Plain SHA-256 on purpose (#174): derives a demo id from profile id, time and
+// session id (identifiers, not typed content); the id names the replay file.
 fn generated_demo_id(profile_id: &str, now_ns: u64, by_session: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(profile_id.as_bytes());
@@ -864,24 +866,9 @@ fn internal(error: anyhow::Error) -> ErrorData {
     mcp_error(error_codes::TOOL_INTERNAL_ERROR, format!("{error:#}"))
 }
 
-fn now_ts_ns() -> u64 {
-    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    u64::try_from(nanos).unwrap_or(0)
-}
-
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }

@@ -14,20 +14,8 @@
 #![cfg(windows)]
 
 use std::{
-    collections::{HashMap, HashSet},
-    fs::{self, OpenOptions},
-    io::{Read as _, Write as _},
-    os::windows::{
-        ffi::OsStrExt as _,
-        fs::{MetadataExt as _, OpenOptionsExt as _},
-        io::AsRawHandle as _,
-    },
-    path::{Path, PathBuf},
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::HashSet,
+    time::{Duration, Instant},
 };
 
 use chromiumoxide::Browser;
@@ -43,48 +31,34 @@ use chromiumoxide::cdp::browser_protocol::network::{
     EventRequestWillBeSent, RequestId,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat,
-    EnableParams as PageEnableParams, EventDomContentEventFired, EventFrameNavigated,
-    EventLifecycleEvent, EventLoadEventFired, EventNavigatedWithinDocument, GetFrameTreeParams,
-    GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
-    NavigateToHistoryEntryParams, ReloadParams, RemoveScriptToEvaluateOnNewDocumentParams,
-    ScriptIdentifier, SetDocumentContentParams, SetLifecycleEventsEnabledParams, Viewport,
+    AddScriptToEvaluateOnNewDocumentParams, EnableParams as PageEnableParams,
+    EventDomContentEventFired, EventFrameNavigated, EventLifecycleEvent, EventLoadEventFired,
+    EventNavigatedWithinDocument, GetLayoutMetricsParams, GetNavigationHistoryParams,
+    NavigateParams, NavigateToHistoryEntryParams, ReloadParams,
+    RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier, SetDocumentContentParams,
+    SetLifecycleEventsEnabledParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
-use chromiumoxide::page::ScreenshotParams;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
-#[derive(Clone, Debug)]
-struct DurableInitScriptEntry {
-    endpoint: String,
-    target_id: String,
-    identifier: String,
-}
-
-fn durable_init_script_registry() -> &'static Mutex<HashMap<String, DurableInitScriptEntry>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, DurableInitScriptEntry>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn durable_init_script_key(endpoint: &str, target_id: &str, identifier: &str) -> String {
-    format!("{endpoint}\n{target_id}\n{identifier}")
-}
-
-#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
-pub struct CdpDurableInitScriptDrainReadback {
-    pub found: usize,
-    pub removed: usize,
-    pub failures: Vec<String>,
-    pub active_after: usize,
-}
 use serde_json::{Value, json};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
-use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
+use crate::{
+    A11yError, A11yResult, ComboBoxReadback, Dropdown, DropdownKind, FieldKind, OptionChoice,
+    SetMethod,
+    cdp_capture::{background_capture_params, capture_png_without_activation},
+    cdp_dom::rect_from_quad,
+};
 
 const CDP_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+mod stroke_bounded;
+use stroke_bounded::dispatch_cdp_mouse_stroke_raw;
+
+#[cfg(test)]
+mod stroke_release_193;
 
 /// Where a CDP action landed, in viewport CSS coordinates (diagnostics).
 #[derive(Copy, Clone, Debug, PartialEq, Serialize)]
@@ -131,7 +105,7 @@ pub struct CdpWheelDelta {
 }
 
 /// One key descriptor for `Input.dispatchKeyEvent`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CdpKeyStroke {
     pub key: String,
     pub code: String,
@@ -216,7 +190,11 @@ pub struct CdpActiveElementState {
     pub target_id: String,
     pub has_active_element: bool,
     pub is_editable: bool,
+    #[serde(default)]
+    pub is_password: bool,
     pub tag_name: String,
+    pub input_type: String,
+    pub element_path: String,
     pub id: String,
     pub name: String,
     pub value: String,
@@ -610,34 +588,6 @@ pub async fn cdp_click_node(
     click_count: i64,
     modifiers: i64,
 ) -> A11yResult<CdpActionPoint> {
-    let endpoint = endpoint.to_owned();
-    let page_title_hint = page_title_hint.to_owned();
-    let target_id_hint = target_id_hint.map(ToOwned::to_owned);
-    run_owned_cdp_input("click node", async move {
-        cdp_click_node_owned(
-            &endpoint,
-            &page_title_hint,
-            target_id_hint.as_deref(),
-            backend_node_id,
-            button,
-            click_count,
-            modifiers,
-        )
-        .await
-    })
-    .await
-}
-
-async fn cdp_click_node_owned(
-    endpoint: &str,
-    page_title_hint: &str,
-    target_id_hint: Option<&str>,
-    backend_node_id: i64,
-    button: CdpMouseButton,
-    click_count: i64,
-    modifiers: i64,
-) -> A11yResult<CdpActionPoint> {
-    let input_endpoint = endpoint.to_owned();
     with_node_center(
         endpoint,
         page_title_hint,
@@ -652,19 +602,75 @@ async fn cdp_click_node_owned(
                 modifiers,
             ))
             .await
-            .map_err(|err| dispatch_err(&err))?;
-            dispatch_mouse_click_on_page(
-                &input_endpoint,
-                &page,
+            .map_err(|err| ClickEventStage::BeforeButton.error(&err))?;
+            page.execute(mouse_event_with_modifiers(
+                DispatchMouseEventType::MousePressed,
                 center,
                 button.to_cdp(),
                 click_count.max(1),
                 modifiers,
-            )
-            .await?;
+            ))
+            .await
+            .map_err(|err| ClickEventStage::Press.error(&err))?;
+            page.execute(mouse_event_with_modifiers(
+                DispatchMouseEventType::MouseReleased,
+                center,
+                button.to_cdp(),
+                click_count.max(1),
+                modifiers,
+            ))
+            .await
+            .map_err(|err| ClickEventStage::AfterPress.error(&err))?;
             Ok(center)
         },
     )
+    .await
+}
+
+/// Dispatches a trusted mouse click at a viewport point on one CDP page
+/// without activating its native host window.
+///
+/// # Errors
+///
+/// Returns a CDP action error if the target, point, or input dispatch fails.
+pub async fn cdp_click_point_target(
+    endpoint: &str,
+    target_id: &str,
+    point: CdpActionPoint,
+    button: CdpMouseButton,
+    click_count: i64,
+    modifiers: i64,
+) -> A11yResult<CdpActionPoint> {
+    validate_cdp_action_point(point, "mouse click")?;
+    if click_count < 1 {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "CDP mouse click count must be positive".to_owned(),
+        });
+    }
+    with_target_page(endpoint, target_id, |page| async move {
+        for kind in [
+            DispatchMouseEventType::MouseMoved,
+            DispatchMouseEventType::MousePressed,
+            DispatchMouseEventType::MouseReleased,
+        ] {
+            let count = if matches!(kind, DispatchMouseEventType::MouseMoved) {
+                0
+            } else {
+                click_count
+            };
+            let stage = ClickEventStage::of(&kind);
+            page.execute(mouse_event_with_modifiers(
+                kind,
+                point,
+                button.to_cdp(),
+                count,
+                modifiers,
+            ))
+            .await
+            .map_err(|error| stage.error(&error))?;
+        }
+        Ok(point)
+    })
     .await
 }
 
@@ -681,22 +687,13 @@ pub async fn cdp_touch_tap_node(
     target_id_hint: Option<&str>,
     backend_node_id: i64,
 ) -> A11yResult<CdpTouchTapResult> {
-    let endpoint = endpoint.to_owned();
-    let page_title_hint = page_title_hint.to_owned();
-    let target_id_hint = target_id_hint.map(ToOwned::to_owned);
-    run_owned_cdp_input("touch tap node", async move {
-        let input_endpoint = endpoint.clone();
-        with_node_center(
-            &endpoint,
-            &page_title_hint,
-            target_id_hint.as_deref(),
-            backend_node_id,
-            |page, center| async move {
-                dispatch_touch_tap_on_page(&input_endpoint, &page, center).await
-            },
-        )
-        .await
-    })
+    with_node_center(
+        endpoint,
+        page_title_hint,
+        target_id_hint,
+        backend_node_id,
+        |page, center| async move { dispatch_touch_tap_on_page(&page, center).await },
+    )
     .await
 }
 
@@ -714,44 +711,44 @@ pub async fn cdp_type_node(
 ) -> A11yResult<()> {
     use chromiumoxide::cdp::browser_protocol::dom::FocusParams;
 
-    let endpoint = endpoint.to_owned();
-    let page_title_hint = page_title_hint.to_owned();
-    let target_id_hint = target_id_hint.map(ToOwned::to_owned);
     let text = text.to_owned();
-    run_owned_cdp_input("type node", async move {
-        let input_endpoint = endpoint.clone();
-        with_node_center(
-            &endpoint,
-            &page_title_hint,
-            target_id_hint.as_deref(),
-            backend_node_id,
-            |page, center| async move {
-                // Click to place the caret, then focus and insert text.
-                dispatch_mouse_click_on_page(
-                    &input_endpoint,
-                    &page,
-                    center,
-                    MouseButton::Left,
-                    1,
-                    0,
-                )
-                .await?;
-                // The click above already places focus/caret in the field. DOM.focus is
-                // a best-effort reinforcement — some nodes (e.g. the AX node maps to a
-                // non-focusable wrapper) report "not focusable", which must not abort the
-                // insert when the click already focused the input.
-                let focus = FocusParams::builder()
-                    .backend_node_id(BackendNodeId::new(backend_node_id))
-                    .build();
-                let _ = page.execute(focus).await;
-                page.execute(InsertTextParams::new(text))
-                    .await
-                    .map_err(|err| dispatch_err(&err))?;
-                Ok(center)
-            },
-        )
-        .await
-    })
+    with_node_center(
+        endpoint,
+        page_title_hint,
+        target_id_hint,
+        backend_node_id,
+        |page, center| async move {
+            // Click to place the caret, then focus and insert text.
+            page.execute(mouse_event(
+                DispatchMouseEventType::MousePressed,
+                center,
+                MouseButton::Left,
+                1,
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+            page.execute(mouse_event(
+                DispatchMouseEventType::MouseReleased,
+                center,
+                MouseButton::Left,
+                1,
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+            // The click above already places focus/caret in the field. DOM.focus is
+            // a best-effort reinforcement — some nodes (e.g. the AX node maps to a
+            // non-focusable wrapper) report "not focusable", which must not abort the
+            // insert when the click already focused the input.
+            let focus = FocusParams::builder()
+                .backend_node_id(BackendNodeId::new(backend_node_id))
+                .build();
+            let _ = page.execute(focus).await;
+            page.execute(InsertTextParams::new(text))
+                .await
+                .map_err(|err| dispatch_err(&err))?;
+            Ok(center)
+        },
+    )
     .await
     .map(|_point| ())
 }
@@ -760,8 +757,10 @@ pub async fn cdp_type_node(
 /// the replace, and whether an empty replacement was delivered as a Delete.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CdpSetNodeTextReadback {
-    /// `selected_value` (input/textarea `select()`) or
-    /// `selected_contenteditable` (DOM range over the editable host).
+    /// `selected_value` (input/textarea `select()`),
+    /// `selected_contenteditable` (DOM range over the editable host), or
+    /// [`CDP_NATIVE_VALUE_SETTER`] (#2365: a date-like input set through its
+    /// native `value` setter, no select-all, no typing).
     pub selection_mode: String,
     /// True when `text` was empty and the selection was removed with a
     /// synthesized Delete key instead of `Input.insertText`.
@@ -908,64 +907,71 @@ const CDP_DOM_PRIMITIVE_FUNCTION: &str = r#"(el, requestedAction) => {
 
     function performSelectText(element, events) {
         const beforeSelection = selectionSummary(element);
-        let readback;
-        if (isSelectableValueControl(element)) {
-            try {
-                if (typeof element.focus === "function") {
-                    element.focus({ preventScroll: true });
-                    events.push("focus");
-                }
-            } catch (_) {
-                // select() may still work for some controls.
-            }
-            element.select();
-            element.dispatchEvent(new Event("select", { bubbles: true }));
-            events.push("select");
-            element.ownerDocument.dispatchEvent(new Event("selectionchange", { bubbles: true }));
-            events.push("selectionchange");
-            const value = elementTextValue(element);
-            const start = typeof element.selectionStart === "number" ? element.selectionStart : null;
-            const end = typeof element.selectionEnd === "number" ? element.selectionEnd : null;
-            const selected = start === null || end === null ? "" : value.slice(start, end);
-            if (selected !== value) {
-                throw new Error(`selectText postcondition failed: selected ${selected.length} of ${value.length} chars`);
-            }
-            readback = {
-                selection_mode: "value_control_select",
-                text_len: value.length,
-                selection_start: start,
-                selection_end: end,
-                selected_text: selected
-            };
-        } else {
-            const doc = element.ownerDocument;
-            const selection = doc.defaultView && doc.defaultView.getSelection ? doc.defaultView.getSelection() : null;
-            if (!selection) {
-                throw new Error("selectText requires document.getSelection()");
-            }
-            const range = doc.createRange();
-            range.selectNodeContents(element);
-            selection.removeAllRanges();
-            selection.addRange(range);
-            doc.dispatchEvent(new Event("selectionchange", { bubbles: true }));
-            events.push("selectionchange");
-            const expected = String(element.textContent || "");
-            const selected = String(selection.toString() || "");
-            if (selected !== expected) {
-                throw new Error(`selectText postcondition failed: selected ${selected.length} of ${expected.length} chars`);
-            }
-            readback = {
-                selection_mode: "dom_range_select_node_contents",
-                text_len: expected.length,
-                selection_start: null,
-                selection_end: null,
-                selected_text: selected
-            };
-        }
+        const readback = isSelectableValueControl(element)
+            ? selectValueText(element, events) : selectRangeText(element, events);
         return {
             before_selection: beforeSelection,
             after_selection: selectionSummary(element),
             ...readback
+        };
+    }
+
+    function selectValueText(element, events) {
+        try {
+            if (typeof element.focus === "function") {
+                element.focus({ preventScroll: true });
+                events.push("focus");
+            }
+        } catch (_) {
+            // select() may still work for some controls.
+        }
+        element.select();
+        element.dispatchEvent(new Event("select", { bubbles: true }));
+        events.push("select");
+        element.ownerDocument.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+        events.push("selectionchange");
+        const value = elementTextValue(element);
+        const start = typeof element.selectionStart === "number" ? element.selectionStart : null;
+        const end = typeof element.selectionEnd === "number" ? element.selectionEnd : null;
+        const selected = start === null || end === null ? "" : value.slice(start, end);
+        if (selected !== value) {
+            throw new Error(`selectText postcondition failed: selected ${selected.length} of ${value.length} chars`);
+        }
+        const readback = {
+            selection_mode: "value_control_select",
+            text_len: value.length,
+            selection_start: start,
+            selection_end: end,
+            is_password: tag(element) === "input" && String(element.getAttribute("type") || element.type || "").toLowerCase() === "password",
+            selected_text: selected
+        };
+        if (readback.is_password) readback.selected_text = "[REDACTED]";
+        return readback;
+    }
+
+    function selectRangeText(element, events) {
+        const doc = element.ownerDocument;
+        const selection = doc.defaultView && doc.defaultView.getSelection ? doc.defaultView.getSelection() : null;
+        if (!selection) {
+            throw new Error("selectText requires document.getSelection()");
+        }
+        const range = doc.createRange();
+        range.selectNodeContents(element);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        doc.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+        events.push("selectionchange");
+        const expected = String(element.textContent || "");
+        const selected = String(selection.toString() || "");
+        if (selected !== expected) {
+            throw new Error(`selectText postcondition failed: selected ${selected.length} of ${expected.length} chars`);
+        }
+        return {
+            selection_mode: "dom_range_select_node_contents",
+            text_len: expected.length,
+            selection_start: null,
+            selection_end: null,
+            selected_text: selected
         };
     }
 
@@ -1064,12 +1070,15 @@ const CDP_DOM_PRIMITIVE_FUNCTION: &str = r#"(el, requestedAction) => {
 
     function selectionSummary(element) {
         const value = elementTextValue(element);
+        const isPassword = tag(element) === "input" &&
+            String(element.getAttribute("type") || element.type || "").toLowerCase() === "password";
         if (typeof element.selectionStart === "number" && typeof element.selectionEnd === "number") {
             return {
                 selection_mode: "value_control",
                 selection_start: element.selectionStart,
                 selection_end: element.selectionEnd,
-                selected_text: value.slice(element.selectionStart, element.selectionEnd)
+                is_password: isPassword,
+                selected_text: isPassword ? "[REDACTED]" : value.slice(element.selectionStart, element.selectionEnd)
             };
         }
         const selection = element.ownerDocument.defaultView && element.ownerDocument.defaultView.getSelection
@@ -1079,7 +1088,8 @@ const CDP_DOM_PRIMITIVE_FUNCTION: &str = r#"(el, requestedAction) => {
             selection_mode: "dom_selection",
             selection_start: null,
             selection_end: null,
-            selected_text: selection ? String(selection.toString() || "") : ""
+            is_password: isPassword,
+            selected_text: isPassword ? "[REDACTED]" : selection ? String(selection.toString() || "") : ""
         };
     }
 
@@ -1142,6 +1152,378 @@ pub async fn cdp_dom_primitive_node(
     })
 }
 
+/// Readback of [`cdp_select_option`] (#2365): the option the page holds
+/// after the pick and its `input` / `change` events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CdpSelectOptionReadback {
+    /// `el.selectedIndex` read back (a custom combo box, #2365b: the picked
+    /// position among its enabled options).
+    index: usize,
+    /// That option's visible label, trimmed (a custom combo box: the clicked
+    /// option's text).
+    label: String,
+    /// `el.value` read back (a custom combo box: the text the trigger shows
+    /// after the click).
+    value: String,
+}
+
+impl CdpSelectOptionReadback {
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Picks one option of a `<select>` on a raw-CDP page (#2365): reads its
+/// options, asks `choice` which one, sets it, fires `input` and `change`
+/// (`bubbles: true`) like a user's pick, and reads the selection back. No
+/// mouse, no focus change.
+///
+/// First (#2365b) one read-only page script tells [`DropdownKind`] what the
+/// element is: a `<select>` takes the path above; an element with
+/// `role="combobox"` takes `ComboBoxFacts::select` (open, pick, click the
+/// option, read the trigger's text back); anything else is refused before
+/// anything is sent.
+///
+/// # Errors
+///
+/// As [`cdp_evaluate_on_element`]; `A11Y_CDP_AXTREE_FAILED` when the node is
+/// not a single-choice enabled `<select>`, when `choice` refuses, or when the
+/// page holds another option after the events.
+pub async fn cdp_select_option(
+    endpoint: &str,
+    target_id: &str,
+    backend_node_id: i64,
+    choice: &OptionChoice,
+) -> A11yResult<CdpSelectOptionReadback> {
+    let refused = |reason: String| A11yError::CdpAxtreeFailed {
+        detail: format!("cdp_select_option refused backendNodeId {backend_node_id}: {reason}"),
+    };
+    // #2365b: which kind of dropdown this element is, before anything is sent.
+    let facts = ComboBoxFacts::read(endpoint, target_id, backend_node_id).await?;
+    let kind = DropdownKind::new(&facts.tag, facts.role.as_deref(), facts.disabled).kind();
+    match kind {
+        Dropdown::BrowserSelect => {}
+        Dropdown::CustomComboBox => {
+            return facts
+                .select(endpoint, target_id, backend_node_id, choice, refused)
+                .await;
+        }
+        Dropdown::Refused(reason) => return Err(refused(reason)),
+    }
+    let read = cdp_evaluate_on_element(
+        endpoint,
+        target_id,
+        backend_node_id,
+        CDP_SELECT_READ_FUNCTION,
+        &[],
+        false,
+        true,
+    )
+    .await?;
+    let (refusal, options): (Option<String>, Vec<(String, String)>) =
+        serde_json::from_value(read.value).map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.callFunctionOn select options decode: {err}"),
+        })?;
+    if let Some(reason) = refusal {
+        return Err(refused(reason));
+    }
+    let picked = choice.pick(&options).map_err(refused)?;
+    let written = cdp_evaluate_on_element(
+        endpoint,
+        target_id,
+        backend_node_id,
+        CDP_SELECT_WRITE_FUNCTION,
+        &[json!(picked)],
+        false,
+        true,
+    )
+    .await?;
+    let readback: CdpSelectOptionReadback =
+        serde_json::from_value(written.value).map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.callFunctionOn select readback decode: {err}"),
+        })?;
+    if readback.index != picked {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "cdp_select_option readback mismatch backendNodeId {backend_node_id}: picked {picked}, page holds {}",
+                readback.index
+            ),
+        });
+    }
+    Ok(readback)
+}
+
+/// `ComboBoxFacts::select` (#2365b) waits at most this long for the options
+/// to appear after it clicked the trigger.
+const COMBO_BOX_OPEN_WAIT: Duration = Duration::from_secs(1);
+
+/// Pause between two option reads while the list opens.
+const COMBO_BOX_POLL: Duration = Duration::from_millis(100);
+
+/// One item of a custom list. The page script and the option click
+/// ([`cdp_locate`]) count the document's options with this same selector.
+const COMBO_BOX_OPTION_SELECTOR: &str = r#"[role="option"]"#;
+
+/// JS for [`cdp_select_option`] (#2365b), read-only: what [`DropdownKind`]
+/// needs, the visible options of the list the element controls (its
+/// `aria-controls`; without that attribute, the one visible
+/// `role="listbox"` of the page) as `[text, aria-disabled, position among
+/// the document's options]`, and the element's own text.
+const CDP_COMBO_BOX_READ_FUNCTION: &str = r#"(el, optionSelector) => {
+    if (!el || !el.isConnected) {
+        throw new Error("resolved backend node is detached");
+    }
+    const doc = el.ownerDocument;
+    const visible = (node) =>
+        node.getClientRects().length > 0 &&
+        doc.defaultView.getComputedStyle(node).visibility !== "hidden";
+    const ids = (el.getAttribute("aria-controls") || "").split(/\s+/).filter(Boolean);
+    let list = null;
+    if (ids.length > 0) {
+        list = ids.map((id) => doc.getElementById(id)).find((node) => node) || null;
+    } else {
+        const open = Array.from(doc.querySelectorAll('[role="listbox"]')).filter(visible);
+        list = open.length === 1 ? open[0] : null;
+    }
+    const all = Array.from(doc.querySelectorAll(optionSelector));
+    const options = list
+        ? Array.from(list.querySelectorAll(optionSelector))
+              .filter(visible)
+              .map((option) => [
+                  (option.innerText || option.textContent || "").trim(),
+                  option.getAttribute("aria-disabled") === "true",
+                  all.indexOf(option),
+              ])
+        : [];
+    return {
+        tag: String(el.tagName || el.nodeName || ""),
+        role: el.getAttribute("role"),
+        disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
+        options,
+        shown: (el.innerText || el.textContent || "").trim(),
+    };
+}"#;
+
+/// What [`CDP_COMBO_BOX_READ_FUNCTION`] read from one element (#2365b).
+#[derive(Debug, Deserialize)]
+struct ComboBoxFacts {
+    tag: String,
+    role: Option<String>,
+    disabled: bool,
+    /// `(text, disabled, position among the document's options)`, page order.
+    options: Vec<(String, bool, i64)>,
+    /// The element's own text: what the combo box shows.
+    shown: String,
+}
+
+impl ComboBoxFacts {
+    /// Runs [`CDP_COMBO_BOX_READ_FUNCTION`] on the element; sends no input.
+    async fn read(endpoint: &str, target_id: &str, backend_node_id: i64) -> A11yResult<Self> {
+        let read = cdp_evaluate_on_element(
+            endpoint,
+            target_id,
+            backend_node_id,
+            CDP_COMBO_BOX_READ_FUNCTION,
+            &[json!(COMBO_BOX_OPTION_SELECTOR)],
+            false,
+            true,
+        )
+        .await?;
+        serde_json::from_value(read.value).map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.callFunctionOn combo box facts decode: {err}"),
+        })
+    }
+
+    /// The custom combo box path of [`cdp_select_option`] (#2365b), each step
+    /// once: (1) when no option shows, click the trigger and wait up to
+    /// [`COMBO_BOX_OPEN_WAIT`] for them; (2) [`OptionChoice::pick`] over the
+    /// enabled options' texts, a refusal pressing Escape when this call opened
+    /// the list; (3) click the chosen option; (4) read the trigger's text back
+    /// and let [`ComboBoxReadback`] decide.
+    async fn select(
+        self,
+        endpoint: &str,
+        target_id: &str,
+        backend_node_id: i64,
+        choice: &OptionChoice,
+        refused: impl Fn(String) -> A11yError,
+    ) -> A11yResult<CdpSelectOptionReadback> {
+        let opened_here = self.options.is_empty();
+        let mut facts = self;
+        if opened_here {
+            cdp_click_node(
+                endpoint,
+                "",
+                Some(target_id),
+                backend_node_id,
+                CdpMouseButton::Left,
+                1,
+                0,
+            )
+            .await?;
+            let started = tokio::time::Instant::now();
+            loop {
+                facts = Self::read(endpoint, target_id, backend_node_id).await?;
+                if !facts.options.is_empty() || started.elapsed() >= COMBO_BOX_OPEN_WAIT {
+                    break;
+                }
+                tokio::time::sleep(COMBO_BOX_POLL).await;
+            }
+        }
+
+        let offered: Vec<(String, i64)> = facts
+            .options
+            .into_iter()
+            .filter(|(_, disabled, _)| !disabled)
+            .map(|(text, _, position)| (text, position))
+            .collect();
+        let labels: Vec<(String, String)> = offered
+            .iter()
+            .map(|(text, _)| (text.clone(), text.clone()))
+            .collect();
+        let picked = match choice.pick(&labels) {
+            Ok(picked) => picked,
+            Err(reason) if !opened_here => return Err(refused(reason)),
+            Err(reason) => {
+                let escape = CdpKeyStroke {
+                    key: "Escape".to_owned(),
+                    code: "Escape".to_owned(),
+                    windows_virtual_key_code: 27,
+                    native_virtual_key_code: 27,
+                    key_identifier: None,
+                    text: None,
+                    unmodified_text: None,
+                    modifier_bit: 0,
+                    location: None,
+                };
+                let reason = match cdp_press_key_sequence(endpoint, target_id, vec![escape], 0)
+                    .await
+                {
+                    Ok(()) => reason,
+                    Err(err) => format!("{reason} (closing the list with Escape failed: {err})"),
+                };
+                return Err(refused(reason));
+            }
+        };
+        let Some((chosen, position)) = offered.get(picked) else {
+            return Err(refused(format!("option {picked} is not in the list")));
+        };
+
+        let located = cdp_locate(
+            endpoint,
+            target_id,
+            CdpLocateRequest {
+                engine: CdpLocateEngine::Css,
+                query: COMBO_BOX_OPTION_SELECTOR.to_owned(),
+                nth: Some(*position),
+                limit: 1,
+                ..CdpLocateRequest::default()
+            },
+        )
+        .await?;
+        let Some(option_node) = located.backend_node_ids.first().copied() else {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "cdp_select_option backendNodeId {backend_node_id}: the option \"{chosen}\" left the page before its click"
+                ),
+            });
+        };
+        cdp_click_node(
+            endpoint,
+            "",
+            Some(target_id),
+            option_node,
+            CdpMouseButton::Left,
+            1,
+            0,
+        )
+        .await?;
+
+        let shown = Self::read(endpoint, target_id, backend_node_id)
+            .await?
+            .shown;
+        ComboBoxReadback::new(chosen, &shown)
+            .verdict()
+            .map_err(|text| A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "cdp_select_option readback mismatch backendNodeId {backend_node_id}: {text}"
+                ),
+            })?;
+        Ok(CdpSelectOptionReadback {
+            index: picked,
+            label: chosen.clone(),
+            value: shown,
+        })
+    }
+}
+
+/// [`CdpSetNodeTextReadback::selection_mode`] when a date-like input (#2365)
+/// was set through its native `value` setter instead of typed text.
+pub const CDP_NATIVE_VALUE_SETTER: &str = "native_value_setter";
+
+/// JS run on the resolved node before any click (#2365): what [`FieldKind`]
+/// needs, as `[tag, type attribute or null, isContentEditable, disabled or
+/// readOnly]`.
+const CDP_FIELD_KIND_FUNCTION: &str = r"function() {
+    if (this === null || this === undefined || !this.isConnected) { throw new Error('resolved backend node is detached'); }
+    const type = typeof this.getAttribute === 'function' ? this.getAttribute('type') : null;
+    return [String(this.tagName || ''), type, this.isContentEditable === true, this.disabled === true || this.readOnly === true];
+}";
+
+/// JS for a [`SetMethod::Value`] field (#2365): the element's own native
+/// `value` setter (so page frameworks see the change), then `input` and
+/// `change` like a user's pick. Success is decided by the caller's separate
+/// `cdp_node_value` readback: a text the browser rejects for the type
+/// leaves `value` empty and fails that check.
+const CDP_SET_NATIVE_VALUE_FUNCTION: &str = r"function(text) {
+    if (this === null || this === undefined || !this.isConnected) { throw new Error('resolved backend node is detached'); }
+    const view = this.ownerDocument.defaultView;
+    const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value').set;
+    setter.call(this, text);
+    this.dispatchEvent(new view.Event('input', { bubbles: true }));
+    this.dispatchEvent(new view.Event('change', { bubbles: true }));
+    return true;
+}";
+
+/// JS for [`cdp_select_option`] (#2365): `[refusal or null, [[label, value], ...]]`.
+const CDP_SELECT_READ_FUNCTION: &str = r#"(el) => {
+    if (!el || !el.isConnected) {
+        throw new Error("resolved backend node is detached");
+    }
+    const tag = String(el.tagName || el.nodeName || "").toLowerCase();
+    if (tag !== "select") {
+        return [`the <${tag}> element is not a dropdown (<select>)`, []];
+    }
+    if (el.disabled) {
+        return ["the dropdown is disabled", []];
+    }
+    if (el.multiple) {
+        return ["a multi-select list is not supported: act select picks one option", []];
+    }
+    return [null, Array.from(el.options, (option) => [option.label.trim(), option.value])];
+}"#;
+
+/// JS for [`cdp_select_option`] (#2365): sets the picked index, fires `input`
+/// and `change` like a user's pick, and reads the selection back.
+const CDP_SELECT_WRITE_FUNCTION: &str = r#"(el, index) => {
+    el.selectedIndex = index;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    const option = el.options[el.selectedIndex];
+    return { index: el.selectedIndex, label: option ? option.label.trim() : "", value: el.value };
+}"#;
+
 /// JS run on the resolved node to select its full content before the replace.
 /// Mirrors the Playwright `fill` strategy: value controls use `select()`, a
 /// contenteditable host gets a DOM range over its contents. Returns a wire
@@ -1172,6 +1554,13 @@ const CDP_SELECT_ALL_FUNCTION: &str = r"function() {
 /// selection, the same strategy Playwright `fill()` uses. Empty `text`
 /// removes the selection with a synthesized Delete key.
 ///
+/// Before any click (#2365) the node's [`FieldKind`] decides: a typed field
+/// takes the path above unchanged; a date-like input gets its native `value`
+/// setter plus `input` / `change` (readback `selection_mode` =
+/// [`CDP_NATIVE_VALUE_SETTER`]); a refused kind (dropdown, checkbox, radio,
+/// file, hidden, disabled, read-only, plain element) returns
+/// `A11Y_CDP_AXTREE_FAILED` with the kind's reason and touches nothing.
+///
 /// Fail-loud: a target that is neither a value control nor contenteditable
 /// returns `A11Y_CDP_AXTREE_FAILED` naming the select-all readback — there is
 /// no append fallback. Callers must verify with a separate
@@ -1190,27 +1579,90 @@ pub async fn cdp_set_node_text(
 ) -> A11yResult<CdpSetNodeTextReadback> {
     use chromiumoxide::cdp::browser_protocol::dom::FocusParams;
 
-    let endpoint = endpoint.to_owned();
-    let page_title_hint = page_title_hint.to_owned();
-    let target_id_hint = target_id_hint.map(ToOwned::to_owned);
     let text = text.to_owned();
-    run_owned_cdp_input("set node text", async move {
-        let input_endpoint = endpoint.clone();
-        with_node_center(
-            &endpoint,
-            &page_title_hint,
-            target_id_hint.as_deref(),
-            backend_node_id,
-            |page, center| async move {
-            dispatch_mouse_click_on_page(
-                &input_endpoint,
-                &page,
+    with_node_center(
+        endpoint,
+        page_title_hint,
+        target_id_hint,
+        backend_node_id,
+        |page, center| async move {
+            // #2365: how this element takes text, decided before any click.
+            let kind_resolve = ResolveNodeParams::builder()
+                .backend_node_id(BackendNodeId::new(backend_node_id))
+                .object_group("synapse_set_field_text")
+                .build();
+            let kind_object_id = page
+                .execute(kind_resolve)
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+                })?
+                .object
+                .object_id
+                .clone()
+                .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "resolveNode for backendNodeId {backend_node_id} returned no objectId"
+                    ),
+                })?;
+            let kind_call = CallFunctionOnParams::builder()
+                .function_declaration(CDP_FIELD_KIND_FUNCTION)
+                .object_id(kind_object_id.clone())
+                .return_by_value(true)
+                .silent(true)
+                .build()
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("build Runtime.callFunctionOn field-kind params: {err}"),
+                })?;
+            let (tag, input_type, content_editable, locked): (String, Option<String>, bool, bool) =
+                call_function_on_value(&page, kind_call, "field-kind").await?;
+            match FieldKind::new(&tag, input_type.as_deref(), content_editable, locked).set_method()
+            {
+                SetMethod::Typed => {}
+                SetMethod::Value => {
+                    let value_call = CallFunctionOnParams::builder()
+                        .function_declaration(CDP_SET_NATIVE_VALUE_FUNCTION)
+                        .object_id(kind_object_id)
+                        .argument(CallArgument::builder().value(json!(text)).build())
+                        .return_by_value(true)
+                        .silent(true)
+                        .build()
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "build Runtime.callFunctionOn native-value params: {err}"
+                            ),
+                        })?;
+                    let _set: bool =
+                        call_function_on_value(&page, value_call, "native-value").await?;
+                    return Ok(CdpSetNodeTextReadback {
+                        selection_mode: CDP_NATIVE_VALUE_SETTER.to_owned(),
+                        cleared_with_delete: false,
+                    });
+                }
+                SetMethod::Refused(reason) => {
+                    return Err(A11yError::CdpAxtreeFailed {
+                        detail: format!(
+                            "cdp_set_node_text refused backendNodeId {backend_node_id}: {reason}"
+                        ),
+                    });
+                }
+            }
+            page.execute(mouse_event(
+                DispatchMouseEventType::MousePressed,
                 center,
                 MouseButton::Left,
                 1,
-                0,
-            )
-            .await?;
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+            page.execute(mouse_event(
+                DispatchMouseEventType::MouseReleased,
+                center,
+                MouseButton::Left,
+                1,
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
             // The click already places focus; DOM.focus is best-effort
             // reinforcement (some AX nodes map to non-focusable wrappers).
             let focus = FocusParams::builder()
@@ -1272,7 +1724,12 @@ pub async fn cdp_set_node_text(
                     modifier_bit: 0,
                     location: None,
                 };
-                dispatch_key_sequence_on_page(&input_endpoint, &page, &[delete], 0).await?;
+                page.execute(cdp_key_event(DispatchKeyEventType::KeyDown, &delete, 0)?)
+                    .await
+                    .map_err(|err| dispatch_err(&err))?;
+                page.execute(cdp_key_event(DispatchKeyEventType::KeyUp, &delete, 0)?)
+                    .await
+                    .map_err(|err| dispatch_err(&err))?;
             } else {
                 page.execute(InsertTextParams::new(text))
                     .await
@@ -1282,10 +1739,8 @@ pub async fn cdp_set_node_text(
                 selection_mode,
                 cleared_with_delete,
             })
-            },
-        )
-        .await
-    })
+        },
+    )
     .await
 }
 
@@ -1307,14 +1762,32 @@ pub async fn cdp_press_key_sequence(
             detail: "cdp_press_key_sequence requires at least one key".to_owned(),
         });
     }
-    let endpoint = endpoint.to_owned();
-    let target_id = target_id.to_owned();
-    run_owned_cdp_input("press key sequence", async move {
-        let input_endpoint = endpoint.clone();
-        with_target_page(&endpoint, &target_id, |page| async move {
-            dispatch_key_sequence_on_page(&input_endpoint, &page, &keys, hold_ms).await
-        })
-        .await
+    with_target_page(endpoint, target_id, |page| async move {
+        let mut modifiers = 0_i64;
+        for key in &keys {
+            let key_down_type = if key.text.is_some() {
+                DispatchKeyEventType::KeyDown
+            } else {
+                DispatchKeyEventType::RawKeyDown
+            };
+            let event_modifiers = modifiers | key.modifier_bit;
+            page.execute(cdp_key_event(key_down_type, key, event_modifiers)?)
+                .await
+                .map_err(|err| dispatch_err(&err))?;
+            modifiers = event_modifiers;
+        }
+        if hold_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+        }
+        for key in keys.iter().rev() {
+            if key.modifier_bit != 0 {
+                modifiers &= !key.modifier_bit;
+            }
+            page.execute(cdp_key_event(DispatchKeyEventType::KeyUp, key, modifiers)?)
+                .await
+                .map_err(|err| dispatch_err(&err))?;
+        }
+        Ok(())
     })
     .await
 }
@@ -1337,7 +1810,6 @@ pub async fn cdp_mouse_stroke_target(
     let end = points
         .last()
         .map_or(start, |point| cdp_stroke_action_point(*point));
-    let point_count = points.len();
     let duration_ms = points.last().map_or(0.0, |point| point.elapsed_ms.max(0.0));
     let button = button.map_or(MouseButton::None, CdpMouseButton::to_cdp);
     let dispatched_target_id = with_target_page(endpoint, target_id, |page| async move {
@@ -1345,34 +1817,10 @@ pub async fn cdp_mouse_stroke_target(
         Ok(dispatched_target_id)
     })
     .await?;
-    let owned_endpoint = endpoint.to_owned();
-    let owned_target_id = dispatched_target_id.clone();
-    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut terminal_guard = RawCdpInputTaskTerminalGuard::new();
-        let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-        let result = if crate::cdp_network::durable_browser_mutation_owners_enabled() {
-            dispatch_cdp_mouse_stroke_raw(&owned_endpoint, &owned_target_id, &points, button).await
-        } else {
-            Err(A11yError::CdpAttachFailed {
-                detail: "durable browser mutation owners are disabled by operator panic; refusing raw CDP mouse stroke"
-                    .to_owned(),
-            })
-        };
-        // Every normal return from the dispatcher either observed the release
-        // acknowledgement or incremented the unresolved-owner counter itself.
-        terminal_guard.mark_terminal_accounted();
-        let _send_result = result_sender.send(result);
-    });
-    result_receiver.await.map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "owned raw CDP mouse stroke task closed before publishing its terminal verdict: {error}; unresolved_raw_cdp_input_owner_count={}",
-                unresolved_raw_cdp_input_owner_count()
-            ),
-        })??;
+    dispatch_cdp_mouse_stroke_raw(endpoint, &dispatched_target_id, &points, button).await?;
     Ok(CdpMouseStrokeResult {
         target_id: dispatched_target_id,
-        point_count,
+        point_count: points.len(),
         start,
         end,
         duration_ms,
@@ -1392,14 +1840,8 @@ pub async fn cdp_touch_tap_target(
     point: CdpActionPoint,
 ) -> A11yResult<CdpTouchTapResult> {
     validate_cdp_action_point(point, "touch tap")?;
-    let endpoint = endpoint.to_owned();
-    let target_id = target_id.to_owned();
-    run_owned_cdp_input("touch tap target", async move {
-        let input_endpoint = endpoint.clone();
-        with_target_page(&endpoint, &target_id, |page| async move {
-            dispatch_touch_tap_on_page(&input_endpoint, &page, point).await
-        })
-        .await
+    with_target_page(endpoint, target_id, |page| async move {
+        dispatch_touch_tap_on_page(&page, point).await
     })
     .await
 }
@@ -1420,13 +1862,17 @@ pub async fn cdp_active_element_state(
     with_target_page(endpoint, &target_id_for_lookup, |page| async move {
         let expression = format!(
             r#"(() => {{
-                const el = document.activeElement;
+                let el = document.activeElement;
+                while (el?.shadowRoot?.activeElement) {{ el = el.shadowRoot.activeElement; }}
                 if (!el) {{
                     return {{
                         target_id: {target_id_json},
                         has_active_element: false,
                         is_editable: false,
+                        is_password: false,
                         tag_name: "",
+                        input_type: "",
+                        element_path: "",
                         id: "",
                         name: "",
                         value: "",
@@ -1449,7 +1895,8 @@ pub async fn cdp_active_element_state(
                     (tag === "INPUT" && textInputTypes.has(inputType) && !isDisabled && !isReadOnly) ||
                     (Boolean(el.isContentEditable) && !isDisabled) ||
                     (String(el.getAttribute("role") || "").toLowerCase() === "textbox" && !isDisabled);
-                const value = ("value" in el)
+                const isPassword = tag === "INPUT" && inputType === "password";
+                const value = isPassword ? "[REDACTED]" : ("value" in el)
                     ? String(el.value ?? "")
                     : String(el.textContent ?? "");
                 const selectionStart = (typeof el.selectionStart === "number")
@@ -1458,11 +1905,18 @@ pub async fn cdp_active_element_state(
                 const selectionEnd = (typeof el.selectionEnd === "number")
                     ? el.selectionEnd
                     : null;
+                const path = [];
+                for (let node = el; node && node.parentElement; node = node.parentElement) {{
+                    path.push(Array.prototype.indexOf.call(node.parentElement.children, node));
+                }}
                 return {{
                     target_id: {target_id_json},
                     has_active_element: true,
                     is_editable: isEditable,
+                    is_password: isPassword,
                     tag_name: tagName,
+                    input_type: tag === "INPUT" ? inputType : "",
+                    element_path: path.reverse().join("/"),
                     id: String(el.id || ""),
                     name: String(el.getAttribute("name") || ""),
                     value,
@@ -1567,1199 +2021,6 @@ pub async fn cdp_page_text_target(
 /// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
 /// `A11Y_CDP_AXTREE_FAILED` if the evaluate command fails at the protocol level,
 /// the page throws an exception, or the result cannot be decoded.
-/// Default per-expression evaluation budget (milliseconds) for the raw-CDP and
-/// Chrome-bridge evaluate paths. Historically the Chrome-bridge wall was a fixed,
-/// non-configurable 5000 ms; this preserves that default while letting callers
-/// raise it through `timeout_ms` (issue #1596).
-pub const DEFAULT_EVALUATE_TIMEOUT_MS: u64 = 5_000;
-
-/// Minimum accepted `timeout_ms` for an evaluate call.
-pub const MIN_EVALUATE_TIMEOUT_MS: u64 = 50;
-
-/// Maximum accepted `timeout_ms` for an evaluate call. Bounded so a single stuck
-/// expression cannot pin a CDP connection indefinitely.
-pub const MAX_EVALUATE_TIMEOUT_MS: u64 = 120_000;
-
-static UNRESOLVED_RAW_CDP_EVALUATE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-static UNRESOLVED_RAW_CDP_INPUT_OWNERS: AtomicU64 = AtomicU64::new(0);
-static CDP_MUTATION_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-const CDP_MUTATION_OWNER_SCHEMA_VERSION: u32 = 1;
-const CDP_MUTATION_OWNER_DIR_ENV: &str = "SYNAPSE_CDP_MUTATION_OWNER_DIR";
-const CDP_MUTATION_OWNER_MAX_BYTES: u64 = 1_048_576;
-const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum PersistedCdpMutationKind {
-    Mouse {
-        button: String,
-        x: f64,
-        y: f64,
-        click_count: i64,
-        modifiers: i64,
-    },
-    Keys {
-        keys: Vec<CdpKeyStroke>,
-    },
-    Touch {
-        x: f64,
-        y: f64,
-    },
-    Evaluate {
-        operation: String,
-    },
-    InitScriptEffect {
-        registration_identifier: Option<String>,
-        registration_removed: bool,
-    },
-}
-
-impl PersistedCdpMutationKind {
-    const fn category(&self) -> PersistedCdpMutationCategory {
-        match self {
-            Self::Mouse { .. } | Self::Keys { .. } | Self::Touch { .. } => {
-                PersistedCdpMutationCategory::Input
-            }
-            Self::Evaluate { .. } => PersistedCdpMutationCategory::Evaluate,
-            Self::InitScriptEffect { .. } => PersistedCdpMutationCategory::InitScriptEffect,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum PersistedCdpMutationCategory {
-    Input,
-    Evaluate,
-    InitScriptEffect,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct PersistedCdpMutationOwner {
-    schema_version: u32,
-    owner_id: String,
-    endpoint: String,
-    target_id: String,
-    created_unix_ms: u64,
-    mutation: PersistedCdpMutationKind,
-}
-
-#[derive(Clone, Debug)]
-struct PersistedCdpMutationOwnerRow {
-    path: PathBuf,
-    owner: PersistedCdpMutationOwner,
-}
-
-#[derive(Clone, Debug, Default)]
-struct PersistedCdpMutationOwnerSnapshot {
-    candidate_count: usize,
-    rows: Vec<PersistedCdpMutationOwnerRow>,
-    failures: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CdpPersistedMutationOwnerReadback {
-    pub total_count: usize,
-    pub input_count: usize,
-    pub evaluate_count: usize,
-    pub init_script_effect_count: usize,
-    pub failures: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CdpPersistedMutationOwnerDrainReadback {
-    pub total_found: usize,
-    pub input_found: usize,
-    pub evaluate_found: usize,
-    pub init_script_effect_found: usize,
-    pub input_drained: usize,
-    pub evaluate_drained: usize,
-    pub init_script_effect_drained: usize,
-    pub input_remaining: usize,
-    pub evaluate_remaining: usize,
-    pub init_script_effect_remaining: usize,
-    pub total_remaining: usize,
-    pub failures: Vec<String>,
-}
-
-fn cdp_mutation_owner_ledger_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-fn cdp_mutation_owner_root() -> Result<PathBuf, String> {
-    let root = if let Some(configured) = std::env::var_os(CDP_MUTATION_OWNER_DIR_ENV) {
-        PathBuf::from(configured)
-    } else {
-        let local_appdata = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-            format!(
-                "{CDP_MUTATION_OWNER_DIR_ENV} and LOCALAPPDATA are both unset; durable CDP mutation ownership is unavailable"
-            )
-        })?;
-        PathBuf::from(local_appdata)
-            .join("synapse")
-            .join("cdp-mutation-owners")
-    };
-    if !root.is_absolute() {
-        return Err(format!(
-            "durable CDP mutation owner root must be absolute, got {}",
-            root.display()
-        ));
-    }
-    Ok(root)
-}
-
-fn cdp_mutation_owner_id() -> Result<String, String> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before UNIX epoch: {error}"))?
-        .as_nanos();
-    let sequence = CDP_MUTATION_OWNER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-    Ok(format!("{nanos}-{}-{sequence}", std::process::id()))
-}
-
-fn now_unix_ms() -> Result<u64, String> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before UNIX epoch: {error}"))?
-        .as_millis();
-    Ok(u64::try_from(millis).unwrap_or(u64::MAX))
-}
-
-fn validate_persisted_cdp_mutation_owner(owner: &PersistedCdpMutationOwner) -> Result<(), String> {
-    if owner.schema_version != CDP_MUTATION_OWNER_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported schema_version={} for owner {}",
-            owner.schema_version, owner.owner_id
-        ));
-    }
-    if owner.owner_id.is_empty()
-        || !owner
-            .owner_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-')
-    {
-        return Err(format!("owner_id {:?} is not canonical", owner.owner_id));
-    }
-    if owner.endpoint.trim() != owner.endpoint
-        || !(owner.endpoint.starts_with("http://")
-            || owner.endpoint.starts_with("https://")
-            || owner.endpoint.starts_with("ws://")
-            || owner.endpoint.starts_with("wss://"))
-    {
-        return Err(format!(
-            "owner {} has invalid endpoint {:?}",
-            owner.owner_id, owner.endpoint
-        ));
-    }
-    if owner.target_id.trim() != owner.target_id
-        || owner.target_id.is_empty()
-        || owner.target_id.contains('/')
-        || owner.target_id.contains('\\')
-    {
-        return Err(format!(
-            "owner {} has invalid target_id {:?}",
-            owner.owner_id, owner.target_id
-        ));
-    }
-    match &owner.mutation {
-        PersistedCdpMutationKind::Mouse { x, y, .. } | PersistedCdpMutationKind::Touch { x, y } => {
-            if !x.is_finite() || !y.is_finite() {
-                return Err(format!(
-                    "owner {} has non-finite input coordinates",
-                    owner.owner_id
-                ));
-            }
-        }
-        PersistedCdpMutationKind::Keys { keys } if keys.is_empty() => {
-            return Err(format!(
-                "owner {} has an empty key sequence",
-                owner.owner_id
-            ));
-        }
-        PersistedCdpMutationKind::Evaluate { operation } if operation.trim().is_empty() => {
-            return Err(format!(
-                "owner {} has an empty evaluate operation",
-                owner.owner_id
-            ));
-        }
-        PersistedCdpMutationKind::InitScriptEffect {
-            registration_identifier: Some(identifier),
-            registration_removed: _,
-        } if identifier.trim().is_empty() => {
-            return Err(format!(
-                "owner {} has an empty init-script identifier",
-                owner.owner_id
-            ));
-        }
-        PersistedCdpMutationKind::InitScriptEffect {
-            registration_identifier: None,
-            registration_removed: true,
-        } => {
-            return Err(format!(
-                "owner {} cannot mark an unknown init-script registration removed",
-                owner.owner_id
-            ));
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn path_to_nul_terminated_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
-}
-
-fn move_file_write_through(source: &Path, destination: &Path) -> Result<(), String> {
-    use windows::{
-        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
-        core::PCWSTR,
-    };
-    let source_wide = path_to_nul_terminated_wide(source);
-    let destination_wide = path_to_nul_terminated_wide(destination);
-    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source_wide.as_ptr()),
-            PCWSTR(destination_wide.as_ptr()),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .map_err(|error| {
-        format!(
-            "atomic write-through move {} -> {} failed: {error}",
-            source.display(),
-            destination.display()
-        )
-    })
-}
-
-fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
-    metadata.file_attributes() & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-fn validate_existing_cdp_owner_path_ancestors(path: &Path) -> Result<(), String> {
-    for ancestor in path.ancestors() {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) => {
-                if metadata_is_reparse_point(&metadata) {
-                    return Err(format!(
-                        "durable CDP mutation owner path {} crosses reparse point {}",
-                        path.display(),
-                        ancestor.display()
-                    ));
-                }
-                if !metadata.file_type().is_dir() && ancestor != path {
-                    return Err(format!(
-                        "durable CDP mutation owner path {} has non-directory ancestor {}",
-                        path.display(),
-                        ancestor.display()
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect durable CDP mutation owner ancestor {} failed: {error}",
-                    ancestor.display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_cdp_mutation_owner_root(root: &Path, create: bool) -> Result<(), String> {
-    validate_existing_cdp_owner_path_ancestors(root)?;
-    if create {
-        fs::create_dir_all(root).map_err(|error| {
-            format!(
-                "create durable CDP mutation owner root {} failed: {error}",
-                root.display()
-            )
-        })?;
-        // `create_dir_all` follows directory reparse points. Re-read the full
-        // chain after creation so a configured junction/symlink never becomes
-        // a silent alternate ledger location.
-        validate_existing_cdp_owner_path_ancestors(root)?;
-    }
-    match fs::symlink_metadata(root) {
-        Ok(metadata)
-            if metadata.file_type().is_dir()
-                && !metadata.file_type().is_symlink()
-                && !metadata_is_reparse_point(&metadata) =>
-        {
-            Ok(())
-        }
-        Ok(_) => Err(format!(
-            "durable CDP mutation owner root {} is not a real directory",
-            root.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(()),
-        Err(error) => Err(format!(
-            "inspect durable CDP mutation owner root {} failed: {error}",
-            root.display()
-        )),
-    }
-}
-
-fn read_persisted_cdp_mutation_owner_file(
-    path: &Path,
-) -> Result<PersistedCdpMutationOwner, String> {
-    use windows::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
-        },
-    };
-
-    let mut file = OpenOptions::new()
-        .read(true)
-        // An immutable owner row must not change or disappear between its
-        // metadata validation and JSON readback.
-        .share_mode(0)
-        // Open the link itself, never a reparse target, so its attributes fail
-        // closed below.
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
-        .map_err(|error| format!("open owner row {} failed: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect owner row {} failed: {error}", path.display()))?;
-    if !metadata.file_type().is_file()
-        || metadata.file_type().is_symlink()
-        || metadata_is_reparse_point(&metadata)
-    {
-        return Err(format!("owner row {} is not a real file", path.display()));
-    }
-    if metadata.len() > CDP_MUTATION_OWNER_MAX_BYTES {
-        return Err(format!(
-            "owner row {} exceeds {} bytes",
-            path.display(),
-            CDP_MUTATION_OWNER_MAX_BYTES
-        ));
-    }
-    let mut file_information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a valid handle for the duration of the call and the
-    // output pointer references initialized writable storage.
-    unsafe {
-        GetFileInformationByHandle(
-            HANDLE(file.as_raw_handle()),
-            std::ptr::from_mut(&mut file_information),
-        )
-    }
-    .map_err(|error| format!("inspect owner row links {} failed: {error}", path.display()))?;
-    if file_information.nNumberOfLinks != 1 {
-        return Err(format!(
-            "owner row {} has {} hard links; immutable rows require exactly one",
-            path.display(),
-            file_information.nNumberOfLinks
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.read_to_end(&mut bytes)
-        .map_err(|error| format!("read owner row {} failed: {error}", path.display()))?;
-    let owner: PersistedCdpMutationOwner = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("decode owner row {} failed: {error}", path.display()))?;
-    validate_persisted_cdp_mutation_owner(&owner)?;
-    let expected_name = format!("{}.json", owner.owner_id);
-    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-        return Err(format!(
-            "owner row filename {} does not match owner_id {}",
-            path.display(),
-            owner.owner_id
-        ));
-    }
-    Ok(owner)
-}
-
-fn read_persisted_cdp_mutation_owner_snapshot_from_root(
-    root: &Path,
-) -> PersistedCdpMutationOwnerSnapshot {
-    let mut snapshot = PersistedCdpMutationOwnerSnapshot::default();
-    if let Err(error) = validate_cdp_mutation_owner_root(root, false) {
-        snapshot.candidate_count = usize::MAX;
-        snapshot.failures.push(error);
-        return snapshot;
-    }
-    if !root.exists() {
-        return snapshot;
-    }
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            snapshot.candidate_count = usize::MAX;
-            snapshot.failures.push(format!(
-                "read durable CDP mutation owner root {} failed: {error}",
-                root.display()
-            ));
-            return snapshot;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                snapshot.candidate_count = snapshot.candidate_count.saturating_add(1);
-                snapshot.failures.push(format!(
-                    "read durable owner directory entry failed: {error}"
-                ));
-                continue;
-            }
-        };
-        let path = entry.path();
-        if entry.file_name() == "resolved" {
-            match fs::symlink_metadata(&path) {
-                Ok(metadata)
-                    if metadata.file_type().is_dir()
-                        && !metadata.file_type().is_symlink()
-                        && !metadata_is_reparse_point(&metadata) => {}
-                Ok(_) => snapshot.failures.push(format!(
-                    "resolved owner archive {} is not a real directory",
-                    path.display()
-                )),
-                Err(error) => snapshot.failures.push(format!(
-                    "inspect resolved owner archive {} failed: {error}",
-                    path.display()
-                )),
-            }
-            continue;
-        }
-        snapshot.candidate_count = snapshot.candidate_count.saturating_add(1);
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            snapshot.failures.push(format!(
-                "unexpected or incomplete durable owner entry {}",
-                path.display()
-            ));
-            continue;
-        }
-        match read_persisted_cdp_mutation_owner_file(&path) {
-            Ok(owner) => snapshot
-                .rows
-                .push(PersistedCdpMutationOwnerRow { path, owner }),
-            Err(error) => snapshot.failures.push(error),
-        }
-    }
-    snapshot
-}
-
-fn read_persisted_cdp_mutation_owner_snapshot() -> PersistedCdpMutationOwnerSnapshot {
-    let root = match cdp_mutation_owner_root() {
-        Ok(root) => root,
-        Err(error) => {
-            return PersistedCdpMutationOwnerSnapshot {
-                candidate_count: usize::MAX,
-                failures: vec![error],
-                ..Default::default()
-            };
-        }
-    };
-    let _lock = match cdp_mutation_owner_ledger_lock().lock() {
-        Ok(lock) => lock,
-        Err(_) => {
-            return PersistedCdpMutationOwnerSnapshot {
-                candidate_count: usize::MAX,
-                failures: vec!["durable CDP mutation owner ledger lock is poisoned".to_owned()],
-                ..Default::default()
-            };
-        }
-    };
-    read_persisted_cdp_mutation_owner_snapshot_from_root(&root)
-}
-
-#[must_use]
-pub fn persisted_cdp_mutation_owner_readback() -> CdpPersistedMutationOwnerReadback {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    let mut readback = CdpPersistedMutationOwnerReadback {
-        total_count: snapshot.candidate_count,
-        failures: snapshot.failures,
-        ..Default::default()
-    };
-    for row in snapshot.rows {
-        match row.owner.mutation.category() {
-            PersistedCdpMutationCategory::Input => {
-                readback.input_count = readback.input_count.saturating_add(1);
-            }
-            PersistedCdpMutationCategory::Evaluate => {
-                readback.evaluate_count = readback.evaluate_count.saturating_add(1);
-            }
-            PersistedCdpMutationCategory::InitScriptEffect => {
-                readback.init_script_effect_count =
-                    readback.init_script_effect_count.saturating_add(1);
-            }
-        }
-    }
-    readback
-}
-
-fn persist_cdp_mutation_owner(
-    endpoint: &str,
-    target_id: &str,
-    mutation: PersistedCdpMutationKind,
-) -> A11yResult<PersistedCdpMutationOwner> {
-    let owner = PersistedCdpMutationOwner {
-        schema_version: CDP_MUTATION_OWNER_SCHEMA_VERSION,
-        owner_id: cdp_mutation_owner_id().map_err(cdp_owner_ledger_error)?,
-        endpoint: endpoint.trim().to_owned(),
-        target_id: target_id.trim().to_owned(),
-        created_unix_ms: now_unix_ms().map_err(cdp_owner_ledger_error)?,
-        mutation,
-    };
-    validate_persisted_cdp_mutation_owner(&owner).map_err(cdp_owner_ledger_error)?;
-    let root = cdp_mutation_owner_root().map_err(cdp_owner_ledger_error)?;
-    let _lock = cdp_mutation_owner_ledger_lock().lock().map_err(|_| {
-        cdp_owner_ledger_error("durable CDP mutation owner ledger lock is poisoned")
-    })?;
-    persist_cdp_mutation_owner_at_root(&root, &owner)?;
-    Ok(owner)
-}
-
-fn persist_cdp_mutation_owner_at_root(
-    root: &Path,
-    owner: &PersistedCdpMutationOwner,
-) -> A11yResult<()> {
-    validate_cdp_mutation_owner_root(root, true).map_err(cdp_owner_ledger_error)?;
-    let final_path = root.join(format!("{}.json", owner.owner_id));
-    let staging_path = root.join(format!(
-        ".{}.json.tmp.{}",
-        owner.owner_id,
-        CDP_MUTATION_OWNER_SEQUENCE.fetch_add(1, Ordering::SeqCst)
-    ));
-    let bytes = serde_json::to_vec_pretty(&owner).map_err(|error| {
-        cdp_owner_ledger_error(format!("encode durable CDP mutation owner failed: {error}"))
-    })?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CDP_MUTATION_OWNER_MAX_BYTES {
-        return Err(cdp_owner_ledger_error(format!(
-            "encoded owner {} exceeds {} bytes",
-            owner.owner_id, CDP_MUTATION_OWNER_MAX_BYTES
-        )));
-    }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&staging_path)
-        .map_err(|error| {
-            cdp_owner_ledger_error(format!(
-                "create owner staging file {} failed: {error}",
-                staging_path.display()
-            ))
-        })?;
-    file.write_all(&bytes).map_err(|error| {
-        cdp_owner_ledger_error(format!(
-            "write owner staging file {} failed: {error}",
-            staging_path.display()
-        ))
-    })?;
-    file.sync_all().map_err(|error| {
-        cdp_owner_ledger_error(format!(
-            "flush owner staging file {} failed: {error}",
-            staging_path.display()
-        ))
-    })?;
-    drop(file);
-    move_file_write_through(&staging_path, &final_path).map_err(cdp_owner_ledger_error)?;
-    let readback =
-        read_persisted_cdp_mutation_owner_file(&final_path).map_err(cdp_owner_ledger_error)?;
-    if readback != *owner {
-        return Err(cdp_owner_ledger_error(format!(
-            "durable owner readback differed after write at {}",
-            final_path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn resolve_persisted_cdp_mutation_owner(owner: &PersistedCdpMutationOwner) -> A11yResult<()> {
-    let root = cdp_mutation_owner_root().map_err(cdp_owner_ledger_error)?;
-    let _lock = cdp_mutation_owner_ledger_lock().lock().map_err(|_| {
-        cdp_owner_ledger_error("durable CDP mutation owner ledger lock is poisoned")
-    })?;
-    resolve_persisted_cdp_mutation_owner_at_root(&root, owner)
-}
-
-fn resolve_persisted_cdp_mutation_owner_at_root(
-    root: &Path,
-    owner: &PersistedCdpMutationOwner,
-) -> A11yResult<()> {
-    validate_cdp_mutation_owner_root(root, true).map_err(cdp_owner_ledger_error)?;
-    let active_path = root.join(format!("{}.json", owner.owner_id));
-    let readback =
-        read_persisted_cdp_mutation_owner_file(&active_path).map_err(cdp_owner_ledger_error)?;
-    if &readback != owner {
-        return Err(cdp_owner_ledger_error(format!(
-            "durable owner row changed before resolve at {}",
-            active_path.display()
-        )));
-    }
-    let resolved_root = root.join("resolved");
-    fs::create_dir_all(&resolved_root).map_err(|error| {
-        cdp_owner_ledger_error(format!(
-            "create resolved owner archive {} failed: {error}",
-            resolved_root.display()
-        ))
-    })?;
-    validate_cdp_mutation_owner_root(&resolved_root, false).map_err(cdp_owner_ledger_error)?;
-    let resolved_path = resolved_root.join(format!("{}.json", owner.owner_id));
-    move_file_write_through(&active_path, &resolved_path).map_err(cdp_owner_ledger_error)?;
-    let resolved =
-        read_persisted_cdp_mutation_owner_file(&resolved_path).map_err(cdp_owner_ledger_error)?;
-    if &resolved != owner || active_path.exists() {
-        return Err(cdp_owner_ledger_error(format!(
-            "durable owner terminal readback failed for {}",
-            owner.owner_id
-        )));
-    }
-    Ok(())
-}
-
-fn mark_persisted_init_script_registration_removed(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<()> {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    if !snapshot.failures.is_empty() {
-        return Err(cdp_owner_ledger_error(format!(
-            "cannot transition init-script owner after physical removal: {}",
-            snapshot.failures.join(" | ")
-        )));
-    }
-    for row in snapshot.rows {
-        let PersistedCdpMutationKind::InitScriptEffect {
-            registration_identifier: Some(row_identifier),
-            registration_removed: false,
-        } = &row.owner.mutation
-        else {
-            continue;
-        };
-        if row.owner.endpoint != endpoint
-            || row.owner.target_id != target_id
-            || row_identifier != identifier
-        {
-            continue;
-        }
-        let _removed_owner = transition_persisted_init_script_registration_removed(&row.owner)?;
-    }
-    Ok(())
-}
-
-fn persisted_init_script_registration_removed_readback(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<bool> {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    if !snapshot.failures.is_empty() {
-        return Err(cdp_owner_ledger_error(format!(
-            "cannot read init-script registration state: {}",
-            snapshot.failures.join(" | ")
-        )));
-    }
-    Ok(snapshot.rows.iter().any(|row| {
-        row.owner.endpoint == endpoint
-            && row.owner.target_id == target_id
-            && matches!(
-                &row.owner.mutation,
-                PersistedCdpMutationKind::InitScriptEffect {
-                    registration_identifier: Some(row_identifier),
-                    registration_removed: true,
-                } if row_identifier == identifier
-            )
-    }))
-}
-
-fn transition_persisted_init_script_registration_removed(
-    owner: &PersistedCdpMutationOwner,
-) -> A11yResult<PersistedCdpMutationOwner> {
-    let PersistedCdpMutationKind::InitScriptEffect {
-        registration_identifier: Some(identifier),
-        registration_removed: false,
-    } = &owner.mutation
-    else {
-        return Err(cdp_owner_ledger_error(format!(
-            "owner {} is not an active identifier-bearing init-script effect",
-            owner.owner_id
-        )));
-    };
-    let removed_owner = persist_cdp_mutation_owner(
-        &owner.endpoint,
-        &owner.target_id,
-        PersistedCdpMutationKind::InitScriptEffect {
-            registration_identifier: Some(identifier.clone()),
-            registration_removed: true,
-        },
-    )?;
-    resolve_persisted_cdp_mutation_owner(owner)?;
-    Ok(removed_owner)
-}
-
-async fn remove_init_script_registration_for_recovery(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<()> {
-    let identifier = identifier.to_owned();
-    with_target_page_without_dom_prime(endpoint, target_id, |page| async move {
-        tokio::time::timeout(
-            CDP_INPUT_COMMAND_TIMEOUT,
-            page.execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
-                ScriptIdentifier::new(identifier.clone()),
-            )),
-        )
-        .await
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.removeScriptToEvaluateOnNewDocument({identifier:?}) timed out after {} ms during persisted-owner recovery",
-                CDP_INPUT_COMMAND_TIMEOUT.as_millis()
-            ),
-        })?
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.removeScriptToEvaluateOnNewDocument({identifier:?}) during persisted-owner recovery: {error}"
-            ),
-        })?;
-        Ok(())
-    })
-    .await
-}
-
-async fn reload_cdp_target_with_new_document_readback(
-    endpoint: &str,
-    target_id: &str,
-) -> A11yResult<()> {
-    with_target_page_without_dom_prime(endpoint, target_id, |page| async move {
-        let before = tokio::time::timeout(
-            CDP_INPUT_COMMAND_TIMEOUT,
-            page.execute(GetFrameTreeParams::default()),
-        )
-        .await
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.getFrameTree before durable-owner reload timed out after {} ms",
-                CDP_INPUT_COMMAND_TIMEOUT.as_millis()
-            ),
-        })?
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.getFrameTree before durable-owner reload: {error}"),
-        })?
-        .result
-        .frame_tree
-        .frame
-        .loader_id
-        .inner()
-        .clone();
-        if before.is_empty() {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: "Page.getFrameTree returned an empty pre-reload main-frame loader id"
-                    .to_owned(),
-            });
-        }
-
-        tokio::time::timeout(
-            CDP_INPUT_COMMAND_TIMEOUT,
-            page.execute(ReloadParams::default()),
-        )
-        .await
-        .map_err(|_| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Page.reload during durable-owner reconciliation timed out after {} ms",
-                CDP_INPUT_COMMAND_TIMEOUT.as_millis()
-            ),
-        })?
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.reload during durable-owner reconciliation: {error}"),
-        })?;
-
-        let started = Instant::now();
-        let budget = CDP_INPUT_COMMAND_TIMEOUT;
-        let mut last_loader_id = before.clone();
-        loop {
-            let remaining = budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "Page.reload target {target_id:?} did not change the main-frame loader id within {} ms (before={before:?}, last={last_loader_id:?})",
-                        budget.as_millis(),
-                    ),
-                });
-            }
-            match tokio::time::timeout(
-                remaining,
-                page.execute(GetFrameTreeParams::default()),
-            )
-            .await
-            {
-                Ok(Ok(readback)) => {
-                    last_loader_id = readback
-                        .result
-                        .frame_tree
-                        .frame
-                        .loader_id
-                        .inner()
-                        .clone();
-                    if !last_loader_id.is_empty() && last_loader_id != before {
-                        return Ok(());
-                    }
-                }
-                Ok(Err(_)) => {}
-                Err(_) => continue,
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-}
-
-async fn cdp_target_present_inventory(endpoint: &str, target_id: &str) -> A11yResult<bool> {
-    let targets = crate::cdp::cdp_list_targets(endpoint).await?;
-    Ok(targets.iter().any(|target| target.target_id == target_id))
-}
-
-async fn close_cdp_target_with_absence_readback(endpoint: &str, target_id: &str) -> A11yResult<()> {
-    let close = crate::cdp::cdp_close_target(endpoint, target_id).await;
-    match cdp_target_present_inventory(endpoint, target_id).await {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(A11yError::CdpAxtreeFailed {
-            detail: match close {
-                Ok(_) => {
-                    format!("target {target_id:?} remained in a separate inventory after close")
-                }
-                Err(error) => format!(
-                    "close target {target_id:?} failed and the target remained present: {error}"
-                ),
-            },
-        }),
-        Err(inventory_error) => Err(A11yError::CdpAxtreeFailed {
-            detail: match close {
-                Ok(_) => format!(
-                    "close target {target_id:?} returned success but the separate absence inventory failed: {inventory_error}"
-                ),
-                Err(close_error) => format!(
-                    "close target {target_id:?} failed: {close_error}; separate absence inventory also failed: {inventory_error}"
-                ),
-            },
-        }),
-    }
-}
-
-fn decrement_if_nonzero(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-        (value > 0).then_some(value - 1)
-    });
-}
-
-fn record_drained_owner(
-    drain: &mut CdpPersistedMutationOwnerDrainReadback,
-    owner: &PersistedCdpMutationOwner,
-) {
-    match owner.mutation.category() {
-        PersistedCdpMutationCategory::Input => {
-            drain.input_drained = drain.input_drained.saturating_add(1);
-            decrement_if_nonzero(&UNRESOLVED_RAW_CDP_INPUT_OWNERS);
-        }
-        PersistedCdpMutationCategory::Evaluate => {
-            drain.evaluate_drained = drain.evaluate_drained.saturating_add(1);
-            decrement_if_nonzero(&UNRESOLVED_RAW_CDP_EVALUATE_TIMEOUTS);
-        }
-        PersistedCdpMutationCategory::InitScriptEffect => {
-            drain.init_script_effect_drained = drain.init_script_effect_drained.saturating_add(1);
-        }
-    }
-}
-
-pub async fn persisted_cdp_mutation_owners_disable_and_drain()
--> CdpPersistedMutationOwnerDrainReadback {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    let mut drain = CdpPersistedMutationOwnerDrainReadback {
-        total_found: snapshot.candidate_count,
-        failures: snapshot.failures,
-        ..Default::default()
-    };
-    for row in &snapshot.rows {
-        match row.owner.mutation.category() {
-            PersistedCdpMutationCategory::Input => {
-                drain.input_found = drain.input_found.saturating_add(1);
-            }
-            PersistedCdpMutationCategory::Evaluate => {
-                drain.evaluate_found = drain.evaluate_found.saturating_add(1);
-            }
-            PersistedCdpMutationCategory::InitScriptEffect => {
-                drain.init_script_effect_found = drain.init_script_effect_found.saturating_add(1);
-            }
-        }
-    }
-
-    for row in snapshot.rows {
-        let owner = &row.owner;
-        let present = match cdp_target_present_inventory(&owner.endpoint, &owner.target_id).await {
-            Ok(present) => present,
-            Err(error) => {
-                drain.failures.push(format!(
-                    "inventory owner {} target {:?} at {} failed (row {}): {error}",
-                    owner.owner_id,
-                    owner.target_id,
-                    owner.endpoint,
-                    row.path.display()
-                ));
-                continue;
-            }
-        };
-        let terminal_owner = if present {
-            match &owner.mutation {
-                PersistedCdpMutationKind::Mouse { .. }
-                | PersistedCdpMutationKind::Keys { .. }
-                | PersistedCdpMutationKind::Touch { .. } => {
-                    match release_persisted_cdp_input_owner(owner).await {
-                        Ok(()) => Ok(owner.clone()),
-                        Err(release_error) => {
-                            reload_cdp_target_with_new_document_readback(
-                                &owner.endpoint,
-                                &owner.target_id,
-                            )
-                            .await
-                            .map_err(|reload_error| A11yError::CdpAxtreeFailed {
-                                detail: format!(
-                                    "exact persisted input release failed: {release_error}; reload fallback also failed: {reload_error}"
-                                ),
-                            })
-                            .map(|()| owner.clone())
-                        }
-                    }
-                }
-                PersistedCdpMutationKind::Evaluate { .. } => {
-                    reload_cdp_target_with_new_document_readback(
-                        &owner.endpoint,
-                        &owner.target_id,
-                    )
-                    .await
-                    .map(|()| owner.clone())
-                }
-                PersistedCdpMutationKind::InitScriptEffect {
-                    registration_identifier: None,
-                    ..
-                } => close_cdp_target_with_absence_readback(&owner.endpoint, &owner.target_id)
-                    .await
-                    .map(|()| owner.clone()),
-                PersistedCdpMutationKind::InitScriptEffect {
-                    registration_identifier: Some(identifier),
-                    registration_removed,
-                } => {
-                    let effect_owner = if *registration_removed {
-                        Ok(owner.clone())
-                    } else {
-                        remove_init_script_registration_for_recovery(
-                            &owner.endpoint,
-                            &owner.target_id,
-                            identifier,
-                        )
-                        .await
-                        .and_then(|()| {
-                            transition_persisted_init_script_registration_removed(owner)
-                        })
-                    };
-                    match effect_owner {
-                        Ok(effect_owner) => match reload_cdp_target_with_new_document_readback(
-                            &owner.endpoint,
-                            &owner.target_id,
-                        )
-                        .await
-                        {
-                            Ok(()) => Ok(effect_owner),
-                            Err(reload_error) => close_cdp_target_with_absence_readback(
-                                &owner.endpoint,
-                                &owner.target_id,
-                            )
-                            .await
-                            .map(|()| effect_owner)
-                            .map_err(|close_error| A11yError::CdpAxtreeFailed {
-                                detail: format!(
-                                    "init-script effect reload failed: {reload_error}; exact target close fallback also failed: {close_error}"
-                                ),
-                            }),
-                        },
-                        Err(cleanup_error) => close_cdp_target_with_absence_readback(
-                            &owner.endpoint,
-                            &owner.target_id,
-                        )
-                        .await
-                        .map(|()| owner.clone())
-                        .map_err(|close_error| A11yError::CdpAxtreeFailed {
-                            detail: format!(
-                                "init-script registration cleanup/ledger transition failed: {cleanup_error}; exact target close fallback also failed: {close_error}"
-                            ),
-                        }),
-                    }
-                }
-            }
-        } else {
-            Ok(owner.clone())
-        };
-        match terminal_owner {
-            Ok(terminal_owner) => match resolve_persisted_cdp_mutation_owner(&terminal_owner) {
-                Ok(()) => record_drained_owner(&mut drain, owner),
-                Err(error) => drain.failures.push(format!(
-                    "owner {} reached a physical terminal state but ledger transition failed: {error}",
-                    owner.owner_id
-                )),
-            },
-            Err(error) => drain.failures.push(format!(
-                "owner {} remains retryable and active: {error}",
-                owner.owner_id
-            )),
-        }
-    }
-    let after = persisted_cdp_mutation_owner_readback();
-    drain.input_remaining = after.input_count;
-    drain.evaluate_remaining = after.evaluate_count;
-    drain.init_script_effect_remaining = after.init_script_effect_count;
-    drain.total_remaining = after.total_count;
-    drain.failures.extend(after.failures);
-    drain
-}
-
-fn cdp_owner_ledger_error(detail: impl Into<String>) -> A11yError {
-    A11yError::CdpAxtreeFailed {
-        detail: format!("durable CDP mutation owner ledger: {}", detail.into()),
-    }
-}
-
-struct RawCdpInputTaskTerminalGuard {
-    terminal_accounted: bool,
-}
-
-impl RawCdpInputTaskTerminalGuard {
-    const fn new() -> Self {
-        Self {
-            terminal_accounted: false,
-        }
-    }
-
-    const fn mark_terminal_accounted(&mut self) {
-        self.terminal_accounted = true;
-    }
-}
-
-impl Drop for RawCdpInputTaskTerminalGuard {
-    fn drop(&mut self) {
-        if !self.terminal_accounted {
-            // Do not manufacture an in-memory owner here. Cancellation can
-            // happen before the dispatcher persists a row (no physical input
-            // was sent) or after its acknowledged release resolved that row.
-            // Every physical press/keyDown/touchStart is preceded by the
-            // crash-safe ledger row, so that row—not this task lifetime—is the
-            // exact recovery owner. Explicit ambiguous release paths increment
-            // the same-process tripwire separately.
-            let persisted = persisted_cdp_mutation_owner_readback();
-            tracing::error!(
-                code = "A11Y_RAW_CDP_INPUT_OWNER_DROPPED_UNFINISHED",
-                persisted_cdp_input_owner_count = persisted.input_count,
-                persisted_cdp_owner_readback_healthy = persisted.failures.is_empty(),
-                unresolved_raw_cdp_input_owner_count = unresolved_raw_cdp_input_owner_count(),
-                "raw CDP input task ended without publishing its terminal verdict; durable ledger readback remains authoritative"
-            );
-        }
-    }
-}
-
-async fn run_owned_cdp_input<T, Fut>(operation: &'static str, action: Fut) -> A11yResult<T>
-where
-    T: Send + 'static,
-    Fut: std::future::Future<Output = A11yResult<T>> + Send + 'static,
-{
-    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let mut terminal_guard = RawCdpInputTaskTerminalGuard::new();
-        let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-        let result = if crate::cdp_network::durable_browser_mutation_owners_enabled() {
-            action.await
-        } else {
-            Err(A11yError::CdpAttachFailed {
-                detail: format!(
-                    "durable browser mutation owners are disabled by operator panic; refusing CDP input operation {operation}"
-                ),
-            })
-        };
-        // Every normal return from an input dispatcher either observed all
-        // required release acknowledgements or recorded a fail-closed owner.
-        terminal_guard.mark_terminal_accounted();
-        let _ = result_sender.send(result);
-    });
-    result_receiver
-        .await
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "owned CDP input operation {operation} ended before publishing its terminal verdict: {error}; unresolved_raw_cdp_input_owner_count={}",
-                unresolved_raw_cdp_input_owner_count()
-            ),
-        })?
-}
-
-/// Same-process tripwire for timed-out Runtime.evaluate commands. The
-/// crash-safe owner rows are the restart-surviving source of truth; this count
-/// is cleared only as K2 terminally reconciles matching rows.
-#[must_use]
-pub fn unresolved_raw_cdp_evaluate_timeout_count() -> u64 {
-    UNRESOLVED_RAW_CDP_EVALUATE_TIMEOUTS.load(Ordering::SeqCst)
-}
-
-/// Same-process tripwire for input tasks whose terminal release was not proven.
-/// Each physical press/start is preceded by a crash-safe owner row, so K2 can
-/// retry the exact release (or reload) even after daemon restart.
-#[must_use]
-pub fn unresolved_raw_cdp_input_owner_count() -> u64 {
-    UNRESOLVED_RAW_CDP_INPUT_OWNERS.load(Ordering::SeqCst)
-}
-
-/// Runs an evaluate command future under a bounded wall-clock budget, converting a
-/// deadline overrun into a structured [`A11yError::CdpEvaluateTimeout`] that is
-/// distinct from a thrown JS exception (`A11yError::CdpAxtreeFailed`). The error
-/// carries the elapsed and budget milliseconds so a caller can retry with a larger
-/// `timeout_ms` instead of guessing. The wall clock is the source of truth for the
-/// "still running at the deadline" classification; a real exception resolves the
-/// inner future to `Ok` and is surfaced separately via `exception_details`.
-async fn evaluate_with_owned_budget<Fut, T>(
-    operation: &str,
-    scope: &str,
-    timeout_ms: Option<u64>,
-    owner: &PersistedCdpMutationOwner,
-    fut: Fut,
-) -> A11yResult<T>
-where
-    Fut: std::future::Future<Output = A11yResult<T>>,
-{
-    // No caller-imposed budget: preserve the underlying transport's own timeout
-    // (chromiumoxide's request timeout) exactly as before.
-    let Some(timeout_ms) = timeout_ms else {
-        return match fut.await {
-            Ok(value) => {
-                resolve_persisted_cdp_mutation_owner(owner)?;
-                Ok(value)
-            }
-            Err(error) => Err(error),
-        };
-    };
-    let budget = Duration::from_millis(timeout_ms);
-    let started = Instant::now();
-    if let Ok(result) = tokio::time::timeout(budget, fut).await {
-        match result {
-            Ok(value) => {
-                resolve_persisted_cdp_mutation_owner(owner)?;
-                Ok(value)
-            }
-            Err(error) => Err(error),
-        }
-    } else {
-        let elapsed_ms = duration_millis_u64(started.elapsed());
-        UNRESOLVED_RAW_CDP_EVALUATE_TIMEOUTS.fetch_add(1, Ordering::SeqCst);
-        Err(A11yError::CdpEvaluateTimeout {
-            detail: format!(
-                "{operation} ({scope} scope) was still running when the {timeout_ms} ms timeout_ms budget elapsed (elapsed {elapsed_ms} ms); CDP exposes no cancellation primitive, so durable owner {} remains fail-closed until exact target reload/absence reconciliation. The expression neither resolved nor threw. If waiting for a returned promise is unnecessary, retry with await_promise=false.",
-                owner.owner_id
-            ),
-        })
-    }
-}
-
 pub async fn cdp_evaluate_expression(
     endpoint: &str,
     target_id: &str,
@@ -2767,63 +2028,12 @@ pub async fn cdp_evaluate_expression(
     await_promise: bool,
     return_by_value: bool,
 ) -> A11yResult<CdpEvaluateResult> {
-    cdp_evaluate_expression_inner(
-        endpoint,
-        target_id,
-        expression,
-        await_promise,
-        return_by_value,
-        None,
-    )
-    .await
-}
-
-/// Like [`cdp_evaluate_expression`] but enforces a caller-supplied wall-clock
-/// budget (`timeout_ms`). If the expression is still running when the budget
-/// elapses the call fails with [`A11yError::CdpEvaluateTimeout`] (error code
-/// `BROWSER_EVALUATE_TIMEOUT`), distinct from the exception path, so an agent can
-/// retry with a larger budget (issue #1596).
-pub async fn cdp_evaluate_expression_with_timeout(
-    endpoint: &str,
-    target_id: &str,
-    expression: &str,
-    await_promise: bool,
-    return_by_value: bool,
-    timeout_ms: u64,
-) -> A11yResult<CdpEvaluateResult> {
-    cdp_evaluate_expression_inner(
-        endpoint,
-        target_id,
-        expression,
-        await_promise,
-        return_by_value,
-        Some(timeout_ms),
-    )
-    .await
-}
-
-async fn cdp_evaluate_expression_inner(
-    endpoint: &str,
-    target_id: &str,
-    expression: &str,
-    await_promise: bool,
-    return_by_value: bool,
-    timeout_ms: Option<u64>,
-) -> A11yResult<CdpEvaluateResult> {
     use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
-    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "durable browser mutation owners are disabled by operator panic; refusing Runtime.evaluate"
-                .to_owned(),
-        });
-    }
-    let owner_endpoint = endpoint.to_owned();
     let expression = expression.to_owned();
     with_target_page(endpoint, target_id, |page| async move {
         let target_id = page.target_id().inner().clone();
         // Read URL/title/readyState separately so the result carries the page
-        // context it was evaluated against (manual FSV source correlation).
+        // context it was evaluated against (FSV source-of-truth correlation).
         let state = read_page_state(&page).await?;
         let params = EvaluateParams::builder()
             .expression(expression)
@@ -2833,22 +2043,12 @@ async fn cdp_evaluate_expression_inner(
             .map_err(|err| A11yError::CdpAxtreeFailed {
                 detail: format!("Runtime.evaluate params build: {err}"),
             })?;
-        let owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::Evaluate {
-                operation: "Runtime.evaluate".to_owned(),
-            },
-        )?;
-        let returns =
-            evaluate_with_owned_budget("Runtime.evaluate", "page", timeout_ms, &owner, async {
-                page.execute(params)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("Runtime.evaluate: {err}"),
-                    })
-            })
-            .await?
+        let returns = page
+            .execute(params)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Runtime.evaluate: {err}"),
+            })?
             .result;
         if let Some(exception) = returns.exception_details.as_ref() {
             return Err(A11yError::CdpAxtreeFailed {
@@ -2889,71 +2089,6 @@ pub async fn cdp_evaluate_on_element(
     await_promise: bool,
     return_by_value: bool,
 ) -> A11yResult<CdpEvaluateResult> {
-    cdp_evaluate_on_element_inner(
-        endpoint,
-        target_id,
-        backend_node_id,
-        function_declaration,
-        args,
-        await_promise,
-        return_by_value,
-        None,
-    )
-    .await
-}
-
-/// Like [`cdp_evaluate_on_element`] but enforces a caller-supplied wall-clock
-/// budget (`timeout_ms`), failing with [`A11yError::CdpEvaluateTimeout`] when the
-/// element function is still running at the deadline (issue #1596).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors cdp_evaluate_on_element plus the caller-configurable evaluate budget"
-)]
-pub async fn cdp_evaluate_on_element_with_timeout(
-    endpoint: &str,
-    target_id: &str,
-    backend_node_id: i64,
-    function_declaration: &str,
-    args: &[Value],
-    await_promise: bool,
-    return_by_value: bool,
-    timeout_ms: u64,
-) -> A11yResult<CdpEvaluateResult> {
-    cdp_evaluate_on_element_inner(
-        endpoint,
-        target_id,
-        backend_node_id,
-        function_declaration,
-        args,
-        await_promise,
-        return_by_value,
-        Some(timeout_ms),
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "element-scope evaluate carries node id, function, args, CDP flags, and the evaluate budget"
-)]
-async fn cdp_evaluate_on_element_inner(
-    endpoint: &str,
-    target_id: &str,
-    backend_node_id: i64,
-    function_declaration: &str,
-    args: &[Value],
-    await_promise: bool,
-    return_by_value: bool,
-    timeout_ms: Option<u64>,
-) -> A11yResult<CdpEvaluateResult> {
-    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "durable browser mutation owners are disabled by operator panic; refusing Runtime.callFunctionOn"
-                .to_owned(),
-        });
-    }
-    let owner_endpoint = endpoint.to_owned();
     let function_declaration = function_declaration.to_owned();
     let args = args.to_vec();
     with_target_page(endpoint, target_id, |page| async move {
@@ -2999,28 +2134,13 @@ async fn cdp_evaluate_on_element_inner(
         let call = call.build().map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("build Runtime.callFunctionOn params: {err}"),
         })?;
-        let owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::Evaluate {
-                operation: "Runtime.callFunctionOn".to_owned(),
-            },
-        )?;
-        let returns = evaluate_with_owned_budget(
-            "Runtime.callFunctionOn",
-            "element",
-            timeout_ms,
-            &owner,
-            async {
-                page.execute(call)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("Runtime.callFunctionOn: {err}"),
-                    })
-            },
-        )
-        .await?
-        .result;
+        let returns = page
+            .execute(call)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Runtime.callFunctionOn: {err}"),
+            })?
+            .result;
         if let Some(exception) = returns.exception_details.as_ref() {
             return Err(A11yError::CdpAxtreeFailed {
                 detail: format!(
@@ -3055,46 +2175,9 @@ pub async fn cdp_add_init_script_target(
     include_command_line_api: Option<bool>,
     run_immediately: Option<bool>,
 ) -> A11yResult<CdpInitScriptResult> {
-    let endpoint = endpoint.to_owned();
-    let target_id = target_id.to_owned();
     let source = source.to_owned();
     let world_name = world_name.map(ToOwned::to_owned);
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-        let result = cdp_add_init_script_target_owned(
-            &endpoint,
-            &target_id,
-            &source,
-            world_name.as_deref(),
-            include_command_line_api,
-            run_immediately,
-        )
-        .await;
-        let _ = result_tx.send(result);
-    });
-    result_rx.await.map_err(|_| A11yError::CdpAttachFailed {
-        detail: "owned init-script install task terminated before publishing a verdict".to_owned(),
-    })?
-}
-
-async fn cdp_add_init_script_target_owned(
-    endpoint: &str,
-    target_id: &str,
-    source: &str,
-    world_name: Option<&str>,
-    include_command_line_api: Option<bool>,
-    run_immediately: Option<bool>,
-) -> A11yResult<CdpInitScriptResult> {
-    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "durable browser mutation owners are disabled by operator panic; refusing init-script install".to_owned(),
-        });
-    }
-    let source = source.to_owned();
-    let world_name = world_name.map(ToOwned::to_owned);
-    let owner_endpoint = endpoint.to_owned();
-    let result = with_target_page(endpoint, target_id, |page| async move {
+    with_target_page(endpoint, target_id, |page| async move {
         let target_id = page.target_id().inner().clone();
         let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source);
         if let Some(world_name) = world_name {
@@ -3109,18 +2192,6 @@ async fn cdp_add_init_script_target_owned(
         let params = builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {err}"),
         })?;
-        // Persist a conservative unknown-registration effect owner before the
-        // physical command. If the response is lost, K2 cannot safely infer an
-        // identifier and must close the exact target rather than reload a
-        // possibly still-registered script.
-        let pending_effect_owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::InitScriptEffect {
-                registration_identifier: None,
-                registration_removed: false,
-            },
-        )?;
         let added = page
             .execute(params)
             .await
@@ -3128,66 +2199,14 @@ async fn cdp_add_init_script_target_owned(
                 detail: format!("Page.addScriptToEvaluateOnNewDocument: {err}"),
             })?
             .result;
-        let identifier = added.identifier.inner().clone();
-        // Commit the identifier-bearing owner before retiring the conservative
-        // pending row. Normal registration removal intentionally leaves this
-        // effect owner active until a new-document reload readback terminates
-        // page-world code which may already have executed.
-        let _effect_owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::InitScriptEffect {
-                registration_identifier: Some(identifier.clone()),
-                registration_removed: false,
-            },
-        )?;
-        resolve_persisted_cdp_mutation_owner(&pending_effect_owner)?;
         let state = read_page_state(&page).await?;
         Ok(CdpInitScriptResult {
             target_id,
-            identifier,
+            identifier: added.identifier.inner().clone(),
             state,
         })
     })
-    .await?;
-    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
-        return Err(A11yError::CdpAttachFailed {
-            detail:
-                "operator panic crossed init-script installation; the new identifier was removed"
-                    .to_owned(),
-        });
-    }
-    let entry = DurableInitScriptEntry {
-        endpoint: endpoint.to_owned(),
-        target_id: target_id.to_owned(),
-        identifier: result.identifier.clone(),
-    };
-    let key = durable_init_script_key(endpoint, target_id, &result.identifier);
-    let registered = match durable_init_script_registry().lock() {
-        Ok(mut registry) => {
-            if crate::cdp_network::durable_browser_mutation_owners_enabled() {
-                registry.insert(key, entry);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
-        Err(_) => Err(()),
-    };
-    if registered != Ok(true) {
-        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
-        return Err(A11yError::CdpAttachFailed {
-            detail: if registered == Ok(false) {
-                "operator panic crossed init-script registration; the new identifier was removed"
-                    .to_owned()
-            } else {
-                "durable init-script registry lock is poisoned; the untracked physical identifier was removed"
-                    .to_owned()
-            },
-        });
-    }
-    Ok(result)
+    .await
 }
 
 /// Removes a script previously installed with
@@ -3203,35 +2222,6 @@ pub async fn cdp_remove_init_script_target(
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
-    let result = cdp_remove_init_script_target_owned(endpoint, target_id, identifier).await?;
-    let key = durable_init_script_key(endpoint, target_id, identifier);
-    let mut registry =
-        durable_init_script_registry()
-            .lock()
-            .map_err(|_| A11yError::CdpAttachFailed {
-                detail: "durable init-script registry lock is poisoned after physical removal"
-                    .to_owned(),
-            })?;
-    registry.remove(&key);
-    drop(registry);
-    Ok(result)
-}
-
-async fn cdp_remove_init_script_target_owned(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<CdpInitScriptResult> {
-    cdp_remove_init_script_target_physical(endpoint, target_id, identifier).await
-}
-
-async fn cdp_remove_init_script_target_physical(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<CdpInitScriptResult> {
-    let owner_endpoint = endpoint.to_owned();
-    let owner_target_id = target_id.to_owned();
     let identifier = identifier.to_owned();
     with_target_page(endpoint, target_id, |page| async move {
         let target_id = page.target_id().inner().clone();
@@ -3242,11 +2232,6 @@ async fn cdp_remove_init_script_target_physical(
         .map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("Page.removeScriptToEvaluateOnNewDocument({identifier:?}): {err}"),
         })?;
-        mark_persisted_init_script_registration_removed(
-            &owner_endpoint,
-            &owner_target_id,
-            &identifier,
-        )?;
         let state = read_page_state(&page).await?;
         Ok(CdpInitScriptResult {
             target_id,
@@ -3255,79 +2240,6 @@ async fn cdp_remove_init_script_target_physical(
         })
     })
     .await
-}
-
-pub fn durable_init_script_active_count_readback() -> Result<usize, String> {
-    durable_init_script_registry()
-        .lock()
-        .map(|entries| entries.len())
-        .map_err(|_| "durable init-script registry lock is poisoned".to_owned())
-}
-
-pub async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback {
-    let entries = match durable_init_script_registry().lock() {
-        Ok(mut entries) => std::mem::take(&mut *entries),
-        Err(_) => {
-            return CdpDurableInitScriptDrainReadback {
-                failures: vec!["durable init-script registry lock is poisoned".to_owned()],
-                active_after: usize::MAX,
-                ..Default::default()
-            };
-        }
-    };
-    let found = entries.len();
-    let mut removed = 0usize;
-    let mut failures = Vec::new();
-    let mut failed_entries = Vec::new();
-    for (key, entry) in entries {
-        let removal = match persisted_init_script_registration_removed_readback(
-            &entry.endpoint,
-            &entry.target_id,
-            &entry.identifier,
-        ) {
-            Ok(true) => Ok(()),
-            Ok(false) => remove_init_script_registration_for_recovery(
-                &entry.endpoint,
-                &entry.target_id,
-                &entry.identifier,
-            )
-            .await
-            .and_then(|()| {
-                mark_persisted_init_script_registration_removed(
-                    &entry.endpoint,
-                    &entry.target_id,
-                    &entry.identifier,
-                )
-            }),
-            Err(error) => Err(error),
-        };
-        match removal {
-            Ok(()) => removed = removed.saturating_add(1),
-            Err(error) => {
-                failures.push(format!(
-                    "remove init script {:?} from target {:?}: {error}",
-                    entry.identifier, entry.target_id
-                ));
-                failed_entries.push((key, entry));
-            }
-        }
-    }
-    if !failed_entries.is_empty() {
-        match durable_init_script_registry().lock() {
-            Ok(mut registry) => registry.extend(failed_entries),
-            Err(_) => failures.push(
-                "durable init-script registry lock poisoned while retaining failed removals"
-                    .to_owned(),
-            ),
-        }
-    }
-    let active_after = durable_init_script_active_count_readback().unwrap_or(usize::MAX);
-    CdpDurableInitScriptDrainReadback {
-        found,
-        removed,
-        failures,
-        active_after,
-    }
 }
 
 /// The injected JavaScript selector engine (#1110). One self-contained function
@@ -3839,14 +2751,14 @@ async fn locate_role(
             })?;
         builder.node_id(document.result.root.node_id)
     };
-    let nodes = page
-        .execute(builder.build())
-        .await
-        .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("Accessibility.queryAXTree(role={:?}): {err}", request.query),
-        })?
-        .result
-        .nodes;
+    let nodes = crate::bound_ax_query(
+        crate::ax_query_timeout(),
+        &format!("role={:?}", request.query),
+        page.execute(builder.build()),
+    )
+    .await?
+    .result
+    .nodes;
 
     let name_matcher = request
         .name
@@ -4148,13 +3060,13 @@ pub async fn cdp_wait_for_load_state(
             detail: "CDP target id must not be empty".to_owned(),
         });
     }
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = get_target_page_with_discovery(&browser, target_id).await?;
@@ -4320,7 +3232,8 @@ pub async fn cdp_wait_for_load_state(
     }
     .await;
 
-    finish_chromiumoxide_handler(result, handler_task, "load-state wait").await
+    handler_task.abort();
+    result
 }
 
 // Assembles the load-state wait result from ten independent scalar observations
@@ -4414,13 +3327,13 @@ pub async fn cdp_wait_for_url(
         });
     }
     let matcher = CdpUrlMatcher::new(pattern, match_kind)?;
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = get_target_page_with_discovery(&browser, target_id).await?;
@@ -4513,7 +3426,8 @@ pub async fn cdp_wait_for_url(
     }
     .await;
 
-    finish_chromiumoxide_handler(result, handler_task, "URL wait").await
+    handler_task.abort();
+    result
 }
 
 #[derive(Debug)]
@@ -5272,11 +4186,12 @@ fn validate_cdp_mouse_stroke_points(points: &[CdpMouseStrokePoint]) -> A11yResul
     Ok(())
 }
 
-async fn dispatch_cdp_mouse_stroke_raw(
+async fn dispatch_cdp_mouse_stroke_session(
     endpoint: &str,
     target_id: &str,
     points: &[CdpMouseStrokePoint],
     button: MouseButton,
+    pressed: &std::sync::atomic::AtomicBool,
 ) -> A11yResult<()> {
     let ws_url = cdp_page_websocket_url(endpoint, target_id)?;
     let connect = tokio_tungstenite::connect_async(ws_url.as_str());
@@ -5340,21 +4255,10 @@ async fn dispatch_cdp_mouse_stroke_raw(
         0,
     )
     .await?;
-    let terminal_point = points
-        .last()
-        .map_or(first_point, |point| cdp_stroke_action_point(*point));
-    let owner = persist_cdp_mutation_owner(
-        endpoint,
-        target_id,
-        PersistedCdpMutationKind::Mouse {
-            button: mouse_button_wire(&button).to_owned(),
-            x: terminal_point.x,
-            y: terminal_point.y,
-            click_count: 1,
-            modifiers: 0,
-        },
-    )?;
-    if let Err(press_error) = dispatch_raw_mouse_event(
+    // Set before the press is sent: a cancelled/failed send may still have reached
+    // the page, so the bounded wrapper must release the button (#193).
+    pressed.store(true, std::sync::atomic::Ordering::SeqCst);
+    dispatch_raw_mouse_event(
         &mut socket,
         &mut command_id,
         DispatchMouseEventType::MousePressed,
@@ -5365,122 +4269,42 @@ async fn dispatch_cdp_mouse_stroke_raw(
         "press",
         0,
     )
-    .await
-    {
-        let release = dispatch_raw_mouse_event(
-            &mut socket,
-            &mut command_id,
-            DispatchMouseEventType::MouseReleased,
-            first_point,
-            button.clone(),
-            Some(0),
-            1,
-            "release_after_press_error",
-            0,
-        )
-        .await;
-        return match release {
-            Ok(()) => {
-                resolve_persisted_cdp_mutation_owner(&owner)?;
-                Err(press_error)
-            }
-            Err(release_error) => Err(record_unresolved_input_release(
-                Some(press_error),
-                release_error,
-                "press status and compensating release acknowledgement are both unresolved",
-            )),
-        };
-    }
+    .await?;
 
     let held_buttons = mouse_button_bit(&button);
     let mut previous_elapsed_ms = first.elapsed_ms;
-    let mut current_point = first_point;
-    let mut dispatch_failure = None;
     for (index, point) in points.iter().enumerate().skip(1) {
         sleep_until_sample(previous_elapsed_ms, point.elapsed_ms).await;
         previous_elapsed_ms = point.elapsed_ms;
-        let next_point = cdp_stroke_action_point(*point);
-        if let Err(error) = dispatch_raw_mouse_event(
+        dispatch_raw_mouse_event(
             &mut socket,
             &mut command_id,
             DispatchMouseEventType::MouseMoved,
-            next_point,
+            cdp_stroke_action_point(*point),
             button.clone(),
             Some(held_buttons),
             0,
             "drag_move",
             index,
         )
-        .await
-        {
-            dispatch_failure = Some(error);
-            break;
-        }
-        current_point = next_point;
+        .await?;
     }
-    let release_result = dispatch_raw_mouse_event(
+    dispatch_raw_mouse_event(
         &mut socket,
         &mut command_id,
         DispatchMouseEventType::MouseReleased,
-        current_point,
+        points
+            .last()
+            .map_or(first_point, |point| cdp_stroke_action_point(*point)),
         button,
         Some(0),
         1,
         "release",
         points.len().saturating_sub(1),
     )
-    .await;
-    if let Err(release_error) = release_result {
-        UNRESOLVED_RAW_CDP_INPUT_OWNERS.fetch_add(1, Ordering::SeqCst);
-        return Err(combine_raw_input_failures(
-            dispatch_failure,
-            release_error,
-            "mouse release acknowledgement was not proven",
-        ));
-    }
-    resolve_persisted_cdp_mutation_owner(&owner)?;
+    .await?;
     settle_and_close_raw_input_socket(&mut socket).await;
-    match dispatch_failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-fn combine_raw_input_failures(
-    primary: Option<A11yError>,
-    release: A11yError,
-    context: &str,
-) -> A11yError {
-    let primary = primary.map_or_else(|| "none".to_owned(), |error| error.to_string());
-    A11yError::CdpAxtreeFailed {
-        detail: format!(
-            "{context}; primary_error={primary}; release_error={release}; unresolved_raw_cdp_input_owner_count={}",
-            unresolved_raw_cdp_input_owner_count()
-        ),
-    }
-}
-
-fn record_unresolved_input_release(
-    primary: Option<A11yError>,
-    release: A11yError,
-    context: &str,
-) -> A11yError {
-    record_unresolved_input_release_detail(primary, release.to_string(), context)
-}
-
-fn record_unresolved_input_release_detail(
-    primary: Option<A11yError>,
-    release_detail: String,
-    context: &str,
-) -> A11yError {
-    UNRESOLVED_RAW_CDP_INPUT_OWNERS.fetch_add(1, Ordering::SeqCst);
-    let primary = primary.map_or_else(|| "none".to_owned(), |error| error.to_string());
-    A11yError::CdpAxtreeFailed {
-        detail: format!(
-            "{context}; primary_error={primary}; release_error={release_detail}; unresolved_raw_cdp_input_owner_count={}",
-            unresolved_raw_cdp_input_owner_count()
-        ),
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5505,7 +4329,7 @@ async fn dispatch_raw_mouse_event(
         click_count,
     );
     *command_id = command_id.saturating_add(1);
-    send_raw_cdp_input_payload(socket, payload, stage, sample_index).await
+    send_raw_mouse_event_payload(socket, payload, stage, sample_index).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5534,23 +4358,15 @@ async fn send_raw_mouse_event(
     .await
 }
 
-async fn send_raw_cdp_input_payload(
+async fn send_raw_mouse_event_payload(
     socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     payload: Value,
     stage: &'static str,
     sample_index: usize,
 ) -> A11yResult<()> {
-    let command_id = payload
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "raw CDP input payload at stage {stage} sample_index={sample_index} had no integer command id"
-            ),
-        })?;
     let text = serde_json::to_string(&payload).map_err(|err| A11yError::CdpAxtreeFailed {
         detail: format!(
-            "serialize raw CDP input command at stage {stage} sample_index={sample_index}: {err}"
+            "serialize raw CDP Input.dispatchMouseEvent at stage {stage} sample_index={sample_index}: {err}"
         ),
     })?;
     let send = socket.send(Message::Text(text.into()));
@@ -5567,107 +4383,7 @@ async fn send_raw_cdp_input_payload(
                 CDP_INPUT_COMMAND_TIMEOUT.as_millis()
             ),
         }),
-    }?;
-    await_raw_cdp_command_ack(socket, command_id, stage, sample_index).await
-}
-
-async fn await_raw_cdp_command_ack(
-    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    command_id: u64,
-    stage: &'static str,
-    sample_index: usize,
-) -> A11yResult<()> {
-    let deadline = Instant::now() + CDP_INPUT_COMMAND_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "CDP raw input acknowledgement timed out after {} ms for command_id={command_id} stage={stage} sample_index={sample_index}",
-                    CDP_INPUT_COMMAND_TIMEOUT.as_millis()
-                ),
-            });
-        }
-        let message = tokio::time::timeout(remaining, socket.next())
-            .await
-            .map_err(|_| A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "CDP raw input acknowledgement timed out after {} ms for command_id={command_id} stage={stage} sample_index={sample_index}",
-                    CDP_INPUT_COMMAND_TIMEOUT.as_millis()
-                ),
-            })?
-            .ok_or_else(|| A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "CDP raw input socket closed before acknowledgement command_id={command_id} stage={stage} sample_index={sample_index}"
-                ),
-            })?
-            .map_err(|error| A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "CDP raw input socket read failed before acknowledgement command_id={command_id} stage={stage} sample_index={sample_index}: {error}"
-                ),
-            })?;
-        let response = match message {
-            Message::Text(text) => serde_json::from_str::<Value>(text.as_str()),
-            Message::Binary(bytes) => serde_json::from_slice::<Value>(&bytes),
-            Message::Ping(payload) => {
-                tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, socket.send(Message::Pong(payload)))
-                    .await
-                    .map_err(|_| A11yError::CdpAxtreeFailed {
-                        detail: format!(
-                            "CDP raw input pong timed out while awaiting command_id={command_id}"
-                        ),
-                    })?
-                    .map_err(|error| A11yError::CdpAxtreeFailed {
-                        detail: format!(
-                            "CDP raw input pong failed while awaiting command_id={command_id}: {error}"
-                        ),
-                    })?;
-                continue;
-            }
-            Message::Close(frame) => {
-                return Err(A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "CDP raw input socket closed before acknowledgement command_id={command_id} stage={stage} sample_index={sample_index}: {frame:?}"
-                    ),
-                });
-            }
-            Message::Pong(_) | Message::Frame(_) => continue,
-        }
-        .map_err(|error| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "decode CDP raw input response while awaiting command_id={command_id} stage={stage} sample_index={sample_index}: {error}"
-            ),
-        })?;
-        if raw_cdp_ack_response_matches(&response, command_id, stage, sample_index)? {
-            return Ok(());
-        }
     }
-}
-
-fn raw_cdp_ack_response_matches(
-    response: &Value,
-    command_id: u64,
-    stage: &'static str,
-    sample_index: usize,
-) -> A11yResult<bool> {
-    if response.get("id").and_then(Value::as_u64) != Some(command_id) {
-        return Ok(false);
-    }
-    if let Some(error) = response.get("error") {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Chrome rejected raw CDP input command_id={command_id} stage={stage} sample_index={sample_index}: {error}"
-            ),
-        });
-    }
-    if response.get("result").is_none() {
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Chrome returned raw input response without result/error command_id={command_id} stage={stage} sample_index={sample_index}: {response}"
-            ),
-        });
-    }
-    Ok(true)
 }
 
 async fn settle_and_close_raw_input_socket(
@@ -5675,110 +4391,6 @@ async fn settle_and_close_raw_input_socket(
 ) {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let _ = tokio::time::timeout(std::time::Duration::from_millis(250), socket.close(None)).await;
-}
-
-async fn release_persisted_cdp_input_owner(owner: &PersistedCdpMutationOwner) -> A11yResult<()> {
-    let ws_url = cdp_page_websocket_url(&owner.endpoint, &owner.target_id)?;
-    let connect = tokio_tungstenite::connect_async(ws_url.as_str());
-    let (mut socket, _response) = tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, connect)
-        .await
-        .map_err(|_| A11yError::CdpAttachFailed {
-            detail: format!(
-                "persisted input release WebSocket connect timed out after {} ms for owner {} target {}",
-                CDP_INPUT_COMMAND_TIMEOUT.as_millis(),
-                owner.owner_id,
-                owner.target_id
-            ),
-        })?
-        .map_err(|error| A11yError::CdpAttachFailed {
-            detail: format!(
-                "connect persisted input release WebSocket {ws_url} for owner {}: {error}",
-                owner.owner_id
-            ),
-        })?;
-    let mut command_id = 1_u64;
-    match &owner.mutation {
-        PersistedCdpMutationKind::Mouse {
-            button,
-            x,
-            y,
-            click_count,
-            modifiers,
-        } => {
-            let button = mouse_button_from_wire(button)?;
-            let mut payload = raw_mouse_event_message(
-                command_id,
-                DispatchMouseEventType::MouseReleased,
-                CdpActionPoint { x: *x, y: *y },
-                button,
-                0,
-                *click_count,
-            );
-            payload["params"]["modifiers"] = json!(modifiers);
-            send_raw_cdp_input_payload(&mut socket, payload, "persisted_mouse_release", 0).await?;
-        }
-        PersistedCdpMutationKind::Keys { keys } => {
-            let mut modifiers = keys.iter().fold(0_i64, |mask, key| mask | key.modifier_bit);
-            for (index, key) in keys.iter().rev().enumerate() {
-                if key.modifier_bit != 0 {
-                    modifiers &= !key.modifier_bit;
-                }
-                let params = serde_json::to_value(cdp_key_event(
-                    DispatchKeyEventType::KeyUp,
-                    key,
-                    modifiers,
-                )?)
-                .map_err(|error| A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "serialize persisted keyUp for owner {}: {error}",
-                        owner.owner_id
-                    ),
-                })?;
-                let payload = json!({
-                    "id": command_id,
-                    "method": "Input.dispatchKeyEvent",
-                    "params": params,
-                });
-                send_raw_cdp_input_payload(&mut socket, payload, "persisted_key_release", index)
-                    .await?;
-                command_id = command_id.saturating_add(1);
-            }
-        }
-        PersistedCdpMutationKind::Touch { .. } => {
-            let params = serde_json::to_value(touch_event(DispatchTouchEventType::TouchEnd, None)?)
-                .map_err(|error| A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "serialize persisted touchEnd for owner {}: {error}",
-                        owner.owner_id
-                    ),
-                })?;
-            let payload = json!({
-                "id": command_id,
-                "method": "Input.dispatchTouchEvent",
-                "params": params,
-            });
-            send_raw_cdp_input_payload(&mut socket, payload, "persisted_touch_release", 0).await?;
-        }
-        PersistedCdpMutationKind::Evaluate { .. }
-        | PersistedCdpMutationKind::InitScriptEffect { .. } => {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!("owner {} is not a persisted input owner", owner.owner_id),
-            });
-        }
-    }
-    settle_and_close_raw_input_socket(&mut socket).await;
-    Ok(())
-}
-
-fn mouse_button_from_wire(value: &str) -> A11yResult<MouseButton> {
-    match value {
-        "left" => Ok(MouseButton::Left),
-        "right" => Ok(MouseButton::Right),
-        "middle" => Ok(MouseButton::Middle),
-        other => Err(A11yError::CdpAxtreeFailed {
-            detail: format!("persisted mouse owner has unsupported button {other:?}"),
-        }),
-    }
 }
 
 fn cdp_page_websocket_url(endpoint: &str, target_id: &str) -> A11yResult<String> {
@@ -5887,18 +4499,19 @@ pub async fn cdp_capture_node_bgra(
     target_id_hint: Option<&str>,
     backend_node_id: i64,
 ) -> A11yResult<CdpNodeBitmap> {
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page =
             resolve_owning_page(&browser, page_title_hint, target_id_hint, backend_node_id).await?;
         let rect = node_content_rect(&page, backend_node_id).await?;
+        validate_capture_region(rect)?;
         // getBoxModel is viewport-relative (the click path dispatches at its
         // centre as viewport coords and lands correctly); captureScreenshot with
         // captureBeyondViewport=true expects document coords, so add the scroll
@@ -5918,23 +4531,16 @@ pub async fn cdp_capture_node_bgra(
             height: f64::from(rect.h),
             scale: 1.0,
         };
-        let params = ScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
-            .clip(clip)
-            .from_surface(true)
-            .capture_beyond_viewport(true)
-            .build();
+        // #177: never `Page::screenshot` — it activates the user's tab first.
         let png_bytes =
-            page.screenshot(params)
-                .await
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("captureScreenshot: {err}"),
-                })?;
-        decode_png_to_bgra(&png_bytes)
+            capture_png_without_activation(&page, background_capture_params(Some(clip), true))
+                .await?;
+        decode_captured_png(png_bytes).await
     }
     .await;
 
-    finish_chromiumoxide_handler(result, handler_task, "node screenshot capture").await
+    handler_task.abort();
+    result
 }
 
 /// Captures a CDP page target's viewport, or a viewport clip, as a BGRA8 bitmap.
@@ -5952,9 +4558,27 @@ pub async fn cdp_capture_page_bgra(
     target_id: &str,
     region: Option<synapse_core::Rect>,
 ) -> A11yResult<CdpNodeBitmap> {
-    if let Some(region) = region
-        && (region.w <= 0 || region.h <= 0)
-    {
+    if let Some(region) = region {
+        validate_capture_region(region)?;
+    }
+    with_target_page(endpoint, target_id, |page| async move {
+        let clip = region.map(|region| Viewport {
+            x: f64::from(region.x),
+            y: f64::from(region.y),
+            width: f64::from(region.w),
+            height: f64::from(region.h),
+            scale: 1.0,
+        });
+        // #177: never `Page::screenshot` — it activates the user's tab first.
+        let png_bytes =
+            capture_png_without_activation(&page, background_capture_params(clip, false)).await?;
+        decode_captured_png(png_bytes).await
+    })
+    .await
+}
+
+fn validate_capture_region(region: synapse_core::Rect) -> A11yResult<()> {
+    if region.w <= 0 || region.h <= 0 {
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
                 "Page.captureScreenshot clip must be non-empty: bbox=({}, {}, {}, {})",
@@ -5962,28 +4586,11 @@ pub async fn cdp_capture_page_bgra(
             ),
         });
     }
-    with_target_page(endpoint, target_id, |page| async move {
-        let mut params = ScreenshotParams::builder()
-            .format(CaptureScreenshotFormat::Png)
-            .from_surface(true);
-        if let Some(region) = region {
-            params = params.clip(Viewport {
-                x: f64::from(region.x),
-                y: f64::from(region.y),
-                width: f64::from(region.w),
-                height: f64::from(region.h),
-                scale: 1.0,
-            });
-        }
-        let png_bytes =
-            page.screenshot(params.build())
-                .await
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Page.captureScreenshot: {err}"),
-                })?;
-        decode_png_to_bgra(&png_bytes)
-    })
-    .await
+    crate::cdp_capture::check_capture_extent(
+        u64::try_from(region.w).unwrap_or(u64::MAX),
+        u64::try_from(region.h).unwrap_or(u64::MAX),
+        crate::cdp_capture::MAX_CAPTURE_PIXELS,
+    )
 }
 
 fn mouse_event(
@@ -6025,59 +4632,6 @@ fn mouse_event_with_buttons(
     params.button = Some(button);
     params.modifiers = Some(modifiers);
     params
-}
-
-async fn dispatch_mouse_click_on_page(
-    endpoint: &str,
-    page: &chromiumoxide::Page,
-    point: CdpActionPoint,
-    button: MouseButton,
-    click_count: i64,
-    modifiers: i64,
-) -> A11yResult<()> {
-    let owner = persist_cdp_mutation_owner(
-        endpoint,
-        page.target_id().inner(),
-        PersistedCdpMutationKind::Mouse {
-            button: mouse_button_wire(&button).to_owned(),
-            x: point.x,
-            y: point.y,
-            click_count,
-            modifiers,
-        },
-    )?;
-    let press = page
-        .execute(mouse_event_with_modifiers(
-            DispatchMouseEventType::MousePressed,
-            point,
-            button.clone(),
-            click_count,
-            modifiers,
-        ))
-        .await
-        .map_err(|error| dispatch_err(&error));
-    let release = page
-        .execute(mouse_event_with_modifiers(
-            DispatchMouseEventType::MouseReleased,
-            point,
-            button,
-            click_count,
-            modifiers,
-        ))
-        .await
-        .map_err(|error| dispatch_err(&error));
-    match (press, release) {
-        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner),
-        (Err(press_error), Ok(_)) => {
-            resolve_persisted_cdp_mutation_owner(&owner)?;
-            Err(press_error)
-        }
-        (press, Err(release_error)) => Err(record_unresolved_input_release(
-            press.err(),
-            release_error,
-            "mouse click release acknowledgement was not proven",
-        )),
-    }
 }
 
 fn touch_event(
@@ -6125,48 +4679,21 @@ struct CdpTouchInputState {
 }
 
 async fn dispatch_touch_tap_on_page(
-    endpoint: &str,
     page: &chromiumoxide::Page,
     point: CdpActionPoint,
 ) -> A11yResult<CdpTouchTapResult> {
     validate_cdp_action_point(point, "touch tap")?;
     let touch_state = read_touch_input_state(page).await.unwrap_or_default();
-    let owner = persist_cdp_mutation_owner(
-        endpoint,
-        page.target_id().inner(),
-        PersistedCdpMutationKind::Touch {
-            x: point.x,
-            y: point.y,
-        },
-    )?;
-    let start = page
-        .execute(touch_event(
-            DispatchTouchEventType::TouchStart,
-            Some(point),
-        )?)
+    page.execute(touch_event(
+        DispatchTouchEventType::TouchStart,
+        Some(point),
+    )?)
+    .await
+    .map_err(|err| dispatch_err(&err))?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    page.execute(touch_event(DispatchTouchEventType::TouchEnd, None)?)
         .await
-        .map_err(|error| dispatch_err(&error));
-    if start.is_ok() {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let end = page
-        .execute(touch_event(DispatchTouchEventType::TouchEnd, None)?)
-        .await
-        .map_err(|error| dispatch_err(&error));
-    match (start, end) {
-        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner)?,
-        (Err(start_error), Ok(_)) => {
-            resolve_persisted_cdp_mutation_owner(&owner)?;
-            return Err(start_error);
-        }
-        (start, Err(end_error)) => {
-            return Err(record_unresolved_input_release(
-                start.err(),
-                end_error,
-                "touchEnd acknowledgement was not proven",
-            ));
-        }
-    }
+        .map_err(|err| dispatch_err(&err))?;
     Ok(CdpTouchTapResult {
         target_id: page.target_id().inner().clone(),
         point,
@@ -6178,84 +4705,6 @@ async fn dispatch_touch_tap_on_page(
         non_touch_fallback:
             "none; use mouse click explicitly when touch semantics are not required".to_owned(),
     })
-}
-
-async fn dispatch_key_sequence_on_page(
-    endpoint: &str,
-    page: &chromiumoxide::Page,
-    keys: &[CdpKeyStroke],
-    hold_ms: u32,
-) -> A11yResult<()> {
-    for key in keys {
-        let key_down_type = if key.text.is_some() {
-            DispatchKeyEventType::KeyDown
-        } else {
-            DispatchKeyEventType::RawKeyDown
-        };
-        cdp_key_event(key_down_type, key, key.modifier_bit)?;
-        cdp_key_event(DispatchKeyEventType::KeyUp, key, 0)?;
-    }
-    let owner = persist_cdp_mutation_owner(
-        endpoint,
-        page.target_id().inner(),
-        PersistedCdpMutationKind::Keys {
-            keys: keys.to_vec(),
-        },
-    )?;
-    let mut modifiers = 0_i64;
-    let mut possibly_held = Vec::with_capacity(keys.len());
-    let mut primary_error = None;
-    for key in keys {
-        let key_down_type = if key.text.is_some() {
-            DispatchKeyEventType::KeyDown
-        } else {
-            DispatchKeyEventType::RawKeyDown
-        };
-        let event_modifiers = modifiers | key.modifier_bit;
-        let params = cdp_key_event(key_down_type, key, event_modifiers)?;
-        // Once the command enters chromiumoxide its delivery status is
-        // ambiguous until a matching response arrives, so include this key in
-        // the compensating release set before awaiting the response.
-        possibly_held.push(key);
-        match page.execute(params).await {
-            Ok(_) => modifiers = event_modifiers,
-            Err(error) => {
-                modifiers = event_modifiers;
-                primary_error = Some(dispatch_err(&error));
-                break;
-            }
-        }
-    }
-    if primary_error.is_none() && hold_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
-    }
-
-    let mut release_failures = Vec::new();
-    for key in possibly_held.into_iter().rev() {
-        if key.modifier_bit != 0 {
-            modifiers &= !key.modifier_bit;
-        }
-        match cdp_key_event(DispatchKeyEventType::KeyUp, key, modifiers) {
-            Ok(params) => {
-                if let Err(error) = page.execute(params).await {
-                    release_failures.push(dispatch_err(&error).to_string());
-                }
-            }
-            Err(error) => release_failures.push(error.to_string()),
-        }
-    }
-    if !release_failures.is_empty() {
-        return Err(record_unresolved_input_release_detail(
-            primary_error,
-            release_failures.join(" | "),
-            "one or more keyUp acknowledgements were not proven",
-        ));
-    }
-    resolve_persisted_cdp_mutation_owner(&owner)?;
-    match primary_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
 }
 
 async fn read_touch_input_state(page: &chromiumoxide::Page) -> A11yResult<CdpTouchInputState> {
@@ -6287,6 +4736,49 @@ const fn mouse_button_bit(button: &MouseButton) -> i64 {
 fn dispatch_err(err: &chromiumoxide::error::CdpError) -> A11yError {
     A11yError::CdpAxtreeFailed {
         detail: format!("CDP input dispatch failed: {err}"),
+    }
+}
+
+/// #189 C4/C5/C6: a failed `Input.dispatchMouseEvent` may still have reached
+/// the page, so each click event failure carries the delivery evidence its
+/// stage proves. Every other click failure (connect, target/node resolution,
+/// box model) precedes input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickEventStage {
+    /// `mouseMoved` precedes every button event: no button was dispatched.
+    BeforeButton,
+    /// `mousePressed` itself failed: it may still have reached the page.
+    Press,
+    /// `mouseReleased` after a returned `mousePressed`: the press was delivered.
+    AfterPress,
+}
+
+impl ClickEventStage {
+    const fn of(kind: &DispatchMouseEventType) -> Self {
+        match kind {
+            DispatchMouseEventType::MouseMoved => Self::BeforeButton,
+            DispatchMouseEventType::MousePressed | DispatchMouseEventType::MouseWheel => {
+                Self::Press
+            }
+            DispatchMouseEventType::MouseReleased => Self::AfterPress,
+        }
+    }
+
+    fn error(self, err: &impl std::fmt::Display) -> A11yError {
+        let source = Box::new(A11yError::CdpAxtreeFailed {
+            detail: format!("CDP input dispatch failed: {err}"),
+        });
+        match self {
+            Self::BeforeButton => A11yError::ClickNotDispatched { source },
+            Self::Press => A11yError::ClickDispatch {
+                source,
+                delivered: false,
+            },
+            Self::AfterPress => A11yError::ClickDispatch {
+                source,
+                delivered: true,
+            },
+        }
     }
 }
 
@@ -6431,33 +4923,6 @@ async fn wait_for_pages(browser: &chromiumoxide::Browser) -> A11yResult<Vec<chro
     })
 }
 
-async fn finish_chromiumoxide_handler<T>(
-    result: A11yResult<T>,
-    handler_task: tokio::task::JoinHandle<()>,
-    operation: &str,
-) -> A11yResult<T> {
-    handler_task.abort();
-    let shutdown = match handler_task.await {
-        Ok(()) => Ok(()),
-        Err(error) if error.is_cancelled() => Ok(()),
-        Err(error) => Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "chromiumoxide handler task for {operation} failed before exact join: {error}"
-            ),
-        }),
-    };
-    match (result, shutdown) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
-        (Err(primary), Err(shutdown_error)) => Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "{operation} failed: {primary}; chromiumoxide handler shutdown also failed: {shutdown_error}"
-            ),
-        }),
-    }
-}
-
 /// Attaches, finds the page owning `backend_node_id`, scrolls it into view,
 /// resolves its box-model centre, runs `action(page, center)`, and tears down.
 async fn with_node_center<A, Fut, T>(
@@ -6471,13 +4936,13 @@ where
     A: FnOnce(chromiumoxide::Page, CdpActionPoint) -> Fut,
     Fut: std::future::Future<Output = A11yResult<T>>,
 {
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page =
@@ -6491,7 +4956,8 @@ where
     }
     .await;
 
-    finish_chromiumoxide_handler(result, handler_task, "node-center action").await
+    handler_task.abort();
+    result
 }
 
 async fn with_node_page<A, Fut, T>(
@@ -6505,13 +4971,13 @@ where
     A: FnOnce(chromiumoxide::Page) -> Fut,
     Fut: std::future::Future<Output = A11yResult<T>>,
 {
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page =
@@ -6520,7 +4986,8 @@ where
     }
     .await;
 
-    finish_chromiumoxide_handler(result, handler_task, "node-page action").await
+    handler_task.abort();
+    result
 }
 
 async fn with_target_page<A, Fut, T>(endpoint: &str, target_id: &str, action: A) -> A11yResult<T>
@@ -6534,13 +5001,13 @@ where
             detail: "CDP target id must not be empty".to_owned(),
         });
     }
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = get_target_page_with_discovery(&browser, target_id).await?;
@@ -6549,44 +5016,8 @@ where
     }
     .await;
 
-    finish_chromiumoxide_handler(result, handler_task, "target-page action").await
-}
-
-/// Recovery-only target attachment which deliberately skips `DOM.getDocument`.
-/// A timed-out `Runtime.evaluate` can leave the renderer main thread blocked;
-/// browser-process Page commands such as `getFrameTree`/`reload` remain usable,
-/// while the DOM priming command can wait on the unhealthy renderer and prevent
-/// the cleanup from ever reaching `Page.reload`.
-async fn with_target_page_without_dom_prime<A, Fut, T>(
-    endpoint: &str,
-    target_id: &str,
-    action: A,
-) -> A11yResult<T>
-where
-    A: FnOnce(chromiumoxide::Page) -> Fut,
-    Fut: std::future::Future<Output = A11yResult<T>>,
-{
-    let target_id = target_id.trim();
-    if target_id.is_empty() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "CDP target id must not be empty".to_owned(),
-        });
-    }
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-
-    let result = async {
-        let page = get_target_page_with_discovery(&browser, target_id).await?;
-        action(page).await
-    }
-    .await;
-
-    finish_chromiumoxide_handler(result, handler_task, "target-page recovery action").await
+    handler_task.abort();
+    result
 }
 
 /// Resolves a CDP target id to its [`chromiumoxide::Page`], tolerating the
@@ -6879,11 +5310,28 @@ where
 
 /// Decodes a Chrome PNG screenshot into a top-down BGRA8 bitmap for OCR (#703).
 fn decode_png_to_bgra(png_bytes: &[u8]) -> A11yResult<CdpNodeBitmap> {
+    decode_png_to_bgra_bounded(png_bytes, crate::cdp_capture::MAX_CAPTURE_PIXELS)
+}
+
+async fn decode_captured_png(png_bytes: Vec<u8>) -> A11yResult<CdpNodeBitmap> {
+    tokio::task::spawn_blocking(move || decode_png_to_bgra(&png_bytes))
+        .await
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("screenshot PNG decode worker failed: {error}"),
+        })?
+}
+
+fn decode_png_to_bgra_bounded(png_bytes: &[u8], max_pixels: u64) -> A11yResult<CdpNodeBitmap> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(png_bytes))
         .read_info()
         .map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("screenshot PNG header decode failed: {err}"),
         })?;
+    crate::cdp_capture::check_capture_extent(
+        u64::from(reader.info().width),
+        u64::from(reader.info().height),
+        max_pixels,
+    )?;
     let buf_size = reader
         .output_buffer_size()
         .ok_or_else(|| A11yError::CdpAxtreeFailed {
@@ -6895,6 +5343,10 @@ fn decode_png_to_bgra(png_bytes: &[u8]) -> A11yResult<CdpNodeBitmap> {
         .map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("screenshot PNG frame decode failed: {err}"),
         })?;
+    decoded_png_frame_to_bgra(&buf, info)
+}
+
+fn decoded_png_frame_to_bgra(buf: &[u8], info: png::OutputInfo) -> A11yResult<CdpNodeBitmap> {
     if info.bit_depth != png::BitDepth::Eight {
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
@@ -6943,3 +5395,13 @@ fn rgb8_to_bgra(rgb: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "tests/cdp_capture_bounds_179.rs"]
+mod capture_bounds_179_tests;
+#[cfg(test)]
+#[path = "tests/cdp_click_stage_189.rs"]
+mod cdp_click_stage_189_tests;
+#[cfg(test)]
+#[path = "tests/cdp_png_decode_budget_179.rs"]
+mod png_decode_budget_179_tests;

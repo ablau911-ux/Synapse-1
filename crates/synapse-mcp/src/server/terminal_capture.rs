@@ -18,4 +18,6 @@
 
 pub(crate) mod asciicast;
 pub(crate) mod capture;
+#[cfg(windows)]
+mod confined_conpty;
 pub(crate) mod shadow_screen;

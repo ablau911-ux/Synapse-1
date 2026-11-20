@@ -63,18 +63,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use synapse_core::{
     AGENT_TRANSCRIPT_MAX_SUMMARY_CHARS, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS,
     AGENT_TRANSCRIPT_MAX_TOOL_RESULT_CHARS, AgentEventKind, AgentEventRecord,
     AgentTranscriptRecord, GenAiOperationName, TranscriptParseStatus, TranscriptRole,
     TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
-use synapse_storage::{
-    Db,
-    agent_transcripts::{agent_transcript_key, agent_transcript_ts_index_key},
-    cf, decode_json, encode_json,
-};
+use synapse_storage::{Db, agent_transcripts::agent_transcript_key, cf, decode_json, encode_json};
 use tokio_util::sync::CancellationToken;
 
 use super::agent_events::{provider_for_agent_kind, record_agent_events, unix_time_ns_now};
@@ -219,19 +214,6 @@ fn cursor_kv_key(spawn_id: &str) -> Vec<u8> {
     format!("{CURSOR_KV_PREFIX}{spawn_id}").into_bytes()
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
-}
-
 fn bounded_chars(text: &str, max_chars: usize) -> (String, bool) {
     if text.chars().count() <= max_chars {
         return (text.to_owned(), false);
@@ -257,15 +239,32 @@ fn bounded_json_string(value: &Value, cap: usize) -> (String, u64, bool) {
 ///
 /// Returns a structured detail when no home anchor can be found — the daemon
 /// must say *why* discovery is impossible rather than silently watch nothing.
+/// Production resolves through [`ambient_projects_root_for_db`]; this
+/// process-environment entry point is kept for tests.
+#[cfg(test)]
 fn claude_projects_root() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os(ROOT_ENV) {
-        return Ok(PathBuf::from(dir));
-    }
-    claude_projects_root_from_host_env()
+    claude_projects_root_with(&process_env)
 }
 
-fn claude_projects_root_from_host_env() -> Result<PathBuf, String> {
-    if let Some(cfg) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+/// Environment lookup injected into the ambient root resolvers (test seam).
+type EnvLookup<'a> = dyn Fn(&str) -> Option<std::ffi::OsString> + 'a;
+
+/// The live [`EnvLookup`]: the daemon's process environment.
+fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+/// `claude_projects_root` reading variables through `env` instead of the
+/// process environment.
+fn claude_projects_root_with(env: &EnvLookup<'_>) -> Result<PathBuf, String> {
+    if let Some(dir) = env(ROOT_ENV) {
+        return Ok(PathBuf::from(dir));
+    }
+    claude_projects_root_from_host_env(env)
+}
+
+fn claude_projects_root_from_host_env(env: &EnvLookup<'_>) -> Result<PathBuf, String> {
+    if let Some(cfg) = env("CLAUDE_CONFIG_DIR") {
         // CLAUDE_CONFIG_DIR may list several dirs; the first is the writable one.
         let raw = cfg.to_string_lossy().into_owned();
         let first = raw
@@ -275,10 +274,10 @@ fn claude_projects_root_from_host_env() -> Result<PathBuf, String> {
             .unwrap_or(raw.as_str());
         return Ok(PathBuf::from(first).join("projects"));
     }
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
+    if let Some(profile) = env("USERPROFILE") {
         return Ok(PathBuf::from(profile).join(".claude").join("projects"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = env("HOME") {
         return Ok(PathBuf::from(home).join(".claude").join("projects"));
     }
     Err(
@@ -289,7 +288,16 @@ fn claude_projects_root_from_host_env() -> Result<PathBuf, String> {
 }
 
 fn ambient_projects_root_for_db(db_path: &Path) -> Result<Option<AmbientRootDecision>, String> {
-    if let Some(dir) = std::env::var_os(ROOT_ENV) {
+    ambient_projects_root_for_db_with(db_path, &process_env)
+}
+
+/// [`ambient_projects_root_for_db`] reading variables through `env` instead of
+/// the process environment.
+fn ambient_projects_root_for_db_with(
+    db_path: &Path,
+    env: &EnvLookup<'_>,
+) -> Result<Option<AmbientRootDecision>, String> {
+    if let Some(dir) = env(ROOT_ENV) {
         return Ok(Some(AmbientRootDecision {
             root: PathBuf::from(dir),
             scope: AmbientRootScope::ExplicitEnv,
@@ -299,7 +307,7 @@ fn ambient_projects_root_for_db(db_path: &Path) -> Result<Option<AmbientRootDeci
         return Ok(None);
     }
     Ok(Some(AmbientRootDecision {
-        root: claude_projects_root()?,
+        root: claude_projects_root_with(env)?,
         scope: AmbientRootScope::ConfiguredDaemonDb,
     }))
 }
@@ -614,7 +622,6 @@ fn ingest_session_file(
     }
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
-    let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     let mut last_lifecycle: Option<Lifecycle> = None;
@@ -649,12 +656,7 @@ fn ingest_session_file(
                 ),
             ));
         }
-        let transcript_key = agent_transcript_key(&spawn_id, line_no);
-        ts_index_rows.push((
-            agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
-            transcript_key.clone(),
-        ));
-        rows.push((transcript_key, encoded));
+        rows.push((agent_transcript_key(&spawn_id, line_no), encoded));
         cursor.lines_ingested = line_no;
         if let Some(signal) = lifecycle {
             last_lifecycle = Some(signal);
@@ -662,13 +664,10 @@ fn ingest_session_file(
     }
 
     if !rows.is_empty() {
-        db.put_cf_batches_pressure_bypass(vec![
-            (cf::CF_AGENT_TRANSCRIPTS, rows),
-            (cf::CF_KV, ts_index_rows),
-        ])
-        .map_err(|error| {
-            format!("AMBIENT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines re-ingest)")
-        })?;
+        db.put_batch_pressure_bypass(cf::CF_AGENT_TRANSCRIPTS, rows)
+            .map_err(|error| {
+                format!("AMBIENT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines re-ingest)")
+            })?;
     }
 
     cursor.offset_bytes += consumed_bytes as u64;
@@ -986,7 +985,7 @@ fn parse_session_line(
         line_no,
         TranscriptSource::ClaudeSessionJsonl,
         raw_line.len() as u64,
-        sha256_hex(raw_line),
+        crate::content_digest::keyed_digest_hex(raw_line),
     );
     // The session id is the file identity; stamp it as the conversation id.
     record.conversation_id = Some(cursor.session_id.clone());
@@ -1043,7 +1042,7 @@ fn parse_session_line(
 fn set_content(record: &mut AgentTranscriptRecord, content: &str) {
     let (summary, truncated) = bounded_chars(content, AGENT_TRANSCRIPT_MAX_SUMMARY_CHARS);
     record.content_bytes = Some(content.len() as u64);
-    record.content_sha256 = Some(sha256_hex(content.as_bytes()));
+    record.content_sha256 = Some(crate::content_digest::keyed_text_digest_hex(content));
     record.content_summary = Some(summary);
     record.content_truncated = truncated;
 }
@@ -1113,7 +1112,14 @@ fn classify_session_object(
         | "permission-mode"
         | "pr-link"
         | "worktree-state"
-        | "agent-name" => {
+        | "agent-name"
+        // #146 (2026-10-13): newer Claude Code builds also write these. Each
+        // carries only session metadata (ATIS latch, file-history backup delta,
+        // cumulative cost, dev-mod folder) and no conversational content.
+        | "atis-latch"
+        | "file-history-delta"
+        | "cost-state"
+        | "dev-mods" => {
             record.role = Some(TranscriptRole::System);
             record.event_kind = Some(event_type.to_owned());
             Ok(None)
@@ -1186,7 +1192,7 @@ fn classify_assistant(
                 let input = block_object.get("input").cloned().unwrap_or(Value::Null);
                 let (arguments, arguments_bytes, arguments_truncated) =
                     bounded_json_string(&input, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS);
-                let input_sha = sha256_hex(input.to_string().as_bytes());
+                let input_sha = crate::content_digest::keyed_text_digest_hex(&input.to_string());
                 record.tool_calls.push(TranscriptToolCall {
                     tool_name: tool_name.clone(),
                     tool_call_id: block_object
@@ -1340,3 +1346,6 @@ fn claude_usage(usage: &Value) -> TranscriptUsage {
         model_usage: Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests;

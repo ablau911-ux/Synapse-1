@@ -12,7 +12,9 @@ title_regex = ".* - Google Chrome$"
 
 [[matches]]
 exe = "msedge.exe"
-title_regex = ".* - Microsoft Edge$"
+# Edge titles may carry U+200B right after "Microsoft" (deliberate Edge compat
+# shim, slated for removal), so the zero-width space is optional.
+title_regex = ".* - Microsoft​? Edge$"
 
 [[matches]]
 exe = "chromium.exe"

@@ -1,0 +1,57 @@
+{
+  "id": "chrome",
+  "label": "Google Chrome",
+  "family": "chromium",
+  "process_names": ["chrome.exe"],
+  "legacy_chromium_process_names": [
+    "chrome.exe",
+    "chromium.exe",
+    "msedge.exe",
+    "brave.exe",
+    "vivaldi.exe",
+    "opera.exe",
+    "chrome",
+    "chromium",
+    "msedge",
+    "brave",
+    "vivaldi",
+    "opera"
+  ],
+  "exe_path_markers": [],
+  "exe_candidates": [
+    "%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe",
+    "%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe"
+  ],
+  "app_paths_name": "chrome.exe",
+  "user_data_root": "%LOCALAPPDATA%\\Google\\Chrome\\User Data",
+  "profile_layout": "multi",
+  "window_title_suffixes": [" - Google Chrome"],
+  "tab_target_prefix": "chrome-tab:",
+  "endpoint_base": "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk",
+  "health_key": "chrome_bridge",
+  "registration_token_file": "chrome-bridge-token.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "chrome://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "chrome-extension"
+  },
+  "policy": {
+    "root": "Software\\Policies\\Google\\Chrome",
+    "extension_settings_value": "ExtensionSettings"
+  },
+  "native_messaging_cleanup_roots": [
+    "Software\\Google\\Chrome\\NativeMessagingHosts",
+    "Software\\Wow6432Node\\Google\\Chrome\\NativeMessagingHosts"
+  ],
+  "protected_extension_ids": [],
+  "cdp_product_tokens": ["Chrome", "Chromium", "Edg"],
+  "unsupported_capabilities": [],
+  "debugger_api_expected": true,
+  "install_ui": {
+    "developer_mode_names": ["Developer mode"],
+    "load_unpacked_names": ["Load unpacked"]
+  },
+  "winget_id": "Google.Chrome"
+}

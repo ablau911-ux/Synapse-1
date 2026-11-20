@@ -59,6 +59,23 @@ The browser-facing MCP tools (`browser_*`, `cdp_*`) are thin wrappers over this 
 
 > Background note from `cdp.rs`: since Chrome 136, `--remote-debugging-port` is ignored unless paired with a non-default `--user-data-dir`, so a normally-launched Chrome on the user's primary profile can never expose a debug port. This is why `act_launch` (#684) launches a dedicated automation profile and registers its port.
 
+### Multi-browser normal bridge (`crates/synapse-browsers`, ADR `docs/adr/2026-10-15-multi-browser-bridge.md`)
+
+The normal (extension) bridge is no longer Chrome-only. Every bridgeable browser is one declared row in `crates/synapse-browsers/browsers/<id>.json` (`BrowserRow`: process names, path markers, exe candidates, user-data root and layout, title suffixes, tab-target prefix, endpoint base, health key, registration token file, extension identity, policy root, protected extension ids, CDP product tokens, unsupported capabilities, installer UI names). Only `chrome.json` ships in the foundation; per-browser rows are added as data.
+
+| Piece | Location | Role |
+|---|---|---|
+| `BrowserRegistry` | `synapse-browsers/src/registry.rs` | Loads `<exe dir>\browsers`, else the crate dir, else the compiled-in `chrome.json`; `by_id`, `by_process(name, path)` (fails closed on ambiguity), `chromium_process_names`, `is_bridge_tab_target`, `is_bridge_tab_lane_endpoint`, `bridge_endpoint_for_target`. |
+| `BridgeTabTarget` / `BridgeElementTarget` | `synapse-browsers/src/target_id.rs` | `<prefix><tabId>` and `…:frame:<f>:path:<p>` (shadow hop `s`); an undeclared `<kind>-tab:` prefix is `BROWSER_BRIDGE_KIND_UNRESOLVED`. |
+| `BridgeEndpoint` | `synapse-browsers/src/endpoint.rs` | `<endpoint_base>/<lane>`; chrome keeps `chrome-extension://<id>/chrome.tabs`, so persisted owner rows need no migration. |
+| `BrowserExecutableLocator` | `synapse-browsers/src/discovery.rs` | App Paths (HKLM, HKCU) then `exe_candidates`; registry reads go through the daemon's `WindowsRegistryReader` (the crate forbids `unsafe`). Used by seat discovery. |
+| `BrowserProfileInspector` | `synapse-browsers/src/inspector.rs`, `chromium/`, `gecko/` | Per-family install state and origin rule; gecko is a fail-closed stub until the Firefox package lands. |
+| Per-kind hosts | `synapse-mcp/src/browser_bridge_hosts.rs` | One active host per kind; a same-kind reconnect replaces only that kind's host. |
+| Routing | `synapse-mcp/src/browser_bridge_routing.rs` | Kind from the command's `hwnd` process and `targetIdHint`/`elementId` prefix; cross-kind commands and multi-kind ambiguity are refused. |
+| Health rows | `synapse-mcp/src/browser_bridge_health.rs` | `health.subsystems.<health_key>` per non-chrome row; `not_installed` never degrades `ok`. `chrome_bridge` is unchanged. |
+
+Registration binds the kind from the registration token file that matches (`%APPDATA%\synapse\<row.registration_token_file>`); the worker's hello `browserKind` is cross-checked. Commands whose capability the row declares unsupported fail with `BROWSER_BRIDGE_CAPABILITY_UNSUPPORTED` before queueing. The shared service worker reads `bridge-config.json` (written by `scripts/install-synapse-chrome-debugger.ps1 -Browser <id>`, dispatched by `scripts/install-synapse-browser-bridge.ps1`) and stays dormant without it.
+
 ---
 
 ## 2. UI Element Model
@@ -203,7 +220,7 @@ Diagnostic types (`CdpDiagnostics`, `CdpStatus`, `CdpCapability`) live in `synap
 | Function | Signature | Notes |
 |---|---|---|
 | `cdp_capabilities` | `() -> Vec<CdpCapability>` | cross-platform |
-| `is_chromium_family` | `(process_name: &str) -> bool` | matches chrome/chromium/msedge/brave/vivaldi/opera | cross-platform |
+| `is_chromium_family` | `(process_name: &str) -> bool` | suffix-matches the Chromium image names declared in `crates/synapse-browsers/browsers/*.json` (`legacy_chromium_process_names` + every Chromium row's `process_names`; today chrome/chromium/msedge/brave/vivaldi/opera) | cross-platform |
 | `probe_chromium_cdp_blocking` | `(process_name, ports: &[u16], connect_timeout: Duration) -> CdpDiagnostics` | sync probe used in perception path; connection-refused returns in microseconds | cross-platform |
 | `probe_chromium_cdp` | `async (process_name, ports, connect_timeout) -> CdpDiagnostics` | async variant | cross-platform |
 | `endpoint_for_window` | `(hwnd: i64) -> Option<String>` | `cfg(windows)`; resolves reachable `http://127.0.0.1:<port>` for a browser window (#686) |

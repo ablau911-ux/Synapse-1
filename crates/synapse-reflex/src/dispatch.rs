@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::json;
-use synapse_action::ActionHandle;
+use synapse_action::{
+    ActionError, ActionHandle, InputDeliveryTarget, delivery_target::require_stored_input_target,
+};
 use synapse_core::{
     Action, ReflexId, ReflexState, SCHEMA_VERSION, StoredAuditContext, StoredReflexAudit,
-    StoredReflexStep, error_codes,
+    StoredReflexStep, error_codes, types::StoredInputTarget,
 };
 use synapse_storage::Db;
 use uuid::Uuid;
@@ -14,6 +16,7 @@ use crate::{ReflexError, ReflexResult, write_audit};
 
 pub const REFLEX_ACTION_PERMISSION_DENIED_KIND: &str = "reflex_action_permission_denied";
 pub const REFLEX_ACTION_DENIED_STEP_STATUS: &str = "action_denied";
+pub const REFLEX_INPUT_TARGET_REFUSED_KIND: &str = "reflex_input_target_refused";
 
 pub type ReflexActionGateHandle = Arc<dyn ReflexActionGate>;
 
@@ -29,6 +32,52 @@ pub trait ReflexActionGate: Send + Sync {
         reflex_id: &ReflexId,
         action: &Action,
     ) -> Result<(), ReflexActionPermissionDenied>;
+
+    /// Resolves a stored automation target against its live claim and foreground.
+    /// The default has no live claim table, so it refuses every stored target.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `ACTION_INPUT_TARGET_*` refusal from
+    /// [`require_stored_input_target`].
+    fn resolve_input_target(
+        &self,
+        reflex_id: &ReflexId,
+        target: Option<StoredInputTarget>,
+        _owner: Option<&str>,
+    ) -> Result<InputDeliveryTarget, ActionError> {
+        require_stored_input_target(reflex_id, target, None).map(InputDeliveryTarget::from_stored)
+    }
+
+    /// The foreground typing guard every reflex/routine `TypeText` must go
+    /// through (#188). `None` (the default) means no guard is installed, and
+    /// reflex `TypeText` is then refused before any key.
+    fn foreground_type_guard(&self) -> Option<ReflexForegroundTypeGuardHandle> {
+        None
+    }
+}
+
+pub type ReflexForegroundTypeGuardHandle = Arc<dyn ReflexForegroundTypeGuard>;
+
+/// Protects reflex/routine `TypeText` the way #188 protects `act_type`: the
+/// text is typed only while the routine's target window is the foreground.
+pub trait ReflexForegroundTypeGuard: Send + Sync {
+    /// Enqueues the `TypeText` `action` on `handle` only when the target window
+    /// is the foreground, then watches the foreground until the action
+    /// finishes and raises the release interrupt on every departure. It must
+    /// enqueue before returning, so the reflex's action order is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ActionError::ForegroundLost` when the target is not the
+    /// foreground or the foreground cannot be read (no input was sent), or the
+    /// enqueue error.
+    fn dispatch_type_text(
+        &self,
+        reflex_id: &ReflexId,
+        action: Action,
+        handle: &ActionHandle,
+    ) -> Result<(), ActionError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +109,8 @@ pub struct ReflexActionDispatchContext {
     audit_db: Option<Arc<Db>>,
     audit_context: Option<StoredAuditContext>,
     tick_index: u64,
+    input_target: Option<StoredInputTarget>,
+    input_owner: Option<String>,
 }
 
 impl ReflexActionDispatchContext {
@@ -77,16 +128,77 @@ impl ReflexActionDispatchContext {
             audit_db,
             audit_context,
             tick_index,
+            input_target: None,
+            input_owner: None,
         }
     }
 
+    pub(crate) fn with_reflex_target(mut self, reflex: &crate::ScheduledReflex) -> Self {
+        self.input_target = reflex.input_target;
+        self.input_owner.clone_from(&reflex.input_owner);
+        self
+    }
+
+    /// Dispatches one reflex action. OS input (everything but releases and
+    /// virtual-pad reports) is delivered only to the reflex's stored target
+    /// window, proven claimed and in front at this moment (#312).
     pub fn dispatch_action(&self, reflex_id: &ReflexId, action: &Action) -> ReflexResult<()> {
         self.ensure_action_allowed(reflex_id, action)?;
+        let handle = self.action_handle.with_session_id(self.input_owner.clone());
+        let handle = if requires_input_target(action) {
+            let delivery = self
+                .resolve_input_target(reflex_id)
+                .map_err(|error| ReflexError::InputTarget { error })?;
+            handle.with_delivery_target(Some(delivery))
+        } else {
+            handle
+        };
+        if matches!(action, Action::TypeText { .. }) {
+            return self.dispatch_foreground_type_text(reflex_id, action, &handle);
+        }
 
-        self.action_handle
-            .try_execute(action.clone())
-            .map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("scheduler action dispatch failed: {error}"),
+        handle.try_execute(action.clone()).map_err(dispatch_failed)
+    }
+
+    /// Live proof comes from the installed gate; without one nothing can be
+    /// proven claimed and in front, so the stored target is refused.
+    fn resolve_input_target(
+        &self,
+        reflex_id: &ReflexId,
+    ) -> Result<InputDeliveryTarget, ActionError> {
+        self.action_gate.as_ref().map_or_else(
+            || {
+                require_stored_input_target(reflex_id, self.input_target, None)
+                    .map(InputDeliveryTarget::from_stored)
+            },
+            |gate| {
+                gate.resolve_input_target(reflex_id, self.input_target, self.input_owner.as_deref())
+            },
+        )
+    }
+
+    /// Keep the #188 monitor active while the stored window receives text.
+    fn dispatch_foreground_type_text(
+        &self,
+        reflex_id: &ReflexId,
+        action: &Action,
+        handle: &ActionHandle,
+    ) -> ReflexResult<()> {
+        let guard = self
+            .action_gate
+            .as_ref()
+            .and_then(|gate| gate.foreground_type_guard());
+        let Some(guard) = guard else {
+            return Err(foreground_lost(
+                reflex_id,
+                "reflex TypeText refused before the first key: no foreground typing guard is installed; no input was sent".to_owned(),
+            ));
+        };
+        guard
+            .dispatch_type_text(reflex_id, action.clone(), handle)
+            .map_err(|error| match error {
+                ActionError::ForegroundLost { detail } => foreground_lost(reflex_id, detail),
+                other => dispatch_failed(other),
             })
     }
 
@@ -154,6 +266,42 @@ impl ReflexActionDispatchContext {
     }
 }
 
+const fn requires_input_target(action: &Action) -> bool {
+    // Recovery key/button ups are intentionally target-free in the emitter.
+    !matches!(
+        action,
+        Action::ReleaseAll
+            | Action::KeyUp { .. }
+            | Action::MouseButton {
+                action: synapse_core::ButtonAction::Up,
+                ..
+            }
+            | Action::PadButton { .. }
+            | Action::PadStick { .. }
+            | Action::PadTrigger { .. }
+            | Action::PadReport { .. }
+    )
+}
+
+fn dispatch_failed(error: ActionError) -> ReflexError {
+    ReflexError::ParamsInvalid {
+        detail: format!("scheduler action dispatch failed: {error}"),
+    }
+}
+
+fn foreground_lost(reflex_id: &ReflexId, detail: String) -> ReflexError {
+    tracing::warn!(
+        code = error_codes::ACTION_FOREGROUND_LOST,
+        reflex_id = %reflex_id,
+        detail = %detail,
+        "reflex TypeText refused: target window is not the foreground"
+    );
+    ReflexError::ForegroundLost {
+        reflex_id: reflex_id.clone(),
+        detail,
+    }
+}
+
 const fn action_kind(action: &Action) -> &'static str {
     match action {
         Action::KeyPress { .. } => "key_press",
@@ -183,3 +331,7 @@ fn now_ts_ns() -> u64 {
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "tests/dispatch_foreground_type_188.rs"]
+mod foreground_type_tests;

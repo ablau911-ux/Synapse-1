@@ -1,0 +1,70 @@
+---
+source: crates/synapse-mcp/tests/m3_audio_transcribe_tool.rs
+expression: shape
+---
+{
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "language": {
+        "default": "en",
+        "type": "string"
+      },
+      "seconds": {
+        "default": 5.0,
+        "maximum": 30,
+        "minimum": 0,
+        "type": "number"
+      }
+    },
+    "title": "AudioTranscribeParams",
+    "type": "object"
+  },
+  "name": "audio_transcribe",
+  "outputSchema": {
+    "$defs": {
+      "ConfidenceSource": {
+        "description": "Describes how a reported confidence score was obtained.",
+        "enum": [
+          "engine",
+          "uia",
+          "synthetic",
+          "heuristic",
+          "not_applicable",
+          "unsupported"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "confidence": {
+        "type": "number"
+      },
+      "confidence_source": {
+        "$ref": "#/$defs/ConfidenceSource",
+        "default": "unsupported"
+      },
+      "latency_ms": {
+        "minimum": 0,
+        "type": "integer"
+      },
+      "model_id": {
+        "type": "string"
+      },
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text",
+      "confidence",
+      "latency_ms",
+      "model_id"
+    ],
+    "title": "AudioTranscribeResponse",
+    "type": "object"
+  }
+}

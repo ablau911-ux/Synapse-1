@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::browser_facades::merge_top_level_target;
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
@@ -13,6 +12,9 @@ use super::{
         validate_cdp_target_id,
     },
     tool, tool_router,
+};
+use crate::credential_redaction::{
+    REDACTED, credential_name, label_contains_value, sensitive_control_attributes, token_like_value,
 };
 use crate::m1::{
     BrowserContentParams, BrowserContentResponse, BrowserInspectParams, BrowserInspectResponse,
@@ -60,7 +62,6 @@ pub struct BrowserAriaSnapshotParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional CDP element id to scope the ARIA snapshot to a subtree.
     #[serde(default)]
@@ -76,6 +77,8 @@ pub struct BrowserAriaSnapshotParams {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserAriaSnapshotNode {
+    #[serde(default)]
+    pub is_password: bool,
     pub element_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_element_id: Option<String>,
@@ -144,17 +147,6 @@ impl BrowserDomOperation {
 pub struct BrowserDomParams {
     /// DOM operation to run. Supply exactly the matching nested spec object.
     pub operation: BrowserDomOperation,
-    /// Optional top-level target alias (#1551). When set, this populates the
-    /// selected operation spec's `cdp_target_id`; a conflicting nested value
-    /// fails closed. Defaults to the nested spec / session target.
-    #[serde(default)]
-    pub cdp_target_id: Option<String>,
-    /// Optional top-level target-window alias (#1551). When set, this populates
-    /// the selected operation spec's `window_hwnd`; a conflicting nested value
-    /// fails closed. Defaults to the nested spec / session target window.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
-    pub window_hwnd: Option<i64>,
     /// `operation=content`: serialized document HTML readback.
     #[serde(default)]
     pub content: Option<BrowserContentParams>,
@@ -302,7 +294,6 @@ pub struct BrowserAssertParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     pub locator: BrowserAssertLocator,
     pub matcher: BrowserAssertMatcher,
@@ -395,6 +386,8 @@ struct NormalizedBrowserAssertParams {
 
 #[derive(Clone, Debug, Deserialize)]
 struct AssertElementState {
+    #[serde(default)]
+    is_password: bool,
     tag_name: String,
     text: String,
     value: Option<String>,
@@ -427,60 +420,15 @@ struct AriaSnapshotBuild {
 #[tool_router(router = browser_assert_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Target addressing (cdp_target_id/window_hwnd) may be supplied at the envelope top level as an alias for the selected nested spec's target; a conflicting nested value fails closed. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_dom(
         &self,
         params: Parameters<BrowserDomParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserDomResponse>, ErrorData> {
-        let mut params = params.0;
+        let params = params.0;
         let operation = params.operation;
-        // #1551: fold top-level cdp_target_id/window_hwnd aliases into the nested
-        // operation spec before source/validation so the effective target is
-        // resolved identically to the equivalent nested-spec form.
-        let top_cdp_target_id = params.cdp_target_id.clone();
-        let top_window_hwnd = params.window_hwnd;
-        if let Some(spec) = params.content.as_mut() {
-            merge_top_level_target(
-                DOM_TOOL,
-                "content",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
-        if let Some(spec) = params.locate.as_mut() {
-            merge_top_level_target(
-                DOM_TOOL,
-                "locate",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
-        if let Some(spec) = params.inspect.as_mut() {
-            merge_top_level_target(
-                DOM_TOOL,
-                "inspect",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
-        if let Some(spec) = params.aria_snapshot.as_mut() {
-            merge_top_level_target(
-                DOM_TOOL,
-                "aria_snapshot",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
         let source_id = browser_dom_source_id(&params);
         validate_browser_dom_params(&params)?;
         tracing::info!(
@@ -636,14 +584,12 @@ impl SynapseService {
             "required_foreground": false,
             "phase": "target_resolution",
         });
-        let resolution = self
-            .resolve_cdp_tab_mutation_target_adopting(
-                ARIA_TOOL,
-                &session_id,
-                params.0.window_hwnd,
-                resolution_target.as_deref(),
-            )
-            .await;
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            ARIA_TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            resolution_target.as_deref(),
+        );
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             ARIA_TOOL,
             &session_id,
@@ -781,6 +727,7 @@ impl SynapseService {
                 })?;
         let built = build_aria_snapshot(
             &snapshot.nodes,
+            &snapshot.aria_controls,
             params.root_element_id.as_deref(),
             params.max_depth,
         )?;
@@ -795,7 +742,7 @@ impl SynapseService {
             node_count = built.nodes.len(),
             total_ax_nodes = snapshot.total_ax_nodes,
             root_scoped = params.root_element_id.is_some(),
-            target_url = %state.url,
+            target_url = %crate::server::url_redaction::RedactedUrl(&state.url),
             "readback=Accessibility.getFullAXTree outcome=aria_snapshot"
         );
         Ok(BrowserAriaSnapshotResponse {
@@ -1520,22 +1467,12 @@ fn parse_root_element_target(element_id: &str) -> Result<(Option<i64>, String), 
 }
 
 fn is_chrome_bridge_target_id(target_id: &str) -> bool {
-    target_id
-        .strip_prefix("chrome-tab:")
-        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+    // Any declared browser's tab prefix (browsers/*.json), decimal tab id.
+    synapse_browsers::BrowserRegistry::global().is_bridge_tab_target(target_id)
 }
 
 fn chrome_bridge_target_id_from_element_id(element_id: &str) -> Option<String> {
-    let suffix = element_id.strip_prefix("chrome-tab:")?;
-    let digit_count = suffix.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    if digit_count == 0 {
-        return None;
-    }
-    let (tab_id, remainder) = suffix.split_at(digit_count);
-    if !remainder.starts_with(":frame:") {
-        return None;
-    }
-    Some(format!("chrome-tab:{tab_id}"))
+    synapse_browsers::BrowserRegistry::global().tab_target_of_element_id(element_id)
 }
 
 #[cfg(windows)]
@@ -1568,9 +1505,36 @@ async fn browser_aria_snapshot_bridge(
         cdp_target_id = %snapshot.target_id,
         node_count = snapshot.nodes.len(),
         root_scoped = params.root_element_id.is_some(),
-        target_url = %snapshot.url,
+        target_url = %crate::server::url_redaction::RedactedUrl(&snapshot.url),
         "readback=chrome.scripting.executeScript outcome=aria_snapshot"
     );
+    // The extension's own text is discarded: it is rebuilt from the nodes
+    // after Rust's pass so a stale or faulty worker cannot leak through it.
+    let nodes: Vec<BrowserAriaSnapshotNode> = snapshot
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let mut out = BrowserAriaSnapshotNode {
+                is_password: node.is_password,
+                element_id: node.element_id,
+                parent_element_id: node.parent_element_id,
+                depth: node.depth,
+                role: node.role,
+                name: node.name,
+                value: node.value,
+                enabled: node.enabled,
+                focused: node.focused,
+                children_count: node.children_count,
+            };
+            redact_aria_node(&mut out, node.redacted);
+            out
+        })
+        .collect();
+    let snapshot_text = nodes
+        .iter()
+        .map(render_aria_line)
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(BrowserAriaSnapshotResponse {
         session_id: session_id.to_owned(),
         window_hwnd,
@@ -1583,23 +1547,9 @@ async fn browser_aria_snapshot_bridge(
         root_element_id: snapshot
             .root_element_id
             .or_else(|| params.root_element_id.clone()),
-        snapshot: snapshot.snapshot,
-        node_count: snapshot.nodes.len(),
-        nodes: snapshot
-            .nodes
-            .into_iter()
-            .map(|node| BrowserAriaSnapshotNode {
-                element_id: node.element_id,
-                parent_element_id: node.parent_element_id,
-                depth: node.depth,
-                role: node.role,
-                name: node.name,
-                value: node.value,
-                enabled: node.enabled,
-                focused: node.focused,
-                children_count: node.children_count,
-            })
-            .collect(),
+        snapshot: snapshot_text,
+        node_count: nodes.len(),
+        nodes,
         total_ax_nodes: snapshot.total_ax_nodes,
         max_nodes: snapshot.max_nodes,
         max_depth: snapshot.max_depth,
@@ -1768,6 +1718,7 @@ async fn browser_assert_bridge_poll(
     assert_element_poll(
         params,
         AssertElementState {
+            is_password: state.is_password,
             tag_name: state.tag_name,
             text: state.text,
             value: state.value,
@@ -1851,7 +1802,7 @@ async fn browser_assert_poll(
         endpoint,
         cdp_target_id,
         backend_node_id,
-        ASSERT_ELEMENT_FUNCTION,
+        &synapse_a11y::password_safe_function(ASSERT_ELEMENT_FUNCTION),
         &[],
         true,
         true,
@@ -2012,7 +1963,7 @@ fn assert_element_poll(
     title: String,
     ready_state: String,
 ) -> Result<AssertPoll, ErrorData> {
-    let (base_pass, actual, expected, message) = match params.matcher {
+    let (base_pass, mut actual, expected, message) = match params.matcher {
         BrowserAssertMatcher::ToBeVisible => {
             let expected = params.expected_bool.unwrap_or(true);
             let actual = state.is_visible;
@@ -2147,6 +2098,9 @@ fn assert_element_poll(
         BrowserAssertMatcher::ToHaveCount => unreachable!("count handled before element inspect"),
     };
     let pass = apply_negate(base_pass, params.negate);
+    if state.is_password {
+        actual["is_password"] = json!(true);
+    }
     Ok(AssertPoll {
         pass,
         url: redact_url_for_public_readback(&url),
@@ -2263,6 +2217,7 @@ fn browser_assert_response(
 
 fn build_aria_snapshot(
     nodes: &[AccessibleNode],
+    aria_controls: &HashMap<String, synapse_a11y::CdpAriaControl>,
     root_element_id: Option<&str>,
     max_depth: u32,
 ) -> Result<AriaSnapshotBuild, ErrorData> {
@@ -2296,24 +2251,82 @@ fn build_aria_snapshot(
             truncated_by_depth = true;
             continue;
         }
-        lines.push(render_aria_line(depth, node));
-        out_nodes.push(BrowserAriaSnapshotNode {
-            element_id: id,
-            parent_element_id: node.parent.as_ref().map(ToString::to_string),
-            depth,
-            role: node.role.clone(),
-            name: node.name.clone(),
-            value: node.value.clone(),
-            enabled: node.enabled,
-            focused: node.focused,
-            children_count: node.children_count,
-        });
+        let node = aria_snapshot_node(node, depth, aria_controls.get(&id));
+        lines.push(render_aria_line(&node));
+        out_nodes.push(node);
     }
     Ok(AriaSnapshotBuild {
         snapshot: lines.join("\n"),
         nodes: out_nodes,
         truncated_by_depth,
     })
+}
+
+fn aria_node_is_password(node: &AccessibleNode) -> bool {
+    node.role.eq_ignore_ascii_case("password")
+        || node.control_state.as_deref().is_some_and(|state| {
+            state.split([';', ',', ' ']).any(|part| {
+                part.eq_ignore_ascii_case("is_password=true")
+                    || part.eq_ignore_ascii_case("protected=true")
+            })
+        })
+}
+
+fn aria_snapshot_node(
+    node: &AccessibleNode,
+    depth: u32,
+    control: Option<&synapse_a11y::CdpAriaControl>,
+) -> BrowserAriaSnapshotNode {
+    let is_password = aria_node_is_password(node);
+    let mut out = BrowserAriaSnapshotNode {
+        is_password,
+        element_id: node.element_id.to_string(),
+        parent_element_id: node.parent.as_ref().map(ToString::to_string),
+        depth,
+        role: node.role.clone(),
+        name: node.name.clone(),
+        value: if is_password {
+            Some(REDACTED.to_owned())
+        } else {
+            node.value.clone()
+        },
+        enabled: node.enabled,
+        focused: node.focused,
+        children_count: node.children_count,
+    };
+    let page_verdict = control.map(|control| {
+        sensitive_control_attributes(&control.input_type, &control.autocomplete)
+            || control.names.iter().any(|name| credential_name(name))
+    });
+    redact_aria_node(&mut out, page_verdict);
+    out
+}
+
+/// Rust's own value pass over every ARIA snapshot node, whichever route read
+/// it, run before the snapshot text is rendered. `page_verdict` is what the
+/// page side knew about the control: `Some(true)` sensitive, `Some(false)`
+/// ordinary, `None` unknown (an extension without redaction metadata, or a
+/// node without DOM attributes), which fails closed. The label is kept so the
+/// control stays navigable by role and name, unless it carries the value.
+fn redact_aria_node(node: &mut BrowserAriaSnapshotNode, page_verdict: Option<bool>) {
+    if node.is_password {
+        node.value = Some(REDACTED.to_owned());
+        return;
+    }
+    let Some(value) = node
+        .value
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != REDACTED)
+    else {
+        return;
+    };
+    if page_verdict == Some(false) && !credential_name(&node.name) && !token_like_value(value) {
+        return;
+    }
+    if label_contains_value(&node.name, value) || token_like_value(&node.name) {
+        node.name.clear();
+    }
+    node.value = Some(REDACTED.to_owned());
 }
 
 fn included_aria_node_ids(
@@ -2388,8 +2401,8 @@ fn relative_aria_depth(
     depth
 }
 
-fn render_aria_line(depth: u32, node: &AccessibleNode) -> String {
-    let mut line = format!("{}- {}", "  ".repeat(depth as usize), node.role);
+fn render_aria_line(node: &BrowserAriaSnapshotNode) -> String {
+    let mut line = format!("{}- {}", "  ".repeat(node.depth as usize), node.role);
     if !node.name.is_empty() {
         line.push(' ');
         line.push('"');
@@ -2426,10 +2439,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(windows)]
 const ASSERT_ELEMENT_FUNCTION: &str = r#"(el) => {
     const str = v => String(v == null ? "" : v);
-    const attrs = {};
-    if (el && el.attributes) {
-        for (const a of el.attributes) { attrs[a.name] = str(a.value); }
-    }
+    const attrs = passwordReadback(el, "attributes");
     const rect = el && el.getBoundingClientRect ? el.getBoundingClientRect() : { width: 0, height: 0 };
     const cs = (el && el.nodeType === 1 && el.ownerDocument && el.ownerDocument.defaultView)
         ? el.ownerDocument.defaultView.getComputedStyle(el) : null;
@@ -2448,8 +2458,9 @@ const ASSERT_ELEMENT_FUNCTION: &str = r#"(el) => {
     }
     return {
         tag_name: str(el && el.tagName),
-        text: str((el && el.innerText) || (el && el.textContent) || ""),
-        value: (el && "value" in el) ? str(el.value) : null,
+        text: passwordReadback(el, "text", str((el && el.innerText) || (el && el.textContent) || "")),
+        value: passwordReadback(el, "value", (el && "value" in el) ? str(el.value) : null),
+        is_password: passwordReadback(el, "is_password"),
         attributes: attrs,
         is_visible: visible,
         is_enabled: enabled,

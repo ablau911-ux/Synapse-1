@@ -25,7 +25,9 @@ use super::episodes::{hex_encode, key_after, local_day_start, next_local_day_sta
 use super::intent::{IntentCurrentParams, current_intents};
 use super::permissions::{Permission, RequiredPermissions, required};
 use super::profile_authoring::load_routine_automation_record;
-use super::routines::{load_routine_record, load_state_row, validate_routine_id_param};
+use super::routines::{
+    load_routine_record, load_state_row, unmined_routine_error, validate_routine_id_param,
+};
 
 const ARMED_ROUTINE_PREFIX: &str = "armed_routine/v1/";
 const ARMED_ROUTINE_RUN_PREFIX: &str = "armed_routine_run/v1/";
@@ -227,7 +229,6 @@ pub struct ArmedRoutineTickParams {
     /// an MCP session. Periodic daemon ticks have no session, so browser steps
     /// refuse rather than using the human foreground implicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub browser_window_hwnd: Option<i64>,
     /// Timeout applied to launch-window/postcondition waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,6 +316,10 @@ pub fn validate_arm_config(config: ArmRoutineConfig) -> Result<(), ErrorData> {
     Ok(())
 }
 
+fn armed_routine_not_found(message: String) -> ErrorData {
+    mcp_error(error_codes::ARMED_ROUTINE_NOT_FOUND, message)
+}
+
 pub fn arm_routine(
     db: &Arc<Db>,
     routine_id: &str,
@@ -326,7 +331,7 @@ pub fn arm_routine(
     validate_arm_config(config)?;
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "routine_update action=arm refused under disk pressure: cf_name={} pressure_level={:?}",
                 cf::CF_KV,
@@ -335,9 +340,7 @@ pub fn arm_routine(
         ));
     }
     let Some(_routine) = load_routine_record(db.as_ref(), routine_id)? else {
-        return Err(invalid(format!(
-            "ROUTINE_NOT_MINED: routine_id {routine_id} is not in CF_ROUTINES; run routine_mine before arming"
-        )));
+        return Err(unmined_routine_error(db.as_ref(), routine_id, "arm"));
     };
     let Some(automation) = load_routine_automation_record(db, routine_id)? else {
         return Err(invalid(format!(
@@ -406,7 +409,7 @@ pub fn disarm_routine(
     validate_routine_id_param("routine_update", routine_id)?;
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "routine_update action=disarm refused under disk pressure: cf_name={} pressure_level={:?}",
                 cf::CF_KV,
@@ -415,7 +418,10 @@ pub fn disarm_routine(
         ));
     }
     let Some(mut record) = load_armed_routine_record(db, routine_id)? else {
-        return Err(invalid(format!(
+        if load_routine_record(db.as_ref(), routine_id)?.is_none() {
+            return Err(unmined_routine_error(db.as_ref(), routine_id, "disarm"));
+        }
+        return Err(armed_routine_not_found(format!(
             "ARMED_ROUTINE_NOT_FOUND: routine_id {routine_id} is not armed"
         )));
     };
@@ -649,7 +655,7 @@ pub fn claim_armed_run(
 ) -> Result<ArmedRoutineRunRecord, ErrorData> {
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "armed_routine_tick refused under disk pressure: cf_name={} pressure_level={:?}",
                 cf::CF_KV,
@@ -658,7 +664,7 @@ pub fn claim_armed_run(
         ));
     }
     let Some(mut armed) = load_armed_routine_record(db, &due.routine_id)? else {
-        return Err(invalid(format!(
+        return Err(armed_routine_not_found(format!(
             "ARMED_ROUTINE_NOT_FOUND: routine_id {} is no longer armed",
             due.routine_id
         )));
@@ -732,12 +738,35 @@ pub fn complete_armed_run(
     evidence: Value,
 ) -> Result<ArmedRoutineRunRecord, ErrorData> {
     let Some(mut armed) = load_armed_routine_record(db, &run.routine_id)? else {
-        return Err(invalid(format!(
+        return Err(armed_routine_not_found(format!(
             "ARMED_ROUTINE_NOT_FOUND: routine_id {} vanished before run completion",
             run.routine_id
         )));
     };
     let now = now_ts_ns();
+    let disarmed_after_failure = update_armed_run_status(&mut armed, &run, status, now);
+    run.completed_ts_ns = now;
+    run.status = status;
+    run.plan_ref = plan_ref.or(run.plan_ref);
+    run.execution_id = execution_id;
+    run.approval_id = approval_id;
+    run.failure_count_after = armed.consecutive_failures;
+    run.disarmed_after_failure = disarmed_after_failure;
+    run.error_code = error_code;
+    run.error = error;
+    run.evidence = evidence;
+    // The claim was admitted before execution. Its terminal state and evidence
+    // must survive pressure changes, just like the durable trigger reservation.
+    persist_armed_and_run_records(db, &armed, &run)?;
+    Ok(run)
+}
+
+fn update_armed_run_status(
+    armed: &mut ArmedRoutineRecord,
+    run: &ArmedRoutineRunRecord,
+    status: ArmedRoutineRunStatus,
+    now: u64,
+) -> bool {
     if status.is_failure() {
         armed.consecutive_failures = armed.consecutive_failures.saturating_add(1);
     } else if matches!(status, ArmedRoutineRunStatus::Succeeded) {
@@ -757,19 +786,7 @@ pub fn complete_armed_run(
     armed.updated_at_ns = now;
     armed.last_run_id = Some(run.run_id.clone());
     armed.last_run_status = Some(status);
-
-    run.completed_ts_ns = now;
-    run.status = status;
-    run.plan_ref = plan_ref.or(run.plan_ref);
-    run.execution_id = execution_id;
-    run.approval_id = approval_id;
-    run.failure_count_after = armed.consecutive_failures;
-    run.disarmed_after_failure = disarmed_after_failure;
-    run.error_code = error_code;
-    run.error = error;
-    run.evidence = evidence;
-    write_armed_and_run_records(db, &armed, &run)?;
-    Ok(run)
+    disarmed_after_failure
 }
 
 pub fn dry_run_tick_run(due: &ArmedRoutineDueRun) -> ArmedRoutineTickRun {
@@ -970,6 +987,10 @@ fn load_routine_record_with_raw(
     Ok(Some(RoutineSourceRow { record, key, value }))
 }
 
+// Plain SHA-256 on purpose (#174): integrity binding between the due-index row
+// and the primary/routine rows it points at. Those rows sit in the same DB in
+// cleartext, so the digest reveals nothing new, and rows persisted before this
+// change must keep verifying.
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(&digest[..])
@@ -1416,7 +1437,7 @@ fn refresh_schedule_due_index(
     db.mutate_batch_pressure_bypass(cf::CF_KV, mutation.deletes.clone(), mutation.puts.clone())
         .map_err(|error| {
             mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error.code(),
                 format!(
                     "failed to refresh armed routine due index for {}: {error}",
                     record.routine_id
@@ -1525,7 +1546,7 @@ pub fn reindex_armed_routine_schedule_due_indexes(db: &Arc<Db>) -> Result<(), Er
     db.mutate_batch_pressure_bypass(cf::CF_KV, deletes, puts)
         .map_err(|error| {
             mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error.code(),
                 format!("failed to rebuild armed routine due indexes atomically: {error}"),
             )
         })?;
@@ -1545,7 +1566,7 @@ pub fn reindex_armed_routine_schedule_due_indexes(db: &Arc<Db>) -> Result<(), Er
     Ok(())
 }
 
-fn load_all_armed_routines(db: &Arc<Db>) -> Result<Vec<ArmedRoutineRecord>, ErrorData> {
+pub(super) fn load_all_armed_routines(db: &Arc<Db>) -> Result<Vec<ArmedRoutineRecord>, ErrorData> {
     let mut out = Vec::new();
     let mut scanned = 0_usize;
     let mut start = ARMED_ROUTINE_PREFIX.as_bytes().to_vec();
@@ -1589,13 +1610,6 @@ fn load_all_armed_routines(db: &Arc<Db>) -> Result<Vec<ArmedRoutineRecord>, Erro
 }
 
 fn validate_tick_params(params: &ArmedRoutineTickParams) -> Result<(), ErrorData> {
-    if let Some(browser_window_hwnd) = params.browser_window_hwnd {
-        crate::m1::validate_hwnd_shape(
-            "armed_routine_tick",
-            "browser_window_hwnd",
-            browser_window_hwnd,
-        )?;
-    }
     if let Some(routine_id) = &params.routine_id {
         validate_routine_id_param("armed_routine_tick", routine_id)?;
     }
@@ -1635,7 +1649,7 @@ fn write_armed_routine_record(db: &Arc<Db>, record: &ArmedRoutineRecord) -> Resu
     db.mutate_batch_pressure_bypass(cf::CF_KV, index_mutation.deletes.clone(), puts)
         .map_err(|error| {
             mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error.code(),
                 format!(
                     "failed to persist armed routine row and due indexes for {}: {error}",
                     record.routine_id
@@ -1663,13 +1677,21 @@ fn write_armed_and_run_records(
 ) -> Result<(), ErrorData> {
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "armed routine write refused under disk pressure: pressure_level={:?}",
                 db.pressure_level()
             ),
         ));
     }
+    persist_armed_and_run_records(db, armed, run)
+}
+
+fn persist_armed_and_run_records(
+    db: &Arc<Db>,
+    armed: &ArmedRoutineRecord,
+    run: &ArmedRoutineRunRecord,
+) -> Result<(), ErrorData> {
     let armed_key = armed_routine_key(&armed.routine_id).into_bytes();
     let run_key = armed_run_key(&run.run_id).into_bytes();
     let armed_value = encode_json(armed).map_err(|error| {
@@ -1692,13 +1714,23 @@ fn write_armed_and_run_records(
     db.mutate_batch_pressure_bypass(cf::CF_KV, index_mutation.deletes.clone(), puts)
         .map_err(|error| {
             mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error.code(),
                 format!(
                     "failed to persist armed routine run {} and due indexes atomically: {error}",
                     run.run_id
                 ),
             )
         })?;
+    validate_armed_and_run_readback(db, armed, run)?;
+    validate_schedule_due_index_readback(db, &armed.routine_id, &index_mutation)?;
+    Ok(())
+}
+
+fn validate_armed_and_run_readback(
+    db: &Arc<Db>,
+    armed: &ArmedRoutineRecord,
+    run: &ArmedRoutineRunRecord,
+) -> Result<(), ErrorData> {
     let armed_readback = read_armed_required(db, &armed.routine_id)?;
     if armed_readback != *armed {
         return Err(mcp_error(
@@ -1718,7 +1750,6 @@ fn write_armed_and_run_records(
             format!("ARMED_ROUTINE_RUN_READBACK_MISMATCH for {}", run.run_id),
         ));
     }
-    validate_schedule_due_index_readback(db, &armed.routine_id, &index_mutation)?;
     Ok(())
 }
 
@@ -1743,7 +1774,7 @@ fn load_armed_run(db: &Arc<Db>, run_id: &str) -> Result<Option<ArmedRoutineRunRe
     }
 }
 
-fn armed_routine_key(routine_id: &str) -> String {
+pub(super) fn armed_routine_key(routine_id: &str) -> String {
     format!("{ARMED_ROUTINE_PREFIX}{routine_id}")
 }
 
@@ -1776,3 +1807,7 @@ fn invalid(detail: impl Into<String>) -> ErrorData {
 fn internal(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail.into())
 }
+
+#[cfg(test)]
+#[path = "tests/routine_arming_missing_98.rs"]
+mod routine_arming_missing_98_tests;

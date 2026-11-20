@@ -1,19 +1,20 @@
 ' Windowless runner for scheduled tasks:  wscript.exe //B //Nologo run-hidden.vbs <program> [args...]
 '
 ' A scheduled task must never start a console program (powershell.exe, pwsh.exe, cmd.exe, ...)
-' directly. Task Scheduler gives it a visible console (an OpenConsole window under Windows
+' directly: Task Scheduler gives it a visible console (an OpenConsole window under Windows
 ' Terminal) before -WindowStyle Hidden can apply, so every run flashes a terminal and steals
 ' focus. wscript.exe is a GUI-subsystem host: no console exists until Run() creates the
 ' program with window style 0 (SW_HIDE).
 '
 ' Run(..., True) waits, so MultipleInstances=IgnoreNew still sees the task as running, and its
-' return value is the program's own exit code, which WScript.Quit hands to Task Scheduler
-' unchanged (conhost.exe --headless, by contrast, recorded 0 even when the program failed).
+' return value is the program's own exit code, which WScript.Quit hands to Task Scheduler.
+' Exit codes of the runner itself: 2 = no program given, 3 = the program could not be started.
 '
 ' Arguments are re-quoted with the Windows command-line rules. WScript.Arguments cannot carry
-' an embedded double quote, so a command that needs one gets its own .vbs launcher instead.
+' an embedded double quote; Format-SynapseHiddenRunnerAction (synapse-hidden-runner.ps1)
+' refuses such arguments before a task is registered.
 Option Explicit
-Dim shell, cmd, i
+Dim shell, cmd, i, exitCode
 
 Function QuoteArg(value)
   Dim n
@@ -31,7 +32,6 @@ Function QuoteArg(value)
   QuoteArg = """" & value & String(n, "\") & """"
 End Function
 
-Dim exitCode
 If WScript.Arguments.Count = 0 Then WScript.Quit 2
 Set shell = CreateObject("WScript.Shell")
 cmd = QuoteArg(WScript.Arguments(0))

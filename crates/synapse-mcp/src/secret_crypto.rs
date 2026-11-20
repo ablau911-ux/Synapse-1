@@ -23,6 +23,13 @@ const ENTROPY: &[u8] = b"synapse/local-model-api-key/v1";
 /// this function.
 #[cfg(windows)]
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
+    protect_with_entropy(plaintext, ENTROPY)
+}
+
+/// Like [`protect`] with a caller-supplied purpose entropy, so blobs minted for
+/// one subsystem cannot be decrypted by another `unprotect_with_entropy` call.
+#[cfg(windows)]
+pub fn protect_with_entropy(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
@@ -37,8 +44,8 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
             pbData: plaintext.as_ptr().cast_mut(),
         };
         let entropy_blob = CRYPT_INTEGER_BLOB {
-            cbData: u32::try_from(ENTROPY.len()).context("entropy too large")?,
-            pbData: ENTROPY.as_ptr().cast_mut(),
+            cbData: u32::try_from(entropy.len()).context("entropy too large")?,
+            pbData: entropy.as_ptr().cast_mut(),
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
         let result = CryptProtectData(
@@ -68,6 +75,12 @@ pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>> {
 /// fallback to returning the raw bytes.
 #[cfg(windows)]
 pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
+    unprotect_with_entropy(ciphertext, ENTROPY)
+}
+
+/// Counterpart of [`protect_with_entropy`].
+#[cfg(windows)]
+pub fn unprotect_with_entropy(ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptUnprotectData};
 
@@ -79,8 +92,8 @@ pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>> {
             pbData: ciphertext.as_ptr().cast_mut(),
         };
         let entropy_blob = CRYPT_INTEGER_BLOB {
-            cbData: u32::try_from(ENTROPY.len()).context("entropy too large")?,
-            pbData: ENTROPY.as_ptr().cast_mut(),
+            cbData: u32::try_from(entropy.len()).context("entropy too large")?,
+            pbData: entropy.as_ptr().cast_mut(),
         };
         let mut out_blob = CRYPT_INTEGER_BLOB::default();
         let result = CryptUnprotectData(
@@ -113,5 +126,15 @@ pub fn protect(_plaintext: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(not(windows))]
 pub fn unprotect(_ciphertext: &[u8]) -> Result<Vec<u8>> {
+    bail!("secure secret storage requires Windows DPAPI; this platform is unsupported")
+}
+
+#[cfg(not(windows))]
+pub fn protect_with_entropy(_plaintext: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
+    bail!("secure secret storage requires Windows DPAPI; this platform is unsupported")
+}
+
+#[cfg(not(windows))]
+pub fn unprotect_with_entropy(_ciphertext: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
     bail!("secure secret storage requires Windows DPAPI; this platform is unsupported")
 }

@@ -30,6 +30,7 @@ use synapse_core::types::{TimelineActor, TimelineKind, TimelineRecord};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, timeline as timeline_codec};
 
+use super::episodes::{hex_decode, hex_encode, now_ts_ns};
 use crate::m1::mcp_error;
 use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
@@ -149,7 +150,17 @@ pub fn search_timeline(
     runtime: &Arc<Mutex<ReflexRuntime>>,
     params: &TimelineSearchParams,
 ) -> Result<TimelineSearchResponse, ErrorData> {
-    let filters = validate(params)?;
+    scan_timeline(runtime, params, "timeline_search")
+}
+
+/// The single CF_TIMELINE scan behind `timeline_search` and `timeline_get`;
+/// `tool` names the calling operation in refusals (#235).
+fn scan_timeline(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &TimelineSearchParams,
+    tool: &str,
+) -> Result<TimelineSearchResponse, ErrorData> {
+    let filters = validate(params, tool)?;
     let runtime = lock_runtime(runtime)?;
 
     let mut matches = Vec::new();
@@ -201,9 +212,10 @@ pub fn search_timeline(
                     invalid_rows += 1;
                     tracing::warn!(
                         code = "TIMELINE_ROW_DECODE_FAILED",
+                        tool,
                         key_hex = %hex_encode(&key),
                         %error,
-                        "timeline_search skipped undecodable CF_TIMELINE row"
+                        "timeline scan skipped undecodable CF_TIMELINE row"
                     );
                 }
             }
@@ -306,7 +318,7 @@ pub fn get_timeline(
         limit: params.limit,
         cursor: params.cursor.clone(),
     };
-    let response = search_timeline(runtime, &search_params)?;
+    let response = scan_timeline(runtime, &search_params, "timeline_get")?;
     Ok(TimelineGetResponse {
         rows: response.matches,
         scanned_rows: response.scanned_rows,
@@ -642,7 +654,7 @@ pub fn purge_timeline(
         limit: None,
         cursor: params.cursor.clone(),
     };
-    let mut filters = validate(&search_equivalent)?;
+    let mut filters = validate(&search_equivalent, "timeline_purge")?;
     // Purge has no match cap: everything matched inside the scan budget is
     // deleted; the budget plus cursor bound one call's work.
     filters.limit = usize::MAX;
@@ -997,23 +1009,20 @@ pub(crate) fn write_cleaning_audit_row(
     Ok(hex_encode(&key))
 }
 
-fn now_ts_ns() -> u64 {
-    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    u64::try_from(nanos).unwrap_or(0)
-}
-
-fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
+/// Validates the shared scan filters; `tool` names the calling operation in
+/// every refusal (`timeline_get`, `timeline_search` or `timeline_purge`).
+fn validate(params: &TimelineSearchParams, tool: &str) -> Result<Filters, ErrorData> {
     let start_ts_ns = params.start_ts_ns.unwrap_or(0);
     let end_ts_ns = params.end_ts_ns.unwrap_or(u64::MAX);
     if start_ts_ns > end_ts_ns {
         return Err(invalid(format!(
-            "timeline_search start_ts_ns {start_ts_ns} must be <= end_ts_ns {end_ts_ns}"
+            "{tool} start_ts_ns {start_ts_ns} must be <= end_ts_ns {end_ts_ns}"
         )));
     }
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 || limit > MAX_LIMIT {
         return Err(invalid(format!(
-            "timeline_search limit must be between 1 and {MAX_LIMIT}; got {limit}"
+            "{tool} limit must be between 1 and {MAX_LIMIT}; got {limit}"
         )));
     }
     let apps_lower = params
@@ -1024,7 +1033,7 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
         .map(|app| {
             let trimmed = app.trim();
             if trimmed.is_empty() {
-                Err(invalid("timeline_search apps entries must not be empty"))
+                Err(invalid(format!("{tool} apps entries must not be empty")))
             } else {
                 Ok(trimmed.to_lowercase())
             }
@@ -1036,11 +1045,11 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
         .map(|text| {
             let trimmed = text.trim();
             if trimmed.is_empty() {
-                return Err(invalid("timeline_search text must not be empty"));
+                return Err(invalid(format!("{tool} text must not be empty")));
             }
             if trimmed.len() > MAX_TEXT_FILTER_BYTES {
                 return Err(invalid(format!(
-                    "timeline_search text must be <= {MAX_TEXT_FILTER_BYTES} bytes"
+                    "{tool} text must be <= {MAX_TEXT_FILTER_BYTES} bytes"
                 )));
             }
             Ok(trimmed.to_lowercase())
@@ -1051,7 +1060,7 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|kind| parse_kind(kind))
+        .map(|kind| parse_kind(kind, tool))
         .collect::<Result<Vec<_>, _>>()?;
     let actor = params
         .actor
@@ -1060,14 +1069,16 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
             "human" => Ok(ActorFilter::Human),
             "agent" => Ok(ActorFilter::Agent),
             other => Err(invalid(format!(
-                "timeline_search actor must be \"human\" or \"agent\"; got {other:?}"
+                "{tool} actor must be \"human\" or \"agent\"; got {other:?}"
             ))),
         })
         .transpose()?;
     let start_key = match params.cursor.as_deref() {
         Some(cursor) => {
             let decoded = hex_decode(cursor).ok_or_else(|| {
-                invalid("timeline_search cursor is not a valid hex key from a prior response")
+                invalid(format!(
+                    "{tool} cursor is not a valid hex key from a prior response"
+                ))
             })?;
             key_after(&decoded)
         }
@@ -1085,10 +1096,10 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
     })
 }
 
-fn parse_kind(raw: &str) -> Result<TimelineKind, ErrorData> {
+fn parse_kind(raw: &str, tool: &str) -> Result<TimelineKind, ErrorData> {
     serde_json::from_value::<TimelineKind>(Value::String(raw.trim().to_owned())).map_err(|_error| {
         invalid(format!(
-            "timeline_search kinds entry {raw:?} is not a known timeline kind"
+            "{tool} kinds entry {raw:?} is not a known timeline kind"
         ))
     })
 }
@@ -1168,27 +1179,6 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    let text = text.trim();
-    if text.is_empty() || !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(text.get(index..index + 2)?, 16).ok())
-        .collect()
-}
-
 fn invalid(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, detail.into())
 }
@@ -1203,3 +1193,7 @@ fn lock_runtime(
         )
     })
 }
+
+#[cfg(test)]
+#[path = "tests/timeline_error_tool_name_235.rs"]
+mod timeline_error_tool_name_235_tests;

@@ -7,7 +7,9 @@ use std::{
 
 use chrono::Utc;
 use synapse_action::ActionHandle;
-use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime, StoredAuditContext};
+use synapse_core::{
+    Action, EventFilter, ReflexId, ReflexLifetime, StoredAuditContext, types::StoredInputTarget,
+};
 use synapse_storage::Db;
 
 use crate::{
@@ -99,6 +101,10 @@ pub struct ScheduledReflex {
     pub lifetime: ReflexLifetime,
     pub exclusive: bool,
     pub debounce: Duration,
+    /// Stored OS-input window (#312); `None` refuses every OS input.
+    pub input_target: Option<StoredInputTarget>,
+    /// Session whose live window claim proves the stored target at delivery.
+    pub input_owner: Option<String>,
 }
 
 impl ScheduledReflex {
@@ -113,6 +119,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::UntilCancelled,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -131,6 +139,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::UntilCancelled,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -150,6 +160,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::UntilCancelled,
             exclusive: false,
             debounce,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -164,6 +176,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::UntilCancelled,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -178,6 +192,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::UntilCancelled,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -192,6 +208,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::UntilCancelled,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -206,6 +224,8 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::OneShot,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
     }
 
@@ -220,7 +240,20 @@ impl ScheduledReflex {
             lifetime: ReflexLifetime::OneShot,
             exclusive: false,
             debounce: Duration::ZERO,
+            input_target: None,
+            input_owner: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_input_target(
+        mut self,
+        target: Option<StoredInputTarget>,
+        owner: Option<String>,
+    ) -> Self {
+        self.input_target = target;
+        self.input_owner = owner.filter(|_| target.is_some());
+        self
     }
 
     #[must_use]
@@ -544,6 +577,13 @@ impl ReflexScheduler {
             controls: Arc::clone(&controls),
             statuses: Arc::clone(&statuses),
             config,
+            audit_producer: audit_db.as_ref().map(|db| {
+                let db = Arc::clone(db);
+                crate::audit::AuditProducer::with_writer(
+                    crate::audit::AUDIT_QUEUE_CAPACITY,
+                    move |audit| crate::write_audit(&db, &audit),
+                )
+            }),
             audit_db,
             audit_context,
             action_gate,

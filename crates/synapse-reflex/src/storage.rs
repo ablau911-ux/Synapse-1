@@ -1,11 +1,41 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{Mutex, PoisonError},
+    time::{Duration, Instant},
+};
 
 use synapse_core::{StoredReflexAudit, error_codes};
 use synapse_storage::{
     DiskPressureLevel, GcReport, PressureReport, StorageResult, cf, decode_json,
 };
 
-use crate::{ReflexError, ReflexResult, ReflexRuntime};
+use crate::{ReflexResult, ReflexRuntime};
+
+/// Rows read per page when counting recursion-guard clamps.
+const RECURSION_CLAMP_SCAN_WINDOW: usize = 1_000;
+
+/// How long a recursion-clamp count is reused before the audit CF is rescanned.
+/// `health` is polled far more often than clamps change, and a full audit scan
+/// runs under the reflex runtime lock (#60).
+const RECURSION_CLAMP_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Last recursion-clamp count and when it was computed.
+#[derive(Debug, Default)]
+pub(crate) struct ClampCountCache(Mutex<Option<(Instant, u64)>>);
+
+impl ClampCountCache {
+    fn fresh(&self, now: Instant) -> Option<u64> {
+        let cached = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        cached.and_then(|(at, total)| {
+            (now.saturating_duration_since(at) < RECURSION_CLAMP_CACHE_TTL).then_some(total)
+        })
+    }
+
+    fn store(&self, now: Instant, total: u64) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((now, total));
+    }
+}
 
 impl ReflexRuntime {
     /// Returns the storage path backing this runtime.
@@ -13,6 +43,13 @@ impl ReflexRuntime {
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn storage_path(&self) -> &Path {
         &self.db.path
+    }
+
+    /// Returns a shared handle to the backing storage so callers can write
+    /// after releasing the runtime lock instead of holding it across disk I/O.
+    #[must_use]
+    pub fn storage_db(&self) -> std::sync::Arc<synapse_storage::Db> {
+        std::sync::Arc::clone(&self.db)
     }
 
     /// Returns the storage schema version backing this runtime.
@@ -384,30 +421,68 @@ impl ReflexRuntime {
         self.db.pressure_transition_codes()
     }
 
-    /// Counts persisted recursion-guard clamp audit rows.
+    /// Counts persisted recursion-guard clamp audit rows, reusing a count
+    /// younger than 30 seconds so frequent `health` polls do not rescan the
+    /// whole audit CF. Use [`Self::recursion_clamps_total_fresh`] to force a rescan.
     ///
     /// # Errors
     ///
-    /// Returns a reflex error when audit rows cannot be scanned or decoded.
-    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    /// Returns a reflex error when the audit CF cannot be scanned.
     pub fn recursion_clamps_total(&self) -> ReflexResult<u64> {
-        let rows =
-            self.db
-                .scan_cf(cf::CF_REFLEX_AUDIT)
-                .map_err(|error| ReflexError::ParamsInvalid {
-                    detail: format!("reflex audit scan failed: {error}"),
-                })?;
+        if let Some(total) = self.clamp_count_cache.fresh(Instant::now()) {
+            return Ok(total);
+        }
+        self.recursion_clamps_total_fresh()
+    }
+
+    /// Counts persisted recursion-guard clamp audit rows with a full rescan
+    /// and refreshes the cached count.
+    ///
+    /// Pages through the audit CF in bounded windows instead of materializing
+    /// it, and skips (and logs) rows that cannot be decoded: one corrupt audit
+    /// row must not take the whole count, or `health`, down.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reflex error when the audit CF cannot be scanned.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn recursion_clamps_total_fresh(&self) -> ReflexResult<u64> {
         let mut total = 0_u64;
-        for (_key, value) in rows {
-            let audit = decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                ReflexError::ParamsInvalid {
-                    detail: format!("reflex audit decode failed: {error}"),
+        let mut start_key: Vec<u8> = Vec::new();
+        loop {
+            let (rows, more) = self
+                .db
+                .scan_cf_from(cf::CF_REFLEX_AUDIT, &start_key, RECURSION_CLAMP_SCAN_WINDOW)
+                .map_err(|error| {
+                    crate::audit_state::audit_storage_error(&error, "reflex audit scan")
+                })?;
+            let Some((last_key, _)) = rows.last() else {
+                self.clamp_count_cache.store(Instant::now(), total);
+                return Ok(total);
+            };
+            start_key.clone_from(last_key);
+            start_key.push(0);
+            for (key, value) in &rows {
+                match decode_json::<StoredReflexAudit>(value) {
+                    Ok(audit)
+                        if audit.error_code.as_deref()
+                            == Some(error_codes::REFLEX_RECURSION_LIMIT) =>
+                    {
+                        total = total.saturating_add(1);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        code = "REFLEX_AUDIT_ROW_UNDECODABLE",
+                        key_len = key.len(),
+                        error = %error,
+                        "skipping undecodable reflex audit row while counting recursion clamps"
+                    ),
                 }
-            })?;
-            if audit.error_code.as_deref() == Some(error_codes::REFLEX_RECURSION_LIMIT) {
-                total = total.saturating_add(1);
+            }
+            if !more {
+                self.clamp_count_cache.store(Instant::now(), total);
+                return Ok(total);
             }
         }
-        Ok(total)
     }
 }

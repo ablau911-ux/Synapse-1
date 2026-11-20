@@ -16,7 +16,6 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallFunctionOnParams, EvaluateParams, RemoteObjectId,
 };
-use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{A11yError, A11yResult};
@@ -186,13 +185,13 @@ pub async fn cdp_actionability(
         });
     }
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;

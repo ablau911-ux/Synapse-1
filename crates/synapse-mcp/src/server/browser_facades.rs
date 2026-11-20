@@ -1,6 +1,4 @@
-//! Public browser facades for the <=40 MCP tool surface.
-
-use std::sync::Arc;
+//! Public browser facades for the public MCP tool surface (`PUBLIC_TOOL_LIMIT`).
 
 use super::{
     BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
@@ -8,8 +6,8 @@ use super::{
     BrowserConsoleMessagesResponse, BrowserDownloadsParams, BrowserDownloadsResponse,
     BrowserEvaluateParams, BrowserEvaluateResponse, BrowserExposeBindingParams,
     BrowserExposeBindingResponse, BrowserPdfParams, BrowserPdfResponse, BrowserScreenshotParams,
-    BrowserScreenshotResponse, CdpBridgeReloadParams, CdpBridgeReloadResponse, ErrorData, Json,
-    Parameters, SynapseService,
+    BrowserScreenshotResponse, CaptureScreenshotParams, CaptureScreenshotResponse,
+    CdpBridgeReloadParams, CdpBridgeReloadResponse, ErrorData, Json, Parameters, SynapseService,
     browser_dialog::{BrowserHandleDialogParams, BrowserHandleDialogResponse},
     browser_dnd::{BrowserDndParams, BrowserDndResponse},
     browser_emulate::{BrowserEmulateParams, BrowserEmulateResponse},
@@ -25,7 +23,7 @@ use super::{
 };
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::json;
 use synapse_core::error_codes;
 
 const BROWSER_CAPTURE_TOOL: &str = "browser_capture";
@@ -67,6 +65,10 @@ pub struct BrowserCaptureResponse {
     pub screenshot: Option<BrowserScreenshotResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads: Option<BrowserDownloadsResponse>,
+    /// #117: set instead of `screenshot` when an explicit `window_hwnd` (no
+    /// exact tab) was captured through the passive per-window route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_capture: Option<CaptureScreenshotResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -119,18 +121,6 @@ impl BrowserDebuggerOperation {
 #[serde(deny_unknown_fields)]
 pub struct BrowserDebuggerParams {
     pub operation: BrowserDebuggerOperation,
-    /// Envelope-level target alias (#1551/#1593). When set, it is folded into the
-    /// selected operation spec's `cdp_target_id` before dispatch, so top-level
-    /// addressing resolves the SAME target as the nested-spec form. Fails closed
-    /// on a conflicting nested value. `reload_bridge` takes no target and rejects
-    /// this alias.
-    #[serde(default)]
-    pub cdp_target_id: Option<String>,
-    /// Envelope-level target alias (#1551/#1593). Browser HWND that owns the
-    /// target; folded into the selected operation spec's `window_hwnd`.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
-    pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub evaluate: Option<BrowserEvaluateParams>,
     #[serde(default)]
@@ -209,82 +199,10 @@ pub struct BrowserDebuggerResponse {
     pub drop: Option<BrowserDndResponse>,
 }
 
-fn loose_object_schema(description: &'static str) -> Value {
-    json!({
-        "type": "object",
-        "description": description,
-        "additionalProperties": true
-    })
-}
-
-fn browser_debugger_input_schema() -> Arc<Map<String, Value>> {
-    let schema = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["operation"],
-        "properties": {
-            "operation": {
-                "type": "string",
-                "enum": [
-                    "evaluate",
-                    "console_messages",
-                    "reload_bridge",
-                    "pdf",
-                    "file_upload",
-                    "dialog",
-                    "add_init_script",
-                    "add_script_tag",
-                    "add_style_tag",
-                    "network",
-                    "network_har",
-                    "network_overrides",
-                    "route",
-                    "emulate",
-                    "expose_binding",
-                    "drag",
-                    "drop"
-                ],
-                "description": "Debugger facade operation. Supply exactly the same-named spec object."
-            },
-            "cdp_target_id": {
-                "type": "string",
-                "description": "Optional top-level target alias folded into the selected operation spec; reload_bridge rejects it."
-            },
-            "window_hwnd": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 4_294_967_295_u64,
-                "description": "Optional browser window HWND folded into the selected operation spec."
-            },
-            "evaluate": loose_object_schema("Spec for operation=evaluate."),
-            "console_messages": loose_object_schema("Spec for operation=console_messages."),
-            "reload_bridge": loose_object_schema("Spec for operation=reload_bridge."),
-            "pdf": loose_object_schema("Spec for operation=pdf."),
-            "file_upload": loose_object_schema("Spec for operation=file_upload."),
-            "dialog": loose_object_schema("Spec for operation=dialog."),
-            "add_init_script": loose_object_schema("Spec for operation=add_init_script."),
-            "add_script_tag": loose_object_schema("Spec for operation=add_script_tag."),
-            "add_style_tag": loose_object_schema("Spec for operation=add_style_tag."),
-            "network": loose_object_schema("Spec for operation=network."),
-            "network_har": loose_object_schema("Spec for operation=network_har."),
-            "network_overrides": loose_object_schema("Spec for operation=network_overrides."),
-            "route": loose_object_schema("Spec for operation=route."),
-            "emulate": loose_object_schema("Spec for operation=emulate."),
-            "expose_binding": loose_object_schema("Spec for operation=expose_binding."),
-            "drag": loose_object_schema("Spec for operation=drag."),
-            "drop": loose_object_schema("Spec for operation=drop.")
-        }
-    });
-    match schema {
-        Value::Object(map) => Arc::new(map),
-        _ => Arc::new(Map::new()),
-    }
-}
-
 #[tool_router(router = browser_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for browser capture and download readbacks in the <=40 public MCP surface. operation=screenshot requires screenshot params and writes an image artifact with byte/hash readback. operation=downloads requires downloads params and reads/waits/saves/moves Chrome download rows/events from the already-open Chrome profile. Exactly one operation-specific spec is accepted."
+        description = "Facade for browser capture and download readbacks in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation=screenshot requires screenshot params and writes an image artifact with byte/hash readback; screenshot.window_hwnd without cdp_target_id (and no page-only options) captures that window passively by HWND (window_capture), bypassing tab ownership. operation=downloads requires downloads params and reads/waits/saves/moves Chrome download rows/events from the already-open Chrome profile. Exactly one operation-specific spec is accepted."
     )]
     pub async fn browser_capture(
         &self,
@@ -309,6 +227,26 @@ impl SynapseService {
                         "pass screenshot={...} and no other operation spec",
                     )
                 })?;
+                if let Some(window_params) = browser_capture_window_route(&screenshot_params)? {
+                    let capture = self
+                        .capture_screenshot(Parameters(window_params), request_context)
+                        .await?
+                        .0;
+                    return Ok(Json(BrowserCaptureResponse {
+                        operation: BrowserCaptureOperation::Screenshot,
+                        source_of_truth: format!(
+                            "explicit window_hwnd capture backend={}",
+                            capture.capture_backend
+                        ),
+                        readback_source_of_truth: format!(
+                            "window_capture file={} bytes={} sha256={}",
+                            capture.path, capture.bytes_written, capture.bitmap_sha256
+                        ),
+                        screenshot: None,
+                        downloads: None,
+                        window_capture: Some(capture),
+                    }));
+                }
                 let screenshot = self
                     .browser_screenshot(Parameters(screenshot_params), request_context)
                     .await?
@@ -323,6 +261,7 @@ impl SynapseService {
                     readback_source_of_truth,
                     screenshot: Some(screenshot),
                     downloads: None,
+                    window_capture: None,
                 }))
             }
             BrowserCaptureOperation::Downloads => {
@@ -346,18 +285,18 @@ impl SynapseService {
                     readback_source_of_truth,
                     screenshot: None,
                     downloads: Some(downloads),
+                    window_capture: None,
                 }))
             }
         }
     }
 
     #[tool(
-        description = "Stable browser debugger facade. evaluate, console_messages and network run under any profile against a tab this session owns/has bound, or an explicitly named unowned chrome-tab cdp_target_id (auto-adopted: refused if another session owns/claims it or it is the active tab of the human's foreground window without an exact claim). All other operations fail closed until this session is set to browser_debugger. Pick operation and pass exactly one matching spec object; server-side typed validation remains authoritative.",
-        input_schema = browser_debugger_input_schema()
+        description = "Stable browser debugger facade. The tool name is visible in the default <={PUBLIC_TOOL_LIMIT} surface so clients with static tool namespaces can keep one callable route; each operation still fails closed with TOOL_PROFILE_POLICY_DENIED until this MCP session is explicitly set to browser_debugger (or a broader admin profile). Routes typed operations to target-scoped chrome.debugger/CDP browser tools: evaluate, console_messages, reload_bridge, pdf, file_upload, dialog, script/style injection, network/HAR/overrides/route, emulation, binding, drag, and drop. Exactly one operation-specific spec is accepted."
     )]
     pub async fn browser_debugger(
         &self,
-        mut params: Parameters<BrowserDebuggerParams>,
+        params: Parameters<BrowserDebuggerParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserDebuggerResponse>, ErrorData> {
         tracing::info!(
@@ -368,10 +307,6 @@ impl SynapseService {
         );
         validate_browser_debugger_params(&params.0)?;
         self.require_browser_debugger_facade_profile(&request_context, params.0.operation)?;
-        // #1551/#1593: fold the envelope-level cdp_target_id/window_hwnd aliases
-        // into the selected operation spec so top-level addressing resolves the
-        // same target as the nested-spec form (fail-closed on conflict).
-        merge_browser_debugger_top_level_target(&mut params.0)?;
         match params.0.operation {
             BrowserDebuggerOperation::Evaluate => {
                 let delegate = params
@@ -686,62 +621,6 @@ impl SynapseService {
     }
 }
 
-/// Fold `browser_debugger`'s envelope-level `cdp_target_id`/`window_hwnd`
-/// aliases (#1551/#1593) into whichever operation spec is present, reusing the
-/// same [`merge_top_level_target`] resolver every other browser facade uses.
-/// `reload_bridge` reloads the whole CDP bridge rather than a single target, so
-/// it fails closed when a top-level target is supplied.
-fn merge_browser_debugger_top_level_target(
-    params: &mut BrowserDebuggerParams,
-) -> Result<(), ErrorData> {
-    let top_cdp = params.cdp_target_id.clone();
-    let top_hwnd = params.window_hwnd;
-    if top_cdp.is_none() && top_hwnd.is_none() {
-        return Ok(());
-    }
-    let operation = params.operation.as_str();
-    if matches!(params.operation, BrowserDebuggerOperation::ReloadBridge) {
-        return Err(browser_facade_error(
-            BROWSER_DEBUGGER_TOOL,
-            error_codes::TOOL_PARAMS_INVALID,
-            operation,
-            "browser_debugger operation=reload_bridge does not address a single target; reload_bridge reloads the whole CDP bridge",
-            "drop the top-level cdp_target_id/window_hwnd for reload_bridge",
-        ));
-    }
-    macro_rules! fold {
-        ($spec:expr) => {
-            if let Some(spec) = $spec.as_mut() {
-                merge_top_level_target(
-                    BROWSER_DEBUGGER_TOOL,
-                    operation,
-                    top_cdp.as_deref(),
-                    top_hwnd,
-                    &mut spec.cdp_target_id,
-                    &mut spec.window_hwnd,
-                )?;
-            }
-        };
-    }
-    fold!(params.evaluate);
-    fold!(params.console_messages);
-    fold!(params.pdf);
-    fold!(params.file_upload);
-    fold!(params.dialog);
-    fold!(params.add_init_script);
-    fold!(params.add_script_tag);
-    fold!(params.add_style_tag);
-    fold!(params.network);
-    fold!(params.network_har);
-    fold!(params.network_overrides);
-    fold!(params.route);
-    fold!(params.emulate);
-    fold!(params.expose_binding);
-    fold!(params.drag);
-    fold!(params.drop);
-    Ok(())
-}
-
 fn validate_browser_capture_params(params: &BrowserCaptureParams) -> Result<(), ErrorData> {
     validate_exact_operation_spec(
         BROWSER_CAPTURE_TOOL,
@@ -839,84 +718,6 @@ fn browser_facade_error(
     )
 }
 
-/// Unify top-level `cdp_target_id`/`window_hwnd` envelope aliases (#1551) into an
-/// operation spec's own target fields so every browser facade accepts target
-/// addressing at the envelope top level and routes it to the exact same nested
-/// resolver the spec form already triggers. An agent passing top-level
-/// `cdp_target_id` therefore resolves the SAME target as the equivalent
-/// nested-spec form.
-///
-/// Precedence (fail-closed): when BOTH the top-level alias and the same nested
-/// spec field carry a value and they CONFLICT, this returns a typed
-/// [`error_codes::TOOL_PARAMS_INVALID`] error naming both locations; when only one
-/// side is set the spec field is populated from it; when the nested spec already
-/// carries the value and the top-level alias is absent the spec is left unchanged.
-pub(super) fn merge_top_level_target(
-    tool: &'static str,
-    operation: &str,
-    top_cdp_target_id: Option<&str>,
-    top_window_hwnd: Option<i64>,
-    spec_cdp_target_id: &mut Option<String>,
-    spec_window_hwnd: &mut Option<i64>,
-) -> Result<(), ErrorData> {
-    if let Some(top) = top_cdp_target_id {
-        match spec_cdp_target_id.as_deref() {
-            Some(nested) if nested != top => {
-                return Err(target_alias_conflict_error(
-                    tool,
-                    operation,
-                    "cdp_target_id",
-                    top.to_owned(),
-                    nested.to_owned(),
-                ));
-            }
-            _ => *spec_cdp_target_id = Some(top.to_owned()),
-        }
-    }
-    if let Some(top) = top_window_hwnd {
-        match *spec_window_hwnd {
-            Some(nested) if nested != top => {
-                return Err(target_alias_conflict_error(
-                    tool,
-                    operation,
-                    "window_hwnd",
-                    format!("{top:#x}"),
-                    format!("{nested:#x}"),
-                ));
-            }
-            _ => *spec_window_hwnd = Some(top),
-        }
-    }
-    Ok(())
-}
-
-fn target_alias_conflict_error(
-    tool: &'static str,
-    operation: &str,
-    field: &'static str,
-    top_level: String,
-    nested: String,
-) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "{tool} operation={operation} received conflicting {field}: top-level {field}={top_level} disagrees with nested {operation}.{field}={nested}"
-        ),
-        Some(json!({
-            "code": error_codes::TOOL_PARAMS_INVALID,
-            "tool": tool,
-            "operation": operation,
-            "field": field,
-            "top_level_value": top_level,
-            "nested_spec_value": nested,
-            "source_of_truth": "unified browser facade target addressing (#1551): top-level cdp_target_id/window_hwnd alias the nested operation spec's target fields",
-            "remediation": format!(
-                "pass {field} at the envelope top level OR inside the operation spec, not both with different values"
-            ),
-        })),
-    )
-}
-
 fn browser_downloads_readback_source(response: &BrowserDownloadsResponse) -> String {
     match (
         &response.saved_path,
@@ -944,7 +745,7 @@ fn browser_debugger_response(
     let mut response = BrowserDebuggerResponse {
         operation,
         source_of_truth: format!(
-            "CF_SESSIONS mcp/tool-profile/v1/<session_id> profile row (browser_debugger, or any profile for owned-target evaluate/console_messages/network) + delegated browser operation={}",
+            "CF_SESSIONS mcp/tool-profile/v1/<session_id> profile=browser_debugger + delegated browser operation={}",
             operation.as_str()
         ),
         readback_source_of_truth,
@@ -970,37 +771,6 @@ fn browser_debugger_response(
     response
 }
 
-/// Operations admissible under every profile (normal_agent/browser_control
-/// included) because the delegate itself only ever acts on a target this MCP
-/// session owns, has bound as its active target, or has just auto-adopted under
-/// the claim + human-foreground guards (`resolve_cdp_tab_mutation_target` /
-/// `_adopting`); the human's unrelated foreground tab is never a fallback.
-///
-/// - `evaluate`: page-scope Runtime.evaluate in that owned tab — the same
-///   authority the debugger-free browser_dom/browser_form/act routes already
-///   grant over the page; the call is single-shot and leaves no persistent
-///   instrumentation (contrast add_init_script/route/overrides).
-/// - `console_messages` / `network`: read-only buffers (contract
-///   mutates_state=false) on raw-CDP automation-profile targets owned by this
-///   session.
-///
-/// Everything else stays gated on browser_debugger/break_glass/full_capability:
-/// reload_bridge restarts the shared bridge for all sessions; pdf/file_upload
-/// cross the file-system boundary; dialog answers page prompts; init/script/
-/// style injection, expose_binding, emulate, route, network_overrides and
-/// network_har leave persistent per-target instrumentation; drag/drop are
-/// synthetic input.
-const fn browser_debugger_operation_admissible_on_owned_target(
-    operation: BrowserDebuggerOperation,
-) -> bool {
-    matches!(
-        operation,
-        BrowserDebuggerOperation::Evaluate
-            | BrowserDebuggerOperation::ConsoleMessages
-            | BrowserDebuggerOperation::Network
-    )
-}
-
 impl SynapseService {
     fn require_browser_debugger_facade_profile(
         &self,
@@ -1023,8 +793,7 @@ impl SynapseService {
             ToolProfileKind::BrowserDebugger
                 | ToolProfileKind::BreakGlass
                 | ToolProfileKind::FullCapability
-        ) || browser_debugger_operation_admissible_on_owned_target(operation)
-        {
+        ) {
             return Ok(());
         }
         let error = ErrorData::new(
@@ -1086,3 +855,71 @@ impl SynapseService {
         Err(error)
     }
 }
+
+/// #117: a `browser_capture` screenshot that names an explicit `window_hwnd`
+/// without an exact tab (`cdp_target_id`) or page-only options is a request
+/// for that WINDOW. Route it to the passive explicit-HWND capture instead of
+/// CDP tab-ownership resolution. Exact tab capture keeps ownership checks.
+fn explicit_window_capture_params(
+    params: &BrowserScreenshotParams,
+) -> Option<CaptureScreenshotParams> {
+    let window_hwnd = params.window_hwnd?;
+    let page_only = params.cdp_target_id.is_some()
+        || params.scope != super::BrowserScreenshotScope::Viewport
+        || params.clip.is_some()
+        || params.element_id.is_some()
+        || !params.masks.is_empty()
+        || params.quality.is_some()
+        || params.omit_background;
+    if page_only {
+        return None;
+    }
+    Some(CaptureScreenshotParams {
+        path: params.path.clone(),
+        region: None,
+        window_hwnd: Some(window_hwnd),
+        overwrite: params.overwrite,
+        max_pixels: params.max_pixels,
+        max_long_edge: params.max_long_edge,
+    })
+}
+
+/// #117: route decision for `browser_capture operation=screenshot`, made
+/// without a request context. `Some` = the passive explicit-HWND window route
+/// with its capture params (after the format-conflict check, so a conflicting
+/// `format` is an error); `None` = the CDP tab route. The window HWND itself
+/// (including 0) is validated later by the window capture.
+pub(super) fn browser_capture_window_route(
+    params: &BrowserScreenshotParams,
+) -> Result<Option<CaptureScreenshotParams>, ErrorData> {
+    let Some(window_params) = explicit_window_capture_params(params) else {
+        return Ok(None);
+    };
+    if let Some(conflict) = window_route_format_conflict(params) {
+        return Err(conflict);
+    }
+    Ok(Some(window_params))
+}
+
+/// #117: the window route writes the format implied by the path extension.
+/// An explicit `format` that disagrees is rejected instead of ignored.
+fn window_route_format_conflict(params: &BrowserScreenshotParams) -> Option<ErrorData> {
+    let requested = params.format?;
+    let implied =
+        super::m1_tools::screenshot_format_from_path(std::path::Path::new(&params.path)).ok()?;
+    (requested != implied).then(|| {
+        browser_facade_error(
+            BROWSER_CAPTURE_TOOL,
+            error_codes::TOOL_PARAMS_INVALID,
+            BrowserCaptureOperation::Screenshot.as_str(),
+            format!(
+                "screenshot.format={requested:?} conflicts with path extension (implies {implied:?}) on the explicit window_hwnd capture route, which writes the extension's format"
+            ),
+            "omit screenshot.format or use a path extension matching it (.png / .jpg|.jpeg)",
+        )
+    })
+}
+
+#[cfg(test)]
+#[path = "tests/browser_capture_window_route_117.rs"]
+mod browser_capture_window_route_117_tests;

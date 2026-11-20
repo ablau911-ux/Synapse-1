@@ -100,6 +100,74 @@ pub struct PlanExecutionRecord {
     pub steps: Vec<PlanStepExecutionReport>,
 }
 
+pub(crate) struct PlanExecutionOutcome {
+    dry_run: bool,
+    steps: Vec<PlanStepExecutionStatus>,
+}
+
+impl PlanExecutionOutcome {
+    pub(crate) fn new(
+        dry_run: bool,
+        steps: impl IntoIterator<Item = PlanStepExecutionStatus>,
+    ) -> Self {
+        Self {
+            dry_run,
+            steps: steps.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn status(&self) -> PlanExecutionStatus {
+        if self.dry_run {
+            PlanExecutionStatus::DryRun
+        } else if self.steps.iter().any(|step| step.is_terminal_failure()) {
+            PlanExecutionStatus::Failed
+        } else if !self.steps.is_empty()
+            && self
+                .steps
+                .iter()
+                .all(|step| *step == PlanStepExecutionStatus::Succeeded)
+        {
+            PlanExecutionStatus::Succeeded
+        } else {
+            PlanExecutionStatus::Skipped
+        }
+    }
+}
+
+pub(crate) struct AssistReadbackOutcome {
+    process_matches: bool,
+    pid_matches: bool,
+}
+
+impl AssistReadbackOutcome {
+    pub(crate) const fn new(process_matches: bool, pid_matches: bool) -> Self {
+        Self {
+            process_matches,
+            pid_matches,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PlanStepExecutionStatus,
+        Option<&'static str>,
+        Option<String>,
+    ) {
+        if self.process_matches && self.pid_matches {
+            (PlanStepExecutionStatus::Skipped, Some("ASSIST_CORRECTION_REPORT_ONLY"),
+             Some("assist produced a scoped target readback report only; no correction was attempted because no verifiable desired state was available".to_owned()))
+        } else {
+            (PlanStepExecutionStatus::Failed, Some("ASSIST_TARGET_READBACK_MISMATCH"),
+             Some("assist target HWND resolved, but process/pid no longer match the detector evidence".to_owned()))
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "plan_execution_table_595.rs"]
+mod plan_execution_table_595;
+
 #[must_use]
 pub fn plan_execution_id(suggestion_id: &str, started_ts_ns: u64) -> String {
     format!(
@@ -149,20 +217,7 @@ pub fn build_plan_execution_record(
     plan: PlanDocument,
     steps: Vec<PlanStepExecutionReport>,
 ) -> PlanExecutionRecord {
-    let failed = steps.iter().any(|step| step.status.is_terminal_failure());
-    let all_succeeded = !steps.is_empty()
-        && steps
-            .iter()
-            .all(|step| step.status == PlanStepExecutionStatus::Succeeded);
-    let status = if dry_run {
-        PlanExecutionStatus::DryRun
-    } else if failed {
-        PlanExecutionStatus::Failed
-    } else if all_succeeded {
-        PlanExecutionStatus::Succeeded
-    } else {
-        PlanExecutionStatus::Skipped
-    };
+    let status = PlanExecutionOutcome::new(dry_run, steps.iter().map(|step| step.status)).status();
     PlanExecutionRecord {
         record_version: PLAN_EXECUTION_RECORD_VERSION,
         execution_id,
@@ -184,13 +239,22 @@ pub fn build_plan_execution_record(
 pub fn write_plan_execution(db: &Arc<Db>, record: &PlanExecutionRecord) -> Result<(), ErrorData> {
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "plan execution write refused under disk pressure: pressure_level={:?}",
                 db.pressure_level()
             ),
         ));
     }
+    write_completed_plan_execution(db, record)
+}
+
+/// Finish the bounded audit of an already accepted execution. Admission must
+/// precede side effects; shedding their evidence afterwards would invite replay.
+pub(crate) fn write_completed_plan_execution(
+    db: &Arc<Db>,
+    record: &PlanExecutionRecord,
+) -> Result<(), ErrorData> {
     let key = plan_execution_key(&record.execution_id);
     let value = encode_json(record).map_err(|error| {
         mcp_error(
@@ -204,7 +268,7 @@ pub fn write_plan_execution(db: &Arc<Db>, record: &PlanExecutionRecord) -> Resul
     db.put_batch_pressure_bypass(cf::CF_KV, [(key, value)])
         .map_err(|error| {
             mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error.code(),
                 format!(
                     "failed to persist plan execution {}: {error}",
                     record.execution_id

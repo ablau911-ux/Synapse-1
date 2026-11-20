@@ -1,11 +1,22 @@
 mod auth;
+mod connection_activity;
+mod connection_admission;
+mod dashboard_facade_guard;
+mod dashboard_origin_guard;
+mod inflight_ids;
+mod liveness_triage;
 mod session;
+mod session_admission;
+mod session_guards;
+mod shutdown_sessions;
+mod socket_close_policy;
 pub mod sse;
+mod stale_sweep;
 mod transport;
 
 pub(crate) use auth::load_token_value;
 pub(crate) use session::current_mcp_session_id;
-pub(crate) use transport::http_transport_diagnostics_detail;
+pub(crate) use session::with_current_mcp_session_id;
 
 use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
 

@@ -41,9 +41,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub use crate::routine_identity::routine_id;
+use crate::routine_identity::routine_signature;
 use crate::types::{
     EpisodeRecord, ROUTINE_RECORD_VERSION, RoutineDowClass, RoutineEvidence, RoutineGranularity,
     RoutineRecord, RoutineStep, TimelineActor,
@@ -290,58 +291,11 @@ struct Promoted {
     cluster_ordinal: u32,
 }
 
-const fn granularity_token(granularity: RoutineGranularity) -> &'static str {
+pub(crate) const fn granularity_token(granularity: RoutineGranularity) -> &'static str {
     match granularity {
         RoutineGranularity::App => "app",
         RoutineGranularity::AppDocument => "app_document",
     }
-}
-
-fn dow_token(dow: &RoutineDowClass) -> String {
-    match dow {
-        RoutineDowClass::Daily => "daily".to_owned(),
-        RoutineDowClass::Weekdays => "weekdays".to_owned(),
-        RoutineDowClass::Weekend => "weekend".to_owned(),
-        RoutineDowClass::Days { days } => {
-            let list: Vec<String> = days.iter().map(u8::to_string).collect();
-            format!("days:{}", list.join(","))
-        }
-    }
-}
-
-/// Deterministic stable id: `rt1-` + first 16 hex chars of SHA-256 over the
-/// routine's identity tuple.
-///
-/// Excludes the mining timestamp and all derived statistics so re-mining
-/// the same episodes reproduces the same ids — the property lifecycle state
-/// (#849) and intent feedback (#856) anchor on.
-#[must_use]
-pub fn routine_id(
-    granularity: RoutineGranularity,
-    steps: &[RoutineStep],
-    dow_class: &RoutineDowClass,
-    cluster_ordinal: u32,
-) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut hasher = Sha256::new();
-    hasher.update(granularity_token(granularity).as_bytes());
-    for step in steps {
-        hasher.update([0x1F]);
-        hasher.update(step.app.as_bytes());
-        hasher.update([0x1E]);
-        hasher.update(step.document.as_deref().unwrap_or_default().as_bytes());
-    }
-    hasher.update([0x1F]);
-    hasher.update(dow_token(dow_class).as_bytes());
-    hasher.update([0x1F]);
-    hasher.update(cluster_ordinal.to_be_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        hex.push(char::from(HEX[usize::from(byte >> 4)]));
-        hex.push(char::from(HEX[usize::from(byte & 0x0F)]));
-    }
-    format!("rt1-{hex}")
 }
 
 fn validate_config(config: &RoutineMiningConfig) -> Result<(), RoutineMiningError> {
@@ -508,7 +462,7 @@ fn candidate_key(granularity: RoutineGranularity, steps: &[SeqItem]) -> String {
 }
 
 /// Circular distance between two minutes on the day circle.
-const fn circular_distance(a: u32, b: u32) -> u32 {
+pub(crate) const fn circular_distance(a: u32, b: u32) -> u32 {
     let diff = a.abs_diff(b);
     if diff > MINUTES_PER_DAY / 2 {
         MINUTES_PER_DAY - diff
@@ -941,13 +895,22 @@ pub fn mine_routines(
                 cluster_ordinal: 0,
             });
         }
-        // Ordinals follow cluster mean order so an id never depends on
-        // which clusters happened to be rejected.
-        accepted.sort_by_key(|cluster| cluster.mean_minute);
-        for (ordinal, mut cluster) in accepted.into_iter().enumerate() {
-            cluster.cluster_ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
-            promoted.push(cluster);
-        }
+        promoted.append(&mut accepted);
+    }
+    // Time anchors are independent of earlier/later clusters. Cosmetic raw
+    // candidates at the same anchor still need distinct ids: candidate-key
+    // iteration order provides a deterministic tie ordinal for that anchor.
+    // Persisted mining reconciles schedule drift with stored identities.
+    let mut next_anchor_ordinal: BTreeMap<(String, u32), u32> = BTreeMap::new();
+    for cluster in &mut promoted {
+        let ordinal = next_anchor_ordinal
+            .entry((
+                routine_signature(cluster.granularity, &cluster.steps),
+                cluster.mean_minute,
+            ))
+            .or_insert(0);
+        cluster.cluster_ordinal = MINUTES_PER_DAY * (1 + *ordinal) + cluster.mean_minute;
+        *ordinal += 1;
     }
 
     // Closed-pattern suppression on physical episode-id containment.
@@ -979,9 +942,11 @@ pub fn mine_routines(
             .then_with(|| b.confidence.total_cmp(&a.confidence))
             .then_with(|| a.steps.len().cmp(&b.steps.len()).reverse())
             .then_with(|| {
-                routine_id(a.granularity, &a.steps, &a.dow_class, a.cluster_ordinal).cmp(
-                    &routine_id(b.granularity, &b.steps, &b.dow_class, b.cluster_ordinal),
-                )
+                routine_id(a.granularity, &a.steps, a.cluster_ordinal).cmp(&routine_id(
+                    b.granularity,
+                    &b.steps,
+                    b.cluster_ordinal,
+                ))
             })
     });
     if survivors.len() > config.max_routines {
@@ -995,12 +960,7 @@ pub fn mine_routines(
     out.routines = survivors
         .into_iter()
         .map(|cluster| {
-            let id = routine_id(
-                cluster.granularity,
-                &cluster.steps,
-                &cluster.dow_class,
-                cluster.cluster_ordinal,
-            );
+            let id = routine_id(cluster.granularity, &cluster.steps, cluster.cluster_ordinal);
             let evidence_start = cluster
                 .occurrences
                 .len()

@@ -178,7 +178,7 @@ struct CaptureSlot {
     // Keep the connection + pumps alive for the capture's lifetime. Dropped /
     // aborted when the slot is removed (target closed / explicit stop).
     _browser: Browser,
-    handler_task: JoinHandle<()>,
+    handler_task: crate::cdp::CdpHandlerTask,
     listener_task: JoinHandle<()>,
 }
 
@@ -242,13 +242,13 @@ pub async fn console_capture_ensure(
     }
 
     let capacity = capacity.clamp(1, MAX_CONSOLE_BUFFER_CAPACITY);
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("console capture connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     // If anything below fails, abort the handler so we don't leak the
     // connection/task on the error path.

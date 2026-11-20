@@ -28,12 +28,27 @@ pub(super) struct BackendRateLimits {
     software: TokenBucket,
     vigem: TokenBucket,
     hardware: TokenBucket,
+    /// Latest override generation per backend (software, vigem, hardware). Kept with the
+    /// buckets so each emitter's overrides only supersede that emitter's resets (#199).
+    override_generations: [u64; 3],
 }
 
 impl BackendRateLimitControl {
     pub(super) fn new(rate_limits: BackendRateLimits) -> Self {
         Self {
             inner: Arc::new(RwLock::new(rate_limits)),
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    /// # Panics
+    ///
+    /// Panics if the backend rate-limit state lock is poisoned in a test.
+    pub fn snapshot(&self) -> BackendRateLimitSnapshot {
+        match self.try_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("backend rate limit snapshot failed: {error}"),
         }
     }
 
@@ -50,6 +65,9 @@ impl BackendRateLimitControl {
             })
     }
 
+    /// Override `backend`'s limiter and return the override's generation. Every
+    /// override supersedes resets scheduled for earlier overrides (#199).
+    ///
     /// # Errors
     ///
     /// Returns [`ActionError::BackendUnavailable`] if the backend rate-limit
@@ -59,31 +77,44 @@ impl BackendRateLimitControl {
         backend: ResolvedBackend,
         capacity: u32,
         refill_rate_per_s: u32,
-    ) -> ActionResult<BackendRateLimitOverrideReadback> {
-        let mut rate_limits =
-            self.inner
-                .write()
-                .map_err(|_err| ActionError::BackendUnavailable {
-                    detail: "backend rate limit lock poisoned".to_owned(),
-                })?;
-        Ok(rate_limits.replace_backend(backend, TokenBucket::new(capacity, refill_rate_per_s)))
+    ) -> ActionResult<(BackendRateLimitOverrideReadback, u64)> {
+        let mut rate_limits = self.write_limits()?;
+        let readback =
+            rate_limits.replace_backend(backend, TokenBucket::new(capacity, refill_rate_per_s));
+        let generation = rate_limits.generation_mut(backend);
+        *generation = generation.saturating_add(1);
+        Ok((readback, *generation))
     }
 
+    /// Restore `backend`'s default limiter if `generation` is still its latest
+    /// override. `Ok(None)` means a newer override superseded it (#199). The
+    /// check and the reset happen under one write lock.
+    ///
     /// # Errors
     ///
     /// Returns [`ActionError::BackendUnavailable`] if the backend rate-limit
     /// state lock is poisoned.
-    pub fn reset_backend(
+    pub fn reset_backend_if_current(
         &self,
         backend: ResolvedBackend,
-    ) -> ActionResult<BackendRateLimitOverrideReadback> {
-        let mut rate_limits =
-            self.inner
-                .write()
-                .map_err(|_err| ActionError::BackendUnavailable {
-                    detail: "backend rate limit lock poisoned".to_owned(),
-                })?;
-        Ok(rate_limits.replace_backend(backend, TokenBucket::for_backend(backend)))
+        generation: u64,
+    ) -> ActionResult<Option<BackendRateLimitOverrideReadback>> {
+        let mut rate_limits = self.write_limits()?;
+        if *rate_limits.generation_mut(backend) != generation {
+            return Ok(None);
+        }
+        Ok(Some(rate_limits.replace_backend(
+            backend,
+            TokenBucket::for_backend(backend),
+        )))
+    }
+
+    fn write_limits(&self) -> ActionResult<std::sync::RwLockWriteGuard<'_, BackendRateLimits>> {
+        self.inner
+            .write()
+            .map_err(|_err| ActionError::BackendUnavailable {
+                detail: "backend rate limit lock poisoned".to_owned(),
+            })
     }
 
     pub(super) fn consume(&self, backend: ResolvedBackend) -> ActionResult<()> {
@@ -120,6 +151,21 @@ impl BackendRateLimits {
             software: TokenBucket::for_backend(ResolvedBackend::Software),
             vigem: TokenBucket::for_backend(ResolvedBackend::Vigem),
             hardware: TokenBucket::for_backend(ResolvedBackend::Hardware),
+            override_generations: [0; 3],
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn with_buckets(
+        software: TokenBucket,
+        vigem: TokenBucket,
+        hardware: TokenBucket,
+    ) -> Self {
+        Self {
+            software,
+            vigem,
+            hardware,
+            override_generations: [0; 3],
         }
     }
 
@@ -136,6 +182,14 @@ impl BackendRateLimits {
             ResolvedBackend::Software => &mut self.software,
             ResolvedBackend::Vigem => &mut self.vigem,
             ResolvedBackend::Hardware => &mut self.hardware,
+        }
+    }
+
+    const fn generation_mut(&mut self, backend: ResolvedBackend) -> &mut u64 {
+        match backend {
+            ResolvedBackend::Software => &mut self.override_generations[0],
+            ResolvedBackend::Vigem => &mut self.override_generations[1],
+            ResolvedBackend::Hardware => &mut self.override_generations[2],
         }
     }
 

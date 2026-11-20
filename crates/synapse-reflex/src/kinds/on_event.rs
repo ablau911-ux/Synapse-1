@@ -1,21 +1,20 @@
 use std::time::{Duration, Instant};
 
+use crate::audit::AuditProducer;
 use chrono::Utc;
 use serde_json::json;
 use synapse_core::{
     Action, Event, EventRef, EventSource, ReflexId, ReflexState, SCHEMA_VERSION,
     StoredAuditContext, StoredReflexAudit, StoredReflexStep, error_codes,
 };
-use synapse_storage::Db;
 use uuid::Uuid;
 
-use crate::{EventBus, write_audit};
+use crate::{EventBus, enqueue_audit};
 
 pub const MAX_ON_EVENT_FIRINGS_PER_TICK: usize = 4;
 pub const REFLEX_DEBOUNCED_KIND: &str = "reflex_debounced";
 pub const REFLEX_FIRED_KIND: &str = "reflex_fired";
 pub const REFLEX_RECURSION_LIMIT_KIND: &str = "reflex_recursion_limit";
-const REFLEX_RECURSION_CLAMPS_METRIC: &str = "reflex_recursion_clamps_total";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OnEventState {
@@ -53,7 +52,7 @@ impl OnEventTickGuard {
     pub(crate) fn report_limit_once(
         &mut self,
         event_bus: &EventBus,
-        audit_db: Option<&Db>,
+        audit_db: Option<&AuditProducer>,
         reflex_id: &ReflexId,
         tick_index: u64,
         trigger_event: &Event,
@@ -63,7 +62,6 @@ impl OnEventTickGuard {
             return;
         }
         self.limit_reported = true;
-        metrics::counter!(REFLEX_RECURSION_CLAMPS_METRIC).increment(1);
         publish_limit_event(event_bus, reflex_id, tick_index, trigger_event);
         let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context);
         write_audit_if_configured(audit_db, &audit);
@@ -72,7 +70,7 @@ impl OnEventTickGuard {
 
 pub(crate) fn publish_fired(
     event_bus: &EventBus,
-    audit_db: Option<&Db>,
+    audit_db: Option<&AuditProducer>,
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
@@ -109,7 +107,7 @@ pub(crate) fn publish_fired(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_debounced(
     event_bus: &EventBus,
-    audit_db: Option<&Db>,
+    audit_db: Option<&AuditProducer>,
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
@@ -284,11 +282,11 @@ fn completed_steps(actions: &[Action]) -> Vec<StoredReflexStep> {
         .collect()
 }
 
-fn write_audit_if_configured(audit_db: Option<&Db>, audit: &StoredReflexAudit) {
+fn write_audit_if_configured(audit_db: Option<&AuditProducer>, audit: &StoredReflexAudit) {
     let Some(db) = audit_db else {
         return;
     };
-    if let Err(error) = write_audit(db, audit) {
+    if let Err(error) = enqueue_audit(db, audit) {
         tracing::warn!(
             component = "reflex_on_event",
             reflex_id = %audit.reflex_id,

@@ -19,10 +19,20 @@ pub(super) fn nested_string(value: &Value, path: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Keyed `hmac-sha256:` digest of text (#174), e.g. an MCP session id.
 pub(super) fn sha256_text(value: &str) -> String {
-    prefixed_sha256(value.as_bytes())
+    keyed_sha256(value.as_bytes())
 }
 
+/// Keyed `hmac-sha256:` digest (#174) of one replay/lifecycle line. Lines carry
+/// recorded user/agent content and error text, so a plain SHA-256 would be
+/// brute-forceable; equal lines still give equal digests within one install.
+pub(super) fn keyed_sha256(bytes: &[u8]) -> String {
+    crate::content_digest::keyed_prefixed_digest(bytes)
+}
+
+/// Plain SHA-256 on purpose (#174): used for the digest of a whole artifact
+/// file, which operators compare against `sha256sum` of the file on disk.
 pub(super) fn prefixed_sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }

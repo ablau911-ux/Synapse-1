@@ -14,8 +14,7 @@
 //! `chrome.tabs` active-element readback. Fail-loud on every divergence; never
 //! an optimistic success and never a foreground fallback.
 
-use super::browser_facades::merge_top_level_target;
-use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
+use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 use crate::m1::mcp_error;
 use crate::m2::postcondition::text_signature;
 use rmcp::schemars::JsonSchema;
@@ -26,7 +25,6 @@ use synapse_core::error_codes;
 
 const TOOL: &str = "browser_set_value";
 const FORM_TOOL: &str = "browser_form";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const SOURCE_OF_TRUTH: &str =
     "chrome_bridge_in_page_value + separate chrome.tabs active-element readback";
 const FORM_SOURCE_OF_TRUTH: &str =
@@ -55,17 +53,6 @@ impl BrowserFormOperation {
 pub struct BrowserFormParams {
     /// Form operation to run. Supply exactly the matching nested spec object.
     pub operation: BrowserFormOperation,
-    /// Optional top-level target alias (#1551). When set, this populates the
-    /// selected operation spec's `cdp_target_id`; a conflicting nested value
-    /// fails closed. Defaults to the nested spec / session target.
-    #[serde(default)]
-    pub cdp_target_id: Option<String>,
-    /// Optional top-level target-window alias (#1551). When set, this populates
-    /// the selected operation spec's `window_hwnd`; a conflicting nested value
-    /// fails closed. Defaults to the nested spec / session target window.
-    #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
-    pub window_hwnd: Option<i64>,
     /// `operation=set_value`: replace one field value with dual readback.
     #[serde(default)]
     pub set_value: Option<BrowserSetValueParams>,
@@ -113,7 +100,6 @@ pub struct BrowserSetValueParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -163,7 +149,6 @@ pub struct BrowserFillFormParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Per-action DOM wait budget in milliseconds. Defaults to 5000.
     #[serde(default)]
@@ -268,40 +253,15 @@ pub struct BrowserFillFormFieldOutcome {
 #[tool_router(router = browser_field_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public form facade for the calling session's owned browser tab. operation=set_value delegates to the dual-readback field replacement path; operation=fill delegates to ordered multi-field form fill. The operation requires exactly its matching nested spec object and rejects extra operation specs before mutation. Target addressing (cdp_target_id/window_hwnd) may be supplied at the envelope top level as an alias for the selected nested spec's target; a conflicting nested value fails closed. Target-scoped and background-safe: never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Public form facade for the calling session's owned browser tab. operation=set_value delegates to the dual-readback field replacement path; operation=fill delegates to ordered multi-field form fill. The operation requires exactly its matching nested spec object and rejects extra operation specs before mutation. Target-scoped and background-safe: never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_form(
         &self,
         params: Parameters<BrowserFormParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserFormResponse>, ErrorData> {
-        let mut params = params.0;
+        let params = params.0;
         let operation = params.operation;
-        // #1551: fold top-level cdp_target_id/window_hwnd aliases into the nested
-        // operation spec(s) before source/validation so the effective target is
-        // resolved identically to the equivalent nested-spec form.
-        let top_cdp_target_id = params.cdp_target_id.clone();
-        let top_window_hwnd = params.window_hwnd;
-        if let Some(spec) = params.set_value.as_mut() {
-            merge_top_level_target(
-                FORM_TOOL,
-                "set_value",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
-        if let Some(spec) = params.fill.as_mut() {
-            merge_top_level_target(
-                FORM_TOOL,
-                "fill",
-                top_cdp_target_id.as_deref(),
-                top_window_hwnd,
-                &mut spec.cdp_target_id,
-                &mut spec.window_hwnd,
-            )?;
-        }
         let source_id = browser_form_source_id(&params);
         validate_browser_form_params(&params)?;
         tracing::info!(
@@ -400,11 +360,13 @@ impl SynapseService {
                 ),
             ));
         }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        let browser_rows = synapse_browsers::BrowserRegistry::global();
+        if !browser_rows.has_bridge_tab_prefix(&cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "{TOOL} requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "{TOOL} requires a normal Chrome bridge tab target ({}); got {cdp_target_id:?}",
+                    browser_rows.tab_target_shapes()
                 ),
             ));
         }
@@ -473,11 +435,13 @@ impl SynapseService {
                 ),
             ));
         }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        let browser_rows = synapse_browsers::BrowserRegistry::global();
+        if !browser_rows.has_bridge_tab_prefix(&cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "browser_fill_form requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "browser_fill_form requires a normal Chrome bridge tab target ({}); got {cdp_target_id:?}",
+                    browser_rows.tab_target_shapes()
                 ),
             ));
         }
@@ -530,9 +494,6 @@ impl SynapseService {
         }
         let expected_chrome_window_id = owner.as_ref().and_then(|owner| owner.chrome_window_id);
 
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_set_value_before_bridge_field_replace",
-        )?;
         let result = crate::chrome_debugger_bridge::set_field_value(
             window_hwnd,
             cdp_target_id,
@@ -552,9 +513,6 @@ impl SynapseService {
                 ),
             )
         })?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_set_value_after_bridge_field_replace",
-        )?;
 
         let before_value = result.before_value.clone().unwrap_or_default();
         let after_value = result.after_value.clone().ok_or_else(|| {
@@ -895,11 +853,6 @@ impl SynapseService {
         wait_timeout_ms: u64,
     ) -> BrowserFillFormFieldOutcome {
         let option = field.option.as_deref().or(field.value.as_deref());
-        if let Err(error) = super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_fill_form_before_bridge_dom_action",
-        ) {
-            return fill_form_error_data(index, field, "operator_panic_boundary", error);
-        }
         match crate::chrome_debugger_bridge::dom_action(
             crate::chrome_debugger_bridge::ChromeDebuggerDomActionRequest {
                 hwnd: window_hwnd,
@@ -930,11 +883,6 @@ impl SynapseService {
         .await
         {
             Ok(result) => {
-                if let Err(error) = super::operator_panic_boundary::ensure_mcp_mutation(
-                    "browser_fill_form_after_bridge_dom_action",
-                ) {
-                    return fill_form_error_data(index, field, "operator_panic_boundary", error);
-                }
                 fill_form_success(index, field, "chrome_debugger_bridge.domAction", result)
             }
             Err(error) => {
@@ -943,56 +891,22 @@ impl SynapseService {
         }
     }
 
-    fn resolve_bridge_target(
+    /// Resolves the tab a `browser_form` call fills: the explicit
+    /// `cdp_target_id` when this MCP session owns it (or it is the active
+    /// target), else the active CDP target. Same ownership rule as
+    /// `browser_nav` (#299): an owned tab need not be the active target, and a
+    /// tab this session does not own is refused; never the human foreground.
+    pub(super) fn resolve_bridge_target(
         &self,
         session_id: &str,
         params: &BrowserSetValueParams,
     ) -> Result<(i64, String), ErrorData> {
-        let active_target = self.session_target(Some(session_id))?;
-        let cdp_target_id = match (params.cdp_target_id.as_ref(), active_target.as_ref()) {
-            (Some(target_id), _) => target_id.clone(),
-            (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
-            (None, _) => {
-                return Err(mcp_error(
-                    error_codes::TARGET_NOT_SET,
-                    format!(
-                        "{TOOL} requires an active CDP session target or an explicit cdp_target_id owned by this session; refusing the human foreground tab"
-                    ),
-                ));
-            }
-        };
-        let window_hwnd = params
-            .window_hwnd
-            .or_else(|| match active_target.as_ref() {
-                Some(SessionTarget::Cdp { window_hwnd, .. }) => Some(*window_hwnd),
-                Some(SessionTarget::Window { hwnd }) => Some(*hwnd),
-                None => None,
-            })
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::TARGET_NOT_SET,
-                    format!("{TOOL} requires window_hwnd when no active session target is set"),
-                )
-            })?;
-        let window_hwnd = crate::m1::validate_window_hwnd_shape(TOOL, window_hwnd)?;
-        // Ownership: an explicit target must match this session's active CDP
-        // target. This keeps the tool from acting on another session's tab.
-        if let Some(explicit) = params.cdp_target_id.as_ref() {
-            let owned = matches!(
-                active_target.as_ref(),
-                Some(SessionTarget::Cdp { cdp_target_id, .. })
-                    if cdp_target_id.eq_ignore_ascii_case(explicit)
-            );
-            if !owned {
-                return Err(mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "{TOOL} refused target {explicit:?}: it is not this session's active CDP target"
-                    ),
-                ));
-            }
-        }
-        Ok((window_hwnd, cdp_target_id))
+        self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            session_id,
+            params.window_hwnd,
+            params.cdp_target_id.as_deref(),
+        )
     }
 }
 
@@ -1291,11 +1205,13 @@ fn validate_locator(params: &BrowserSetValueParams) -> Result<Locator, ErrorData
         return Ok(Locator::Selector(selector.to_owned()));
     }
     if let Some(element_id) = element_id {
-        if !element_id.starts_with(CHROME_TAB_PREFIX) {
+        let browser_rows = synapse_browsers::BrowserRegistry::global();
+        if !browser_rows.has_bridge_tab_prefix(element_id) {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
-                    "{TOOL} element_id must be a normal Chrome bridge id starting with {CHROME_TAB_PREFIX:?}; got {element_id:?}"
+                    "{TOOL} element_id must be a normal Chrome bridge id shaped like {}; got {element_id:?}",
+                    browser_rows.tab_target_shapes()
                 ),
             ));
         }

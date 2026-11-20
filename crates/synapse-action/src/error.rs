@@ -4,6 +4,21 @@ pub type ActionResult<T> = Result<T, ActionError>;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ActionError {
+    /// Preserve dispatch evidence independently of the provider's error code/text.
+    #[error("{source}")]
+    ClickDispatch {
+        source: Box<ActionError>,
+        delivered: bool,
+    },
+    /// #189: the producer proved no click dispatch call was made.
+    /// `tier_unavailable` marks a backend admission refusal (UIA worker limit,
+    /// busy or unavailable): the tier could not run, so the caller's next
+    /// in-tier route may run once.
+    #[error("{source}")]
+    ClickNotDispatched {
+        source: Box<ActionError>,
+        tier_unavailable: bool,
+    },
     #[error("action queue full: {detail}")]
     QueueFull { detail: String },
     #[error("action rate limited: {detail}")]
@@ -17,10 +32,16 @@ pub enum ActionError {
     },
     #[error("action backend unavailable: {detail}")]
     BackendUnavailable { detail: String },
+    #[error("action input target required: {detail}")]
+    InputTargetRequired { detail: String },
+    #[error("action input target not ready: {detail}")]
+    InputTargetNotReady { detail: String },
     #[error("foreground activation refused: {detail}")]
     ForegroundActivationRefused { detail: String },
     #[error("action target invalid: {detail}")]
     TargetInvalid { detail: String },
+    #[error("target window not found: {detail}")]
+    WindowNotFound { detail: String },
     #[error("action hold exceeds max: {detail}")]
     HoldExceededMax { detail: String },
     #[error("ViGEm is not installed: {detail}")]
@@ -41,10 +62,6 @@ pub enum ActionError {
     },
     #[error("action foreground lost: {detail}")]
     ForegroundLost { detail: String },
-    #[error("action input target required: {detail}")]
-    InputTargetRequired { detail: String },
-    #[error("human fullscreen foreground protected: {detail}")]
-    HumanFullscreenForeground { detail: String },
     #[error("action unsupported key: {detail}")]
     UnsupportedKey { detail: String },
     #[error("action observed no state delta: {detail}")]
@@ -63,12 +80,18 @@ impl ActionError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::ClickDispatch { source, .. } | Self::ClickNotDispatched { source, .. } => {
+                source.code()
+            }
             Self::QueueFull { .. } => error_codes::ACTION_QUEUE_FULL,
             Self::RateLimited { .. } => error_codes::ACTION_RATE_LIMITED,
             Self::ForegroundLeaseBusy { .. } => error_codes::ACTION_FOREGROUND_LEASE_BUSY,
             Self::BackendUnavailable { .. } => error_codes::ACTION_BACKEND_UNAVAILABLE,
+            Self::InputTargetRequired { .. } => error_codes::ACTION_INPUT_TARGET_REQUIRED,
+            Self::InputTargetNotReady { .. } => error_codes::ACTION_INPUT_TARGET_NOT_READY,
             Self::ForegroundActivationRefused { .. } => error_codes::FOREGROUND_ACTIVATION_REFUSED,
             Self::TargetInvalid { .. } => error_codes::ACTION_TARGET_INVALID,
+            Self::WindowNotFound { .. } => error_codes::TARGET_WINDOW_NOT_FOUND,
             Self::HoldExceededMax { .. } => error_codes::ACTION_HOLD_EXCEEDED_MAX,
             Self::VigemNotInstalled { .. } => error_codes::ACTION_VIGEM_NOT_INSTALLED,
             Self::VigemPluginFailed { .. } => error_codes::ACTION_VIGEM_PLUGIN_FAILED,
@@ -78,10 +101,6 @@ impl ActionError {
             }
             Self::TransientElementExpired { .. } => error_codes::TRANSIENT_ELEMENT_EXPIRED,
             Self::ForegroundLost { .. } => error_codes::ACTION_FOREGROUND_LOST,
-            Self::InputTargetRequired { .. } => error_codes::ACTION_INPUT_TARGET_REQUIRED,
-            Self::HumanFullscreenForeground { .. } => {
-                error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND
-            }
             Self::UnsupportedKey { .. } => error_codes::ACTION_UNSUPPORTED_KEY,
             Self::NoObservedDelta { .. } => error_codes::ACTION_NO_OBSERVED_DELTA,
             Self::DragDistanceExceedsLimit { .. } => {
@@ -96,12 +115,18 @@ impl ActionError {
     #[must_use]
     pub fn detail(&self) -> &str {
         match self {
+            Self::ClickDispatch { source, .. } | Self::ClickNotDispatched { source, .. } => {
+                source.detail()
+            }
             Self::QueueFull { detail }
             | Self::RateLimited { detail, .. }
             | Self::ForegroundLeaseBusy { detail, .. }
             | Self::BackendUnavailable { detail }
+            | Self::InputTargetRequired { detail }
+            | Self::InputTargetNotReady { detail }
             | Self::ForegroundActivationRefused { detail }
             | Self::TargetInvalid { detail }
+            | Self::WindowNotFound { detail }
             | Self::HoldExceededMax { detail }
             | Self::VigemNotInstalled { detail }
             | Self::VigemPluginFailed { detail }
@@ -109,8 +134,6 @@ impl ActionError {
             | Self::ElementPatternUnsupported { detail, .. }
             | Self::TransientElementExpired { detail, .. }
             | Self::ForegroundLost { detail }
-            | Self::InputTargetRequired { detail }
-            | Self::HumanFullscreenForeground { detail }
             | Self::UnsupportedKey { detail }
             | Self::NoObservedDelta { detail }
             | Self::DragDistanceExceedsLimit { detail }
@@ -124,6 +147,17 @@ impl ActionError {
     pub fn with_detail(self, detail: impl Into<String>) -> Self {
         let detail = detail.into();
         match self {
+            Self::ClickDispatch { source, delivered } => Self::ClickDispatch {
+                source: Box::new(source.with_detail(detail)),
+                delivered,
+            },
+            Self::ClickNotDispatched {
+                source,
+                tier_unavailable,
+            } => Self::ClickNotDispatched {
+                source: Box::new(source.with_detail(detail)),
+                tier_unavailable,
+            },
             Self::QueueFull { .. } => Self::QueueFull { detail },
             Self::RateLimited { retry_after_ms, .. } => Self::RateLimited {
                 detail,
@@ -141,10 +175,13 @@ impl ActionError {
                 retry_after_ms,
             },
             Self::BackendUnavailable { .. } => Self::BackendUnavailable { detail },
+            Self::InputTargetRequired { .. } => Self::InputTargetRequired { detail },
+            Self::InputTargetNotReady { .. } => Self::InputTargetNotReady { detail },
             Self::ForegroundActivationRefused { .. } => {
                 Self::ForegroundActivationRefused { detail }
             }
             Self::TargetInvalid { .. } => Self::TargetInvalid { detail },
+            Self::WindowNotFound { .. } => Self::WindowNotFound { detail },
             Self::HoldExceededMax { .. } => Self::HoldExceededMax { detail },
             Self::VigemNotInstalled { .. } => Self::VigemNotInstalled { detail },
             Self::VigemPluginFailed { .. } => Self::VigemPluginFailed { detail },
@@ -156,8 +193,6 @@ impl ActionError {
                 Self::TransientElementExpired { element_id, detail }
             }
             Self::ForegroundLost { .. } => Self::ForegroundLost { detail },
-            Self::InputTargetRequired { .. } => Self::InputTargetRequired { detail },
-            Self::HumanFullscreenForeground { .. } => Self::HumanFullscreenForeground { detail },
             Self::UnsupportedKey { .. } => Self::UnsupportedKey { detail },
             Self::NoObservedDelta { .. } => Self::NoObservedDelta { detail },
             Self::DragDistanceExceedsLimit { .. } => Self::DragDistanceExceedsLimit { detail },
@@ -170,12 +205,16 @@ impl ActionError {
     #[must_use]
     pub const fn retry_after_ms(&self) -> Option<u64> {
         match self {
+            Self::ClickDispatch { .. } | Self::ClickNotDispatched { .. } => None,
             Self::RateLimited { retry_after_ms, .. }
             | Self::ForegroundLeaseBusy { retry_after_ms, .. } => Some(*retry_after_ms),
             Self::QueueFull { .. }
             | Self::BackendUnavailable { .. }
+            | Self::InputTargetRequired { .. }
+            | Self::InputTargetNotReady { .. }
             | Self::ForegroundActivationRefused { .. }
             | Self::TargetInvalid { .. }
+            | Self::WindowNotFound { .. }
             | Self::HoldExceededMax { .. }
             | Self::VigemNotInstalled { .. }
             | Self::VigemPluginFailed { .. }
@@ -183,8 +222,6 @@ impl ActionError {
             | Self::ElementPatternUnsupported { .. }
             | Self::TransientElementExpired { .. }
             | Self::ForegroundLost { .. }
-            | Self::InputTargetRequired { .. }
-            | Self::HumanFullscreenForeground { .. }
             | Self::UnsupportedKey { .. }
             | Self::NoObservedDelta { .. }
             | Self::DragDistanceExceedsLimit { .. }

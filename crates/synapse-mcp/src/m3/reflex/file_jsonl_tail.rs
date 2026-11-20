@@ -2,7 +2,6 @@ use std::{
     fmt,
     fs::File,
     io::{BufRead, BufReader},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -322,7 +321,7 @@ fn read_remote_file_jsonl_tail(
         "p={quoted_path}; if [ ! -f \"$p\" ]; then printf 'missing\\t0\\n'; exit 0; fi; c=$(wc -l < \"$p\") || exit 2; printf 'ok\\t%s\\n' \"$c\"; tail -n 1 -- \"$p\""
     );
     let remote_command = format!("sh -lc {}", shell_single_quote(&script));
-    let output = Command::new("ssh")
+    let output = crate::m4::child_environment::internal_helper_command("ssh")
         .args([
             "-o",
             "BatchMode=yes",

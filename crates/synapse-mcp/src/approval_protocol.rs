@@ -256,6 +256,9 @@ mod windows_protocol {
     ) -> Result<(), String> {
         let subkey_wide = wide_null(subkey);
         let mut key = HKEY::default();
+        // SAFETY: `subkey_wide` is a live NUL-terminated UTF-16 buffer and `key` is a live local
+        // out-param, both outliving the call; the null class, security and disposition arguments
+        // are allowed.
         let status = unsafe {
             RegCreateKeyExW(
                 HKEY_CURRENT_USER,
@@ -280,10 +283,16 @@ mod windows_protocol {
             .as_ref()
             .map_or_else(PCWSTR::null, |name| PCWSTR(name.as_ptr()));
         let value_wide = wide_null(value);
+        // SAFETY: `value_wide` is a live Vec<u16>; viewing its `len * 2` bytes as u8 stays in
+        // bounds with align 1, and the slice does not outlive the Vec.
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(value_wide.as_ptr().cast::<u8>(), value_wide.len() * 2)
         };
+        // SAFETY: `key` was opened by the successful RegCreateKeyExW above (status checked);
+        // `name_pcw` is null or points into the live `name_wide`; `bytes` borrows the live
+        // `value_wide`.
         let status = unsafe { RegSetValueExW(key, name_pcw, None, REG_SZ, Some(bytes)) };
+        // SAFETY: `key` is the handle opened above and still open; this is its only close.
         let close_status = unsafe { RegCloseKey(key) };
         if status != ERROR_SUCCESS {
             return Err(format!(
@@ -308,6 +317,9 @@ mod windows_protocol {
             .map_or_else(PCWSTR::null, |value| PCWSTR(value.as_ptr()));
         let mut value_type = REG_VALUE_TYPE::default();
         let mut byte_len = 0_u32;
+        // SAFETY: `subkey_wide` and `value_wide` are live NUL-terminated UTF-16 buffers (the value
+        // name may be null); `value_type` and `byte_len` are live locals; the null data pointer
+        // only asks for the size.
         let status = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
@@ -323,6 +335,8 @@ mod windows_protocol {
             return None;
         }
         let mut buffer = vec![0_u16; (byte_len as usize).div_ceil(2)];
+        // SAFETY: same live pointers as the size query; `buffer` holds `byte_len.div_ceil(2)` u16s,
+        // enough for the byte count the size query returned, and `byte_len` reports that capacity.
         let status = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,

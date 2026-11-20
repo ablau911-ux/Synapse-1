@@ -23,10 +23,13 @@
 //!
 //! ## bbox semantics
 //!
-//! Web-node `bbox` is the element's CSS-pixel rectangle in page-layout
-//! coordinates (from `DOM.getBoxModel`), NOT screen pixels. Actions do not rely
-//! on it — they re-resolve the live box model at click time after scrolling the
-//! node into view — but it lets an agent reason about on-page layout.
+//! Web-node `bbox` is the element's CSS-pixel rectangle from `DOM.getBoxModel`
+//! (viewport-relative), NOT screen pixels. A node with no intersection with the
+//! viewport is scrolled out of view: its `bbox` keeps its origin but has zero
+//! width and height (see [`bbox_in_viewport`]), so the shared visibility model
+//! (`is_usable_element`) excludes it just like a UIA offscreen control (#101).
+//! Actions do not rely on it — they re-resolve the live box model at click time
+//! after scrolling the node into view.
 
 use synapse_core::{AccessibleNode, ElementId, Rect, element_id};
 
@@ -190,6 +193,7 @@ pub fn build_accessible_nodes_for_target(
                 patterns: Vec::new(),
                 children_count: node.child_count,
                 depth,
+                control_state: None,
             }
         })
         .collect()
@@ -264,11 +268,40 @@ pub fn rect_from_quad(quad: &[f64]) -> Option<Rect> {
     })
 }
 
+/// Visible geometry of a web node: a rectangle that does not overlap the
+/// `[0, viewport_w) x [0, viewport_h)` viewport (box-model coordinates are
+/// viewport-relative) keeps its origin but loses its extent (#101).
+#[must_use]
+pub const fn bbox_in_viewport(rect: Rect, viewport_w: i32, viewport_h: i32) -> Rect {
+    let overlaps = rect.x.saturating_add(rect.w) > 0
+        && rect.x < viewport_w
+        && rect.y.saturating_add(rect.h) > 0
+        && rect.y < viewport_h;
+    if overlaps || (rect.w == 0 && rect.h == 0) {
+        rect
+    } else {
+        Rect { w: 0, h: 0, ..rect }
+    }
+}
+
+/// DOM attributes used to classify an ARIA value before public readback.
+#[derive(Clone, Debug)]
+pub struct CdpAriaControl {
+    /// The HTML input type, if present.
+    pub input_type: String,
+    /// The autocomplete attribute, if present.
+    pub autocomplete: String,
+    /// Name-bearing attributes that can identify a credential control.
+    pub names: Vec<String>,
+}
+
 /// A fully-resolved CDP DOM snapshot ready to fold into observation elements.
 #[derive(Clone, Debug)]
 pub struct CdpDomSnapshot {
     /// Mapped, queryable web nodes.
     pub nodes: Vec<AccessibleNode>,
+    /// Form-control metadata indexed by the mapped accessibility element ID.
+    pub aria_controls: std::collections::HashMap<String, CdpAriaControl>,
     /// Total non-ignored AX nodes the page exposed (before `max_nodes` capping).
     pub total_ax_nodes: u32,
     /// Page URL the snapshot came from (diagnostics).
@@ -384,17 +417,16 @@ pub async fn fetch_dom_snapshot(
 
     use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
-    use futures_util::StreamExt as _;
 
     use crate::A11yError;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let pages = wait_for_pages(&browser).await?;
@@ -442,16 +474,13 @@ pub async fn fetch_dom_snapshot(
             }
         };
 
-        let main_read =
+        let mut main_read =
             fetch_target_dom_read(&page, &selection.target_id, max_nodes).await?;
         frame_snapshot_errors.extend(main_read.frame_snapshot_errors.clone());
 
-        let mut nodes = build_accessible_nodes_for_target(
-            hwnd,
-            Some(&selection.target_id),
-            &main_read.dom_nodes,
-            max_nodes,
-        );
+        let mut aria_controls = std::collections::HashMap::new();
+        let mut nodes =
+            main_read.accessible_nodes(hwnd, &selection.target_id, max_nodes, &mut aria_controls);
         let mut total_ax_nodes = main_read.total_ax_nodes;
         let mut frame_tree_frame_count = main_read.frame_tree_frame_count;
         let mut attached_frame_target_count = 0_u32;
@@ -499,7 +528,7 @@ pub async fn fetch_dom_snapshot(
                 let remaining = max_nodes.saturating_sub(nodes.len());
                 match fetch_target_dom_read(&iframe_page, target.target_id.inner(), remaining).await
                 {
-                    Ok(read) => {
+                    Ok(mut read) => {
                         attached_frame_target_count = attached_frame_target_count.saturating_add(1);
                         total_ax_nodes = total_ax_nodes.saturating_add(read.total_ax_nodes);
                         frame_tree_frame_count =
@@ -510,11 +539,11 @@ pub async fn fetch_dom_snapshot(
                                 known_frame_ids.push(frame_id.clone());
                             }
                         }
-                        nodes.extend(build_accessible_nodes_for_target(
+                        nodes.extend(read.accessible_nodes(
                             hwnd,
-                            Some(target.target_id.inner()),
-                            &read.dom_nodes,
+                            target.target_id.inner(),
                             remaining,
+                            &mut aria_controls,
                         ));
                     }
                     Err(error) => {
@@ -533,6 +562,7 @@ pub async fn fetch_dom_snapshot(
         }
         Ok(CdpDomSnapshot {
             nodes,
+            aria_controls,
             total_ax_nodes,
             page_url,
             target_id: selection.target_id,
@@ -574,17 +604,16 @@ pub async fn cdp_list_frames(
 
     use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::target::{GetTargetsParams, TargetId, TargetInfo};
-    use futures_util::StreamExt as _;
 
     use crate::A11yError;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = wait_for_page_target(&browser, TargetId::new(target_id.to_owned()))
@@ -744,10 +773,127 @@ pub async fn cdp_list_frames(
 #[derive(Clone, Debug)]
 struct CdpTargetDomRead {
     dom_nodes: Vec<CdpDomNode>,
+    password_backends: std::collections::HashSet<i64>,
+    aria_controls: std::collections::HashMap<i64, CdpAriaControl>,
     total_ax_nodes: u32,
     frame_tree_frame_count: u32,
     frame_ids: Vec<String>,
     frame_snapshot_errors: Vec<String>,
+}
+
+#[cfg(windows)]
+impl CdpTargetDomRead {
+    fn accessible_nodes(
+        &mut self,
+        hwnd: i64,
+        target_id: &str,
+        limit: usize,
+        aria_controls: &mut std::collections::HashMap<String, CdpAriaControl>,
+    ) -> Vec<AccessibleNode> {
+        let mut nodes =
+            build_accessible_nodes_for_target(hwnd, Some(target_id), &self.dom_nodes, limit);
+        for node in &mut nodes {
+            let Some(backend) = cdp_backend_from_element_id(&node.element_id) else {
+                continue;
+            };
+            if self.password_backends.contains(&backend) {
+                node.value = Some("[REDACTED]".to_owned());
+                node.control_state = Some("is_password=true".to_owned());
+            }
+            if let Some(control) = self.aria_controls.remove(&backend) {
+                aria_controls.insert(node.element_id.to_string(), control);
+            }
+        }
+        nodes
+    }
+}
+
+#[cfg(windows)]
+fn dom_node_is_password(node: &chromiumoxide::cdp::browser_protocol::dom::Node) -> bool {
+    node.local_name.eq_ignore_ascii_case("input")
+        && node.attributes.as_deref().is_some_and(|attributes| {
+            attributes.chunks_exact(2).any(|pair| {
+                pair[0].eq_ignore_ascii_case("type") && pair[1].eq_ignore_ascii_case("password")
+            })
+        })
+}
+
+#[cfg(windows)]
+fn dom_nodes_by_backend(
+    root: &chromiumoxide::cdp::browser_protocol::dom::Node,
+) -> std::collections::HashMap<i64, &chromiumoxide::cdp::browser_protocol::dom::Node> {
+    let mut nodes = std::collections::HashMap::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        nodes.insert(*node.backend_node_id.inner(), node);
+        pending.extend(node.children.iter().flatten());
+        pending.extend(node.shadow_roots.iter().flatten());
+        pending.extend(node.pseudo_elements.iter().flatten());
+        pending.extend(node.content_document.as_deref());
+        pending.extend(node.template_content.as_deref());
+    }
+    nodes
+}
+
+#[cfg(windows)]
+async fn ax_dom_control(
+    page: &chromiumoxide::Page,
+    backend: i64,
+    nodes: &std::collections::HashMap<i64, &chromiumoxide::cdp::browser_protocol::dom::Node>,
+    include_metadata: bool,
+) -> crate::A11yResult<(bool, Option<CdpAriaControl>)> {
+    use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, DescribeNodeParams};
+
+    let described;
+    let node = if let Some(&node) = nodes.get(&backend) {
+        node
+    } else {
+        described = page
+            .execute(
+                DescribeNodeParams::builder()
+                    .backend_node_id(BackendNodeId::new(backend))
+                    .build(),
+            )
+            .await
+            .map_err(|error| crate::A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "DOM.describeNode form-control classification for {backend}: {error}"
+                ),
+            })?;
+        &described.result.node
+    };
+    let is_password = dom_node_is_password(node);
+    let control = if include_metadata && !is_password {
+        aria_control_attributes(node)
+    } else {
+        None
+    };
+    Ok((is_password, control))
+}
+
+#[cfg(windows)]
+fn aria_control_attributes(
+    node: &chromiumoxide::cdp::browser_protocol::dom::Node,
+) -> Option<CdpAriaControl> {
+    let attrs = node.attributes.as_deref()?;
+    let mut control = CdpAriaControl {
+        input_type: String::new(),
+        autocomplete: String::new(),
+        names: Vec::new(),
+    };
+    for pair in attrs.chunks_exact(2) {
+        match pair[0].to_ascii_lowercase().as_str() {
+            "type" if node.local_name.eq_ignore_ascii_case("input") => {
+                control.input_type.clone_from(&pair[1]);
+            }
+            "autocomplete" => control.autocomplete.clone_from(&pair[1]),
+            "name" | "id" | "placeholder" | "aria-label" => control.names.push(pair[1].clone()),
+            _ => {}
+        }
+    }
+    // An element without any of these attributes is a known ordinary control;
+    // `None` (no attribute list at all) means unknown and fails closed upstream.
+    Some(control)
 }
 
 #[cfg(windows)]
@@ -798,6 +944,7 @@ async fn fetch_target_dom_read(
     use chromiumoxide::cdp::browser_protocol::dom::{
         BackendNodeId, GetBoxModelParams, GetDocumentParams,
     };
+    use chromiumoxide::cdp::browser_protocol::page::GetLayoutMetricsParams;
 
     use crate::A11yError;
 
@@ -809,12 +956,33 @@ async fn fetch_target_dom_read(
 
     let mut frame_snapshot_errors = Vec::new();
     let prime = GetDocumentParams::builder().depth(-1).pierce(true).build();
-    if let Err(error) = page.execute(prime).await {
-        frame_snapshot_errors.push(format!(
-            "target {target_id} DOM.getDocument depth=-1 pierce=true failed: {error}"
-        ));
-    }
+    let document = page
+        .execute(prime)
+        .await
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "target {target_id} DOM.getDocument password classification failed: {error}"
+            ),
+        })?;
+    let dom_by_backend = dom_nodes_by_backend(&document.result.root);
+    let mut password_backends = HashSet::new();
+    let mut aria_controls = HashMap::new();
 
+    let viewport = match page.execute(GetLayoutMetricsParams::default()).await {
+        Ok(metrics) => {
+            let layout = &metrics.result.css_layout_viewport;
+            Some((
+                i32::try_from(layout.client_width).unwrap_or(i32::MAX),
+                i32::try_from(layout.client_height).unwrap_or(i32::MAX),
+            ))
+        }
+        Err(error) => {
+            frame_snapshot_errors.push(format!(
+                "target {target_id} Page.getLayoutMetrics failed; viewport visibility not applied: {error}"
+            ));
+            None
+        }
+    };
     let frames = frame_descriptors_for_page(page, target_id, &mut frame_snapshot_errors).await;
     let mut dom_nodes = Vec::new();
     let mut total_ax_nodes = 0_u32;
@@ -865,7 +1033,19 @@ async fn fetch_target_dom_read(
                 continue;
             }
             let name = ax_value_string(node.name.as_ref());
-            let value = {
+            let (is_password, control) = if role.eq_ignore_ascii_case("password") {
+                (true, None)
+            } else {
+                let include_metadata = dom_nodes.len() < max_nodes && node.value.is_some();
+                ax_dom_control(page, backend, &dom_by_backend, include_metadata).await?
+            };
+            if let Some(control) = control {
+                aria_controls.insert(backend, control);
+            }
+            let value = if is_password {
+                password_backends.insert(backend);
+                Some("[REDACTED]".to_owned())
+            } else {
                 let value = ax_value_string(node.value.as_ref());
                 (!value.is_empty()).then_some(value)
             };
@@ -883,6 +1063,11 @@ async fn fetch_target_dom_read(
                     .await
                     .ok()
                     .and_then(|response| rect_from_quad(response.result.model.content.inner()))
+                    .map(|rect| {
+                        viewport.map_or(rect, |(width, height)| {
+                            bbox_in_viewport(rect, width, height)
+                        })
+                    })
             } else {
                 None
             };
@@ -911,6 +1096,8 @@ async fn fetch_target_dom_read(
 
     Ok(CdpTargetDomRead {
         dom_nodes,
+        password_backends,
+        aria_controls,
         total_ax_nodes,
         frame_tree_frame_count: u32::try_from(frames.len()).unwrap_or(u32::MAX),
         frame_ids: frames

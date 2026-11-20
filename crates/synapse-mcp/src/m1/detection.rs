@@ -1,8 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::time::Instant;
 use synapse_core::{
-    DetectedEntity, Detection, PerceptionMode, ProfileDetection, Rect, SensorStatus, entity_id,
-    error_codes,
+    DetectedEntity, Detection, ProfileDetection, Rect, SensorStatus, entity_id, error_codes,
 };
 use synapse_models::{
     DEFAULT_DETECTION_MODEL_ID, DetectOpts, DetectionFrame, Detector, LoadedModel, ModelLoader,
@@ -52,6 +51,7 @@ pub struct DetectionRuntime {
     loader: ModelLoader,
     loaded: Option<LoadedDetectionModel>,
     tracker: EntityTracker,
+    tracker_target: Option<DetectionTargetIdentity>,
     next_frame_seq: u64,
 }
 
@@ -59,6 +59,14 @@ impl DetectionRuntime {
     fn next_frame_seq(&mut self) -> u64 {
         self.next_frame_seq = self.next_frame_seq.saturating_add(1);
         self.next_frame_seq
+    }
+
+    fn tracker_for_target(&mut self, target: DetectionTargetIdentity) -> &mut EntityTracker {
+        if self.tracker_target != Some(target) {
+            self.tracker.active.clear();
+            self.tracker_target = Some(target);
+        }
+        &mut self.tracker
     }
 
     fn load_model(&mut self, model_id: Option<&str>) -> synapse_models::ModelResult<&LoadedModel> {
@@ -111,6 +119,56 @@ impl DetectionRuntime {
     }
 }
 
+/// Window-lifetime identity for tracker ownership. Windows reuses HWND values,
+/// so the creator thread id narrows the collision window and the capture
+/// crate's destroy generation closes it: a destroyed and recreated window
+/// (same hwnd, pid, thread, and size) reads a different generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DetectionTargetIdentity {
+    hwnd: i64,
+    pid: u32,
+    thread_id: u32,
+    width: u32,
+    height: u32,
+    generation: u64,
+}
+
+impl DetectionTargetIdentity {
+    /// Identity of window `hwnd` (owned by `pid`) captured at `width`x`height`,
+    /// reading the creator thread and destroy generation from the live capture
+    /// crate.
+    fn for_window(hwnd: i64, pid: u32, width: u32, height: u32) -> Self {
+        Self::for_window_with(
+            hwnd,
+            pid,
+            width,
+            height,
+            synapse_capture::window_thread_id,
+            synapse_capture::window_generation,
+        )
+    }
+
+    /// Same identity with injected creator-thread and destroy-generation
+    /// readers. A missing thread id reads as 0.
+    fn for_window_with(
+        hwnd: i64,
+        pid: u32,
+        width: u32,
+        height: u32,
+        thread_id: impl FnOnce(i64) -> Option<u32>,
+        generation: impl FnOnce(i64) -> u64,
+    ) -> Self {
+        Self {
+            hwnd,
+            pid,
+            thread_id: thread_id(hwnd).unwrap_or(0),
+            width,
+            height,
+            generation: generation(hwnd),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LoadedDetectionModel {
     model_id: String,
@@ -126,7 +184,7 @@ pub fn populate_detection_from_state(
     input: &mut synapse_perception::ObservationInput,
 ) {
     let mode = input.mode_override.unwrap_or(state.perception_mode);
-    if !matches!(mode, PerceptionMode::PixelOnly | PerceptionMode::Hybrid) {
+    if !super::detection_needs_pixels(mode) {
         input.detection_status = SensorStatus::Disabled;
         return;
     }
@@ -154,21 +212,13 @@ pub fn populate_detection_from_state(
     }
 
     let started = Instant::now();
-    let captured =
-        match synapse_capture::screen_region_to_bgra_bitmap(input.foreground.window_bounds) {
-            Ok(captured) => captured,
-            Err(error) => {
-                input.detection_status = SensorStatus::DegradedSensorFailed {
-                    reason_code: error.code().to_owned(),
-                };
-                tracing::warn!(
-                    code = "M1_DETECTION_CAPTURE_FAILED",
-                    error = %error,
-                    "foreground capture failed before detection inference"
-                );
-                return;
-            }
+    let Some(captured) = super::browser_ocr_target_frame(input) else {
+        input.detection_status = SensorStatus::DegradedSensorFailed {
+            reason_code: error_codes::DETECTION_NO_FRAME.to_owned(),
         };
+        return;
+    };
+    let entity_origin = captured.region;
     let rgb = match bgra_to_rgb(&captured.bytes, captured.width, captured.height) {
         Ok(rgb) => rgb,
         Err(detail) => {
@@ -215,17 +265,33 @@ pub fn populate_detection_from_state(
         }
     };
     let detections = filter_classes(batch.items, &state.detection_config.classes_of_interest);
-    let entities =
-        state
-            .detection_runtime
-            .tracker
-            .update(detections, batch.inferred_at, captured.region);
+    let target_identity = DetectionTargetIdentity::for_window(
+        input.foreground.hwnd,
+        input.foreground.pid,
+        captured.width,
+        captured.height,
+    );
+    let entities = state
+        .detection_runtime
+        .tracker_for_target(target_identity)
+        .update(detections, batch.inferred_at, entity_origin);
     input.entities.extend(entities);
     input.detection_status = SensorStatus::Healthy;
     input.sensor_latency_ms.insert(
         "detection".to_owned(),
         started.elapsed().as_secs_f32() * 1000.0,
     );
+}
+
+pub(crate) fn stable_capture_origin(
+    before: Rect,
+    after: Rect,
+    width: u32,
+    height: u32,
+) -> Option<Rect> {
+    let width = i32::try_from(width).ok()?;
+    let height = i32::try_from(height).ok()?;
+    (before == after && after.w == width && after.h == height).then_some(after)
 }
 
 fn valid_detection_config(config: &DetectionRuntimeConfig) -> bool {
@@ -467,3 +533,11 @@ fn iou(left: Rect, right: Rect) -> f32 {
     }
     intersection as f32 / union as f32
 }
+
+#[cfg(test)]
+#[path = "tests/hwnd_reuse_130.rs"]
+mod hwnd_reuse_130;
+
+#[cfg(test)]
+#[path = "tests/detection_identity_250.rs"]
+mod detection_identity_250;

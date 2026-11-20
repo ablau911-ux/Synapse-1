@@ -16,11 +16,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Which perception path produced the web/document content for a Chromium-family
-/// foreground window.
+/// foreground window or an embedded `WebView` host.
 ///
 /// Reported in `observe` diagnostics (`web_path`) so callers can reason about
-/// fidelity. `None` (absent) means the foreground is not a browser and the field
-/// does not apply.
+/// fidelity. `None` (absent) means the foreground has no detected web surface
+/// and the field does not apply.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebPerceptionPath {
@@ -30,10 +30,10 @@ pub enum WebPerceptionPath {
     /// CDP unreachable: content recovered via pixel capture + OCR tiling of the
     /// content region. Degraded but non-empty.
     Ocr,
-    /// CDP unreachable and OCR not applied: only the collapsed UIA
+    /// No DOM/OCR content was available: only the collapsed UIA
     /// window/pane/region tree is available. This is the trap #682 documents —
-    /// it is always accompanied by a non-`ok` [`CdpStatus`] so the caller knows
-    /// why web content is missing and how to fix it.
+    /// callers must inspect the accompanying accessibility status before treating
+    /// the result as a complete web control surface.
     UiaOnly,
 }
 

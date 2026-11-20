@@ -1,0 +1,5 @@
+---
+source: crates/synapse-action/tests/humanize.rs
+expression: rendered_first
+---
+[TimedPathPoint { elapsed_ms: 0.0, arclen: 0.0, point: PathPoint { x: 0.0, y: 0.0 } }, TimedPathPoint { elapsed_ms: 25.0, arclen: 25.0, point: PathPoint { x: 25.20735987513964, y: -0.44594310730184294 } }, TimedPathPoint { elapsed_ms: 40.0, arclen: 25.0, point: PathPoint { x: 25.20735987513964, y: -0.44594310730184294 } }, TimedPathPoint { elapsed_ms: 65.0, arclen: 50.0, point: PathPoint { x: 50.27281021753329, y: -0.5402064772258768 } }, TimedPathPoint { elapsed_ms: 80.0, arclen: 50.0, point: PathPoint { x: 50.27281021753329, y: -0.5402064772258768 } }, TimedPathPoint { elapsed_ms: 105.0, arclen: 75.0, point: PathPoint { x: 74.42719078514929, y: 0.13022526922468916 } }, TimedPathPoint { elapsed_ms: 120.0, arclen: 75.0, point: PathPoint { x: 74.42719078514929, y: 0.13022526922468916 } }, TimedPathPoint { elapsed_ms: 145.0, arclen: 100.0, point: PathPoint { x: 109.9998727273818, y: -0.05092268538802863 } }, TimedPathPoint { elapsed_ms: 176.0, arclen: 100.0, point: PathPoint { x: 100.0, y: 0.0 } }]

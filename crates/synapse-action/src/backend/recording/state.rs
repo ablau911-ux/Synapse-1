@@ -6,7 +6,7 @@ use synapse_core::{
     StrokeMotionModel, StrokeTiming, Trigger, VelocityProfile,
 };
 
-use super::RecordedInput;
+use super::{RecordedInput, log::EventLog};
 use crate::{
     ActionError, EmitState, ModifierMask, StrokeError, plan_timed_stroke, sample_typing_schedule,
     screen_point_from_path_point,
@@ -14,7 +14,7 @@ use crate::{
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RecordingState {
-    pub(super) events: Vec<RecordedInput>,
+    pub(super) events: EventLog,
     pub(super) held_keys: BTreeSet<KeyCode>,
     pub(super) held_buttons: BTreeSet<MouseButton>,
     pub(super) pad_state: HashMap<PadId, GamepadReport>,

@@ -38,6 +38,20 @@
   }
 }
 
+@layer components {
+  .markdown-body {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .markdown-body pre {
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-wrap: normal;
+    white-space: pre;
+  }
+}
+
 @layer utilities {
   .tracking-normal {
     letter-spacing: 0;

@@ -380,16 +380,24 @@ impl SynapseService {
             )
         })?;
         let runtime = self.reflex_runtime()?;
-        let runtime = runtime.lock().map_err(|_error| {
-            mcp_error(
-                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                "reflex runtime lock poisoned while writing action audit",
-            )
-        })?;
-        runtime
-            .storage_put_action_log_rows(vec![(action_audit_key(ts_ns, seq), encoded)])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        drop(runtime);
+        // Take a storage handle and release the reflex runtime lock before
+        // the write: health and reflex ticks share that lock and must not wait
+        // on disk I/O (#33).
+        let db = runtime
+            .lock()
+            .map_err(|_error| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "reflex runtime lock poisoned while writing action audit",
+                )
+            })?
+            .storage_db();
+        db.put_batch(
+            synapse_storage::cf::CF_ACTION_LOG,
+            [(action_audit_key(ts_ns, seq), encoded)],
+        )
+        .and_then(|()| db.flush())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         tracing::info!(
             code = "ACTION_AUDIT_RECORDED",
             tool,
@@ -553,7 +561,9 @@ impl SynapseService {
     /// on a non-denied action, this is a policy violation and is surfaced as a
     /// high-severity audit marker + ERROR log (queryable via
     /// `audit_intelligence_query`). Foreground-equivalent agent lanes are not
-    /// this shared human OS foreground tier.
+    /// this shared human OS foreground tier, and neither is a background native
+    /// UIA action whose target activated itself (#316): `ForegroundUse` decides,
+    /// and the row records that outcome and its restore result instead.
     fn action_audit_foreground_tier(
         &self,
         tool: &'static str,
@@ -573,10 +583,10 @@ impl SynapseService {
         let policy_label = profile.map_or("unknown", super::tool_profiles::ToolProfileKind::as_str);
         let policy_allows_foreground =
             profile.is_some_and(super::tool_profiles::ToolProfileKind::allows_foreground_tier);
-        // A denied action never actually touched the foreground, so it is not a
-        // violation even if it was a foreground-tier request.
+        let foreground_use = ForegroundUse::from_details(details);
+        let claimed_target_route = foreground_use == ForegroundUse::ClaimedTarget;
         let foreground_policy_violation =
-            required_foreground && !policy_allows_foreground && status != "denied";
+            foreground_use.is_policy_violation(policy_allows_foreground, status);
         if foreground_policy_violation {
             tracing::error!(
                 code = "ACTION_FOREGROUND_TIER_POLICY_VIOLATION",
@@ -601,6 +611,10 @@ impl SynapseService {
             },
             "session_foreground_policy": policy_label,
             "policy_allows_foreground": policy_allows_foreground,
+            "claimed_target_route": claimed_target_route,
+            "foreground_use": foreground_use.as_str(),
+            "background_foreground_outcome": foreground_use.background_outcome(),
+            "background_foreground_restore": foreground_use.background_restore(),
             "foreground_policy_violation": foreground_policy_violation,
             "allowed": !foreground_policy_violation,
         })
@@ -698,42 +712,162 @@ struct ActionAuditProfileRef {
     schema_version: Option<u32>,
 }
 
+/// The objects inside an audit `details` value that can carry foreground-tier
+/// facts. Tools may state them flat, but `audit_action_result_*` wraps ok rows
+/// as `{"response": ...}` and error rows as `{"message", "data": ...}` (#190).
+/// The echoed `request` is deliberately excluded: it is what the caller asked
+/// for, not what the backend did.
+fn foreground_detail_scopes(details: &Value) -> impl Iterator<Item = &Value> {
+    [Some(details), details.get("response"), details.get("data")]
+        .into_iter()
+        .flatten()
+}
+
+/// The kind of OS foreground use an audit row records (#316). It owns the
+/// foreground-tier policy rule and is decided from what the backend did
+/// (delivered tier attempts, the native UIA `foreground_outcome`), never from
+/// the echoed request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ForegroundUse<'a> {
+    /// The action neither needed nor moved the OS foreground.
+    None,
+    /// Foreground input only through the #187 claimed-window route (#190):
+    /// sanctioned without a foreground profile.
+    ClaimedTarget,
+    /// A background native UIA pattern route that delivered no foreground input
+    /// while the OS foreground moved (#300/#316): `taken_by_target` (the target
+    /// activated itself; Synapse put the prior window back, see `restore`) or
+    /// `moved_elsewhere` (another actor moved it). `required_foreground` is
+    /// truthfully true in the reply, but this is not a foreground-tier delivery.
+    BackgroundOutcome {
+        outcome: &'a str,
+        restore: Option<&'a Value>,
+    },
+    /// A real human-OS-foreground-tier delivery.
+    ForegroundTier,
+}
+
+impl<'a> ForegroundUse<'a> {
+    fn from_details(details: &'a Value) -> Self {
+        if !detail_required_foreground(details) {
+            return Self::None;
+        }
+        if delivered_foreground_attempts(details).next().is_some() {
+            return if detail_foreground_claimed_target_only(details) {
+                Self::ClaimedTarget
+            } else {
+                Self::ForegroundTier
+            };
+        }
+        foreground_detail_scopes(details)
+            .find_map(|scope| {
+                let outcome = scope.get("foreground_outcome")?.as_str()?;
+                (outcome != "unchanged").then(|| Self::BackgroundOutcome {
+                    outcome,
+                    restore: scope.get("foreground_restore"),
+                })
+            })
+            .unwrap_or(Self::ForegroundTier)
+    }
+
+    /// Only a real foreground-tier delivery by a session whose profile may not
+    /// reach the human OS foreground is a violation. A denied action never
+    /// touched the foreground, so it is not one even for a foreground request.
+    fn is_policy_violation(self, policy_allows_foreground: bool, status: &str) -> bool {
+        self == Self::ForegroundTier && !policy_allows_foreground && status != "denied"
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClaimedTarget => "claimed_target",
+            Self::BackgroundOutcome { .. } => "background_outcome",
+            Self::ForegroundTier => "foreground_tier",
+        }
+    }
+
+    const fn background_outcome(self) -> Option<&'a str> {
+        match self {
+            Self::BackgroundOutcome { outcome, .. } => Some(outcome),
+            _ => None,
+        }
+    }
+
+    const fn background_restore(self) -> Option<&'a Value> {
+        match self {
+            Self::BackgroundOutcome { restore, .. } => restore,
+            _ => None,
+        }
+    }
+}
+
 /// Extract the foreground requirement from a tool's audit `details`. A tool
 /// either states it directly (`required_foreground`) or reports it per backend
-/// attempt (`tier_attempts[].required_foreground`); any foreground-requiring
-/// attempt makes the action foreground-tier.
+/// attempt (`tier_attempts[].required_foreground`); any delivered
+/// foreground-requiring attempt counts.
 fn detail_required_foreground(details: &Value) -> bool {
-    if details.get("required_foreground").and_then(Value::as_bool) == Some(true) {
-        return true;
-    }
-    details
-        .get("tier_attempts")
-        .and_then(Value::as_array)
-        .is_some_and(|attempts| {
-            attempts.iter().any(|attempt| {
-                attempt.get("required_foreground").and_then(Value::as_bool) == Some(true)
-            })
+    foreground_detail_scopes(details)
+        .any(|scope| scope.get("required_foreground").and_then(Value::as_bool) == Some(true))
+        || delivered_foreground_attempts(details).next().is_some()
+}
+
+/// The backend tier attempts that required the foreground and delivered input.
+fn delivered_foreground_attempts(details: &Value) -> impl Iterator<Item = &Value> {
+    foreground_detail_scopes(details)
+        .filter_map(|scope| scope.get("tier_attempts").and_then(Value::as_array))
+        .flatten()
+        .filter(|attempt| {
+            attempt.get("required_foreground").and_then(Value::as_bool) == Some(true)
+                && attempt_reached_input(attempt)
         })
+}
+
+/// True when the action's foreground use was only the #187 claimed-window
+/// route (#190): at least one delivered foreground attempt, and every one of
+/// them stamped `foreground_authorization: "claimed_target"`.
+fn detail_foreground_claimed_target_only(details: &Value) -> bool {
+    let mut foreground_attempts = delivered_foreground_attempts(details).peekable();
+    foreground_attempts.peek().is_some()
+        && foreground_attempts.all(|attempt| {
+            attempt
+                .get("foreground_authorization")
+                .and_then(Value::as_str)
+                == Some(crate::m2::FOREGROUND_AUTH_CLAIMED_TARGET)
+        })
+}
+
+/// A tier attempt used the foreground only if it delivered input: a refused or
+/// failed attempt (e.g. the #187 profile/claim gate) sent nothing and is not a
+/// policy violation. Attempts without a status are counted (older row shapes).
+fn attempt_reached_input(attempt: &Value) -> bool {
+    attempt
+        .get("status")
+        .and_then(Value::as_str)
+        .is_none_or(|status| status == "delivered")
 }
 
 /// Extract the backend tier a tool used, from whichever field the tool records.
 fn detail_backend_tier(details: &Value) -> Option<String> {
-    for key in ["backend_tier_used", "backend_tier", "tier"] {
-        if let Some(tier) = details.get(key).and_then(Value::as_str) {
-            return Some(tier.to_owned());
+    for scope in foreground_detail_scopes(details) {
+        for key in ["backend_tier_used", "backend_tier", "tier"] {
+            if let Some(tier) = scope.get(key).and_then(Value::as_str) {
+                return Some(tier.to_owned());
+            }
         }
     }
     // Otherwise, the last delivered tier attempt, if any.
-    details
-        .get("tier_attempts")
-        .and_then(Value::as_array)
-        .and_then(|attempts| {
-            attempts
-                .iter()
-                .rev()
-                .find_map(|attempt| attempt.get("tier").and_then(Value::as_str))
-        })
-        .map(str::to_owned)
+    foreground_detail_scopes(details).find_map(|scope| {
+        scope
+            .get("tier_attempts")
+            .and_then(Value::as_array)
+            .and_then(|attempts| {
+                attempts
+                    .iter()
+                    .rev()
+                    .find_map(|attempt| attempt.get("tier").and_then(Value::as_str))
+            })
+            .map(str::to_owned)
+    })
 }
 
 fn next_audit_key_parts() -> (u64, u32) {
@@ -765,3 +899,11 @@ fn non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
+
+#[cfg(test)]
+#[path = "tests/action_audit_foreground_190.rs"]
+mod action_audit_foreground_190_tests;
+
+#[cfg(test)]
+#[path = "tests/action_audit_test_support.rs"]
+mod tests;

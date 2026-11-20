@@ -13,6 +13,11 @@ use synapse_core::{Event, EventFilter, SubscriptionId, error_codes, new_subscrip
 use thiserror::Error;
 
 pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 4096;
+const SUBSCRIBER_QUEUE_CAPACITY_NONZERO: NonZeroUsize =
+    match NonZeroUsize::new(SUBSCRIBER_QUEUE_CAPACITY) {
+        Some(value) => value,
+        None => NonZeroUsize::MIN,
+    };
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 64;
 pub const DEFAULT_MAX_SUBSCRIPTIONS_NONZERO: NonZeroUsize =
     match NonZeroUsize::new(DEFAULT_MAX_SUBSCRIPTIONS) {
@@ -20,7 +25,6 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS_NONZERO: NonZeroUsize =
         None => NonZeroUsize::MIN,
     };
 pub const EVENTS_DROPPED_METRIC: &str = "events_dropped_for_subscriber";
-const EVENTS_PUBLISHED_METRIC: &str = "events_published_total";
 
 pub type EventBusResult<T> = Result<T, EventBusError>;
 
@@ -135,6 +139,26 @@ impl EventBus {
         kinds: Vec<String>,
         snapshot_first: bool,
     ) -> EventBusResult<SubscriberHandle> {
+        self.subscribe_with_capacity(
+            filter,
+            kinds,
+            snapshot_first,
+            SUBSCRIBER_QUEUE_CAPACITY_NONZERO,
+        )
+    }
+
+    /// Subscribes with an explicit bounded per-subscriber queue capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::subscribe`].
+    pub fn subscribe_with_capacity(
+        &self,
+        filter: EventFilter,
+        kinds: Vec<String>,
+        snapshot_first: bool,
+        capacity: NonZeroUsize,
+    ) -> EventBusResult<SubscriberHandle> {
         filter
             .validate()
             .map_err(|error| EventBusError::FilterInvalid {
@@ -151,7 +175,7 @@ impl EventBus {
         }
 
         let id = new_subscription_id();
-        let (sender, receiver) = bounded(SUBSCRIBER_QUEUE_CAPACITY);
+        let (sender, receiver) = bounded(capacity.get());
         let lossy = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dropped_since_read = Arc::new(AtomicU64::new(0));
         let subscriber = Arc::new(Subscriber {
@@ -186,12 +210,6 @@ impl EventBus {
     #[must_use]
     #[tracing::instrument(skip_all, fields(event_kind = %event.kind, event_seq = event.seq))]
     pub fn publish(&self, event: Event) -> PublishReport {
-        metrics::counter!(
-            EVENTS_PUBLISHED_METRIC,
-            "source" => event_source_label(event.source),
-            "kind" => event.kind.clone()
-        )
-        .increment(1);
         let subscribers = self.inner.subscribers.load();
         let mut report = PublishReport::default();
         for subscriber in subscribers.iter() {
@@ -211,7 +229,7 @@ impl EventBus {
                     .store(true, std::sync::atomic::Ordering::Release);
                 metrics::counter!(
                     EVENTS_DROPPED_METRIC,
-                    "subscription_id" => subscriber.id.clone()
+                    "subscriber_slot" => synapse_core::metric_labels::subscriber_slot_label(&subscriber.id)
                 )
                 .increment(dropped);
             }
@@ -237,24 +255,6 @@ impl EventBus {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
-    }
-}
-
-const fn event_source_label(source: synapse_core::EventSource) -> &'static str {
-    match source {
-        synapse_core::EventSource::A11yUia => "a11y_uia",
-        synapse_core::EventSource::A11yWinEvent => "a11y_win_event",
-        synapse_core::EventSource::A11yCdp => "a11y_cdp",
-        synapse_core::EventSource::Perception => "perception",
-        synapse_core::EventSource::PerceptionDetection => "perception_detection",
-        synapse_core::EventSource::PerceptionHud => "perception_hud",
-        synapse_core::EventSource::PerceptionAudio => "perception_audio",
-        synapse_core::EventSource::Filesystem => "filesystem",
-        synapse_core::EventSource::Process => "process",
-        synapse_core::EventSource::Clipboard => "clipboard",
-        synapse_core::EventSource::ActionEmitter => "action_emitter",
-        synapse_core::EventSource::Reflex => "reflex",
-        synapse_core::EventSource::System => "system",
     }
 }
 

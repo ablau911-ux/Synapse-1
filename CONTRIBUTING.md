@@ -37,9 +37,7 @@ the roadmap (see the README "What's left on the docket" section).
 
 ## Development workflow
 
-1. Use the toolchain pinned in `rust-toolchain.toml` (currently Rust 1.96.1);
-   rustup installs it automatically. The exact version is pinned so `cargo fmt`
-   and `cargo clippy` are reproducible across contributors.
+1. Use the current stable Rust toolchain (verified with Rust 1.95).
 2. Build and check the workspace:
    ```bash
    cargo build --workspace

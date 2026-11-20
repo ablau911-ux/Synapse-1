@@ -116,6 +116,7 @@ Rate-limit control (`emitter/rate_limits.rs`):
 | `execute` | `async fn(&self, Action) -> ActionResult<()>` (validate, enqueue, await ack; records session input ownership on success) |
 | `try_execute` | `fn(&self, Action) -> ActionResult<()>` (non-blocking enqueue) |
 | `fire_release_all_blocking_with_timeout` | `fn(&self, Duration) -> ActionResult<()>` (synchronous; used by the panic hook) |
+| `fire_release_all_blocking` | `fn(&self, Duration, Duration) -> ActionResult<ReleaseAllOutcome>` (K1 hotkey: waits for the early primary-backend ack, then a bounded wait for the combined result incl. ViGEm/hardware drains; `execute(ReleaseAll)` always returns the combined result; session ledger cleared only when every drain succeeded) |
 | `session_inputs_snapshot` | `fn(&self) -> ActionResult<SessionInputSnapshot>` |
 | `release_session_inputs` | `async fn(&self, &str) -> ActionResult<SessionReleaseSummary>` (targeted key-up/mouse-up/neutral-pad for inputs no other session owns; never `ReleaseAll`) |
 | `release_session_inputs_and_lease` | `async fn(&self, &str) -> ActionResult<SessionInputLeaseReleaseSummary>` (release inputs, verify ledger cleared, then release lease) |

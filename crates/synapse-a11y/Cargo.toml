@@ -3,11 +3,13 @@ name = "synapse-a11y"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+sha2.workspace = true
+synapse-browsers = { version = "0.1.0", path = "../synapse-browsers" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
 tokio.workspace = true
@@ -20,9 +22,20 @@ futures-util.workspace = true
 png = "0.18"
 regex.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 tokio-tungstenite.workspace = true
 uiautomation.workspace = true
 windows.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+futures-util.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "uia_snapshot_depth2_60elem"
+harness = false
 
 [lints.rust]
 unsafe_code = "allow"

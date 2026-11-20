@@ -1,9 +1,10 @@
-//! Developer readback utility: dump `CF_AGENT_TRANSCRIPTS` rows as JSON lines.
+//! Dev/FSV utility: dump `CF_AGENT_TRANSCRIPTS` rows as JSON lines.
 //!
-//! Its output is supporting storage evidence only; manual FSV remains separate.
-//! Run it against a stopped daemon's `--db` directory and diff what the store
-//! actually holds against the spawn's raw `stdout.jsonl`. An optional spawn-id
-//! argument restricts the dump to one spawn's rows.
+//! Physical readback of the #900 transcript store for Full State
+//! Verification: run it against a stopped daemon's `--db` directory and
+//! diff what the store actually holds against the spawn's raw
+//! `stdout.jsonl`. An optional spawn-id argument restricts the dump to one
+//! spawn's rows.
 //!
 //! ```text
 //! cargo run -p synapse-mcp --example dump_agent_transcripts -- <db-path> [spawn-id]

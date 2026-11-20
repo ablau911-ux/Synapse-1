@@ -17,7 +17,11 @@ pub(super) fn frames_after(
     let lossy = gap_lossy || pending_lossy;
     let mut frames = VecDeque::with_capacity(events.len() + usize::from(lossy));
     if lossy {
-        frames.push_back(SseFrame::subscription_started(subscription.id(), true));
+        frames.push_back(SseFrame::subscription_started(
+            subscription.id(),
+            true,
+            subscription.capacity(),
+        ));
     }
     for (index, event) in events.into_iter().enumerate() {
         frames.push_back(SseFrame::event(

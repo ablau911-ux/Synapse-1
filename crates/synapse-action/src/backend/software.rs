@@ -1,11 +1,13 @@
-use std::time::{Duration, Instant};
-
 use synapse_core::{Action, ComboInput, Point};
 
 use crate::{ActionBackend, ActionError, EmitState, recovery};
 
 mod delivery_guard;
 mod input;
+
+#[cfg(test)]
+#[path = "software/tests/delivery_guard_294.rs"]
+mod delivery_guard_294;
 mod keyboard;
 mod mouse;
 mod text;
@@ -33,29 +35,64 @@ pub fn cursor_position() -> Result<Point, ActionError> {
 }
 
 /// Moves the software cursor to a Win32 screen coordinate and returns the
-/// separately-read final cursor position.
+/// separately-read final cursor position. Its one caller restores the human's
+/// cursor after a foreground action, so it runs in a release scope (#294):
+/// bare cursor moves pass, any key, button or wheel input is still refused.
 ///
 /// # Errors
 ///
 /// Returns `ActionError::BackendUnavailable` when the OS rejects the cursor
 /// move or final readback does not match the requested point.
 pub fn set_cursor_position(point: Point) -> Result<Point, ActionError> {
+    let _release_scope =
+        delivery_guard::enter_delivery_scope(None, delivery_guard::InputKind::ReleaseOnly);
     mouse::set_cursor_position(point)
+}
+
+/// Checks the live foreground before dispatching a wheel event to a bound window.
+///
+/// # Errors
+///
+/// Returns `ACTION_FOREGROUND_LOST` if the live root window or process differs.
+pub fn ensure_pointer_foreground(target: &crate::InputDeliveryTarget) -> Result<(), ActionError> {
+    delivery_guard::check_delivery(
+        Some(delivery_guard::DeliveryTargetId {
+            root_hwnd: target.root_hwnd,
+            pid: target.pid,
+        }),
+        delivery_guard::foreground_identity(),
+        delivery_guard::InputKind::Pointer,
+    )
 }
 
 impl ActionBackend for SoftwareBackend {
     #[tracing::instrument(skip_all, fields(backend = "software"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
         crate::validate_action(action)?;
-        // OS-input safety: every batch below re-verifies the live foreground
-        // against this intended target immediately before delivery.
-        let _delivery_scope = delivery_guard::enter_scope(state.delivery_target().cloned());
+        let stored_automation = state.delivery_target().is_some_and(|target| {
+            target.source == crate::delivery_target::STORED_AUTOMATION_TARGET_SOURCE
+        });
+        let target = state
+            .delivery_target()
+            .map(|target| delivery_guard::DeliveryTargetId {
+                root_hwnd: target.root_hwnd,
+                pid: target.pid,
+            });
+        let kind = if matches!(action, Action::ReleaseAll) {
+            delivery_guard::InputKind::ReleaseOnly
+        } else {
+            delivery_guard::InputKind::Keyboard
+        };
+        let _delivery_scope = delivery_guard::enter_delivery_scope(target, kind)
+            .with_pointer_target_check(stored_automation);
         match action {
             Action::KeyPress { key, hold_ms, .. } => keyboard::press_key(key, *hold_ms, state),
             Action::KeyDown { key, .. } => keyboard::key_down(key, state),
             Action::KeyUp { key, .. } => keyboard::key_up(key, state),
             Action::KeyChord { keys, hold_ms, .. } => keyboard::key_chord(keys, *hold_ms, state),
-            Action::TypeText { text, dynamics, .. } => text::type_text(text, dynamics),
+            Action::TypeText { text, dynamics, .. } => {
+                text::type_text(text, dynamics, state.enqueued_release_epoch())
+            }
             Action::MouseMove {
                 to,
                 curve,
@@ -110,9 +147,9 @@ impl ActionBackend for SoftwareBackend {
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_combo"))]
 fn combo(steps: &[synapse_core::ComboStep], state: &mut EmitState) -> Result<(), ActionError> {
-    let start = Instant::now();
+    let timeline = utils::InputTimeline::new();
     for step in steps {
-        sleep_until_combo_step(start, step.at_ms)?;
+        timeline.wait_for_offset(u64::from(step.at_ms))?;
         match &step.input {
             ComboInput::KeyDown { key } => keyboard::key_down(key, state)?,
             ComboInput::KeyUp { key } => keyboard::key_up(key, state)?,
@@ -131,25 +168,6 @@ fn combo(steps: &[synapse_core::ComboStep], state: &mut EmitState) -> Result<(),
         }
     }
     Ok(())
-}
-
-fn sleep_until_combo_step(start: Instant, at_ms: u32) -> Result<(), ActionError> {
-    let elapsed_ms = elapsed_millis_u32(start.elapsed());
-    let delay_ms = combo_step_delay_ms(elapsed_ms, at_ms);
-    if utils::sleep_ms(delay_ms) {
-        return Err(ActionError::SafetyOperatorHotkeyFired {
-            detail: format!("operator release requested before combo step at_ms={at_ms}"),
-        });
-    }
-    Ok(())
-}
-
-const fn combo_step_delay_ms(elapsed_ms: u32, at_ms: u32) -> u32 {
-    at_ms.saturating_sub(elapsed_ms)
-}
-
-fn elapsed_millis_u32(duration: Duration) -> u32 {
-    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_release_all"))]

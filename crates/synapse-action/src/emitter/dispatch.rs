@@ -1,29 +1,23 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use tokio::sync::oneshot;
 
 use synapse_core::{Action, ComboInput, error_codes};
 
 use super::routing::{action_consumes_rate_limit, action_kind, resolved_backend_for_action};
 use super::{ActionEmitter, EmitState, HeldKeyTimerKey};
-use crate::{ActionBackend, ActionError, ActionResult, InputDeliveryTarget, ResolvedBackend};
+use crate::{ActionBackend, ActionError, ActionResult, ResolvedBackend};
 
 impl ActionEmitter {
     #[tracing::instrument(skip_all, fields(action_kind = %action_kind(&action)))]
     pub(super) async fn execute(&mut self, action: Action) -> ActionResult<()> {
-        self.execute_with_delivery_target(action, None).await
-    }
-
-    /// Executes `action` with its intended OS-input delivery window; the
-    /// software backend re-verifies the live foreground against it immediately
-    /// before every input batch.
-    pub(super) async fn execute_with_delivery_target(
-        &mut self,
-        action: Action,
-        delivery_target: Option<InputDeliveryTarget>,
-    ) -> ActionResult<()> {
         crate::validate_action(&action)?;
 
         if matches!(action, Action::ReleaseAll) {
-            return self.do_release_all("tool_invocation").await;
+            return self.do_release_all("tool_invocation", &mut None).await;
         }
 
         let resolved = resolved_backend_for_action(&action, self.backend_resolution_policy()?)?;
@@ -36,7 +30,7 @@ impl ActionEmitter {
 
         let backend = self.backends.pick(resolved);
         let result = self
-            .dispatch_via_backend(resolved, backend, action.clone(), delivery_target)
+            .dispatch_via_backend(resolved, backend, action.clone())
             .await;
 
         if result.is_ok() {
@@ -51,12 +45,10 @@ impl ActionEmitter {
         resolved: ResolvedBackend,
         backend: Arc<dyn ActionBackend>,
         action: Action,
-        delivery_target: Option<InputDeliveryTarget>,
     ) -> ActionResult<()> {
         let mut state = std::mem::take(&mut self.state);
         let task = tokio::task::spawn_blocking(move || {
             state.set_active_backend(resolved);
-            state.set_delivery_target(delivery_target);
             let result = backend.execute(&action, &mut state);
             state.set_delivery_target(None);
             state.clear_active_backend();
@@ -139,7 +131,7 @@ impl ActionEmitter {
 
     #[tracing::instrument(skip_all, fields(action_kind = "release_all"))]
     pub(super) async fn release_all(&mut self, reason: &'static str) {
-        let _release_result = self.do_release_all(reason).await;
+        let _release_result = self.do_release_all(reason, &mut None).await;
     }
 
     /// Drives a `ReleaseAll` through the resolved backend (so the production
@@ -147,7 +139,23 @@ impl ActionEmitter {
     /// aborts in-flight auto-release timers, and logs the drained snapshot.
     /// The blocking backend work runs on `spawn_blocking` so the runtime
     /// stays responsive.
-    async fn do_release_all(&mut self, reason: &'static str) -> ActionResult<()> {
+    ///
+    /// When `early_ack` holds a sender, the PRIMARY (resolved) backend result
+    /// is sent on it as soon as that release finishes, before the `ViGEm` and
+    /// hardware secondary drains run (#95). That early value is only a latency
+    /// signal for the K1 hotkey: the returned result always combines the
+    /// primary and every secondary drain, and callers that need correctness
+    /// (the `release_all` tool, K1's bounded completion wait) consume it. The
+    /// slot is left `Some` if the release failed before the primary phase
+    /// started so the caller can still send the failure on it.
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn do_release_all(
+        &mut self,
+        reason: &'static str,
+        early_ack: &mut Option<oneshot::Sender<ActionResult<()>>>,
+    ) -> ActionResult<()> {
+        let started = Instant::now();
+        let queue_wait = crate::safety::take_release_all_queue_wait();
         let before = self.snapshot();
         let mut held_pad_ids: Vec<_> = before.pad_state.keys().copied().collect();
         held_pad_ids.sort_unstable();
@@ -162,30 +170,51 @@ impl ActionEmitter {
         let primary_backend = self.backends.pick(resolved);
         let mut release_backends = vec![resolved.as_str()];
         let mut hardware_release_ok = None;
+        let primary_started = Instant::now();
         let mut result = self
-            .dispatch_via_backend(
-                resolved,
-                Arc::clone(&primary_backend),
-                Action::ReleaseAll,
-                None,
-            )
+            .dispatch_via_backend(resolved, Arc::clone(&primary_backend), Action::ReleaseAll)
             .await;
+        let primary_release = primary_started.elapsed();
+        if let Some(ack) = early_ack.take() {
+            let _send_result = ack.send(result.clone());
+        }
+        let acked_after = started.elapsed();
 
+        let mut vigem_drain = None;
         let vigem_has_held_state = snapshot_has_backend_held_state(&before, ResolvedBackend::Vigem);
         if resolved != ResolvedBackend::Vigem && (released_pads != 0 || vigem_has_held_state) {
             release_backends.push("vigem");
             let vigem_backend = self.backends.pick_vigem_for_release();
+            let vigem_started = Instant::now();
             let vigem_result = self
-                .dispatch_via_backend(
-                    ResolvedBackend::Vigem,
-                    vigem_backend,
-                    Action::ReleaseAll,
-                    None,
-                )
+                .dispatch_via_backend(ResolvedBackend::Vigem, vigem_backend, Action::ReleaseAll)
                 .await;
+            vigem_drain = Some(vigem_started.elapsed());
             result = combine_release_results(result, vigem_result);
         }
 
+        // Keys/buttons held through an explicit `backend: software` request
+        // while the profile resolves to another backend must be released too;
+        // otherwise they stay down at the OS after shutdown.
+        let mut software_drain = None;
+        if resolved != ResolvedBackend::Software
+            && snapshot_has_backend_held_state(&before, ResolvedBackend::Software)
+        {
+            release_backends.push("software");
+            let software_backend = self.backends.pick(ResolvedBackend::Software);
+            let software_started = Instant::now();
+            let software_result = self
+                .dispatch_via_backend(
+                    ResolvedBackend::Software,
+                    software_backend,
+                    Action::ReleaseAll,
+                )
+                .await;
+            software_drain = Some(software_started.elapsed());
+            result = combine_release_results(result, software_result);
+        }
+
+        let mut hardware_drain = None;
         let hardware_has_held_state =
             snapshot_has_backend_held_state(&before, ResolvedBackend::Hardware);
         if resolved != ResolvedBackend::Hardware
@@ -193,14 +222,15 @@ impl ActionEmitter {
         {
             release_backends.push("hardware");
             let hardware_backend = self.backends.pick_hardware_for_release();
+            let hardware_started = Instant::now();
             let hardware_result = self
                 .dispatch_via_backend(
                     ResolvedBackend::Hardware,
                     hardware_backend,
                     Action::ReleaseAll,
-                    None,
                 )
                 .await;
+            hardware_drain = Some(hardware_started.elapsed());
             hardware_release_ok = Some(hardware_result.is_ok());
             result = combine_release_results(result, hardware_result);
         }
@@ -228,6 +258,13 @@ impl ActionEmitter {
             released_pads,
             cancelled_key_timers,
             hardware_release_ok,
+            queue_wait_ms = ?queue_wait.map(millis),
+            primary_release_ms = millis(primary_release),
+            ack_after_ms = millis(acked_after),
+            vigem_drain_ms = ?vigem_drain.map(millis),
+            software_drain_ms = ?software_drain.map(millis),
+            hardware_drain_ms = ?hardware_drain.map(millis),
+            total_ms = millis(started.elapsed()),
             backend_ok = result.is_ok(),
             "release_all drained action emitter held state"
         );
@@ -252,6 +289,10 @@ impl ActionEmitter {
                 ),
             })
     }
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn snapshot_has_backend_held_state(

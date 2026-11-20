@@ -6,9 +6,11 @@
 //! overnight fleet runs the operator is away from the machine entirely, so the
 //! escalation engine here ships **two tiers**:
 //!
-//! - **Tier 0 — on-PC, always on, no config:** a WinRT toast via the verified
+//! - **Tier 0 — on-PC, enabled by default:** a WinRT toast via the verified
 //!   delivery path in [`super::notify_tools`]. Reaches the operator when they
-//!   are at the machine but looking elsewhere.
+//!   are at the machine but looking elsewhere. `SYNAPSE_DESKTOP_TOASTS=off`
+//!   disables it per daemon (#313): the row keeps `tier0_fired=false` and
+//!   records the reason in `tier0_suppressed_reason`; Tier 1 is unaffected.
 //! - **Tier 1 — off-machine, opt-in, operator-supplied egress:** on a severity
 //!   threshold, POST a structured packet to the operator's own webhook(s)
 //!   (self-hosted ntfy, Pushover, a Telegram/Discord webhook, a phone-call
@@ -46,17 +48,26 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use self::webhook_retry::{WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL, next_webhook_step};
 use super::agent_state::{AgentLifecycleState, AgentStateRead, StateTransition};
 use super::notify_tools::{
-    NotifyHumanParams, NotifyKind, ToastCleanupReport, ToastRemovalOutcome, remove_internal_toast,
+    NotifyHumanParams, NotifyKind, ToastCleanupReport, ToastRemovalOutcome,
+    desktop_toasts_config_suppressed_reason, remove_internal_toast,
     remove_orphaned_escalation_toasts, run_internal_toast, toast_tag_for,
 };
 use super::session_registry::unix_time_ms_now;
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
+use crate::m3::approvals::terminal_retention::{
+    QueueRowSummary, TERMINAL_RETENTION, plan_terminal_prune,
+};
 use crate::m3::approvals::{
     ApprovalAllow, ApprovalAuditRecord, ApprovalItemRecord, ApprovalKind, ApprovalStatus,
     ApprovalTimeoutDecision, ApprovalToastState,
 };
+
+#[cfg(test)]
+mod tests;
+mod webhook_retry;
 
 type CfKvRow = (Vec<u8>, Vec<u8>);
 type CfKvRows = Vec<CfKvRow>;
@@ -77,18 +88,11 @@ const DEFAULT_CRITICAL_ACK_WINDOW_MS: u64 = 60 * 1_000;
 const DEFAULT_TTL_ORDINARY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_TTL_SENSITIVE_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_SCAN_ROWS: usize = 20_000;
-const SCAN_CHUNK_ROWS: usize = 4_096;
-const TERMINAL_ITEM_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const TERMINAL_ITEM_RETAIN_ROWS: usize = 5_000;
-const DELETE_BATCH_ROWS: usize = 512;
 const MAX_WEBHOOKS: usize = 8;
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_SECRET_CHARS: usize = 512;
 const WEBHOOK_TIMEOUT_MS: u64 = 15_000;
-const WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL: u32 = 3;
-const WEBHOOK_RETRY_BASE_BACKOFF_MS: u64 = 30_000;
-const WEBHOOK_RETRY_MAX_BACKOFF_MS: u64 = DEFAULT_ACK_WINDOW_MS;
 const WORKER_TICK_MS: u64 = 1_000;
 const AMBIENT_SILENT_TIMEOUT_SUPPRESSED: &str = "ambient_unprobeable_silent_timeout";
 
@@ -313,10 +317,6 @@ pub(crate) struct EscalationContext {
 pub(crate) struct ChannelAttempt {
     pub channel_name: String,
     pub url_host: String,
-    #[serde(default)]
-    pub ladder_index: u32,
-    #[serde(default)]
-    pub attempt_number: u32,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
@@ -379,6 +379,10 @@ pub(crate) struct EscalationItem {
     pub tier1_eligible: bool,
     /// Count of off-machine channels already attempted.
     pub ladder_index: u32,
+    /// Failed attempts on the current ladder channel; absent when none, so rows
+    /// without a retry in progress keep their earlier shape (#307).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier1_rung_failed_attempts: Option<u32>,
     /// When the next ladder channel may fire; `None` when no channel remains,
     /// it is not tier1-eligible, or the escalation is no longer pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,133 +547,70 @@ fn decode_item(escalation_id: &str, value: &[u8]) -> Result<EscalationItem, Erro
     })
 }
 
-#[derive(Clone, Debug)]
-struct EscalationItemRow {
-    key: Vec<u8>,
-    item: EscalationItem,
+/// All escalation items for readers. Refuses above [`MAX_SCAN_ROWS`]; the
+/// worker sweep prunes finished rows (#307), so readers recover after a tick.
+fn scan_items(db: &Db) -> Result<Vec<EscalationItem>, ErrorData> {
+    let rows = scan_item_rows(db)?;
+    if rows.len() > MAX_SCAN_ROWS {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "escalation item scan exceeded {MAX_SCAN_ROWS} rows ({}); refusing partial result",
+                rows.len()
+            ),
+        ));
+    }
+    Ok(rows.into_iter().map(|(_key, item)| item).collect())
 }
 
-fn key_after(key: &[u8]) -> Vec<u8> {
-    let mut next = key.to_vec();
-    next.push(0);
-    next
-}
-
-fn scan_item_rows(db: &Db) -> Result<Vec<EscalationItemRow>, ErrorData> {
-    let mut start = ITEM_PREFIX.as_bytes().to_vec();
-    let mut out = Vec::new();
-    loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
-            .map_err(storage_error)?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut stop = false;
-        let mut last_key = None;
-        for (key, value) in rows {
-            if !key.starts_with(ITEM_PREFIX.as_bytes()) {
-                stop = true;
-                break;
-            }
+/// Every escalation item row with its key, without the scan limit. Only the
+/// worker sweep reads this directly: it prunes finished rows (#307), which is
+/// how a queue that already passed [`MAX_SCAN_ROWS`] recovers.
+fn scan_item_rows(db: &Db) -> Result<Vec<(Vec<u8>, EscalationItem)>, ErrorData> {
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, ITEM_PREFIX.as_bytes())
+        .map_err(storage_error)?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        let item = {
             let id = String::from_utf8_lossy(&key);
             let id = id.strip_prefix(ITEM_PREFIX).unwrap_or(&id);
-            out.push(EscalationItemRow {
-                key: key.clone(),
-                item: decode_item(id, &value)?,
-            });
-            last_key = Some(key);
-        }
-        if stop || !more {
-            break;
-        }
-        let Some(key) = last_key else {
-            break;
+            decode_item(id, &value)?
         };
-        start = key_after(&key);
+        items.push((key, item));
     }
-    Ok(out)
+    Ok(items)
 }
 
-fn delete_keys(db: &Db, mut keys: Vec<Vec<u8>>, context: &str) -> Result<usize, ErrorData> {
-    keys.sort();
-    keys.dedup();
-    let deleted = keys.len();
-    for chunk in keys.chunks(DELETE_BATCH_ROWS) {
-        db.delete_batch(cf::CF_KV, chunk.iter().cloned())
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("{context} failed to delete terminal rows: {error}"),
-                )
-            })?;
-    }
-    Ok(deleted)
-}
-
-fn prune_terminal_item_rows(
-    db: &Db,
-    now_unix_ms: u64,
-    rows: &[EscalationItemRow],
-) -> Result<usize, ErrorData> {
-    let mut terminal = rows
-        .iter()
-        .filter(|row| !row.item.status.is_open())
-        .map(|row| (row.item.updated_at_unix_ms, row.key.clone()))
-        .collect::<Vec<_>>();
-    terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut delete = terminal
-        .iter()
-        .filter(|(updated_at, _key)| {
-            updated_at.saturating_add(TERMINAL_ITEM_RETENTION_MS) <= now_unix_ms
-        })
-        .map(|(_updated_at, key)| key.clone())
-        .collect::<Vec<_>>();
-
-    if terminal.len() > TERMINAL_ITEM_RETAIN_ROWS {
-        let over_cap = terminal.len() - TERMINAL_ITEM_RETAIN_ROWS;
-        delete.extend(
-            terminal
-                .iter()
-                .take(over_cap)
-                .map(|(_updated_at, key)| key.clone()),
-        );
-    }
-
-    let deleted = delete_keys(db, delete, "escalation terminal retention")?;
-    if deleted > 0 {
-        tracing::info!(
-            code = "ESCALATION_ITEM_RETENTION_PRUNED",
-            scanned_rows = rows.len(),
-            terminal_rows = terminal.len(),
-            deleted_rows = deleted,
-            retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
-            retention_ms = TERMINAL_ITEM_RETENTION_MS,
-            "readback=CF_KV escalation terminal item rows pruned"
-        );
-    } else if rows.len() > MAX_SCAN_ROWS {
-        tracing::warn!(
-            code = "ESCALATION_ITEM_QUEUE_LARGE",
-            scanned_rows = rows.len(),
-            terminal_rows = terminal.len(),
-            retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
-            "escalation item scan exceeded historical hard limit but continued"
-        );
-    }
-    Ok(deleted)
-}
-
+/// #307: delete finished (resolved/expired) escalation rows past retention.
+/// Finished rows never reopen, so a row read here as finished cannot be live by
+/// the time it is deleted. Rows whose Tier 0 toast removal has not run yet are
+/// kept. The append-only audit rows stay as the history.
 fn prune_terminal_items(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
-    let rows = scan_item_rows(db)?;
-    prune_terminal_item_rows(db, now_unix_ms, &rows)
-}
-
-/// All escalation items. Large queues are scanned in bounded RocksDB windows;
-/// terminal item rows are compacted by the sweep/list paths instead of making
-/// the queue fail closed at the historical row limit.
-fn scan_items(db: &Db) -> Result<Vec<EscalationItem>, ErrorData> {
-    scan_item_rows(db).map(|rows| rows.into_iter().map(|row| row.item).collect())
+    let summaries: Vec<QueueRowSummary> = scan_item_rows(db)?
+        .into_iter()
+        .map(|(key, item)| QueueRowSummary {
+            key,
+            terminal: !item.status.is_open(),
+            cleanup_pending: item.tier0_fired && item.tier0_toast_removed.is_none(),
+            updated_at_unix_ms: item.updated_at_unix_ms,
+        })
+        .collect();
+    let doomed = plan_terminal_prune(&summaries, now_unix_ms, TERMINAL_RETENTION);
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let deleted = doomed.len();
+    db.delete_batch(cf::CF_KV, doomed).map_err(storage_error)?;
+    tracing::info!(
+        code = "ESCALATION_ITEM_RETENTION_PRUNED",
+        scanned_rows = summaries.len(),
+        deleted_rows = deleted,
+        retain_terminal_rows = TERMINAL_RETENTION.max_terminal_rows,
+        retention_ms = TERMINAL_RETENTION.max_age_ms,
+        "readback=CF_KV escalation finished item rows pruned"
+    );
+    Ok(deleted)
 }
 
 fn open_items_for_anchor(db: &Db, anchor: &str) -> Result<Vec<EscalationItem>, ErrorData> {
@@ -822,6 +763,7 @@ fn approval_rows_for_opened_escalation(
         operator_response: None,
         toast: ApprovalToastState {
             requested: false,
+            shown: None,
             suppress_popup: item.tier0_quiet_digest,
             actionable_buttons: false,
             activation_id: None,
@@ -1008,6 +950,7 @@ fn note_transition_inner(
     transition: &StateTransition,
     now_unix_ms: u64,
 ) -> Result<(), ErrorData> {
+    let _approval_transition = crate::m3::approvals::lock_approval_transitions()?;
     let new_state = transition.state_to.as_str();
     // 1. Auto-resolve any open escalation for this anchor whose attention state
     //    differs from the new state. Leaving the attention state (resume/finish)
@@ -1080,6 +1023,9 @@ fn open_escalation(
     // Critical routes even during quiet hours; low/medium are suppressed.
     let quiet_suppressed = in_quiet && severity < Severity::Critical;
     let policy_suppressed_reason = operator_interrupt_suppressed_reason(transition);
+    let tier0_suppressed_reason = policy_suppressed_reason
+        .clone()
+        .or_else(|| desktop_toasts_config_suppressed_reason().map(str::to_owned));
     let tier1_eligible = !policy.webhooks.is_empty()
         && severity >= policy.min_tier1_severity
         && !quiet_suppressed
@@ -1108,13 +1054,14 @@ fn open_escalation(
         expires_at_unix_ms: now_unix_ms.saturating_add(ttl),
         tier0_fired: false,
         tier0_toast_removed: None,
-        tier0_quiet_digest: quiet_suppressed || policy_suppressed_reason.is_some(),
-        tier0_suppressed_reason: policy_suppressed_reason.clone(),
+        tier0_quiet_digest: quiet_suppressed || tier0_suppressed_reason.is_some(),
+        tier0_suppressed_reason,
         tier1_quiet_suppressed: quiet_suppressed,
         tier1_suppressed_reason: policy_suppressed_reason.clone(),
         approval_suppressed_reason: policy_suppressed_reason.clone(),
         tier1_eligible,
         ladder_index: 0,
+        tier1_rung_failed_attempts: None,
         // First off-machine channel may fire immediately when eligible.
         next_escalate_at_unix_ms: tier1_eligible.then_some(now_unix_ms),
         channel_attempts: Vec::new(),
@@ -1152,7 +1099,7 @@ fn open_escalation(
         attention_state = %item.attention_state,
         tier1_eligible,
         quiet_suppressed,
-        policy_suppressed_reason = item.tier0_suppressed_reason.as_deref(),
+        policy_suppressed_reason = policy_suppressed_reason.as_deref(),
         "readback=CF_KV escalation opened"
     );
     Ok(item)
@@ -1329,6 +1276,8 @@ pub(crate) struct ProcessReport {
     pub terminal_resolved: usize,
     pub linked_approvals_closed: usize,
     pub scanned: usize,
+    /// Finished item rows deleted by retention (#307).
+    pub pruned: usize,
 }
 
 /// One escalation-delivery sweep. Fires the on-PC toast for any pending
@@ -1340,13 +1289,11 @@ pub(crate) async fn process_pending(
     now_unix_ms: u64,
 ) -> Result<ProcessReport, ErrorData> {
     let mut report = ProcessReport::default();
-    let rows = scan_item_rows(db)?;
-    let pruned = prune_terminal_item_rows(db, now_unix_ms, &rows)?;
-    let items = if pruned > 0 {
-        scan_items(db)?
-    } else {
-        rows.into_iter().map(|row| row.item).collect()
-    };
+    // Unlimited scan: this sweep is what prunes an oversized queue (#307).
+    let items: Vec<EscalationItem> = scan_item_rows(db)?
+        .into_iter()
+        .map(|(_key, item)| item)
+        .collect();
     let terminal_agent_reads: Vec<AgentStateRead> = super::agent_state::reads(now_unix_ms)
         .into_iter()
         .filter(|read| read.state == AgentLifecycleState::Dead)
@@ -1363,6 +1310,7 @@ pub(crate) async fn process_pending(
                 item.status,
                 EscalationStatus::Resolved | EscalationStatus::Expired
             ) {
+                let _approval_transition = crate::m3::approvals::lock_approval_transitions()?;
                 let approval_rows = linked_approval_terminal_rows(
                     db,
                     &item,
@@ -1405,28 +1353,31 @@ pub(crate) async fn process_pending(
             item.next_escalate_at_unix_ms = None;
             let reason = agent_state.reason_code.as_deref().unwrap_or("dead");
             item.closed_reason = Some(format!("terminal_agent_state:dead:{reason}"));
-            let approval_rows = linked_approval_terminal_rows(
-                db,
-                &item,
-                "linked_escalation_resolved",
-                format!(
-                    "linked escalation {} resolved because anchor is terminal dead:{reason}",
-                    item.escalation_id
-                ),
-            )?;
-            if !approval_rows.is_empty() {
-                report.linked_approvals_closed += 1;
+            {
+                let _approval_transition = crate::m3::approvals::lock_approval_transitions()?;
+                let approval_rows = linked_approval_terminal_rows(
+                    db,
+                    &item,
+                    "linked_escalation_resolved",
+                    format!(
+                        "linked escalation {} resolved because anchor is terminal dead:{reason}",
+                        item.escalation_id
+                    ),
+                )?;
+                if !approval_rows.is_empty() {
+                    report.linked_approvals_closed += 1;
+                }
+                write_item_and_audit_with_extra_rows(
+                    db,
+                    &item,
+                    "resolved",
+                    json!({
+                        "reason": "terminal_agent_state",
+                        "agent_state": agent_state,
+                    }),
+                    approval_rows,
+                )?;
             }
-            write_item_and_audit_with_extra_rows(
-                db,
-                &item,
-                "resolved",
-                json!({
-                    "reason": "terminal_agent_state",
-                    "agent_state": agent_state,
-                }),
-                approval_rows,
-            )?;
             report.terminal_resolved += 1;
             tracing::info!(
                 code = "ESCALATION_RESOLVED",
@@ -1448,22 +1399,25 @@ pub(crate) async fn process_pending(
             item.updated_at_unix_ms = now_unix_ms;
             item.next_escalate_at_unix_ms = None;
             item.closed_reason = Some("ttl_expired".to_owned());
-            let approval_rows = linked_approval_terminal_rows(
-                db,
-                &item,
-                "linked_escalation_expired",
-                format!("linked escalation {} expired by ttl", item.escalation_id),
-            )?;
-            if !approval_rows.is_empty() {
-                report.linked_approvals_closed += 1;
+            {
+                let _approval_transition = crate::m3::approvals::lock_approval_transitions()?;
+                let approval_rows = linked_approval_terminal_rows(
+                    db,
+                    &item,
+                    "linked_escalation_expired",
+                    format!("linked escalation {} expired by ttl", item.escalation_id),
+                )?;
+                if !approval_rows.is_empty() {
+                    report.linked_approvals_closed += 1;
+                }
+                write_item_and_audit_with_extra_rows(
+                    db,
+                    &item,
+                    "expired",
+                    json!({ "ttl_ms": item.expires_at_unix_ms }),
+                    approval_rows,
+                )?;
             }
-            write_item_and_audit_with_extra_rows(
-                db,
-                &item,
-                "expired",
-                json!({ "ttl_ms": item.expires_at_unix_ms }),
-                approval_rows,
-            )?;
             report.expired += 1;
             tracing::warn!(
                 code = "ESCALATION_EXPIRED",
@@ -1480,10 +1434,17 @@ pub(crate) async fn process_pending(
 
         let mut dirty = false;
 
-        // Tier 0 — on-PC toast (always, regardless of egress config).
+        // Tier 0 — on-PC toast, independent of egress config.
         if item.tier0_suppressed_reason.is_none() && !item.tier0_fired {
             match fire_tier0(&item).await {
-                Ok(()) => {
+                Ok(Some(reason)) => {
+                    // Row opened under an earlier daemon with toasts on: record the
+                    // config suppression instead of claiming tier0_fired (#313).
+                    item.tier0_quiet_digest = true;
+                    item.tier0_suppressed_reason = Some(reason);
+                    dirty = true;
+                }
+                Ok(None) => {
                     item.tier0_fired = true;
                     item.updated_at_unix_ms = now_unix_ms;
                     write_item_and_audit(
@@ -1517,47 +1478,39 @@ pub(crate) async fn process_pending(
             let policy = load_policy(db)?;
             let index = item.ladder_index as usize;
             if let Some(channel) = policy.webhooks.get(index).cloned() {
-                let ladder_index = item.ladder_index;
-                let attempt_number = next_channel_attempt_number(&item, ladder_index);
-                let attempt =
-                    deliver_webhook(&channel, &item, ladder_index, attempt_number, now_unix_ms)
-                        .await;
+                let attempt = deliver_webhook(&channel, &item, now_unix_ms).await;
                 if attempt.ok {
                     report.tier1_fired += 1;
                 } else {
                     report.tier1_failed += 1;
                 }
-                let policy_window_ms = policy.window_for(item.severity);
-                let retry_backoff_ms = (!attempt.ok
-                    && attempt_number < WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL)
-                    .then(|| webhook_retry_backoff_ms(attempt_number, policy_window_ms));
-                let retry_exhausted = !attempt.ok && retry_backoff_ms.is_none();
+                // A failed channel is retried with backoff before the ladder
+                // moves on (#307).
+                let step = next_webhook_step(
+                    attempt.ok,
+                    item.ladder_index,
+                    item.tier1_rung_failed_attempts.unwrap_or(0),
+                    policy.webhooks.len(),
+                    policy.window_for(item.severity),
+                    now_unix_ms,
+                );
                 let event_detail = json!({
                     "channel_name": attempt.channel_name,
-                    "ladder_index": ladder_index,
-                    "attempt_number": attempt_number,
-                    "max_attempts_per_channel": WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL,
                     "ok": attempt.ok,
                     "http_status": attempt.http_status,
                     "error": attempt.error,
-                    "retry_backoff_ms": retry_backoff_ms,
-                    "retry_exhausted": retry_exhausted,
+                    "ladder_index": item.ladder_index,
+                    "attempt_number": step.attempt_number,
+                    "max_attempts_per_channel": WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL,
+                    "retry_backoff_ms": step.retry_backoff_ms,
+                    "retry_exhausted": step.retry_exhausted,
                 });
                 item.channel_attempts.push(attempt);
-                if item
-                    .channel_attempts
-                    .last()
-                    .is_some_and(|attempt| attempt.ok || retry_exhausted)
-                {
-                    item.ladder_index += 1;
-                }
+                item.ladder_index = step.ladder_index;
+                item.tier1_rung_failed_attempts =
+                    (step.rung_failed_attempts > 0).then_some(step.rung_failed_attempts);
                 item.updated_at_unix_ms = now_unix_ms;
-                item.next_escalate_at_unix_ms = retry_backoff_ms
-                    .map(|backoff| now_unix_ms.saturating_add(backoff))
-                    .or_else(|| {
-                        ((item.ladder_index as usize) < policy.webhooks.len())
-                            .then_some(now_unix_ms.saturating_add(policy_window_ms))
-                    });
+                item.next_escalate_at_unix_ms = step.next_escalate_at_unix_ms;
                 write_item_and_audit(db, &item, "tier1_channel_attempt", event_detail)?;
                 dirty = false;
             } else {
@@ -1572,6 +1525,9 @@ pub(crate) async fn process_pending(
             write_item_and_audit(db, &item, "updated", json!({}))?;
         }
     }
+    // After this sweep's toast removal and linked-approval closing, so a row is
+    // never deleted before its follow-up ran.
+    report.pruned = prune_terminal_items(db, now_unix_ms)?;
     Ok(report)
 }
 
@@ -1642,7 +1598,7 @@ fn escalation_item_matches_agent_read(item: &EscalationItem, read: &AgentStateRe
     false
 }
 
-async fn fire_tier0(item: &EscalationItem) -> Result<(), ErrorData> {
+async fn fire_tier0(item: &EscalationItem) -> Result<Option<String>, ErrorData> {
     let title = format!(
         "Synapse: {} [{}]",
         item.context.action,
@@ -1665,7 +1621,7 @@ async fn fire_tier0(item: &EscalationItem) -> Result<(), ErrorData> {
     let tag = toast_tag_for(params.dedupe_key.as_deref());
     run_internal_toast(params, tag, Vec::new())
         .await
-        .map(|_response| ())
+        .map(|response| response.suppressed_reason)
 }
 
 fn escalation_toast_dedupe_key(escalation_id: &str) -> String {
@@ -1679,8 +1635,6 @@ fn escalation_toast_tag(escalation_id: &str) -> String {
 async fn deliver_webhook(
     channel: &WebhookChannel,
     item: &EscalationItem,
-    ladder_index: u32,
-    attempt_number: u32,
     now_unix_ms: u64,
 ) -> ChannelAttempt {
     let url_host = reqwest::Url::parse(&channel.url)
@@ -1690,8 +1644,6 @@ async fn deliver_webhook(
     let mut attempt = ChannelAttempt {
         channel_name: channel.name.clone(),
         url_host,
-        ladder_index,
-        attempt_number,
         ok: false,
         http_status: None,
         error: None,
@@ -1740,28 +1692,6 @@ async fn deliver_webhook(
     attempt
 }
 
-fn next_channel_attempt_number(item: &EscalationItem, ladder_index: u32) -> u32 {
-    let previous = item
-        .channel_attempts
-        .iter()
-        .filter(|attempt| attempt.ladder_index == ladder_index)
-        .count();
-    u32::try_from(previous)
-        .unwrap_or(u32::MAX)
-        .saturating_add(1)
-}
-
-fn webhook_retry_backoff_ms(attempt_number: u32, policy_window_ms: u64) -> u64 {
-    let capped_exponent = attempt_number.saturating_sub(1).min(4);
-    let multiplier = 1_u64 << capped_exponent;
-    let base = WEBHOOK_RETRY_BASE_BACKOFF_MS
-        .min(policy_window_ms)
-        .max(WORKER_TICK_MS);
-    base.saturating_mul(multiplier)
-        .min(WEBHOOK_RETRY_MAX_BACKOFF_MS)
-        .min(policy_window_ms)
-}
-
 fn webhook_payload(channel: &WebhookChannel, item: &EscalationItem) -> Value {
     json!({
         "schema": "synapse.escalation.v1",
@@ -1781,7 +1711,7 @@ fn webhook_payload(channel: &WebhookChannel, item: &EscalationItem) -> Value {
 
 /// HMAC-SHA256 (RFC 2104) over `msg` with `key`, hex-encoded. Implemented over
 /// the already-vendored `sha2` so no extra dependency is pulled in.
-fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+pub(crate) fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     const BLOCK: usize = 64;
     let mut block_key = [0u8; BLOCK];
     if key.len() > BLOCK {
@@ -2185,7 +2115,6 @@ impl SynapseService {
     ) -> Result<Json<EscalationListResponse>, ErrorData> {
         let params = params.0;
         let db = self.m3_storage()?;
-        prune_terminal_items(&db, unix_time_ms_now())?;
         let mut items = scan_items(&db)?;
         items.sort_by_key(|item| std::cmp::Reverse(item.created_at_unix_ms));
         let total_open = items.iter().filter(|item| item.status.is_open()).count();

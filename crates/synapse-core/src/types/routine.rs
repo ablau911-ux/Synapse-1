@@ -90,8 +90,9 @@ pub struct RoutineRecord {
     /// Mining instant (ns since epoch). `CF_ROUTINES` has no TTL; this is
     /// provenance, not a retention contract.
     pub ts_ns: u64,
-    /// Stable deterministic id: `rt1-` + first 16 hex chars of SHA-256 over
-    /// granularity, step keys, day-of-week class, and time-cluster ordinal.
+    /// Stable content-derived id: `rt1-` + first 16 hex chars of SHA-256 over
+    /// the normalized step signature and the per-signature cluster ordinal
+    /// (see `routine_identity`, #165). Excludes the day-of-week class.
     pub routine_id: String,
     pub granularity: RoutineGranularity,
     /// Ordered episode template (collapsed: consecutive identical

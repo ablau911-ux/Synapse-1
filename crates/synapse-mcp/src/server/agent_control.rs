@@ -56,6 +56,7 @@ use super::command_audit::CommandAuditInput;
 use super::session_lifecycle::{SessionTeardownOptions, SessionTeardownReport};
 use super::session_registry::{SpawnedAgentControlRead, unix_time_ms_now};
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
+use crate::m4::{ActSpawnAgentRequest, ActSpawnAgentTarget};
 use crate::safety::OperatorHotkeyImmediateReport;
 use futures_util::future::join_all;
 
@@ -107,9 +108,6 @@ const CODEX_APP_SERVER_INTERRUPT_SCRIPT: &str = include_str!("codex_app_server_i
 const CODEX_INTERRUPT_HELPER_TIMEOUT_MS: u64 = 8_000;
 const CODEX_APP_SERVER_STEER_SCRIPT: &str = include_str!("codex_app_server_steer.ps1");
 const CODEX_STEER_HELPER_TIMEOUT_MS: u64 = 8_000;
-const OPERATOR_PANIC_SPAWN_QUIESCENCE_TIMEOUT: Duration = Duration::from_millis(750);
-const OPERATOR_PANIC_SPAWN_QUIESCENCE_POLL: Duration = Duration::from_millis(25);
-const OPERATOR_PANIC_FLEET_STOP_MAX_STABLE_ROUNDS: u32 = 3;
 
 /// Destructive-action confirmation token for `fleet_stop`, matching the
 /// action-diagnostic confirm pattern. A typo or empty value is refused.
@@ -338,451 +336,22 @@ pub struct FleetStopResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct OperatorPanicKillAllResponse {
     pub immediate: OperatorHotkeyImmediateReport,
-    pub chrome_extension_mutation_owners: OperatorPanicChromeExtensionOwnersReadback,
-    pub durable_browser_mutation_owners_drain:
-        synapse_a11y::CdpDurableBrowserMutationOwnersDrainReadback,
-    pub durable_browser_mutation_owners_after:
-        synapse_a11y::CdpDurableBrowserMutationOwnersReadback,
-    pub durable_browser_mutation_owners_terminal: bool,
-    pub chrome_mutation_command_owners_drain:
-        crate::chrome_debugger_bridge::ChromeDebuggerMutationOwnersDrainReadback,
-    pub chrome_mutation_command_owners_after:
-        crate::chrome_debugger_bridge::ChromeDebuggerMutationOwnersReadback,
-    pub chrome_mutation_command_owners_terminal: bool,
     pub prior_lease_owner_session_id: Option<String>,
-    pub prior_lease_row_cleanup: Option<super::session_continuity::LeaseContinuityCleanupReadback>,
+    pub prior_lease_row_cleanup:
+        Option<super::session_continuity::LeaseReleaseReconciliationReadback>,
     pub prior_lease_row_cleanup_error: Option<String>,
+    pub deferred_disable_report: crate::safety::DisableReport,
     pub matched_sessions_before: Vec<String>,
     pub matched_sessions_before_error: Option<String>,
     pub fleet_stop: Option<FleetStopResponse>,
     pub fleet_stop_error: Option<String>,
     pub operator_lease_cleared: Option<synapse_action::LeaseStatus>,
     pub lease_after: synapse_action::LeaseStatus,
-    pub operator_panic_safety_after: synapse_action::OperatorPanicSafetyReadback,
     pub live_sessions_after: Vec<String>,
     pub live_sessions_after_error: Option<String>,
-    pub spawn_activity_before: super::m4_tools::AgentSpawnActivityReadback,
-    pub spawn_activity_after: super::m4_tools::AgentSpawnActivityReadback,
-    pub spawn_activity_stable: bool,
-    pub mcp_mutation_activity: OperatorPanicMutationActivityReadback,
-    pub final_safety_sweep: Option<OperatorPanicFinalSafetySweepReadback>,
-    pub final_safety_sweep_error: Option<String>,
-    pub fleet_stop_rounds: u32,
     pub all_stopped: bool,
     pub audit_intent_error: Option<String>,
     pub audit_final_error: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OperatorPanicChromeExtensionOwnersReadback {
-    pub disable: Option<crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback>,
-    pub disable_error: Option<String>,
-    pub cleanup: Option<crate::chrome_debugger_bridge::ChromeDebuggerExtensionCleanupReadback>,
-    pub cleanup_error: Option<String>,
-    pub cdp_target_owner_reconciliation:
-        Option<super::m1_tools::OperatorPanicCdpTargetOwnerReconciliationReadback>,
-    pub cdp_target_owner_reconciliation_error: Option<String>,
-    pub before_command_drain:
-        Option<crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback>,
-    pub before_command_drain_error: Option<String>,
-    pub after_command_drain:
-        Option<crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback>,
-    pub after_command_drain_error: Option<String>,
-    pub terminal: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OperatorPanicMutationActivityReadback {
-    pub initial: Option<super::operator_panic_boundary::McpMutationActivitySnapshot>,
-    pub stable_before: Option<super::operator_panic_boundary::McpMutationActivitySnapshot>,
-    pub after: Option<super::operator_panic_boundary::McpMutationActivitySnapshot>,
-    pub quiescent: bool,
-    pub error: Option<String>,
-    pub elapsed_ms: u128,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OperatorPanicEmitterStateReadback {
-    pub held_keys: usize,
-    pub held_key_bits: usize,
-    pub held_key_timer_keys: usize,
-    pub held_key_timer_count: usize,
-    pub held_buttons: usize,
-    pub held_button_bits: usize,
-    pub held_pads: usize,
-    pub held_keys_by_backend_entries: usize,
-    pub held_keys_by_backend_values: usize,
-    pub held_buttons_by_backend_entries: usize,
-    pub held_buttons_by_backend_values: usize,
-    pub terminal: bool,
-}
-
-impl OperatorPanicEmitterStateReadback {
-    fn from_snapshot(snapshot: &synapse_action::ActionStateSnapshot) -> Self {
-        let mut readback = Self {
-            held_keys: snapshot.held_keys.len(),
-            held_key_bits: snapshot.held_key_bits.len(),
-            held_key_timer_keys: snapshot.held_key_timer_keys.len(),
-            held_key_timer_count: snapshot.held_key_timer_count,
-            held_buttons: snapshot.held_buttons.len(),
-            held_button_bits: snapshot.held_button_bits.len(),
-            held_pads: snapshot.pad_state.len(),
-            held_keys_by_backend_entries: snapshot.held_keys_by_backend.len(),
-            held_keys_by_backend_values: snapshot.held_keys_by_backend.values().map(Vec::len).sum(),
-            held_buttons_by_backend_entries: snapshot.held_buttons_by_backend.len(),
-            held_buttons_by_backend_values: snapshot
-                .held_buttons_by_backend
-                .values()
-                .map(Vec::len)
-                .sum(),
-            terminal: false,
-        };
-        readback.terminal = readback.held_keys == 0
-            && readback.held_key_bits == 0
-            && readback.held_key_timer_keys == 0
-            && readback.held_key_timer_count == 0
-            && readback.held_buttons == 0
-            && readback.held_button_bits == 0
-            && readback.held_pads == 0
-            && readback.held_keys_by_backend_entries == 0
-            && readback.held_keys_by_backend_values == 0
-            && readback.held_buttons_by_backend_entries == 0
-            && readback.held_buttons_by_backend_values == 0;
-        readback
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OperatorPanicFinalSafetySweepReadback {
-    pub release_all: crate::safety::ReleaseAllReport,
-    pub reflex_disable: crate::safety::DisableReport,
-    pub reflex_active_count_after: Option<usize>,
-    pub reflex_readback_error: Option<String>,
-    pub emitter_after: Option<OperatorPanicEmitterStateReadback>,
-    pub emitter_readback_error: Option<String>,
-    pub lease_after: synapse_action::LeaseStatus,
-    pub operator_lease_generation_after: Option<u64>,
-    pub terminal: bool,
-}
-
-fn operator_panic_spawn_activity_stable(
-    baseline: &super::m4_tools::AgentSpawnActivityReadback,
-    after: &super::m4_tools::AgentSpawnActivityReadback,
-    quiescent_readback_stable: bool,
-) -> bool {
-    quiescent_readback_stable
-        && baseline.sequence == after.sequence
-        && after.in_flight == 0
-        && !after.cleanup_incident
-}
-
-async fn wait_for_operator_panic_spawn_quiescence()
--> (super::m4_tools::AgentSpawnActivityReadback, bool) {
-    let deadline = Instant::now() + OPERATOR_PANIC_SPAWN_QUIESCENCE_TIMEOUT;
-    loop {
-        let first = super::m4_tools::agent_spawn_activity_readback();
-        if first.in_flight == 0 {
-            tokio::time::sleep(OPERATOR_PANIC_SPAWN_QUIESCENCE_POLL).await;
-            let second = super::m4_tools::agent_spawn_activity_readback();
-            if second.in_flight == 0 && second.sequence == first.sequence {
-                return (second, true);
-            }
-        } else {
-            tokio::time::sleep(OPERATOR_PANIC_SPAWN_QUIESCENCE_POLL).await;
-        }
-        if Instant::now() >= deadline {
-            return (super::m4_tools::agent_spawn_activity_readback(), false);
-        }
-    }
-}
-
-fn operator_panic_mcp_mutation_activity_stable(
-    before: &super::operator_panic_boundary::McpMutationActivitySnapshot,
-    after: &super::operator_panic_boundary::McpMutationActivitySnapshot,
-) -> bool {
-    before.in_flight == 0 && after.in_flight == 0 && before.sequence == after.sequence
-}
-
-async fn wait_for_operator_panic_mcp_mutation_quiescence(
-    initial: Result<super::operator_panic_boundary::McpMutationActivitySnapshot, String>,
-) -> OperatorPanicMutationActivityReadback {
-    let started = Instant::now();
-    let deadline = started + crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT;
-    let initial = match initial {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return OperatorPanicMutationActivityReadback {
-                initial: None,
-                stable_before: None,
-                after: None,
-                quiescent: false,
-                error: Some(error),
-                elapsed_ms: started.elapsed().as_millis(),
-            };
-        }
-    };
-    let mut first = initial;
-    loop {
-        if Instant::now() >= deadline {
-            return OperatorPanicMutationActivityReadback {
-                initial: Some(initial),
-                stable_before: Some(first),
-                after: Some(first),
-                quiescent: false,
-                error: Some(format!(
-                    "MCP mutation activity did not reach stable zero within {} ms",
-                    crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT.as_millis()
-                )),
-                elapsed_ms: started.elapsed().as_millis(),
-            };
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(OPERATOR_PANIC_SPAWN_QUIESCENCE_POLL.min(remaining)).await;
-        let second = match super::operator_panic_boundary::mcp_mutation_activity_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return OperatorPanicMutationActivityReadback {
-                    initial: Some(initial),
-                    stable_before: Some(first),
-                    after: None,
-                    quiescent: false,
-                    error: Some(error),
-                    elapsed_ms: started.elapsed().as_millis(),
-                };
-            }
-        };
-        if operator_panic_mcp_mutation_activity_stable(&first, &second) {
-            return OperatorPanicMutationActivityReadback {
-                initial: Some(initial),
-                stable_before: Some(first),
-                after: Some(second),
-                quiescent: true,
-                error: None,
-                elapsed_ms: started.elapsed().as_millis(),
-            };
-        }
-        first = second;
-    }
-}
-
-async fn operator_panic_final_safety_sweep(
-    service: &SynapseService,
-) -> OperatorPanicFinalSafetySweepReadback {
-    let context = service.m2_release_all_context();
-    // With request-owned mutation reservations at stable zero, no admitted MCP
-    // request can register a new combo after this point. Disable first, then
-    // drain the emitter so a final reflex tick cannot reassert held input after
-    // the final ReleaseAll.
-    let reflex_disable = crate::safety::disable_reflexes(&service.m3_state_handle());
-    let (release_all, snapshot_handle, context_error) = match context {
-        Ok((handle, snapshot_handle, _reflex_runtime)) => (
-            crate::safety::fire_release_all_with_handle_timeout(
-                &handle,
-                crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT,
-            ),
-            Some(snapshot_handle),
-            None,
-        ),
-        Err(error) => {
-            let detail = error.message.to_string();
-            (
-                crate::safety::ReleaseAllReport {
-                    result: "error",
-                    error_code: Some(error_codes::TOOL_INTERNAL_ERROR),
-                    detail: Some(detail.clone()),
-                },
-                None,
-                Some(detail),
-            )
-        }
-    };
-    let (reflex_active_count_after, reflex_readback_error) =
-        match crate::safety::operator_panic_reflex_active_count_readback(&service.m3_state_handle())
-        {
-            Ok(count) => (count, None),
-            Err(error) => (None, Some(error)),
-        };
-    let (emitter_after, emitter_readback_error) = match snapshot_handle {
-        Some(snapshot_handle) => match tokio::time::timeout(
-            crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT,
-            snapshot_handle.snapshot(),
-        )
-        .await
-        {
-            Ok(Ok(snapshot)) => (
-                Some(OperatorPanicEmitterStateReadback::from_snapshot(&snapshot)),
-                None,
-            ),
-            Ok(Err(error)) => (None, Some(error.to_string())),
-            Err(_elapsed) => (
-                None,
-                Some(format!(
-                    "action emitter readback timed out after {} ms",
-                    crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT.as_millis()
-                )),
-            ),
-        },
-        None => (None, context_error),
-    };
-    let lease_safety_after = synapse_action::input_lease_safety_snapshot();
-    let emitter_terminal = emitter_readback_error.is_none()
-        && emitter_after
-            .as_ref()
-            .is_some_and(|readback| readback.terminal);
-    let release_all_terminal =
-        release_all.result == "ok" || (release_all.error_code.is_some() && emitter_terminal);
-    let terminal = release_all_terminal
-        && matches!(reflex_disable.result, "ok" | "not_initialized")
-        && reflex_readback_error.is_none()
-        && reflex_active_count_after.unwrap_or(0) == 0
-        && emitter_terminal;
-    OperatorPanicFinalSafetySweepReadback {
-        release_all,
-        reflex_disable,
-        reflex_active_count_after,
-        reflex_readback_error,
-        emitter_after,
-        emitter_readback_error,
-        lease_after: lease_safety_after.status,
-        operator_lease_generation_after: lease_safety_after.operator_panic_generation,
-        terminal,
-    }
-}
-
-fn chrome_debugger_bridge_error_detail(
-    error: &crate::chrome_debugger_bridge::ChromeDebuggerBridgeError,
-) -> String {
-    format!("{}: {}", error.code(), error.detail())
-}
-
-fn operator_panic_chrome_extension_owner_terminal(
-    readback: &crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback,
-    expected_disable_sequence: u64,
-) -> bool {
-    !readback.enabled
-        && readback.disable_sequence == expected_disable_sequence
-        && readback.command_in_flight_count == 1
-        && readback.command_activity_sequence
-            == readback.command_last_completed_sequence.saturating_add(1)
-        && readback.mutation_handlers_started_count == readback.mutation_handlers_completed_count
-        && !readback.worker_boot_id.is_empty()
-        && readback
-            .browser_session_id
-            .as_deref()
-            .is_some_and(|session_id| !session_id.is_empty())
-        && !readback.ledger_browser_session_id.is_empty()
-        && readback.browser_session_id.as_deref()
-            == Some(readback.ledger_browser_session_id.as_str())
-        && readback.browser_session_continuity_matched
-        && readback.stale_browser_session_owner_count == 0
-        && readback.storage_state_loaded
-        && readback.storage_state_load_error.is_none()
-        && readback.persisted_state_revision > 0
-        && readback.persisted_in_flight_mutation.is_none()
-        && readback.unresolved_debugger_command_timeouts.is_empty()
-        && readback.unresolved_worker_restart_mutation_count == 0
-        && readback.owner_continuity_healthy
-        && readback.active_after.is_empty()
-        && readback.fully_drained
-}
-
-fn operator_panic_chrome_extension_terminal(
-    readback: &OperatorPanicChromeExtensionOwnersReadback,
-) -> bool {
-    if readback.disable_error.is_some()
-        || readback.cleanup_error.is_some()
-        || readback.cdp_target_owner_reconciliation_error.is_some()
-        || readback.before_command_drain_error.is_some()
-        || readback.after_command_drain_error.is_some()
-    {
-        return false;
-    }
-    let Some(disable) = readback.disable.as_ref() else {
-        return false;
-    };
-    let expected_disable_sequence = disable.disable_sequence;
-    if disable.enabled
-        || expected_disable_sequence == 0
-        || disable.worker_boot_id.is_empty()
-        || disable
-            .browser_session_id
-            .as_deref()
-            .is_none_or(str::is_empty)
-        || disable.ledger_browser_session_id.is_empty()
-        || disable.browser_session_id.as_deref() != Some(disable.ledger_browser_session_id.as_str())
-        || !disable.browser_session_continuity_matched
-        || disable.stale_browser_session_owner_count != 0
-        || !disable.storage_state_loaded
-        || disable.storage_state_load_error.is_some()
-        || disable.persisted_state_revision == 0
-        || disable.unresolved_worker_restart_mutation_count != 0
-        || !disable.owner_continuity_healthy
-    {
-        return false;
-    }
-    let Some(cleanup) = readback.cleanup.as_ref() else {
-        return false;
-    };
-    let Some(owner_reconciliation) = readback.cdp_target_owner_reconciliation.as_ref() else {
-        return false;
-    };
-    if cleanup.expected_disable_sequence != expected_disable_sequence
-        || !cleanup.failures.is_empty()
-        || !owner_reconciliation.terminal
-        || cleanup.opened_tabs_found != cleanup.opened_tabs_closed
-        || cleanup.opened_tabs_closed != cleanup.closed_opened_tabs.len()
-        || !cleanup.remaining_opened_tabs.is_empty()
-        || owner_reconciliation.successful_physical_closes != cleanup.closed_opened_tabs.len()
-        || !operator_panic_chrome_extension_owner_terminal(
-            &cleanup.owner,
-            expected_disable_sequence,
-        )
-        || cleanup.init_scripts_found != cleanup.init_scripts_removed
-        || cleanup.init_script_effects_found != cleanup.init_script_effects_cleared
-        || cleanup.bindings_found != cleanup.bindings_removed
-        || cleanup.debugger_tabs_found != cleanup.debugger_tabs_detached
-        || cleanup.debugger_tabs_detached != cleanup.detached_debugger_tabs.len()
-        || cleanup.dialog_policies_found != cleanup.dialog_policies_disabled
-        || cleanup.file_chooser_interceptions_found != cleanup.file_chooser_interceptions_disabled
-        || cleanup.clocks_found != cleanup.clocks_uninstalled
-    {
-        return false;
-    }
-    let (Some(before), Some(after)) = (
-        readback.before_command_drain.as_ref(),
-        readback.after_command_drain.as_ref(),
-    ) else {
-        return false;
-    };
-    operator_panic_chrome_extension_owner_terminal(before, expected_disable_sequence)
-        && operator_panic_chrome_extension_owner_terminal(after, expected_disable_sequence)
-        && before.mutation_handlers_started_count == after.mutation_handlers_started_count
-        && before.mutation_handlers_completed_count == after.mutation_handlers_completed_count
-        && before.worker_boot_id == after.worker_boot_id
-        && before.browser_session_id == after.browser_session_id
-        && before.ledger_browser_session_id == after.ledger_browser_session_id
-        && before.persisted_state_revision == after.persisted_state_revision
-        && after.command_activity_sequence == before.command_activity_sequence.saturating_add(1)
-        && after.command_last_completed_sequence == before.command_activity_sequence
-}
-
-fn operator_panic_k2_lease_retained(
-    immediate_generation: u64,
-    current_epoch: u64,
-    tagged_generation: Option<u64>,
-    lease: &synapse_action::LeaseStatus,
-) -> bool {
-    lease.held
-        && lease.owner_session_id.as_deref()
-            == Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
-        && tagged_generation.is_some_and(|generation| {
-            generation == immediate_generation
-                || (generation > immediate_generation && generation <= current_epoch)
-        })
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -887,7 +456,7 @@ pub struct AgentRespawnParams {
     /// The work prompt for the new instance. Required: the original prompt is
     /// not persisted (only its size is journaled), so respawn never fabricates
     /// it — supply the continued task. The new agent's kind/model/model_ref and
-    /// manifest-recorded working_dir are reused from the prior spawn.
+    /// (when journaled) working_dir/target are reused from the prior spawn.
     pub prompt: String,
     /// When true (default), a continuity packet naming the prior spawn/session
     /// and, if present, its final message is prepended to the prompt so the new
@@ -917,6 +486,25 @@ pub struct RespawnManifest {
     pub source: String,
 }
 
+/// The runtime settings the prior spawn recorded in its `spawn-manifest.json`,
+/// carried unchanged into the respawn (#308). A field the manifest does not
+/// record (older spawns) stays `None` and the spawn applies its own rule: an
+/// omitted `mcp_url` resolves to this daemon's bind, the rest take defaults.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RespawnSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval_gate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_open_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ActSpawnAgentTarget>,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRespawnResponse {
@@ -931,6 +519,8 @@ pub struct AgentRespawnResponse {
     pub prior_already_dead: bool,
     /// What the respawn reused from the prior spawn.
     pub manifest: RespawnManifest,
+    /// The prior spawn's recorded runtime settings the respawn carried over.
+    pub settings: RespawnSettings,
     /// True when a continuity packet was prepended to the new prompt.
     pub carried_context: bool,
     /// Character count of the final prompt the new instance was spawned with.
@@ -955,6 +545,7 @@ struct RespawnPlan {
     lookup: String,
     target: ResolvedAgent,
     manifest: RespawnManifest,
+    settings: RespawnSettings,
     effective_prompt: String,
     carried_context: bool,
     request_value: Value,
@@ -997,12 +588,11 @@ impl SynapseService {
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
         let service = self.clone();
-        tokio::task::spawn_blocking(move || {
-            service.agent_interrupt_impl(params.0, caller.as_deref())
-        })
-        .await
-        .map_err(|error| blocking_worker_join_error(TOOL_AGENT_INTERRUPT, error))?
-        .map(Json)
+        let params = params.0;
+        tokio::task::spawn_blocking(move || service.agent_interrupt_impl(params, caller.as_deref()))
+            .await
+            .map_err(|error| blocking_worker_join_error(TOOL_AGENT_INTERRUPT, &error))?
+            .map(Json)
     }
 
     #[tool(
@@ -1058,9 +648,10 @@ impl SynapseService {
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
         let service = self.clone();
-        tokio::task::spawn_blocking(move || service.agent_steer_impl(params.0, caller.as_deref()))
+        let params = params.0;
+        tokio::task::spawn_blocking(move || service.agent_steer_impl(params, caller.as_deref()))
             .await
-            .map_err(|error| blocking_worker_join_error(TOOL_AGENT_STEER, error))?
+            .map_err(|error| blocking_worker_join_error(TOOL_AGENT_STEER, &error))?
             .map(Json)
     }
 
@@ -1078,7 +669,12 @@ impl SynapseService {
             "tool.invocation kind=agent_pause"
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
-        self.agent_pause_impl(params.0, caller.as_deref()).map(Json)
+        let service = self.clone();
+        let params = params.0;
+        tokio::task::spawn_blocking(move || service.agent_pause_impl(params, caller.as_deref()))
+            .await
+            .map_err(|error| blocking_worker_join_error(TOOL_AGENT_PAUSE, &error))?
+            .map(Json)
     }
 
     #[tool(
@@ -1095,12 +691,16 @@ impl SynapseService {
             "tool.invocation kind=agent_resume"
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
-        self.agent_resume_impl(params.0, caller.as_deref())
+        let service = self.clone();
+        let params = params.0;
+        tokio::task::spawn_blocking(move || service.agent_resume_impl(params, caller.as_deref()))
+            .await
+            .map_err(|error| blocking_worker_join_error(TOOL_AGENT_RESUME, &error))?
             .map(Json)
     }
 
     #[tool(
-        description = "Respawn ONE spawned agent (#906): kill the prior instance (if live) and launch a fresh one that reuses the prior spawn's kind/model/model_ref and manifest-recorded working_dir, with a continuity packet (prior spawn/session id + final message) prepended so it resumes. prompt is REQUIRED — the original prompt is not persisted, so respawn supplies the continued task rather than fabricate it. Writes a StateChanged lineage row (respawned_into) on the prior agent and returns both ids. Errors loudly if the prior spawn manifest or working_dir cannot be read."
+        description = "Respawn ONE spawned agent (#906): kill the prior instance (if live) and launch a fresh one that reuses the prior spawn's kind/model/model_ref and journaled working_dir/target, with a continuity packet (prior spawn/session id + final message) prepended so it resumes. prompt is REQUIRED — the original prompt is not persisted, so respawn supplies the continued task rather than fabricate it. Writes a StateChanged lineage row (respawned_into) on the prior agent and returns both ids. Errors loudly if the prior spawn manifest cannot be read."
     )]
     pub async fn agent_respawn(
         &self,
@@ -1146,7 +746,7 @@ impl SynapseService {
         self.fleet_stop_impl(params, Some("dashboard-fleet")).await
     }
 
-    pub(crate) fn dashboard_agent_interrupt_request(
+    pub(crate) async fn dashboard_agent_interrupt_request(
         &self,
         params: AgentInterruptParams,
     ) -> Result<AgentInterruptResponse, ErrorData> {
@@ -1156,10 +756,15 @@ impl SynapseService {
             requested_id = %params.session_id,
             "dashboard.invocation kind=agent_interrupt"
         );
-        self.agent_interrupt_impl(params, Some("dashboard-agent-detail"))
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.agent_interrupt_impl(params, Some("dashboard-agent-detail"))
+        })
+        .await
+        .unwrap_or_else(|error| Err(blocking_worker_join_error(TOOL_AGENT_INTERRUPT, &error)))
     }
 
-    pub(crate) fn dashboard_agent_pause_request(
+    pub(crate) async fn dashboard_agent_pause_request(
         &self,
         params: AgentPauseParams,
     ) -> Result<AgentSuspendResponse, ErrorData> {
@@ -1169,10 +774,15 @@ impl SynapseService {
             requested_id = %params.session_id,
             "dashboard.invocation kind=agent_pause"
         );
-        self.agent_pause_impl(params, Some("dashboard-agent-detail"))
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.agent_pause_impl(params, Some("dashboard-agent-detail"))
+        })
+        .await
+        .unwrap_or_else(|error| Err(blocking_worker_join_error(TOOL_AGENT_PAUSE, &error)))
     }
 
-    pub(crate) fn dashboard_agent_resume_request(
+    pub(crate) async fn dashboard_agent_resume_request(
         &self,
         params: AgentPauseParams,
     ) -> Result<AgentSuspendResponse, ErrorData> {
@@ -1182,13 +792,17 @@ impl SynapseService {
             requested_id = %params.session_id,
             "dashboard.invocation kind=agent_resume"
         );
-        self.agent_resume_impl(params, Some("dashboard-agent-detail"))
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.agent_resume_impl(params, Some("dashboard-agent-detail"))
+        })
+        .await
+        .unwrap_or_else(|error| Err(blocking_worker_join_error(TOOL_AGENT_RESUME, &error)))
     }
 
     pub(crate) async fn dashboard_agent_respawn_request(
         &self,
         params: AgentRespawnParams,
-        mcp_url: String,
     ) -> Result<AgentRespawnResponse, ErrorData> {
         tracing::info!(
             code = "DASHBOARD_AGENT_RESPAWN_REQUESTED",
@@ -1196,8 +810,7 @@ impl SynapseService {
             requested_id = %params.session_id,
             "dashboard.invocation kind=agent_respawn"
         );
-        self.agent_respawn_core(params, None, None, Some(mcp_url))
-            .await
+        self.agent_respawn_core(params, None, None).await
     }
 
     // ------------------------------------------------------------------
@@ -1577,20 +1190,26 @@ impl SynapseService {
         }
     }
 
-    pub(crate) fn dashboard_agent_steer(
+    pub(crate) async fn dashboard_agent_steer(
         &self,
         session_id: String,
         instruction: String,
         request_receipt: bool,
     ) -> Result<Value, ErrorData> {
-        dashboard_json_readback(self.agent_steer_impl(
-            AgentSteerParams {
-                session_id,
-                instruction,
-                request_receipt,
-            },
-            Some("dashboard-context"),
-        )?)
+        let service = self.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            service.agent_steer_impl(
+                AgentSteerParams {
+                    session_id,
+                    instruction,
+                    request_receipt,
+                },
+                Some("dashboard-context"),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| Err(blocking_worker_join_error(TOOL_AGENT_STEER, &error)))?;
+        dashboard_json_readback(response)
     }
 
     // ------------------------------------------------------------------
@@ -2275,19 +1894,10 @@ impl SynapseService {
         }
         let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_RESPAWN)?;
 
-        // Reuse the prior spawn's identity from its persisted manifest (the SoT
-        // for kind/model/model_ref) — refuse loudly if it cannot be read rather
-        // than guess.
-        let manifest = self.read_respawn_manifest(&target)?;
-        let Some(cli_token) = spawn_cli_serde_token(&manifest.agent_kind) else {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "AGENT_RESPAWN_KIND_UNSUPPORTED: prior spawn manifest reports agent kind {:?}, which is not a respawnable CLI",
-                    manifest.agent_kind
-                ),
-            ));
-        };
+        // Reuse the prior spawn's identity and runtime settings from its
+        // persisted manifest (the SoT) — refuse loudly if it cannot be read
+        // rather than guess.
+        let (manifest, settings) = self.read_respawn_manifest(&target)?;
 
         // Continuity packet: name the prior lineage and, when present, fold in
         // its final message so the new instance resumes with context.
@@ -2316,26 +1926,13 @@ impl SynapseService {
         }
         effective_prompt.push_str(prompt);
 
-        // Build a direct spawn request reusing the prior identity. Constructed
-        // via serde so every unspecified field takes its documented default.
-        let mut request_value = json!({
-            "cli": cli_token,
-            "prompt": effective_prompt,
-        });
-        if let Some(model) = manifest.model.as_deref() {
-            request_value["model"] = json!(model);
-        }
-        if let Some(model_ref) = manifest.model_ref.as_deref() {
-            request_value["model_ref"] = json!(model_ref);
-        }
-        if let Some(working_dir) = manifest.working_dir.as_deref() {
-            request_value["working_dir"] = json!(working_dir);
-        }
+        let request_value = respawn_request(&manifest, &settings, &effective_prompt)?;
 
         Ok(RespawnPlan {
             lookup,
             target,
             manifest,
+            settings,
             effective_prompt,
             carried_context,
             request_value,
@@ -2348,7 +1945,7 @@ impl SynapseService {
         request_context: &RequestContext<RoleServer>,
     ) -> Result<AgentRespawnResponse, ErrorData> {
         let caller = super::context::mcp_session_id_from_request_context(request_context)?;
-        self.agent_respawn_core(params, caller, Some(request_context), None)
+        self.agent_respawn_core(params, caller, Some(request_context))
             .await
     }
 
@@ -2357,22 +1954,49 @@ impl SynapseService {
         params: AgentRespawnParams,
         caller: Option<String>,
         request_context: Option<&RequestContext<RoleServer>>,
-        dashboard_mcp_url: Option<String>,
     ) -> Result<AgentRespawnResponse, ErrorData> {
-        // Own one spawn-activity generation from respawn entry, before planning
-        // or killing the prior process. The inner spawn has its own guard too,
-        // but this original epoch prevents a K2 that fires during a long prior
-        // kill from finalizing and then allowing a fresh replacement launch.
-        let respawn_activity =
-            super::m4_tools::AgentSpawnInFlightGuard::enter("agent_respawn_outer")?;
         let RespawnPlan {
             lookup,
             target,
             manifest,
+            settings,
             effective_prompt,
             carried_context,
             request_value,
         } = self.agent_respawn_plan(&params)?;
+        let request: ActSpawnAgentRequest =
+            serde_json::from_value(request_value).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("AGENT_RESPAWN_REQUEST_BUILD_FAILED: {error}"),
+                )
+            })?;
+
+        // Refuse invalid replacement requests while the prior agent still runs.
+        // The params come from the same resolver the spawn uses, so the checks
+        // below see the exact mcp_url (recorded, else this daemon's bind).
+        validate_respawn_request(&request)?;
+        let spawn_params = self.resolve_spawn_request(request.clone())?;
+        super::m4_tools::resolve_agent_working_dir(spawn_params.working_dir.as_deref()).map_err(
+            |error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("AGENT_RESPAWN_WORKING_DIR_INVALID: {}", error.message),
+                )
+            },
+        )?;
+        let agent_kind = spawn_params.effective_cli()?;
+        super::m4_tools::validate_cli_model_before_spawn(&spawn_params, agent_kind)?;
+        self.ensure_supported_use_allows_action("act_launch")?;
+        // D8 (#598): refuse while the prior agent still runs (it is killed below).
+        self.m4_config.agent_spawn().ensure_allowed()?;
+        if agent_kind.is_local_model() {
+            self.require_spawn_local_model_row(
+                &spawn_params,
+                caller.as_deref().unwrap_or(TOOL_AGENT_RESPAWN),
+            )
+            .await?;
+        }
         let prior_spawn_id = target.spawn_id.clone();
 
         let payload = json!({
@@ -2380,6 +2004,7 @@ impl SynapseService {
             "carry_context": params.carry_context,
             "grace_ms": params.grace_ms,
             "manifest": &manifest,
+            "settings": &settings,
             "from": caller,
         });
         let before = json!({
@@ -2401,46 +2026,15 @@ impl SynapseService {
             .with_target(json!({ "spawn_id": prior_spawn_id, "agent_kind": target.agent_kind })),
         )?;
 
-        let finalize_operator_panic =
-            |stage: &'static str, error: &ErrorData| -> Result<(), ErrorData> {
-                self.command_audit_final(
-                    CommandAuditInput::mcp(
-                        TOOL_AGENT_RESPAWN,
-                        "respawn",
-                        caller.clone(),
-                        Some(target.session_id.clone()),
-                        payload.clone(),
-                        before.clone(),
-                        json!({
-                            "spawn_attempted": false,
-                            "operator_panic_stage": stage,
-                            "error": error,
-                            "spawn_activity": super::m4_tools::agent_spawn_activity_readback(),
-                        }),
-                        "error",
-                    )
-                    .with_target(json!({
-                        "spawn_id": prior_spawn_id.clone(),
-                        "agent_kind": target.agent_kind.clone()
-                    })),
-                )?;
-                Ok(())
-            };
-        if let Err(error) = respawn_activity.ensure("respawn_before_prior_kill") {
-            finalize_operator_panic("respawn_before_prior_kill", &error)?;
-            return Err(error);
-        }
-
-        // Kill the prior instance first when it is still live; an already-dead
-        // prior is simply re-launched.
-        let prior_already_dead = target.dead
-            || process_readback_for_target(&target)
-                .live_process_ids
-                .is_empty();
-        let prior_killed = if prior_already_dead {
-            false
-        } else {
-            match self
+        // Stop the prior instance first; a new copy launches only once the
+        // prior process is confirmed gone (#308).
+        let prior_live = !process_readback_for_target(&target)
+            .live_process_ids
+            .is_empty();
+        let prior = match (prior_live, target.dead) {
+            (false, _) => PriorProcess::Gone,
+            (true, true) => PriorProcess::Unconfirmed,
+            (true, false) => match self
                 .agent_kill_impl(
                     AgentKillParams {
                         session_id: target.session_id.clone(),
@@ -2451,132 +2045,74 @@ impl SynapseService {
                 )
                 .await
             {
-                Ok(kill) if kill.killed => true,
-                Ok(kill) => {
-                    let error = mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "AGENT_RESPAWN_PRIOR_KILL_FAILED: agent {} (session {}) was still live and agent_kill returned killed=false; no replacement was launched",
-                            lookup, target.session_id
-                        ),
-                    );
-                    let after = json!({
-                        "spawn_attempted": false,
-                        "prior_kill_failed": true,
-                        "prior_kill": kill,
-                        "error": error.message.to_string(),
-                    });
-                    self.command_audit_final(
-                        CommandAuditInput::mcp(
-                            TOOL_AGENT_RESPAWN,
-                            "respawn",
-                            caller.clone(),
-                            Some(target.session_id.clone()),
-                            payload.clone(),
-                            before.clone(),
-                            after,
-                            "error",
-                        )
-                        .with_target(json!({
-                            "spawn_id": prior_spawn_id.clone(),
-                            "agent_kind": target.agent_kind.clone()
-                        })),
-                    )?;
-                    return Err(error);
-                }
-                Err(source) => {
-                    let source_message = source.message.to_string();
-                    let error = mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!(
-                            "AGENT_RESPAWN_PRIOR_KILL_FAILED: prior agent kill failed before replacement spawn; no replacement was launched: {source_message}"
-                        ),
-                    );
-                    let after = json!({
-                        "spawn_attempted": false,
-                        "prior_kill_failed": true,
-                        "source_error": source_message,
-                        "error": error.message.to_string(),
-                    });
-                    self.command_audit_final(
-                        CommandAuditInput::mcp(
-                            TOOL_AGENT_RESPAWN,
-                            "respawn",
-                            caller.clone(),
-                            Some(target.session_id.clone()),
-                            payload.clone(),
-                            before.clone(),
-                            after,
-                            "error",
-                        )
-                        .with_target(json!({
-                            "spawn_id": prior_spawn_id.clone(),
-                            "agent_kind": target.agent_kind.clone()
-                        })),
-                    )?;
-                    return Err(error);
-                }
-            }
+                Ok(kill) if kill.already_dead => PriorProcess::Gone,
+                Ok(kill) if kill.killed => PriorProcess::Killed,
+                Ok(kill) => PriorProcess::KillFailed(format!(
+                    "agent_kill left processes {:?}",
+                    kill.orphan_process_ids
+                )),
+                Err(error) => PriorProcess::KillFailed(error.message.to_string()),
+            },
         };
-        if let Err(error) = respawn_activity.ensure("respawn_after_prior_kill") {
-            finalize_operator_panic("respawn_after_prior_kill", &error)?;
-            return Err(error);
-        }
-
-        let request: crate::m4::ActSpawnAgentRequest = serde_json::from_value(request_value)
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("AGENT_RESPAWN_REQUEST_BUILD_FAILED: {error}"),
-                )
-            })?;
-        let mut request = request;
-        if let Err(error) = respawn_activity.ensure("respawn_immediately_before_replacement_spawn")
-        {
-            finalize_operator_panic("respawn_immediately_before_replacement_spawn", &error)?;
-            return Err(error);
-        }
-        let spawned = if let Some(request_context) = request_context {
-            self.spawn_agent_journaled(request, request_context).await?
-        } else {
-            if let Some(mcp_url) = dashboard_mcp_url {
-                request.mcp_url = mcp_url;
-            }
-            self.dashboard_spawn_agent_request(request).await?
-        };
-        if let Err(error) = respawn_activity.ensure("respawn_after_replacement_spawn") {
-            let cleanup = self
-                .cleanup_spawn_response_after_operator_panic(
-                    &spawned,
-                    "respawn_after_replacement_spawn",
-                )
-                .await;
+        if let Err(error) = respawn_prior_gone(target.launcher_process_id, &prior) {
             self.command_audit_final(
                 CommandAuditInput::mcp(
                     TOOL_AGENT_RESPAWN,
                     "respawn",
-                    caller.clone(),
+                    caller,
                     Some(target.session_id.clone()),
-                    payload.clone(),
-                    before.clone(),
-                    json!({
-                        "spawn_attempted": true,
-                        "operator_panic_stage": "respawn_after_replacement_spawn",
-                        "replacement_spawn_id": spawned.spawn_id,
-                        "replacement_session_id": spawned.session_id,
-                        "replacement_cleanup": cleanup,
-                        "error": &error,
-                        "spawn_activity": super::m4_tools::agent_spawn_activity_readback(),
-                    }),
+                    payload,
+                    before,
+                    json!({ "spawn_attempted": false, "error": error.message.to_string() }),
                     "error",
                 )
-                .with_target(json!({
-                    "spawn_id": prior_spawn_id.clone(),
-                    "agent_kind": target.agent_kind.clone()
-                })),
+                .with_target(
+                    json!({ "spawn_id": prior_spawn_id, "agent_kind": target.agent_kind }),
+                ),
             )?;
             return Err(error);
         }
+        let prior_killed = matches!(prior, PriorProcess::Killed);
+        let prior_already_dead = matches!(prior, PriorProcess::Gone);
+
+        let spawn_result = if let Some(request_context) = request_context {
+            self.spawn_agent_journaled(request, request_context).await
+        } else {
+            self.dashboard_spawn_agent_request(request).await
+        };
+        let spawned = match spawn_result {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let error = ErrorData {
+                    message: format!(
+                        "AGENT_RESPAWN_REPLACEMENT_FAILED: the prior agent (launcher pid {}) is stopped and no replacement started: {}",
+                        target.launcher_process_id, error.message
+                    )
+                    .into(),
+                    ..error
+                };
+                self.command_audit_final(
+                    CommandAuditInput::mcp(
+                        TOOL_AGENT_RESPAWN,
+                        "respawn",
+                        caller,
+                        Some(target.session_id.clone()),
+                        payload,
+                        before,
+                        json!({
+                            "spawn_attempted": true,
+                            "prior_stopped": true,
+                            "error": error.message.to_string(),
+                        }),
+                        "error",
+                    )
+                    .with_target(
+                        json!({ "spawn_id": prior_spawn_id, "agent_kind": target.agent_kind }),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
 
         // Lineage: record on the prior agent that it was respawned into the new
         // spawn, so agent_query/the journal can trace the chain.
@@ -2602,6 +2138,7 @@ impl SynapseService {
             prior_killed,
             prior_already_dead,
             manifest,
+            settings,
             carried_context,
             effective_prompt_chars: effective_prompt.chars().count(),
             new_session_id: spawned.session_id.clone(),
@@ -2635,10 +2172,15 @@ impl SynapseService {
         Ok(response)
     }
 
-    /// Reads the prior spawn's reusable identity from its `spawn-manifest.json`
-    /// (kind/model/model_ref/working_dir). Errors if no manifest or working
-    /// directory exists — respawn never fabricates a spawn identity or cwd.
-    fn read_respawn_manifest(&self, target: &ResolvedAgent) -> Result<RespawnManifest, ErrorData> {
+    /// Reads the prior spawn's reusable identity (kind/model/model_ref/
+    /// working_dir; spawns older than the manifest working_dir fall back to the
+    /// journaled one) and its recorded runtime settings from its
+    /// `spawn-manifest.json`. Errors if no manifest exists — respawn never
+    /// fabricates a spawn identity.
+    fn read_respawn_manifest(
+        &self,
+        target: &ResolvedAgent,
+    ) -> Result<(RespawnManifest, RespawnSettings), ErrorData> {
         let manifest_path =
             PathBuf::from(&target.log_dir).join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
         let bytes = fs::read(&manifest_path).map_err(|error| {
@@ -2673,43 +2215,44 @@ impl SynapseService {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         };
-        let working_dir = string_field("working_dir")
-            .or_else(|| string_field("effective_working_dir"))
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    format!(
-                        "AGENT_RESPAWN_WORKING_DIR_MISSING: prior spawn manifest {} has no working_dir/effective_working_dir; refusing to respawn into the daemon default cwd",
-                        manifest_path.display()
-                    ),
-                )
-            })?;
-        let working_dir_path = PathBuf::from(&working_dir);
-        let canonical_working_dir = fs::canonicalize(&working_dir_path).map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "AGENT_RESPAWN_WORKING_DIR_INVALID: prior spawn working_dir {working_dir_path:?} from {} could not be resolved: {error}",
-                    manifest_path.display()
-                ),
-            )
-        })?;
-        if !canonical_working_dir.is_dir() {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "AGENT_RESPAWN_WORKING_DIR_INVALID: prior spawn working_dir {canonical_working_dir:?} from {} is not a directory",
-                    manifest_path.display()
-                ),
-            ));
-        }
-        Ok(RespawnManifest {
+        let identity = RespawnManifest {
             agent_kind,
             model: string_field("model"),
             model_ref: string_field("model_ref"),
-            working_dir: Some(canonical_working_dir.display().to_string()),
+            working_dir: string_field("working_dir")
+                .or_else(|| self.prior_spawn_working_dir(target.spawn_id.as_deref())),
             source: super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME.to_owned(),
-        })
+        };
+        Ok((identity, respawn_settings_from_manifest(&manifest)))
+    }
+
+    /// Recovers the prior spawn's working_dir from its `SpawnRequested` journal
+    /// row, for spawns whose manifest predates the recorded working_dir.
+    fn prior_spawn_working_dir(&self, spawn_id: Option<&str>) -> Option<String> {
+        let spawn_id = spawn_id?;
+        let db = self.agent_control_db().ok()?;
+        let (rows, _more) = db
+            .scan_cf_from(synapse_storage::cf::CF_AGENT_EVENTS, &[], 1_000_000)
+            .ok()?;
+        for (_key, value) in rows {
+            let Ok(record) = serde_json::from_slice::<AgentEventRecord>(&value) else {
+                continue;
+            };
+            if record.kind == AgentEventKind::SpawnRequested
+                && record.spawn_id.as_deref() == Some(spawn_id)
+            {
+                if let Some(working_dir) = record
+                    .payload
+                    .get("working_dir")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(working_dir.to_owned());
+                }
+            }
+        }
+        None
     }
 
     // ------------------------------------------------------------------
@@ -2720,193 +2263,7 @@ impl SynapseService {
         &self,
         immediate: OperatorHotkeyImmediateReport,
     ) -> Result<OperatorPanicKillAllResponse, ErrorData> {
-        let mcp_mutation_activity_initial =
-            super::operator_panic_boundary::mcp_mutation_activity_snapshot();
-        // The extension gives operatorPanicDisable a priority admission lane:
-        // it closes and persists mutation admission without waiting behind the
-        // long normal-command tail. Then wait for every pre-K1 MCP mutation
-        // reservation to finish. K1 prevents new reservations; stable zero is
-        // therefore the terminal cut before all verdict-bearing owner drains
-        // and fleet sweeps below.
-        let (chrome_extension_disable, chrome_extension_disable_error) =
-            match crate::chrome_debugger_bridge::operator_panic_disable().await {
-                Ok(readback) => (Some(readback), None),
-                Err(error) => (None, Some(chrome_debugger_bridge_error_detail(&error))),
-            };
-        let expected_chrome_extension_disable_sequence = chrome_extension_disable
-            .as_ref()
-            .map(|readback| readback.disable_sequence);
-        let mcp_mutation_activity =
-            wait_for_operator_panic_mcp_mutation_quiescence(mcp_mutation_activity_initial.clone())
-                .await;
-
-        // Remove extension-owned durable effects only after the request-wide
-        // mutation registry reached its stable terminal cut. The independent
-        // readback also authoritatively reconciles a response whose transport
-        // disappeared after the extension had already completed its mutation.
-        let (chrome_extension_cleanup, chrome_extension_cleanup_error) =
-            match expected_chrome_extension_disable_sequence {
-                Some(disable_sequence) => {
-                    match crate::chrome_debugger_bridge::operator_panic_cleanup(disable_sequence)
-                        .await
-                    {
-                        Ok(readback) => (Some(readback), None),
-                        Err(error) => {
-                            (None, Some(chrome_debugger_bridge_error_detail(&error)))
-                        }
-                    }
-                }
-                None => (
-                    None,
-                    Some(
-                        "operatorPanicCleanup was not attempted because operatorPanicDisable did not return an exact generation"
-                            .to_owned(),
-                    ),
-                ),
-            };
-        let (
-            chrome_extension_cdp_target_owner_reconciliation,
-            chrome_extension_cdp_target_owner_reconciliation_error,
-        ) = match chrome_extension_cleanup.as_ref() {
-            Some(cleanup) => {
-                let closed_targets = cleanup
-                    .closed_opened_tabs
-                    .iter()
-                    .map(|target| (target.tab_id, target.target_id.clone()))
-                    .collect::<Vec<_>>();
-                (
-                    Some(
-                        self.reconcile_operator_panic_extension_target_owners(
-                            cleanup.expected_disable_sequence,
-                            &closed_targets,
-                        )
-                        .await,
-                    ),
-                    None,
-                )
-            }
-            None => (
-                None,
-                Some(
-                    "M1 CDP target-owner reconciliation was not attempted because extension cleanup returned no physical-close readback"
-                        .to_owned(),
-                ),
-            ),
-        };
-        let (chrome_extension_before_command_drain, chrome_extension_before_command_drain_error) =
-            match crate::chrome_debugger_bridge::operator_panic_readback().await {
-                Ok(readback) => (Some(readback), None),
-                Err(error) => (None, Some(chrome_debugger_bridge_error_detail(&error))),
-            };
-
-        // K1 synchronously closed the daemon's durable browser-owner admission
-        // gate. Drain those exact async owners after the extension itself is
-        // closed and independently read back.
-        let durable_browser_mutation_owners_drain =
-            synapse_a11y::durable_browser_mutation_owners_disable_and_drain().await;
-        let durable_browser_mutation_owners_after =
-            synapse_a11y::durable_browser_mutation_owners_readback();
-        let durable_browser_mutation_owners_terminal = durable_browser_mutation_owners_drain
-            .fully_drained
-            && durable_browser_mutation_owners_drain.failures.is_empty()
-            && durable_browser_mutation_owners_drain.persisted_cdp_input_owners_drained
-                == durable_browser_mutation_owners_drain.persisted_cdp_input_owners_found
-            && durable_browser_mutation_owners_drain.persisted_cdp_evaluate_owners_drained
-                == durable_browser_mutation_owners_drain.persisted_cdp_evaluate_owners_found
-            && durable_browser_mutation_owners_drain
-                .persisted_cdp_init_script_effect_owners_drained
-                == durable_browser_mutation_owners_drain
-                    .persisted_cdp_init_script_effect_owners_found
-            && durable_browser_mutation_owners_drain.persisted_cdp_input_owners_remaining == 0
-            && durable_browser_mutation_owners_drain.persisted_cdp_evaluate_owners_remaining == 0
-            && durable_browser_mutation_owners_drain
-                .persisted_cdp_init_script_effect_owners_remaining
-                == 0
-            && durable_browser_mutation_owners_drain.persisted_cdp_mutation_owners_remaining == 0
-            && durable_browser_mutation_owners_drain
-                .persisted_cdp_input_owners_found
-                .checked_add(
-                    durable_browser_mutation_owners_drain.persisted_cdp_evaluate_owners_found,
-                )
-                .and_then(|subtotal| {
-                    subtotal.checked_add(
-                        durable_browser_mutation_owners_drain
-                            .persisted_cdp_init_script_effect_owners_found,
-                    )
-                })
-                .is_some_and(|total| {
-                    durable_browser_mutation_owners_drain.persisted_cdp_mutation_owners_found
-                        == total
-                })
-            && durable_browser_mutation_owners_drain.readback
-                == durable_browser_mutation_owners_after
-            && !durable_browser_mutation_owners_after.enabled
-            && durable_browser_mutation_owners_after.registry_readback_healthy
-            && durable_browser_mutation_owners_after
-                .registry_readback_failures
-                .is_empty()
-            && durable_browser_mutation_owners_after.fetch_interception_active_count == 0
-            && durable_browser_mutation_owners_after.network_override_active_count == 0
-            && durable_browser_mutation_owners_after.dialog_auto_policy_active_count == 0
-            && durable_browser_mutation_owners_after.clock_active_count == 0
-            && durable_browser_mutation_owners_after.init_script_active_count == 0
-            && durable_browser_mutation_owners_after.unresolved_raw_cdp_evaluate_timeout_count == 0
-            && durable_browser_mutation_owners_after.unresolved_raw_cdp_input_owner_count == 0
-            && durable_browser_mutation_owners_after.persisted_cdp_mutation_owner_count == 0
-            && durable_browser_mutation_owners_after.persisted_cdp_input_owner_count == 0
-            && durable_browser_mutation_owners_after.persisted_cdp_evaluate_owner_count == 0
-            && durable_browser_mutation_owners_after.persisted_cdp_init_script_effect_owner_count
-                == 0;
-        if !durable_browser_mutation_owners_terminal {
-            synapse_action::record_operator_panic_safety_incident();
-        }
-        let chrome_mutation_command_owners_drain =
-            crate::chrome_debugger_bridge::drain_mutation_command_owners(
-                crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT,
-            )
-            .await;
-        let chrome_mutation_command_owners_after =
-            crate::chrome_debugger_bridge::mutation_command_owners_readback();
-        let chrome_mutation_command_owners_terminal = chrome_mutation_command_owners_drain
-            .fully_drained
-            && chrome_mutation_command_owners_drain.failures.is_empty()
-            && chrome_mutation_command_owners_drain.readback
-                == chrome_mutation_command_owners_after
-            && chrome_mutation_command_owners_after.registry_readback_healthy
-            && chrome_mutation_command_owners_after
-                .registry_readback_failure
-                .is_none()
-            && chrome_mutation_command_owners_after.queued_mutation_count == 0
-            && chrome_mutation_command_owners_after.delivered_mutation_count == 0
-            && chrome_mutation_command_owners_after.delivered_caller_timed_out_count == 0
-            && chrome_mutation_command_owners_after
-                .delivered_command_ids
-                .is_empty();
-        let (chrome_extension_after_command_drain, chrome_extension_after_command_drain_error) =
-            match crate::chrome_debugger_bridge::operator_panic_readback().await {
-                Ok(readback) => (Some(readback), None),
-                Err(error) => (None, Some(chrome_debugger_bridge_error_detail(&error))),
-            };
-        let mut chrome_extension_mutation_owners = OperatorPanicChromeExtensionOwnersReadback {
-            disable: chrome_extension_disable,
-            disable_error: chrome_extension_disable_error,
-            cleanup: chrome_extension_cleanup,
-            cleanup_error: chrome_extension_cleanup_error,
-            cdp_target_owner_reconciliation: chrome_extension_cdp_target_owner_reconciliation,
-            cdp_target_owner_reconciliation_error:
-                chrome_extension_cdp_target_owner_reconciliation_error,
-            before_command_drain: chrome_extension_before_command_drain,
-            before_command_drain_error: chrome_extension_before_command_drain_error,
-            after_command_drain: chrome_extension_after_command_drain,
-            after_command_drain_error: chrome_extension_after_command_drain_error,
-            terminal: false,
-        };
-        chrome_extension_mutation_owners.terminal =
-            operator_panic_chrome_extension_terminal(&chrome_extension_mutation_owners);
-        if !chrome_extension_mutation_owners.terminal || !chrome_mutation_command_owners_terminal {
-            synapse_action::record_operator_panic_safety_incident();
-        }
-        let spawn_activity_before = super::m4_tools::agent_spawn_activity_readback();
+        let _emergency_reservation = synapse_action::lease::reserve_emergency_cleanup();
         let prior_lease_owner_session_id = immediate
             .preempted_lease
             .as_ref()
@@ -2926,19 +2283,10 @@ impl SynapseService {
             "prior_lease_owner_session_id": prior_lease_owner_session_id,
         });
         let before = json!({
-            "source_of_truth": "synapse_action::lease + server::operator_panic_boundary MCP mutation registry + synapse_a11y durable browser-owner registry + Chrome debugger pending-command registry + extension chrome.storage.session durable-owner ledger/live readback + M1 CdpTargetOwner registry/CF_SESSIONS owner rows + CF_SESSIONS session lease row + session registry/agent_state + OS process table + reflex scheduler/emitter state + CF_ACTION_LOG",
+            "source_of_truth": "synapse_action::lease + CF_SESSIONS session lease row + session registry/agent_state + OS process table + CF_ACTION_LOG",
             "immediate": &immediate,
             "matched_sessions_before": &matched_sessions_before,
             "matched_sessions_before_error": &matched_sessions_before_error,
-            "spawn_activity_before": &spawn_activity_before,
-            "mcp_mutation_activity_initial": &mcp_mutation_activity_initial,
-            "chrome_extension_mutation_owners": &chrome_extension_mutation_owners,
-            "durable_browser_mutation_owners_drain": &durable_browser_mutation_owners_drain,
-            "durable_browser_mutation_owners_after": &durable_browser_mutation_owners_after,
-            "durable_browser_mutation_owners_terminal": durable_browser_mutation_owners_terminal,
-            "chrome_mutation_command_owners_drain": &chrome_mutation_command_owners_drain,
-            "chrome_mutation_command_owners_after": &chrome_mutation_command_owners_after,
-            "chrome_mutation_command_owners_terminal": chrome_mutation_command_owners_terminal,
         });
         let audit_intent_error = self
             .command_audit_intent(
@@ -2957,98 +2305,49 @@ impl SynapseService {
             .err()
             .map(|error| error.message.to_string());
 
+        let transition_gate = self.lease_transition_gate();
+        let transition = transition_gate.lock().await;
         let (prior_lease_row_cleanup, prior_lease_row_cleanup_error) =
-            match prior_lease_owner_session_id.as_deref() {
-                Some(owner) => match super::session_continuity::delete_persisted_session_lease_row(
-                    &self.m3_state_handle(),
-                    owner,
-                ) {
-                    Ok(readback) => (Some(readback), None),
-                    Err(error) => (None, Some(error)),
-                },
+            match immediate.preempted_lease.as_ref().filter(|prior| {
+                prior.owner_session_id.as_deref()
+                    != Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
+            }) {
+                Some(displaced) => {
+                    match super::session_continuity::reconcile_displaced_session_lease_row(
+                        &self.m3_state_handle(),
+                        displaced,
+                        "operator_hotkey_preempted",
+                    ) {
+                        Ok(readback) => (Some(readback), None),
+                        Err(error) => (None, Some(error)),
+                    }
+                }
                 None => (None, None),
             };
+        drop(transition);
+        let deferred_disable_report = crate::safety::disable_reflexes(&self.m3_state_handle());
 
-        let mut spawn_activity_baseline = spawn_activity_before.clone();
-        let mut spawn_activity_after = spawn_activity_before.clone();
-        let mut spawn_activity_stable = false;
-        let mut fleet_stop_rounds = 0_u32;
-        let mut fleet_stop = None;
-        let mut fleet_stop_errors = Vec::new();
-        while fleet_stop_rounds < OPERATOR_PANIC_FLEET_STOP_MAX_STABLE_ROUNDS {
-            fleet_stop_rounds = fleet_stop_rounds.saturating_add(1);
-            let mut round_failed = false;
-            match self
-                .fleet_stop_impl(
-                    FleetStopParams {
-                        mode: "kill".to_owned(),
-                        confirm: FLEET_STOP_CONFIRM.to_owned(),
-                        agent_kinds: Vec::new(),
-                        grace_ms: 0,
-                    },
-                    Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID),
-                )
-                .await
-            {
-                Ok(response) => fleet_stop = Some(response),
-                Err(error) => {
-                    round_failed = true;
-                    fleet_stop_errors.push(format!("round {fleet_stop_rounds}: {}", error.message));
-                }
-            }
-            let (observed, quiescent_readback_stable) =
-                wait_for_operator_panic_spawn_quiescence().await;
-            spawn_activity_stable = operator_panic_spawn_activity_stable(
-                &spawn_activity_baseline,
-                &observed,
-                quiescent_readback_stable,
-            );
-            spawn_activity_after = observed;
-            if spawn_activity_stable
-                || round_failed
-                || !quiescent_readback_stable
-                || spawn_activity_after.in_flight != 0
-                || spawn_activity_after.cleanup_incident
-            {
-                break;
-            }
-            // A racing spawn entered during this fleet sweep, but admission
-            // forced it to abort/clean up. Sweep once more from that now-stable
-            // sequence so no process can live between the fleet snapshot and
-            // K2 completion.
-            spawn_activity_baseline = spawn_activity_after.clone();
-        }
-        let fleet_stop_error =
-            (!fleet_stop_errors.is_empty()).then(|| fleet_stop_errors.join(" | "));
-
-        let (final_safety_sweep, final_safety_sweep_error) = if mcp_mutation_activity.quiescent
-            && mcp_mutation_activity.error.is_none()
-        {
-            (Some(operator_panic_final_safety_sweep(self).await), None)
-        } else {
-            (
-                    None,
-                    Some(
-                        "final K2 ReleaseAll/reflex/emitter sweep was not terminally ordered because MCP mutation activity did not reach stable zero"
-                            .to_owned(),
-                    ),
-                )
+        let fleet_stop_result = self
+            .fleet_stop_impl(
+                FleetStopParams {
+                    mode: "kill".to_owned(),
+                    confirm: FLEET_STOP_CONFIRM.to_owned(),
+                    agent_kinds: Vec::new(),
+                    grace_ms: 0,
+                },
+                Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID),
+            )
+            .await;
+        let (fleet_stop, fleet_stop_error) = match fleet_stop_result {
+            Ok(response) => (Some(response), None),
+            Err(error) => (None, Some(error.message.to_string())),
         };
 
-        // K2 intentionally retains the generation-tagged operator lease. The
-        // unique last-completer token in safety.rs clears only its exact
-        // generation after this transaction and its audit are proven terminal.
-        let operator_lease_cleared = None;
-        let lease_after = final_safety_sweep.as_ref().map_or_else(
-            || synapse_action::input_lease_safety_snapshot().status,
-            |sweep| sweep.lease_after.clone(),
+        let operator_lease_cleared = synapse_action::lease::force_clear_if_generation(
+            &immediate.lease_after_preempt,
+            "operator_hotkey_k2_complete",
         );
-        let operator_lease_generation_after = final_safety_sweep
-            .as_ref()
-            .map_or_else(synapse_action::operator_panic_lease_generation, |sweep| {
-                sweep.operator_lease_generation_after
-            });
-        let operator_panic_safety_after = synapse_action::operator_panic_safety_readback();
+        let lease_after = synapse_action::lease::status();
         let (live_sessions_after, live_sessions_after_error) =
             match self.live_spawned_agent_sessions(&[]) {
                 Ok(sessions) => (sessions, None),
@@ -3058,66 +2357,31 @@ impl SynapseService {
             .as_ref()
             .is_some_and(|response| response.all_stopped)
             && live_sessions_after.is_empty()
-            && immediate.k1_safety_terminal
-            && matched_sessions_before_error.is_none()
             && prior_lease_row_cleanup_error.is_none()
             && fleet_stop_error.is_none()
-            && live_sessions_after_error.is_none()
-            && audit_intent_error.is_none()
-            && spawn_activity_stable
-            && mcp_mutation_activity.quiescent
-            && mcp_mutation_activity.error.is_none()
-            && final_safety_sweep_error.is_none()
-            && final_safety_sweep
-                .as_ref()
-                .is_some_and(|sweep| sweep.terminal)
-            && chrome_extension_mutation_owners.terminal
-            && durable_browser_mutation_owners_terminal
-            && chrome_mutation_command_owners_terminal
-            && operator_panic_safety_after.pending
-            && !operator_panic_safety_after.accounting_incident
-            && operator_panic_k2_lease_retained(
-                immediate.operator_panic_generation,
-                operator_panic_safety_after.epoch,
-                operator_lease_generation_after,
-                &lease_after,
-            );
+            && live_sessions_after_error.is_none();
 
         let mut response = OperatorPanicKillAllResponse {
             immediate,
-            chrome_extension_mutation_owners,
-            durable_browser_mutation_owners_drain,
-            durable_browser_mutation_owners_after,
-            durable_browser_mutation_owners_terminal,
-            chrome_mutation_command_owners_drain,
-            chrome_mutation_command_owners_after,
-            chrome_mutation_command_owners_terminal,
             prior_lease_owner_session_id,
             prior_lease_row_cleanup,
             prior_lease_row_cleanup_error,
+            deferred_disable_report,
             matched_sessions_before,
             matched_sessions_before_error,
             fleet_stop,
             fleet_stop_error,
             operator_lease_cleared,
             lease_after,
-            operator_panic_safety_after,
             live_sessions_after,
             live_sessions_after_error,
-            spawn_activity_before,
-            spawn_activity_after,
-            spawn_activity_stable,
-            mcp_mutation_activity,
-            final_safety_sweep,
-            final_safety_sweep_error,
-            fleet_stop_rounds,
             all_stopped,
             audit_intent_error,
             audit_final_error: None,
         };
 
         let after = json!({
-            "source_of_truth": "synapse_action::lease + server::operator_panic_boundary MCP mutation registry + synapse_a11y durable browser-owner registry + Chrome debugger pending-command registry + extension chrome.storage.session durable-owner ledger/live readback + M1 CdpTargetOwner registry/CF_SESSIONS owner rows + CF_SESSIONS session lease row + session registry/agent_state + OS process table + reflex scheduler/emitter state + CF_ACTION_LOG",
+            "source_of_truth": "synapse_action::lease + CF_SESSIONS session lease row + session registry/agent_state + OS process table + CF_ACTION_LOG",
             "response": &response,
         });
         response.audit_final_error = self
@@ -3136,9 +2400,6 @@ impl SynapseService {
             )
             .err()
             .map(|error| error.message.to_string());
-        if response.audit_final_error.is_some() {
-            response.all_stopped = false;
-        }
 
         if response.audit_intent_error.is_some() || response.audit_final_error.is_some() {
             tracing::error!(
@@ -3157,17 +2418,6 @@ impl SynapseService {
                 .as_ref()
                 .is_some_and(|fleet| fleet.all_stopped),
             lease_after_held = response.lease_after.held,
-            mcp_mutation_activity_quiescent = response.mcp_mutation_activity.quiescent,
-            final_safety_sweep_terminal = response
-                .final_safety_sweep
-                .as_ref()
-                .is_some_and(|sweep| sweep.terminal),
-            chrome_extension_mutation_owners_terminal =
-                response.chrome_extension_mutation_owners.terminal,
-            durable_browser_mutation_owners_terminal =
-                response.durable_browser_mutation_owners_terminal,
-            chrome_mutation_command_owners_terminal =
-                response.chrome_mutation_command_owners_terminal,
             all_stopped = response.all_stopped,
             "operator hotkey K2 fleet kill completed"
         );
@@ -3277,35 +2527,24 @@ impl SynapseService {
             .map(|summary| format_teardown_failure_error(&teardown_report, summary));
         let teardown = Some(teardown_report);
 
-        // Source of truth for "is it dead": re-read the OS process table.
-        let mut process_after = process_readback_for_target(&target);
-        let mut orphan_process_ids =
-            merged_live_process_ids(&process_before.process_tree_ids, &process_after);
-        let post_teardown_force_termination = if orphan_process_ids.is_empty() {
-            None
-        } else {
-            Some(crate::m4::terminate_owned_process_ids(&orphan_process_ids))
-        };
-        if post_teardown_force_termination.is_some() {
-            process_after = process_readback_for_target(&target);
-            orphan_process_ids =
-                merged_live_process_ids(&process_before.process_tree_ids, &process_after);
-        }
+        // Source of truth for "is it dead": re-read the OS process table. The
+        // readback, termination (5 s exit polls) and artifact write block, so
+        // they run off the async workers (#212).
+        let post_kill = post_teardown_kill_off_worker(
+            target.clone(),
+            process_before.clone(),
+            process_readback_for_target,
+            crate::m4::terminate_owned_process_ids,
+        )
+        .await?;
+        let PostTeardownKill {
+            process_after,
+            orphan_process_ids,
+            post_teardown_force_termination,
+            completion_artifact_cleanup_status,
+            completion_artifact_cleanup_error,
+        } = post_kill;
         let killed = orphan_process_ids.is_empty();
-        let (completion_artifact_cleanup_status, completion_artifact_cleanup_error) =
-            if killed && post_teardown_force_termination.is_some() {
-                match write_agent_kill_restart_completion_artifact(
-                    &target,
-                    &process_before,
-                    &orphan_process_ids,
-                    post_teardown_force_termination.as_ref(),
-                ) {
-                    Ok(status) => (Some(status), None),
-                    Err(error) => (None, Some(error)),
-                }
-            } else {
-                (None, None)
-            };
 
         let response = AgentKillResponse {
             requested_id: lookup,
@@ -3526,19 +2765,19 @@ impl SynapseService {
         } else {
             let service = self.clone();
             let worker_session_id = session_id.to_owned();
-            let outcome_session_id = worker_session_id.clone();
-            let caller_session = caller_session.map(ToOwned::to_owned);
-            match tokio::task::spawn_blocking(move || {
+            let worker_caller = caller_session.map(ToOwned::to_owned);
+            let interrupted = tokio::task::spawn_blocking(move || {
                 service.agent_interrupt_impl(
                     AgentInterruptParams {
                         session_id: worker_session_id,
                     },
-                    caller_session.as_deref(),
+                    worker_caller.as_deref(),
                 )
             })
             .await
-            {
-                Ok(Ok(interrupt)) => FleetStopAgentOutcome {
+            .unwrap_or_else(|error| Err(blocking_worker_join_error(TOOL_FLEET_STOP, &error)));
+            match interrupted {
+                Ok(interrupt) => FleetStopAgentOutcome {
                     session_id: interrupt.session_id,
                     spawn_id: interrupt.spawn_id,
                     agent_kind: interrupt.agent_kind,
@@ -3548,22 +2787,12 @@ impl SynapseService {
                         .unwrap_or_else(|| "no_channel_delivered".to_owned()),
                     surviving_process_ids: Vec::new(),
                 },
-                Ok(Err(error)) => FleetStopAgentOutcome {
-                    session_id: outcome_session_id,
+                Err(error) => FleetStopAgentOutcome {
+                    session_id: session_id.to_owned(),
                     spawn_id: None,
                     agent_kind: "unknown".to_owned(),
                     ok: false,
                     reason: error.message.to_string(),
-                    surviving_process_ids: Vec::new(),
-                },
-                Err(error) => FleetStopAgentOutcome {
-                    session_id: outcome_session_id,
-                    spawn_id: None,
-                    agent_kind: "unknown".to_owned(),
-                    ok: false,
-                    reason: blocking_worker_join_error(TOOL_FLEET_STOP, error)
-                        .message
-                        .to_string(),
                     surviving_process_ids: Vec::new(),
                 },
             }
@@ -3728,6 +2957,39 @@ impl SynapseService {
     }
 }
 
+/// The prior agent's process as respawn found it (#308).
+#[derive(Debug)]
+enum PriorProcess {
+    /// No live process is left in its recorded process tree.
+    Gone,
+    /// `agent_kill` stopped it and read back zero remaining processes.
+    Killed,
+    /// `agent_kill` failed or left processes behind.
+    KillFailed(String),
+    /// The registry says the agent is dead, yet its recorded PID runs: it may
+    /// be a reused PID, so respawn neither kills it nor trusts it is gone.
+    Unconfirmed,
+}
+
+/// Respawn may launch a new copy only when the prior process is confirmed
+/// gone (already gone, or killed with zero processes left); otherwise it is
+/// refused, naming the prior PID, so two copies never run.
+fn respawn_prior_gone(prior_pid: u32, prior: &PriorProcess) -> Result<(), ErrorData> {
+    let reason = match prior {
+        PriorProcess::Gone | PriorProcess::Killed => return Ok(()),
+        PriorProcess::KillFailed(detail) => format!("killing it failed: {detail}"),
+        PriorProcess::Unconfirmed => "the agent is recorded dead but that PID is still running \
+             (possibly reused); it was not killed. Stop it with agent_kill or check the PID"
+            .to_owned(),
+    };
+    Err(mcp_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!(
+            "AGENT_RESPAWN_PRIOR_NOT_STOPPED: no new copy was launched; prior PID {prior_pid}: {reason}"
+        ),
+    ))
+}
+
 fn process_readback_for_target(target: &ResolvedAgent) -> ProcessReadback {
     if target.launcher_process_id == 0 {
         return ProcessReadback {
@@ -3874,7 +3136,9 @@ fn write_agent_kill_restart_completion_artifact(
     let final_message_len_before = spawn_file_len(&final_message_path);
     let stdout_len = spawn_file_len(&stdout_path);
     let stderr_len = spawn_file_len(&stderr_path);
-    let (stdout_line_count, last_stdout_event_type) = spawn_stdout_summary(&stdout_path);
+    // #212: the streaming summary, not a whole-file read of stdout.jsonl.
+    let (stdout_line_count, last_stdout_event_type) =
+        super::session_lifecycle::stdout_summary(&stdout_path);
     let status = "agent_kill_forced_after_daemon_restart";
     let error_message =
         "spawned agent was force-killed after daemon restart without a live process job handle";
@@ -3992,31 +3256,82 @@ fn spawn_file_len(path: &PathBuf) -> u64 {
     fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
-fn spawn_stdout_summary(path: &PathBuf) -> (u64, Option<String>) {
-    let Ok(stdout) = fs::read(path) else {
-        return (0, None);
+/// Result of the blocking post-teardown kill readback (#212).
+struct PostTeardownKill {
+    process_after: ProcessReadback,
+    orphan_process_ids: Vec<u32>,
+    post_teardown_force_termination: Option<crate::m4::OwnedProcessTerminationReadback>,
+    completion_artifact_cleanup_status: Option<String>,
+    completion_artifact_cleanup_error: Option<String>,
+}
+
+/// Blocking: re-reads the process table, force-terminates survivors, and
+/// writes the restart completion artifact when a force-kill finished the job.
+/// Runs [`post_teardown_kill`] on the blocking pool so its process-table reads
+/// and exit polls never park an async worker (#212). The readback and
+/// terminate steps are passed in so the off-worker property is testable.
+async fn post_teardown_kill_off_worker<Readback, Terminate>(
+    target: ResolvedAgent,
+    process_before: ProcessReadback,
+    readback: Readback,
+    terminate: Terminate,
+) -> Result<PostTeardownKill, ErrorData>
+where
+    Readback: Fn(&ResolvedAgent) -> ProcessReadback + Send + 'static,
+    Terminate: Fn(&[u32]) -> crate::m4::OwnedProcessTerminationReadback + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        post_teardown_kill(&target, &process_before, &readback, &terminate)
+    })
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("agent_kill post-teardown readback task failed: {error}"),
+        )
+    })
+}
+
+fn post_teardown_kill(
+    target: &ResolvedAgent,
+    process_before: &ProcessReadback,
+    readback: &dyn Fn(&ResolvedAgent) -> ProcessReadback,
+    terminate: &dyn Fn(&[u32]) -> crate::m4::OwnedProcessTerminationReadback,
+) -> PostTeardownKill {
+    let mut process_after = readback(target);
+    let mut orphan_process_ids =
+        merged_live_process_ids(&process_before.process_tree_ids, &process_after);
+    let post_teardown_force_termination = if orphan_process_ids.is_empty() {
+        None
+    } else {
+        Some(terminate(&orphan_process_ids))
     };
-    let stdout = String::from_utf8_lossy(&stdout);
-    let mut line_count = 0;
-    let mut last_event_type = None;
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        line_count += 1;
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if let Some(event_type) = value.get("type").and_then(Value::as_str) {
-                last_event_type = Some(event_type.to_owned());
-            } else if let Some(event_type) = value
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(Value::as_str)
-            {
-                last_event_type = Some(event_type.to_owned());
-            }
-        }
+    if post_teardown_force_termination.is_some() {
+        process_after = readback(target);
+        orphan_process_ids =
+            merged_live_process_ids(&process_before.process_tree_ids, &process_after);
     }
-    (line_count, last_event_type)
+    let (completion_artifact_cleanup_status, completion_artifact_cleanup_error) =
+        if orphan_process_ids.is_empty() && post_teardown_force_termination.is_some() {
+            match write_agent_kill_restart_completion_artifact(
+                target,
+                process_before,
+                &orphan_process_ids,
+                post_teardown_force_termination.as_ref(),
+            ) {
+                Ok(status) => (Some(status), None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {
+            (None, None)
+        };
+    PostTeardownKill {
+        process_after,
+        orphan_process_ids,
+        post_teardown_force_termination,
+        completion_artifact_cleanup_status,
+        completion_artifact_cleanup_error,
+    }
 }
 
 fn summarize_teardown_failures(
@@ -4251,7 +3566,7 @@ fn run_codex_interrupt_helper(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<Output, String> {
-    let mut command = Command::new("powershell.exe");
+    let mut command = crate::m4::child_environment::internal_helper_command("powershell.exe");
     apply_hidden_helper_window_flags(&mut command);
     let mut child = command
         .args([
@@ -4321,7 +3636,7 @@ fn run_codex_steer_helper(
     turn_id: &str,
     instruction: &str,
 ) -> Result<Output, String> {
-    let mut command = Command::new("powershell.exe");
+    let mut command = crate::m4::child_environment::internal_helper_command("powershell.exe");
     apply_hidden_helper_window_flags(&mut command);
     let mut child = command
         .args([
@@ -4396,6 +3711,110 @@ fn compact_for_channel_reason(value: &str) -> String {
     }
 }
 
+/// Rebuilds a direct spawn request from the prior spawn record (#308). A stored
+/// `model_ref` is carried only for `local_model`; older claude/codex records that
+/// stored it beside `model` keep only `model`. Unset fields take serde defaults.
+fn respawn_request_from_record(record: &RespawnManifest, prompt: &str) -> Result<Value, ErrorData> {
+    let Some(cli_token) = spawn_cli_serde_token(&record.agent_kind) else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "AGENT_RESPAWN_KIND_UNSUPPORTED: prior spawn manifest reports agent kind {:?}, which is not a respawnable CLI",
+                record.agent_kind
+            ),
+        ));
+    };
+    let mut request = json!({
+        "cli": cli_token,
+        "prompt": prompt,
+    });
+    if let Some(model) = &record.model {
+        request["model"] = json!(model);
+    }
+    if cli_token == "local_model"
+        && let Some(model_ref) = &record.model_ref
+    {
+        request["model_ref"] = json!(model_ref);
+    }
+    if let Some(working_dir) = &record.working_dir {
+        request["working_dir"] = json!(working_dir);
+    }
+    Ok(request)
+}
+
+/// Reads the runtime settings a spawn recorded in its `spawn-manifest.json`
+/// (written by `build_spawn_manifest`). A missing or mistyped field stays
+/// `None`; nothing is guessed (#308).
+fn respawn_settings_from_manifest(manifest: &Value) -> RespawnSettings {
+    RespawnSettings {
+        mcp_url: manifest
+            .get("mcp_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned),
+        require_approval_gate: manifest
+            .get("require_approval_gate")
+            .and_then(Value::as_bool),
+        wait_timeout_ms: manifest.get("wait_timeout_ms").and_then(Value::as_u64),
+        hold_open_ms: manifest.get("hold_open_ms").and_then(Value::as_u64),
+        target: manifest
+            .get("target")
+            .filter(|target| !target.is_null())
+            .and_then(|target| serde_json::from_value(target.clone()).ok()),
+    }
+}
+
+/// The full respawn request (#308 row 308l): the prior spawn's identity from
+/// [`respawn_request_from_record`] plus every runtime setting it recorded,
+/// unchanged. Only the prompt is new. Unrecorded settings are omitted so the
+/// spawn applies its own rule (an omitted `mcp_url` means this daemon's bind).
+fn respawn_request(
+    identity: &RespawnManifest,
+    settings: &RespawnSettings,
+    prompt: &str,
+) -> Result<Value, ErrorData> {
+    let mut request = respawn_request_from_record(identity, prompt)?;
+    if let Some(mcp_url) = &settings.mcp_url {
+        request["mcp_url"] = json!(mcp_url);
+    }
+    if let Some(require_approval_gate) = settings.require_approval_gate {
+        request["require_approval_gate"] = json!(require_approval_gate);
+    }
+    if let Some(wait_timeout_ms) = settings.wait_timeout_ms {
+        request["wait_timeout_ms"] = json!(wait_timeout_ms);
+    }
+    if let Some(hold_open_ms) = settings.hold_open_ms {
+        request["hold_open_ms"] = json!(hold_open_ms);
+    }
+    if let Some(target) = &settings.target {
+        request["target"] = json!(target);
+    }
+    Ok(request)
+}
+
+/// Bind used only to validate a respawn request that records no `mcp_url`.
+/// Validity never depends on the bind (an omitted url always resolves to a
+/// well-formed `http://<bind>/mcp`); the spawn itself resolves against the
+/// daemon's real bind. Port 0 is unconnectable, so it can never be dialled.
+const RESPAWN_VALIDATION_BIND: &str = "127.0.0.1:0";
+
+/// Validates a rebuilt respawn request with the same rule as a direct spawn,
+/// plus respawn's own requirement of a recorded working dir. Pure: runs before
+/// anything is killed (#308).
+fn validate_respawn_request(request: &ActSpawnAgentRequest) -> Result<(), ErrorData> {
+    if request.working_dir.is_none() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_RESPAWN_WORKING_DIR_MISSING: the prior spawn has no recorded working_dir",
+        ));
+    }
+    request
+        .clone()
+        .into_direct_spawn_params(RESPAWN_VALIDATION_BIND)
+        .map(drop)
+}
+
 /// Maps a stored agent-kind token (manifest/registry, which may use the
 /// `local-model` hyphen form from `ActSpawnAgentCli::as_str`) to the canonical
 /// serde token the spawn request deserializes (`snake_case`). `None` for kinds
@@ -4468,7 +3887,10 @@ fn dashboard_json_readback(value: impl Serialize) -> Result<Value, ErrorData> {
     })
 }
 
-fn blocking_worker_join_error(tool: &str, error: tokio::task::JoinError) -> ErrorData {
+/// Error for a control handler whose blocking-pool worker panicked or was
+/// cancelled (the handlers run their process-table/helper work off the async
+/// runtime, upstream 21341566).
+fn blocking_worker_join_error(tool: &str, error: &tokio::task::JoinError) -> ErrorData {
     mcp_error(
         error_codes::TOOL_INTERNAL_ERROR,
         format!("{tool}: blocking worker join failed: {error}"),
@@ -4485,3 +3907,18 @@ fn validate_lookup_id(session_id: &str, tool: &str) -> Result<String, ErrorData>
     }
     Ok(trimmed.to_owned())
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "agent_respawn_table.rs"]
+mod respawn_table;
+
+#[cfg(test)]
+#[path = "agent_respawn_request_table.rs"]
+mod respawn_request_table;
+
+#[cfg(test)]
+#[path = "agent_respawn_settings_table.rs"]
+mod respawn_settings_table;

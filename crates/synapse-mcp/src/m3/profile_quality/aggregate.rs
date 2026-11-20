@@ -1138,5 +1138,5 @@ fn bounded_label(value: &str) -> String {
 }
 
 fn is_log_event_kind(kind: &str) -> bool {
-    kind.starts_with("runtime.log.") || kind.contains(".log.")
+    kind.starts_with("everquest.log.")
 }

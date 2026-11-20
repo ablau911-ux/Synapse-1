@@ -31,6 +31,7 @@ Thumbs.db
 
 .env
 .env.*
+**/bridge-auth.json
 !.env.example
 
 synapse.log
@@ -68,3 +69,7 @@ tracing-*.log
 # dirty git status. The script itself IS committed; its run products are not.
 /synapse-update-*.log
 /synapse-update.log
+
+# Python probe bytecode caches (tests/probe, scripts)
+__pycache__/
+*.pyc

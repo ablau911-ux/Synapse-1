@@ -1,0 +1,43 @@
+{
+  "id": "edge",
+  "label": "Microsoft Edge",
+  "family": "chromium",
+  "process_names": ["msedge.exe"],
+  "legacy_chromium_process_names": [],
+  "exe_path_markers": ["\\Microsoft\\Edge\\Application\\"],
+  "exe_candidates": [
+    "%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe"
+  ],
+  "app_paths_name": "msedge.exe",
+  "user_data_root": "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",
+  "profile_layout": "multi",
+  "window_title_suffixes": [" - Microsoft\u200b Edge", " - Microsoft Edge"],
+  "tab_target_prefix": "edge-tab:",
+  "endpoint_base": "synapse-bridge://edge",
+  "health_key": "edge_bridge",
+  "registration_token_file": "browser-bridge-token-edge.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "edge://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "browser-extension\\edge"
+  },
+  "policy": {
+    "root": "Software\\Policies\\Microsoft\\Edge",
+    "extension_settings_value": "ExtensionSettings"
+  },
+  "native_messaging_cleanup_roots": [
+    "Software\\Microsoft\\Edge\\NativeMessagingHosts",
+    "Software\\Wow6432Node\\Microsoft\\Edge\\NativeMessagingHosts"
+  ],
+  "protected_extension_ids": [],
+  "cdp_product_tokens": ["Edg/"],
+  "unsupported_capabilities": [],
+  "debugger_api_expected": true,
+  "install_ui": {
+    "developer_mode_names": ["Developer mode"],
+    "load_unpacked_names": ["Load unpacked"]
+  },
+  "winget_id": "Microsoft.Edge"
+}

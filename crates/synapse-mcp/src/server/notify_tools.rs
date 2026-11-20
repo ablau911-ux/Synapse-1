@@ -93,8 +93,11 @@ pub struct NotifyHumanParams {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NotifyHumanResponse {
-    /// True when a new toast was raised; false when deduped.
+    /// True when a new toast was raised.
     pub shown: bool,
+    /// Why delivery was skipped by daemon configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_reason: Option<String>,
     /// True when an existing toast with the same dedupe_key suppressed this one.
     pub deduped: bool,
     /// AUMID the toast was raised under.
@@ -105,9 +108,8 @@ pub struct NotifyHumanResponse {
     /// Action Center group shared by Synapse toasts.
     pub group: String,
     /// Windows notification setting at send time: "enabled", or
-    /// "unavailable_first_use" when the per-app notification record did not
-    /// exist yet (only before the first-ever Synapse toast; Windows creates
-    /// it on first Show). Every disabled state is a distinct error instead.
+    /// "unavailable_first_use" before Windows creates a per-app record.
+    /// "not_checked" means daemon configuration skipped delivery.
     pub notification_setting: String,
     /// True when the toast was read back from Action Center history after
     /// Show — physical delivery proof, not an assumption.
@@ -145,6 +147,8 @@ pub(crate) struct ToastCleanupReport {
     pub already_absent: u32,
     pub failed: u32,
     pub outcomes: Vec<ToastRemovalOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppressed_reason: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 }
@@ -183,6 +187,7 @@ impl ToastCleanupReport {
             already_absent: 0,
             failed: 0,
             outcomes: Vec::new(),
+            suppressed_reason: None,
             error_code: Some(error_codes::NOTIFY_UNSUPPORTED_PLATFORM.to_owned()),
             error_message: Some(
                 "toast history cleanup requires Windows notification support".to_owned(),
@@ -234,6 +239,7 @@ impl NotifyFailure {
 
 struct ToastOutcome {
     shown: bool,
+    suppressed_reason: Option<&'static str>,
     deduped: bool,
     history_count: u32,
     /// Real `ToastNotifier.Setting()` readback: "enabled", or
@@ -303,6 +309,8 @@ fn validate_params(params: &NotifyHumanParams) -> Result<(), ErrorData> {
 pub fn toast_tag_for(dedupe_key: Option<&str>) -> String {
     match dedupe_key {
         Some(key) => {
+            // #174 structural exemption: dedupe_key is a caller-assigned
+            // notification identity; the title/body content is never hashed.
             let digest = Sha256::digest(key.as_bytes());
             let mut tag = String::with_capacity(35);
             tag.push_str("dk-");
@@ -478,7 +486,7 @@ mod windows_toast {
     /// Per-call CoInitializeEx/CoUninitialize on pooled threads is NOT safe
     /// here: tearing down the last MTA invalidates windows-rs's process-wide
     /// cached activation factories, and the next toast call then dies with an
-    /// access violation that kills the daemon (observed during manual FSV; same reason
+    /// access violation that kills the daemon (observed in FSV; same reason
     /// synapse-a11y routes UIA through a dedicated COM worker thread).
     static NOTIFY_WORKER: OnceLock<Result<mpsc::Sender<NotifyCommand>, String>> = OnceLock::new();
     static LIVE_ACTIVATION_SUBSCRIPTIONS: OnceLock<Mutex<Vec<LiveActivationSubscription>>> =
@@ -489,6 +497,8 @@ mod windows_toast {
         std::thread::Builder::new()
             .name("synapse-notify".to_owned())
             .spawn(move || {
+                // SAFETY: runs once on the dedicated worker thread that owns COM for the daemon
+                // lifetime; the reserved argument is None and a failure is recorded in `com_error`.
                 let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
                 let com_error = com
                     .is_err()
@@ -642,6 +652,9 @@ mod windows_toast {
         let subkey_wide = wide_null(AUMID_SUBKEY);
         let value_wide = wide_null(DISPLAY_NAME_VALUE);
         let mut key = HKEY::default();
+        // SAFETY: `subkey_wide` is a live NUL-terminated UTF-16 buffer and `key` is a live local
+        // out-param, both outliving the call; the null class, security and disposition arguments
+        // are allowed.
         let status = unsafe {
             RegCreateKeyExW(
                 HKEY_CURRENT_USER,
@@ -665,9 +678,13 @@ mod windows_toast {
             ));
         }
         let display_wide = wide_null(SYNAPSE_NOTIFY_DISPLAY_NAME);
+        // SAFETY: `display_wide` is a live Vec<u16>; viewing its `len * 2` bytes as u8 stays in
+        // bounds with align 1, and the slice does not outlive the Vec.
         let display_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(display_wide.as_ptr().cast::<u8>(), display_wide.len() * 2)
         };
+        // SAFETY: `key` was opened by the successful RegCreateKeyExW above (status checked);
+        // `value_wide` and `display_bytes` borrow live buffers that outlive the call.
         let status = unsafe {
             RegSetValueExW(
                 key,
@@ -677,6 +694,7 @@ mod windows_toast {
                 Some(display_bytes),
             )
         };
+        // SAFETY: `key` is the handle opened above and still open; this is its only close.
         let close_status = unsafe { RegCloseKey(key) };
         if status != ERROR_SUCCESS {
             return Err(NotifyFailure::new(
@@ -721,6 +739,9 @@ mod windows_toast {
         let value_wide = wide_null(DISPLAY_NAME_VALUE);
         let mut value_type = REG_VALUE_TYPE::default();
         let mut byte_len = 0_u32;
+        // SAFETY: `subkey_wide` and `value_wide` are live NUL-terminated UTF-16 buffers (the value
+        // name may be null); `value_type` and `byte_len` are live locals; the null data pointer
+        // only asks for the size.
         let status = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
@@ -736,6 +757,8 @@ mod windows_toast {
             return None;
         }
         let mut buffer = vec![0_u16; (byte_len as usize).div_ceil(2)];
+        // SAFETY: same live pointers as the size query; `buffer` holds `byte_len.div_ceil(2)` u16s,
+        // enough for the byte count the size query returned, and `byte_len` reports that capacity.
         let status = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
@@ -869,6 +892,7 @@ mod windows_toast {
             already_absent: 0,
             failed: 0,
             outcomes: Vec::new(),
+            suppressed_reason: None,
             error_code: Some(code.to_owned()),
             error_message: Some(message.into()),
         }
@@ -920,6 +944,7 @@ mod windows_toast {
             already_absent: 0,
             failed: 0,
             outcomes: Vec::new(),
+            suppressed_reason: None,
             error_code: None,
             error_message: None,
         };
@@ -1112,6 +1137,7 @@ mod windows_toast {
             if existing > 0 {
                 return Ok(ToastOutcome {
                     shown: false,
+                    suppressed_reason: None,
                     deduped: true,
                     history_count: existing,
                     notification_setting,
@@ -1182,6 +1208,7 @@ mod windows_toast {
             if count > 0 {
                 return Ok(ToastOutcome {
                     shown: true,
+                    suppressed_reason: None,
                     deduped: false,
                     history_count: count,
                     notification_setting,
@@ -1275,19 +1302,6 @@ mod windows_toast {
 }
 
 #[cfg(not(windows))]
-async fn send_toast_for_platform(
-    _params: NotifyHumanParams,
-    _tag: String,
-    _actions: Vec<ToastAction>,
-    _activation_callback: Option<ToastActivationCallback>,
-) -> Result<ToastOutcome, NotifyFailure> {
-    Err(NotifyFailure::new(
-        error_codes::NOTIFY_UNSUPPORTED_PLATFORM,
-        "notify_human requires Windows toast notification support",
-    ))
-}
-
-#[cfg(not(windows))]
 async fn remove_toast_for_platform(tag: String) -> ToastRemovalOutcome {
     ToastRemovalOutcome::unsupported(tag)
 }
@@ -1299,14 +1313,35 @@ async fn cleanup_escalation_orphans_for_platform(
     ToastCleanupReport::unsupported()
 }
 
-#[cfg(windows)]
 async fn send_toast_for_platform(
     params: NotifyHumanParams,
     tag: String,
     actions: Vec<ToastAction>,
     activation_callback: Option<ToastActivationCallback>,
 ) -> Result<ToastOutcome, NotifyFailure> {
-    windows_toast::send_toast(params, tag, actions, activation_callback).await
+    if let Some(reason) = desktop_toasts_config_suppressed_reason() {
+        return Ok(ToastOutcome {
+            shown: false,
+            suppressed_reason: Some(reason),
+            deduped: false,
+            history_count: 0,
+            notification_setting: "not_checked".to_owned(),
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        windows_toast::send_toast(params, tag, actions, activation_callback).await
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (params, tag, actions, activation_callback);
+        Err(NotifyFailure::new(
+            error_codes::NOTIFY_UNSUPPORTED_PLATFORM,
+            "notify_human requires Windows toast notification support",
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -1316,8 +1351,52 @@ async fn remove_toast_for_platform(tag: String) -> ToastRemovalOutcome {
 
 #[cfg(windows)]
 async fn cleanup_escalation_orphans_for_platform(preserve_tags: Vec<String>) -> ToastCleanupReport {
+    if let Some(reason) = desktop_toasts_config_suppressed_reason() {
+        return ToastCleanupReport {
+            aumid: SYNAPSE_AUMID.to_owned(),
+            group: SYNAPSE_TOAST_GROUP.to_owned(),
+            status: "skipped".to_owned(),
+            scanned: 0,
+            candidates: 0,
+            preserved_open: 0,
+            removed: 0,
+            already_absent: 0,
+            failed: 0,
+            outcomes: Vec::new(),
+            suppressed_reason: Some(reason.to_owned()),
+            error_code: None,
+            error_message: None,
+        };
+    }
     windows_toast::cleanup_escalation_orphans(preserve_tags).await
 }
+
+/// Per-daemon knob (#313): `off`/`false`/`0`/`no` (any case, trimmed) silences every
+/// desktop toast this daemon would raise; unset or any other value keeps toasts on.
+const DESKTOP_TOASTS_ENV: &str = "SYNAPSE_DESKTOP_TOASTS";
+
+/// Suppression reason recorded when `SYNAPSE_DESKTOP_TOASTS` silences this daemon (#313).
+pub(crate) const DESKTOP_TOASTS_DISABLED_REASON: &str =
+    "desktop_toasts_disabled_by_config SYNAPSE_DESKTOP_TOASTS=off";
+
+/// Pure decision for the knob: the raw env value in, the suppression reason out.
+pub(crate) fn desktop_toasts_suppressed_reason(value: Option<&str>) -> Option<&'static str> {
+    let value = value?.trim();
+    ["off", "false", "0", "no"]
+        .iter()
+        .any(|disabled| value.eq_ignore_ascii_case(disabled))
+        .then_some(DESKTOP_TOASTS_DISABLED_REASON)
+}
+
+/// Reads this daemon's knob; the single place the environment is consulted.
+pub(crate) fn desktop_toasts_config_suppressed_reason() -> Option<&'static str> {
+    let value = std::env::var(DESKTOP_TOASTS_ENV).ok();
+    desktop_toasts_suppressed_reason(value.as_deref())
+}
+
+#[cfg(test)]
+#[path = "notify_desktop_toasts_table.rs"]
+mod desktop_toasts_table;
 
 async fn run_notify_human(params: NotifyHumanParams) -> Result<NotifyHumanResponse, ErrorData> {
     let tag = toast_tag_for(params.dedupe_key.as_deref());
@@ -1353,6 +1432,7 @@ pub(crate) async fn remove_orphaned_escalation_toasts(
         removed = report.removed,
         already_absent = report.already_absent,
         failed = report.failed,
+        suppressed_reason = report.suppressed_reason.as_deref().unwrap_or(""),
         error_code = report.error_code.as_deref().unwrap_or(""),
         "orphan escalation toast cleanup completed"
     );
@@ -1407,12 +1487,13 @@ async fn run_internal_toast_with_tag(
     );
     Ok(NotifyHumanResponse {
         shown: outcome.shown,
+        suppressed_reason: outcome.suppressed_reason.map(str::to_owned),
         deduped: outcome.deduped,
         aumid: SYNAPSE_AUMID.to_owned(),
         tag,
         group: SYNAPSE_TOAST_GROUP.to_owned(),
         notification_setting: outcome.notification_setting,
-        verified_in_history: true,
+        verified_in_history: outcome.history_count > 0,
         history_count: outcome.history_count,
     })
 }

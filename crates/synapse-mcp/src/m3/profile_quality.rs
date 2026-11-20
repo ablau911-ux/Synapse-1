@@ -10,6 +10,7 @@ use synapse_profiles::{ProfileError, ProfileRuntime, ProfileStatus};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, encode_json};
 
+use super::episodes::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
@@ -207,16 +208,6 @@ fn now_ns() -> u64 {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     u64::try_from(nanos).unwrap_or(u64::MAX)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn utf8_prefix(bytes: &[u8], max_chars: usize) -> String {

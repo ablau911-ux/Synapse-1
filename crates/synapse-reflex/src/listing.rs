@@ -7,9 +7,9 @@ use chrono::{DateTime, Utc};
 use synapse_core::{ReflexId, ReflexLifetime, ReflexState, ReflexStatus, StoredReflexAudit};
 use synapse_storage::{cf, decode_json};
 
+use crate::audit_state::audit_storage_error;
 use crate::{
-    DEFAULT_REFLEX_PRIORITY, REFLEX_FIRED_KIND, REFLEX_REGISTERED_KIND, ReflexError, ReflexResult,
-    ReflexRuntime,
+    DEFAULT_REFLEX_PRIORITY, REFLEX_FIRED_KIND, REFLEX_REGISTERED_KIND, ReflexResult, ReflexRuntime,
 };
 
 impl ReflexRuntime {
@@ -17,12 +17,12 @@ impl ReflexRuntime {
     ///
     /// By default, terminal cancelled/expired statuses are hidden. When
     /// `include_expired` is set, terminal rows from `CF_REFLEX_AUDIT` are
-    /// merged back into the current runtime snapshot so cancelled/expired
-    /// reflexes remain inspectable after a daemon restart.
+    /// merged back into the current runtime snapshot. Targeted registrations
+    /// from earlier runs remain inspectable as disabled after a daemon restart.
     ///
     /// # Errors
     ///
-    /// Returns a [`ReflexError`] when the audit column family cannot be scanned
+    /// Returns a [`crate::ReflexError`] when the audit column family cannot be scanned
     /// or an audit row cannot be decoded.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", include_expired))]
     pub fn list(&self, include_expired: bool) -> ReflexResult<Vec<ReflexStatus>> {
@@ -55,7 +55,7 @@ impl ReflexRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a [`ReflexError`] when the audit column family cannot be scanned
+    /// Returns a [`crate::ReflexError`] when the audit column family cannot be scanned
     /// or an audit row cannot be decoded.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", reflex_id, limit))]
     pub fn history(
@@ -66,11 +66,9 @@ impl ReflexRuntime {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        self.db
-            .flush()
-            .map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("reflex audit flush before scan failed: {error}"),
-            })?;
+        self.db.flush().map_err(|error| {
+            crate::audit_state::audit_storage_error(&error, "reflex audit flush before scan")
+        })?;
 
         let rows = reflex_id
             .map_or_else(
@@ -80,19 +78,11 @@ impl ReflexRuntime {
                         .scan_cf_prefix(cf::CF_REFLEX_AUDIT, audit_key_prefix(reflex_id).as_bytes())
                 },
             )
-            .map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("reflex audit scan failed: {error}"),
-            })?;
+            .map_err(|error| audit_storage_error(&error, "reflex audit scan"))?;
 
         let mut audits = rows
             .into_iter()
-            .map(|(_key, value)| {
-                decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                    ReflexError::ParamsInvalid {
-                        detail: format!("reflex audit decode failed: {error}"),
-                    }
-                })
-            })
+            .map(|(_key, value)| decode_audit(&value))
             .collect::<Result<Vec<_>, _>>()?;
         audits.sort_by(|left, right| {
             right
@@ -106,21 +96,13 @@ impl ReflexRuntime {
     }
 
     pub(crate) fn terminal_statuses_from_audit(&self) -> ReflexResult<Vec<ReflexStatus>> {
-        let rows =
-            self.db
-                .scan_cf(cf::CF_REFLEX_AUDIT)
-                .map_err(|error| ReflexError::ParamsInvalid {
-                    detail: format!("reflex audit scan failed: {error}"),
-                })?;
+        let rows = self
+            .db
+            .scan_cf(cf::CF_REFLEX_AUDIT)
+            .map_err(|error| audit_storage_error(&error, "reflex audit scan"))?;
         let mut audits = rows
             .into_iter()
-            .map(|(_key, value)| {
-                decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                    ReflexError::ParamsInvalid {
-                        detail: format!("reflex audit decode failed: {error}"),
-                    }
-                })
-            })
+            .map(|(_key, value)| decode_audit(&value))
             .collect::<Result<Vec<_>, _>>()?;
         audits.sort_by_key(|audit| (audit.reflex_id.clone(), audit.ts_ns, audit.audit_id.clone()));
 
@@ -145,18 +127,10 @@ impl ReflexRuntime {
         let rows = self
             .db
             .scan_cf_prefix(cf::CF_REFLEX_AUDIT, audit_key_prefix(reflex_id).as_bytes())
-            .map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("reflex audit scan failed: {error}"),
-            })?;
+            .map_err(|error| audit_storage_error(&error, "reflex audit scan"))?;
         let mut audits = rows
             .into_iter()
-            .map(|(_key, value)| {
-                decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                    ReflexError::ParamsInvalid {
-                        detail: format!("reflex audit decode failed: {error}"),
-                    }
-                })
-            })
+            .map(|(_key, value)| decode_audit(&value))
             .collect::<Result<Vec<_>, _>>()?;
         audits.sort_by_key(|audit| (audit.ts_ns, audit.audit_id.clone()));
 
@@ -166,6 +140,10 @@ impl ReflexRuntime {
         }
         Ok(accumulator.into_terminal_status())
     }
+}
+
+fn decode_audit(value: &[u8]) -> ReflexResult<StoredReflexAudit> {
+    decode_json(value).map_err(|error| audit_storage_error(&error, "reflex audit decode"))
 }
 
 const fn is_non_terminal(state: ReflexState) -> bool {
@@ -183,6 +161,7 @@ struct AuditStatusAccumulator {
     priority: Option<u32>,
     lifetime: Option<ReflexLifetime>,
     exclusive: Option<bool>,
+    input_target: Option<synapse_core::types::StoredInputTarget>,
     last_fired_at: Option<DateTime<Utc>>,
     fire_count: u64,
     terminal: Option<StoredReflexAudit>,
@@ -197,6 +176,7 @@ impl AuditStatusAccumulator {
             priority: None,
             lifetime: None,
             exclusive: None,
+            input_target: None,
             last_fired_at: None,
             fire_count: 0,
             terminal: None,
@@ -212,6 +192,11 @@ impl AuditStatusAccumulator {
 
         if details_kind == Some(REFLEX_REGISTERED_KIND) {
             self.registered_at = Some(at);
+            self.input_target = audit
+                .details
+                .get("input_target")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
             self.update_common_fields(&audit);
         } else if details_kind == Some(REFLEX_FIRED_KIND) {
             self.last_fired_at = Some(at);
@@ -258,19 +243,37 @@ impl AuditStatusAccumulator {
     }
 
     fn into_terminal_status(self) -> Option<ReflexStatus> {
-        let terminal = self.terminal?;
-        let terminal_at = datetime_from_ts_ns(terminal.ts_ns);
+        // A non-terminal registration from an earlier run is listed only when it
+        // carried a stored target (#312), so that target stays readable.
+        let registered_at = if let Some(terminal) = &self.terminal {
+            self.registered_at
+                .unwrap_or_else(|| datetime_from_ts_ns(terminal.ts_ns))
+        } else {
+            self.input_target?;
+            self.registered_at?
+        };
         Some(ReflexStatus {
             id: self.reflex_id,
             kind_summary: self.kind_summary.unwrap_or_else(|| "unknown".to_owned()),
-            state: terminal.status,
-            registered_at: self.registered_at.unwrap_or(terminal_at),
+            state: self
+                .terminal
+                .as_ref()
+                .map_or(ReflexState::Disabled, |audit| audit.status),
+            registered_at,
             last_fired_at: self.last_fired_at,
             fire_count: self.fire_count,
             priority: self.priority.unwrap_or(DEFAULT_REFLEX_PRIORITY),
             lifetime: self.lifetime.unwrap_or_default(),
             exclusive: self.exclusive.unwrap_or(false),
-            last_error_code: terminal.error_code,
+            last_error: self.terminal.as_ref().and_then(|audit| {
+                audit
+                    .details
+                    .get("detail")
+                    .and_then(|detail| detail.as_str())
+                    .map(str::to_owned)
+            }),
+            last_error_code: self.terminal.and_then(|audit| audit.error_code),
+            input_target: self.input_target,
         })
     }
 }

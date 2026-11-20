@@ -4,8 +4,20 @@ use synapse_core::{ElementId, MouseButton, Point};
 use crate::ActionError;
 use crate::{ActionBackend, ActionResult, EmitState};
 
-#[cfg(windows)]
+#[cfg(test)]
+mod dispatch;
+#[cfg(any(test, windows))]
 mod resolver;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(all(test, windows))]
+#[path = "invoke/tests/click_dispatch_189.rs"]
+mod click_dispatch_189;
+#[cfg(all(test, windows))]
+#[path = "invoke/tests/window_gone_mapping_315.rs"]
+mod window_gone_mapping_315;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ElementClickOutcome {
@@ -92,47 +104,76 @@ pub fn invoke_element(element_id: &ElementId) -> ActionResult<()> {
 #[cfg(windows)]
 pub fn click_element_or_fallback<B>(
     element_id: &ElementId,
-    _backend: &B,
-    _state: &mut EmitState,
-    _button: MouseButton,
+    backend: &B,
+    state: &mut EmitState,
+    button: MouseButton,
 ) -> ActionResult<ElementClickOutcome>
 where
     B: ActionBackend,
 {
-    match synapse_a11y::click_element_action(element_id)
-        .map_err(|error| a11y_error_to_action(element_id, error))?
-    {
-        synapse_a11y::ElementClickAction::Invoked => Ok(ElementClickOutcome::Invoked),
+    click_element_or_fallback_with(
+        element_id,
+        backend,
+        state,
+        button,
+        synapse_a11y::click_element_action,
+    )
+}
+
+/// [`click_element_or_fallback`] with an injected element-click resolver in
+/// place of `synapse_a11y::click_element_action` (test seam). The resolver's
+/// error is mapped exactly as on the live path; no coordinate fallback runs.
+#[cfg(windows)]
+pub(crate) fn click_element_or_fallback_with<B, R>(
+    element_id: &ElementId,
+    _backend: &B,
+    _state: &mut EmitState,
+    _button: MouseButton,
+    click_element: R,
+) -> ActionResult<ElementClickOutcome>
+where
+    B: ActionBackend,
+    R: FnOnce(&ElementId) -> synapse_a11y::A11yResult<synapse_a11y::ElementClickAction>,
+{
+    let action =
+        click_element(element_id).map_err(|error| a11y_error_to_action(element_id, error))?;
+    Ok(element_click_outcome(action))
+}
+
+#[cfg(windows)]
+fn element_click_outcome(action: synapse_a11y::ElementClickAction) -> ElementClickOutcome {
+    match action {
+        synapse_a11y::ElementClickAction::Invoked => ElementClickOutcome::Invoked,
         synapse_a11y::ElementClickAction::Toggled {
             before_state,
             after_state,
-        } => Ok(ElementClickOutcome::Toggled {
+        } => ElementClickOutcome::Toggled {
             before_state,
             after_state,
-        }),
+        },
         synapse_a11y::ElementClickAction::Selected {
             was_selected,
             is_selected,
-        } => Ok(ElementClickOutcome::Selected {
+        } => ElementClickOutcome::Selected {
             was_selected,
             is_selected,
-        }),
+        },
         synapse_a11y::ElementClickAction::Expanded {
             before_state,
             after_state,
-        } => Ok(ElementClickOutcome::Expanded {
+        } => ElementClickOutcome::Expanded {
             before_state,
             after_state,
-        }),
+        },
         synapse_a11y::ElementClickAction::Collapsed {
             before_state,
             after_state,
-        } => Ok(ElementClickOutcome::Collapsed {
+        } => ElementClickOutcome::Collapsed {
             before_state,
             after_state,
-        }),
+        },
         synapse_a11y::ElementClickAction::LegacyDefaultAction { default_action } => {
-            Ok(ElementClickOutcome::LegacyDefaultAction { default_action })
+            ElementClickOutcome::LegacyDefaultAction { default_action }
         }
     }
 }
@@ -154,8 +195,14 @@ pub fn click_element_or_fallback<B>(
 where
     B: ActionBackend,
 {
-    Err(ActionError::BackendUnavailable {
-        detail: format!("UI Automation element click requires Windows for element {element_id}"),
+    // #189: refused before any dispatch; the UIA tier cannot run here.
+    Err(ActionError::ClickNotDispatched {
+        source: Box::new(ActionError::BackendUnavailable {
+            detail: format!(
+                "UI Automation element click requires Windows for element {element_id}"
+            ),
+        }),
+        tier_unavailable: true,
     })
 }
 
@@ -187,10 +234,33 @@ fn a11y_error_to_action(
     error: synapse_a11y::A11yError,
 ) -> crate::ActionError {
     let detail = error.to_string();
-    if stale_provider_failure(&detail) {
+    if !matches!(
+        &error,
+        synapse_a11y::A11yError::ClickDispatch { .. }
+            | synapse_a11y::A11yError::ClickNotDispatched { .. }
+            | synapse_a11y::A11yError::WindowNotFound { .. }
+    ) && stale_provider_failure(&detail)
+    {
         return resolver::transient_element_expired(element_id, detail);
     }
     match error {
+        synapse_a11y::A11yError::ClickDispatch { source, delivered } => {
+            crate::ActionError::ClickDispatch {
+                source: Box::new(a11y_error_to_action(element_id, *source)),
+                delivered,
+            }
+        }
+        synapse_a11y::A11yError::ClickNotDispatched { source } => {
+            // #189 U9: only a worker admission refusal means the tier could not run.
+            let tier_unavailable = matches!(
+                &*source,
+                synapse_a11y::A11yError::UiaWorkerTimeout { phase, .. } if !phase.job_sent()
+            );
+            crate::ActionError::ClickNotDispatched {
+                source: Box::new(a11y_error_to_action(element_id, *source)),
+                tier_unavailable,
+            }
+        }
         synapse_a11y::A11yError::ElementStale { .. } => {
             resolver::transient_element_expired(element_id, detail)
         }
@@ -200,12 +270,17 @@ fn a11y_error_to_action(
         }
         synapse_a11y::A11yError::ElementValueReadOnly { .. }
         | synapse_a11y::A11yError::ElementNotEnabled { .. }
+        | synapse_a11y::A11yError::OptionRefused { .. }
         | synapse_a11y::A11yError::CdpUnreachable { .. }
         | synapse_a11y::A11yError::CdpAttachFailed { .. }
         | synapse_a11y::A11yError::CdpAxtreeFailed { .. }
         | synapse_a11y::A11yError::BrowserWaitTimeout { .. }
-        | synapse_a11y::A11yError::CdpEvaluateTimeout { .. }
+        | synapse_a11y::A11yError::CdpStrokeTimeout { .. }
+        | synapse_a11y::A11yError::UiaWorkerReplyLost { .. }
         | synapse_a11y::A11yError::Internal { .. } => resolver::target_invalid(detail),
+        synapse_a11y::A11yError::WindowNotFound { detail } => {
+            crate::ActionError::WindowNotFound { detail }
+        }
         synapse_a11y::A11yError::InvalidElementId { .. }
         | synapse_a11y::A11yError::NoForeground { .. } => resolver::element_not_resolved(detail),
         synapse_a11y::A11yError::NotAvailable { detail } => {
@@ -216,9 +291,6 @@ fn a11y_error_to_action(
         }
         synapse_a11y::A11yError::ForegroundActivationRefused { .. } => {
             crate::ActionError::ForegroundActivationRefused { detail }
-        }
-        synapse_a11y::A11yError::HumanFullscreenForeground { .. } => {
-            crate::ActionError::HumanFullscreenForeground { detail }
         }
     }
 }

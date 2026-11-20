@@ -22,3 +22,7 @@ const DEFAULT_ARTIFACT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_ARTIFACT_MAX_RECORDS: usize = 5_000;
 const MAX_ARTIFACT_RECORDS: usize = 50_000;
+
+#[cfg(test)]
+#[path = "tests/audit_pagination_84.rs"]
+mod audit_pagination_84_tests;

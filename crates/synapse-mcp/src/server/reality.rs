@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
+use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -19,8 +19,8 @@ use synapse_perception::ObservationAssembler;
 use synapse_storage::cf;
 
 use super::{
-    Json, ObserveParams, Parameters, SynapseService, current_input, observe_include,
-    populate_audio_summary, populate_clipboard_summary, populate_fs_recent, tool, tool_router,
+    Json, ObserveParams, Parameters, SynapseService, observe_include, populate_audio_summary,
+    populate_clipboard_summary, populate_fs_recent, tool, tool_router,
 };
 use crate::{
     m1::{ObserveSlot, mcp_error},
@@ -37,6 +37,8 @@ const DEFAULT_MAX_DELTAS: u32 = 64;
 const MAX_DEPTH: u32 = 6;
 const MAX_ELEMENTS: usize = 500;
 const MAX_DELTAS: u32 = 256;
+/// Prefix of keyed content digests persisted in reality rows (#136).
+const KEYED_HASH_PREFIX: &str = "hmac-sha256:";
 const UIA_STRUCTURE_COALESCE_THRESHOLD: usize = 8;
 const UIA_STRUCTURE_ID_CAP: usize = 32;
 const SCHEMA_VERSION: u32 = 1;
@@ -463,7 +465,7 @@ impl SynapseService {
             force_new_epoch = params.0.force_new_epoch,
             "tool.invocation kind=reality_baseline"
         );
-        self.require_reality_write_permissions(REALITY_BASELINE_TOOL)?;
+        self.require_m3_permissions(REALITY_BASELINE_TOOL, &required_reality_write_permissions())?;
         let response = self.capture_or_read_reality_baseline(&params.0)?;
         Ok(Json(response))
     }
@@ -482,7 +484,7 @@ impl SynapseService {
             since_seq = ?params.0.since_seq,
             "tool.invocation kind=observe_delta"
         );
-        self.require_reality_write_permissions(OBSERVE_DELTA_TOOL)?;
+        self.require_m3_permissions(OBSERVE_DELTA_TOOL, &required_reality_write_permissions())?;
         let response = self.observe_reality_delta(params.0)?;
         Ok(Json(response))
     }
@@ -501,68 +503,13 @@ impl SynapseService {
             assumption_hash = ?params.0.assumption_hash,
             "tool.invocation kind=reality_audit"
         );
-        self.require_reality_write_permissions(REALITY_AUDIT_TOOL)?;
+        self.require_m3_permissions(REALITY_AUDIT_TOOL, &required_reality_write_permissions())?;
         let response = self.audit_reality(&params.0)?;
         Ok(Json(response))
     }
 }
 
 impl SynapseService {
-    /// Reality-write permission gate (#1559). Passes when EITHER the startup M3
-    /// grants already include the reality-write set OR a non-expired runtime
-    /// `reality_write_grant` overlay is active. The overlay is scoped to exactly
-    /// the reality-write permission set and is consulted ONLY here, so it never
-    /// widens authority for any other tool. The generic `require_m3_permissions`
-    /// path is unchanged for every non-reality tool. Fail-closed: any lock
-    /// failure or unmet permission denies.
-    pub(super) fn require_reality_write_permissions(
-        &self,
-        tool: &'static str,
-    ) -> Result<(), ErrorData> {
-        let required = required_reality_write_permissions();
-        let mut state = self.m3_state.lock().map_err(|_err| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "M3 service state lock poisoned",
-            )
-        })?;
-        // Active runtime overlay satisfies the whole reality-write set. This
-        // check also clears an expired overlay so refusal is restored cleanly.
-        if state.reality_write_grant_active() {
-            let remaining_ms = state
-                .reality_write_grant_snapshot()
-                .map(|snapshot| snapshot.remaining_ms);
-            drop(state);
-            tracing::info!(
-                code = "REALITY_WRITE_OVERLAY_ALLOWED",
-                tool,
-                remaining_ms = ?remaining_ms,
-                "reality-write permitted via active runtime overlay (#1559)"
-            );
-            return Ok(());
-        }
-        let missing = state.permission_grants.first_missing(&required);
-        let config_source = state.permission_grants_source;
-        let effective_grants = state.permission_grants.names().join(", ");
-        drop(state);
-        if let Some(missing) = missing {
-            tracing::warn!(
-                code = error_codes::SAFETY_PERMISSION_DENIED,
-                tool,
-                missing_permission = missing.as_str(),
-                config_source,
-                "reality-write denied: no startup grant and no active runtime overlay (#1559)"
-            );
-            return Err(reality_write_authorization_error(
-                tool,
-                missing,
-                config_source,
-                &effective_grants,
-            ));
-        }
-        Ok(())
-    }
-
     fn capture_or_read_reality_baseline(
         &self,
         params: &RealityBaselineParams,
@@ -573,9 +520,12 @@ impl SynapseService {
             .map(validate_key_segment)
             .transpose()?;
         let mut captured_for_new_baseline = None;
+        let mut replaces_undecodable_head = false;
         if !params.force_new_epoch && params.epoch_id.is_none() {
             if let Some(profile_key) = requested_profile_key.as_deref() {
-                if let Some(head) = self.read_reality_head(profile_key)? {
+                let lookup = self.lookup_reality_head(profile_key)?;
+                replaces_undecodable_head = lookup.is_undecodable();
+                if let Some(head) = lookup.into_head() {
                     return self.existing_baseline_response(head);
                 }
             } else {
@@ -586,7 +536,9 @@ impl SynapseService {
                     "reality_baseline",
                 )?;
                 let profile = select_profile(None, &captured.observation)?;
-                if let Some(head) = self.read_reality_head(&profile.profile_key)? {
+                let lookup = self.lookup_reality_head(&profile.profile_key)?;
+                replaces_undecodable_head = lookup.is_undecodable();
+                if let Some(head) = lookup.into_head() {
                     return self.existing_baseline_response(head);
                 }
                 captured_for_new_baseline = Some((captured, profile));
@@ -641,10 +593,10 @@ impl SynapseService {
             size_bytes: baseline.size_bytes,
             size_estimate_tokens: baseline.size_estimate_tokens,
         };
-        let baseline_readback =
-            self.write_kv_json_readback(&baseline_row_key, &baseline, "reality baseline row")?;
-        let head_readback =
-            self.write_kv_json_readback(&head_key(&profile_key), &head, "reality head row")?;
+        let readback_rows = self.write_reality_rows(&[
+            (baseline_row_key, reality_row_value(&baseline)?),
+            (head_key(&profile_key), reality_row_value(&head)?),
+        ])?;
         Ok(RealityBaselineResponse {
             ok: true,
             created: true,
@@ -652,11 +604,18 @@ impl SynapseService {
             baseline,
             baseline_required: false,
             rebase_required: false,
-            reason: Some("new_baseline_captured".to_owned()),
+            reason: Some(
+                if replaces_undecodable_head {
+                    "head_row_undecodable_rebuilt"
+                } else {
+                    "new_baseline_captured"
+                }
+                .to_owned(),
+            ),
             size_bytes: head.size_bytes,
             size_estimate_tokens: head.size_estimate_tokens,
             head,
-            readback_rows: vec![baseline_readback, head_readback],
+            readback_rows,
         })
     }
 
@@ -712,11 +671,33 @@ impl SynapseService {
             captured_before_head = Some((captured, profile));
             profile_key
         };
-        let Some(mut head) = self.read_reality_head(&head_profile_key)? else {
+        let stored_lookup = self.lookup_reality_head(&head_profile_key)?;
+        let stored_head_undecodable = stored_lookup.is_undecodable();
+        let stored_head = stored_lookup.into_head();
+        // A watch whose epoch belongs to another profile's head is a profile
+        // switch, not a missing baseline (ref #156).
+        if let Some(epoch) = requested_since_epoch.as_deref()
+            && stored_head.as_ref().is_none_or(|row| row.epoch_id != epoch)
+            && let Some(previous) = self.find_reality_head_by_epoch(epoch, &head_profile_key)?
+        {
+            let since_seq = params.since_seq.unwrap_or(previous.baseline_seq);
+            return Ok(profile_changed_response(
+                &previous,
+                since_seq,
+                &head_profile_key,
+            ));
+        }
+        let Some(mut head) = stored_head else {
+            let reason = if stored_head_undecodable {
+                format!("missing_baseline: {UNDECODABLE_HEAD_REASON}")
+            } else {
+                "missing_baseline".to_owned()
+            };
             return Ok(missing_baseline_response(
                 head_profile_key,
                 requested_since_epoch,
                 params.since_seq,
+                &reason,
             ));
         };
         if let Some(epoch) = requested_since_epoch.as_deref()
@@ -757,25 +738,11 @@ impl SynapseService {
             (captured, profile)
         };
         if profile.profile_key != head.profile_key {
-            return Ok(ObserveDeltaResponse {
-                ok: true,
-                profile_key: Some(head.profile_key.clone()),
-                epoch_id: Some(head.epoch_id.clone()),
-                from_seq: Some(since_seq),
-                to_seq: Some(head.head_seq),
-                deltas: Vec::new(),
-                cursor: Some(cursor(&head, head.head_seq, false)),
-                baseline_required: false,
-                rebase_required: true,
-                reason: Some(format!(
-                    "profile_changed: head profile {} but observed {}",
-                    head.profile_key, profile.profile_key
-                )),
-                readback_rows: Vec::new(),
-                published_sse_events: 0,
-                size_bytes: 0,
-                size_estimate_tokens: 0,
-            });
+            return Ok(profile_changed_response(
+                &head,
+                since_seq,
+                &profile.profile_key,
+            ));
         }
 
         let max_deltas = bounded_max_deltas(params.max_deltas)?;
@@ -839,29 +806,23 @@ impl SynapseService {
                     });
                 }
             }
-            let mut last_seq = head.head_seq;
-            for pending in pending_deltas {
-                let row_key = pending.row_key;
-                let delta = pending.delta;
-                last_seq = delta.seq;
-                let readback =
-                    self.write_kv_json_readback(&row_key, &delta, "reality delta row")?;
-                write_readbacks.push(readback);
-                self.publish_reality_delta(&head.profile_key, &row_key, &delta);
-                published_sse_events = published_sse_events.saturating_add(1);
+            let mut rows = Vec::with_capacity(pending_deltas.len() + 1);
+            for pending in &pending_deltas {
+                rows.push((pending.row_key.clone(), reality_row_value(&pending.delta)?));
+                head.head_seq = pending.delta.seq;
             }
-            head.head_seq = last_seq;
             head.compact_state_hash = captured.compact_state_hash;
             head.updated_at = Utc::now();
             head.compact_state = captured.compact_state;
             head.source_refs = captured.source_refs;
             head.size_bytes = captured.size_bytes;
             head.size_estimate_tokens = captured.size_estimate_tokens;
-            write_readbacks.push(self.write_kv_json_readback(
-                &head_key(&head.profile_key),
-                &head,
-                "reality head row",
-            )?);
+            rows.push((head_key(&head.profile_key), reality_row_value(&head)?));
+            write_readbacks.extend(self.write_reality_rows(&rows)?);
+            for pending in &pending_deltas {
+                self.publish_reality_delta(&head.profile_key, &pending.row_key, &pending.delta);
+                published_sse_events = published_sse_events.saturating_add(1);
+            }
         }
 
         let (mut deltas, mut read_readbacks, has_more) =
@@ -906,7 +867,9 @@ impl SynapseService {
         )?;
         let profile = select_profile(params.profile_id.as_deref(), &captured.observation)?;
         let profile_key = profile.profile_key;
-        let head = self.read_reality_head(&profile_key)?;
+        let head_lookup = self.lookup_reality_head(&profile_key)?;
+        let head_undecodable = head_lookup.is_undecodable();
+        let head = head_lookup.into_head();
         if let Some(expected_epoch) = params.epoch_id.as_deref() {
             validate_key_segment(expected_epoch)?;
         }
@@ -954,7 +917,13 @@ impl SynapseService {
             drift_items,
             physical_source_refs: captured.source_refs,
             rebase_required,
-            rebase_reason: rebase_required.then(|| rebase_reason(baseline_status, drift_status)),
+            rebase_reason: rebase_required.then(|| {
+                if head_undecodable {
+                    UNDECODABLE_HEAD_REASON.to_owned()
+                } else {
+                    rebase_reason(baseline_status, drift_status)
+                }
+            }),
             follow_up_refs: Vec::new(),
         };
         let row_key = audit_row_key(&profile_key, &audit_id);
@@ -986,6 +955,32 @@ impl SynapseService {
         })
     }
 
+    fn reality_target_hwnd(&self) -> Result<Option<i64>, ErrorData> {
+        let session_id = crate::http::current_mcp_session_id();
+        if let Some(session_id) = session_id.as_deref()
+            && matches!(
+                super::agent_scope::lookup(session_id)?,
+                super::agent_scope::TargetLookup::Agent(None)
+                    | super::agent_scope::TargetLookup::AgentsActive
+            )
+        {
+            return Err(mcp_error(
+                error_codes::TARGET_NOT_SET,
+                "reality requires the agent's bound target; refusing foreground fallback",
+            ));
+        }
+        match self.session_target(session_id.as_deref())? {
+            Some(super::SessionTarget::Window { hwnd }) => Ok(Some(hwnd)),
+            Some(super::SessionTarget::Cdp { cdp_target_id, .. }) => Err(mcp_error(
+                error_codes::TARGET_CDP_UNRESOLVED,
+                format!(
+                    "reality cannot observe CDP target {cdp_target_id:?} through window perception; use target-specific browser readback"
+                ),
+            )),
+            None => Ok(None),
+        }
+    }
+
     fn capture_reality_observation(
         &self,
         include: &[ObserveSlot],
@@ -995,18 +990,11 @@ impl SynapseService {
     ) -> Result<CapturedReality, ErrorData> {
         let depth = bounded_depth(depth)?;
         let max_elements = bounded_max_elements(max_elements)?;
-        let params = ObserveParams {
-            include: include.to_vec(),
-            depth: Some(depth),
-            max_elements: Some(max_elements),
-            element_offset: None,
-            subtree_root: None,
-            since_event_seq: None,
-            window_hwnd: None,
-        };
+        let params = reality_observe_params(include, depth, max_elements);
         let include = observe_include(&params);
+        let target_hwnd = self.reality_target_hwnd()?;
         let state = self.m1_state()?;
-        let mut input = current_input(&state, depth)?;
+        let mut input = crate::m1::observe_input(&state, &params, target_hwnd)?;
         if include.fs && input.fs_recent.is_empty() {
             let _ = populate_fs_recent(&mut input, &state.fs_recent_tracker);
         }
@@ -1019,6 +1007,9 @@ impl SynapseService {
             let _ = populate_clipboard_summary(&mut input);
         }
         self.resolve_input_profile_and_hud(&mut input, include.hud);
+        if include.events {
+            self.populate_everquest_log_events(&mut input);
+        }
         let observation = ObservationAssembler::new()
             .assemble(include, input)
             .map_err(|err| mcp_error(err.code(), err.to_string()))?;
@@ -1026,7 +1017,6 @@ impl SynapseService {
         state.last_observed_foreground = Some(observation.foreground.clone());
         drop(state);
         self.persist_observation(&observation, reason)?;
-
         let compact_state = compact_state(&observation)?;
         let compact_state_hash = hash_json(&compact_state)?;
         let source_refs = source_refs_for_observation(&observation)?;
@@ -1041,7 +1031,7 @@ impl SynapseService {
         })
     }
 
-    fn read_reality_head(&self, profile_key: &str) -> Result<Option<RealityHeadRow>, ErrorData> {
+    fn lookup_reality_head(&self, profile_key: &str) -> Result<HeadLookup, ErrorData> {
         let key = head_key(profile_key);
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_| {
@@ -1054,10 +1044,44 @@ impl SynapseService {
             .storage_kv_row(key.as_bytes())
             .map_err(|error| mcp_error(error.code(), error.to_string()))?
         else {
-            return Ok(None);
+            return Ok(HeadLookup::Absent);
         };
         drop(runtime);
-        decode_json_row(&bytes, "reality head row").map(Some)
+        Ok(
+            decode_head_row(&key, &bytes).map_or(HeadLookup::Undecodable, |head| {
+                HeadLookup::Present(Box::new(head))
+            }),
+        )
+    }
+
+    /// Finds the stored head (other than `excluding_profile_key`) that owns
+    /// `epoch_id`, so a delta poll after a profile switch can be recognised.
+    fn find_reality_head_by_epoch(
+        &self,
+        epoch_id: &str,
+        excluding_profile_key: &str,
+    ) -> Result<Option<RealityHeadRow>, ErrorData> {
+        let rows = {
+            let runtime = self.reflex_runtime()?;
+            let runtime = runtime.lock().map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "reflex runtime lock poisoned while scanning reality head rows",
+                )
+            })?;
+            runtime
+                .storage_cf_prefix_rows(cf::CF_KV, head_key("").as_bytes(), usize::MAX)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        };
+        for (key, bytes) in rows {
+            let Some(head) = decode_head_row(&String::from_utf8_lossy(&key), &bytes) else {
+                continue;
+            };
+            if head.epoch_id == epoch_id && head.profile_key != excluding_profile_key {
+                return Ok(Some(head));
+            }
+        }
+        Ok(None)
     }
 
     fn read_baseline_row(&self, row_key: &str) -> Result<RealityBaseline, ErrorData> {
@@ -1129,6 +1153,32 @@ impl SynapseService {
         Ok((deltas, readbacks, false))
     }
 
+    fn write_reality_rows(
+        &self,
+        rows: &[(String, Value)],
+    ) -> Result<Vec<RealityRowReadback>, ErrorData> {
+        let runtime = self.reflex_runtime()?;
+        let runtime = runtime.lock().map_err(|_| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "reflex runtime lock poisoned while writing reality transition",
+            )
+        })?;
+        write_reality_rows_with(
+            rows,
+            |batch| {
+                runtime
+                    .storage_put_kv_rows(batch)
+                    .map_err(|error| mcp_error(error.code(), error.to_string()))
+            },
+            |key| {
+                runtime
+                    .storage_kv_row(key)
+                    .map_err(|error| mcp_error(error_codes::STORAGE_READ_FAILED, error.to_string()))
+            },
+        )
+    }
+
     fn write_kv_json_readback<T>(
         &self,
         key: &str,
@@ -1153,12 +1203,7 @@ impl SynapseService {
         })?;
         runtime
             .storage_put_kv_rows(vec![(key.as_bytes().to_vec(), encoded)])
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_WRITE_FAILED,
-                    format!("write {label}: {error}"),
-                )
-            })?;
+            .map_err(|error| mcp_error(error.code(), format!("write {label}: {error}")))?;
         let stored = runtime
             .storage_kv_row(key.as_bytes())
             .map_err(|error| {
@@ -1254,7 +1299,7 @@ fn compact_state(observation: &Observation) -> Result<CompactRealityState, Error
             CompactHudReading {
                 parsed: serde_json::to_value(&reading.parsed)
                     .map_err(|error| encode_value_error(&error))?,
-                raw_text_sha256: non_empty_hash(&reading.raw_text),
+                raw_text_sha256: non_empty_keyed_hash(&reading.raw_text),
                 confidence_milli: confidence_milli(reading.confidence),
                 stale_ms: reading.stale_ms,
             },
@@ -1267,8 +1312,8 @@ fn compact_state(observation: &Observation) -> Result<CompactRealityState, Error
             hwnd: observation.foreground.hwnd,
             pid: observation.foreground.pid,
             process_name: observation.foreground.process_name.clone(),
-            process_path_sha256: non_empty_hash(&observation.foreground.process_path),
-            window_title_sha256: non_empty_hash(&observation.foreground.window_title),
+            process_path_sha256: non_empty_keyed_hash(&observation.foreground.process_path),
+            window_title_sha256: non_empty_keyed_hash(&observation.foreground.window_title),
             window_bounds: serde_json::to_value(observation.foreground.window_bounds)
                 .map_err(|error| encode_value_error(&error))?,
             monitor_index: observation.foreground.monitor_index,
@@ -1302,14 +1347,17 @@ fn compact_state(observation: &Observation) -> Result<CompactRealityState, Error
 fn compact_focused(focused: &synapse_core::FocusedElement) -> Result<CompactFocused, ErrorData> {
     Ok(CompactFocused {
         element_id: focused.element_id.to_string(),
-        name_sha256: non_empty_hash(&focused.name),
+        name_sha256: non_empty_keyed_hash(&focused.name),
         role: focused.role.clone(),
         automation_id: focused.automation_id.clone(),
         bbox: serde_json::to_value(focused.bbox).map_err(|error| encode_value_error(&error))?,
         enabled: focused.enabled,
         patterns: compact_patterns(&focused.patterns),
-        value_sha256: focused.value.as_deref().and_then(non_empty_hash),
-        selected_text_sha256: focused.selected_text.as_deref().and_then(non_empty_hash),
+        value_sha256: focused.value.as_deref().and_then(non_empty_keyed_hash),
+        selected_text_sha256: focused
+            .selected_text
+            .as_deref()
+            .and_then(non_empty_keyed_hash),
     })
 }
 
@@ -1321,7 +1369,7 @@ fn compact_elements(observation: &Observation) -> Result<Vec<CompactElement>, Er
             Ok(CompactElement {
                 element_id: element.element_id.to_string(),
                 parent: element.parent.as_ref().map(ToString::to_string),
-                name_sha256: non_empty_hash(&element.name),
+                name_sha256: non_empty_keyed_hash(&element.name),
                 role: element.role.clone(),
                 automation_id: element.automation_id.clone(),
                 bbox: serde_json::to_value(element.bbox)
@@ -1348,7 +1396,7 @@ fn compact_hud_errors(observation: &Observation) -> BTreeMap<String, CompactHudE
                 name.clone(),
                 CompactHudError {
                     code: error.code.clone(),
-                    detail_sha256: non_empty_hash(&error.detail),
+                    detail_sha256: non_empty_keyed_hash(&error.detail),
                 },
             )
         })
@@ -1416,7 +1464,10 @@ fn compact_clipboard(observation: &Observation) -> Option<CompactClipboard> {
         CompactClipboard {
             formats,
             text_len: summary.text_len,
-            text_excerpt_sha256: summary.text_excerpt.as_deref().and_then(non_empty_hash),
+            text_excerpt_sha256: summary
+                .text_excerpt
+                .as_deref()
+                .and_then(non_empty_keyed_hash),
             redacted: summary.redacted,
         }
     })
@@ -1432,7 +1483,7 @@ fn compact_fs_recent(observation: &Observation) -> CompactFsRecent {
     CompactFsRecent {
         event_count: len_to_u32(observation.fs_recent.len()),
         latest: latest.map(|event| CompactFsEvent {
-            path_sha256: hash_bytes(event.path.as_bytes()),
+            path_sha256: keyed_hash_bytes(event.path.as_bytes()),
             kind: fs_event_kind_name(event.kind).to_owned(),
             size_bytes: event.size_bytes,
         }),
@@ -1480,9 +1531,9 @@ fn compact_events(observation: &Observation) -> CompactEventCursor {
             .data_excerpt
             .get("path")
             .and_then(Value::as_str)
-            .and_then(non_empty_hash)
+            .and_then(non_empty_keyed_hash)
             .or(log_path_sha256);
-        if !event.kind.ends_with(".log_cursor") {
+        if !event.kind.starts_with("everquest.log_cursor") {
             event_count = event_count.saturating_add(1);
             latest_non_cursor_kind = Some(event.kind.clone());
             latest_non_cursor_seq = Some(event.seq);
@@ -1530,7 +1581,7 @@ fn source_refs_for_observation(observation: &Observation) -> Result<Vec<SourceRe
                 "foreground process={} pid={} title_hash={}",
                 observation.foreground.process_name,
                 observation.foreground.pid,
-                non_empty_hash(&observation.foreground.window_title)
+                non_empty_keyed_hash(&observation.foreground.window_title)
                     .unwrap_or_else(|| "empty".to_owned())
             ),
         },
@@ -1538,7 +1589,7 @@ fn source_refs_for_observation(observation: &Observation) -> Result<Vec<SourceRe
             surface: RealitySourceSurface::Process,
             path: format!("pid:{}", observation.foreground.pid),
             offset: None,
-            hash: non_empty_hash(&observation.foreground.process_path),
+            hash: non_empty_keyed_hash(&observation.foreground.process_path),
             summary: format!("process {}", observation.foreground.process_name),
         },
     ];
@@ -1708,7 +1759,10 @@ fn clipboard_source_ref(observation: &Observation) -> Result<Option<SourceRef>, 
             hash: Some(hash_json(&json!({
                 "formats": clipboard.formats,
                 "text_len": clipboard.text_len,
-                "text_excerpt_sha256": clipboard.text_excerpt.as_deref().and_then(non_empty_hash),
+                "text_excerpt_sha256": clipboard
+                    .text_excerpt
+                    .as_deref()
+                    .and_then(non_empty_keyed_hash),
                 "redacted": clipboard.redacted,
             }))?),
             summary: format!(
@@ -2843,6 +2897,32 @@ fn push_change<T>(
     });
 }
 
+fn profile_changed_response(
+    head: &RealityHeadRow,
+    since_seq: u64,
+    observed_profile_key: &str,
+) -> ObserveDeltaResponse {
+    ObserveDeltaResponse {
+        ok: true,
+        profile_key: Some(head.profile_key.clone()),
+        epoch_id: Some(head.epoch_id.clone()),
+        from_seq: Some(since_seq),
+        to_seq: Some(head.head_seq),
+        deltas: Vec::new(),
+        cursor: Some(cursor(head, head.head_seq, false)),
+        baseline_required: false,
+        rebase_required: true,
+        reason: Some(format!(
+            "profile_changed: head profile {} but observed {observed_profile_key}",
+            head.profile_key
+        )),
+        readback_rows: Vec::new(),
+        published_sse_events: 0,
+        size_bytes: 0,
+        size_estimate_tokens: 0,
+    }
+}
+
 fn stale_epoch_response(
     head: &RealityHeadRow,
     requested_epoch: &str,
@@ -2873,6 +2953,7 @@ fn missing_baseline_response(
     profile_key: String,
     since_epoch: Option<String>,
     since_seq: Option<u64>,
+    reason: &str,
 ) -> ObserveDeltaResponse {
     ObserveDeltaResponse {
         ok: true,
@@ -2884,7 +2965,7 @@ fn missing_baseline_response(
         cursor: None,
         baseline_required: true,
         rebase_required: true,
-        reason: Some("missing_baseline".to_owned()),
+        reason: Some(reason.to_owned()),
         readback_rows: Vec::new(),
         published_sse_events: 0,
         size_bytes: 0,
@@ -3147,33 +3228,30 @@ fn audit_drift_status_and_items(
 }
 
 fn audit_source_unavailable(diagnostics: &CompactDiagnostics, include: &[ObserveSlot]) -> bool {
-    let default_include = include.is_empty();
-    let includes_a11y = default_include
-        || include.iter().any(|slot| {
-            matches!(
-                slot,
-                ObserveSlot::Focused
-                    | ObserveSlot::Elements
-                    | ObserveSlot::Hud
-                    | ObserveSlot::Diagnostics
-            )
-        });
-    let includes_capture = default_include
-        || include.iter().any(|slot| {
-            matches!(
-                slot,
-                ObserveSlot::Focused
-                    | ObserveSlot::Elements
-                    | ObserveSlot::Entities
-                    | ObserveSlot::Hud
-                    | ObserveSlot::Diagnostics
-            )
-        });
-    let includes_detection = default_include
-        || include
-            .iter()
-            .any(|slot| matches!(slot, ObserveSlot::Entities | ObserveSlot::Diagnostics));
-    let includes_audio = include
+    let slots = reality_observe_params(include, 0, 0).include;
+    let includes_a11y = slots.iter().any(|slot| {
+        matches!(
+            slot,
+            ObserveSlot::Focused
+                | ObserveSlot::Elements
+                | ObserveSlot::Hud
+                | ObserveSlot::Diagnostics
+        )
+    });
+    let includes_capture = slots.iter().any(|slot| {
+        matches!(
+            slot,
+            ObserveSlot::Focused
+                | ObserveSlot::Elements
+                | ObserveSlot::Entities
+                | ObserveSlot::Hud
+                | ObserveSlot::Diagnostics
+        )
+    });
+    let includes_detection = slots
+        .iter()
+        .any(|slot| matches!(slot, ObserveSlot::Entities | ObserveSlot::Diagnostics));
+    let includes_audio = slots
         .iter()
         .any(|slot| matches!(slot, ObserveSlot::Audio | ObserveSlot::Diagnostics));
 
@@ -3303,19 +3381,82 @@ fn len_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-fn non_empty_hash(value: &str) -> Option<String> {
+/// Keyed (HMAC-SHA256, per-install key) digest of user-derived text, trimmed.
+/// Plain SHA-256 of window titles / field values / element names is
+/// brute-forceable (#136); equality comparison is preserved because the key is
+/// stable per install.
+fn non_empty_keyed_hash(value: &str) -> Option<String> {
     let value = value.trim();
-    (!value.is_empty()).then(|| hash_bytes(value.as_bytes()))
+    (!value.is_empty()).then(|| keyed_hash_bytes(value.as_bytes()))
 }
 
+/// Keyed digest of a serialized structure. Used for every hash that covers
+/// observation content (focused values, element names, HUD text, event data).
 fn hash_json<T>(value: &T) -> Result<String, ErrorData>
 where
     T: Serialize,
 {
     let bytes = serde_json::to_vec(value).map_err(|error| encode_value_error(&error))?;
-    Ok(hash_bytes(&bytes))
+    Ok(keyed_hash_bytes(&bytes))
 }
 
+fn keyed_hash_bytes(bytes: &[u8]) -> String {
+    format!(
+        "{KEYED_HASH_PREFIX}{}",
+        crate::content_digest::keyed_digest_hex(bytes)
+    )
+}
+
+fn reality_row_value(row: &impl Serialize) -> Result<Value, ErrorData> {
+    serde_json::to_value(row).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("encode reality row: {error}"),
+        )
+    })
+}
+
+fn write_reality_rows_with(
+    rows: &[(String, Value)],
+    commit: impl FnOnce(Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), ErrorData>,
+    mut read: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, ErrorData>,
+) -> Result<Vec<RealityRowReadback>, ErrorData> {
+    let encoded = rows
+        .iter()
+        .map(|(key, value)| {
+            synapse_storage::encode_json(value)
+                .map(|bytes| (key.as_bytes().to_vec(), bytes))
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("encode reality row {key}: {error}"),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    commit(encoded)?;
+    rows.iter()
+        .map(|(key, _)| {
+            let stored = read(key.as_bytes())?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!("reality row missing after commit: {key}"),
+                )
+            })?;
+            Ok(RealityRowReadback {
+                cf_name: cf::CF_KV.to_owned(),
+                row_key: key.clone(),
+                value_len_bytes: stored.len() as u64,
+                value_sha256: hash_bytes(&stored),
+            })
+        })
+        .collect()
+}
+
+// Plain SHA-256 on purpose (#174): only the physical-row readbacks
+// (`value_sha256` of reality baseline/delta rows) use it. Those rows already
+// hold keyed digests instead of raw user content, so the row digest is
+// structural integrity evidence. Every path or text digest uses the keyed form.
 fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -3386,6 +3527,64 @@ fn head_key(profile_key: &str) -> String {
     format!("reality/head/v1/{profile_key}")
 }
 
+/// Why a profile must rebase when its stored head row cannot be decoded (#234).
+const UNDECODABLE_HEAD_REASON: &str =
+    "stored head row is undecodable; call reality baseline to rebuild it";
+
+/// A profile's stored head row as read by this build (#234).
+enum HeadLookup {
+    Present(Box<RealityHeadRow>),
+    Absent,
+    /// A row exists but this build cannot decode it; the profile must rebase.
+    Undecodable,
+}
+
+impl HeadLookup {
+    fn into_head(self) -> Option<RealityHeadRow> {
+        match self {
+            Self::Present(head) => Some(*head),
+            Self::Absent | Self::Undecodable => None,
+        }
+    }
+
+    const fn is_undecodable(&self) -> bool {
+        matches!(self, Self::Undecodable)
+    }
+}
+
+/// Decodes a stored head row. A row this build cannot decode (for example one
+/// written by another build with extra fields) is derived state: it is treated
+/// as absent, so its profile rebases and scans of other profiles keep working
+/// (#234).
+pub(super) fn decode_head_row(key: &str, bytes: &[u8]) -> Option<RealityHeadRow> {
+    const MAX_WARNED_REALITY_HEAD_KEYS: usize = 1024;
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    match serde_json::from_slice(bytes) {
+        Ok(head) => {
+            if let Ok(mut keys) = warned.lock() {
+                keys.remove(key);
+            }
+            Some(head)
+        }
+        Err(error) => {
+            let first = warned.lock().is_ok_and(|mut keys| {
+                keys.len() < MAX_WARNED_REALITY_HEAD_KEYS && keys.insert(key.to_owned())
+            });
+            if first {
+                tracing::warn!(
+                    code = "REALITY_HEAD_ROW_UNDECODABLE",
+                    key,
+                    %error,
+                    "reality head row is undecodable; treating it as absent so the profile rebases"
+                );
+            }
+            None
+        }
+    }
+}
+
 fn new_epoch_id() -> String {
     format!(
         "epoch-{:020}-{:010}",
@@ -3414,42 +3613,12 @@ fn json_pointer_segment(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
-pub(super) fn required_reality_write_permissions() -> RequiredPermissions {
+fn required_reality_write_permissions() -> RequiredPermissions {
     required([
         Permission::ReadStorage,
         Permission::WriteStorage,
         Permission::ReadEvents,
     ])
-}
-
-/// Actionable `SAFETY_PERMISSION_DENIED` for reality-write tools (#1559). Names
-/// the EXACT supported opt-ins — the startup `SYNAPSE_MCP_ALLOWED_PERMISSIONS`
-/// config (must list `WRITE_STORAGE`) and the runtime
-/// `profile operation=grant_reality_write` overlay — plus the config source
-/// currently in effect, and states that the `full_capability` facade profile is
-/// independent of M3 grants. Fail-closed: this is only ever built on a denial.
-fn reality_write_authorization_error(
-    tool: &str,
-    missing: Permission,
-    config_source: &str,
-    effective_grants: &str,
-) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!("tool {tool} requires permission {missing}"),
-        Some(json!({
-            "code": error_codes::SAFETY_PERMISSION_DENIED,
-            "tool": tool,
-            "missing_permission": missing.as_str(),
-            "effective_m3_grants": effective_grants,
-            "config_source": config_source,
-            "remediation": {
-                "startup_opt_in": "set SYNAPSE_MCP_ALLOWED_PERMISSIONS (env) or --allowed-permissions (CLI) to a list that includes WRITE_STORAGE (e.g. \"READ_STORAGE WRITE_STORAGE READ_EVENTS\") and restart the daemon",
-                "runtime_opt_in": "acquire the foreground input lease (act operation=lease_acquire), then call profile operation=grant_reality_write with confirm_break_glass=true and a non-empty reason; the grant is bounded-TTL, audited, and revocable via profile operation=revoke_reality_write",
-                "facade_profile_note": "the full_capability tool-visibility profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself",
-            },
-        })),
-    )
 }
 
 const fn default_false() -> bool {
@@ -3468,6 +3637,48 @@ const fn default_max_deltas() -> u32 {
     DEFAULT_MAX_DELTAS
 }
 
-const fn default_include() -> Vec<ObserveSlot> {
-    Vec::new()
+fn default_include() -> Vec<ObserveSlot> {
+    ObserveParams::default().include
 }
+
+fn reality_observe_params(
+    include: &[ObserveSlot],
+    depth: u32,
+    max_elements: usize,
+) -> ObserveParams {
+    ObserveParams {
+        // Serde supplies default slots only when include is omitted.
+        include: include.to_vec(),
+        depth: Some(depth),
+        max_elements: Some(max_elements),
+        ..ObserveParams::default()
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/reality_profile_switch_156.rs"]
+mod reality_profile_switch_156_tests;
+
+#[cfg(test)]
+#[path = "tests/reality_keyed_digests_136.rs"]
+mod reality_keyed_digests_136_tests;
+
+#[cfg(test)]
+#[path = "tests/reality_undecodable_head_234.rs"]
+mod reality_undecodable_head_234_tests;
+
+#[cfg(test)]
+#[path = "tests/reality_test_support.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "tests/reality_corrupt_warning_216.rs"]
+mod reality_corrupt_warning_216;
+
+#[cfg(test)]
+#[path = "tests/reality_atomic_rows_253.rs"]
+mod reality_atomic_rows_253;
+
+#[cfg(test)]
+#[path = "tests/reality_agent_scope_299.rs"]
+mod reality_agent_scope_299_tests;

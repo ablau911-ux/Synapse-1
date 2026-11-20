@@ -112,7 +112,7 @@ struct BindingSlot {
     armed_at_unix_ms: f64,
     page: Page,
     _browser: Browser,
-    handler_task: JoinHandle<()>,
+    handler_task: crate::cdp::CdpHandlerTask,
     listener_task: JoinHandle<()>,
 }
 
@@ -172,13 +172,13 @@ pub async fn binding_capture_add(
         return status_from_slot(&slot, name, false, binding_newly_added, false);
     }
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("binding capture connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let armed = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;

@@ -25,7 +25,7 @@ use crate::m1::mcp_error;
 
 use super::episodes::now_ts_ns;
 use super::permissions::{Permission, RequiredPermissions, required};
-use super::routines::{load_routine_record, validate_routine_id_param};
+use super::routines::{load_routine_record, unmined_routine_error, validate_routine_id_param};
 
 const PLAN_PREFIX: &str = "plan/v1/";
 const PLAN_RECORD_VERSION: u32 = 1;
@@ -258,21 +258,14 @@ pub fn compile_routine_plan(
 ) -> Result<RoutineCompilePlanResponse, ErrorData> {
     validate_routine_id_param("routine_compile_plan", &params.routine_id)?;
     let Some(routine) = load_routine_record(db, &params.routine_id)? else {
-        return Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "ROUTINE_NOT_MINED: routine_id {} is not in CF_ROUTINES; nothing to compile. Run \
-                 routine_mine, or routine_list to see what exists",
-                params.routine_id
-            ),
-        ));
+        return Err(unmined_routine_error(db, &params.routine_id, "compile"));
     };
     let plan = compile_plan(&routine, now_ts_ns());
 
     let stored = if params.store {
         if !db.pressure_permits_write(cf::CF_KV) {
             return Err(mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error_codes::STORAGE_WRITE_SHED,
                 format!(
                     "routine_compile_plan refused under disk pressure: pressure_level={:?}",
                     db.pressure_level()
@@ -289,7 +282,7 @@ pub fn compile_routine_plan(
         db.put_batch_pressure_bypass(cf::CF_KV, [(key, value)])
             .map_err(|error| {
                 mcp_error(
-                    error_codes::STORAGE_WRITE_FAILED,
+                    error.code(),
                     format!("failed to persist plan for {}: {error}", params.routine_id),
                 )
             })?;
@@ -322,9 +315,9 @@ pub fn compile_routine_plan(
 
 pub fn load_plan(db: &Arc<Db>, routine_id: &str) -> Result<Option<PlanDocument>, ErrorData> {
     let key = plan_key(routine_id);
-    let rows = db.scan_cf_prefix(cf::CF_KV, &key).map_err(storage_error)?;
-    match rows.into_iter().find(|(k, _)| k == &key) {
-        Some((_, value)) => {
+    let row = db.get_cf_exact(cf::CF_KV, &key).map_err(storage_error)?;
+    match row {
+        Some(value) => {
             let plan: PlanDocument = decode_json(&value).map_err(|error| {
                 mcp_error(
                     error_codes::STORAGE_CORRUPTED,

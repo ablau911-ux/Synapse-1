@@ -16,6 +16,19 @@ pub struct ActPostcondition {
     pub before_signature: Option<String>,
     pub after_signature: Option<String>,
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_window_observed: Option<RelatedWindowObservation>,
+}
+
+/// A newly inventoried foreground window with verified ownership, not causal attribution.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RelatedWindowObservation {
+    pub hwnd: i64,
+    pub pid: u32,
+    pub title: String,
+    pub target_hwnd: i64,
+    pub relationship: String,
 }
 
 pub const fn default_verify_timeout_ms() -> u32 {
@@ -24,6 +37,7 @@ pub const fn default_verify_timeout_ms() -> u32 {
 
 pub fn postcondition_not_requested(tool: &str, source_of_truth: &str) -> ActPostcondition {
     ActPostcondition {
+        related_window_observed: None,
         status: "not_requested".to_owned(),
         observed_delta: None,
         source_of_truth: Some(source_of_truth.to_owned()),
@@ -43,6 +57,7 @@ pub fn postcondition_observed_delta(
     detail: impl Into<String>,
 ) -> ActPostcondition {
     ActPostcondition {
+        related_window_observed: None,
         status: "observed_delta".to_owned(),
         observed_delta: Some(true),
         source_of_truth: Some(source_of_truth.to_owned()),
@@ -62,6 +77,7 @@ pub fn postcondition_target_window_closed(
     detail: impl Into<String>,
 ) -> ActPostcondition {
     ActPostcondition {
+        related_window_observed: None,
         status: "observed_delta".to_owned(),
         observed_delta: Some(true),
         source_of_truth: Some("target_window_liveness".to_owned()),
@@ -109,6 +125,64 @@ pub fn no_observed_delta_error(
             }
         })),
     )
+}
+
+/// Hint attached to a no-delta error whose input was already delivered (#218).
+pub const DELIVERED_NO_DELTA_RETRY_HINT: &str = "input was delivered but its effect was not observed; re-observe the target before acting again instead of retrying blindly";
+
+/// `no_observed_delta_error` for input that verifiably reached the target
+/// (#218): the action is delivered-but-unverified, not undelivered, so the
+/// error data says `delivered: true` and warns against a blind retry that could
+/// apply the action twice.
+pub fn delivered_no_observed_delta_error(
+    tool: &str,
+    source_of_truth: &str,
+    timeout_ms: u32,
+    before_signature: String,
+    after_signature: String,
+    readback: Value,
+) -> ErrorData {
+    mark_input_delivered(no_observed_delta_error(
+        tool,
+        source_of_truth,
+        timeout_ms,
+        before_signature,
+        after_signature,
+        readback,
+    ))
+}
+
+/// Marks a post-delivery verification failure (#189/#218): `delivered: true`
+/// plus the no-blind-retry hint, so a caller never repeats an action that
+/// already happened just because its effect was not seen.
+pub fn mark_input_delivered(mut error: ErrorData) -> ErrorData {
+    // #189: a marker is evidence; never drop it because the error had no data.
+    if let Value::Object(data) = error.data.get_or_insert_with(|| json!({})) {
+        data.insert("delivered".to_owned(), Value::Bool(true));
+        data.insert(
+            "retry_hint".to_owned(),
+            Value::String(DELIVERED_NO_DELTA_RETRY_HINT.to_owned()),
+        );
+    }
+    error
+}
+
+/// Hint attached to an error whose input may already have been delivered (#189).
+pub const POSSIBLY_DELIVERED_RETRY_HINT: &str = "the input may already have been delivered (the delivery call did not report back); re-observe the target before acting again instead of retrying blindly";
+
+/// Marks a failure after which delivery is unknown (#189), e.g. a UIA Invoke
+/// sent to the provider whose reply timed out (blocked on a modal dialog):
+/// `possibly_delivered: true` plus the no-blind-retry hint. It never sets
+/// `delivered: true`, which would claim a delivery nobody observed.
+pub fn mark_input_possibly_delivered(mut error: ErrorData) -> ErrorData {
+    if let Value::Object(data) = error.data.get_or_insert_with(|| json!({})) {
+        data.insert("possibly_delivered".to_owned(), Value::Bool(true));
+        data.insert(
+            "retry_hint".to_owned(),
+            Value::String(POSSIBLY_DELIVERED_RETRY_HINT.to_owned()),
+        );
+    }
+    error
 }
 
 pub fn postcondition_failed_error(
@@ -161,8 +235,10 @@ pub fn hash_json<T: Serialize>(value: &T) -> Result<String, ErrorData> {
     Ok(hex_encode(&Sha256::digest(bytes)))
 }
 
+/// Keyed (HMAC-SHA256, per-install key) digest of user content; see
+/// `crate::content_digest`. Not recomputable by clients.
 pub fn text_signature(value: &str) -> String {
-    hex_encode(&Sha256::digest(value.as_bytes()))
+    crate::content_digest::keyed_text_digest_hex(value)
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -174,3 +250,11 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+#[path = "tests/delivered_no_delta_218.rs"]
+mod delivered_no_delta_218_tests;
+
+#[cfg(test)]
+#[path = "tests/marker_without_data_271.rs"]
+mod marker_without_data_271_tests;

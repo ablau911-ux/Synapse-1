@@ -18,6 +18,10 @@ use synapse_core::{
 };
 use synapse_perception::ObservationInput;
 
+use super::find_cost::PerceptionPurpose;
+#[cfg(windows)]
+use super::find_cost::{capture_baseline_required, webview2_probe_required};
+
 pub const TIMELINE_CLIPBOARD_ENV: &str = "SYNAPSE_TIMELINE_CLIPBOARD";
 pub const TIMELINE_FILE_ACTIVITY_ENV: &str = "SYNAPSE_TIMELINE_FILE_ACTIVITY";
 const FS_WATCH_ROOT_ENV: &str = "SYNAPSE_FS_WATCH_ROOT";
@@ -35,6 +39,38 @@ const A11Y_UIA_WORKER_TIMEOUT: &str = synapse_core::error_codes::A11Y_UIA_WORKER
 const A11Y_TARGET_WINDOW_NO_UIA_CONTENT: &str = "A11Y_TARGET_WINDOW_NO_UIA_CONTENT";
 #[cfg(windows)]
 const A11Y_TARGET_WINDOW_SNAPSHOT_FAILED: &str = "A11Y_TARGET_WINDOW_SNAPSHOT_FAILED";
+#[cfg(windows)]
+const A11Y_TARGET_WINDOW_SNAPSHOT_TRUNCATED: &str = "A11Y_TARGET_WINDOW_SNAPSHOT_TRUNCATED";
+
+/// True for the sensor-status reason codes that mean "the accessibility view is
+/// partial" (as opposed to other degradations such as a focus-proxy rewrite).
+#[cfg(windows)]
+pub(super) fn is_a11y_coverage_reason(reason_code: &str) -> bool {
+    reason_code == A11Y_TARGET_WINDOW_SNAPSHOT_TRUNCATED
+        || reason_code == A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE
+        || reason_code == A11Y_TARGET_WINDOW_NO_UIA_CONTENT
+        || reason_code == A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE
+}
+
+/// True when a sparse-UIA verdict was provisional and an unblocked CDP page
+/// tree replaces it (an embedded WebView, or a CEF/Electron window whose UIA
+/// tree is only an empty render-host pane, #232).
+#[cfg(windows)]
+pub(super) fn cdp_tree_supersedes_sparse_uia(reason_code: &str) -> bool {
+    reason_code == A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE
+        || reason_code == A11Y_TARGET_WINDOW_NO_UIA_CONTENT
+}
+
+#[cfg(not(windows))]
+pub(super) const fn is_a11y_coverage_reason(_reason_code: &str) -> bool {
+    false
+}
+#[cfg(windows)]
+pub(super) const A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE: &str =
+    "A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE";
+#[cfg(windows)]
+const A11Y_VSCODE_TERMINAL_FOCUS_PROXY_NOT_TEXT_EDITABLE: &str =
+    "A11Y_VSCODE_TERMINAL_FOCUS_PROXY_NOT_TEXT_EDITABLE";
 #[cfg(windows)]
 const MINIMIZED_WINDOW_CAPTURE_PROBE_TIMEOUT_MS: u64 = 250;
 
@@ -121,6 +157,7 @@ pub fn synthetic_notepad_input() -> ObservationInput {
         input_backends: None,
         cdp: None,
         web_path: None,
+        target_window_frame: std::sync::OnceLock::new(),
     }
 }
 
@@ -192,7 +229,10 @@ fn clipboard_summary_from_text(text: &str) -> ClipboardSummary {
     ClipboardSummary {
         formats: vec!["text/plain".to_owned(), "text/unicode".to_owned()],
         text_len: Some(len_to_u32(text.chars().count())),
-        text_excerpt: Some(sha256_hex(text.as_bytes())),
+        text_excerpt: Some(format!(
+            "hmac-sha256:{}",
+            crate::content_digest::keyed_text_digest_hex(text)
+        )),
         redacted: true,
     }
 }
@@ -207,7 +247,10 @@ fn clipboard_timeline_sample_from_text(text: &str) -> Option<ClipboardTimelineSa
         formats: vec!["text/plain".to_owned(), "text/unicode".to_owned()],
         text_len,
         snippet,
-        text_sha256: sha256_hex(text.as_bytes()),
+        text_sha256: format!(
+            "hmac-sha256:{}",
+            crate::content_digest::keyed_text_digest_hex(text)
+        ),
     })
 }
 
@@ -549,27 +592,63 @@ fn node(sequence: u32, depth: u32, name: &str, role: &str, focused: bool) -> Acc
         patterns: Vec::new(),
         children_count: 0,
         depth,
+        control_state: None,
+    }
+}
+
+#[cfg(test)]
+fn foreground_with_bounds(window_bounds: Rect) -> ForegroundContext {
+    ForegroundContext {
+        hwnd: 0x1234,
+        pid: 44,
+        process_name: "notepad.exe".to_owned(),
+        process_path: "C:\\Windows\\System32\\notepad.exe".to_owned(),
+        window_title: "manual.txt - Notepad".to_owned(),
+        window_bounds,
+        monitor_index: 0,
+        dpi_scale: 1.0,
+        profile_id: None,
+        steam_appid: None,
+        is_fullscreen: false,
+        is_dwm_composed: true,
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub fn platform_input(_depth: u32, mode: PerceptionMode) -> Result<ObservationInput, ErrorData> {
+pub(super) fn platform_input(
+    _depth: u32,
+    mode: PerceptionMode,
+    _purpose: PerceptionPurpose,
+) -> Result<ObservationInput, ErrorData> {
     linux_x11::platform_input(mode)
 }
 
 #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
-pub fn platform_input(_depth: u32, _mode: PerceptionMode) -> Result<ObservationInput, ErrorData> {
+pub(super) fn platform_input(
+    _depth: u32,
+    _mode: PerceptionMode,
+    _purpose: PerceptionPurpose,
+) -> Result<ObservationInput, ErrorData> {
     Err(crate::m1::mcp_error(
         synapse_core::error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
         "UIA foreground window lookup requires Windows",
     ))
 }
 
-#[cfg(not(windows))]
 pub fn window_input_from_hwnd(
+    hwnd: i64,
+    depth: u32,
+    mode: PerceptionMode,
+) -> Result<ObservationInput, ErrorData> {
+    window_input_for_purpose(hwnd, depth, mode, PerceptionPurpose::Observe)
+}
+
+#[cfg(not(windows))]
+pub(super) fn window_input_for_purpose(
     _hwnd: i64,
     _depth: u32,
     _mode: PerceptionMode,
+    _purpose: PerceptionPurpose,
 ) -> Result<ObservationInput, ErrorData> {
     Err(crate::m1::mcp_error(
         synapse_core::error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
@@ -818,7 +897,11 @@ mod linux_x11 {
 }
 
 #[cfg(windows)]
-pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInput, ErrorData> {
+pub(super) fn platform_input(
+    depth: u32,
+    mode: PerceptionMode,
+    purpose: PerceptionPurpose,
+) -> Result<ObservationInput, ErrorData> {
     let foreground = synapse_a11y::current_foreground_context().map_err(|err| a11y_error(&err))?;
     let hwnd = foreground.hwnd;
     let tree = synapse_a11y::snapshot_window_from_hwnd(hwnd, depth).map_err(|err| {
@@ -833,16 +916,18 @@ pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInp
         foreground,
         mode,
         FocusSupplementScope::GlobalForeground,
+        purpose,
     )?;
     input.is_minimized = synapse_a11y::is_window_minimized(hwnd).unwrap_or(false);
     Ok(input)
 }
 
 #[cfg(windows)]
-pub fn window_input_from_hwnd(
+pub(super) fn window_input_for_purpose(
     hwnd: i64,
     depth: u32,
     mode: PerceptionMode,
+    purpose: PerceptionPurpose,
 ) -> Result<ObservationInput, ErrorData> {
     validate_live_target_hwnd(hwnd)?;
     let foreground = windows_foreground_context(hwnd)?;
@@ -854,6 +939,7 @@ pub fn window_input_from_hwnd(
                     foreground,
                     mode,
                     FocusSupplementScope::TargetWindow(hwnd),
+                    purpose,
                 )?;
                 input.is_minimized = true;
                 mark_sparse_minimized_target_a11y(&mut input);
@@ -882,7 +968,17 @@ pub fn window_input_from_hwnd(
                 )
             }
         };
-        populate_minimized_window_capture_probe(hwnd, &mut input);
+        // #302: observe always reports minimized capture health; a find pays
+        // for the probe only when its mode needs pixels.
+        if matches!(purpose, PerceptionPurpose::Observe)
+            || capture_baseline_required(
+                purpose,
+                mode == PerceptionMode::A11yOnly,
+                super::detection_needs_pixels(mode),
+            )
+        {
+            populate_minimized_window_capture_probe(hwnd, &mut input);
+        }
         return Ok(input);
     }
     let tree = match synapse_a11y::snapshot_window_from_hwnd(hwnd, depth) {
@@ -915,6 +1011,7 @@ pub fn window_input_from_hwnd(
         foreground,
         mode,
         FocusSupplementScope::TargetWindow(hwnd),
+        purpose,
     )?;
     input.is_minimized = false;
     mark_sparse_target_a11y(&mut input);
@@ -940,6 +1037,7 @@ pub fn element_input_from_id(
         foreground,
         mode,
         FocusSupplementScope::TargetWindow(hwnd),
+        PerceptionPurpose::Observe,
     )?;
     input.is_minimized = synapse_a11y::is_window_minimized(hwnd).unwrap_or(false);
     Ok(input)
@@ -1023,11 +1121,10 @@ fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInp
 
 #[cfg(windows)]
 fn mark_sparse_minimized_target_a11y(input: &mut ObservationInput) {
-    let has_accessible_content = input
-        .elements
-        .iter()
-        .any(|node| node.depth > 0 && !is_standard_window_chrome_node(node));
-    if has_accessible_content {
+    if !matches!(input.a11y_status, SensorStatus::Healthy) {
+        return;
+    }
+    if has_accessible_content(input) {
         return;
     }
     tracing::warn!(
@@ -1044,11 +1141,24 @@ fn mark_sparse_minimized_target_a11y(input: &mut ObservationInput) {
 
 #[cfg(windows)]
 fn mark_sparse_target_a11y(input: &mut ObservationInput) {
-    let has_accessible_content = input
-        .elements
-        .iter()
-        .any(|node| node.depth > 0 && !is_standard_window_chrome_node(node));
-    if has_accessible_content {
+    if !matches!(input.a11y_status, SensorStatus::Healthy) {
+        return;
+    }
+    if embedded_webview_content_is_incomplete(input) {
+        tracing::warn!(
+            code = A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE,
+            hwnd = input.foreground.hwnd,
+            title = %input.foreground.window_title,
+            process_name = %input.foreground.process_name,
+            "embedded WebView content is present but exposes fewer than three usable UIA nodes"
+        );
+        input.a11y_status = SensorStatus::DegradedSensorFailed {
+            reason_code: A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE.to_owned(),
+        };
+        input.web_path = Some(synapse_core::WebPerceptionPath::UiaOnly);
+        return;
+    }
+    if has_accessible_content(input) {
         return;
     }
     tracing::warn!(
@@ -1061,6 +1171,109 @@ fn mark_sparse_target_a11y(input: &mut ObservationInput) {
     input.a11y_status = SensorStatus::DegradedSensorFailed {
         reason_code: A11Y_TARGET_WINDOW_NO_UIA_CONTENT.to_owned(),
     };
+}
+
+/// Whether the snapshot holds any node below the window root that is neither
+/// standard window chrome nor an empty structural leaf.
+#[cfg(windows)]
+fn has_accessible_content(input: &ObservationInput) -> bool {
+    input.elements.iter().any(|node| {
+        node.depth > 0 && !is_standard_window_chrome_node(node) && !is_empty_structural_leaf(node)
+    })
+}
+
+/// A childless structural container with no name, no value and no interaction
+/// pattern beyond `LegacyIAccessible`, such as the
+/// empty render-host `pane` a CEF/Chromium app exposes before its renderer
+/// tree is built. It carries no usable content (#232).
+#[cfg(windows)]
+fn is_empty_structural_leaf(node: &AccessibleNode) -> bool {
+    node.children_count == 0
+        && node.name.trim().is_empty()
+        && node
+            .value
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && node
+            .patterns
+            .iter()
+            .all(|pattern| matches!(pattern, synapse_core::UiaPattern::LegacyIAccessible))
+        && matches!(
+            node.role.to_ascii_lowercase().as_str(),
+            "pane" | "group" | "custom"
+        )
+}
+
+#[cfg(windows)]
+fn embedded_webview_content_is_incomplete(input: &ObservationInput) -> bool {
+    let content_roots: Vec<_> = input
+        .elements
+        .iter()
+        .filter(|node| is_embedded_webview_content_root(node))
+        .collect();
+    if content_roots.is_empty() {
+        return false;
+    }
+
+    let usable_content_nodes = input
+        .elements
+        .iter()
+        .filter(|node| {
+            content_roots.iter().any(|root| {
+                node.depth > root.depth
+                    && rect_contains(root.bbox, node.bbox)
+                    && is_embedded_webview_content_node(node)
+            })
+        })
+        .count();
+    usable_content_nodes < 3
+}
+
+#[cfg(windows)]
+fn is_embedded_webview_content_root(node: &AccessibleNode) -> bool {
+    node.role.eq_ignore_ascii_case("region")
+        && node
+            .name
+            .trim_end()
+            .to_ascii_lowercase()
+            .ends_with(" - web content")
+}
+
+#[cfg(windows)]
+fn is_embedded_webview_content_node(node: &AccessibleNode) -> bool {
+    if !synapse_perception::is_usable_element(node) {
+        return false;
+    }
+    matches!(
+        node.role.to_ascii_lowercase().as_str(),
+        "button"
+            | "checkbox"
+            | "combobox"
+            | "edit"
+            | "heading"
+            | "hyperlink"
+            | "link"
+            | "list item"
+            | "list_item"
+            | "menu item"
+            | "menu_item"
+            | "radio button"
+            | "radio_button"
+            | "row"
+            | "tab"
+            | "text"
+            | "textbox"
+    )
+}
+
+#[cfg(windows)]
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+    inner.w > 0
+        && inner.h > 0
+        && inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x.saturating_add(inner.w) <= outer.x.saturating_add(outer.w)
+        && inner.y.saturating_add(inner.h) <= outer.y.saturating_add(outer.h)
 }
 
 #[cfg(windows)]
@@ -1095,6 +1308,7 @@ fn window_metadata_node(foreground: &ForegroundContext) -> AccessibleNode {
         patterns: vec![UiaPattern::Window],
         children_count: 0,
         depth: 0,
+        control_state: None,
     }
 }
 
@@ -1128,26 +1342,47 @@ fn input_from_tree_and_foreground(
     foreground: ForegroundContext,
     mode: PerceptionMode,
     focus_scope: FocusSupplementScope,
+    purpose: PerceptionPurpose,
 ) -> Result<ObservationInput, ErrorData> {
     let snapshot_depth = tree.max_depth;
+    let snapshot_truncated = tree.truncated;
     rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
     let focused = focused_from_nodes(&tree.nodes, focus_scope);
     let mut input = ObservationInput::new(foreground);
     input.focused = focused;
     input.elements = tree.nodes;
     supplement_focused_element(&mut input, focus_scope);
-    input.a11y_status = SensorStatus::Healthy;
+    input.a11y_status = a11y_status_for_snapshot(snapshot_truncated);
     populate_cdp_diagnostics(&mut input);
     supplement_chromium_renderer_accessibility(&mut input, snapshot_depth);
-    if mode == PerceptionMode::A11yOnly {
+    suppress_vscode_terminal_focus_proxy(&mut input);
+    let a11y_only = mode == PerceptionMode::A11yOnly;
+    if capture_baseline_required(purpose, a11y_only, super::detection_needs_pixels(mode)) {
+        populate_window_capture_baseline(&mut input);
+    } else if a11y_only {
         input.capture_status = SensorStatus::Disabled;
     } else {
-        populate_window_capture_baseline(&mut input);
+        // No baseline was captured for this find. Browser OCR can request the
+        // target frame later if its fallback is selected.
+        input.capture_status = SensorStatus::Unavailable;
     }
     if mode != PerceptionMode::Auto {
         input.mode_override = Some(mode);
     }
     Ok(input)
+}
+
+/// One coverage verdict for every observe path: a snapshot that hit a depth,
+/// node or deadline limit (or lost a subtree) is never reported as healthy.
+#[cfg(windows)]
+pub(super) fn a11y_status_for_snapshot(truncated: bool) -> SensorStatus {
+    if truncated {
+        SensorStatus::DegradedSensorFailed {
+            reason_code: A11Y_TARGET_WINDOW_SNAPSHOT_TRUNCATED.to_owned(),
+        }
+    } else {
+        SensorStatus::Healthy
+    }
 }
 
 #[cfg(windows)]
@@ -1173,6 +1408,7 @@ pub fn hidden_desktop_input_from_worker_snapshot(
     foreground: ForegroundContext,
     mode: PerceptionMode,
 ) -> ObservationInput {
+    let snapshot_truncated = tree.truncated;
     rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
     let focused = tree
         .nodes
@@ -1183,7 +1419,7 @@ pub fn hidden_desktop_input_from_worker_snapshot(
     let mut input = ObservationInput::new(foreground);
     input.focused = focused;
     input.elements = tree.nodes;
-    input.a11y_status = SensorStatus::Healthy;
+    input.a11y_status = a11y_status_for_snapshot(snapshot_truncated);
     input.capture_status = SensorStatus::Disabled;
     if mode != PerceptionMode::Auto {
         input.mode_override = Some(mode);
@@ -1240,6 +1476,14 @@ fn supplement_target_focused_element(input: &mut ObservationInput, hwnd: i64) {
         Ok(None) => {
             input.focused = None;
         }
+        Err(synapse_a11y::A11yError::NotAvailable { detail }) => {
+            tracing::debug!(
+                code = "A11Y_TARGET_FOCUS_UNAVAILABLE",
+                hwnd,
+                detail,
+                "target-window focus readback unavailable; retaining any tree-backed focused node"
+            );
+        }
         Err(error) => {
             tracing::warn!(
                 code = "A11Y_TARGET_FOCUSED_ELEMENT_READ_FAILED",
@@ -1248,7 +1492,8 @@ fn supplement_target_focused_element(input: &mut ObservationInput, hwnd: i64) {
                 error = %error,
                 "target-window focused element readback failed"
             );
-            input.focused = None;
+            // The tree snapshot may already contain a focused node. A failed
+            // supplemental read must not discard that earlier observation.
         }
     }
 }
@@ -1266,32 +1511,120 @@ fn set_focused_node(input: &mut ObservationInput, focused_node: AccessibleNode) 
 }
 
 #[cfg(windows)]
-fn supplement_chromium_renderer_accessibility(input: &mut ObservationInput, snapshot_depth: u32) {
-    use std::collections::HashSet;
-
-    use synapse_core::CdpStatus;
-
-    if !synapse_a11y::is_chromium_family(&input.foreground.process_name) {
+fn suppress_vscode_terminal_focus_proxy(input: &mut ObservationInput) {
+    if !input
+        .foreground
+        .process_name
+        .eq_ignore_ascii_case("Code.exe")
+    {
         return;
     }
-    if !input
-        .cdp
-        .as_ref()
-        .is_some_and(|cdp| cdp.status == CdpStatus::Unreachable)
+    let Some(focused) = input.focused.as_ref() else {
+        return;
+    };
+    if !is_vscode_terminal_focus_proxy(focused) {
+        return;
+    }
+
+    let focused_id = focused.element_id.clone();
+    tracing::warn!(
+        code = A11Y_VSCODE_TERMINAL_FOCUS_PROXY_NOT_TEXT_EDITABLE,
+        focused_role = %focused.role,
+        focused_name = %focused.name,
+        hwnd = input.foreground.hwnd,
+        "VS Code terminal focus resolved to a non-editable selection proxy; suppressing focused readback"
+    );
+    input.focused = None;
+    for element in &mut input.elements {
+        if element.element_id == focused_id {
+            element.focused = false;
+        }
+    }
+    input.a11y_status = SensorStatus::DegradedSensorFailed {
+        reason_code: A11Y_VSCODE_TERMINAL_FOCUS_PROXY_NOT_TEXT_EDITABLE.to_owned(),
+    };
+}
+
+#[cfg(windows)]
+fn is_vscode_terminal_focus_proxy(focused: &FocusedElement) -> bool {
+    let role = normalized_focus_role(&focused.role);
+    let is_selection_proxy = matches!(role.as_str(), "listitem" | "tabitem");
+    let has_text_readback = focused
+        .value
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || focused.patterns.iter().any(|pattern| {
+            matches!(
+                pattern,
+                synapse_core::UiaPattern::Value | synapse_core::UiaPattern::Text
+            )
+        });
+    is_selection_proxy && focused.name.contains("Terminal") && !has_text_readback
+}
+
+#[cfg(windows)]
+fn normalized_focus_role(role: &str) -> String {
+    role.chars()
+        .filter(|character| !character.is_whitespace() && *character != '_' && *character != '-')
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+#[cfg(windows)]
+fn supplement_chromium_renderer_accessibility(input: &mut ObservationInput, snapshot_depth: u32) {
+    supplement_chromium_renderer_accessibility_with(
+        input,
+        snapshot_depth,
+        |hwnd, depth, max_nodes| {
+            synapse_a11y::chromium_renderer_accessibility_nodes_from_window(hwnd, depth, max_nodes)
+                .ok()
+        },
+    );
+}
+
+/// Chromium renderer UIA supplement with an injected node reader. The reader
+/// gets `(hwnd, depth, max_nodes)` and returns `(nodes, truncated)`, or `None`
+/// when the read failed (the supplement is then skipped).
+#[cfg(windows)]
+fn supplement_chromium_renderer_accessibility_with(
+    input: &mut ObservationInput,
+    snapshot_depth: u32,
+    read_nodes: impl FnOnce(i64, u32, usize) -> Option<(Vec<AccessibleNode>, bool)>,
+) {
+    use synapse_core::CdpStatus;
+
+    if synapse_a11y::is_chromium_family(&input.foreground.process_name)
+        && !input
+            .cdp
+            .as_ref()
+            .is_some_and(|cdp| cdp.status == CdpStatus::Unreachable)
     {
         return;
     }
     let started = Instant::now();
-    let Ok(nodes) = synapse_a11y::chromium_renderer_accessibility_nodes_from_window(
+    let Some((nodes, truncated)) = read_nodes(
         input.foreground.hwnd,
         snapshot_depth.max(1),
         CHROMIUM_RENDERER_UIA_SUPPLEMENT_MAX_NODES,
     ) else {
         return;
     };
+    super::cdp_coverage::apply_renderer_supplement_coverage(input, truncated);
     if nodes.is_empty() {
         return;
     }
+    merge_renderer_supplement_nodes(input, nodes, started);
+}
+
+/// Appends renderer supplement nodes not already observed, rebases them to the
+/// foreground window, and records the supplement latency from `started`.
+#[cfg(windows)]
+fn merge_renderer_supplement_nodes(
+    input: &mut ObservationInput,
+    nodes: Vec<AccessibleNode>,
+    started: Instant,
+) {
+    use std::collections::HashSet;
 
     let mut seen: HashSet<_> = input
         .elements
@@ -1341,12 +1674,35 @@ fn populate_cdp_diagnostics(input: &mut ObservationInput) {
     use synapse_core::{CdpStatus, WebPerceptionPath};
 
     let process_name = input.foreground.process_name.clone();
-    if !synapse_a11y::is_chromium_family(&process_name) {
+    let process_is_chromium_family = synapse_a11y::is_chromium_family(&process_name);
+    if !process_is_chromium_family {
+        // WebView2 keeps Chromium in a child process. Its host executable is
+        // not a Chromium-family image, but a child-owned debug endpoint still
+        // provides the page tree used by observe and find. The all-process
+        // scan behind it runs only for a host with a Chromium child HWND (#302).
+        let hwnd = input.foreground.hwnd;
+        if webview2_probe_required(
+            process_is_chromium_family,
+            synapse_a11y::has_chromium_child_window(hwnd),
+        ) && let Some(diagnostics) = synapse_a11y::webview2_cdp_diagnostics_for_window(hwnd)
+        {
+            if diagnostics.status != CdpStatus::Ok
+                && matches!(input.a11y_status, SensorStatus::Healthy)
+            {
+                input.a11y_status = SensorStatus::DegradedSensorFailed {
+                    reason_code: A11Y_TARGET_WINDOW_WEBVIEW_CONTENT_INCOMPLETE.to_owned(),
+                };
+            }
+            input.web_path = Some(WebPerceptionPath::UiaOnly);
+            input.cdp = Some(diagnostics);
+        }
         return;
     }
     let started = Instant::now();
     let pid = input.foreground.pid;
-    let ports = synapse_a11y::candidate_ports_for_pid(pid);
+    // #2409: only the ports whose listener is this window's own browser.
+    let ports =
+        synapse_a11y::ports_serving_window(pid, &synapse_a11y::candidate_ports_for_pid(pid));
     let diagnostics =
         synapse_a11y::probe_chromium_cdp_blocking(&process_name, &ports, CDP_PROBE_TIMEOUT);
     input
@@ -1378,14 +1734,14 @@ fn populate_cdp_diagnostics(input: &mut ObservationInput) {
 #[cfg(windows)]
 fn populate_window_capture_baseline(input: &mut ObservationInput) {
     let started = Instant::now();
-    let Some(probe_region) = one_pixel_region(input.foreground.window_bounds) else {
+    if one_pixel_region(input.foreground.window_bounds).is_none() {
         input.capture_status = SensorStatus::DegradedSensorFailed {
             reason_code: "WINDOW_CAPTURE_EMPTY".to_owned(),
         };
         return;
-    };
-    match synapse_capture::screen_region_to_bgra_bitmap(probe_region) {
-        Ok(_probe) => {
+    }
+    match super::browser_ocr_target_frame(input) {
+        Some(_frame) => {
             input.capture_status = SensorStatus::Healthy;
             input.sensor_latency_ms.insert(
                 "capture".to_owned(),
@@ -1395,10 +1751,9 @@ fn populate_window_capture_baseline(input: &mut ObservationInput) {
                 populate_luanti_visible_baseline(input);
             }
         }
-        Err(error) => {
+        None => {
             tracing::debug!(
                 code = "OBSERVE_CAPTURE_PROBE_FAILED",
-                error = %error,
                 "foreground window capture probe failed"
             );
             input.capture_status = SensorStatus::DegradedSensorFailed {
@@ -1413,7 +1768,7 @@ fn populate_luanti_visible_baseline(input: &mut ObservationInput) {
     let Some(crosshair_region) = centered_region(input.foreground.window_bounds, 48, 48) else {
         return;
     };
-    if let Some(reading) = contrast_reading("luanti.crosshair_contrast", crosshair_region) {
+    if let Some(reading) = contrast_reading(input, "luanti.crosshair_contrast", crosshair_region) {
         let confidence = reading.confidence;
         input
             .hud
@@ -1434,7 +1789,7 @@ fn populate_luanti_visible_baseline(input: &mut ObservationInput) {
     let Some(hotbar_region) = hotbar_region(input.foreground.window_bounds) else {
         return;
     };
-    if let Some(reading) = contrast_reading("luanti.hotbar_contrast", hotbar_region) {
+    if let Some(reading) = contrast_reading(input, "luanti.hotbar_contrast", hotbar_region) {
         let confidence = reading.confidence;
         input
             .hud
@@ -1454,8 +1809,9 @@ fn populate_luanti_visible_baseline(input: &mut ObservationInput) {
 }
 
 #[cfg(windows)]
-fn contrast_reading(name: &str, region: Rect) -> Option<HudReading> {
-    let captured = synapse_capture::screen_region_to_bgra_bitmap(region).ok()?;
+fn contrast_reading(input: &ObservationInput, name: &str, region: Rect) -> Option<HudReading> {
+    let frame = super::browser_ocr_target_frame(input)?;
+    let captured = frame.crop_screen_rect(region)?;
     let score = bgra_contrast_score(&captured.bytes);
     Some(HudReading {
         raw_text: format!(
@@ -1464,6 +1820,7 @@ fn contrast_reading(name: &str, region: Rect) -> Option<HudReading> {
         ),
         parsed: HudValue::Number(f64::from(score)),
         confidence: score.clamp(0.0, 1.0),
+        confidence_source: synapse_core::ConfidenceSource::Heuristic,
         stale_ms: 0,
     })
 }
@@ -1550,7 +1907,9 @@ fn a11y_error(err: &synapse_a11y::A11yError) -> ErrorData {
             synapse_core::error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
             err.to_string(),
         ),
-        synapse_a11y::A11yError::UiaWorkerTimeout { .. } => {
+        synapse_a11y::A11yError::UiaWorkerTimeout { .. }
+        | synapse_a11y::A11yError::ElementStale { .. }
+        | synapse_a11y::A11yError::WindowNotFound { .. } => {
             crate::m1::mcp_error(err.code(), err.to_string())
         }
         _ => crate::m1::mcp_error(synapse_core::error_codes::OBSERVE_INTERNAL, err.to_string()),
@@ -1643,3 +2002,43 @@ fn rebase_nodes_to_foreground(nodes: &mut [AccessibleNode], foreground: &Foregro
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/snapshot_coverage_77.rs"]
+mod snapshot_coverage_77;
+
+#[cfg(all(test, windows))]
+#[path = "tests/cdp_budget_coverage_77.rs"]
+mod cdp_budget_coverage_77;
+
+#[cfg(all(test, windows))]
+#[path = "tests/sparse_empty_container_232.rs"]
+mod sparse_empty_container_232;
+
+#[cfg(all(test, windows))]
+#[path = "tests/renderer_supplement_coverage_77.rs"]
+mod renderer_supplement_coverage_77;
+
+#[cfg(all(test, windows))]
+#[path = "tests/shared_target_frame_130.rs"]
+mod shared_target_frame_130;
+
+#[cfg(all(test, windows))]
+#[path = "tests/truncation_propagation_77.rs"]
+mod truncation_propagation_77;
+
+#[cfg(all(test, windows))]
+#[path = "tests/offscreen_and_relevance_find_101.rs"]
+mod offscreen_and_relevance_find_101;
+
+#[cfg(all(test, windows))]
+#[path = "tests/unmanaged_webview2_observe_119.rs"]
+mod unmanaged_webview2_observe_119;
+
+#[cfg(all(test, windows))]
+#[path = "tests/cdp_supersede_and_minimized_232.rs"]
+mod cdp_supersede_and_minimized_232;
+
+#[cfg(all(test, windows))]
+#[path = "tests/window_gone_mapping_315.rs"]
+mod window_gone_mapping_315;

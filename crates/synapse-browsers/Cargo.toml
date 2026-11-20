@@ -1,0 +1,23 @@
+[package]
+name = "synapse-browsers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Declared browser rows (browsers/*.json) and the shared multi-browser bridge vocabulary: kinds, tab targets, endpoints, discovery and profile inspection."
+
+[dependencies]
+miniz_oxide.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+synapse-core = { version = "0.1.0", path = "../synapse-core" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

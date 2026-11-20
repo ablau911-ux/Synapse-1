@@ -1454,7 +1454,7 @@ fn probe_report_success(
         error_phase: None,
         error_kind: None,
         error_detail: None,
-        raw_response_sha256: Some(sha256_bytes(raw_text.as_bytes())),
+        raw_response_sha256: Some(keyed_raw_response_digest(raw_text.as_bytes())),
         raw_response_excerpt: Some(raw_response_excerpt),
         raw_response_truncated,
     }
@@ -1489,7 +1489,7 @@ fn probe_report_error(
         error_phase: Some(error_phase.to_owned()),
         error_kind: Some(error_kind.to_owned()),
         error_detail: Some(detail),
-        raw_response_sha256: raw_text.map(|raw| sha256_bytes(raw.as_bytes())),
+        raw_response_sha256: raw_text.map(|raw| keyed_raw_response_digest(raw.as_bytes())),
         raw_response_excerpt: excerpt,
         raw_response_truncated: truncated,
     }
@@ -1940,6 +1940,15 @@ fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
     (excerpt, truncated)
 }
 
+/// Keyed `hmac-sha256:` digest (#174) of a model's raw response text, which is
+/// user/agent content; write-only readback, nothing compares it.
+fn keyed_raw_response_digest(value: &[u8]) -> String {
+    crate::content_digest::keyed_prefixed_digest(value)
+}
+
+// Plain SHA-256 on purpose (#174): readback of the registry row, which holds
+// endpoint/model configuration and the DPAPI-encrypted API key (ciphertext),
+// not user or agent content.
 fn sha256_bytes(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value);

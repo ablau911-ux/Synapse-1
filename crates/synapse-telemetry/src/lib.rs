@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{
-        Arc, Once,
+        Arc, Mutex, Once, OnceLock,
         mpsc::{self, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
@@ -18,6 +18,7 @@ use tracing_subscriber::{
 };
 
 pub mod metrics;
+pub mod recorder;
 
 const DEFAULT_MAX_DIR_BYTES: u64 = 500 * 1024 * 1024;
 const DEFAULT_KEEP_DAYS: u32 = 7;
@@ -68,8 +69,6 @@ pub enum TelemetryError {
     LogDirNotWritable(PathBuf, String),
     #[error("TELEMETRY_SUBSCRIBER_INIT_FAILED: {0}")]
     SubscriberInit(String),
-    #[error("TELEMETRY_METRICS_RECORDER_FAILED: {0}")]
-    MetricsRecorder(String),
     #[error("TELEMETRY_GC_FAILED: {0}")]
     Gc(String),
 }
@@ -80,7 +79,6 @@ impl TelemetryError {
         match self {
             Self::LogDirNotWritable(_, _) => "TELEMETRY_LOG_DIR_NOT_WRITABLE",
             Self::SubscriberInit(_) => "TELEMETRY_SUBSCRIBER_INIT_FAILED",
-            Self::MetricsRecorder(_) => "TELEMETRY_METRICS_RECORDER_FAILED",
             Self::Gc(_) => "TELEMETRY_GC_FAILED",
         }
     }
@@ -88,8 +86,30 @@ impl TelemetryError {
 
 #[derive(Debug)]
 pub struct TelemetryGuard {
-    _file_guard: WorkerGuard,
+    file_guard: Arc<Mutex<Option<WorkerGuard>>>,
     _gc_worker: Option<GcWorker>,
+}
+
+static EXIT_FILE_GUARD: OnceLock<Arc<Mutex<Option<WorkerGuard>>>> = OnceLock::new();
+
+/// Drain the non-blocking file writer before an OS-forced process exit.
+///
+/// Only the file worker is stopped: joining the GC worker could exceed the
+/// Windows session-ending deadline. No logging may follow this call.
+pub fn flush_for_process_exit() {
+    if let Some(slot) = EXIT_FILE_GUARD.get()
+        && let Ok(mut guard) = slot.lock()
+    {
+        drop(guard.take());
+    }
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.file_guard.lock() {
+            drop(guard.take());
+        }
+    }
 }
 
 /// Background thread that re-runs `run_log_gc` on a fixed interval. Cleanly
@@ -233,8 +253,6 @@ pub fn init_tracing(cfg: TelemetryConfig) -> Result<TelemetryGuard, TelemetryErr
         .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     install_panic_hook();
-    let _metrics_handle = metrics::install_prometheus_recorder()
-        .map_err(|error| TelemetryError::MetricsRecorder(error.to_string()))?;
     metrics::register_m3_metrics();
 
     let gc_interval = effective_gc_interval(cfg.gc_interval);
@@ -242,8 +260,10 @@ pub fn init_tracing(cfg: TelemetryConfig) -> Result<TelemetryGuard, TelemetryErr
         GcWorker::spawn(log_dir.clone(), cfg.keep_days, cfg.max_dir_bytes, interval)
     });
 
+    let file_guard = Arc::new(Mutex::new(Some(file_guard)));
+    let _ = EXIT_FILE_GUARD.set(Arc::clone(&file_guard));
     Ok(TelemetryGuard {
-        _file_guard: file_guard,
+        file_guard,
         _gc_worker: gc_worker,
     })
 }
@@ -376,39 +396,33 @@ fn prepare_log_dir(log_dir: &Path) -> Result<(), TelemetryError> {
     })
 }
 
-/// Deletes one log file during retention GC. A file another process still holds
-/// open (Windows sharing violation / access denied, e.g. the live daemon's own
-/// stderr log while a setup candidate boots) is skipped instead of failing
-/// daemon startup: retention is housekeeping and the next GC pass retries it.
-fn remove_log_file_unless_in_use(path: &Path) -> Result<bool, String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(err)
-            if err.raw_os_error() == Some(32)
-                || err.kind() == std::io::ErrorKind::PermissionDenied =>
-        {
-            Ok(false)
-        }
-        Err(err) => Err(format!("{}: {err}", path.display())),
-    }
-}
-
 fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), String> {
     let keep = Duration::from_secs(u64::from(keep_days) * 24 * 60 * 60);
     let now = SystemTime::now();
     let mut entries = Vec::new();
 
+    // The log dir is shared with other processes (and other daemon runs), so a
+    // single unreadable, locked or vanished entry must not abort startup:
+    // skip it and report on stderr (tracing is not installed yet).
     for entry in fs::read_dir(log_dir).map_err(|err| err.to_string())? {
-        let entry = entry.map_err(|err| err.to_string())?;
-        let metadata = entry.metadata().map_err(|err| err.to_string())?;
+        let Some(entry) = skip_on_error("read log dir entry", log_dir, entry) else {
+            continue;
+        };
+        let Some(metadata) = skip_on_error("stat log entry", &entry.path(), entry.metadata())
+        else {
+            continue;
+        };
         if !metadata.is_file() {
             continue;
         }
 
         let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if now.duration_since(modified).unwrap_or_default() > keep
-            && remove_log_file_unless_in_use(&entry.path())?
-        {
+        if now.duration_since(modified).unwrap_or_default() > keep {
+            let _removed = skip_on_error(
+                "remove expired log file",
+                &entry.path(),
+                fs::remove_file(entry.path()),
+            );
             continue;
         }
 
@@ -422,7 +436,13 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
 
     entries.sort_by_key(|(_, modified, _)| *modified);
     for (path, _, len) in entries {
-        if !remove_log_file_unless_in_use(&path)? {
+        if skip_on_error(
+            "remove log file over size cap",
+            &path,
+            fs::remove_file(&path),
+        )
+        .is_none()
+        {
             continue;
         }
         total = total.saturating_sub(len);
@@ -432,4 +452,21 @@ fn run_log_gc(log_dir: &Path, keep_days: u32, max_dir_bytes: u64) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn skip_on_error<T, E: std::fmt::Display>(
+    what: &str,
+    path: &Path,
+    result: Result<T, E>,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            eprintln!(
+                "synapse-telemetry: log GC skipped '{what}' for {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }

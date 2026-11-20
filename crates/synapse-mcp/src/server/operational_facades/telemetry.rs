@@ -1,8 +1,6 @@
-use std::collections::BTreeSet;
-
 use serde_json::Value;
 
-use rmcp::{RoleServer, model::Tool, service::RequestContext};
+use rmcp::{RoleServer, service::RequestContext};
 
 use crate::server::{
     ErrorData, Json, Parameters, SynapseService, tool_profiles::ToolProfileSnapshot,
@@ -12,8 +10,8 @@ use super::{
     TELEMETRY_SOT, TELEMETRY_TOOL,
     errors::facade_delegate_error,
     types::{
-        AgentEventIngressStats, TelemetryParams, TelemetryResponse, TelemetryStatusResponse,
-        ToolSurfacePayloadContributor, ToolSurfacePayloadTelemetry, ToolSurfaceTelemetry,
+        AgentEventIngressStats, MetricsRecorderTelemetry, TelemetryParams, TelemetryResponse,
+        TelemetryStatusResponse, ToolSurfaceTelemetry,
     },
     validation::validate_telemetry_params,
 };
@@ -55,23 +53,10 @@ pub(super) async fn handle(
     })?;
     let ingress = agent_ingress_stats();
     let cf_row_counts = storage_summary.cf_row_counts.clone();
-    let visible_tools = service
-        .tools_for_session_profile(session_id.as_deref())
-        .map_err(|error| {
-            facade_delegate_error(
-                TELEMETRY_TOOL,
-                operation.as_str(),
-                "tools_for_session_profile",
-                TELEMETRY_SOT,
-                error,
-                "repair tool profile policy or schema sanitization before reading telemetry status",
-            )
-        })?;
     let status = TelemetryStatusResponse {
         source_of_truth: TELEMETRY_SOT,
         metrics_recorder: metrics_recorder_telemetry(),
-        tool_surface: tool_surface_telemetry(&snapshot, &visible_tools),
-        tool_usage: crate::daemon_lifecycle::recent_tool_usage(10_000, 128),
+        tool_surface: tool_surface_telemetry(&snapshot),
         storage_summary,
         agent_event_ingress: ingress,
         cf_row_counts,
@@ -95,62 +80,19 @@ fn agent_ingress_stats() -> AgentEventIngressStats {
     }
 }
 
-fn metrics_recorder_telemetry() -> super::types::MetricsRecorderTelemetry {
-    let rendered = synapse_telemetry::metrics::render_prometheus();
-    let recorded_metric_names = rendered
-        .as_deref()
-        .map(recorded_metric_names)
-        .unwrap_or_default();
-    let recorded_metric_samples = rendered
-        .as_deref()
-        .map(recorded_metric_samples)
-        .unwrap_or_default();
-    super::types::MetricsRecorderTelemetry {
-        source_of_truth: synapse_telemetry::metrics::PROMETHEUS_RECORDER_SOURCE_OF_TRUTH,
-        installed: synapse_telemetry::metrics::prometheus_recorder_installed(),
-        recorder: "prometheus".to_owned(),
-        registry_metric_count: synapse_telemetry::metrics::m3_metric_specs().len(),
-        rendered_bytes: rendered.as_ref().map_or(0, String::len),
-        recorded_metric_names,
-        recorded_metric_samples,
+fn metrics_recorder_telemetry() -> MetricsRecorderTelemetry {
+    let readback = synapse_telemetry::recorder::recorder_readback();
+    MetricsRecorderTelemetry {
+        source_of_truth: synapse_telemetry::recorder::RECORDER_SOURCE_OF_TRUTH,
+        installed: readback.installed,
+        install_error: readback.install_error,
+        metric_names: readback.metric_names,
+        samples: readback.samples,
+        rejected_sample_count: readback.rejected_sample_count,
     }
 }
 
-fn recorded_metric_names(rendered: &str) -> Vec<String> {
-    rendered
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-        .filter_map(|line| {
-            line.split(['{', ' '])
-                .next()
-                .filter(|name| !name.is_empty())
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(64)
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn recorded_metric_samples(rendered: &str) -> Vec<String> {
-    let mut samples = rendered
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            (!trimmed.is_empty() && !trimmed.starts_with('#')).then(|| trimmed.to_owned())
-        })
-        .collect::<Vec<_>>();
-    samples.sort();
-    samples.into_iter().take(256).collect()
-}
-
-const TOOL_PAYLOAD_SOURCE_OF_TRUTH: &str =
-    "live sanitized tools_for_session_profile mapped to local_agent OpenAI tools[] wrapper";
-
-fn tool_surface_telemetry(
-    snapshot: &ToolProfileSnapshot,
-    visible_tools: &[Tool],
-) -> ToolSurfaceTelemetry {
+fn tool_surface_telemetry(snapshot: &ToolProfileSnapshot) -> ToolSurfaceTelemetry {
     let visible_public_count = count_visible_public_tools(
         &snapshot.public_tool_registry.public_tool_names,
         &snapshot.visible_tool_names,
@@ -184,74 +126,7 @@ fn tool_surface_telemetry(
         facade_contract_tool_count: snapshot.facade_contract.contract_tool_count,
         facade_contract_operation_count: snapshot.facade_contract.operation_count,
         facade_contract_mutating_operation_count: snapshot.facade_contract.mutating_operation_count,
-        model_payload: tool_surface_payload_telemetry(visible_tools),
         codex_client_surface: snapshot.codex_client_surface.clone(),
-    }
-}
-
-fn tool_surface_payload_telemetry(tools: &[Tool]) -> ToolSurfacePayloadTelemetry {
-    let mut openai_tools = Vec::with_capacity(tools.len());
-    let mut input_schema_bytes = 0_usize;
-    let mut output_schema_bytes = 0_usize;
-    let mut contributors = Vec::with_capacity(tools.len());
-    for tool in tools {
-        let description = tool
-            .description
-            .as_ref()
-            .map(|desc| desc.as_ref())
-            .unwrap_or("Synapse MCP tool");
-        let input_schema = serde_json::Value::Object((*tool.input_schema).clone());
-        let input_schema_json =
-            serde_json::to_string(&input_schema).unwrap_or_else(|_| "{}".to_owned());
-        input_schema_bytes = input_schema_bytes.saturating_add(input_schema_json.len());
-        if let Some(output_schema) = &tool.output_schema {
-            let output_schema_json =
-                serde_json::to_string(&serde_json::Value::Object((**output_schema).clone()))
-                    .unwrap_or_else(|_| "{}".to_owned());
-            output_schema_bytes = output_schema_bytes.saturating_add(output_schema_json.len());
-        }
-        let openai_tool = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": tool.name.as_ref(),
-                "description": description,
-                "parameters": input_schema,
-            }
-        });
-        let openai_tool_json =
-            serde_json::to_string(&openai_tool).unwrap_or_else(|_| "{}".to_owned());
-        contributors.push(ToolSurfacePayloadContributor {
-            name: tool.name.to_string(),
-            openai_tool_bytes: openai_tool_json.len(),
-            input_schema_bytes: input_schema_json.len(),
-            description_bytes: description.len(),
-        });
-        openai_tools.push(openai_tool);
-    }
-    contributors.sort_by(|left, right| {
-        right
-            .openai_tool_bytes
-            .cmp(&left.openai_tool_bytes)
-            .then(left.name.cmp(&right.name))
-    });
-    contributors.truncate(10);
-    let openai_tools_json = serde_json::to_string(&openai_tools).unwrap_or_default();
-    let openai_tools_chars = openai_tools_json.chars().count();
-    ToolSurfacePayloadTelemetry {
-        source_of_truth: TOOL_PAYLOAD_SOURCE_OF_TRUTH,
-        tool_count: tools.len(),
-        openai_tools_bytes: openai_tools_json.len(),
-        openai_tools_chars,
-        approx_tokens_chars_div_4: (openai_tools_chars as f64 / 4.0).ceil() as u64,
-        approx_tokens_chars_div_3_5: (openai_tools_chars as f64 / 3.5).ceil() as u64,
-        input_schema_bytes,
-        output_schema_bytes,
-        budget_openai_tools_bytes:
-            crate::server::tool_profiles::PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES,
-        over_budget_by_bytes: openai_tools_json
-            .len()
-            .saturating_sub(crate::server::tool_profiles::PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES),
-        top_contributors: contributors,
     }
 }
 

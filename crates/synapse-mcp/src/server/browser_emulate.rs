@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
-        require_target_session_id, validate_cdp_target_id,
+        browser_raw_cdp_required_error, cdp_target_id_audit_ref, require_target_session_id,
+        validate_cdp_target_id,
     },
     tool, tool_router,
 };
@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use synapse_core::error_codes;
 
 const TOOL: &str = "browser_emulate";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_BRIDGE_WAIT_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
@@ -75,7 +74,6 @@ pub struct BrowserEmulateParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// `set` applies one or more nested overrides; `reset` clears selected
     /// domains. For reset, an empty `domains` list means all domains.
@@ -222,7 +220,7 @@ struct NormalizedBrowserEmulateParams {
 #[tool_router(router = browser_emulate_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Set or reset multiple target-scoped browser emulation overrides in one call for the calling session's owned browser tab. Raw CDP targets use the CDP emulation domains directly; normal Chrome bridge chrome-tab:* targets use the already-open authenticated Chrome profile's viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, mediaEmulation, and networkConditions lanes with same-target MAIN-world readback. operation=set accepts nested viewport, device, geolocation, locale, media, and network sections and returns each domain's same-target readback; viewport and device are mutually exclusive because device includes viewport metrics. operation=reset clears the listed domains, or all domains when domains is empty. Target-scoped and foreground-capable without activating the human OS foreground tab; never falls back to the human foreground tab. Use page text/evaluate/network readback as independent manual FSV evidence."
+        description = "Set or reset multiple target-scoped browser emulation overrides in one call for the calling session's owned browser tab. Raw CDP targets use the CDP emulation domains directly; normal Chrome bridge chrome-tab:* targets use the already-open authenticated Chrome profile's viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, mediaEmulation, and networkConditions lanes with same-target MAIN-world readback. operation=set accepts nested viewport, device, geolocation, locale, media, and network sections and returns each domain's same-target readback; viewport and device are mutually exclusive because device includes viewport metrics. operation=reset clears the listed domains, or all domains when domains is empty. Target-scoped and foreground-capable without activating the human OS foreground tab; never falls back to the human foreground tab. Use page text/evaluate/network readback as independent FSV evidence."
     )]
     pub async fn browser_emulate(
         &self,
@@ -282,16 +280,13 @@ impl SynapseService {
         params: &NormalizedBrowserEmulateParams,
     ) -> Result<BrowserEmulateResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+            if synapse_browsers::BrowserRegistry::global().has_bridge_tab_prefix(cdp_target_id) {
                 return self
                     .browser_emulate_bridge_impl(session_id, window_hwnd, cdp_target_id, params)
                     .await;
             }
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         };
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_emulate_before_raw_domain_command",
-        )?;
         let mut results = Vec::new();
         match params.operation {
             BrowserEmulateOperation::Set => {
@@ -305,9 +300,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Viewport, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_viewport_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Viewport,
                         params.operation,
@@ -335,9 +327,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Device, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_device_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Device,
                         params.operation,
@@ -361,9 +350,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Geolocation, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_geolocation_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Geolocation,
                         params.operation,
@@ -381,9 +367,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Locale, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_locale_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Locale,
                         params.operation,
@@ -402,9 +385,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Media, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_media_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Media,
                         params.operation,
@@ -429,9 +409,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Network, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_network_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Network,
                         params.operation,
@@ -441,9 +418,6 @@ impl SynapseService {
             }
             BrowserEmulateOperation::Reset => {
                 for domain in &params.domains {
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_before_raw_reset_domain",
-                    )?;
                     match domain {
                         BrowserEmulateDomain::Viewport => {
                             let result =
@@ -494,9 +468,6 @@ impl SynapseService {
                             results.push(domain_result(*domain, params.operation, result)?);
                         }
                     }
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_reset_domain",
-                    )?;
                 }
             }
         }
@@ -535,9 +506,6 @@ impl SynapseService {
         cdp_target_id: &str,
         params: &NormalizedBrowserEmulateParams,
     ) -> Result<BrowserEmulateResponse, ErrorData> {
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_emulate_before_bridge_domain_command",
-        )?;
         let mut results = Vec::new();
         match params.operation {
             BrowserEmulateOperation::Set => {
@@ -556,9 +524,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Viewport, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_viewport_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Viewport,
                         params.operation,
@@ -588,9 +553,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Device, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_device_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Device,
                         params.operation,
@@ -618,9 +580,6 @@ impl SynapseService {
                     .map_err(|error| {
                         emulate_bridge_error(BrowserEmulateDomain::Geolocation, error)
                     })?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_geolocation_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Geolocation,
                         params.operation,
@@ -640,9 +599,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Locale, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_locale_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Locale,
                         params.operation,
@@ -663,9 +619,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Media, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_media_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Media,
                         params.operation,
@@ -692,9 +645,6 @@ impl SynapseService {
                     )
                     .await
                     .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Network, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_network_command",
-                    )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Network,
                         params.operation,
@@ -704,9 +654,6 @@ impl SynapseService {
             }
             BrowserEmulateOperation::Reset => {
                 for domain in &params.domains {
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_before_bridge_reset_domain",
-                    )?;
                     let result = match domain {
                         BrowserEmulateDomain::Viewport => domain_result(
                             *domain,
@@ -822,9 +769,6 @@ impl SynapseService {
                             .map_err(|error| emulate_bridge_error(*domain, error))?,
                         )?,
                     };
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_reset_domain",
-                    )?;
                     results.push(result);
                 }
             }
@@ -843,7 +787,8 @@ impl SynapseService {
             session_id: session_id.to_owned(),
             window_hwnd,
             transport: "chrome_tabs_extension".to_owned(),
-            endpoint: chrome_debugger_default_endpoint(),
+            endpoint: synapse_browsers::BrowserRegistry::global()
+                .bridge_endpoint_for_target(cdp_target_id, synapse_browsers::BridgeLane::Tabs),
             cdp_target_id: cdp_target_id.to_owned(),
             operation: params.operation,
             domains: params.domains.clone(),

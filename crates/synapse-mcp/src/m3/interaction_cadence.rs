@@ -1,12 +1,27 @@
 //! Counts-only low-level input hook for timeline interaction cadence (#838).
 //!
-//! The hook never records key names, characters, mouse coordinates, window
-//! text, or clipboard content. It only emits event class counters plus the
-//! OS-injected flag so the activity recorder can keep human cadence separate
-//! from Synapse-generated input.
+//! The hook never records key names, characters, window text, or clipboard
+//! content. It only emits event class counters plus the OS-injected flag so the
+//! activity recorder can keep human cadence separate from Synapse-generated
+//! input. Mouse events also carry their screen point, used transiently to find
+//! the window under the pointer (#106) and never stored.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+
+/// Owner-away mode: wall-clock ns of the last counted physical mouse move
+/// (0 = none). Moves are coalesced in the hook and never become cadence events.
+static LAST_PHYSICAL_MOVE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The last counted physical (non-injected) mouse move, if any.
+pub fn last_physical_move_ns() -> Option<u64> {
+    match LAST_PHYSICAL_MOVE_NS.load(Ordering::Acquire) {
+        0 => None,
+        ns => Some(ns),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InteractionEvent {
@@ -14,6 +29,9 @@ pub struct InteractionEvent {
     pub kind: InteractionEventKind,
     pub injected: bool,
     pub key_signal: Option<InteractionKeySignal>,
+    /// Screen position of a mouse event (click/wheel), used only to resolve the
+    /// window under the pointer; never stored or recorded.
+    pub screen_point: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,59 +71,6 @@ impl InteractionHook {
     pub const fn readback(&self) -> &InteractionHookReadback {
         self.inner.readback()
     }
-
-    pub fn shutdown_checked(
-        self,
-        timeout: std::time::Duration,
-        reason: &'static str,
-    ) -> InteractionHookShutdownReport {
-        self.inner.shutdown_checked(timeout, reason)
-    }
-}
-
-/// Reaps terminal hook owners retained by a prior bounded shutdown and returns
-/// the exact count that is still physically live. A nonzero count must prevent
-/// daemon lifetime-lock release even when no `ActivityRecorder` was returned to
-/// the caller (for example, a failed startup transaction).
-#[must_use]
-pub(crate) fn retained_live_owner_count() -> usize {
-    platform::retained_live_owner_count()
-}
-
-#[derive(Clone, Debug)]
-pub struct InteractionHookShutdownReport {
-    pub reason: &'static str,
-    pub stop_wake_sent: bool,
-    pub sender_cleared: bool,
-    pub thread_owner_present: bool,
-    pub thread_terminal: bool,
-    pub thread_joined: bool,
-    pub exact_owner_retained: bool,
-    pub failures: Vec<String>,
-}
-
-impl InteractionHookShutdownReport {
-    #[must_use]
-    pub const fn owners_quiescent(&self) -> bool {
-        (!self.thread_owner_present || (self.thread_terminal && self.thread_joined))
-            && self.sender_cleared
-    }
-
-    pub fn verdict(&self) -> anyhow::Result<()> {
-        if self.failures.is_empty()
-            && self.stop_wake_sent
-            && self.owners_quiescent()
-            && !self.exact_owner_retained
-        {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "interaction hook shutdown failed at {}: {}; readback={self:?}",
-                self.reason,
-                self.failures.join("; ")
-            )
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,13 +83,8 @@ pub struct InteractionHookReadback {
 #[cfg(windows)]
 mod platform {
     use std::{
-        sync::{
-            Arc, Mutex, OnceLock,
-            atomic::{AtomicBool, Ordering},
-            mpsc as std_mpsc,
-        },
+        sync::{Mutex, OnceLock, mpsc as std_mpsc},
         thread,
-        time::{Duration, Instant},
     };
 
     use anyhow::{Context, Result, bail};
@@ -134,20 +94,18 @@ mod platform {
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
         UI::Input::KeyboardAndMouse::GetAsyncKeyState,
         UI::WindowsAndMessaging::{
-            CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
-            PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-            WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-            WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_NULL, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+            PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+            WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
+            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN,
         },
     };
 
     use super::{
-        InteractionEvent, InteractionEventKind, InteractionHookReadback,
-        InteractionHookShutdownReport, InteractionKeySignal,
+        InteractionEvent, InteractionEventKind, InteractionHookReadback, InteractionKeySignal,
     };
-
-    const HOOK_START_TIMEOUT: Duration = Duration::from_secs(3);
+    use crate::server::user_active_gate::owner_presence;
 
     const LLKHF_INJECTED_MASK: u32 = 0x12;
     const LLMHF_INJECTED_MASK: u32 = 0x03;
@@ -163,257 +121,64 @@ mod platform {
 
     static HOOK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<InteractionEvent>>>> =
         OnceLock::new();
-    type HookThreadResult = std::result::Result<(), String>;
-    type HookThreadOwner = thread::JoinHandle<HookThreadResult>;
-
-    static RETAINED_HOOK_OWNERS: OnceLock<Mutex<Vec<HookThreadOwner>>> = OnceLock::new();
-    static HOOK_OWNER_PHASE: OnceLock<Mutex<HookOwnerPhase>> = OnceLock::new();
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum HookOwnerPhase {
-        Terminal,
-        Starting,
-        Running,
-        Stopping,
-        Retained,
-    }
-
-    fn hook_owner_phase() -> &'static Mutex<HookOwnerPhase> {
-        HOOK_OWNER_PHASE.get_or_init(|| Mutex::new(HookOwnerPhase::Terminal))
-    }
-
-    fn set_hook_owner_phase(next: HookOwnerPhase) {
-        match hook_owner_phase().lock() {
-            Ok(mut phase) => *phase = next,
-            Err(poisoned) => *poisoned.into_inner() = next,
-        }
-    }
-
-    const fn hook_start_allowed(phase: HookOwnerPhase, retained_live: usize) -> bool {
-        matches!(phase, HookOwnerPhase::Terminal) && retained_live == 0
-    }
-
-    fn begin_hook_start() -> Result<()> {
-        let retained_live = retained_live_owner_count();
-        let mut phase = match hook_owner_phase().lock() {
-            Ok(phase) => phase,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if !hook_start_allowed(*phase, retained_live) {
-            bail!(
-                "interaction cadence hook owner is not terminal: phase={phase:?} retained_live={retained_live}"
-            );
-        }
-        *phase = HookOwnerPhase::Starting;
-        Ok(())
-    }
-
-    fn begin_hook_stop() -> Option<String> {
-        let mut phase = match hook_owner_phase().lock() {
-            Ok(phase) => phase,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let previous = *phase;
-        *phase = HookOwnerPhase::Stopping;
-        (!matches!(previous, HookOwnerPhase::Running | HookOwnerPhase::Starting)).then(|| {
-            format!("interaction hook stop began from unexpected owner phase {previous:?}")
-        })
-    }
-
-    fn finish_hook_stop(exact_owner_retained: bool) {
-        set_hook_owner_phase(if exact_owner_retained {
-            HookOwnerPhase::Retained
-        } else {
-            HookOwnerPhase::Terminal
-        });
-    }
 
     pub struct InteractionHook {
         readback: InteractionHookReadback,
-        thread: Option<HookThreadOwner>,
-        stop_requested: Arc<AtomicBool>,
-        shutdown_complete: bool,
+        thread: Option<thread::JoinHandle<()>>,
     }
 
     impl InteractionHook {
         pub fn start(sender: mpsc::UnboundedSender<InteractionEvent>) -> Result<Self> {
-            begin_hook_start()?;
             {
-                let mut slot = match hook_sender().lock() {
-                    Ok(slot) => slot,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
+                let mut slot = hook_sender()
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("interaction hook sender lock poisoned"))?;
                 if slot.is_some() {
-                    set_hook_owner_phase(HookOwnerPhase::Retained);
                     bail!("interaction cadence hook is already installed in this process");
                 }
                 *slot = Some(sender);
             }
 
             let (ready_tx, ready_rx) = std_mpsc::channel();
-            let (thread_id_tx, thread_id_rx) = std_mpsc::channel();
-            let stop_requested = Arc::new(AtomicBool::new(false));
-            let thread_stop_requested = Arc::clone(&stop_requested);
-            let thread = match thread::Builder::new()
+            let thread = thread::Builder::new()
                 .name("synapse-interaction-cadence-hook".to_owned())
-                .spawn(move || run_hook_thread(thread_id_tx, ready_tx, thread_stop_requested))
-                .context("spawn interaction cadence hook thread")
-            {
-                Ok(thread) => thread,
-                Err(error) => {
-                    let _phase_failure = begin_hook_stop();
-                    clear_sender();
-                    finish_hook_stop(false);
-                    return Err(error);
-                }
-            };
-            let thread_id = match thread_id_rx.recv_timeout(HOOK_START_TIMEOUT) {
-                Ok(thread_id) => thread_id,
-                Err(error) => {
-                    let _phase_failure = begin_hook_stop();
-                    clear_sender();
-                    stop_requested.store(true, Ordering::Release);
-                    let (terminal, joined, retained, join_failure) =
-                        join_thread_until(thread, HOOK_START_TIMEOUT);
-                    finish_hook_stop(retained);
-                    bail!(
-                        "interaction cadence hook thread did not publish its identity: {error}; terminal={terminal} joined={joined} exact_owner_retained={retained} join_failure={join_failure:?}"
-                    );
-                }
-            };
-            let readback = match ready_rx.recv_timeout(HOOK_START_TIMEOUT) {
+                .spawn(move || run_hook_thread(ready_tx))
+                .context("spawn interaction cadence hook thread")?;
+            let readback = match ready_rx.recv() {
                 Ok(Ok(readback)) => readback,
                 Ok(Err(error)) => {
-                    let _phase_failure = begin_hook_stop();
                     clear_sender();
-                    stop_requested.store(true, Ordering::Release);
-                    let _ = unsafe { PostThreadMessageW(thread_id, WM_NULL, WPARAM(0), LPARAM(0)) };
-                    let (terminal, joined, retained, join_failure) =
-                        join_thread_until(thread, HOOK_START_TIMEOUT);
-                    finish_hook_stop(retained);
-                    bail!(
-                        "{error}; terminal={terminal} joined={joined} exact_owner_retained={retained} join_failure={join_failure:?}"
-                    );
+                    let _ = thread.join();
+                    bail!(error);
                 }
                 Err(error) => {
-                    let _phase_failure = begin_hook_stop();
                     clear_sender();
-                    stop_requested.store(true, Ordering::Release);
-                    let _ = unsafe { PostThreadMessageW(thread_id, WM_NULL, WPARAM(0), LPARAM(0)) };
-                    let (terminal, joined, retained, join_failure) =
-                        join_thread_until(thread, HOOK_START_TIMEOUT);
-                    finish_hook_stop(retained);
-                    bail!(
-                        "interaction cadence hook thread exited before readiness: {error}; terminal={terminal} joined={joined} exact_owner_retained={retained} join_failure={join_failure:?}"
-                    );
+                    let _ = thread.join();
+                    bail!("interaction cadence hook thread exited before readiness: {error}");
                 }
             };
-            set_hook_owner_phase(HookOwnerPhase::Running);
             Ok(Self {
                 readback,
                 thread: Some(thread),
-                stop_requested,
-                shutdown_complete: false,
             })
         }
 
         pub const fn readback(&self) -> &InteractionHookReadback {
             &self.readback
         }
-
-        pub fn shutdown_checked(
-            mut self,
-            timeout: Duration,
-            reason: &'static str,
-        ) -> InteractionHookShutdownReport {
-            self.shutdown_inner(timeout, reason)
-        }
-
-        fn shutdown_inner(
-            &mut self,
-            timeout: Duration,
-            reason: &'static str,
-        ) -> InteractionHookShutdownReport {
-            if self.shutdown_complete {
-                return InteractionHookShutdownReport {
-                    reason,
-                    stop_wake_sent: true,
-                    sender_cleared: true,
-                    thread_owner_present: false,
-                    thread_terminal: true,
-                    thread_joined: true,
-                    exact_owner_retained: false,
-                    failures: Vec::new(),
-                };
-            }
-            self.shutdown_complete = true;
-            let mut failures = Vec::new();
-            if let Some(failure) = begin_hook_stop() {
-                failures.push(failure);
-            }
-            let sender_cleared = clear_sender();
-            let thread_owner_present = self.thread.is_some();
-            let thread_finished_before_stop = self
-                .thread
-                .as_ref()
-                .is_some_and(thread::JoinHandle::is_finished);
-            self.stop_requested.store(true, Ordering::Release);
-            let stop_wake_sent = if !thread_owner_present {
-                true
-            } else if thread_finished_before_stop {
-                failures.push(
-                    "interaction hook thread terminated before the exact stop request".to_owned(),
-                );
-                false
-            } else {
-                // WM_NULL is deliberately benign. If the hook thread exited
-                // between the terminal read and this call and Windows already
-                // recycled its TID, the wake cannot terminate an unrelated
-                // thread (the old WM_QUIT path could). The exact owner checks
-                // `stop_requested` after GetMessageW wakes.
-                match unsafe {
-                    PostThreadMessageW(self.readback.thread_id, WM_NULL, WPARAM(0), LPARAM(0))
-                } {
-                    Ok(()) => true,
-                    Err(error) => {
-                        failures.push(format!("interaction hook stop wake failed: {error}"));
-                        false
-                    }
-                }
-            };
-            let (thread_terminal, thread_joined, exact_owner_retained, join_failure) = self
-                .thread
-                .take()
-                .map_or((true, true, false, None), |thread| {
-                    join_thread_until(thread, timeout)
-                });
-            finish_hook_stop(exact_owner_retained);
-            if let Some(failure) = join_failure {
-                failures.push(failure);
-            }
-            InteractionHookShutdownReport {
-                reason,
-                stop_wake_sent,
-                sender_cleared,
-                thread_owner_present,
-                thread_terminal,
-                thread_joined,
-                exact_owner_retained,
-                failures,
-            }
-        }
     }
 
     impl Drop for InteractionHook {
         fn drop(&mut self) {
-            let report = self.shutdown_inner(HOOK_START_TIMEOUT, "drop_backstop");
-            if !report.owners_quiescent() || !report.failures.is_empty() {
-                tracing::error!(
-                    code = "TIMELINE_INTERACTION_HOOK_DROP_INCOMPLETE",
-                    report = ?report,
-                    "interaction hook drop backstop could not prove every owner terminal"
-                );
+            // SAFETY: PostThreadMessageW takes only plain integers; thread_id is the hook thread's
+            // id. If that thread already exited the call just fails and the result is ignored.
+            let _ = unsafe {
+                PostThreadMessageW(self.readback.thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
+            };
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
             }
+            clear_sender();
         }
     }
 
@@ -421,6 +186,8 @@ mod platform {
 
     impl Drop for HookGuard {
         fn drop(&mut self) {
+            // SAFETY: self.0 is the HHOOK from SetWindowsHookExW, owned by this guard and unhooked
+            // exactly once here on the hook thread; failure is ignored.
             let _ = unsafe { UnhookWindowsHookEx(self.0) };
         }
     }
@@ -429,127 +196,28 @@ mod platform {
         HOOK_SENDER.get_or_init(|| Mutex::new(None))
     }
 
-    fn clear_sender() -> bool {
-        match hook_sender().lock() {
-            Ok(mut guard) => {
-                *guard = None;
-                true
-            }
-            Err(poisoned) => {
-                *poisoned.into_inner() = None;
-                tracing::error!(
-                    code = "TIMELINE_INTERACTION_HOOK_SENDER_POISONED",
-                    "recovered poisoned interaction-hook sender while clearing ownership"
-                );
-                true
-            }
+    fn clear_sender() {
+        if let Ok(mut guard) = hook_sender().lock() {
+            *guard = None;
         }
     }
 
-    fn join_thread_until(
-        thread: HookThreadOwner,
-        timeout: Duration,
-    ) -> (bool, bool, bool, Option<String>) {
-        let deadline = Instant::now() + timeout;
-        while !thread.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if !thread.is_finished() {
-            retain_live_owner(thread);
-            return (
-                false,
-                false,
-                true,
-                Some(format!(
-                    "interaction hook thread did not terminate within {} ms; exact JoinHandle retained until process teardown",
-                    timeout.as_millis()
-                )),
-            );
-        }
-        match thread.join() {
-            Ok(Ok(())) => (true, true, false, None),
-            Ok(Err(error)) => (
-                true,
-                true,
-                false,
-                Some(format!("interaction hook thread failed: {error}")),
-            ),
-            Err(_panic) => (
-                true,
-                true,
-                false,
-                Some("interaction hook thread panicked".to_owned()),
-            ),
-        }
-    }
-
-    fn retain_live_owner(thread: HookThreadOwner) {
-        let owners = RETAINED_HOOK_OWNERS.get_or_init(|| Mutex::new(Vec::new()));
-        match owners.lock() {
-            Ok(mut owners) => owners.push(thread),
-            Err(poisoned) => poisoned.into_inner().push(thread),
-        }
-    }
-
-    pub(super) fn retained_live_owner_count() -> usize {
-        let owners = RETAINED_HOOK_OWNERS.get_or_init(|| Mutex::new(Vec::new()));
-        let mut owners = match owners.lock() {
-            Ok(owners) => owners,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let mut still_live = Vec::with_capacity(owners.len());
-        for owner in std::mem::take(&mut *owners) {
-            if owner.is_finished() {
-                match owner.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::error!(
-                        code = "TIMELINE_INTERACTION_HOOK_RETAINED_OWNER_FAILED",
-                        detail = %error,
-                        "terminal retained interaction-hook owner failed while being reaped"
-                    ),
-                    Err(_panic) => tracing::error!(
-                        code = "TIMELINE_INTERACTION_HOOK_RETAINED_OWNER_PANICKED",
-                        "terminal retained interaction-hook owner panicked while being reaped"
-                    ),
-                }
-            } else {
-                still_live.push(owner);
-            }
-        }
-        let count = still_live.len();
-        *owners = still_live;
-        drop(owners);
-        if count == 0 {
-            let mut phase = match hook_owner_phase().lock() {
-                Ok(phase) => phase,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if *phase == HookOwnerPhase::Retained {
-                *phase = HookOwnerPhase::Terminal;
-            }
-        }
-        count
-    }
-
-    fn run_hook_thread(
-        thread_id_tx: std_mpsc::Sender<u32>,
-        ready_tx: std_mpsc::Sender<Result<InteractionHookReadback, String>>,
-        stop_requested: Arc<AtomicBool>,
-    ) -> HookThreadResult {
+    fn run_hook_thread(ready_tx: std_mpsc::Sender<Result<InteractionHookReadback, String>>) {
+        // SAFETY: GetCurrentThreadId has no preconditions.
         let thread_id = unsafe { GetCurrentThreadId() };
-        let _ = thread_id_tx.send(thread_id);
-        if stop_requested.load(Ordering::Acquire) {
-            return Ok(());
-        }
+        // SAFETY: a None module name returns the calling process's own handle; no pointers.
         let module = match unsafe { GetModuleHandleW(None) } {
             Ok(module) => module,
             Err(error) => {
-                let detail =
-                    format!("GetModuleHandleW failed for interaction cadence hook: {error}");
-                let _ = ready_tx.send(Err(detail.clone()));
-                return Err(detail);
+                let _ = ready_tx.send(Err(format!(
+                    "GetModuleHandleW failed for interaction cadence hook: {error}"
+                )));
+                return;
             }
         };
+        // SAFETY: keyboard_hook_proc is a 'static extern "system" fn matching HOOKPROC, module is
+        // the valid process HINSTANCE, and thread id 0 makes a global LL hook; this thread pumps
+        // messages in the GetMessageW loop below, which low-level hooks require.
         let keyboard_hook = match unsafe {
             SetWindowsHookExW(
                 WH_KEYBOARD_LL,
@@ -560,11 +228,15 @@ mod platform {
         } {
             Ok(hook) => hook,
             Err(error) => {
-                let detail = format!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {error}");
-                let _ = ready_tx.send(Err(detail.clone()));
-                return Err(detail);
+                let _ = ready_tx.send(Err(format!(
+                    "SetWindowsHookExW(WH_KEYBOARD_LL) failed: {error}"
+                )));
+                return;
             }
         };
+        // SAFETY: mouse_hook_proc is a 'static extern "system" fn matching HOOKPROC, module is
+        // the valid process HINSTANCE, and thread id 0 makes a global LL hook; this thread pumps
+        // messages in the GetMessageW loop below, which low-level hooks require.
         let mouse_hook = match unsafe {
             SetWindowsHookExW(
                 WH_MOUSE_LL,
@@ -576,53 +248,67 @@ mod platform {
             Ok(hook) => hook,
             Err(error) => {
                 let _keyboard_guard = HookGuard(keyboard_hook);
-                let detail = format!("SetWindowsHookExW(WH_MOUSE_LL) failed: {error}");
-                let _ = ready_tx.send(Err(detail.clone()));
-                return Err(detail);
+                let _ = ready_tx.send(Err(format!(
+                    "SetWindowsHookExW(WH_MOUSE_LL) failed: {error}"
+                )));
+                return;
             }
         };
         let _keyboard_guard = HookGuard(keyboard_hook);
         let _mouse_guard = HookGuard(mouse_hook);
-        // PostThreadMessageW fails until the target thread owns a message
-        // queue. Create it before publishing readiness so an immediate stop
-        // always has a real wake surface.
-        let mut msg = MSG::default();
-        let _ = unsafe { PeekMessageW(&raw mut msg, None, 0, 0, PM_NOREMOVE) };
-        if stop_requested.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        ready_tx
-            .send(Ok(InteractionHookReadback {
-                thread_id,
-                keyboard_hook_installed: true,
-                mouse_hook_installed: true,
-            }))
-            .map_err(|_| {
-                "interaction hook readiness receiver closed before acknowledgement".to_owned()
-            })?;
+        let _ = ready_tx.send(Ok(InteractionHookReadback {
+            thread_id,
+            keyboard_hook_installed: true,
+            mouse_hook_installed: true,
+        }));
 
+        let mut msg = MSG::default();
         loop {
-            let result = unsafe { GetMessageW(&raw mut msg, None, 0, 0) };
-            if result.0 == -1 {
-                return Err(format!(
-                    "GetMessageW failed for interaction cadence hook: {}",
-                    windows::core::Error::from_thread()
-                ));
-            }
-            if result.0 == 0 {
-                return if stop_requested.load(Ordering::Acquire) {
-                    Ok(())
-                } else {
-                    Err("interaction hook message loop received WM_QUIT without an exact stop request"
-                        .to_owned())
-                };
-            }
-            if stop_requested.load(Ordering::Acquire) {
-                return Ok(());
+            // SAFETY: &raw mut msg points to a live, initialized local MSG; a None HWND receives
+            // all messages for this thread, which also drives the low-level hook callbacks.
+            let result = unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.0;
+            match classify_get_message(result) {
+                MessagePump::Continue => {}
+                MessagePump::Quit => break,
+                MessagePump::Failed => {
+                    // GetMessageW returned -1: the pump can no longer run, so stop instead of
+                    // busy-spinning; the guards unhook on return.
+                    tracing::warn!(
+                        code = "MCP_INTERACTION_CADENCE_GETMESSAGE_FAILED",
+                        result,
+                        os_error = %std::io::Error::last_os_error(),
+                        "interaction cadence hook message pump failed; exiting hook thread"
+                    );
+                    break;
+                }
             }
         }
     }
 
+    /// What the hook thread does after one `GetMessageW` call.
+    #[derive(Debug, PartialEq, Eq)]
+    enum MessagePump {
+        /// `> 0`: a message was retrieved; keep pumping.
+        Continue,
+        /// `0`: `WM_QUIT`; exit normally.
+        Quit,
+        /// `-1` (or any other negative value): error; `BOOL::as_bool` would wrongly treat this
+        /// as true and busy-loop forever.
+        Failed,
+    }
+
+    const fn classify_get_message(result: i32) -> MessagePump {
+        if result > 0 {
+            MessagePump::Continue
+        } else if result == 0 {
+            MessagePump::Quit
+        } else {
+            MessagePump::Failed
+        }
+    }
+
+    // SAFETY: contract - Windows invokes this only as the WH_KEYBOARD_LL HOOKPROC on the hook
+    // thread; when code >= 0, lparam points to a KBDLLHOOKSTRUCT valid for the callback.
     unsafe extern "system" fn keyboard_hook_proc(
         code: i32,
         wparam: WPARAM,
@@ -631,20 +317,26 @@ mod platform {
         if code >= 0 {
             let message = u32::try_from(wparam.0).unwrap_or(0);
             if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                // SAFETY: code >= 0, WM_KEY* message: lparam is a valid, aligned pointer to a
+                // KBDLLHOOKSTRUCT living for this callback; it is Copy, read by value.
                 let data = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
                 emit(
                     InteractionEventKind::Keystroke,
                     data.flags.0 & LLKHF_INJECTED_MASK != 0,
                     Some(key_signal(data.vkCode)),
+                    None,
                 );
             } else if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
                 // Key-up confirms release state but is not an interaction
                 // count. Counting key-down only avoids doubling keystrokes.
             }
         }
+        // SAFETY: forwards the hook arguments unchanged down the chain; hook handle may be None.
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 
+    // SAFETY: contract - Windows invokes this only as the WH_MOUSE_LL HOOKPROC on the hook
+    // thread; when code >= 0, lparam points to a MSLLHOOKSTRUCT valid for the callback.
     unsafe extern "system" fn mouse_hook_proc(
         code: i32,
         wparam: WPARAM,
@@ -652,11 +344,14 @@ mod platform {
     ) -> LRESULT {
         if code >= 0 {
             let message = u32::try_from(wparam.0).unwrap_or(0);
+            // SAFETY: code >= 0, so lparam is a valid, aligned pointer to a MSLLHOOKSTRUCT that
+            // lives for this callback; it is Copy and read by value here.
             let data = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
             let injected = data.flags & LLMHF_INJECTED_MASK != 0;
+            let point = (data.pt.x, data.pt.y);
             match message {
                 WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
-                    emit(InteractionEventKind::Click, injected, None);
+                    emit(InteractionEventKind::Click, injected, None, Some(point));
                 }
                 WM_MOUSEWHEEL => {
                     emit(
@@ -665,6 +360,7 @@ mod platform {
                         },
                         injected,
                         None,
+                        Some(point),
                     );
                 }
                 WM_MOUSEHWHEEL => {
@@ -674,25 +370,51 @@ mod platform {
                         },
                         injected,
                         None,
+                        Some(point),
                     );
                 }
+                WM_MOUSEMOVE if !injected => note_physical_move(),
                 _ => {}
             }
         }
+        // SAFETY: forwards the hook arguments unchanged down the chain; hook handle may be None.
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
 
-    fn emit(kind: InteractionEventKind, injected: bool, key_signal: Option<InteractionKeySignal>) {
+    fn emit(
+        kind: InteractionEventKind,
+        injected: bool,
+        key_signal: Option<InteractionKeySignal>,
+        screen_point: Option<(i32, i32)>,
+    ) {
         let event = InteractionEvent {
             ts_ns: super::super_now_ts_ns(),
             kind,
             injected,
             key_signal,
+            screen_point,
         };
+        owner_presence::observe_input_event(injected, event.ts_ns);
         if let Ok(guard) = hook_sender().lock()
             && let Some(sender) = guard.as_ref()
         {
             let _ = sender.send(event);
+        }
+    }
+
+    /// Owner-away mode: count a physical mouse move at most once per
+    /// [`owner_presence::PHYSICAL_MOVE_COALESCE_MS`] and treat it like any
+    /// other physical input for the owner-return stop.
+    fn note_physical_move() {
+        let now_ns = super::super_now_ts_ns();
+        let last_ns = super::LAST_PHYSICAL_MOVE_NS.load(super::Ordering::Acquire);
+        if owner_presence::physical_move_due(
+            now_ns,
+            last_ns,
+            owner_presence::PHYSICAL_MOVE_COALESCE_MS,
+        ) {
+            super::LAST_PHYSICAL_MOVE_NS.store(now_ns, super::Ordering::Release);
+            owner_presence::observe_input_event(false, now_ns);
         }
     }
 
@@ -723,6 +445,7 @@ mod platform {
     }
 
     fn key_down(vk_code: u32) -> bool {
+        // SAFETY: GetAsyncKeyState takes a plain integer virtual-key code; no pointers involved.
         let state = unsafe { GetAsyncKeyState(i32::try_from(vk_code).unwrap_or(0)) };
         (state as u16 & KEY_DOWN_MASK) != 0
     }
@@ -746,7 +469,7 @@ mod platform {
     use anyhow::{Result, bail};
     use tokio::sync::mpsc;
 
-    use super::{InteractionEvent, InteractionHookReadback, InteractionHookShutdownReport};
+    use super::{InteractionEvent, InteractionHookReadback};
 
     pub struct InteractionHook {
         readback: InteractionHookReadback,
@@ -760,27 +483,6 @@ mod platform {
         pub const fn readback(&self) -> &InteractionHookReadback {
             &self.readback
         }
-
-        pub fn shutdown_checked(
-            self,
-            _timeout: std::time::Duration,
-            reason: &'static str,
-        ) -> InteractionHookShutdownReport {
-            InteractionHookShutdownReport {
-                reason,
-                stop_wake_sent: true,
-                sender_cleared: true,
-                thread_owner_present: false,
-                thread_terminal: true,
-                thread_joined: true,
-                exact_owner_retained: false,
-                failures: Vec::new(),
-            }
-        }
-    }
-
-    pub(super) const fn retained_live_owner_count() -> usize {
-        0
     }
 }
 

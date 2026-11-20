@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex, OnceLock},
+    task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
 
@@ -10,25 +13,14 @@ use synapse_core::{
 };
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
-use crate::{ActionError, ActionResult, InputDeliveryTarget, validate_action};
+use crate::release_ack::closed_before_completion;
+use crate::{
+    ActionAck, ActionError, ActionResult, ReleaseAllCompletion, ReleaseAllOutcome, validate_action,
+};
 
 pub const ACTION_QUEUE_CAPACITY: usize = 256;
 
-/// Emitter queue item carrying the operator-panic epoch from the enqueue edge.
-///
-/// A normal action must still match this epoch at physical dispatch; otherwise
-/// an item queued before K1 could resume after a fully finalized K2 wave.
-pub type ActionMessage = (Action, oneshot::Sender<ActionResult<()>>, ActionEnqueueMeta);
-
-/// Per-action metadata captured at the enqueue edge.
-#[derive(Clone, Debug, Default)]
-pub struct ActionEnqueueMeta {
-    /// Operator-panic epoch captured when the action was enqueued.
-    pub operator_panic_epoch_at_enqueue: Option<u64>,
-    /// Window the action is meant for; the software backend re-verifies the
-    /// live foreground against it immediately before every OS input batch.
-    pub delivery_target: Option<InputDeliveryTarget>,
-}
+pub type ActionMessage = (Action, ActionAck);
 
 pub static RELEASE_ALL_HANDLE: OnceLock<ActionHandle> = OnceLock::new();
 
@@ -43,7 +35,7 @@ pub trait ActionComboScheduler: Send + Sync {
         &self,
         steps: Vec<ComboStep>,
         backend: Backend,
-        operator_panic_epoch_at_schedule: u64,
+        origin: &ActionHandle,
     ) -> ActionResult<()>;
 }
 
@@ -55,8 +47,8 @@ pub struct ActionHandle {
     session_id: Option<String>,
     session_inputs: Arc<Mutex<SessionInputOwnership>>,
     session_input_gate: Arc<AsyncMutex<()>>,
-    delivery_target: Option<InputDeliveryTarget>,
-    session_delivery_targets: Arc<Mutex<BTreeMap<String, InputDeliveryTarget>>>,
+    delivery_target: Option<crate::InputDeliveryTarget>,
+    session_delivery_targets: Arc<Mutex<BTreeMap<String, crate::InputDeliveryTarget>>>,
 }
 
 impl std::fmt::Debug for ActionHandle {
@@ -129,12 +121,18 @@ impl ActionHandle {
     /// Returns a handle whose actions carry `target` as their intended OS-input
     /// delivery window. `None` keeps the current (or session-bound) target.
     #[must_use]
-    pub fn with_delivery_target(&self, target: Option<InputDeliveryTarget>) -> Self {
+    pub fn with_delivery_target(&self, target: Option<crate::InputDeliveryTarget>) -> Self {
         let mut handle = self.clone();
         if target.is_some() {
             handle.delivery_target = target;
         }
         handle
+    }
+
+    /// The MCP session this handle acts for, if any.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// The intended OS-input delivery target for actions sent through this
@@ -145,7 +143,7 @@ impl ActionHandle {
     ///
     /// Returns `ACTION_BACKEND_UNAVAILABLE` if the session target map is
     /// poisoned.
-    pub fn delivery_target(&self) -> ActionResult<Option<InputDeliveryTarget>> {
+    pub fn delivery_target(&self) -> ActionResult<Option<crate::InputDeliveryTarget>> {
         if let Some(target) = &self.delivery_target {
             return Ok(Some(target.clone()));
         }
@@ -160,6 +158,24 @@ impl ActionHandle {
             })
     }
 
+    /// The live delivery identity for `hwnd` (any descendant is accepted).
+    /// When this handle's target is that root window, the live owner pid must
+    /// still be the bound pid: a closed window or a root HWND reused by another
+    /// process is refused, never silently retargeted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_TARGET_INVALID` for a dead or reused HWND, or
+    /// `ACTION_BACKEND_UNAVAILABLE` if the session target map is poisoned.
+    pub fn delivery_target_for_window(
+        &self,
+        hwnd: i64,
+        source: &'static str,
+    ) -> ActionResult<crate::InputDeliveryTarget> {
+        let live = crate::InputDeliveryTarget::resolve_window(hwnd, source)?;
+        live.keep_bound_identity(self.delivery_target()?)
+    }
+
     /// Records `target` as this session's intended OS-input window after an
     /// explicit, verified focus of that window. Returns `false` (and records
     /// nothing) for an unscoped handle.
@@ -168,7 +184,10 @@ impl ActionHandle {
     ///
     /// Returns `ACTION_BACKEND_UNAVAILABLE` if the session target map is
     /// poisoned.
-    pub fn bind_session_delivery_target(&self, target: InputDeliveryTarget) -> ActionResult<bool> {
+    pub fn bind_session_delivery_target(
+        &self,
+        target: crate::InputDeliveryTarget,
+    ) -> ActionResult<bool> {
         let Some(session_id) = self.session_id.clone() else {
             return Ok(false);
         };
@@ -212,7 +231,11 @@ impl ActionHandle {
     /// saturated, `ACTION_BACKEND_UNAVAILABLE` when the emitter channel or
     /// acknowledgement path is closed, or the emitter's own `ActionError`.
     pub async fn execute(&self, action: Action) -> ActionResult<()> {
-        self.execute_with_owner(action, self.session_id.clone())
+        // #188: the release epoch is read when the caller hands the action
+        // over, before the session gate wait, so an interrupt raised while the
+        // action waits for the gate or the queue still stops it.
+        let release_epoch = crate::hotkey::operator_release_epoch();
+        self.execute_with_owner(action, self.session_id.clone(), release_epoch)
             .await
     }
 
@@ -220,49 +243,35 @@ impl ActionHandle {
         &self,
         action: Action,
         session_id: Option<String>,
+        release_epoch: u64,
     ) -> ActionResult<()> {
         let _session_input_gate = self.session_input_gate.lock().await;
-        self.execute_with_owner_gated(action, session_id).await
+        self.execute_with_owner_gated(action, session_id, release_epoch)
+            .await
     }
 
     async fn execute_with_owner_gated(
         &self,
         action: Action,
         session_id: Option<String>,
+        release_epoch: u64,
     ) -> ActionResult<()> {
         validate_action(&action)?;
-        ensure_operator_panic_allows_action(&action)?;
         if let Action::Combo { steps, backend } = &action
             && let Some(scheduler) = self.combo_scheduler()?
         {
-            let epoch_at_schedule =
-                capture_operator_panic_action_epoch(&action)?.ok_or_else(|| {
-                    ActionError::BackendUnavailable {
-                        detail: "combo scheduling unexpectedly lacked an operator-panic epoch"
-                            .to_owned(),
-                    }
-                })?;
-            scheduler.schedule_combo(steps.clone(), *backend, epoch_at_schedule)?;
-            ensure_operator_panic_allows_action_since(&action, Some(epoch_at_schedule))?;
-            return Ok(());
+            return scheduler.schedule_combo(steps.clone(), *backend, self);
         }
         let (ack_tx, ack_rx) = oneshot::channel();
-        let epoch_at_enqueue = self.send_for_execution(action.clone(), ack_tx)?;
+        let ack = ActionAck::new(ack_tx).with_release_epoch(release_epoch);
+        self.send_for_execution(action.clone(), ack)?;
         let result = ack_rx
             .await
             .map_err(|_err| ActionError::BackendUnavailable {
                 detail: "action emitter dropped acknowledgement".to_owned(),
             })?;
         if result.is_ok() {
-            // Do not resurrect held-input ownership after K1 released the
-            // physical state while an already-dispatched action was awaiting
-            // its emitter acknowledgement.
-            ensure_operator_panic_allows_action_since(&action, epoch_at_enqueue)?;
-            self.record_successful_action_with_panic_guard(
-                session_id.as_deref(),
-                &action,
-                epoch_at_enqueue,
-            )?;
+            self.record_successful_action(session_id.as_deref(), &action)?;
         }
         result
     }
@@ -275,59 +284,118 @@ impl ActionHandle {
     /// `ACTION_BACKEND_UNAVAILABLE` when the emitter channel is closed.
     pub fn try_execute(&self, action: Action) -> ActionResult<()> {
         validate_action(&action)?;
-        ensure_operator_panic_allows_action(&action)?;
         if let Action::Combo { steps, backend } = &action
             && let Some(scheduler) = self.combo_scheduler()?
         {
-            let epoch_at_schedule =
-                capture_operator_panic_action_epoch(&action)?.ok_or_else(|| {
-                    ActionError::BackendUnavailable {
-                        detail: "combo scheduling unexpectedly lacked an operator-panic epoch"
-                            .to_owned(),
-                    }
-                })?;
-            scheduler.schedule_combo(steps.clone(), *backend, epoch_at_schedule)?;
-            return ensure_operator_panic_allows_action_since(&action, Some(epoch_at_schedule));
+            return scheduler.schedule_combo(steps.clone(), *backend, self);
         }
-        let (ack_tx, _ack_rx) = oneshot::channel();
-        let _epoch_at_enqueue = self.send_for_execution(action, ack_tx)?;
-        Ok(())
+        self.try_enqueue(action).map(|_completion| ())
     }
 
-    /// Enqueues `ReleaseAll` and synchronously waits for its acknowledgement.
+    /// Enqueues like [`Self::try_execute`] without waiting, and returns the
+    /// receiver of the emitter's final result so a caller that must watch the
+    /// action until it finishes (the reflex foreground typing guard, #188) can
+    /// do so without changing queue order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_QUEUE_FULL` when the bounded queue is saturated,
+    /// `ACTION_BACKEND_UNAVAILABLE` when the emitter channel is closed or the
+    /// action is a combo routed to the combo scheduler (no single completion).
+    pub fn try_execute_with_completion(
+        &self,
+        action: Action,
+    ) -> ActionResult<oneshot::Receiver<ActionResult<()>>> {
+        validate_action(&action)?;
+        if matches!(action, Action::Combo { .. }) && self.combo_scheduler()?.is_some() {
+            return Err(ActionError::BackendUnavailable {
+                detail: "combo actions run on the combo scheduler and have no single completion"
+                    .to_owned(),
+            });
+        }
+        self.try_enqueue(action)
+    }
+
+    fn try_enqueue(&self, action: Action) -> ActionResult<oneshot::Receiver<ActionResult<()>>> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let ack = self.attach_delivery_target(&action, ActionAck::new(ack_tx))?;
+        self.tx.try_send((action, ack)).map_err(map_try_send)?;
+        Ok(ack_rx)
+    }
+
+    /// Enqueues `ReleaseAll` and synchronously waits for its acknowledgement,
+    /// using `timeout` for both the primary release and the combined result.
     ///
     /// # Errors
     ///
     /// Returns `ACTION_QUEUE_FULL` if the fallback bounded queue is saturated,
-    /// or `ACTION_BACKEND_UNAVAILABLE` if the acknowledgement closes or times
-    /// out.
+    /// `ACTION_BACKEND_UNAVAILABLE` if the acknowledgement closes or times
+    /// out, or the primary / secondary-drain failure.
     pub fn fire_release_all_blocking_with_timeout(&self, timeout: Duration) -> ActionResult<()> {
-        let (ack_tx, mut ack_rx) = oneshot::channel();
-        self.send_release_all(Action::ReleaseAll, ack_tx)?;
+        self.fire_release_all_blocking(timeout, timeout)?
+            .into_result()
+    }
 
-        let deadline = Instant::now() + timeout;
-        let result = loop {
-            match ack_rx.try_recv() {
-                Ok(result) => break result,
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    return Err(ActionError::BackendUnavailable {
-                        detail: "release_all acknowledgement channel closed".to_owned(),
-                    });
-                }
-                Err(oneshot::error::TryRecvError::Empty) if Instant::now() >= deadline => {
-                    return Err(ActionError::BackendUnavailable {
-                        detail: format!("release_all acknowledgement timed out after {timeout:?}"),
-                    });
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+    /// Enqueues `ReleaseAll` for the K1 hotkey: waits up to `primary_timeout`
+    /// for the PRIMARY backend release (the latency-critical part), then up to
+    /// `completion_timeout` for the combined result that also covers the
+    /// `ViGEm`/hardware secondary drains.
+    ///
+    /// The per-session input ledger is cleared only when every drain finished
+    /// successfully; a failed or still-pending secondary drain leaves it intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_QUEUE_FULL` if the fallback bounded queue is saturated,
+    /// or `ACTION_BACKEND_UNAVAILABLE` if the primary acknowledgement closes or
+    /// times out. A primary or secondary failure is reported inside the
+    /// returned [`ReleaseAllOutcome`], not as an error here.
+    pub fn fire_release_all_blocking(
+        &self,
+        primary_timeout: Duration,
+        completion_timeout: Duration,
+    ) -> ActionResult<ReleaseAllOutcome> {
+        let started = Instant::now();
+        let (completion_tx, mut completion_rx) = oneshot::channel();
+        let (primary_tx, mut primary_rx) = oneshot::channel();
+        self.send_release_all(
+            Action::ReleaseAll,
+            ActionAck::with_primary(completion_tx, primary_tx),
+        )?;
+
+        let primary = match blocking_recv_with_timeout(&mut primary_rx, primary_timeout) {
+            Ok(result) => result,
+            Err(AckWaitError::Closed) => {
+                return Err(ActionError::BackendUnavailable {
+                    detail: "release_all acknowledgement channel closed".to_owned(),
+                });
+            }
+            Err(AckWaitError::TimedOut) => {
+                return Err(ActionError::BackendUnavailable {
+                    detail: format!(
+                        "release_all acknowledgement timed out after {primary_timeout:?}"
+                    ),
+                });
             }
         };
-        if result.is_ok() {
+        let primary_ack_after = started.elapsed();
+
+        let completion = match blocking_recv_with_timeout(&mut completion_rx, completion_timeout) {
+            Ok(result) => ReleaseAllCompletion::Complete(result),
+            Err(AckWaitError::Closed) => {
+                ReleaseAllCompletion::Complete(Err(closed_before_completion()))
+            }
+            Err(AckWaitError::TimedOut) => ReleaseAllCompletion::Pending,
+        };
+        let outcome = ReleaseAllOutcome {
+            primary,
+            primary_ack_after,
+            completion,
+        };
+        if outcome.fully_released() {
             self.record_successful_action(None, &Action::ReleaseAll)?;
         }
-        result
+        Ok(outcome)
     }
 
     /// Reads the per-HTTP-session held-input ownership ledger.
@@ -379,7 +447,11 @@ impl ActionHandle {
             })?;
         let mut first_error = None;
         for action in plan.actions {
-            match self.execute_with_owner_gated(action.clone(), None).await {
+            let release_epoch = crate::hotkey::operator_release_epoch();
+            match self
+                .execute_with_owner_gated(action.clone(), None, release_epoch)
+                .await
+            {
                 Ok(()) => {
                     if let Err(error) = self.confirm_session_release_action(session_id, &action)
                         && first_error.is_none()
@@ -446,47 +518,47 @@ impl ActionHandle {
             })
     }
 
-    fn send_for_execution(
-        &self,
-        action: Action,
-        ack_tx: oneshot::Sender<ActionResult<()>>,
-    ) -> ActionResult<Option<u64>> {
-        let operator_panic_epoch_at_enqueue = capture_operator_panic_action_epoch(&action)?;
-        let meta = ActionEnqueueMeta {
-            operator_panic_epoch_at_enqueue,
-            delivery_target: self.delivery_target()?,
-        };
+    /// Every enqueue edge carries this handle's intended OS-input window (#294);
+    /// the software backend re-checks it against the live foreground before
+    /// each batch. Releases carry none: a release must never fail on a target
+    /// lookup, and release-only batches always pass the guard. Queue routing
+    /// stays with [`is_safety_action`]; a button-up keeps its queue order.
+    fn attach_delivery_target(&self, action: &Action, ack: ActionAck) -> ActionResult<ActionAck> {
+        let release = is_safety_action(action)
+            || matches!(
+                action,
+                Action::MouseButton {
+                    action: ButtonAction::Up,
+                    ..
+                }
+            );
+        if release {
+            return Ok(ack);
+        }
+        Ok(ack.with_delivery_target(self.delivery_target()?))
+    }
+
+    fn send_for_execution(&self, action: Action, ack_tx: ActionAck) -> ActionResult<()> {
+        let ack_tx = self.attach_delivery_target(&action, ack_tx)?;
         if matches!(action, Action::ReleaseAll) {
             crate::request_release_interrupt();
+            crate::safety::mark_release_all_enqueued();
         }
         if is_safety_action(&action)
             && let Some(safety_tx) = &self.safety_tx
         {
-            safety_tx
-                .send((action, ack_tx, meta))
-                .map_err(map_unbounded_send)?;
-            return Ok(operator_panic_epoch_at_enqueue);
+            return safety_tx.send((action, ack_tx)).map_err(map_unbounded_send);
         }
-        self.tx
-            .try_send((action, ack_tx, meta))
-            .map_err(map_try_send)?;
-        Ok(operator_panic_epoch_at_enqueue)
+        self.tx.try_send((action, ack_tx)).map_err(map_try_send)
     }
 
-    fn send_release_all(
-        &self,
-        action: Action,
-        ack_tx: oneshot::Sender<ActionResult<()>>,
-    ) -> ActionResult<()> {
+    fn send_release_all(&self, action: Action, ack_tx: ActionAck) -> ActionResult<()> {
         crate::request_release_interrupt();
+        crate::safety::mark_release_all_enqueued();
         if let Some(safety_tx) = &self.safety_tx {
-            return safety_tx
-                .send((action, ack_tx, ActionEnqueueMeta::default()))
-                .map_err(map_unbounded_send);
+            return safety_tx.send((action, ack_tx)).map_err(map_unbounded_send);
         }
-        self.tx
-            .try_send((action, ack_tx, ActionEnqueueMeta::default()))
-            .map_err(map_try_send)
+        self.tx.try_send((action, ack_tx)).map_err(map_try_send)
     }
 
     fn record_successful_action(
@@ -502,30 +574,6 @@ impl ActionHandle {
             })
     }
 
-    fn record_successful_action_with_panic_guard(
-        &self,
-        session_id: Option<&str>,
-        action: &Action,
-        epoch_at_enqueue: Option<u64>,
-    ) -> ActionResult<()> {
-        self.record_successful_action(session_id, action)?;
-        if let Err(operator_panic_error) =
-            ensure_operator_panic_allows_action_since(action, epoch_at_enqueue)
-        {
-            // K1 may have raced the ledger write after the caller's first
-            // check: the physical ReleaseAll can clear ownership and then this
-            // request can otherwise restore a stale held-input owner. The
-            // caller still owns `session_input_gate`, so conservatively restore
-            // the ledger to the same all-released state before returning.
-            if let Err(cleanup_error) = self.record_successful_action(None, &Action::ReleaseAll) {
-                crate::record_operator_panic_safety_incident();
-                return Err(cleanup_error);
-            }
-            return Err(operator_panic_error);
-        }
-        Ok(())
-    }
-
     fn confirm_session_release_action(
         &self,
         session_id: &str,
@@ -537,6 +585,61 @@ impl ActionHandle {
             .map_err(|_err| ActionError::BackendUnavailable {
                 detail: "session input ownership ledger is poisoned".to_owned(),
             })
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/handle_wait_95.rs"]
+mod handle_wait_95;
+
+#[cfg(test)]
+#[path = "tests/handle_delivery_target_294.rs"]
+mod handle_delivery_target_294;
+
+enum AckWaitError {
+    Closed,
+    TimedOut,
+}
+
+/// Wakes a parked thread; lets a plain OS thread block on a tokio oneshot
+/// without a runtime and without polling on a sleep interval.
+struct ThreadWaker(std::thread::Thread);
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Event-driven blocking wait for a oneshot value: the thread parks until the
+/// sender completes (wake-up is immediate) or `timeout` elapses.
+fn blocking_recv_with_timeout<T>(
+    receiver: &mut oneshot::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, AckWaitError> {
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let deadline = Instant::now() + timeout;
+    loop {
+        // `unconstrained`: a plain oneshot poll spends the calling task's tokio
+        // coop budget, and once that is exhausted it answers `Pending` and
+        // defers its wake-up, which would park this thread forever and report a
+        // false timeout (e.g. from a panic hook on a busy worker).
+        let mut unconstrained = tokio::task::unconstrained(&mut *receiver);
+        match Pin::new(&mut unconstrained).poll(&mut context) {
+            Poll::Ready(Ok(value)) => return Ok(value),
+            Poll::Ready(Err(_closed)) => return Err(AckWaitError::Closed),
+            Poll::Pending => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AckWaitError::TimedOut);
+        }
+        std::thread::park_timeout(remaining);
     }
 }
 
@@ -558,56 +661,8 @@ fn map_unbounded_send(error: mpsc::error::SendError<ActionMessage>) -> ActionErr
     }
 }
 
-pub(crate) fn is_safety_action(action: &Action) -> bool {
-    match action {
-        Action::ReleaseAll
-        | Action::KeyUp { .. }
-        | Action::MouseButton {
-            action: ButtonAction::Up,
-            ..
-        } => true,
-        Action::PadReport { report, .. } => is_neutral_report(report),
-        _ => false,
-    }
-}
-
-pub(crate) fn ensure_operator_panic_allows_action(action: &Action) -> ActionResult<()> {
-    capture_operator_panic_action_epoch(action).map(|_epoch| ())
-}
-
-fn capture_operator_panic_action_epoch(action: &Action) -> ActionResult<Option<u64>> {
-    if is_safety_action(action) {
-        return Ok(None);
-    }
-    let epoch_at_arm = crate::operator_panic_epoch();
-    ensure_operator_panic_allows_action_since(action, Some(epoch_at_arm))?;
-    Ok(Some(epoch_at_arm))
-}
-
-pub(crate) fn ensure_operator_panic_allows_action_since(
-    action: &Action,
-    epoch_at_enqueue: Option<u64>,
-) -> ActionResult<()> {
-    if is_safety_action(action) {
-        return Ok(());
-    }
-    let readback = crate::operator_panic_safety_readback();
-    if let Some(epoch_at_enqueue) = epoch_at_enqueue
-        && !readback.pending
-        && readback.epoch == epoch_at_enqueue
-    {
-        return Ok(());
-    }
-    Err(ActionError::SafetyOperatorHotkeyFired {
-        detail: format!(
-            "operator-panic safety admission is closed for a normal action: epoch_at_enqueue={epoch_at_enqueue:?} epoch_after={} publications_in_flight={} outstanding_generations={} outstanding_finalizations={} accounting_incident={}",
-            readback.epoch,
-            readback.publications_in_flight,
-            readback.outstanding_generations,
-            readback.outstanding_finalizations,
-            readback.accounting_incident
-        ),
-    })
+const fn is_safety_action(action: &Action) -> bool {
+    matches!(action, Action::ReleaseAll | Action::KeyUp { .. })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

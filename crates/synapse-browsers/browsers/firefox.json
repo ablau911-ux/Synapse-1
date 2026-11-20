@@ -1,0 +1,53 @@
+{
+  "id": "firefox",
+  "label": "Mozilla Firefox",
+  "family": "gecko",
+  "process_names": ["firefox.exe"],
+  "exe_path_markers": [],
+  "exe_candidates": [
+    "%ProgramFiles%\\Mozilla Firefox\\firefox.exe",
+    "%ProgramFiles(x86)%\\Mozilla Firefox\\firefox.exe"
+  ],
+  "app_paths_name": "firefox.exe",
+  "user_data_root": "%APPDATA%\\Mozilla\\Firefox",
+  "profile_layout": "gecko",
+  "window_title_suffixes": [" — Mozilla Firefox", " - Mozilla Firefox"],
+  "tab_target_prefix": "firefox-tab:",
+  "endpoint_base": "synapse-bridge://firefox",
+  "health_key": "firefox_bridge",
+  "registration_token_file": "browser-bridge-token-firefox.txt",
+  "extension": {
+    "id": "synapse-bridge@synapse.local",
+    "origin_scheme": "moz-extension",
+    "extensions_page_url": "about:addons",
+    "manifest_dir": "synapse-firefox-bridge",
+    "deploy_subdir": "browser-extension\\firefox"
+  },
+  "policy": {
+    "root": "Software\\Policies\\Mozilla\\Firefox",
+    "extension_settings_value": "ExtensionSettings"
+  },
+  "native_messaging_cleanup_roots": [],
+  "protected_extension_ids": [],
+  "cdp_product_tokens": [],
+  "unsupported_capabilities": [
+    "evaluateScript",
+    "initScript",
+    "exposeBinding",
+    "handleDialog",
+    "fileUpload",
+    "cdpInput",
+    "typeActiveElement",
+    "viewportEmulation",
+    "deviceEmulation",
+    "geolocationEmulation",
+    "localeEmulation",
+    "mediaEmulation",
+    "networkConditions",
+    "pagePdf",
+    "externalPopupRiskSuppression"
+  ],
+  "debugger_api_expected": false,
+  "install_ui": null,
+  "winget_id": "Mozilla.Firefox"
+}

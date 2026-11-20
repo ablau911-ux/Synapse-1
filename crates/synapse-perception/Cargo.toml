@@ -3,7 +3,7 @@ name = "synapse-perception"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -20,7 +20,27 @@ tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+windows = { workspace = true, features = ["Globalization"] }
+
+[dev-dependencies]
+criterion.workspace = true
+synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }
+
+[[bench]]
+name = "ocr_read_text"
+harness = false
+
+[[bench]]
+name = "observe_warm_a11y_only"
+harness = false
+
+[[bench]]
+name = "observe_warm_hybrid"
+harness = false
+
+[[bench]]
+name = "hud_template_match"
+harness = false
 
 [lints]
 workspace = true

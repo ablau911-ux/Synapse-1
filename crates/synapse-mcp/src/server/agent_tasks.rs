@@ -47,15 +47,13 @@ use super::{
     tool, tool_router,
 };
 use crate::m4::{
-    ActSpawnAgentRequest, default_agent_spawn_hold_open_ms, default_agent_spawn_mcp_url,
-    default_agent_spawn_wait_timeout_ms,
+    ActSpawnAgentRequest, default_agent_spawn_hold_open_ms, default_agent_spawn_wait_timeout_ms,
 };
 
 /// CF_KV key namespace for task rows. Versioned prefix so a format change is a
 /// clean re-key, never an in-place migration.
 const TASK_NAMESPACE: &str = "agent-task/v1";
 const TASK_SCHEMA_VERSION: u32 = 1;
-const TASK_SEQUENCE_KEY: &str = "agent-task/v1/meta/last_enqueue_seq";
 
 const MAX_TASK_ID_CHARS: usize = 200;
 const MAX_TITLE_CHARS: usize = 500;
@@ -64,10 +62,6 @@ const MAX_PARAM_VALUE_BYTES: usize = 16 * 1024;
 const MIN_PRIORITY: u8 = 1;
 const MAX_PRIORITY: u8 = 5;
 const MAX_LIST_TASKS: usize = 1000;
-const SCAN_CHUNK_ROWS: usize = 4_096;
-const TERMINAL_TASK_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const TERMINAL_TASK_RETAIN_ROWS: usize = 5_000;
-const DELETE_BATCH_ROWS: usize = 512;
 /// Default global cap on concurrently in-flight (`in_progress`) tasks the
 /// dispatcher will allow. Operators override per call.
 const DEFAULT_CONCURRENCY_CAP: usize = 8;
@@ -390,10 +384,11 @@ pub struct TaskDispatchOnceParams {
     #[serde(default = "default_cap")]
     #[schemars(default = "default_cap", range(min = 1))]
     pub concurrency_cap: usize,
-    /// Streamable HTTP MCP endpoint forwarded to `act_spawn_agent`.
-    #[serde(default = "default_agent_spawn_mcp_url")]
-    #[schemars(default = "default_agent_spawn_mcp_url")]
-    pub mcp_url: String,
+    /// Streamable HTTP MCP endpoint forwarded to `act_spawn_agent`. Omit to
+    /// use this daemon's own endpoint.
+    #[serde(default)]
+    #[schemars(default)]
+    pub mcp_url: Option<String>,
     /// Spawn readback wait budget forwarded to `act_spawn_agent`.
     #[serde(default = "default_agent_spawn_wait_timeout_ms")]
     #[schemars(
@@ -454,14 +449,30 @@ fn task_prefix() -> String {
     format!("{TASK_NAMESPACE}/task/")
 }
 
-fn key_after(key: &[u8]) -> Vec<u8> {
-    let mut next = key.to_vec();
-    next.push(0);
-    next
-}
-
 fn params_error(message: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, message.into())
+}
+
+/// Enforces the advertised `list.max` schema range (1..=1000) so an
+/// out-of-range value is a parameter error, not an empty-looking success (#100).
+fn validate_list_max(max: usize) -> Result<(), ErrorData> {
+    if (1..=MAX_LIST_TASKS).contains(&max) {
+        Ok(())
+    } else {
+        Err(params_error(format!(
+            "task list max must be in 1..={MAX_LIST_TASKS}; got {max}"
+        )))
+    }
+}
+
+/// Enforces the advertised `concurrency_cap` schema minimum (>= 1): a cap of 0
+/// would report a permanent, misleading `at_capacity:0` (#100).
+fn validate_concurrency_cap(concurrency_cap: usize) -> Result<(), ErrorData> {
+    if concurrency_cap >= 1 {
+        Ok(())
+    } else {
+        Err(params_error("task concurrency_cap must be >= 1; got 0"))
+    }
 }
 
 fn task_not_found(task_id: &str) -> ErrorData {
@@ -638,12 +649,6 @@ struct SpawnTerminalCompletion {
     error_message: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-struct AgentTaskRow {
-    key: Vec<u8>,
-    task: AgentTask,
-}
-
 impl SpawnTerminalCompletion {
     fn is_success(&self) -> bool {
         self.status == "ok"
@@ -708,7 +713,89 @@ fn read_spawn_terminal_completion(
     })
 }
 
+// Serializes task read/modify/write transitions. A dispatch reserves its
+// selected task while its external spawn runs, rather than holding the mutex
+// across that slow operation.
+type TaskReservations = BTreeSet<(usize, String)>;
+static TASK_MUTATIONS: std::sync::Mutex<TaskReservations> = std::sync::Mutex::new(BTreeSet::new());
+
+fn task_mutation_guard() -> Result<std::sync::MutexGuard<'static, TaskReservations>, ErrorData> {
+    TASK_MUTATIONS.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "task mutation lock poisoned; restart the daemon before retrying",
+        )
+    })
+}
+
+fn reservation_key(db: &Db, task_id: &str) -> (usize, String) {
+    (std::ptr::from_ref(db) as usize, task_id.to_owned())
+}
+
+fn reject_dispatching(guard: &TaskReservations, db: &Db, task_id: &str) -> Result<(), ErrorData> {
+    if guard.contains(&reservation_key(db, task_id)) {
+        return Err(mcp_error(
+            error_codes::AGENT_TASK_INVALID_TRANSITION,
+            format!("agent_task {task_id:?} is reserved by an active dispatcher"),
+        ));
+    }
+    Ok(())
+}
+
+struct TaskDispatchReservation {
+    key: (usize, String),
+    active: bool,
+}
+
+impl Drop for TaskDispatchReservation {
+    fn drop(&mut self) {
+        if self.active
+            && let Ok(mut guard) = TASK_MUTATIONS.lock()
+        {
+            guard.remove(&self.key);
+        }
+    }
+}
+
+impl TaskDispatchReservation {
+    fn claim(
+        &mut self,
+        db: &Db,
+        session_id: &str,
+        spawn_id: String,
+        version: Option<u32>,
+    ) -> Result<AgentTask, ErrorData> {
+        let mut guard = task_mutation_guard()?;
+        guard.remove(&self.key);
+        self.active = false;
+        SynapseService::claim_internal_locked(db, &self.key.1, session_id, Some(spawn_id), version)
+    }
+}
+
 impl SynapseService {
+    fn reserve_task_dispatch(
+        db: &Db,
+        cap: usize,
+    ) -> Result<(DispatchDecision, usize, Option<TaskDispatchReservation>), ErrorData> {
+        let mut guard = task_mutation_guard()?;
+        let mut tasks = Self::read_all_tasks(db)?;
+        for task in &mut tasks {
+            if guard.contains(&reservation_key(db, &task.task_id)) {
+                task.state = TaskState::InProgress;
+            }
+        }
+        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
+        let decision = dispatch_decision(&tasks, cap);
+        let reservation = if let DispatchDecision::Dispatch { task_id } = &decision {
+            let key = reservation_key(db, task_id);
+            guard.insert(key.clone());
+            Some(TaskDispatchReservation { key, active: true })
+        } else {
+            None
+        };
+        Ok((decision, in_flight, reservation))
+    }
+
     fn agent_task_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {
         let state = self.m3_state_handle();
         let mut guard = state.lock().map_err(|_error| {
@@ -741,191 +828,21 @@ impl SynapseService {
     }
 
     pub(crate) fn read_all_tasks(db: &Db) -> Result<Vec<AgentTask>, ErrorData> {
-        Self::scan_task_rows(db).map(|rows| rows.into_iter().map(|row| row.task).collect())
-    }
-
-    fn scan_task_rows(db: &Db) -> Result<Vec<AgentTaskRow>, ErrorData> {
         let prefix = task_prefix();
-        let mut start = prefix.as_bytes().to_vec();
-        let mut out = Vec::new();
-        loop {
-            let (rows, more) = db
-                .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("agent_task failed to scan tasks: {error}"),
-                    )
-                })?;
-            if rows.is_empty() {
-                break;
-            }
-            let mut stop = false;
-            let mut last_key = None;
-            for (raw_key, raw_value) in rows {
-                if !raw_key.starts_with(prefix.as_bytes()) {
-                    stop = true;
-                    break;
-                }
-                let key = String::from_utf8_lossy(&raw_key).into_owned();
-                out.push(AgentTaskRow {
-                    key: raw_key.clone(),
-                    task: decode_task(&key, &raw_value)?,
-                });
-                last_key = Some(raw_key);
-            }
-            if stop || !more {
-                break;
-            }
-            let Some(key) = last_key else {
-                break;
-            };
-            start = key_after(&key);
-        }
-        Ok(out)
-    }
-
-    fn read_enqueue_seq_watermark(db: &Db) -> Result<Option<u64>, ErrorData> {
         let rows = db
-            .scan_cf_prefix(cf::CF_KV, TASK_SEQUENCE_KEY.as_bytes())
+            .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_task failed to read sequence watermark: {error}"),
+                    format!("agent_task failed to scan tasks: {error}"),
                 )
             })?;
-        for (key, value) in rows {
-            if key == TASK_SEQUENCE_KEY.as_bytes() {
-                let text = std::str::from_utf8(&value).map_err(|error| {
-                    mcp_error(
-                        error_codes::STORAGE_CORRUPTED,
-                        format!("agent_task sequence watermark is not UTF-8: {error}"),
-                    )
-                })?;
-                let seq = text.parse::<u64>().map_err(|error| {
-                    mcp_error(
-                        error_codes::STORAGE_CORRUPTED,
-                        format!("agent_task sequence watermark is not a u64: {error}"),
-                    )
-                })?;
-                return Ok(Some(seq));
-            }
-        }
-        Ok(None)
-    }
-
-    fn write_enqueue_seq_watermark(db: &Db, seq: u64) -> Result<(), ErrorData> {
-        db.put_batch(
-            cf::CF_KV,
-            [(
-                TASK_SEQUENCE_KEY.as_bytes().to_vec(),
-                seq.to_string().into_bytes(),
-            )],
-        )
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("agent_task failed to persist sequence watermark: {error}"),
-            )
-        })?;
-        db.flush().map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("agent_task sequence watermark persisted but failed to flush: {error}"),
-            )
-        })
-    }
-
-    fn ensure_enqueue_seq_watermark(db: &Db) -> Result<u64, ErrorData> {
-        if let Some(seq) = Self::read_enqueue_seq_watermark(db)? {
-            return Ok(seq);
-        }
-        let max_seq = Self::scan_task_rows(db)?
-            .iter()
-            .map(|row| row.task.enqueue_seq)
-            .max()
-            .unwrap_or(0);
-        Self::write_enqueue_seq_watermark(db, max_seq)?;
-        Ok(max_seq)
-    }
-
-    fn next_enqueue_seq(db: &Db) -> Result<u64, ErrorData> {
-        let current = Self::ensure_enqueue_seq_watermark(db)?;
-        let next = current.checked_add(1).ok_or_else(|| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "agent_task enqueue sequence overflowed u64",
-            )
-        })?;
-        Self::write_enqueue_seq_watermark(db, next)?;
-        Ok(next)
-    }
-
-    fn delete_task_keys(db: &Db, mut keys: Vec<Vec<u8>>) -> Result<usize, ErrorData> {
-        keys.sort();
-        keys.dedup();
-        let deleted = keys.len();
-        for chunk in keys.chunks(DELETE_BATCH_ROWS) {
-            db.delete_batch(cf::CF_KV, chunk.iter().cloned())
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("agent_task failed to prune terminal rows: {error}"),
-                    )
-                })?;
-        }
-        Ok(deleted)
-    }
-
-    fn prune_terminal_task_rows(
-        db: &Db,
-        now: u64,
-        rows: &[AgentTaskRow],
-    ) -> Result<usize, ErrorData> {
-        let mut terminal = rows
-            .iter()
-            .filter(|row| row.task.state.is_terminal())
-            .map(|row| (row.task.updated_unix_ms, row.key.clone()))
-            .collect::<Vec<_>>();
-        terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        let mut delete = terminal
-            .iter()
-            .filter(|(updated_at, _key)| {
-                updated_at.saturating_add(TERMINAL_TASK_RETENTION_MS) <= now
+        rows.into_iter()
+            .map(|(raw_key, raw_value)| {
+                let key = String::from_utf8_lossy(&raw_key).into_owned();
+                decode_task(&key, &raw_value)
             })
-            .map(|(_updated_at, key)| key.clone())
-            .collect::<Vec<_>>();
-
-        if terminal.len() > TERMINAL_TASK_RETAIN_ROWS {
-            let over_cap = terminal.len() - TERMINAL_TASK_RETAIN_ROWS;
-            delete.extend(
-                terminal
-                    .iter()
-                    .take(over_cap)
-                    .map(|(_updated_at, key)| key.clone()),
-            );
-        }
-
-        let deleted = Self::delete_task_keys(db, delete)?;
-        if deleted > 0 {
-            tracing::info!(
-                code = "AGENT_TASK_RETENTION_PRUNED",
-                scanned_rows = rows.len(),
-                terminal_rows = terminal.len(),
-                deleted_rows = deleted,
-                retain_terminal_rows = TERMINAL_TASK_RETAIN_ROWS,
-                retention_ms = TERMINAL_TASK_RETENTION_MS,
-                "readback=CF_KV terminal agent task rows pruned"
-            );
-        }
-        Ok(deleted)
-    }
-
-    fn prune_terminal_tasks(db: &Db, now: u64) -> Result<usize, ErrorData> {
-        Self::ensure_enqueue_seq_watermark(db)?;
-        let rows = Self::scan_task_rows(db)?;
-        Self::prune_terminal_task_rows(db, now, &rows)
+            .collect()
     }
 
     /// Persists a task row and flushes so it is durable + immediately visible on
@@ -969,16 +886,20 @@ impl SynapseService {
             .collect())
     }
 
-    fn reconcile_task_rows(
+    fn reconcile_task_rows_locked(
         db: &Db,
         live: &BTreeSet<String>,
         now: u64,
         spawn_log_root: Option<&Path>,
+        guard: &TaskReservations,
     ) -> Result<(usize, Vec<String>), ErrorData> {
         let tasks = Self::read_all_tasks(db)?;
         let mut scanned = 0usize;
         let mut flagged = Vec::new();
         for mut task in tasks {
+            if guard.contains(&reservation_key(db, &task.task_id)) {
+                continue;
+            }
             if task.state != TaskState::InProgress {
                 continue;
             }
@@ -1036,18 +957,31 @@ impl SynapseService {
     /// orphan. Never silently re-queues — a human (or operator tool) decides
     /// what next.
     fn reconcile_tasks(&self, db: &Db) -> Result<(usize, Vec<String>), ErrorData> {
+        let guard = task_mutation_guard()?;
         let now = unix_time_ms_now();
         let live = self.live_session_ids(now)?;
         let spawn_log_root = default_agent_spawn_log_root();
-        Self::reconcile_task_rows(db, &live, now, spawn_log_root.as_deref())
+        Self::reconcile_task_rows_locked(db, &live, now, spawn_log_root.as_deref(), &guard)
     }
 
     /// Shared claim primitive: transitions a `todo` task to `in_progress` and
     /// appends a `Pending` attempt bound to `session_id`. Rejects a claim on a
-    /// task that is not `todo` (duplicate-claim race protection — the daemon's
-    /// storage path is serialized so the first claim wins and the second sees
-    /// `in_progress`).
+    /// task that is not `todo`. The mutation mutex covers the full
+    /// read/check/write, so the first claim wins and the second sees
+    /// `in_progress`.
     fn claim_internal(
+        db: &Db,
+        task_id: &str,
+        session_id: &str,
+        spawn_id: Option<String>,
+        template_version: Option<u32>,
+    ) -> Result<AgentTask, ErrorData> {
+        let guard = task_mutation_guard()?;
+        reject_dispatching(&guard, db, task_id)?;
+        Self::claim_internal_locked(db, task_id, session_id, spawn_id, template_version)
+    }
+
+    fn claim_internal_locked(
         db: &Db,
         task_id: &str,
         session_id: &str,
@@ -1110,8 +1044,8 @@ impl SynapseService {
         validate_template_params(&params.template_params)?;
 
         let db = self.agent_task_db()?;
-        let now = unix_time_ms_now();
-        Self::prune_terminal_tasks(&db, now)?;
+        let guard = task_mutation_guard()?;
+        reject_dispatching(&guard, &db, &params.task_id)?;
         if Self::read_task(&db, &params.task_id)?.is_some() {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
@@ -1121,9 +1055,14 @@ impl SynapseService {
                 ),
             ));
         }
-        // Strict global FIFO survives terminal-row pruning via a durable
-        // namespace watermark instead of deriving from retained rows.
-        let next_seq = Self::next_enqueue_seq(&db)?;
+        // Strict global FIFO: enqueue_seq is max(existing) + 1, stable across
+        // restarts (low task volume makes the scan negligible).
+        let next_seq = Self::read_all_tasks(&db)?
+            .iter()
+            .map(|task| task.enqueue_seq)
+            .max()
+            .map_or(1, |max| max + 1);
+        let now = unix_time_ms_now();
         let task = AgentTask {
             schema_version: TASK_SCHEMA_VERSION,
             task_id: params.task_id,
@@ -1168,8 +1107,17 @@ impl SynapseService {
         params: TaskUpdateParams,
     ) -> Result<TaskMutationResponse, ErrorData> {
         let db = self.agent_task_db()?;
-        let mut task = Self::read_task(&db, &params.task_id)?
-            .ok_or_else(|| task_not_found(&params.task_id))?;
+        let guard = task_mutation_guard()?;
+        reject_dispatching(&guard, &db, &params.task_id)?;
+        Self::task_update_locked(&db, params)
+    }
+
+    fn task_update_locked(
+        db: &Db,
+        params: TaskUpdateParams,
+    ) -> Result<TaskMutationResponse, ErrorData> {
+        let mut task =
+            Self::read_task(db, &params.task_id)?.ok_or_else(|| task_not_found(&params.task_id))?;
         let now = unix_time_ms_now();
 
         if let Some(priority) = params.priority {
@@ -1230,7 +1178,7 @@ impl SynapseService {
             }
         }
         task.updated_unix_ms = now;
-        let written_row = Self::write_task(&db, &task)?;
+        let written_row = Self::write_task(db, &task)?;
         tracing::info!(
             code = "AGENT_TASK_UPDATE",
             task_id = %task.task_id,
@@ -1286,8 +1234,8 @@ impl SynapseService {
     }
 
     fn task_list_impl(&self, params: TaskListParams) -> Result<TaskListResponse, ErrorData> {
+        validate_list_max(params.max)?;
         let db = self.agent_task_db()?;
-        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         // Lazy reconcile on read so orphaned in_progress tasks surface even
         // without an explicit reconcile or a daemon restart hook.
         let (_, flagged) = self.reconcile_tasks(&db)?;
@@ -1306,10 +1254,16 @@ impl SynapseService {
     }
 
     fn task_next_impl(&self, params: TaskNextParams) -> Result<TaskNextResponse, ErrorData> {
+        validate_concurrency_cap(params.concurrency_cap)?;
         let db = self.agent_task_db()?;
-        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
-        let tasks = Self::read_all_tasks(&db)?;
+        let guard = task_mutation_guard()?;
+        let mut tasks = Self::read_all_tasks(&db)?;
+        for task in &mut tasks {
+            if guard.contains(&reservation_key(&db, &task.task_id)) {
+                task.state = TaskState::InProgress;
+            }
+        }
         let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
         let decision = dispatch_decision(&tasks, params.concurrency_cap);
         let (decision_str, task) = match decision {
@@ -1333,7 +1287,6 @@ impl SynapseService {
 
     fn task_reconcile_impl(&self) -> Result<TaskReconcileResponse, ErrorData> {
         let db = self.agent_task_db()?;
-        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         let (scanned, flagged) = self.reconcile_tasks(&db)?;
         tracing::info!(
             code = "AGENT_TASK_RECONCILE",
@@ -1353,6 +1306,7 @@ impl SynapseService {
         task_id: &str,
         reason: String,
     ) -> Result<AgentTask, ErrorData> {
+        let _guard = task_mutation_guard()?;
         let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
         if task.state != TaskState::Todo {
             return Err(mcp_error(
@@ -1385,14 +1339,12 @@ impl SynapseService {
         params: TaskDispatchOnceParams,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
-        let dispatch_activity =
-            super::m4_tools::AgentSpawnInFlightGuard::enter("mcp_task_dispatch_outer")?;
+        validate_concurrency_cap(params.concurrency_cap)?;
         let db = self.agent_task_db()?;
-        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
-        let tasks = Self::read_all_tasks(&db)?;
-        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
-        let task_id = match dispatch_decision(&tasks, params.concurrency_cap) {
+        let (decision, in_flight, reservation) =
+            Self::reserve_task_dispatch(&db, params.concurrency_cap)?;
+        let task_id = match decision {
             DispatchDecision::Empty => {
                 return Ok(TaskDispatchOnceResponse {
                     ok: true,
@@ -1416,6 +1368,12 @@ impl SynapseService {
             DispatchDecision::Dispatch { task_id } => task_id,
         };
 
+        let mut reservation = reservation.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "dispatch decision missing reservation",
+            )
+        })?;
         let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
         let wait_timeout_ms = dashboard_task_dispatch_wait_timeout_ms(params.wait_timeout_ms);
         let request = ActSpawnAgentRequest {
@@ -1442,11 +1400,7 @@ impl SynapseService {
             "readback=agent_tasks edge=dispatch_spawn_begin"
         );
 
-        let spawn_result = match dispatch_activity.ensure("mcp_task_dispatch_before_spawn") {
-            Ok(()) => self.spawn_agent_journaled(request, request_context).await,
-            Err(error) => Err(error),
-        };
-        let response = match spawn_result {
+        let response = match self.spawn_agent_journaled(request, request_context).await {
             Ok(response) => response,
             Err(spawn_error) => {
                 let error_code = error_code_str(&spawn_error);
@@ -1465,27 +1419,11 @@ impl SynapseService {
                 return Err(spawn_error);
             }
         };
-        if let Err(error) = dispatch_activity.ensure("mcp_task_dispatch_after_spawn") {
-            let cleanup = self
-                .cleanup_spawn_response_after_operator_panic(
-                    &response,
-                    "mcp_task_dispatch_after_spawn",
-                )
-                .await;
-            let reason = format!(
-                "dispatch spawn superseded by operator panic [{}]: {}; cleanup={cleanup}",
-                error_code_str(&error),
-                error.message
-            );
-            Self::record_failed_attempt_internal(&db, &task_id, reason)?;
-            return Err(error);
-        }
 
-        let claimed = match Self::claim_internal(
+        let claimed = match reservation.claim(
             &db,
-            &task_id,
             &response.session_id,
-            Some(response.spawn_id.clone()),
+            response.spawn_id.clone(),
             response.template_version,
         ) {
             Ok(task) => task,
@@ -1571,18 +1509,35 @@ impl SynapseService {
         params: TaskCancelParams,
     ) -> Result<DashboardTaskCancelResponse, ErrorData> {
         let db = self.agent_task_db()?;
-        let before = Self::read_task(&db, &params.task_id)?
-            .ok_or_else(|| task_not_found(&params.task_id))?;
-        let interrupt_target = before.live_attempt().and_then(|attempt| {
-            attempt
-                .spawn_id
-                .as_ref()
-                .filter(|spawn_id| !spawn_id.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    (!attempt.session_id.trim().is_empty()).then(|| attempt.session_id.clone())
-                })
-        });
+        let (cancel, interrupt_target) = {
+            let guard = task_mutation_guard()?;
+            reject_dispatching(&guard, &db, &params.task_id)?;
+            let before = Self::read_task(&db, &params.task_id)?
+                .ok_or_else(|| task_not_found(&params.task_id))?;
+            let interrupt_target = before.live_attempt().and_then(|attempt| {
+                attempt
+                    .spawn_id
+                    .as_ref()
+                    .filter(|spawn_id| !spawn_id.trim().is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        (!attempt.session_id.trim().is_empty()).then(|| attempt.session_id.clone())
+                    })
+            });
+            let cancel = Self::task_update_locked(
+                &db,
+                TaskUpdateParams {
+                    task_id: params.task_id,
+                    state: Some(TaskState::Cancelled),
+                    reason: params.reason,
+                    priority: None,
+                    title: None,
+                    description: None,
+                    acceptance: None,
+                },
+            )?;
+            (cancel, interrupt_target)
+        };
         let interrupt = if let Some(session_id) = interrupt_target {
             Some(
                 self.dashboard_agent_kill_request(super::agent_control::AgentKillParams {
@@ -1595,7 +1550,6 @@ impl SynapseService {
         } else {
             None
         };
-        let cancel = self.task_cancel_impl(params)?;
         Ok(DashboardTaskCancelResponse {
             ok: true,
             cancel,
@@ -1607,14 +1561,12 @@ impl SynapseService {
         &self,
         params: TaskDispatchOnceParams,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
-        let dispatch_activity =
-            super::m4_tools::AgentSpawnInFlightGuard::enter("dashboard_task_dispatch_outer")?;
+        validate_concurrency_cap(params.concurrency_cap)?;
         let db = self.agent_task_db()?;
-        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
-        let tasks = Self::read_all_tasks(&db)?;
-        let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
-        let task_id = match dispatch_decision(&tasks, params.concurrency_cap) {
+        let (decision, in_flight, reservation) =
+            Self::reserve_task_dispatch(&db, params.concurrency_cap)?;
+        let task_id = match decision {
             DispatchDecision::Empty => {
                 return Ok(TaskDispatchOnceResponse {
                     ok: true,
@@ -1638,6 +1590,12 @@ impl SynapseService {
             DispatchDecision::Dispatch { task_id } => task_id,
         };
 
+        let mut reservation = reservation.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "dashboard dispatch decision missing reservation",
+            )
+        })?;
         let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
         let request = ActSpawnAgentRequest {
             template_id: Some(task.template_id.clone()),
@@ -1663,11 +1621,7 @@ impl SynapseService {
             "readback=agent_tasks edge=dashboard_dispatch_spawn_begin"
         );
 
-        let spawn_result = match dispatch_activity.ensure("dashboard_task_dispatch_before_spawn") {
-            Ok(()) => self.dashboard_spawn_agent_request(request).await,
-            Err(error) => Err(error),
-        };
-        let response = match spawn_result {
+        let response = match self.dashboard_spawn_agent_request(request).await {
             Ok(response) => response,
             Err(spawn_error) => {
                 let error_code = error_code_str(&spawn_error);
@@ -1686,27 +1640,11 @@ impl SynapseService {
                 return Err(spawn_error);
             }
         };
-        if let Err(error) = dispatch_activity.ensure("dashboard_task_dispatch_after_spawn") {
-            let cleanup = self
-                .cleanup_spawn_response_after_operator_panic(
-                    &response,
-                    "dashboard_task_dispatch_after_spawn",
-                )
-                .await;
-            let reason = format!(
-                "dashboard dispatch spawn superseded by operator panic [{}]: {}; cleanup={cleanup}",
-                error_code_str(&error),
-                error.message
-            );
-            Self::record_failed_attempt_internal(&db, &task_id, reason)?;
-            return Err(error);
-        }
 
-        let claimed = match Self::claim_internal(
+        let claimed = match reservation.claim(
             &db,
-            &task_id,
             &response.session_id,
-            Some(response.spawn_id.clone()),
+            response.spawn_id.clone(),
             response.template_version,
         ) {
             Ok(task) => task,
@@ -1918,3 +1856,52 @@ impl SynapseService {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
+
+#[cfg(test)]
+impl SynapseService {
+    /// Test-only: create a task through the production `task_create_impl` path
+    /// (real CF_KV row + flush). Lets cross-module tests (e.g. #951 cost
+    /// rollups) seed real tasks without `task_create_impl` being public.
+    pub(crate) fn task_create_for_test(
+        &self,
+        task_id: &str,
+        template_id: &str,
+    ) -> Result<(), ErrorData> {
+        self.task_create_impl(TaskCreateParams {
+            task_id: task_id.to_owned(),
+            title: task_id.to_owned(),
+            description: None,
+            acceptance: None,
+            priority: 3,
+            template_id: template_id.to_owned(),
+            template_params: BTreeMap::new(),
+        })
+        .map(|_response| ())
+    }
+
+    /// Test-only: claim a task while binding a `spawn_id` + `template_version`
+    /// to the attempt — exactly what the #957 auto-dispatcher does via
+    /// `claim_internal`. Lets cost-rollup tests (#951) build real
+    /// `spawn -> task -> template` rows through the production claim path
+    /// instead of hand-writing CF_KV rows, without the live-spawn harness.
+    pub(crate) fn task_claim_with_spawn_for_test(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        spawn_id: &str,
+        template_version: u32,
+    ) -> Result<AgentTask, ErrorData> {
+        let db = self.agent_task_db()?;
+        Self::claim_internal(
+            &db,
+            task_id,
+            session_id,
+            Some(spawn_id.to_owned()),
+            Some(template_version),
+        )
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/task_bounds_100.rs"]
+mod task_bounds_100_tests;

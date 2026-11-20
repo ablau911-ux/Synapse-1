@@ -9,7 +9,7 @@ extension requests `debugger` only for narrow target-scoped lanes:
 `geolocationEmulation`, `localeEmulation`, `mediaEmulation`, and
 `networkConditions`. Inactive normal-profile tabs use a strict
 selector-scoped synthetic MouseEvent drag path through `chrome.scripting` so
-manual drag FSV stays background-safe. It also dispatches HTML5 DragEvent/DataTransfer
+drag FSV stays background-safe. It also dispatches HTML5 DragEvent/DataTransfer
 drops in page script. `pageScreenshot` uses typed page metrics/masks/scroll via
 `chrome.scripting` plus queued `chrome.tabs.captureVisibleTab` tile stitching for
 viewport, full-page, clip, and element screenshots without `Page.captureScreenshot`.
@@ -164,12 +164,12 @@ narrow target-scoped `chrome.debugger` `Runtime.evaluate`,
 session-owned `chrome-tab:*` targets. Use raw CDP in a dedicated silent
 automation profile for element-scoped evaluation and broader DevTools-domain
 work.
-`pageScreenshot` temporarily activates only the requested tab inside its existing
-Chrome window so `chrome.tabs.captureVisibleTab` captures the right page. On
-Windows builds where Chrome refuses image readback for an unfocused Chrome
-window, it focuses that Chrome window during capture, reports
-`required_foreground=true`, restores the previous Chrome tab/window focus when
-Chrome can report one, and always restores scroll position and masks. It queues
+The public `browser_capture screenshot` route sends `backgroundSafe=true` to
+`pageScreenshot`. It captures only when the requested tab is already active and
+its Chrome window is already foreground; otherwise it refuses before changing
+tab selection or OS focus. Use explicit-HWND `screenshot` for a passive window
+image, or a session-owned raw-CDP target for an inactive-tab page image. The
+bridge checks the active tab before each tile. It queues
 `captureVisibleTab` calls to stay under Chrome's per-second capture quota for
 tiled full-page screenshots and back-to-back screenshot requests. Each tile
 capture is bounded inside the extension and reports tab/window/tile timing on
@@ -192,7 +192,7 @@ to dispatch hover/tap/active-tab mouse-drag input, then detaches; inactive-tab
 mouse drag uses a strict in-page MouseEvent sequence. `viewportEmulation`
 attaches only long enough to call `Emulation.setDeviceMetricsOverride` or
 `Emulation.clearDeviceMetricsOverride` plus a zero-metrics disable command.
-Set accepts explicit mobile viewport semantics for manual DPR/mobile FSV. Because
+Set accepts explicit mobile viewport semantics for DPR/mobile FSV. Because
 Chrome's normal-profile extension debugger path does not make
 `deviceScaleFactor` visible as `window.devicePixelRatio` on this host, the
 normal bridge installs a narrow MAIN-world DPR shim for page scripts and removes

@@ -10,8 +10,10 @@ use synapse_core::{
 
 use crate::{ActionBackend, ActionError, EmitState};
 
+mod log;
 mod state;
 
+pub use log::MAX_RECORDED_EVENTS;
 use state::RecordingState;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -97,6 +99,35 @@ pub enum RecordedInput {
     },
 }
 
+impl RecordedInput {
+    /// Label that is safe to log: identical to the `Debug` form except that
+    /// typed-text carriers (Unicode units and key identities, see
+    /// [`redacted_key_label`]) never appear, so a password typed through the
+    /// recording backend cannot reach the log (#196).
+    #[must_use]
+    pub fn log_label(&self) -> String {
+        match self {
+            Self::UnicodeUnitDown { .. } => "unicode_unit_down".to_owned(),
+            Self::UnicodeUnitUp { .. } => "unicode_unit_up".to_owned(),
+            Self::KeyDown { key } => format!("key_down:{}", redacted_key_label(key)),
+            Self::KeyUp { key } => format!("key_up:{}", redacted_key_label(key)),
+            other => format!("{other:?}"),
+        }
+    }
+}
+
+/// Log-safe key label: control-style named keys keep their name; printable
+/// characters (a `Symbol` key, a one-character name) and raw HID codes are
+/// redacted because together they reconstruct typed text.
+#[must_use]
+pub fn redacted_key_label(key: &Key) -> String {
+    match &key.code {
+        KeyCode::Named { value } if value.chars().count() > 1 => value.clone(),
+        KeyCode::Named { .. } | KeyCode::Symbol { .. } => "char".to_owned(),
+        KeyCode::HidCode { .. } => "hid".to_owned(),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RecordingBackend {
     inner: Arc<Mutex<RecordingState>>,
@@ -109,22 +140,42 @@ impl RecordingBackend {
         Self::default()
     }
 
+    /// Clone of the retained event window (at most [`MAX_RECORDED_EVENTS`]).
+    /// O(n): for tests and diagnostics, not per-action readbacks - use
+    /// [`Self::execute_capturing`] or [`Self::events_since`] for those.
     #[must_use]
     pub fn events(&self) -> Vec<RecordedInput> {
-        self.state().events.clone()
+        self.state().events.retained()
     }
 
+    /// Events recorded since creation, including ones evicted from the window.
     #[must_use]
     pub fn event_count(&self) -> usize {
-        self.state().events.len()
+        self.state().events.total()
     }
 
+    /// Retained events recorded after the first `event_count` events.
     #[must_use]
     pub fn events_since(&self, event_count: usize) -> Vec<RecordedInput> {
-        self.state()
-            .events
-            .get(event_count..)
-            .map_or_else(Vec::new, <[RecordedInput]>::to_vec)
+        self.state().events.since(event_count)
+    }
+
+    /// Execute `action` and return exactly the events it recorded. The state
+    /// lock is held across the call, so concurrent sessions sharing this
+    /// backend never see each other's events in their readback (#196).
+    ///
+    /// # Errors
+    /// Returns the validation or emission error from the action.
+    pub fn execute_capturing(
+        &self,
+        action: &Action,
+        state: &mut EmitState,
+    ) -> Result<Vec<RecordedInput>, ActionError> {
+        crate::validate_action(action)?;
+        let mut recording = self.state();
+        let total_before = recording.events.total();
+        recording.apply_action(action, state)?;
+        Ok(recording.events.since(total_before))
     }
 
     #[must_use]
@@ -157,3 +208,7 @@ impl ActionBackend for RecordingBackend {
         self.state().apply_action(action, state)
     }
 }
+
+#[cfg(test)]
+#[path = "recording/tests/event_log_196.rs"]
+mod event_log_196_tests;

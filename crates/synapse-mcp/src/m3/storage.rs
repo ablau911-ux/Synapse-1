@@ -6,12 +6,14 @@ use std::{
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{DiskPressureLevel, GcReport, PressureReport, cf};
 
-use crate::m1::mcp_error;
+use crate::{
+    credential_redaction::{REDACTED, fingerprint, key_embeds_secret},
+    m1::mcp_error,
+};
 
 use super::{
     M3ToolStub,
@@ -19,6 +21,7 @@ use super::{
         AUDIT_RETENTION_MODE, AuditRetentionPolicy, AuditRetentionReport, AuditRetentionRunConfig,
         audit_retention_policies, run_audit_retention, validate_audit_retention_config,
     },
+    episodes::hex_encode,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -27,9 +30,43 @@ const MAX_PROBE_VALUE_BYTES: u32 = 65_536;
 const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
-const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len()] = cf::ALL_COLUMN_FAMILIES;
-const STORAGE_INSPECT_REDACTION_POLICY: &str =
-    "metadata_only_no_raw_keys_or_values_hashes_for_correlation";
+/// Column families whose rows are sealed or otherwise not caller-writable:
+/// a diagnostic probe must not plant plaintext into `CF_OCR_CACHE` (#52).
+const PROBE_DENIED_CFS: [&str; 1] = [cf::CF_OCR_CACHE];
+const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len() - PROBE_DENIED_CFS.len()] = {
+    let mut allowed = [""; cf::ALL_COLUMN_FAMILIES.len() - PROBE_DENIED_CFS.len()];
+    let mut next = 0;
+    let mut index = 0;
+    while index < cf::ALL_COLUMN_FAMILIES.len() {
+        let candidate = cf::ALL_COLUMN_FAMILIES[index];
+        let mut denied = false;
+        let mut deny_index = 0;
+        while deny_index < PROBE_DENIED_CFS.len() {
+            // Compare by bytes: `==` on `&str` is not usable in const context.
+            let (a, b) = (
+                candidate.as_bytes(),
+                PROBE_DENIED_CFS[deny_index].as_bytes(),
+            );
+            let mut equal = a.len() == b.len();
+            let mut byte = 0;
+            while equal && byte < a.len() {
+                equal = a[byte] == b[byte];
+                byte += 1;
+            }
+            denied |= equal;
+            deny_index += 1;
+        }
+        if !denied {
+            allowed[next] = candidate;
+            next += 1;
+        }
+        index += 1;
+    }
+    allowed
+};
+/// Placeholder returned for `CF_OCR_CACHE` samples: rows embed recognized
+/// screen text, so inspection reports metadata only (#52).
+const WITHHELD_ROW_CONTENT: &str = "<CF_OCR_CACHE row content withheld>";
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -112,14 +149,14 @@ pub struct StorageSummaryResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageRowSample {
+    pub key_hex: String,
     pub key_len_bytes: u64,
-    pub key_sha256: String,
-    pub key_material_omitted: bool,
+    pub key_fingerprint: String,
     pub value_len_bytes: u64,
-    pub value_sha256: String,
-    pub value_encoding: String,
-    pub value_content_omitted: bool,
-    pub redaction_policy: String,
+    pub value_utf8_prefix: String,
+    pub value_truncated: bool,
+    pub value_encoding: &'static str,
+    pub value_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -159,13 +196,9 @@ pub struct StorageGcCfReport {
     pub after_value: u64,
     pub before_estimated_num_keys: Option<u64>,
     pub after_estimated_num_keys: Option<u64>,
-    pub examined_rows: u64,
-    pub scan_limited: bool,
     pub evicted_rows: u64,
     pub hard_cap_reached: bool,
     pub hard_cap_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eviction_skipped_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -249,8 +282,8 @@ pub fn inspect_storage_summary(
     let (cf_sizes, missing_cf_size_estimates) = runtime
         .storage_cf_live_data_size_estimates()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let (cf_row_counts, missing_cf_row_count_estimates) = runtime
-        .storage_cf_estimated_row_counts()
+    let cf_row_counts = runtime
+        .storage_cf_row_counts()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(StorageSummaryResponse {
         schema_version: runtime.schema_version(),
@@ -262,11 +295,11 @@ pub fn inspect_storage_summary(
             .map(str::to_owned)
             .collect(),
         audit_retention_policy_count: audit_retention_policies().len(),
-        metrics_mode: "rocksdb_live_data_size_estimates_estimated_row_counts".to_owned(),
+        metrics_mode: "rocksdb_live_data_size_estimates_exact_row_counts".to_owned(),
         cf_sizes,
         cf_row_counts,
         missing_cf_size_estimates,
-        missing_cf_row_count_estimates,
+        missing_cf_row_count_estimates: Vec::new(),
     })
 }
 
@@ -278,15 +311,6 @@ pub fn put_probe_rows(
     let cf_name = probe_writable_cf(&params.cf_name)?;
     let rows = build_probe_rows(params);
     let runtime = lock_runtime(runtime)?;
-    let pressure = runtime.storage_pressure_level();
-    if params.rows > 0 && !runtime.storage_pressure_permits_write(cf_name) {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "storage diagnostic write refused under disk pressure: cf_name={cf_name} pressure_level={pressure:?}"
-            ),
-        ));
-    }
     let before = cf_count(
         &runtime
             .storage_cf_row_counts()
@@ -321,6 +345,14 @@ pub fn run_storage_gc_once(
     params: &StorageGcOnceParams,
 ) -> Result<StorageGcOnceResponse, ErrorData> {
     validate_gc_params(params)?;
+    if params.cf_name.trim() != AUDIT_RETENTION_MODE {
+        reject_audit_retention_fields(params)?;
+        gc_cf(&params.cf_name)?;
+    }
+    #[cfg(test)]
+    lock_runtime(runtime)?
+        .storage_db()
+        .observe_storage_maintenance_for_test("gc_once");
     if params.cf_name.trim() == AUDIT_RETENTION_MODE {
         let runtime = lock_runtime(runtime)?;
         let before_counts = runtime
@@ -356,15 +388,23 @@ pub fn run_storage_gc_once(
         });
     }
     reject_audit_retention_fields(params)?;
-    let cf_name = probe_writable_cf(&params.cf_name)?;
+    let cf_name = gc_cf(&params.cf_name)?;
     let runtime = lock_runtime(runtime)?;
+    let before = cf_count(
+        &runtime
+            .storage_cf_row_counts()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?,
+        cf_name,
+    );
     let report = runtime
         .storage_run_gc_once_with_row_caps(cf_name, params.soft_cap_rows, params.hard_cap_rows)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let (before, after) = report
-        .cf(cf_name)
-        .map(|cf_report| (cf_report.before_value, cf_report.after_value))
-        .unwrap_or((0, 0));
+    let after = cf_count(
+        &runtime
+            .storage_cf_row_counts()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?,
+        cf_name,
+    );
     drop(runtime);
     Ok(gc_response(cf_name, before, after, report))
 }
@@ -374,6 +414,10 @@ pub fn apply_storage_pressure_sample(
     params: &StoragePressureSampleParams,
 ) -> Result<StoragePressureSampleResponse, ErrorData> {
     let runtime = lock_runtime(runtime)?;
+    #[cfg(test)]
+    runtime
+        .storage_db()
+        .observe_storage_maintenance_for_test("pressure_sample");
     let report = runtime
         .storage_run_pressure_sample(params.free_bytes)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -383,8 +427,8 @@ pub fn apply_storage_pressure_sample(
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let (cf_row_counts, _missing_cf_row_count_estimates) = runtime
-        .storage_cf_estimated_row_counts()
+    let cf_row_counts = runtime
+        .storage_cf_row_counts()
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     drop(runtime);
     Ok(StoragePressureSampleResponse {
@@ -426,52 +470,57 @@ fn cf_row_samples(
         samples.insert(
             cf_name.to_owned(),
             rows.into_iter()
-                .map(|(key, value)| storage_row_sample(&key, &value))
+                .map(|(key, value)| storage_row_sample(cf_name, &key, &value))
                 .collect(),
         );
     }
     Ok(samples)
 }
 
-fn storage_row_sample(key: &[u8], value: &[u8]) -> StorageRowSample {
+fn storage_row_sample(cf_name: &str, key: &[u8], value: &[u8]) -> StorageRowSample {
+    // The hex form is reversible, so a key that embeds a secret is withheld;
+    // ordinary keys stay readable for diagnosis.
+    let key_hex = if key_embeds_secret(key) {
+        REDACTED.to_owned()
+    } else {
+        hex_encode(key)
+    };
+    let key = fingerprint(key);
+    let withheld = cf_name == cf::CF_OCR_CACHE;
+    let value_encoding = if withheld {
+        "withheld"
+    } else {
+        classify_value_encoding(value)
+    };
+    let value = fingerprint(value);
+    let marker = if withheld {
+        WITHHELD_ROW_CONTENT
+    } else {
+        REDACTED
+    };
+
     StorageRowSample {
-        key_len_bytes: key.len() as u64,
-        key_sha256: sha256_hex(key),
-        key_material_omitted: true,
-        value_len_bytes: value.len() as u64,
-        value_sha256: sha256_hex(value),
-        value_encoding: classify_value_encoding(value),
-        value_content_omitted: true,
-        redaction_policy: STORAGE_INSPECT_REDACTION_POLICY.to_owned(),
+        key_hex,
+        key_len_bytes: key.len_bytes,
+        key_fingerprint: key.digest,
+        value_len_bytes: value.len_bytes,
+        value_utf8_prefix: marker.to_owned(),
+        value_truncated: true,
+        value_encoding,
+        value_fingerprint: value.digest,
     }
 }
 
-fn classify_value_encoding(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "empty".to_owned();
+fn classify_value_encoding(value: &[u8]) -> &'static str {
+    if value.is_empty() {
+        "empty"
+    } else if std::str::from_utf8(value).is_err() {
+        "binary_or_invalid_utf8"
+    } else if serde_json::from_slice::<serde::de::IgnoredAny>(value).is_ok() {
+        "json"
+    } else {
+        "utf8_non_json"
     }
-    if std::str::from_utf8(bytes).is_err() {
-        return "binary_or_invalid_utf8".to_owned();
-    }
-    if serde_json::from_slice::<Value>(bytes).is_ok() {
-        return "json".to_owned();
-    }
-    "utf8_non_json".to_owned()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("sha256:{}", hex_encode(digest.as_ref()))
 }
 
 fn validate_probe_params(params: &StoragePutProbeRowsParams) -> Result<(), ErrorData> {
@@ -607,6 +656,24 @@ fn reject_audit_retention_fields(params: &StorageGcOnceParams) -> Result<(), Err
     Ok(())
 }
 
+/// GC only deletes rows, so every column family (including the sealed
+/// `CF_OCR_CACHE`) may be capped; only probe *writes* exclude some.
+fn gc_cf(raw: &str) -> Result<&'static str, ErrorData> {
+    let trimmed = raw.trim();
+    cf::ALL_COLUMN_FAMILIES
+        .into_iter()
+        .find(|name| *name == trimmed)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "storage_gc_once supports only {}; got {trimmed:?}",
+                    cf::ALL_COLUMN_FAMILIES.join(", ")
+                ),
+            )
+        })
+}
+
 fn probe_writable_cf(raw: &str) -> Result<&'static str, ErrorData> {
     let trimmed = raw.trim();
     PROBE_WRITABLE_CFS
@@ -739,12 +806,9 @@ fn gc_response(
                 after_value: report.after_value,
                 before_estimated_num_keys: report.before_estimated_num_keys,
                 after_estimated_num_keys: report.after_estimated_num_keys,
-                examined_rows: report.examined_rows,
-                scan_limited: report.scan_limited,
                 evicted_rows: report.evicted_rows,
                 hard_cap_reached: report.hard_cap_reached,
                 hard_cap_code: report.hard_cap_code.map(str::to_owned),
-                eviction_skipped_reason: report.eviction_skipped_reason.map(str::to_owned),
             })
             .collect(),
         audit_retention_report_key: None,
@@ -803,3 +867,7 @@ fn lock_runtime(
         )
     })
 }
+
+#[cfg(test)]
+#[path = "tests/storage_ocr_guard.rs"]
+mod storage_ocr_guard_tests;

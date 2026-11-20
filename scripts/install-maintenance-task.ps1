@@ -9,7 +9,7 @@
 
       pwsh -NoProfile -File <repo>\scripts\repo-maintenance.ps1 -Apply
 
-  launched windowless through scripts\run-hidden.vbs (wscript.exe), so no terminal flashes.
+  launched windowless through scripts\run-hidden.vbs (wscript.exe), so no terminal flashes,
 
   on a weekly cadence (default: Sunday 03:00) plus once shortly after each logon
   (a one-off catch-up if the machine was off at the scheduled time). The task
@@ -20,6 +20,13 @@
 
   No paid services, no cloud, no GitHub Actions — this is a purely local OS
   scheduler entry, consistent with this project's local-only operating model.
+
+.PARAMETER TaskName
+  Scheduled task name. Default SynapseRepoMaintenance.
+
+.PARAMETER Root
+  Root passed to repo-maintenance.ps1. Default: the parent directory of this
+  checkout.
 
 .PARAMETER Remove
   Unregister the scheduled task instead of installing it.
@@ -33,6 +40,12 @@
 .PARAMETER SweepDays
   Forwarded to repo-maintenance.ps1 (-SweepDays). Default 10.
 
+.PARAMETER MaxTargetDebugGB
+  Forwarded to repo-maintenance.ps1. Default 20.
+
+.PARAMETER MaxGeneratedEvidenceGB
+  Forwarded to repo-maintenance.ps1. Default 5.
+
 .EXAMPLE
   pwsh -File .\scripts\install-maintenance-task.ps1
 .EXAMPLE
@@ -40,15 +53,18 @@
 #>
 [CmdletBinding()]
 param(
+    [string]$TaskName = 'SynapseRepoMaintenance',
+    [string]$Root,
     [switch]$Remove,
     [string]$At = '03:00',
     [ValidateSet('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')]
     [string]$DayOfWeek = 'Sunday',
-    [int]$SweepDays = 10
+    [int]$SweepDays = 10,
+    [int]$MaxTargetDebugGB = 20,
+    [int]$MaxGeneratedEvidenceGB = 5
 )
 
 $ErrorActionPreference = 'Stop'
-$TaskName = 'SynapseRepoMaintenance'
 function Info($m) { Write-Host "[maint-task] $m" }
 function Die($m)  { throw "[maint-task] FATAL: $m" }
 
@@ -71,16 +87,25 @@ if (-not (Test-Path $maintScript)) { Die "Cannot find $maintScript" }
 
 # The task cleans ALL repos under the parent of this repo (e.g. C:\code), so the
 # whole dev tree stays flat — not just Synapse.
-$scanRoot = Split-Path -Parent $repoRoot
+if ([string]::IsNullOrWhiteSpace($Root)) {
+    $scanRoot = Split-Path -Parent $repoRoot
+} else {
+    if (-not (Test-Path -LiteralPath $Root)) { Die "Root '$Root' does not exist." }
+    $scanRoot = (Resolve-Path -LiteralPath $Root).Path
+}
 
-$argline = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$maintScript`" -Apply -Root `"$scanRoot`" -SweepDays $SweepDays"
-# Never start pwsh.exe directly from Task Scheduler: it gets a visible console that flashes on
-# screen before -WindowStyle Hidden applies. run-hidden.vbs starts it hidden from the windowless
-# wscript.exe host and returns pwsh's own exit code as the task result.
+# Never start pwsh.exe directly from Task Scheduler: it gets a visible console that
+# flashes on screen before -WindowStyle Hidden applies. run-hidden.vbs starts it hidden
+# from the windowless wscript.exe host and returns pwsh's exit code as the task result.
+. (Join-Path $PSScriptRoot 'synapse-hidden-runner.ps1')
 $hiddenRunner = Join-Path $PSScriptRoot 'run-hidden.vbs'
-if (-not (Test-Path $hiddenRunner)) { Die "Cannot find $hiddenRunner" }
+if (-not (Test-Path -LiteralPath $hiddenRunner -PathType Leaf)) { Die "Cannot find $hiddenRunner" }
 $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
-$action  = New-ScheduledTaskAction -Execute $wscript -Argument "//B //Nologo `"$hiddenRunner`" `"$pwsh`" $argline"
+$taskArgs = @($pwsh, '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass',
+    '-File', $maintScript, '-Apply', '-Root', $scanRoot, '-SweepDays', "$SweepDays",
+    '-MaxTargetDebugGB', "$MaxTargetDebugGB", '-MaxGeneratedEvidenceGB', "$MaxGeneratedEvidenceGB")
+$hidden = Format-SynapseHiddenRunnerAction -WscriptPath $wscript -RunnerPath $hiddenRunner -ArgumentList $taskArgs
+$action  = New-ScheduledTaskAction -Execute $hidden.Execute -Argument $hidden.Argument
 
 # Weekly trigger only. A logon trigger would require elevation to register
 # (logon triggers are machine-scoped), so instead we rely on -StartWhenAvailable
@@ -105,9 +130,9 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $tWeekly `
 $t = Get-ScheduledTask -TaskName $TaskName
 # Fail closed if what Task Scheduler stored would open a console window on every run.
 $stored = @($t.Actions)
-if ($stored.Count -ne 1 -or $stored[0].Execute -ne $wscript -or $stored[0].Arguments -ne $action.Arguments) {
+if ($stored.Count -ne 1 -or $stored[0].Execute -ne $hidden.Execute -or $stored[0].Arguments -ne $hidden.Argument) {
     Die "Registered action is not the windowless runner: $(($stored | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ', ')"
 }
 Info "Installed '$TaskName': runs weekly on $DayOfWeek at $At (catches up via -StartWhenAvailable if the PC was off)."
-Info "  exec (hidden): $pwsh $argline"
+Info "  exec (hidden): $($hidden.Execute) $($hidden.Argument)"
 Info "Verify any time with:  Get-ScheduledTask -TaskName $TaskName ;  run now with:  Start-ScheduledTask -TaskName $TaskName"

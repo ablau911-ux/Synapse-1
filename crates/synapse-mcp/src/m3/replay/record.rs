@@ -29,9 +29,20 @@ pub async fn record_replay(
     sse_state: SseState,
     params: &ReplayRecordParams,
 ) -> Result<ReplayRecordResponse, ErrorData> {
+    record_replay_with_root(m1_state, sse_state, params, &replay_root()).await
+}
+
+/// Test seam for [`record_replay`]: `root` replaces the live replay root
+/// (`replay_root()`); build one with `replay_root_under(base)`.
+pub(crate) async fn record_replay_with_root(
+    m1_state: SharedM1State,
+    sse_state: SseState,
+    params: &ReplayRecordParams,
+    root: &Path,
+) -> Result<ReplayRecordResponse, ErrorData> {
     let target = ReplayTarget::parse(&params.target)?;
     let _format = ReplayFormat::parse(&params.format)?;
-    let path = replay_path(params.path.as_deref())?;
+    let path = replay_path(root, params.path.as_deref())?;
     create_parent_dir(&path).await?;
 
     let file = File::create(&path).await.map_err(|error| {
@@ -200,8 +211,8 @@ async fn create_parent_dir(path: &Path) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn replay_path(path: Option<&str>) -> Result<PathBuf, ErrorData> {
-    normalize_replay_path(&replay_root(), path)
+fn replay_path(root: &Path, path: Option<&str>) -> Result<PathBuf, ErrorData> {
+    normalize_replay_path(root, path)
 }
 
 fn display_path(path: &Path) -> String {

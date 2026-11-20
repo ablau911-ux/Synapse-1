@@ -209,11 +209,18 @@ function Get-FreeTcpPort {
     }
 }
 
-function Wait-AppServerReady([string]$Url, [int]$TimeoutMs) {
+function Wait-AppServerReady([string]$Url, [int]$TimeoutMs, $Process = $null) {
     $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($TimeoutMs)
     do {
+        if ($null -ne $Process -and $Process.HasExited) {
+            $Process.WaitForExit()
+            throw "codex app-server exited (code $($Process.ExitCode)) before becoming ready at $Url"
+        }
         try {
-            $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 1
+            # A one-second request timeout can abort an accepted health probe while
+            # the server is still starting. Give it the remaining readiness budget.
+            $remainingSeconds = [Math]::Max(1, [Math]::Ceiling(($deadline - [DateTimeOffset]::UtcNow).TotalSeconds))
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $remainingSeconds -DisableKeepAlive
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
                 return
             }
@@ -404,11 +411,16 @@ function Receive-WebSocketText($Socket) {
     return $builder.ToString()
 }
 
-function Read-Message($Socket) {
+function Read-Message($Socket, [int]$PrivateResponseId = -1) {
     $text = Receive-WebSocketText $Socket
-    Add-JsonLine -Path $EventsPath -Value $text
-    Add-JsonLine -Path $StdoutPath -Value $text
-    return ($text | ConvertFrom-Json)
+    $message = $text | ConvertFrom-Json
+    $messageId = Get-JsonProperty $message 'id'
+    # Effective configuration can contain credentials. Never persist its response.
+    if ($null -eq $messageId -or [string]$messageId -ne [string]$PrivateResponseId) {
+        Add-JsonLine -Path $EventsPath -Value $text
+        Add-JsonLine -Path $StdoutPath -Value $text
+    }
+    return $message
 }
 
 function Update-FromNotification($Message) {
@@ -445,9 +457,11 @@ function Update-FromNotification($Message) {
     }
 }
 
-function Receive-Response($Socket, [int]$Id, [string]$ExpectedMethod) {
+function Receive-Response($Socket, [int]$Id, [string]$ExpectedMethod, [switch]$PrivateResponse) {
     while ($true) {
-        $message = Read-Message $Socket
+        $privateId = -1
+        if ($PrivateResponse) { $privateId = $Id }
+        $message = Read-Message $Socket $privateId
         if (Handle-AppServerRequest -Socket $Socket -Message $message) {
             continue
         }
@@ -456,11 +470,70 @@ function Receive-Response($Socket, [int]$Id, [string]$ExpectedMethod) {
         if ($null -ne $messageId -and [int]$messageId -eq $Id) {
             $responseError = Get-JsonProperty $message 'error'
             if ($null -ne $responseError) {
+                if ($PrivateResponse) { throw (Get-PrivateConfigReadFailureMessage $responseError) }
                 Throw-CodexAppServerRpcFailure -Id $Id -ExpectedMethod $ExpectedMethod -ResponseError $responseError -Phase 'receive_response'
             }
             return $message
         }
     }
+}
+
+# Verified against this Codex build; the true minimum that introduced the app-server
+# `config/read` method is not recorded upstream, so the message names the verified one.
+$script:CodexConfigReadVerifiedVersion = '0.162.1'
+
+# Only the JSON-RPC error code is inspected: config/read errors and results can carry
+# private configuration, so their text is never logged or echoed.
+function Get-PrivateConfigReadFailureMessage($ResponseError) {
+    $code = Get-JsonProperty $ResponseError 'code'
+    if ($null -ne $code -and [string]$code -eq '-32601') {
+        return "SYNAPSE_CODEX_CONFIG_READ_UNSUPPORTED: this Codex app-server does not implement config/read (JSON-RPC method not found). Upgrade Codex CLI to $($script:CodexConfigReadVerifiedVersion) or newer (the version this runner was verified with)."
+    }
+    return 'SYNAPSE_CODEX_CONFIG_READ_FAILED: unable to read effective configuration.'
+}
+
+function Get-SynapseTransportOverride($Config, [string]$Url) {
+    $server = Get-JsonProperty (Get-JsonProperty $Config 'mcp_servers') 'synapse'
+    $command = [string](Get-JsonProperty $server 'command')
+    if ([string]::IsNullOrWhiteSpace($command)) {
+        return @{ url = $Url; bearer_token_env_var = 'SYNAPSE_BEARER_TOKEN' }
+    }
+    # Codex merges tables recursively; adding URL to inherited stdio is invalid.
+    # Only our connect adapter has the HTTP forwarding contract required here.
+    if ([IO.Path]::GetFileNameWithoutExtension($command) -ine 'synapse-mcp') {
+        throw 'SYNAPSE_CODEX_TRANSPORT_INCOMPATIBLE: inherited synapse stdio command is not synapse-mcp.'
+    }
+    $connectArgs = @(Get-JsonProperty $server 'args')
+    $mode = $null
+    $forwardArgs = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $connectArgs.Count; $i++) {
+        $arg = [string]$connectArgs[$i]
+        if ($arg -eq '--mode' -or $arg -eq '--bind') {
+            if ($i + 1 -ge $connectArgs.Count) { throw 'SYNAPSE_CODEX_TRANSPORT_INCOMPATIBLE: incomplete connect arguments.' }
+            $i++
+            if ($arg -eq '--mode') { $mode = [string]$connectArgs[$i] }
+        } elseif ($arg.StartsWith('--mode=')) {
+            $mode = $arg.Substring(7)
+        } elseif ($arg.StartsWith('--bind=')) {
+            continue
+        } else {
+            $forwardArgs.Add($arg)
+        }
+    }
+    if ($mode -cne 'connect') { throw 'SYNAPSE_CODEX_TRANSPORT_INCOMPATIBLE: inherited synapse command must use --mode connect.' }
+    $uri = [Uri]$Url
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne 'http' -or $uri.AbsolutePath -ne '/mcp' -or $uri.Query -or $uri.Fragment -or $uri.UserInfo) {
+        throw 'SYNAPSE_CODEX_TRANSPORT_INCOMPATIBLE: connect requires an http://host:port/mcp endpoint.'
+    }
+    # #22: the spawn bearer is a per-spawn scoped credential. The connect adapter
+    # prefers a scoped credential from SYNAPSE_BEARER_TOKEN over token.txt, so the
+    # env override below keeps the operator master token out of this agent.
+    $forwardArgs.Add('--mode')
+    $forwardArgs.Add('connect')
+    $forwardArgs.Add('--bind')
+    $forwardArgs.Add($uri.Authority)
+    # Ensure an inherited stdio env table cannot replace the spawn bearer token.
+    return @{ args = $forwardArgs.ToArray(); env = @{ SYNAPSE_BEARER_TOKEN = [string]$env:SYNAPSE_BEARER_TOKEN } }
 }
 
 function Get-FinalAgentText($Turn) {
@@ -510,9 +583,7 @@ try {
         'app-server',
         '--listen', $script:Endpoint,
         '-c', ('sandbox_mode=' + (ConvertTo-TomlStringLiteral $script:CodexSandboxMode)),
-        '-c', ('approval_policy=' + (ConvertTo-TomlStringLiteral $script:CodexApprovalPolicy)),
-        '-c', ('mcp_servers.synapse.url=' + (ConvertTo-TomlStringLiteral $McpUrl)),
-        '-c', 'mcp_servers.synapse.bearer_token_env_var="SYNAPSE_BEARER_TOKEN"'
+        '-c', ('approval_policy=' + (ConvertTo-TomlStringLiteral $script:CodexApprovalPolicy))
     )
     foreach ($tool in $script:SynapseStartupApprovedMcpTools) {
         $appArgs += @('-c', ('mcp_servers.synapse.tools.' + $tool + '.approval_mode=' + (ConvertTo-TomlStringLiteral 'approve')))
@@ -527,11 +598,13 @@ try {
 
     $launch = Get-CodexLaunchSpec -AppArgs $appArgs
     $appServer = Start-Process -FilePath $launch.File -ArgumentList $launch.Args -WindowStyle Hidden -RedirectStandardOutput $AppServerStdoutPath -RedirectStandardError $AppServerStderrPath -PassThru
+    # Retain the process handle before it exits so ExitCode stays available.
+    $null = $appServer.Handle
     $script:AppServerPid = [int]$appServer.Id
     $script:TurnStatus = 'app_server_started'
     Write-Control @{}
 
-    Wait-AppServerReady -Url $healthUrl -TimeoutMs 15000
+    Wait-AppServerReady -Url $healthUrl -TimeoutMs 15000 -Process $appServer
     $socket = Connect-AppServer $script:Endpoint
 
     Send-WebSocketJson $socket ([ordered]@{
@@ -544,6 +617,11 @@ try {
     })
     [void](Receive-Response $socket 1 'initialize')
 
+    Send-WebSocketJson $socket ([ordered]@{ id = 4; method = 'config/read'; params = @{ cwd = $WorkingDir; includeLayers = $false } })
+    $configResponse = Receive-Response $socket 4 'config/read' -PrivateResponse
+    $effectiveConfig = Get-JsonProperty (Get-JsonProperty $configResponse 'result') 'config'
+    $synapseOverride = Get-SynapseTransportOverride -Config $effectiveConfig -Url $McpUrl
+
     $threadParams = [ordered]@{
         cwd = $WorkingDir
         sandbox = $script:CodexSandboxMode
@@ -555,10 +633,7 @@ try {
         runtimeWorkspaceRoots = @($WorkingDir)
         config = [ordered]@{
             mcp_servers = [ordered]@{
-                synapse = [ordered]@{
-                    url = $McpUrl
-                    bearer_token_env_var = 'SYNAPSE_BEARER_TOKEN'
-                }
+                synapse = $synapseOverride
             }
         }
     }

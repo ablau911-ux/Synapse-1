@@ -20,6 +20,18 @@ impl WinEventSubscription {
     }
 }
 
+pub fn window_root_identity(_hwnd: i64) -> A11yResult<crate::WindowRootIdentity> {
+    Err(A11yError::not_available(
+        "window root identity requires Windows",
+    ))
+}
+
+pub fn foreground_root_identity() -> A11yResult<crate::WindowRootIdentity> {
+    Err(A11yError::not_available(
+        "foreground root identity requires Windows",
+    ))
+}
+
 pub fn focused_window() -> A11yResult<UIElement> {
     Err(A11yError::not_available(
         "UIA foreground window lookup requires Windows",
@@ -62,42 +74,29 @@ pub fn millis_since_last_input() -> A11yResult<u64> {
     ))
 }
 
+pub const fn workstation_locked() -> bool {
+    false
+}
+
 pub fn is_top_level_window(_hwnd: i64) -> A11yResult<bool> {
     Err(A11yError::not_available(
         "top-level window readback requires Windows",
     ))
 }
 
-pub fn window_root_identity(_hwnd: i64) -> A11yResult<crate::WindowRootIdentity> {
-    Err(A11yError::not_available(
-        "window root identity readback requires Windows",
-    ))
+#[must_use]
+pub const fn window_dpi_scale_for_hwnd(_hwnd: i64) -> f32 {
+    1.0
 }
 
-pub fn foreground_root_identity() -> A11yResult<crate::WindowRootIdentity> {
-    Err(A11yError::not_available(
-        "foreground root identity readback requires Windows",
-    ))
+#[must_use]
+pub const fn window_owner_chain(_hwnd: i64) -> Vec<(i64, u32)> {
+    Vec::new()
 }
 
-pub fn window_root_identity_at_point(_x: i32, _y: i32) -> A11yResult<crate::WindowRootIdentity> {
+pub fn ensure_live_window(_hwnd: i64) -> A11yResult<()> {
     Err(A11yError::not_available(
-        "window-under-point readback requires Windows",
-    ))
-}
-
-pub fn human_notification_state() -> A11yResult<crate::HumanNotificationState> {
-    Err(A11yError::not_available(
-        "user notification state readback requires Windows",
-    ))
-}
-
-pub fn ensure_human_foreground_allows_focus_change(
-    _target: crate::WindowRootIdentity,
-    _caller: &'static str,
-) -> A11yResult<crate::WindowRootIdentity> {
-    Err(A11yError::not_available(
-        "human foreground protection requires Windows",
+        "window liveness check requires Windows",
     ))
 }
 
@@ -171,6 +170,18 @@ pub fn focused_element_node() -> A11yResult<AccessibleNode> {
     ))
 }
 
+pub fn focused_spin_button_parent() -> A11yResult<Option<crate::FocusedParentReadback>> {
+    Err(A11yError::not_available(
+        "UIA focused date-segment parent lookup requires Windows",
+    ))
+}
+
+pub fn focused_hwnd_in_window(_hwnd: i64) -> A11yResult<Option<i64>> {
+    Err(A11yError::not_available(
+        "target-window focused HWND lookup requires Windows",
+    ))
+}
+
 pub fn focused_element_node_in_window(_hwnd: i64) -> A11yResult<Option<AccessibleNode>> {
     Err(A11yError::not_available(
         "target-window UIA focused element lookup requires Windows",
@@ -215,7 +226,7 @@ pub fn chromium_renderer_accessibility_nodes_from_window(
     _hwnd: i64,
     _depth: u32,
     _max_nodes: usize,
-) -> A11yResult<Vec<AccessibleNode>> {
+) -> A11yResult<(Vec<AccessibleNode>, bool)> {
     Err(A11yError::not_available(
         "Chromium renderer UIA supplement requires Windows",
     ))
@@ -239,9 +250,36 @@ pub fn element_bounding_rect(_id: &ElementId) -> A11yResult<synapse_core::Rect> 
     ))
 }
 
+pub fn element_framework_id(_id: &ElementId) -> A11yResult<String> {
+    Err(A11yError::not_available(
+        "UIA element framework id requires Windows",
+    ))
+}
+
 pub fn click_element_action(_id: &ElementId) -> A11yResult<ElementClickAction> {
     Err(A11yError::not_available(
         "UIA element click action requires Windows",
+    ))
+}
+
+pub fn invoke_element_pattern(_id: &ElementId) -> A11yResult<()> {
+    Err(A11yError::not_available(
+        "UIA InvokePattern requires Windows",
+    ))
+}
+
+pub fn select_element_option(
+    _id: &ElementId,
+    _choice: &crate::OptionChoice,
+) -> A11yResult<crate::NativeOptionReadback> {
+    Err(A11yError::not_available(
+        "UIA SelectionItemPattern requires Windows",
+    ))
+}
+
+pub fn set_element_checked(_id: &ElementId, _checked: bool) -> A11yResult<(String, String)> {
+    Err(A11yError::not_available(
+        "UIA TogglePattern requires Windows",
     ))
 }
 

@@ -14,7 +14,8 @@ use windows::{
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
-            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, RDW_ALLCHILDREN,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, HBITMAP, HDC,
+            HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, RDW_ALLCHILDREN,
             RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ReleaseDC, SRCCOPY, SelectObject,
         },
     },
@@ -22,15 +23,15 @@ use windows::{
     Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
     Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetMenu, GetWindowLongW, GetWindowPlacement,
-        GetWindowRect, IsIconic, PW_RENDERFULLCONTENT, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WINDOWPLACEMENT,
+        GetWindowRect, GetWindowThreadProcessId, IsIconic, PW_RENDERFULLCONTENT, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
     },
 };
 
 use crate::{
     CaptureBackendPreference, CaptureConfig, CaptureError, CaptureTarget, CapturedBgraBitmap,
-    CapturedFrame, CapturedSoftwareBitmap, CapturedWindowBgraBitmap, DxgiFormat,
-    spawn_capture_loop,
+    CapturedFrame, CapturedSoftwareBitmap, CapturedWindowBgraBitmap, ClientWindowRegion,
+    DxgiFormat, spawn_capture_loop,
 };
 
 use super::common::{capture_unsupported, hwnd_from_i64};
@@ -122,12 +123,24 @@ pub fn window_region_to_bgra_bitmap(
                 error = %wgc_error,
                 "WGC window capture failed; refusing target-reentering PrintWindow fallback"
             );
-            Err(CaptureError::PrintWindowDisabled {
-                detail: format!(
-                    "WGC window capture failed for hwnd {hwnd:#x} region {region:?}: {wgc_error}; PrintWindow fallback is disabled because Windows asks the target process to handle WM_PRINT/WM_PRINTCLIENT and can surface app-visible failures"
-                ),
-            })
+            Err(wgc_failure_to_capture_error(hwnd, region, wgc_error))
         }
+    }
+}
+
+/// Maps a WGC window-capture failure to the error returned to callers.
+///
+/// A frame timeout (for example a minimized window that never presents) keeps
+/// its own `CAPTURE_WGC_FRAME_TIMEOUT` code: it is not a PrintWindow problem
+/// (#224).
+fn wgc_failure_to_capture_error(hwnd: i64, region: Rect, wgc_error: CaptureError) -> CaptureError {
+    if matches!(wgc_error, CaptureError::WgcFrameTimeout { .. }) {
+        return wgc_error;
+    }
+    CaptureError::PrintWindowDisabled {
+        detail: format!(
+            "WGC window capture failed for hwnd {hwnd:#x} region {region:?}: {wgc_error}; PrintWindow fallback is disabled because Windows asks the target process to handle WM_PRINT/WM_PRINTCLIENT and can surface app-visible failures"
+        ),
     }
 }
 
@@ -186,7 +199,7 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     validate_bitmap_region(region)?;
     let hwnd_value = hwnd;
-    let hwnd = hwnd_from_i64(hwnd)?;
+    let hwnd = hwnd_from_i64(hwnd);
     let (window_width, window_height) = window_capture_extent(hwnd)?;
     validate_region_inside_window(region, window_width, window_height)?;
     let bytes = printwindow_region_bgra(hwnd, hwnd_value, region, window_width, window_height)?;
@@ -219,16 +232,94 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 }
 
 pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
-    let hwnd = hwnd_from_i64(hwnd)?;
+    let hwnd = hwnd_from_i64(hwnd);
     let (w, h) = window_capture_extent(hwnd)?;
     let region = Rect { x: 0, y: 0, w, h };
     validate_bitmap_region(region)?;
     Ok(region)
 }
 
-pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, CaptureError> {
+pub fn window_capture_bounds(hwnd: i64) -> Result<Rect, CaptureError> {
+    let hwnd = hwnd_from_i64(hwnd);
+    if !unsafe { IsIconic(hwnd) }.as_bool() {
+        let bounds = dwm_extended_frame_bounds(hwnd)?;
+        return Ok(Rect {
+            x: bounds.left,
+            y: bounds.top,
+            w: bounds.right.saturating_sub(bounds.left),
+            h: bounds.bottom.saturating_sub(bounds.top),
+        });
+    }
+
+    let mut placement = WINDOWPLACEMENT {
+        length: u32::try_from(size_of::<WINDOWPLACEMENT>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(hwnd, &raw mut placement) }.map_err(capture_unsupported)?;
+    let bounds = placement.rcNormalPosition;
+    let mut result = Rect {
+        x: bounds.left,
+        y: bounds.top,
+        w: bounds.right.saturating_sub(bounds.left),
+        h: bounds.bottom.saturating_sub(bounds.top),
+    };
+    // WINDOWPLACEMENT reports rcNormalPosition in workspace coordinates for
+    // top-level windows that are not WS_EX_TOOLWINDOW, and in screen
+    // coordinates otherwise. The workspace is per-monitor: a taskbar docked
+    // to the top/left of the restoring monitor moves that monitor's work-area
+    // origin off (0,0). Offset by the restoring monitor's own rcWork; if the
+    // monitor lookup fails, fail rather than return coordinates that may
+    // still be workspace-relative.
+    let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) }.cast_unsigned());
+    if !ex_style.contains(WS_EX_TOOLWINDOW) {
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_invalid() {
+            return Err(CaptureError::TargetInvalid {
+                detail: format!(
+                    "minimized hwnd {:#x} needs a work-area offset but MonitorFromWindow failed",
+                    hwnd.0 as isize
+                ),
+            });
+        }
+        let mut info = MONITORINFO {
+            cbSize: u32::try_from(size_of::<MONITORINFO>()).unwrap_or(u32::MAX),
+            ..Default::default()
+        };
+        let info_ok = unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool();
+        if !info_ok {
+            return Err(CaptureError::TargetInvalid {
+                detail: format!(
+                    "minimized hwnd {:#x} needs a work-area offset but GetMonitorInfoW failed",
+                    hwnd.0 as isize
+                ),
+            });
+        }
+        result = crate::bitmap::workspace_rect_to_screen(
+            result,
+            Rect {
+                x: info.rcWork.left,
+                y: info.rcWork.top,
+                w: 0,
+                h: 0,
+            },
+        );
+    }
+    validate_bitmap_region(result)?;
+    Ok(result)
+}
+
+pub fn window_thread_id(hwnd: i64) -> Option<u32> {
+    let hwnd = hwnd_from_i64(hwnd);
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    (thread_id != 0).then_some(thread_id)
+}
+
+pub fn client_region_to_window_regions(
+    hwnd: i64,
+    region: Rect,
+) -> Result<ClientWindowRegion, CaptureError> {
     validate_bitmap_region(region)?;
-    let hwnd = hwnd_from_i64(hwnd)?;
+    let hwnd = hwnd_from_i64(hwnd);
 
     if unsafe { IsIconic(hwnd) }.as_bool() {
         let (window_width, window_height) = window_capture_extent(hwnd)?;
@@ -239,14 +330,14 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
                 detail: "minimized target has no client extent for region conversion".to_owned(),
             });
         };
-        let window_region = Rect {
-            x: region.x.saturating_add(offset_x),
-            y: region.y.saturating_add(offset_y),
-            w: region.w,
-            h: region.h,
-        };
-        validate_region_inside_window(window_region, window_width, window_height)?;
-        return Ok(window_region);
+        // The client extent is unknown while minimized: clip to the bitmap only.
+        return clip_client_region_to_bitmap(
+            region,
+            offset_x,
+            offset_y,
+            window_width,
+            window_height,
+        );
     }
 
     let mut client_rect = windows::Win32::Foundation::RECT::default();
@@ -265,7 +356,7 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
     }
     let offset_x = client_origin.x.saturating_sub(frame_rect.left);
     let offset_y = client_origin.y.saturating_sub(frame_rect.top);
-    let window_region = client_region_to_frame_region(
+    client_region_to_frame_region(
         region,
         client_width,
         client_height,
@@ -273,8 +364,7 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
         offset_y,
         frame_width,
         frame_height,
-    )?;
-    Ok(window_region)
+    )
 }
 
 #[derive(Debug)]
@@ -354,7 +444,7 @@ where
                     detail = %detail,
                     "WGC window frame did not arrive after bounded retries"
                 );
-                return Err(CaptureError::ThreadFailed {
+                return Err(CaptureError::WgcFrameTimeout {
                     detail: format!(
                         "timed out after {timeout_ms} ms waiting for WGC window frame after {attempt} attempts over {total_elapsed_ms} ms for hwnd {hwnd:#x}; retry_backoff_ms={WGC_WINDOW_FRAME_RETRY_BACKOFF_MS}; last_timeout={detail}; recommended_next_action=retry capture after confirming the target window is live, visible, and visually stable"
                     ),
@@ -412,13 +502,32 @@ where
             }));
         }
     };
-    let region = select_region(&frame);
-    let result = captured_frame_region_to_bgra_bitmap(&frame, region);
+    let result = validated_window_frame_region(&frame, select_region(&frame));
     let stop_result = handle.stop();
     match stop_result {
         Ok(()) => result.map_err(WgcWindowFrameAttemptError::Other),
         Err(error) => Err(WgcWindowFrameAttemptError::Other(error)),
     }
+}
+
+fn validated_window_frame_region(
+    frame: &CapturedFrame,
+    region: Rect,
+) -> Result<CapturedBgraBitmap, CaptureError> {
+    let full_region = Rect {
+        x: 0,
+        y: 0,
+        w: i32::try_from(frame.width).unwrap_or(i32::MAX),
+        h: i32::try_from(frame.height).unwrap_or(i32::MAX),
+    };
+    let bitmap = captured_frame_region_to_bgra_bitmap(frame, full_region)?;
+    // Judge the source frame before cropping: a black region is valid only
+    // when the window itself has rendered content (#278).
+    crate::bitmap::validate_window_frame_content(&bitmap)?;
+    if region == full_region {
+        return Ok(bitmap);
+    }
+    captured_frame_region_to_bgra_bitmap(frame, region)
 }
 
 fn graphics_capture_window_region_to_bgra_bitmap(
@@ -558,7 +667,7 @@ fn client_region_to_frame_region(
     offset_y: i32,
     frame_width: i32,
     frame_height: i32,
-) -> Result<Rect, CaptureError> {
+) -> Result<ClientWindowRegion, CaptureError> {
     if client_width <= 0 || client_height <= 0 {
         return Err(CaptureError::TargetInvalid {
             detail: format!(
@@ -566,25 +675,71 @@ fn client_region_to_frame_region(
             ),
         });
     }
-    if client_region.x < 0
-        || client_region.y < 0
-        || client_region.x.saturating_add(client_region.w) > client_width
-        || client_region.y.saturating_add(client_region.h) > client_height
-    {
+    // #233: a region that partly overhangs the client area is clipped to it,
+    // and the clipped rectangle is what gets reported; only a region with no
+    // client pixel at all is refused.
+    let Some(client) = clip_rect_to_extent(client_region, client_width, client_height) else {
         return Err(CaptureError::TargetInvalid {
             detail: format!(
-                "client-relative region {client_region:?} is outside the target window client area {client_width}x{client_height}; pass a region within the client bounds, or omit region to OCR/capture the whole window"
+                "client-relative region {client_region:?} has no overlap with the target window client area {client_width}x{client_height}; pass a region that overlaps the client bounds, or omit region to OCR/capture the whole window"
             ),
         });
-    }
-    let frame_region = Rect {
+    };
+    // A maximized window's client area can overhang the monitor (and so the
+    // captured frame bitmap) by a pixel; clip to the bitmap as well.
+    clip_client_region_to_bitmap(client, offset_x, offset_y, frame_width, frame_height)
+}
+
+/// Maps a client-relative region into bitmap coordinates and clips it to the
+/// `frame_width` x `frame_height` bitmap; refuses a region with no pixel in it.
+/// `client` in the result is the clipped region in client coordinates (#233).
+fn clip_client_region_to_bitmap(
+    client_region: Rect,
+    offset_x: i32,
+    offset_y: i32,
+    frame_width: i32,
+    frame_height: i32,
+) -> Result<ClientWindowRegion, CaptureError> {
+    let shifted = Rect {
         x: client_region.x.saturating_add(offset_x),
         y: client_region.y.saturating_add(offset_y),
         w: client_region.w,
         h: client_region.h,
     };
+    let Some(frame_region) = clip_rect_to_extent(shifted, frame_width, frame_height) else {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!(
+                "client-relative region {client_region:?} has no pixel inside the {frame_width}x{frame_height} window bitmap"
+            ),
+        });
+    };
     validate_region_inside_window(frame_region, frame_width, frame_height)?;
-    Ok(frame_region)
+    Ok(ClientWindowRegion {
+        window: frame_region,
+        client: Rect {
+            x: frame_region.x.saturating_sub(offset_x),
+            y: frame_region.y.saturating_sub(offset_y),
+            w: frame_region.w,
+            h: frame_region.h,
+        },
+    })
+}
+
+/// Intersection of `region` with `[0, width) x [0, height)`; `None` when empty.
+fn clip_rect_to_extent(region: Rect, width: i32, height: i32) -> Option<Rect> {
+    let left = i64::from(region.x).max(0);
+    let top = i64::from(region.y).max(0);
+    let right = (i64::from(region.x) + i64::from(region.w)).min(i64::from(width));
+    let bottom = (i64::from(region.y) + i64::from(region.h)).min(i64::from(height));
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(Rect {
+        x: i32::try_from(left).ok()?,
+        y: i32::try_from(top).ok()?,
+        w: i32::try_from(right - left).ok()?,
+        h: i32::try_from(bottom - top).ok()?,
+    })
 }
 
 fn software_bitmap_from_bgra(
@@ -831,6 +986,15 @@ fn copy_screen_region_bgra(region: Rect) -> Result<Vec<u8>, CaptureError> {
             .ok_or_else(|| CaptureError::GraphicsApiUnsupported {
                 detail: "screen capture scratch buffer was not initialized".to_owned(),
             })?;
+        // #46: the scratch DIB is recycled per thread; BitBlt clips off-desktop
+        // source rows and leaves the destination untouched, so zero it first
+        // to never return the previous capture's pixels as the current one.
+        if !unsafe { GdiFlush() }.as_bool() {
+            return Err(CaptureError::GraphicsApiUnsupported {
+                detail: "GdiFlush failed before screen capture scratch access".to_owned(),
+            });
+        }
+        unsafe { slice::from_raw_parts_mut(scratch.bits.cast::<u8>(), byte_len) }.fill(0);
         let bitblt = unsafe {
             BitBlt(
                 scratch.memory_dc,
@@ -845,6 +1009,11 @@ fn copy_screen_region_bgra(region: Rect) -> Result<Vec<u8>, CaptureError> {
             )
         };
         bitblt.map_err(capture_unsupported)?;
+        if !unsafe { GdiFlush() }.as_bool() {
+            return Err(CaptureError::GraphicsApiUnsupported {
+                detail: "GdiFlush failed after screen capture BitBlt".to_owned(),
+            });
+        }
         Ok(unsafe { slice::from_raw_parts(scratch.bits.cast::<u8>(), byte_len) }.to_vec())
     });
     let _ = unsafe { ReleaseDC(None, screen_dc) };
@@ -1142,3 +1311,15 @@ fn clamp_region_to_frame(frame: &CapturedFrame, region: Rect) -> Result<Rect, Ca
         h: i32::try_from(bottom - top).unwrap_or(i32::MAX),
     })
 }
+
+#[cfg(test)]
+#[path = "tests/window_bitmap_math_133.rs"]
+mod window_bitmap_math_133;
+
+#[cfg(test)]
+#[path = "tests/window_region_clip_233.rs"]
+mod window_region_clip_233;
+
+#[cfg(test)]
+#[path = "tests/wgc_timeout_code_224.rs"]
+mod wgc_timeout_code_224;

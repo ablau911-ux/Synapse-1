@@ -5898,7 +5898,7 @@ function AuditView({
       >
         {selectedRow ? (
           <div className="grid gap-4 xl:grid-cols-[minmax(0,0.36fr)_minmax(0,1fr)]">
-            <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+            <div className="min-w-0 rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
               <MetricRow label="Key" value={<span className="font-mono">{shortKey(selectedRow.key_hex)}</span>} />
               <MetricRow label="Kind" value={selectedRow.row_kind} />
               <MetricRow label="Tool" value={selectedRow.tool} />

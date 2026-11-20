@@ -1,0 +1,231 @@
+use anyhow::Context;
+use serde_json::{Value, json};
+use synapse_core::SCHEMA_VERSION;
+use synapse_storage::{Db, cf};
+use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
+use tempfile::TempDir;
+
+#[tokio::test]
+async fn must_pass_storage_tools_are_default_granted_and_persist_probe_rows() -> anyhow::Result<()>
+{
+    let logs = TempDir::new()?;
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let db_path_string = db_path.to_string_lossy().into_owned();
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        Some(logs.path()),
+        &[
+            ("SYNAPSE_DEBUG_TOOLS", "1"),
+            ("SYNAPSE_DB", db_path_string.as_str()),
+        ],
+    )
+    .await?;
+
+    let before = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    let before_events = before["cf_row_counts"][cf::CF_EVENTS].as_u64().unwrap_or(0);
+    println!("readback=storage_tool edge=before before_events={before_events}");
+
+    let key_prefix = "regression-default-storage";
+    let put = structured(
+        &client
+            .tools_call(
+                "storage_put_probe_rows",
+                json!({
+                    "cf_name": cf::CF_EVENTS,
+                    "key_prefix": key_prefix,
+                    "rows": 2,
+                    "value_bytes": 16
+                }),
+            )
+            .await?,
+    )?;
+    assert_eq!(put["rows_added"], 2);
+    assert_eq!(put["before_rows"], before_events);
+    assert_eq!(put["after_rows"], before_events + 2);
+
+    let after = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    let after_events = after["cf_row_counts"][cf::CF_EVENTS]
+        .as_u64()
+        .context("events row count missing")?;
+    println!(
+        "readback=storage_tool edge=after_mcp before_events={before_events} after_events={after_events} put={put}"
+    );
+    assert_eq!(after_events, before_events + 2);
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+
+    let durable_rows = direct_probe_row_count(&db_path, cf::CF_EVENTS, key_prefix)?;
+    println!(
+        "readback=storage_tool edge=after_shutdown_source_of_truth key_prefix={key_prefix} durable_rows={durable_rows}"
+    );
+    assert_eq!(durable_rows, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn must_pass_storage_probe_rows_cover_pressure_gated_column_families() -> anyhow::Result<()> {
+    let logs = TempDir::new()?;
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let mut client = launch_storage_client(&logs, &db_path).await?;
+
+    let l3 = sample_pressure(&mut client, 499_999_999).await?;
+    assert_eq!(l3["report"]["current_level"]["name"], "Level3");
+    assert_eq!(
+        l3["report"]["compacted_cfs"].as_array().map(Vec::len),
+        Some(cf::ALL_COLUMN_FAMILIES.len())
+    );
+    let l3_allowed = structured(
+        &client
+            .tools_call(
+                "storage_put_probe_rows",
+                probe_args(cf::CF_EVENTS, "pressure-l3-events"),
+            )
+            .await?,
+    )?;
+    assert_eq!(l3_allowed["rows_added"], 1);
+
+    let l4 = sample_pressure(&mut client, 199_999_999).await?;
+    assert_eq!(l4["report"]["current_level"]["name"], "Level4");
+    for (cf_name, prefix) in [
+        (cf::CF_REFLEX_AUDIT, "pressure-l4-reflex-audit"),
+        (cf::CF_SESSIONS, "pressure-l4-sessions"),
+    ] {
+        let allowed = structured(
+            &client
+                .tools_call("storage_put_probe_rows", probe_args(cf_name, prefix))
+                .await?,
+        )?;
+        assert_eq!(
+            allowed["rows_added"], 1,
+            "{cf_name} must stay writable at Level4"
+        );
+    }
+
+    let after_l4 = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    assert_eq!(after_l4["cf_row_counts"][cf::CF_EVENTS], 1);
+    assert_eq!(after_l4["cf_row_counts"][cf::CF_REFLEX_AUDIT], 1);
+    assert_eq!(after_l4["cf_row_counts"][cf::CF_SESSIONS], 1);
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+
+    assert_eq!(
+        direct_probe_row_count(&db_path, cf::CF_EVENTS, "pressure-l3-events")?,
+        1
+    );
+    assert_eq!(
+        direct_probe_row_count(&db_path, cf::CF_REFLEX_AUDIT, "pressure-l4-reflex-audit")?,
+        1
+    );
+    assert_eq!(
+        direct_probe_row_count(&db_path, cf::CF_SESSIONS, "pressure-l4-sessions")?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn must_fail_storage_probe_rows_are_shed_from_pressure_gated_column_families()
+-> anyhow::Result<()> {
+    let logs = TempDir::new()?;
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let mut client = launch_storage_client(&logs, &db_path).await?;
+
+    // Level 3 sheds observations.
+    sample_pressure(&mut client, 499_999_999).await?;
+    let l3_blocked = client
+        .tools_call_error(
+            "storage_put_probe_rows",
+            probe_args(cf::CF_OBSERVATIONS, "pressure-l3-observations"),
+        )
+        .await?;
+    assert_eq!(
+        l3_blocked["data"]["code"],
+        synapse_core::error_codes::STORAGE_WRITE_SHED
+    );
+
+    // Level 4 also sheds events.
+    sample_pressure(&mut client, 199_999_999).await?;
+    let l4_blocked = client
+        .tools_call_error(
+            "storage_put_probe_rows",
+            probe_args(cf::CF_EVENTS, "pressure-l4-events"),
+        )
+        .await?;
+    assert_eq!(
+        l4_blocked["data"]["code"],
+        synapse_core::error_codes::STORAGE_WRITE_SHED
+    );
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+
+    assert_eq!(
+        direct_probe_row_count(&db_path, cf::CF_OBSERVATIONS, "pressure-l3-observations")?,
+        0
+    );
+    assert_eq!(
+        direct_probe_row_count(&db_path, cf::CF_EVENTS, "pressure-l4-events")?,
+        0
+    );
+    Ok(())
+}
+
+async fn launch_storage_client(
+    logs: &TempDir,
+    db_path: &std::path::Path,
+) -> anyhow::Result<StdioMcpClient> {
+    let db_path_string = db_path.to_string_lossy().into_owned();
+    StdioMcpClient::launch_and_init_with_env(
+        Some(logs.path()),
+        &[
+            ("SYNAPSE_DEBUG_TOOLS", "1"),
+            ("SYNAPSE_DB", db_path_string.as_str()),
+        ],
+    )
+    .await
+}
+
+async fn sample_pressure(client: &mut StdioMcpClient, free_bytes: u64) -> anyhow::Result<Value> {
+    structured(
+        &client
+            .tools_call("storage_pressure_sample", json!({"free_bytes": free_bytes}))
+            .await?,
+    )
+}
+
+fn probe_args(cf_name: &str, key_prefix: &str) -> Value {
+    json!({"cf_name": cf_name, "key_prefix": key_prefix, "rows": 1, "value_bytes": 8})
+}
+
+fn structured(response: &Value) -> anyhow::Result<Value> {
+    if let Some(value) = response.get("structuredContent") {
+        return Ok(value.clone());
+    }
+
+    let text = response
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+        .context("structured content missing")?;
+    serde_json::from_str(text).context("parse text content")
+}
+
+fn direct_probe_row_count(
+    db_path: &std::path::Path,
+    cf_name: &str,
+    key_prefix: &str,
+) -> anyhow::Result<usize> {
+    let prefix = key_prefix.as_bytes();
+    let db = Db::open(db_path, SCHEMA_VERSION)?;
+    Ok(db
+        .scan_cf(cf_name)?
+        .into_iter()
+        .filter(|(key, _value)| key.starts_with(prefix))
+        .count())
+}

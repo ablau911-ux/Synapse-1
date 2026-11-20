@@ -1,12 +1,18 @@
 pub mod agent_events;
 pub mod agent_transcripts;
 mod batch;
+mod blocking;
 pub mod cf;
 pub mod codecs;
 pub mod compaction;
+mod db_handle;
+#[cfg(any(test, feature = "test-support"))]
+mod diagnostic_hooks;
 pub mod episodes;
 pub mod error;
+mod exact_read;
 mod gc;
+mod kv_quota;
 mod pressure;
 pub mod routines;
 pub mod timeline;
@@ -14,22 +20,21 @@ pub mod timeline;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
-    Direction, IteratorMode, Options, SliceTransform, WriteBatch,
+    Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions,
 };
-use synapse_core::{
-    error_codes,
-    retention::{DEFAULTS, RetentionTtl},
-};
+use synapse_core::error_codes;
+use synapse_core::retention::DEFAULTS;
 
+pub use batch::BatcherStatus;
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
-pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
-pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
+pub use gc::{GcCfReport, GcReport, GcTask};
+pub use pressure::{DiskPressureLevel, PressureReport, PressureTask};
 
 const MIB: usize = 1024 * 1024;
 const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * MIB;
@@ -38,26 +43,66 @@ const BLOCK_CACHE_BYTES: usize = 64 * MIB;
 const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
 const TIMELINE_PERIODIC_COMPACTION_SECONDS: u64 = 86_400;
 const STORAGE_WRITES_SHED_TOTAL: &str = "storage_writes_shed_total";
-const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
 const ESTIMATE_LIVE_DATA_SIZE: &str = "rocksdb.estimate-live-data-size";
 const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 
+fn batch_bytes(kvs: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+    kvs.iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()) as u64)
+        .sum()
+}
+
+fn exact_cf_bytes(db: &DB, cf: &ColumnFamilyRef<'_>, cf_name: &str) -> StorageResult<u64> {
+    let mut bytes = 0u64;
+    for row in db.iterator_cf(cf, IteratorMode::Start) {
+        let (key, value) = row.map_err(|source| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: source.to_string(),
+        })?;
+        bytes = bytes.saturating_add(key.len().saturating_add(value.len()) as u64);
+    }
+    Ok(bytes)
+}
+
 /// One raw storage row: key bytes and value bytes.
 pub type RawRow = (Vec<u8>, Vec<u8>);
-/// One column-family batch: CF name plus raw rows.
-pub type CfWriteBatch<'a> = (&'a str, Vec<RawRow>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
 /// Per-CF integer storage metrics plus CFs whose `RocksDB` property was absent.
 pub type CfEstimateMap = (BTreeMap<String, u64>, Vec<String>);
+
+/// One synchronous mutation in a cross-column-family coordination batch.
+///
+/// This is intentionally reserved for state transitions whose durable marker
+/// and durable journal row must become visible together. Ordinary ingestion
+/// should keep using the single-column-family batched APIs above.
+#[derive(Clone, Debug)]
+pub enum CrossCfBatchMutation {
+    Put {
+        cf_name: &'static str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        cf_name: &'static str,
+        key: Vec<u8>,
+    },
+}
 
 /// Opened storage handle.
 pub struct Db {
     pub path: PathBuf,
     pub schema_version: u32,
     batcher: batch::Batcher,
-    inner: Arc<DB>,
+    inner: Arc<db_handle::DbHandle>,
     pressure: Arc<pressure::PressureState>,
+    quota_bytes: Mutex<BTreeMap<String, u64>>,
+    kv_quota: kv_quota::KvQuotaPolicy,
+    #[cfg(any(test, feature = "test-support"))]
+    test_support: diagnostic_hooks::DbTestSupport,
+    /// Test-only pause point between quota reservation and batcher enqueue.
+    #[cfg(test)]
+    reservation_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl fmt::Debug for Db {
@@ -71,6 +116,129 @@ impl fmt::Debug for Db {
 }
 
 impl Db {
+    /// Current `RocksDB` instance; replaced when the batcher reopens it (#33).
+    fn db(&self) -> StorageResult<Arc<DB>> {
+        self.inner.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> StorageResult<Arc<DB>> {
+        self.db()
+    }
+
+    fn quota_lock(&self) -> StorageResult<std::sync::MutexGuard<'_, BTreeMap<String, u64>>> {
+        self.quota_bytes
+            .lock()
+            .map_err(|error| StorageError::WriteFailed {
+                cf_name: "storage_quota".to_owned(),
+                detail: error.to_string(),
+            })
+    }
+
+    fn check_hard_cap(
+        &self,
+        quota_bytes: &mut BTreeMap<String, u64>,
+        cf_name: &str,
+        puts: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+    ) -> StorageResult<()> {
+        let Some(default) = DEFAULTS.iter().find(|default| default.cf == cf_name) else {
+            return Ok(());
+        };
+        let db = self.db()?;
+        let cf = db
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: "column family handle missing".to_owned(),
+            })?;
+        // #164: bounded namespaces are refused at their own budget, and
+        // critical rows skip the shared cap so they can always write.
+        let scope = kv_quota::KvScope {
+            db: &db,
+            cf: &cf,
+            cf_name,
+        };
+        self.kv_quota
+            .admit(&scope, quota_bytes, puts, deletes, &|| self.batcher.flush())?;
+        if kv_quota::KvQuotaPolicy::exempts_from_shared_cap(cf_name, puts) {
+            if let Some(bytes) = quota_bytes.get_mut(cf_name) {
+                *bytes = bytes.saturating_add(batch_bytes(puts));
+            }
+            return Ok(());
+        }
+        let mut estimated_bytes = db
+            .property_int_value_cf(&cf, ESTIMATE_LIVE_DATA_SIZE)
+            .map_err(|source| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })?
+            .ok_or_else(|| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!("{ESTIMATE_LIVE_DATA_SIZE} unavailable for quota admission"),
+            })?;
+        let hard_cap = default.hard_cap_mb.saturating_mul(MIB as u64);
+        let incoming_bytes = batch_bytes(puts);
+        let current_bytes = if let Some(bytes) = quota_bytes.get(cf_name) {
+            *bytes
+        } else {
+            exact_cf_bytes(&db, &cf, cf_name)?
+        };
+        let mut projected = current_bytes.saturating_add(incoming_bytes);
+        if projected > hard_cap || estimated_bytes.saturating_add(incoming_bytes) > hard_cap {
+            self.batcher.flush()?;
+            db.flush_cf(&cf)
+                .map_err(|source| StorageError::WriteFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: source.to_string(),
+                })?;
+            estimated_bytes = db
+                .property_int_value_cf(&cf, ESTIMATE_LIVE_DATA_SIZE)
+                .map_err(|source| StorageError::ReadFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: source.to_string(),
+                })?
+                .ok_or_else(|| StorageError::ReadFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: format!("{ESTIMATE_LIVE_DATA_SIZE} unavailable after flush"),
+                })?;
+            let baseline = exact_cf_bytes(&db, &cf, cf_name)?;
+            projected = baseline;
+            let mut changes = BTreeMap::<&[u8], Option<&[u8]>>::new();
+            for key in deletes {
+                changes.insert(key, None);
+            }
+            for (key, value) in puts {
+                changes.insert(key, Some(value));
+            }
+            for (key, value) in changes {
+                if let Some(previous) =
+                    db.get_cf(&cf, key)
+                        .map_err(|source| StorageError::ReadFailed {
+                            cf_name: cf_name.to_owned(),
+                            detail: source.to_string(),
+                        })?
+                {
+                    projected = projected.saturating_sub(key.len() as u64 + previous.len() as u64);
+                }
+                if let Some(value) = value {
+                    projected = projected.saturating_add(key.len() as u64 + value.len() as u64);
+                }
+            }
+            if projected > baseline
+                && estimated_bytes.saturating_add(projected.saturating_sub(baseline)) > hard_cap
+            {
+                return Err(StorageError::HardCapReached {
+                    cf_name: cf_name.to_owned(),
+                    hard_cap,
+                    estimated_bytes,
+                });
+            }
+        }
+        quota_bytes.insert(cf_name.to_owned(), projected);
+        Ok(())
+    }
+
     /// Opens the `RocksDB` storage at `path`.
     ///
     /// `RocksDB` refuses to open a database without naming every column
@@ -89,48 +257,8 @@ impl Db {
     /// stored schema sentinel differs from `schema_version`.
     #[tracing::instrument(skip_all, fields(storage_path = %path.display(), schema_version))]
     pub fn open(path: &Path, schema_version: u32) -> StorageResult<Self> {
-        let options = db_options();
-        // An error here means the database does not exist yet (fresh open);
-        // create_missing_column_families covers that path.
-        let existing_cfs = DB::list_cf(&Options::default(), path).unwrap_or_default();
-        let unknown_cfs: Vec<String> = existing_cfs
-            .into_iter()
-            .filter(|name| {
-                name != rocksdb::DEFAULT_COLUMN_FAMILY_NAME
-                    && !cf::ALL_COLUMN_FAMILIES.contains(&name.as_str())
-            })
-            .collect();
-        for name in &unknown_cfs {
-            tracing::warn!(
-                code = "STORAGE_UNKNOWN_CF_OPENED",
-                cf_name = %name,
-                "database holds a column family this binary does not know; \
-                 opening it untouched with default options (newer-binary data, \
-                 preserved for rollback safety)"
-            );
-        }
-        let descriptors = cf::ALL_COLUMN_FAMILIES
-            .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, cf_options(name)))
-            .chain(
-                unknown_cfs
-                    .iter()
-                    .map(|name| ColumnFamilyDescriptor::new(name, Options::default())),
-            );
-        let inner = DB::open_cf_descriptors(&options, path, descriptors)
-            .map_err(|source| open_failed(path, &source))?;
-        verify_schema_version(&inner, path, schema_version)?;
-
-        for name in cf::ALL_COLUMN_FAMILIES {
-            if inner.cf_handle(name).is_none() {
-                return Err(open_failed_detail(
-                    path,
-                    format!("column family handle missing after open: {name}"),
-                ));
-            }
-        }
-
-        let inner = Arc::new(inner);
+        let inner = open_rocksdb(path, schema_version)?;
+        let inner = Arc::new(db_handle::DbHandle::new(inner, path, schema_version));
         let batcher = batch::Batcher::spawn(Arc::clone(&inner));
         let pressure = Arc::new(pressure::PressureState::default());
 
@@ -140,20 +268,49 @@ impl Db {
             batcher,
             inner,
             pressure,
+            quota_bytes: Mutex::new(BTreeMap::new()),
+            kv_quota: kv_quota::KvQuotaPolicy::from_env(),
+            #[cfg(any(test, feature = "test-support"))]
+            test_support: diagnostic_hooks::DbTestSupport::default(),
+            #[cfg(test)]
+            reservation_hook: Mutex::new(None),
         })
     }
 
-    /// Enqueues key/value writes for one column family.
+    #[cfg(test)]
+    pub(crate) fn set_reservation_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.reservation_hook.lock() {
+            *slot = Some(hook);
+        }
+    }
+
+    #[cfg(test)]
+    fn run_reservation_hook(&self) {
+        let hook = self
+            .reservation_hook
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Writes one column-family batch, returning after `RocksDB` accepts it.
+    ///
+    /// Requests are bounded to 64 MiB including allocation overhead; a queue
+    /// that stays full past the admission wait fails closed. The batcher
+    /// commits as soon as its queue is idle, so a lone writer is not delayed.
+    /// Call `flush` for synchronous WAL durability.
     ///
     /// Callers aggregate producer-side and submit batches; per-frame single
     /// writes intentionally are not part of this API.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::WriteFailed`] when the column family is missing,
-    /// the background batcher is unavailable, or `RocksDB` rejects the batch.
-    /// Returns [`StorageError::WriteShed`] when disk-pressure policy rejects
-    /// the write before it reaches `RocksDB`.
+    /// Returns [`StorageError::WriteShed`] when disk-pressure policy refuses
+    /// the batch; no row in that batch was persisted. Other failures return
+    /// [`StorageError::WriteFailed`].
     #[tracing::instrument(skip_all, fields(cf_name))]
     pub fn put_batch<I, K, V>(&self, cf_name: &str, kvs: I) -> StorageResult<()>
     where
@@ -161,7 +318,7 @@ impl Db {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
-        self.inner
+        self.db()?
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::WriteFailed {
                 cf_name: cf_name.to_owned(),
@@ -175,18 +332,16 @@ impl Db {
             return Ok(());
         }
         if !self.pressure.permits_write(cf_name) {
-            // Consumers like the activity timeline mine continuity and need
-            // a returned failure to detect recording gaps (ADR
-            // 2026-06-11-timeline-data-model). Logs/metrics are only
-            // supporting signals.
-            let pressure_level = format!("{:?}", self.pressure.level());
+            // A dropped write must never be acknowledged as persisted. Callers
+            // handling rebuildable/cache CFs may explicitly treat this typed
+            // error as best-effort shedding.
             synapse_telemetry::metrics::counter!(
                 STORAGE_WRITES_SHED_TOTAL,
                 "cf" => cf_name.to_owned()
             )
             .increment(kvs.len() as u64);
             tracing::warn!(
-                code = error_codes::STORAGE_WRITE_FAILED,
+                code = error_codes::STORAGE_WRITE_SHED,
                 cf = cf_name,
                 pressure_level = ?self.pressure.level(),
                 dropped_rows = kvs.len(),
@@ -195,11 +350,38 @@ impl Db {
             );
             return Err(StorageError::WriteShed {
                 cf_name: cf_name.to_owned(),
-                pressure_level,
-                rows: kvs.len(),
+                pressure_level: self.pressure.level(),
+                dropped_rows: kvs.len(),
             });
         }
-        self.batcher.put_batch(cf_name, kvs)
+        // Reserve quota and enqueue as one step under the quota lock (#34): a
+        // slow-path reconcile in another writer flushes the queue behind this
+        // write, so it always sees it as persisted and never forgets the
+        // reservation. Only the enqueue is inside the lock; the commit wait is
+        // outside so writers do not serialize on it (#33).
+        let receipt = {
+            let mut quota = self.quota_lock()?;
+            let before = quota.clone();
+            self.check_hard_cap(&mut quota, cf_name, &kvs, &[])?;
+            #[cfg(test)]
+            self.run_reservation_hook();
+            match self.batcher.submit(cf_name, kvs) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    // Never enqueued: release the reservation.
+                    *quota = before;
+                    return Err(error);
+                }
+            }
+        };
+        receipt.wait()
+    }
+
+    /// Health of the background write batcher: whether a commit failure is
+    /// still latched, why, and how often it has recovered.
+    #[must_use]
+    pub fn batcher_status(&self) -> BatcherStatus {
+        self.batcher.status()
     }
 
     /// Writes a key/value batch while bypassing the pressure ingestion gate.
@@ -220,8 +402,8 @@ impl Db {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
-        let cf = self
-            .inner
+        let db = self.db()?;
+        let cf = db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::WriteFailed {
                 cf_name: cf_name.to_owned(),
@@ -234,89 +416,19 @@ impl Db {
         if kvs.is_empty() {
             return Ok(());
         }
+        let mut quota = self.quota_lock()?;
+        self.check_hard_cap(&mut quota, cf_name, &kvs, &[])?;
         let mut batch = WriteBatch::default();
         for (key, value) in kvs {
             batch.put_cf(&cf, key, value);
         }
-        self.inner
-            .write(batch)
+        // Sync the WAL for durability without forcing this CF's memtable into
+        // an SST. Per-write CF flushes rotate tiny WAL files that cold CFs can
+        // retain, making the next daemon startup replay thousands of files.
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        db.write_opt(batch, &options)
             .map_err(|source| StorageError::WriteFailed {
-                cf_name: cf_name.to_owned(),
-                detail: source.to_string(),
-            })?;
-        self.inner
-            .flush_cf(&cf)
-            .map_err(|source| StorageError::WriteFailed {
-                cf_name: cf_name.to_owned(),
-                detail: source.to_string(),
-            })
-    }
-
-    /// Writes key/value batches across multiple column families in one `RocksDB`
-    /// write batch while bypassing the pressure ingestion gate.
-    ///
-    /// Callers must perform any required pressure admission check before using
-    /// this helper. It exists for coupled rows where a primary row and its
-    /// secondary index must appear atomically.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::WriteFailed`] when any column family is missing
-    /// or `RocksDB` rejects the multi-CF write batch/flush.
-    #[tracing::instrument(skip_all)]
-    pub fn put_cf_batches_pressure_bypass(
-        &self,
-        batches: Vec<CfWriteBatch<'_>>,
-    ) -> StorageResult<()> {
-        if batches.iter().all(|(_cf_name, rows)| rows.is_empty()) {
-            return Ok(());
-        }
-        let mut handles = Vec::with_capacity(batches.len());
-        for (cf_name, _rows) in &batches {
-            let handle =
-                self.inner
-                    .cf_handle(cf_name)
-                    .ok_or_else(|| StorageError::WriteFailed {
-                        cf_name: (*cf_name).to_owned(),
-                        detail: "column family handle missing".to_owned(),
-                    })?;
-            handles.push(handle);
-        }
-        let mut batch = WriteBatch::default();
-        for ((_cf_name, rows), handle) in batches.iter().zip(&handles) {
-            for (key, value) in rows {
-                batch.put_cf(handle, key, value);
-            }
-        }
-        self.inner
-            .write(batch)
-            .map_err(|source| StorageError::WriteFailed {
-                cf_name: "<multi-cf>".to_owned(),
-                detail: source.to_string(),
-            })?;
-        for ((cf_name, _rows), handle) in batches.into_iter().zip(handles) {
-            self.inner
-                .flush_cf(&handle)
-                .map_err(|source| StorageError::WriteFailed {
-                    cf_name: cf_name.to_owned(),
-                    detail: source.to_string(),
-                })?;
-        }
-        Ok(())
-    }
-
-    /// Reads one key from a column family.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::ReadFailed`] when the column family is missing or
-    /// `RocksDB` rejects the point lookup.
-    #[tracing::instrument(skip_all, fields(cf_name, key_len = key.len()))]
-    pub fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
-        let handle = self.cf_handle(cf_name)?;
-        self.inner
-            .get_cf(&handle, key)
-            .map_err(|source| StorageError::ReadFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
             })
@@ -347,8 +459,8 @@ impl Db {
         PK: Into<Vec<u8>>,
         PV: Into<Vec<u8>>,
     {
-        let cf = self
-            .inner
+        let db = self.db()?;
+        let cf = db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::WriteFailed {
                 cf_name: cf_name.to_owned(),
@@ -362,6 +474,10 @@ impl Db {
         if deletes.is_empty() && puts.is_empty() {
             return Ok(());
         }
+        let mut quota = self.quota_lock()?;
+        if !puts.is_empty() {
+            self.check_hard_cap(&mut quota, cf_name, &puts, &deletes)?;
+        }
         let mut batch = WriteBatch::default();
         for key in deletes {
             batch.delete_cf(&cf, key);
@@ -369,21 +485,92 @@ impl Db {
         for (key, value) in puts {
             batch.put_cf(&cf, key, value);
         }
-        self.inner
-            .write(batch)
-            .map_err(|source| StorageError::WriteFailed {
-                cf_name: cf_name.to_owned(),
-                detail: source.to_string(),
-            })?;
-        self.inner
-            .flush_cf(&cf)
+        // Sync the WAL for durability without forcing this CF's memtable into
+        // an SST. Per-write CF flushes rotate tiny WAL files that cold CFs can
+        // retain, making the next daemon startup replay thousands of files.
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        db.write_opt(batch, &options)
             .map_err(|source| StorageError::WriteFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
             })
     }
 
-    /// Deletes key rows from one column family and flushes them immediately.
+    /// Applies mutations spanning multiple column families in one durable
+    /// `RocksDB` write batch.
+    ///
+    /// Coordination callers use this when a durable ownership row and its
+    /// corresponding journal event are one logical transition. Readers cannot
+    /// observe one mutation without the other after the write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when a named column family is
+    /// absent or `RocksDB` rejects the durable batch write.
+    #[tracing::instrument(skip_all)]
+    pub fn mutate_cross_cf_batch_pressure_bypass<I>(&self, mutations: I) -> StorageResult<()>
+    where
+        I: IntoIterator<Item = CrossCfBatchMutation>,
+    {
+        let mutations = mutations.into_iter().collect::<Vec<_>>();
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let db = self.db()?;
+        let mut quota = self.quota_lock()?;
+        let mut incoming = BTreeMap::<&str, (Vec<RawRow>, Vec<Vec<u8>>)>::new();
+        for mutation in &mutations {
+            match mutation {
+                CrossCfBatchMutation::Put {
+                    cf_name,
+                    key,
+                    value,
+                } => {
+                    incoming
+                        .entry(cf_name)
+                        .or_default()
+                        .0
+                        .push((key.clone(), value.clone()));
+                }
+                CrossCfBatchMutation::Delete { cf_name, key } => {
+                    incoming.entry(cf_name).or_default().1.push(key.clone());
+                }
+            }
+        }
+        for (cf_name, (puts, deletes)) in incoming {
+            if !puts.is_empty() {
+                self.check_hard_cap(&mut quota, cf_name, &puts, &deletes)?;
+            }
+        }
+        let mut batch = WriteBatch::default();
+        for mutation in mutations {
+            let cf_name = match &mutation {
+                CrossCfBatchMutation::Put { cf_name, .. }
+                | CrossCfBatchMutation::Delete { cf_name, .. } => *cf_name,
+            };
+            let cf = db
+                .cf_handle(cf_name)
+                .ok_or_else(|| StorageError::WriteFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: "column family handle missing".to_owned(),
+                })?;
+            match mutation {
+                CrossCfBatchMutation::Put { key, value, .. } => batch.put_cf(&cf, key, value),
+                CrossCfBatchMutation::Delete { key, .. } => batch.delete_cf(&cf, key),
+            }
+        }
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        db.write_opt(batch, &options)
+            .map_err(|source| StorageError::WriteFailed {
+                cf_name: "cross_cf_batch".to_owned(),
+                detail: source.to_string(),
+            })?;
+        Ok(())
+    }
+
+    /// Deletes key rows from one column family and synchronizes the WAL.
     ///
     /// Deletions are allowed under disk pressure because they reduce retained
     /// local state.
@@ -398,8 +585,8 @@ impl Db {
         I: IntoIterator<Item = K>,
         K: Into<Vec<u8>>,
     {
-        let cf = self
-            .inner
+        let db = self.db()?;
+        let cf = db
             .cf_handle(cf_name)
             .ok_or_else(|| StorageError::WriteFailed {
                 cf_name: cf_name.to_owned(),
@@ -410,25 +597,24 @@ impl Db {
             return Ok(());
         }
         let mut batch = WriteBatch::default();
-        for key in keys {
+        for key in &keys {
             batch.delete_cf(&cf, key);
         }
-        self.inner
-            .write(batch)
-            .map_err(|source| StorageError::WriteFailed {
-                cf_name: cf_name.to_owned(),
-                detail: source.to_string(),
-            })?;
-        self.inner
-            .flush_cf(&cf)
+        // Sync the WAL for durability without forcing this CF's memtable into
+        // an SST. Per-write CF flushes rotate tiny WAL files that cold CFs can
+        // retain, making the next daemon startup replay thousands of files.
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        #[cfg(any(test, feature = "test-support"))]
+        self.check_delete_batch_fault_for_test(cf_name, &keys)?;
+        db.write_opt(batch, &options)
             .map_err(|source| StorageError::WriteFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
             })
     }
 
-    /// Syncs the batcher WAL. `put_batch` already waits for each submitted
-    /// batch to reach `RocksDB` with a synced WAL before returning.
+    /// Flushes pending batched writes with synchronous `RocksDB` write options.
     ///
     /// # Errors
     ///
@@ -436,6 +622,8 @@ impl Db {
     /// unavailable or `RocksDB` rejects the flush.
     #[tracing::instrument(skip_all)]
     pub fn flush(&self) -> StorageResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.check_flush_fault_for_test()?;
         self.batcher.flush()
     }
 
@@ -447,7 +635,7 @@ impl Db {
     /// or compactions fail.
     #[tracing::instrument(skip_all)]
     pub fn run_gc_once(&self) -> StorageResult<GcReport> {
-        gc::run_once(&self.inner, &gc::GcConfig::from_retention_defaults())
+        gc::run_once(&*self.db()?, &gc::GcConfig::from_retention_defaults())
     }
 
     /// Runs one row-count-scaled GC pass for deterministic regression tests.
@@ -467,7 +655,7 @@ impl Db {
         hard_cap_rows: u64,
     ) -> StorageResult<GcReport> {
         gc::run_once(
-            &self.inner,
+            &*self.db()?,
             &gc::GcConfig::for_row_caps(
                 Duration::from_mins(5),
                 cf_name,
@@ -487,6 +675,27 @@ impl Db {
         gc::spawn(
             Arc::clone(&self.inner),
             gc::GcConfig::from_retention_defaults(),
+        )
+    }
+
+    /// Spawns the periodic storage garbage-collection task with an explicit
+    /// tick interval (#60: the daemon configures it from the environment).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when `interval` is zero or no
+    /// Tokio runtime is active.
+    #[tracing::instrument(skip_all)]
+    pub fn spawn_gc_task_with_interval(&self, interval: Duration) -> StorageResult<GcTask> {
+        if interval.is_zero() {
+            return Err(StorageError::WriteFailed {
+                cf_name: "storage_gc".to_owned(),
+                detail: "GC interval must be non-zero".to_owned(),
+            });
+        }
+        gc::spawn(
+            Arc::clone(&self.inner),
+            gc::GcConfig::from_retention_defaults().with_interval(interval),
         )
     }
 
@@ -512,16 +721,6 @@ impl Db {
         self.pressure.transition_codes()
     }
 
-    /// Returns the last successfully observed disk-pressure probe readback.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::ReadFailed`] if the pressure state cannot be read.
-    #[tracing::instrument(skip_all)]
-    pub fn pressure_probe_readback(&self) -> StorageResult<PressureProbeReadback> {
-        self.pressure.probe_readback()
-    }
-
     /// Returns approximate logical bytes currently stored in each Synapse column family.
     ///
     /// This scans row keys and values so health reports reflect persisted data
@@ -541,7 +740,6 @@ impl Db {
             }
             sizes.insert(cf_name.to_owned(), bytes);
         }
-        emit_storage_cf_bytes(&sizes);
         Ok(sizes)
     }
 
@@ -556,9 +754,7 @@ impl Db {
     /// be read.
     #[tracing::instrument(skip_all)]
     pub fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap> {
-        let estimates = self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)?;
-        emit_storage_cf_bytes(&estimates.0);
-        Ok(estimates)
+        self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)
     }
 
     /// Returns exact row counts for each Synapse column family.
@@ -598,7 +794,7 @@ impl Db {
     #[tracing::instrument(skip_all)]
     pub fn run_pressure_check_once(&self) -> StorageResult<PressureReport> {
         pressure::run_once(
-            &self.inner,
+            &*self.db()?,
             &self.pressure,
             &self.path,
             &pressure::PressureConfig::default(),
@@ -620,7 +816,7 @@ impl Db {
         free_bytes: u64,
     ) -> StorageResult<PressureReport> {
         pressure::run_once_with_free_bytes(
-            &self.inner,
+            &*self.db()?,
             &self.pressure,
             &pressure::PressureConfig::default(),
             free_bytes,
@@ -642,6 +838,32 @@ impl Db {
         )
     }
 
+    /// Spawns the periodic DB-volume disk-pressure task with an explicit poll
+    /// interval (#60: the daemon configures it from the environment).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when `interval` is zero or no
+    /// Tokio runtime is active.
+    #[tracing::instrument(skip_all)]
+    pub fn spawn_pressure_task_with_interval(
+        &self,
+        interval: Duration,
+    ) -> StorageResult<PressureTask> {
+        if interval.is_zero() {
+            return Err(StorageError::WriteFailed {
+                cf_name: "storage_disk_pressure".to_owned(),
+                detail: "disk-pressure poll interval must be non-zero".to_owned(),
+            });
+        }
+        pressure::spawn(
+            Arc::clone(&self.inner),
+            Arc::clone(&self.pressure),
+            self.path.clone(),
+            pressure::PressureConfig::default().with_interval(interval),
+        )
+    }
+
     /// Scans a column family into owned key/value bytes.
     ///
     /// # Errors
@@ -650,9 +872,12 @@ impl Db {
     /// or `RocksDB` iteration fails.
     #[tracing::instrument(skip_all, fields(cf_name))]
     pub fn scan_cf(&self, cf_name: &str) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        let handle = self.cf_handle(cf_name)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.check_read_fault_for_test(cf_name, b"")?;
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
         let mut rows = Vec::new();
-        for item in self.inner.iterator_cf(&handle, IteratorMode::Start) {
+        for item in db.iterator_cf(&handle, IteratorMode::Start) {
             let (key, value) = item.map_err(|source| StorageError::ReadFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
@@ -690,12 +915,12 @@ impl Db {
         prefix: &[u8],
         start_key: &[u8],
     ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        let handle = self.cf_handle(cf_name)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.check_read_fault_for_test(cf_name, start_key)?;
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
         let mut rows = Vec::new();
-        for item in self
-            .inner
-            .iterator_cf(&handle, IteratorMode::From(start_key, Direction::Forward))
-        {
+        for item in db.iterator_cf(&handle, IteratorMode::From(start_key, Direction::Forward)) {
             let (key, value) = item.map_err(|source| StorageError::ReadFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
@@ -706,6 +931,46 @@ impl Db {
             rows.push((key.to_vec(), value.to_vec()));
         }
         Ok(rows)
+    }
+
+    /// Reads at most `max_rows` rows and `max_value_bytes` of values from one
+    /// prefix, with one in-prefix lookahead to report whether another page
+    /// exists. The first row is always included so callers can make progress
+    /// even when its value alone exceeds the byte budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when the column family is missing
+    /// or `RocksDB` iteration fails.
+    pub fn scan_cf_prefix_window(
+        &self,
+        cf_name: &str,
+        prefix: &[u8],
+        start_key: &[u8],
+        max_rows: usize,
+        max_value_bytes: usize,
+    ) -> StorageResult<ScanWindow> {
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
+        let mut rows = Vec::new();
+        let mut value_bytes = 0_usize;
+        for item in db.iterator_cf(&handle, IteratorMode::From(start_key, Direction::Forward)) {
+            let (key, value) = item.map_err(|source| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if rows.len() == max_rows
+                || (!rows.is_empty() && value_bytes.saturating_add(value.len()) > max_value_bytes)
+            {
+                return Ok((rows, true));
+            }
+            value_bytes = value_bytes.saturating_add(value.len());
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        Ok((rows, false))
     }
 
     /// Scans up to `max_rows` rows starting at `start_key` (inclusive) and
@@ -726,13 +991,13 @@ impl Db {
         start_key: &[u8],
         max_rows: usize,
     ) -> StorageResult<ScanWindow> {
-        let handle = self.cf_handle(cf_name)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.check_read_fault_for_test(cf_name, start_key)?;
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
         let mut rows = Vec::new();
         let mut more = false;
-        for item in self
-            .inner
-            .iterator_cf(&handle, IteratorMode::From(start_key, Direction::Forward))
-        {
+        for item in db.iterator_cf(&handle, IteratorMode::From(start_key, Direction::Forward)) {
             let (key, value) = item.map_err(|source| StorageError::ReadFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
@@ -760,9 +1025,10 @@ impl Db {
         if max_rows == 0 {
             return Ok(Vec::new());
         }
-        let handle = self.cf_handle(cf_name)?;
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
         let mut rows = Vec::new();
-        for item in self.inner.iterator_cf(&handle, IteratorMode::End) {
+        for item in db.iterator_cf(&handle, IteratorMode::End) {
             let (key, value) = item.map_err(|source| StorageError::ReadFailed {
                 cf_name: cf_name.to_owned(),
                 detail: source.to_string(),
@@ -783,9 +1049,9 @@ impl Db {
     /// Returns [`StorageError::ReadFailed`] when the column family is missing.
     #[tracing::instrument(skip_all, fields(cf_name))]
     pub fn compact_cf(&self, cf_name: &str) -> StorageResult<()> {
-        let handle = self.cf_handle(cf_name)?;
-        self.inner
-            .compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
+        db.compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
         Ok(())
     }
 
@@ -801,27 +1067,19 @@ impl Db {
     /// Returns [`StorageError::ReadFailed`] when the column family is missing.
     #[tracing::instrument(skip_all, fields(cf_name, start_len = start.len(), end_len = end.len()))]
     pub fn compact_cf_range(&self, cf_name: &str, start: &[u8], end: &[u8]) -> StorageResult<()> {
-        let handle = self.cf_handle(cf_name)?;
-        self.inner.compact_range_cf(&handle, Some(start), Some(end));
+        let db = self.db()?;
+        let handle = cf_handle(&db, cf_name)?;
+        db.compact_range_cf(&handle, Some(start), Some(end));
         Ok(())
-    }
-
-    fn cf_handle(&self, cf_name: &str) -> StorageResult<ColumnFamilyRef<'_>> {
-        self.inner
-            .cf_handle(cf_name)
-            .ok_or_else(|| StorageError::ReadFailed {
-                cf_name: cf_name.to_owned(),
-                detail: "column family handle missing".to_owned(),
-            })
     }
 
     fn cf_property_estimates(&self, property: &str) -> StorageResult<CfEstimateMap> {
         let mut values = BTreeMap::new();
         let mut missing = Vec::new();
+        let db = self.db()?;
         for cf_name in cf::ALL_COLUMN_FAMILIES {
-            let handle = self.cf_handle(cf_name)?;
-            if let Some(value) = self
-                .inner
+            let handle = cf_handle(&db, cf_name)?;
+            if let Some(value) = db
                 .property_int_value_cf(&handle, property)
                 .map_err(|source| StorageError::ReadFailed {
                     cf_name: cf_name.to_owned(),
@@ -838,12 +1096,49 @@ impl Db {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn emit_storage_cf_bytes(sizes: &BTreeMap<String, u64>) {
-    for (cf_name, bytes) in sizes {
-        synapse_telemetry::metrics::gauge!(STORAGE_CF_BYTES, "cf" => cf_name.clone())
-            .set(*bytes as f64);
+/// Opens the `RocksDB` database at `path` and verifies its schema sentinel.
+fn open_rocksdb(path: &Path, schema_version: u32) -> StorageResult<DB> {
+    let options = db_options();
+    // An error here means the database does not exist yet (fresh open);
+    // create_missing_column_families covers that path.
+    let existing_cfs = DB::list_cf(&Options::default(), path).unwrap_or_default();
+    let unknown_cfs: Vec<String> = existing_cfs
+        .into_iter()
+        .filter(|name| {
+            name != rocksdb::DEFAULT_COLUMN_FAMILY_NAME
+                && !cf::ALL_COLUMN_FAMILIES.contains(&name.as_str())
+        })
+        .collect();
+    for name in &unknown_cfs {
+        tracing::warn!(
+            code = "STORAGE_UNKNOWN_CF_OPENED",
+            cf_name = %name,
+            "database holds a column family this binary does not know; \
+             opening it untouched with default options (newer-binary data, \
+             preserved for rollback safety)"
+        );
     }
+    let descriptors = cf::ALL_COLUMN_FAMILIES
+        .into_iter()
+        .map(|name| ColumnFamilyDescriptor::new(name, cf_options(name)))
+        .chain(
+            unknown_cfs
+                .iter()
+                .map(|name| ColumnFamilyDescriptor::new(name, Options::default())),
+        );
+    let inner = DB::open_cf_descriptors(&options, path, descriptors)
+        .map_err(|source| open_failed(path, &source))?;
+    verify_schema_version(&inner, path, schema_version)?;
+
+    for name in cf::ALL_COLUMN_FAMILIES {
+        if inner.cf_handle(name).is_none() {
+            return Err(open_failed_detail(
+                path,
+                format!("column family handle missing after open: {name}"),
+            ));
+        }
+    }
+    Ok(inner)
 }
 
 fn db_options() -> Options {
@@ -902,29 +1197,49 @@ fn cf_options(name: &'static str) -> Options {
         _ => {}
     }
 
-    if cf_has_ttl(name) {
-        // RocksDB TTL filters only remove expired entries during compaction.
-        // Apply periodic compaction to every TTL-backed CF so cold files still
-        // traverse the filter without a foreground full-CF scan.
-        options.set_periodic_compaction_seconds(TIMELINE_PERIODIC_COMPACTION_SECONDS);
-    }
-
     compaction::install_ttl_filter(&mut options, name);
     apply_block_cache(&mut options);
     options
 }
 
-fn cf_has_ttl(name: &'static str) -> bool {
-    DEFAULTS
-        .iter()
-        .find(|default| default.cf == name)
-        .is_some_and(|default| {
-            matches!(default.ttl, RetentionTtl::Hours(_) | RetentionTtl::Days(_))
+/// Per-column-family block cache size in MiB (default 64, one private LRU per
+/// CF). Override with `SYNAPSE_STORAGE_BLOCK_CACHE_MIB`.
+const BLOCK_CACHE_MIB_ENV: &str = "SYNAPSE_STORAGE_BLOCK_CACHE_MIB";
+/// Opt in to ONE block cache shared by every column family of every database
+/// in the process, sized in MiB (#60). Unset keeps the per-CF default.
+const SHARED_BLOCK_CACHE_MIB_ENV: &str = "SYNAPSE_STORAGE_SHARED_BLOCK_CACHE_MIB";
+
+fn env_mib(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|mib| *mib > 0)
+}
+
+/// Resolves the block cache for one column family: the shared cache when
+/// opted in, otherwise a private LRU of the configured (default 64 MiB) size.
+fn block_cache_for_new_cf() -> Cache {
+    static SHARED: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    if let Some(shared_mib) = env_mib(SHARED_BLOCK_CACHE_MIB_ENV) {
+        return SHARED
+            .get_or_init(|| Cache::new_lru_cache(shared_mib.saturating_mul(MIB)))
+            .clone();
+    }
+    let per_cf =
+        env_mib(BLOCK_CACHE_MIB_ENV).map_or(BLOCK_CACHE_BYTES, |mib| mib.saturating_mul(MIB));
+    Cache::new_lru_cache(per_cf)
+}
+
+fn cf_handle<'a>(db: &'a DB, cf_name: &str) -> StorageResult<ColumnFamilyRef<'a>> {
+    db.cf_handle(cf_name)
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: "column family handle missing".to_owned(),
         })
 }
 
 fn apply_block_cache(options: &mut Options) {
-    let cache = Cache::new_lru_cache(BLOCK_CACHE_BYTES);
+    let cache = block_cache_for_new_cf();
     let mut block_options = BlockBasedOptions::default();
     block_options.set_block_cache(&cache);
     options.set_block_based_table_factory(&block_options);
@@ -973,3 +1288,22 @@ fn open_failed_detail(path: &Path, detail: String) -> StorageError {
         detail,
     }
 }
+
+#[cfg(test)]
+mod batch_tests;
+#[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
+mod db_handle_tests_33;
+#[cfg(test)]
+mod gc_tests;
+#[cfg(test)]
+mod kv_quota_tests;
+#[cfg(test)]
+mod open_tests;
+#[cfg(test)]
+mod pressure_tests;
+#[cfg(test)]
+mod quota_reservation_tests;
+#[cfg(all(test, windows))]
+mod recovery_tests_33;

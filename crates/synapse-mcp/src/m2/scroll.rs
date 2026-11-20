@@ -6,9 +6,7 @@ use std::{
 use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use synapse_action::{
-    ActionBackend, ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend,
-};
+use synapse_action::{ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend};
 use synapse_core::{Action, Backend, ElementId, Point, error_codes};
 
 use crate::m1::mcp_error;
@@ -18,20 +16,25 @@ use crate::m2::postcondition::{
 #[cfg(windows)]
 use crate::m2::postcondition::{hash_json, no_observed_delta_error, postcondition_observed_delta};
 #[cfg(windows)]
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
-use windows::{
-    Win32::{
-        Foundation::{HWND, LPARAM, POINT as WinPoint, RECT, WPARAM},
-        UI::WindowsAndMessaging::{
-            EnumChildWindows, GA_ROOT, GetAncestor, GetClassNameW, GetWindowRect, IsWindow,
-            IsWindowVisible, PostMessageW, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WindowFromPoint,
-        },
+use synapse_action::backend::software::{cursor_position, ensure_pointer_foreground};
+#[cfg(windows)]
+use synapse_action::delivery_target::{
+    INPUT_TARGET_REMEDIATION, InputDeliveryTarget, wheel_delivery_point,
+};
+#[cfg(windows)]
+use synapse_core::Rect;
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::{HWND, LPARAM, POINT as WinPoint, RECT, WPARAM},
+    UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetClassNameW, GetWindowRect, IsWindowVisible, PostMessageW,
+        WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WindowFromPoint,
     },
-    core::BOOL,
 };
 
 const SMOOTH_SCROLL_INTERVAL_MS: u32 = 30;
@@ -97,11 +100,11 @@ pub struct ActScrollResponse {
     pub postcondition: ActPostcondition,
 }
 
-pub(crate) async fn act_scroll_with_handle_and_boundary(
+pub(crate) async fn act_scroll_with_handle_bound_target(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActScrollParams,
-    boundary: super::OperatorPanicActionBoundary,
+    checked_window_hwnd: Option<i64>,
 ) -> Result<ActScrollResponse, ErrorData> {
     validate_scroll_params(&params)?;
     let started = Instant::now();
@@ -109,7 +112,15 @@ pub(crate) async fn act_scroll_with_handle_and_boundary(
         if let Some(recording) = recording {
             execute_recording_noop(&recording, &params);
         }
-        return Ok(response(&params, false, 0, "none", started));
+        // Nothing to scroll: no step runs, so the reply is not smooth (#2401 P4).
+        return Ok(response(
+            &params,
+            false,
+            0,
+            "none",
+            ScrollPacing::new(params.smooth, true, params.dy, params.dx),
+            started,
+        ));
     }
 
     if let Some(target) = &params.target {
@@ -118,16 +129,10 @@ pub(crate) async fn act_scroll_with_handle_and_boundary(
             if let Some(backend_node_id) =
                 synapse_a11y::cdp_backend_from_element_id(&target.element_id)
             {
-                return execute_cdp_scroll(
-                    &params,
-                    &target.element_id,
-                    backend_node_id,
-                    started,
-                    boundary,
-                )
-                .await;
+                return execute_cdp_scroll(&params, &target.element_id, backend_node_id, started)
+                    .await;
             }
-            return execute_uia_scroll(&params, &target.element_id, started, boundary).await;
+            return execute_uia_scroll(&params, &target.element_id, started).await;
         }
         #[cfg(not(windows))]
         {
@@ -141,25 +146,29 @@ pub(crate) async fn act_scroll_with_handle_and_boundary(
         }
     }
 
-    let actions = scroll_actions(&params)?;
-    let mut wheel_event_count = actions.len();
-    let mut backend_used = "software";
-
-    if let Some(recording) = recording {
-        execute_recording(&recording, &actions, &params, boundary).await?;
-    } else if let Some(point) = params.at.map(Into::into) {
-        let dispatch = execute_targeted_scroll_actions(&params, point, boundary).await?;
-        wheel_event_count = dispatch.wheel_event_count;
-        backend_used = dispatch.backend_used;
+    let (wheel_event_count, backend_used, pacing) = if let Some(recording) = recording {
+        let actions = scroll_actions(&params)?;
+        execute_recording(&recording, &actions, &params).await?;
+        (
+            actions.len(),
+            "software",
+            ScrollPacing::new(params.smooth, true, params.dy, params.dx),
+        )
     } else {
-        execute_scroll_actions(&handle, actions, params.smooth, boundary).await?;
-    }
+        let dispatch = execute_native_scroll(&handle, &params, checked_window_hwnd).await?;
+        (
+            dispatch.wheel_event_count,
+            dispatch.backend_used,
+            dispatch.pacing,
+        )
+    };
 
     Ok(response(
         &params,
         true,
         wheel_event_count,
         backend_used,
+        pacing,
         started,
     ))
 }
@@ -218,7 +227,6 @@ async fn execute_cdp_scroll(
     element_id: &ElementId,
     backend_node_id: i64,
     started: Instant,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActScrollResponse, ErrorData> {
     let hwnd = element_id
         .parts()
@@ -257,7 +265,6 @@ async fn execute_cdp_scroll(
     };
     let deltas = cdp_wheel_deltas(params)?;
     let wheel_event_count = deltas.len();
-    boundary.ensure("immediately_before_cdp_scroll_node")?;
     let point = synapse_a11y::cdp_scroll_node(
         &endpoint,
         &title_hint,
@@ -315,7 +322,8 @@ async fn execute_cdp_scroll(
         );
         postcondition_not_requested("act_scroll", "cdp_node.scroll_state")
     };
-    let mut response = response(params, true, wheel_event_count, "cdp", started);
+    let pacing = ScrollPacing::new(params.smooth, true, params.dy, params.dx);
+    let mut response = response(params, true, wheel_event_count, "cdp", pacing, started);
     response.postcondition = postcondition;
     Ok(response)
 }
@@ -325,9 +333,7 @@ async fn execute_uia_scroll(
     params: &ActScrollParams,
     element_id: &ElementId,
     started: Instant,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActScrollResponse, ErrorData> {
-    boundary.ensure("immediately_before_uia_scroll_element")?;
     let mut readback =
         synapse_a11y::scroll_element(element_id, params.dy, params.dx).map_err(|error| {
             mcp_error(
@@ -364,11 +370,13 @@ async fn execute_uia_scroll(
         "readback=uia_scroll_state tool=act_scroll uia_scroll_after"
     );
 
+    // The UIA pattern scrolls in one call and never pauses (#2401).
     let mut response = response(
         params,
         true,
         usize::try_from(readback.scroll_call_count).unwrap_or(usize::MAX),
         backend_used,
+        ScrollPacing::new(params.smooth, false, params.dy, params.dx),
         started,
     );
     response.postcondition = postcondition;
@@ -443,8 +451,8 @@ fn cdp_wheel_deltas(
     Ok(ticks
         .into_iter()
         .map(|(dy, dx)| synapse_a11y::CdpWheelDelta {
-            delta_x: scroll_ticks_to_cdp_delta(dx),
-            delta_y: scroll_ticks_to_cdp_delta(dy),
+            delta_x: cdp_delta_x_for_ticks(dx),
+            delta_y: cdp_delta_y_for_ticks(dy),
         })
         .collect())
 }
@@ -470,8 +478,17 @@ fn smooth_scroll_ticks(params: &ActScrollParams) -> Result<Vec<(i32, i32)>, Erro
     Ok(ticks)
 }
 
+/// #192: dx > 0 scrolls RIGHT on every route (Win32 HWHEEL: positive = right), and
+/// CDP `deltaX > 0` is also right, so the sign is kept.
 #[cfg(windows)]
-fn scroll_ticks_to_cdp_delta(ticks: i32) -> f64 {
+fn cdp_delta_x_for_ticks(ticks: i32) -> f64 {
+    f64::from(ticks.saturating_mul(WHEEL_DELTA))
+}
+
+/// dy > 0 scrolls UP on every route (Win32 WHEEL: positive = up), but CDP
+/// `deltaY > 0` is down, so the sign is flipped.
+#[cfg(windows)]
+fn cdp_delta_y_for_ticks(ticks: i32) -> f64 {
     -f64::from(ticks.saturating_mul(WHEEL_DELTA))
 }
 
@@ -570,85 +587,225 @@ fn take_tick(value: &mut i32) -> i32 {
 struct ScrollDispatchResult {
     backend_used: &'static str,
     wheel_event_count: usize,
-}
-
-async fn execute_targeted_scroll_actions(
-    params: &ActScrollParams,
-    point: Point,
-    boundary: super::OperatorPanicActionBoundary,
-) -> Result<ScrollDispatchResult, ErrorData> {
-    execute_targeted_scroll_actions_platform(params, point, boundary).await
+    pacing: ScrollPacing,
 }
 
 #[cfg(windows)]
+async fn execute_native_scroll(
+    handle: &ActionHandle,
+    params: &ActScrollParams,
+    checked_window_hwnd: Option<i64>,
+) -> Result<ScrollDispatchResult, ErrorData> {
+    let at = params.at.map(Into::into);
+    let require_foreground = at.is_none();
+    let (target, cursor) = if at.is_some() {
+        let hwnd = checked_scroll_window(checked_window_hwnd)?;
+        let target = handle
+            .delivery_target_for_window(hwnd, "coordinate_scroll")
+            .map_err(|error| action_error_to_mcp(&error))?;
+        (target, None)
+    } else {
+        let target = handle
+            .delivery_target()
+            .map_err(|error| action_error_to_mcp(&error))?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_INPUT_TARGET_REQUIRED,
+                    format!("Wheel input refused before delivery: no intended window. {INPUT_TARGET_REMEDIATION}"),
+                )
+            })?;
+        ensure_pointer_foreground(&target).map_err(|error| action_error_to_mcp(&error))?;
+        let cursor = cursor_position().map_err(|error| action_error_to_mcp(&error))?;
+        (target, Some(cursor))
+    };
+    let point =
+        bound_wheel_point(&target, cursor, at).map_err(|error| action_error_to_mcp(&error))?;
+    dispatch_targeted_scroll_actions(params, point, &target, require_foreground, |_| {}).await
+}
+
+#[cfg(all(windows, test))]
 async fn execute_targeted_scroll_actions_platform(
     params: &ActScrollParams,
     point: Point,
-    boundary: super::OperatorPanicActionBoundary,
+    checked_window_hwnd: Option<i64>,
 ) -> Result<ScrollDispatchResult, ErrorData> {
-    let readback =
-        windows_hwnd_message_scroll_readback(point).map_err(|error| action_error_to_mcp(&error))?;
+    execute_targeted_scroll_actions_platform_with(params, point, checked_window_hwnd, |_| {}).await
+}
+
+#[cfg(all(windows, test))]
+async fn execute_targeted_scroll_actions_platform_with(
+    params: &ActScrollParams,
+    point: Point,
+    checked_window_hwnd: Option<i64>,
+    before_post: impl FnMut(usize),
+) -> Result<ScrollDispatchResult, ErrorData> {
+    let target = InputDeliveryTarget::resolve_window(
+        checked_scroll_window(checked_window_hwnd)?,
+        "coordinate_scroll",
+    )
+    .map_err(|error| action_error_to_mcp(&error))?;
+    dispatch_targeted_scroll_actions(params, point, &target, false, before_post).await
+}
+
+#[cfg(windows)]
+fn checked_scroll_window(checked_window_hwnd: Option<i64>) -> Result<i64, ErrorData> {
+    checked_window_hwnd.ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "coordinate scroll has no checked native target; no wheel input sent",
+        )
+    })
+}
+
+#[cfg(windows)]
+async fn dispatch_targeted_scroll_actions(
+    params: &ActScrollParams,
+    point: Point,
+    target: &InputDeliveryTarget,
+    require_foreground: bool,
+    mut before_post: impl FnMut(usize),
+) -> Result<ScrollDispatchResult, ErrorData> {
+    let readback = windows_hwnd_message_scroll_readback(point, target.root_hwnd)
+        .map_err(|error| action_error_to_mcp(&error))?;
+    // #2401: smooth steps run only on the foreground route; the posted route at
+    // a point sends every message back to back, and the reply reads the same
+    // `pacing`.
+    let pacing = ScrollPacing::new(params.smooth, require_foreground, params.dy, params.dx);
+    let mut dy = params.dy;
+    let mut dx = params.dx;
     let mut wheel_event_count = 0_usize;
-    for delta in wheel_delta_chunks(params.dy).map_err(|error| action_error_to_mcp(&error))? {
-        boundary.ensure("immediately_before_postmessage_vertical_wheel")?;
-        post_wheel_message(readback.hwnd, WM_MOUSEWHEEL, delta, point)
-            .map_err(|error| action_error_to_mcp(&error))?;
-        wheel_event_count = wheel_event_count.saturating_add(1);
-        tracing::info!(
-            code = "M2_ACT_SCROLL_HWND_MESSAGE",
-            kind = "act_scroll",
-            target_hwnd = readback.hwnd,
-            target_class = %readback.class_name,
-            screen_x = point.x,
-            screen_y = point.y,
-            delta = i32::from(delta),
-            axis = "vertical",
-            "readback=window_message tool=act_scroll targeted_scroll_after"
-        );
-    }
-    for delta in wheel_delta_chunks(params.dx).map_err(|error| action_error_to_mcp(&error))? {
-        boundary.ensure("immediately_before_postmessage_horizontal_wheel")?;
-        post_wheel_message(readback.hwnd, WM_MOUSEHWHEEL, delta, point)
-            .map_err(|error| action_error_to_mcp(&error))?;
-        wheel_event_count = wheel_event_count.saturating_add(1);
-        tracing::info!(
-            code = "M2_ACT_SCROLL_HWND_MESSAGE",
-            kind = "act_scroll",
-            target_hwnd = readback.hwnd,
-            target_class = %readback.class_name,
-            screen_x = point.x,
-            screen_y = point.y,
-            delta = i32::from(delta),
-            axis = "horizontal",
-            "readback=window_message tool=act_scroll targeted_scroll_after"
-        );
+    for step in 0..pacing.steps() {
+        let (vertical_notches, horizontal_notches) = if pacing.smooth() {
+            (take_tick(&mut dy), take_tick(&mut dx))
+        } else {
+            (dy, dx)
+        };
+        let (vertical, horizontal) = WheelPlan::for_scroll(vertical_notches, horizontal_notches)
+            .map_err(|error| scroll_dispatch_error(&error, wheel_event_count))?;
+        for (message, plan, axis) in [
+            (WM_MOUSEWHEEL, vertical, "vertical"),
+            (WM_MOUSEHWHEEL, horizontal, "horizontal"),
+        ] {
+            for &delta in plan.messages() {
+                before_post(wheel_event_count);
+                if require_foreground {
+                    ensure_pointer_foreground(target)
+                        .map_err(|error| scroll_dispatch_error(&error, wheel_event_count))?;
+                }
+                checked_wheel_post(target, readback.hwnd, message, delta, point)
+                    .map_err(|error| scroll_dispatch_error(&error, wheel_event_count))?;
+                wheel_event_count += 1;
+                tracing::info!(
+                    code = "M2_ACT_SCROLL_HWND_MESSAGE",
+                    kind = "act_scroll",
+                    target_hwnd = readback.hwnd,
+                    target_class = %readback.class_name,
+                    screen_x = point.x,
+                    screen_y = point.y,
+                    delta = i32::from(delta),
+                    axis,
+                    "readback=window_message tool=act_scroll targeted_scroll_after"
+                );
+            }
+        }
+        if step + 1 < pacing.steps() {
+            tokio::time::sleep(Duration::from_millis(u64::from(pacing.interval_ms()))).await;
+        }
     }
     Ok(ScrollDispatchResult {
         backend_used: "software_window_message",
         wheel_event_count,
+        pacing,
     })
 }
 
-#[cfg(not(windows))]
-async fn execute_targeted_scroll_actions_platform(
-    _params: &ActScrollParams,
+#[cfg(windows)]
+fn checked_wheel_post(
+    target: &InputDeliveryTarget,
+    recipient_hwnd: i64,
+    message: u32,
+    delta: i16,
     point: Point,
-    _boundary: super::OperatorPanicActionBoundary,
-) -> Result<ScrollDispatchResult, ErrorData> {
-    Err(action_error_to_mcp(&ActionError::BackendUnavailable {
-        detail: format!("act_scroll at={point:?} targeted window-message path requires Windows"),
-    }))
+) -> Result<(), ActionError> {
+    let point = bound_wheel_point(target, None, Some(point))?;
+    // Re-hit-test after the previous post or smooth delay. Keep the original
+    // recipient bound too, so reparenting cannot redirect the next message.
+    let hit = root_hwnd_at_point(point).ok_or_else(|| ActionError::TargetInvalid {
+        detail: format!("wheel point {point:?} is no longer over a live window"),
+    })?;
+    target.ensure_window_identity(hit)?;
+    target.ensure_window_identity(recipient_hwnd)?;
+    post_wheel_message(recipient_hwnd, message, delta, point, target.root_hwnd)
 }
 
+#[cfg(windows)]
+fn bound_wheel_point(
+    target: &InputDeliveryTarget,
+    cursor: Option<Point>,
+    explicit_point: Option<Point>,
+) -> Result<Point, ActionError> {
+    let rect = window_rect(hwnd_from_i64(target.root_hwnd)?)?;
+    wheel_delivery_point(
+        Rect {
+            x: rect.left,
+            y: rect.top,
+            w: rect.right.saturating_sub(rect.left),
+            h: rect.bottom.saturating_sub(rect.top),
+        },
+        cursor,
+        explicit_point,
+    )
+}
+
+#[cfg(not(windows))]
+async fn execute_native_scroll(
+    handle: &ActionHandle,
+    params: &ActScrollParams,
+    _checked_window_hwnd: Option<i64>,
+) -> Result<ScrollDispatchResult, ErrorData> {
+    if let Some(point) = params.at.map(Point::from) {
+        return Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+            detail: format!(
+                "act_scroll at={point:?} targeted window-message path requires Windows"
+            ),
+        }));
+    }
+    let actions = scroll_actions(params)?;
+    let wheel_event_count = actions.len();
+    execute_scroll_actions(handle, actions, params.smooth).await?;
+    Ok(ScrollDispatchResult {
+        backend_used: "software",
+        wheel_event_count,
+        pacing: ScrollPacing::new(params.smooth, true, params.dy, params.dx),
+    })
+}
+
+/// A wheel refusal names how many events reached the target before it
+/// stopped (`delivered_wheel_event_count`); any earlier delivery is marked.
+#[cfg(windows)]
+fn scroll_dispatch_error(error: &ActionError, delivered_count: usize) -> ErrorData {
+    let mut error = action_error_to_mcp(error);
+    if let Value::Object(data) = error.data.get_or_insert_with(|| json!({})) {
+        data.insert(
+            "delivered_wheel_event_count".to_owned(),
+            json!(delivered_count),
+        );
+    }
+    if delivered_count == 0 {
+        error
+    } else {
+        super::postcondition::mark_input_delivered(error)
+    }
+}
+
+#[cfg(not(windows))]
 async fn execute_scroll_actions(
     handle: &ActionHandle,
     actions: Vec<Action>,
     smooth: bool,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.into_iter().enumerate() {
-        boundary.ensure("immediately_before_foreground_scroll_dispatch")?;
         handle
             .execute(action)
             .await
@@ -660,11 +817,15 @@ async fn execute_scroll_actions(
     Ok(())
 }
 
+/// The reply of one scroll. `smooth`, `smooth_interval_ms` and
+/// `scheduled_smooth_total_ms` come from `pacing`, what the route really ran
+/// (#2401, #2395), never from the request's `smooth`.
 fn response(
     params: &ActScrollParams,
     scrolled: bool,
     wheel_event_count: usize,
     backend_used: &'static str,
+    pacing: ScrollPacing,
     started: Instant,
 ) -> ActScrollResponse {
     let wheel_event_count = u32::try_from(wheel_event_count).unwrap_or(u32::MAX);
@@ -673,15 +834,11 @@ fn response(
         ok: true,
         dy: params.dy,
         dx: params.dx,
-        smooth: params.smooth,
+        smooth: pacing.smooth(),
         scrolled,
         wheel_event_count,
-        smooth_interval_ms: if params.smooth {
-            SMOOTH_SCROLL_INTERVAL_MS
-        } else {
-            0
-        },
-        scheduled_smooth_total_ms: scheduled_smooth_total_ms(params.smooth, wheel_event_count),
+        smooth_interval_ms: pacing.interval_ms(),
+        scheduled_smooth_total_ms: pacing.scheduled_total_ms(),
         backend_used: backend_used.to_owned(),
         backend_tier_used: backend_tier_used.to_owned(),
         required_foreground: scroll_required_foreground(backend_tier_used),
@@ -718,7 +875,7 @@ fn scroll_backend_tier_used(
     if params.target.is_some() || backend_used == "cdp" {
         return "cdp";
     }
-    if params.at.is_some() || backend_used == "software_window_message" {
+    if params.at.is_some() {
         return "postmessage";
     }
     "foreground"
@@ -728,51 +885,34 @@ fn scroll_required_foreground(backend_tier_used: &str) -> bool {
     backend_tier_used == "foreground"
 }
 
-const fn scheduled_smooth_total_ms(smooth: bool, wheel_event_count: u32) -> u32 {
-    if !smooth || wheel_event_count == 0 {
-        return 0;
-    }
-    wheel_event_count
-        .saturating_sub(1)
-        .saturating_mul(SMOOTH_SCROLL_INTERVAL_MS)
-}
-
 async fn execute_recording(
     recording: &RecordingBackend,
     actions: &[Action],
     params: &ActScrollParams,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
-    let before_events = recording.events();
-    let before_event_count = before_events.len();
+    let mut new_events = Vec::new();
     let mut emit_state = EmitState::new();
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.iter().enumerate() {
-        boundary.ensure("immediately_before_recorded_scroll_dispatch")?;
-        recording
-            .execute(action, &mut emit_state)
-            .map_err(|error| action_error_to_mcp(&error))?;
+        new_events.extend(
+            recording
+                .execute_capturing(action, &mut emit_state)
+                .map_err(|error| action_error_to_mcp(&error))?,
+        );
         if params.smooth && index < last_index {
             tokio::time::sleep(Duration::from_millis(u64::from(SMOOTH_SCROLL_INTERVAL_MS))).await;
         }
     }
-    let after_events = recording.events();
-    let new_events = &after_events[before_event_count..];
-    log_recording_readback(before_event_count, &after_events, new_events, params);
+    log_recording_readback(recording.event_count(), &new_events, params);
     Ok(())
 }
 
 fn execute_recording_noop(recording: &RecordingBackend, params: &ActScrollParams) {
-    let before_events = recording.events();
-    let before_event_count = before_events.len();
-    let after_events = recording.events();
-    let new_events = &after_events[before_event_count..];
-    log_recording_readback(before_event_count, &after_events, new_events, params);
+    log_recording_readback(recording.event_count(), &[], params);
 }
 
 fn log_recording_readback(
-    before_event_count: usize,
-    after_events: &[RecordedInput],
+    recorded_event_total: usize,
     new_events: &[RecordedInput],
     params: &ActScrollParams,
 ) {
@@ -785,8 +925,7 @@ fn log_recording_readback(
     tracing::info!(
         code = "M2_ACT_SCROLL_RECORDING_READBACK",
         kind = "act_scroll",
-        before_event_count,
-        after_event_count = after_events.len(),
+        recorded_event_total,
         new_event_count = new_events.len(),
         dy = params.dy,
         dx = params.dx,
@@ -797,9 +936,9 @@ fn log_recording_readback(
         } else {
             0
         },
-        scheduled_smooth_total_ms = scheduled_smooth_total_ms(params.smooth, smooth_step_count),
+        scheduled_smooth_total_ms =
+            ScrollPacing::new(params.smooth, true, params.dy, params.dx).scheduled_total_ms(),
         event_sequence,
-        ?new_events,
         "readback=recording_backend tool=act_scroll after_events_readback"
     );
 }
@@ -813,7 +952,7 @@ fn event_label(event: &RecordedInput) -> String {
         RecordedInput::MouseScroll { dy, dx, at } => {
             format!("mouse_scroll:dy={dy}:dx={dx}:at={}", at_label(*at))
         }
-        other => format!("{other:?}"),
+        other => other.log_label(),
     }
 }
 
@@ -839,20 +978,43 @@ struct HwndMessageScrollReadback {
 #[derive(Clone, Debug)]
 struct WindowCandidate {
     hwnd: HWND,
-    rect: RECT,
     class_name: String,
 }
 
+/// Top-level window under a screen point, for claim scoping of a coordinate
+/// scroll (the wheel message is delivered to whatever window is there).
 #[cfg(windows)]
-struct ChildEnumContext {
-    point: Point,
-    candidates: Vec<WindowCandidate>,
+pub(crate) fn root_hwnd_at_point(point: Point) -> Option<i64> {
+    // SAFETY: WindowFromPoint takes a POINT by value and returns a window handle or null; the
+    // handle is never dereferenced and null is handled below.
+    let seed = unsafe {
+        WindowFromPoint(WinPoint {
+            x: point.x,
+            y: point.y,
+        })
+    };
+    if seed.0.is_null() {
+        return None;
+    }
+    // SAFETY: `seed` is a non-null handle just returned by WindowFromPoint; GetAncestor takes it
+    // by value and returns null on failure, which falls back to `seed`.
+    let root = unsafe { GetAncestor(seed, GA_ROOT) };
+    let root = if root.0.is_null() { seed } else { root };
+    Some(hwnd_to_i64(root))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn root_hwnd_at_point(_point: Point) -> Option<i64> {
+    None
 }
 
 #[cfg(windows)]
 fn windows_hwnd_message_scroll_readback(
     point: Point,
+    checked_window_hwnd: i64,
 ) -> Result<HwndMessageScrollReadback, ActionError> {
+    // SAFETY: WindowFromPoint takes a POINT by value and returns a window handle or null; the
+    // handle is never dereferenced and null is handled below.
     let seed = unsafe {
         WindowFromPoint(WinPoint {
             x: point.x,
@@ -864,16 +1026,18 @@ fn windows_hwnd_message_scroll_readback(
             detail: format!("act_scroll at point {point:?} is not over a live window"),
         });
     }
-    let root = unsafe { GetAncestor(seed, GA_ROOT) };
-    let root = if root.0.is_null() { seed } else { root };
-    if !unsafe { IsWindow(Some(root)) }.as_bool() {
+    let root_hwnd = synapse_action::delivery_target::live_root_hwnd(
+        hwnd_to_i64(seed),
+        &format!("act_scroll window under point {point:?}"),
+    )?;
+    if root_hwnd != checked_window_hwnd {
         return Err(ActionError::TargetInvalid {
             detail: format!(
-                "act_scroll root hwnd 0x{:x} for point {point:?} is not a live window",
-                hwnd_to_i64(root)
+                "coordinate scroll point is over hwnd 0x{root_hwnd:x}, not checked window 0x{checked_window_hwnd:x}; no wheel input sent"
             ),
         });
     }
+    let root = hwnd_from_i64(root_hwnd)?;
 
     let target = hit_test_hwnd_for_screen_point(seed, root, point)?;
     let _ = screen_lparam(point)?;
@@ -900,6 +1064,8 @@ fn hit_test_hwnd_for_screen_point(
         });
     }
 
+    // SAFETY: HWND is a plain handle value that is never dereferenced; IsWindowVisible only
+    // reads it and returns FALSE for a stale or invalid handle.
     if let Ok(seed_rect) = window_rect(seed)
         && unsafe { IsWindowVisible(seed) }.as_bool()
         && rect_contains_point(&seed_rect, point)
@@ -907,59 +1073,16 @@ fn hit_test_hwnd_for_screen_point(
     {
         return Ok(WindowCandidate {
             hwnd: seed,
-            rect: seed_rect,
             class_name: window_class_name(seed),
         });
     }
 
-    best_child_hwnd_for_screen_point(root, root_rect, point)
-}
-
-#[cfg(windows)]
-fn best_child_hwnd_for_screen_point(
-    root: HWND,
-    root_rect: RECT,
-    point: Point,
-) -> Result<WindowCandidate, ActionError> {
-    let mut context = ChildEnumContext {
-        point,
-        candidates: Vec::new(),
-    };
-    let context_ptr = (&raw mut context).cast::<c_void>();
-    let _ = unsafe {
-        EnumChildWindows(
-            Some(root),
-            Some(enum_child_containing_point),
-            LPARAM(context_ptr as isize),
-        )
-    };
-
-    Ok(context
-        .candidates
-        .into_iter()
-        .min_by_key(|candidate| rect_area(&candidate.rect))
-        .unwrap_or_else(|| WindowCandidate {
-            hwnd: root,
-            rect: root_rect,
-            class_name: window_class_name(root),
-        }))
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn enum_child_containing_point(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let context = unsafe { &mut *(lparam.0 as *mut ChildEnumContext) };
-    if unsafe { IsWindowVisible(hwnd) }.as_bool()
-        && let Ok(rect) = window_rect(hwnd)
-        && rect_contains_point(&rect, context.point)
-        && rect_area(&rect) > 0
-    {
-        context.candidates.push(WindowCandidate {
-            hwnd,
-            rect,
-            class_name: window_class_name(hwnd),
-        });
-    }
-    BOOL(1)
+    // #197: z-order aware descent (topmost hittable sibling at each level), not smallest-area.
+    let hwnd = crate::m2::click::hit_test::deepest_hit_hwnd(root, point);
+    Ok(WindowCandidate {
+        hwnd,
+        class_name: window_class_name(hwnd),
+    })
 }
 
 #[cfg(windows)]
@@ -968,10 +1091,23 @@ fn post_wheel_message(
     message: u32,
     delta: i16,
     screen_point: Point,
+    checked_window_hwnd: i64,
 ) -> Result<(), ActionError> {
+    let root =
+        synapse_action::delivery_target::live_root_hwnd(hwnd, "act_scroll delivery target check")?;
+    if root != checked_window_hwnd {
+        return Err(ActionError::TargetInvalid {
+            detail: format!(
+                "act_scroll delivery target no longer belongs to checked window 0x{checked_window_hwnd:x}; no wheel message posted"
+            ),
+        });
+    }
     let hwnd = hwnd_from_i64(hwnd)?;
     let wparam = wheel_wparam(delta)?;
     let lparam = screen_lparam(screen_point)?;
+    // SAFETY: wparam/lparam are plain integers (wheel delta and packed screen coordinates),
+    // never pointers, so nothing can dangle in the target's queue; a stale HWND makes
+    // PostMessageW return an error, which is mapped below.
     unsafe { PostMessageW(Some(hwnd), message, wparam, lparam) }.map_err(|error| {
         ActionError::BackendUnavailable {
             detail: format!(
@@ -982,35 +1118,130 @@ fn post_wheel_message(
     })
 }
 
+/// #2351: the window messages one posted scroll of `notches` sends. One notch
+/// is one message of `WHEEL_DELTA` (120) with the notch's sign, like a real
+/// wheel: apps such as Firefox scroll far less for one oversized message.
+/// More notches than `MAX_TARGETED_WHEEL_MESSAGES` are refused before
+/// anything is posted. Pure value object; the posting stays in
+/// `dispatch_targeted_scroll_actions`.
 #[cfg(windows)]
-fn wheel_delta_chunks(ticks: i32) -> Result<Vec<i16>, ActionError> {
-    if ticks == 0 {
-        return Ok(Vec::new());
-    }
-    let max_ticks_per_message = i32::from(i16::MAX) / WHEEL_DELTA;
-    let mut remaining = ticks;
-    let mut chunks = Vec::new();
-    while remaining != 0 {
-        if chunks.len() >= MAX_TARGETED_WHEEL_MESSAGES {
+struct WheelPlan {
+    messages: Vec<i16>,
+}
+
+#[cfg(windows)]
+impl WheelPlan {
+    /// The plan for `notches` (positive = up / right, negative = down /
+    /// left); refused when it needs more than `MAX_TARGETED_WHEEL_MESSAGES`
+    /// messages.
+    fn for_notches(notches: i32) -> Result<Self, ActionError> {
+        let count = usize::try_from(notches.unsigned_abs()).unwrap_or(usize::MAX);
+        if count > MAX_TARGETED_WHEEL_MESSAGES {
             return Err(ActionError::TargetInvalid {
                 detail: format!(
-                    "act_scroll targeted wheel message count exceeds {MAX_TARGETED_WHEEL_MESSAGES} for ticks={ticks}"
+                    "act_scroll targeted wheel message count exceeds {MAX_TARGETED_WHEEL_MESSAGES} for ticks={notches}"
                 ),
             });
         }
-        let step_ticks = remaining.clamp(-max_ticks_per_message, max_ticks_per_message);
-        let delta = step_ticks.saturating_mul(WHEEL_DELTA);
-        chunks.push(
-            i16::try_from(delta).map_err(|error| ActionError::TargetInvalid {
-                detail: format!(
-                    "act_scroll wheel delta {delta} cannot fit WM_MOUSE*WHEEL i16: {error}"
-                ),
-            })?,
-        );
-        remaining = remaining.saturating_sub(step_ticks);
+        let delta = WHEEL_DELTA.saturating_mul(notches.signum());
+        let delta = i16::try_from(delta).map_err(|error| ActionError::TargetInvalid {
+            detail: format!(
+                "act_scroll wheel delta {delta} cannot fit WM_MOUSE*WHEEL i16: {error}"
+            ),
+        })?;
+        Ok(Self {
+            messages: vec![delta; count],
+        })
     }
-    Ok(chunks)
+
+    /// The wheel deltas to post, in order: one per message.
+    const fn messages(&self) -> &[i16] {
+        self.messages.as_slice()
+    }
+
+    /// #2401: the vertical and the horizontal plan of one scroll step, made
+    /// together: refused when the two need more than
+    /// `MAX_TARGETED_WHEEL_MESSAGES` messages TOGETHER, so nothing is posted.
+    /// The posting loop plans only through this.
+    fn for_scroll(dy: i32, dx: i32) -> Result<(Self, Self), ActionError> {
+        let total = usize::try_from(dy.unsigned_abs())
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::try_from(dx.unsigned_abs()).unwrap_or(usize::MAX));
+        if total > MAX_TARGETED_WHEEL_MESSAGES {
+            return Err(ActionError::TargetInvalid {
+                detail: format!(
+                    "act_scroll targeted wheel message count {total} exceeds {MAX_TARGETED_WHEEL_MESSAGES} for dy={dy} dx={dx}"
+                ),
+            });
+        }
+        Ok((Self::for_notches(dy)?, Self::for_notches(dx)?))
+    }
 }
+
+#[cfg(all(test, windows))]
+#[path = "wheel_plan_table_2351.rs"]
+mod wheel_plan_table_2351;
+
+/// #2401 (#2395): how one scroll was paced, taken from what really runs: smooth
+/// steps with `SMOOTH_SCROLL_INTERVAL_MS` between two of them, or one step
+/// that carries every message back to back. The reply's `smooth`,
+/// `smooth_interval_ms` and `scheduled_smooth_total_ms` come only from here,
+/// never from the request. Pure value object.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ScrollPacing {
+    smooth: bool,
+    steps: u32,
+}
+
+impl ScrollPacing {
+    /// `smooth_asked` is the request's `smooth`; `route_pauses` says whether
+    /// the route that runs the scroll waits between steps (the foreground
+    /// window-message route, CDP, the recording backend, the non-Windows
+    /// backend); the posted route at a point and the UIA pattern never do.
+    /// A smooth scroll runs one step per notch of the longer axis; any other
+    /// scroll runs one step.
+    fn new(smooth_asked: bool, route_pauses: bool, dy: i32, dx: i32) -> Self {
+        let smooth = smooth_asked && route_pauses;
+        Self {
+            smooth,
+            steps: if smooth { smooth_step_count(dy, dx) } else { 1 },
+        }
+    }
+
+    /// How many steps run (0 when a smooth scroll has nothing to scroll).
+    const fn steps(&self) -> u32 {
+        self.steps
+    }
+
+    /// Whether smooth steps ran: asked, on a route that pauses, at least one step.
+    const fn smooth(&self) -> bool {
+        self.smooth && self.steps > 0
+    }
+
+    /// The pause between two smooth steps; 0 when the scroll was not smooth.
+    const fn interval_ms(&self) -> u32 {
+        if self.smooth() {
+            SMOOTH_SCROLL_INTERVAL_MS
+        } else {
+            0
+        }
+    }
+
+    /// The pauses the smooth steps took together: one fewer than the steps.
+    const fn scheduled_total_ms(&self) -> u32 {
+        if self.smooth() {
+            self.steps
+                .saturating_sub(1)
+                .saturating_mul(SMOOTH_SCROLL_INTERVAL_MS)
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+#[path = "wheel_plan_table_2401.rs"]
+mod wheel_plan_table_2401;
 
 #[cfg(windows)]
 fn wheel_wparam(delta: i16) -> Result<WPARAM, ActionError> {
@@ -1044,6 +1275,8 @@ fn screen_lparam(point: Point) -> Result<LPARAM, ActionError> {
 #[cfg(windows)]
 fn window_rect(hwnd: HWND) -> Result<RECT, ActionError> {
     let mut rect = RECT::default();
+    // SAFETY: the out-pointer refers to the live local `rect`; a stale HWND makes the call
+    // return an error, which is mapped below.
     unsafe { GetWindowRect(hwnd, &raw mut rect) }.map_err(|error| {
         ActionError::ElementNotResolved {
             detail: format!(
@@ -1075,23 +1308,31 @@ fn rect_tuple(rect: &RECT) -> (i32, i32, i32, i32) {
 #[cfg(windows)]
 fn window_class_name(hwnd: HWND) -> String {
     let mut buffer = vec![0_u16; 256];
+    // SAFETY: `buffer` is a live, writable UTF-16 slice and GetClassNameW writes at most its
+    // length; a stale HWND returns 0, which yields an empty class name.
     let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
     String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
 }
 
 #[cfg(windows)]
 fn hwnd_from_i64(hwnd: i64) -> Result<HWND, ActionError> {
-    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
-        ActionError::TargetInvalid {
-            detail: format!(
-                "act_scroll target hwnd {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
-            ),
-        }
-    })?;
-    Ok(HWND(native as *mut c_void))
+    if hwnd == 0 {
+        return Err(ActionError::TargetInvalid {
+            detail: "act_scroll target hwnd is null".to_owned(),
+        });
+    }
+    Ok(HWND(hwnd as isize as *mut c_void))
 }
 
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: HWND) -> i64 {
-    synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
+    hwnd.0 as isize as i64
 }
+
+#[cfg(all(test, windows))]
+#[path = "tests/scroll_direction_192.rs"]
+mod scroll_direction_192;
+
+#[cfg(all(test, windows))]
+#[path = "tests/wheel_reparent_62.rs"]
+mod wheel_reparent_62;

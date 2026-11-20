@@ -17,7 +17,6 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 use synapse_storage::{Db, cf};
 
@@ -30,9 +29,48 @@ use super::{
 
 const SCHEMA_VERSION: u32 = 1;
 const MESSAGE_PREFIX: &str = "agent-mailbox/v1/recipient_hex/";
+
+#[path = "agent_mailbox_expiry.rs"]
+mod expiry;
 /// CF_KV key prefix for sender-visible receipt rows (#908). Distinct from the
 /// recipient message prefix so receipts never appear in an agent's own inbox.
 const RECEIPT_PREFIX: &str = "agent-mailbox/v1/receipt";
+/// Process-wide lock serializing every mailbox read-modify-write: inbox and
+/// receipt drains (scan -> delete) and capped inserts (depth check -> put).
+static MAILBOX_DRAINS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_mailbox() -> Result<std::sync::MutexGuard<'static, ()>, ErrorData> {
+    #[cfg(test)]
+    note_mailbox_lock_contention();
+    MAILBOX_DRAINS.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "mailbox drain lock poisoned; restart the daemon before retrying",
+        )
+    })
+}
+
+/// Test seam (#31): number of `lock_mailbox` calls that found
+/// `MAILBOX_DRAINS` already held and are about to block on it. Process-wide,
+/// so tests compare against a value read before the contended operation.
+#[cfg(test)]
+static MAILBOX_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn note_mailbox_lock_contention() {
+    if matches!(
+        MAILBOX_DRAINS.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ) {
+        MAILBOX_LOCK_CONTENDED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Test seam (#31): see [`MAILBOX_LOCK_CONTENDED`].
+#[cfg(test)]
+pub(crate) fn mailbox_lock_contention_count() -> u64 {
+    MAILBOX_LOCK_CONTENDED.load(Ordering::SeqCst)
+}
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MESSAGE_TTL_MS: u64 = 5 * 60 * 1000;
 const MAX_MESSAGE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -323,6 +361,7 @@ pub struct AgentWaitResponse {
 struct InboxScan {
     scanned_rows: usize,
     expired_keys: Vec<Vec<u8>>,
+    expired_index_keys: Vec<Vec<u8>>,
     messages: Vec<DecodedMailboxRow>,
 }
 
@@ -497,7 +536,7 @@ impl SynapseService {
         };
         let now_unix_ms = unix_time_ms_now();
         let live = self.live_spawned_agent_session_reads(now_unix_ms)?;
-        let response = self.agent_send_broadcast_impl_at_with_live(
+        let response = self.agent_send_broadcast_impl_with_live_clock(
             AgentSendBroadcastParams {
                 to: target,
                 kind,
@@ -507,7 +546,7 @@ impl SynapseService {
                 request_receipt,
             },
             "dashboard-fleet",
-            now_unix_ms,
+            unix_time_ms_now,
             live,
         )?;
         self.mailbox_notify_handle().notify_waiters();
@@ -535,19 +574,32 @@ impl SynapseService {
         params: AgentSendParams,
         from_session: &str,
     ) -> Result<AgentSendResponse, ErrorData> {
-        self.agent_send_impl_at(params, from_session, unix_time_ms_now())
+        self.agent_send_impl_with_clock(params, from_session, unix_time_ms_now)
     }
 
+    #[cfg(test)]
     fn agent_send_impl_at(
         &self,
         params: AgentSendParams,
         from_session: &str,
         now_unix_ms: u64,
     ) -> Result<AgentSendResponse, ErrorData> {
+        self.agent_send_impl_with_clock(params, from_session, || now_unix_ms)
+    }
+
+    fn agent_send_impl_with_clock(
+        &self,
+        params: AgentSendParams,
+        from_session: &str,
+        clock: impl Fn() -> u64,
+    ) -> Result<AgentSendResponse, ErrorData> {
         validate_session_id(from_session)?;
         validate_send_params(&params)?;
         let db = self.mailbox_db()?;
-        let expired_rows_deleted_before = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
+        let sweep_before = throttled_cleanup_expired_mailbox_rows_with_clock(&db, &clock);
+        let expired_rows_deleted_before = sweep_before.deleted;
+        let mailbox_guard = lock_mailbox()?;
+        let now_unix_ms = clock();
         let resolution = self.recipient_live_read(from_session, &params.to_session, now_unix_ms)?;
         let to_session = resolution.resolved_to_session.clone();
         let depth_before = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
@@ -570,6 +622,7 @@ impl SynapseService {
             "replaced_recipient": &resolution.replaced_recipient,
             "queue_depth_before": depth_before,
             "expired_rows_deleted_before": expired_rows_deleted_before,
+            "corrupt_rows_skipped": sweep_before.corrupt_skipped,
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "agent_send",
@@ -601,15 +654,30 @@ impl SynapseService {
             request_receipt: params.request_receipt,
         };
         let encoded = encode_mailbox_message(&message)?;
-        db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
+        {
+            // The cap check must be atomic with the insert (#31): re-check
+            // under the mailbox lock so concurrent sends cannot overshoot.
+            let depth_locked = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
+            if depth_locked >= MAX_INBOX_ROWS_PER_RECIPIENT {
+                return Err(mailbox_full_error(from_session, &to_session, depth_locked));
+            }
+            db.put_batch_pressure_bypass(
+                cf::CF_KV,
+                [
+                    (row_key.as_bytes().to_vec(), encoded),
+                    expiry::expiry_row(&message)?,
+                ],
+            )
             .map_err(|error| {
                 mcp_error(
                     error.code(),
                     format!("write agent mailbox row {row_key}: {error}"),
                 )
             })?;
+        }
         let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
         let queue_depth_after = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
+        drop(mailbox_guard);
 
         // Journal the delivery fact (#897). The mailbox row is already
         // committed, so a journal failure is surfaced with that context.
@@ -712,28 +780,46 @@ impl SynapseService {
         params: AgentInboxParams,
         session_id: &str,
     ) -> Result<AgentInboxResponse, ErrorData> {
-        self.agent_inbox_impl_at(params, session_id, unix_time_ms_now())
+        self.agent_inbox_impl_with_clock(params, session_id, unix_time_ms_now)
     }
 
+    #[cfg(test)]
     fn agent_inbox_impl_at(
         &self,
         params: AgentInboxParams,
         session_id: &str,
         now_unix_ms: u64,
     ) -> Result<AgentInboxResponse, ErrorData> {
+        self.agent_inbox_impl_with_clock(params, session_id, || now_unix_ms)
+    }
+
+    fn agent_inbox_impl_with_clock(
+        &self,
+        params: AgentInboxParams,
+        session_id: &str,
+        clock: impl Fn() -> u64,
+    ) -> Result<AgentInboxResponse, ErrorData> {
         validate_inbox_params(params.max_messages)?;
         validate_kind_filter(&params.kinds)?;
         validate_session_id(session_id)?;
+        let _drain_guard = lock_mailbox()?;
+        let now_unix_ms = clock();
         let db = self.mailbox_db()?;
         let mut scan = scan_inbox(&db, session_id, now_unix_ms)?;
         if !scan.expired_keys.is_empty() {
-            db.delete_batch(cf::CF_KV, scan.expired_keys.clone())
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("delete expired mailbox rows for {session_id}: {error}"),
-                    )
-                })?;
+            db.delete_batch(
+                cf::CF_KV,
+                scan.expired_keys
+                    .iter()
+                    .chain(&scan.expired_index_keys)
+                    .cloned(),
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("delete expired mailbox rows for {session_id}: {error}"),
+                )
+            })?;
         }
 
         // Server-side kind filter (#908): keep only matching kinds, so a drain
@@ -753,7 +839,7 @@ impl SynapseService {
                 cf_name: cf::CF_KV.to_owned(),
                 row_key: row.message.row_key.clone(),
                 value_len_bytes: row.encoded.len() as u64,
-                value_sha256: hash_bytes(&row.encoded),
+                value_sha256: keyed_hash_bytes(&row.encoded),
             })
             .collect::<Vec<_>>();
         let delete_keys = if params.drain {
@@ -798,16 +884,23 @@ impl SynapseService {
         // message queued and the drain is retry-safe. A message is acked exactly
         // once: the row is deleted in the same drain that writes its receipt.
         if params.drain {
-            write_read_receipts(&db, session_id, &scan.messages, now_unix_ms)?;
+            write_read_receipts(&db, session_id, &scan.messages, clock())?;
         }
         if !delete_keys.is_empty() {
-            db.delete_batch(cf::CF_KV, delete_keys.clone())
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("delete drained mailbox rows for {session_id}: {error}"),
-                    )
-                })?;
+            db.delete_batch(
+                cf::CF_KV,
+                delete_keys.iter().cloned().chain(
+                    scan.messages
+                        .iter()
+                        .map(|row| expiry::expiry_key(&row.message)),
+                ),
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("delete drained mailbox rows for {session_id}: {error}"),
+                )
+            })?;
         }
         let queue_depth_after = queue_depth_for_recipient(&db, session_id, now_unix_ms)?;
         let messages = scan
@@ -1002,14 +1095,25 @@ impl SynapseService {
     ) -> Result<AgentSendBroadcastResponse, ErrorData> {
         let now_unix_ms = unix_time_ms_now();
         let live = self.live_session_reads(from_session, now_unix_ms)?;
-        self.agent_send_broadcast_impl_at_with_live(params, from_session, now_unix_ms, live)
+        self.agent_send_broadcast_impl_with_live_clock(params, from_session, unix_time_ms_now, live)
     }
 
+    #[cfg(test)]
     fn agent_send_broadcast_impl_at_with_live(
         &self,
         params: AgentSendBroadcastParams,
         from_session: &str,
         now_unix_ms: u64,
+        live: Vec<(String, String)>,
+    ) -> Result<AgentSendBroadcastResponse, ErrorData> {
+        self.agent_send_broadcast_impl_with_live_clock(params, from_session, || now_unix_ms, live)
+    }
+
+    fn agent_send_broadcast_impl_with_live_clock(
+        &self,
+        params: AgentSendBroadcastParams,
+        from_session: &str,
+        clock: impl Fn() -> u64,
         live: Vec<(String, String)>,
     ) -> Result<AgentSendBroadcastResponse, ErrorData> {
         validate_session_id(from_session)?;
@@ -1078,9 +1182,12 @@ impl SynapseService {
         }
 
         let resolved_recipients = recipients.len();
-        let expires_at_unix_ms = now_unix_ms.saturating_add(params.ttl_ms);
         let db = self.mailbox_db()?;
-        let expired_rows_deleted_before = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
+        let sweep_before = throttled_cleanup_expired_mailbox_rows_with_clock(&db, &clock);
+        let expired_rows_deleted_before = sweep_before.deleted;
+        let mailbox_guard = lock_mailbox()?;
+        let now_unix_ms = clock();
+        let expires_at_unix_ms = now_unix_ms.saturating_add(params.ttl_ms);
 
         let target_selector = if params.to.all {
             json!({ "all": true })
@@ -1102,6 +1209,7 @@ impl SynapseService {
             "resolved_recipients": resolved_recipients,
             "expires_at_unix_ms": expires_at_unix_ms,
             "expired_rows_deleted_before": expired_rows_deleted_before,
+            "corrupt_rows_skipped": sweep_before.corrupt_skipped,
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "agent_send_broadcast",
@@ -1117,6 +1225,7 @@ impl SynapseService {
         outcomes.reserve(recipients.len());
         let mut delivered_count = 0_usize;
         for to_session in recipients {
+            // Depth check and insert stay atomic per recipient (#31).
             let depth = match queue_depth_for_recipient(&db, &to_session, now_unix_ms) {
                 Ok(depth) => depth,
                 Err(error) => {
@@ -1201,9 +1310,13 @@ impl SynapseService {
                     return Err(error);
                 }
             };
-            if let Err(error) =
-                db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
-            {
+            if let Err(error) = db.put_batch_pressure_bypass(
+                cf::CF_KV,
+                [
+                    (row_key.as_bytes().to_vec(), encoded),
+                    expiry::expiry_row(&message)?,
+                ],
+            ) {
                 let error = mcp_error(
                     error.code(),
                     format!("write broadcast row {row_key}: {error}"),
@@ -1268,6 +1381,7 @@ impl SynapseService {
             });
         }
 
+        drop(mailbox_guard);
         tracing::info!(
             code = "AGENT_MAILBOX_BROADCAST_COMMITTED",
             from_session,
@@ -1358,14 +1472,24 @@ impl SynapseService {
         params: AgentReceiptsParams,
         session_id: &str,
     ) -> Result<AgentReceiptsResponse, ErrorData> {
-        self.agent_receipts_impl_at(params, session_id, unix_time_ms_now())
+        self.agent_receipts_impl_with_clock(params, session_id, unix_time_ms_now)
     }
 
+    #[cfg(test)]
     fn agent_receipts_impl_at(
         &self,
         params: AgentReceiptsParams,
         session_id: &str,
         now_unix_ms: u64,
+    ) -> Result<AgentReceiptsResponse, ErrorData> {
+        self.agent_receipts_impl_with_clock(params, session_id, || now_unix_ms)
+    }
+
+    fn agent_receipts_impl_with_clock(
+        &self,
+        params: AgentReceiptsParams,
+        session_id: &str,
+        clock: impl Fn() -> u64,
     ) -> Result<AgentReceiptsResponse, ErrorData> {
         if params.max_receipts == 0 || params.max_receipts > MAX_MESSAGES_PER_READ {
             return Err(params_error(format!(
@@ -1373,6 +1497,8 @@ impl SynapseService {
             )));
         }
         validate_session_id(session_id)?;
+        let _drain_guard = lock_mailbox()?;
+        let now_unix_ms = clock();
         let db = self.mailbox_db()?;
         let (mut receipts, expired_keys, scanned_rows) =
             scan_receipts(&db, session_id, now_unix_ms)?;
@@ -1449,29 +1575,22 @@ fn scan_inbox(db: &Db, session_id: &str, now_unix_ms: u64) -> Result<InboxScan, 
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let scanned_rows = rows.len();
     let mut expired_keys = Vec::new();
+    let mut expired_index_keys = Vec::new();
     let mut messages = Vec::new();
     for (key, encoded) in rows {
-        let message: AgentMailboxMessage =
-            synapse_storage::decode_json(&encoded).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "decode agent mailbox row {}: {error}",
-                        String::from_utf8_lossy(&key)
-                    ),
-                )
-            })?;
+        let message: AgentMailboxMessage = match synapse_storage::decode_json(&encoded) {
+            Ok(message) => message,
+            Err(error) => {
+                note_corrupt_mailbox_row(&key, &format!("decode failed: {error}"));
+                continue;
+            }
+        };
         if message.schema_version != SCHEMA_VERSION {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "agent mailbox row {} has schema_version {}, expected {SCHEMA_VERSION}",
-                    String::from_utf8_lossy(&key),
-                    message.schema_version
-                ),
-            ));
+            note_corrupt_mailbox_row(&key, "unsupported mailbox schema_version");
+            continue;
         }
         if message.expires_at_unix_ms <= now_unix_ms {
+            expired_index_keys.push(expiry::expiry_key(&message));
             expired_keys.push(key);
         } else {
             messages.push(DecodedMailboxRow {
@@ -1484,52 +1603,177 @@ fn scan_inbox(db: &Db, session_id: &str, now_unix_ms: u64) -> Result<InboxScan, 
     Ok(InboxScan {
         scanned_rows,
         expired_keys,
+        expired_index_keys,
         messages,
     })
 }
 
-fn cleanup_expired_mailbox_rows(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, MESSAGE_PREFIX.as_bytes())
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let mut expired_keys = Vec::new();
-    for (key, encoded) in rows {
-        let message: AgentMailboxMessage =
-            synapse_storage::decode_json(&encoded).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "decode agent mailbox row {} during cleanup: {error}",
-                        String::from_utf8_lossy(&key)
-                    ),
-                )
-            })?;
-        if message.schema_version != SCHEMA_VERSION {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "agent mailbox row {} has schema_version {}, expected {SCHEMA_VERSION}",
-                    String::from_utf8_lossy(&key),
-                    message.schema_version
-                ),
-            ));
-        }
-        if message.expires_at_unix_ms <= now_unix_ms {
-            expired_keys.push(key);
-        }
-    }
-    if expired_keys.is_empty() {
-        return Ok(0);
-    }
-    let count = expired_keys.len();
-    db.delete_batch(cf::CF_KV, expired_keys).map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!("delete expired agent mailbox rows: {error}"),
-        )
-    })?;
-    Ok(count)
+/// Default minimum gap between full mailbox expiry sweeps (#57); override with
+/// `SYNAPSE_MAILBOX_SWEEP_INTERVAL_MS` (`0` sweeps on every send).
+const DEFAULT_MAILBOX_SWEEP_INTERVAL_MS: u64 = 30_000;
+const MAILBOX_SWEEP_INTERVAL_ENV: &str = "SYNAPSE_MAILBOX_SWEEP_INTERVAL_MS";
+
+/// Last full sweep per `Db`, keyed by the `Arc` address: `(db, sweep time,
+/// corrupt rows skipped by that sweep)`. The `Weak` keeps the allocation (and
+/// so the address) from being reused while the entry exists; entries whose
+/// `Db` is gone are pruned on insert.
+type SweepTime = (std::sync::Weak<Db>, u64, usize, Arc<()>);
+type SweepTimes = std::collections::HashMap<usize, SweepTime>;
+static LAST_MAILBOX_SWEEP: std::sync::Mutex<Option<SweepTimes>> = std::sync::Mutex::new(None);
+
+/// Corrupt mailbox row keys already logged, so a permanently corrupt row is
+/// reported once instead of on every sweep (#57). Bounded; the count of
+/// skipped rows stays exposed through [`MailboxSweep::corrupt_skipped`].
+type LoggedKeys = std::collections::HashSet<Vec<u8>>;
+static LOGGED_CORRUPT_MAILBOX_KEYS: std::sync::Mutex<Option<LoggedKeys>> =
+    std::sync::Mutex::new(None);
+const MAX_LOGGED_CORRUPT_MAILBOX_KEYS: usize = 256;
+
+/// Result of the best-effort global expiry sweep.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MailboxSweep {
+    /// Expired rows deleted by this call.
+    deleted: usize,
+    /// Undecodable or wrong-schema rows skipped (not deleted) by the latest sweep.
+    corrupt_skipped: usize,
 }
+
+fn mailbox_sweep_interval_ms() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var(MAILBOX_SWEEP_INTERVAL_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAILBOX_SWEEP_INTERVAL_MS)
+    })
+}
+
+/// Runs bounded indexed expiry housekeeping at most once per interval. Every send used
+/// to decode every mailbox row in the fleet; reads never return expired rows
+/// regardless (inbox scans filter and delete their own), so deferring the
+/// global sweep only delays reclaiming other recipients' expired rows.
+///
+/// The sweep is housekeeping and never fails a send (#57): a storage failure
+/// is logged and the attempt is still recorded so sends do not retry the full
+/// scan every time.
+#[cfg(test)]
+fn throttled_cleanup_expired_mailbox_rows(db: &Arc<Db>, now_unix_ms: u64) -> MailboxSweep {
+    throttled_cleanup_expired_mailbox_rows_with_clock(db, &|| now_unix_ms)
+}
+
+fn throttled_cleanup_expired_mailbox_rows_with_clock(
+    db: &Arc<Db>,
+    clock: &impl Fn() -> u64,
+) -> MailboxSweep {
+    let now_unix_ms = clock();
+    let interval = mailbox_sweep_interval_ms();
+    let key = Arc::as_ptr(db) as usize;
+    let reservation = Arc::new(());
+    let previous = {
+        let mut guard = LAST_MAILBOX_SWEEP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_weak, last, corrupt, _)) = guard.as_ref().and_then(|map| map.get(&key))
+            && interval > 0
+            && now_unix_ms.saturating_sub(*last) < interval
+        {
+            return MailboxSweep {
+                deleted: 0,
+                corrupt_skipped: *corrupt,
+            };
+        }
+        // Reserve this attempt before work so concurrent sends cannot sweep
+        // the same DB twice inside one throttle interval.
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        map.retain(|_, (weak, _, _, _)| weak.strong_count() > 0);
+        let corrupt = map.get(&key).map_or(0, |(_, _, corrupt, _)| *corrupt);
+        let attempt = (
+            Arc::downgrade(db),
+            now_unix_ms,
+            corrupt,
+            Arc::clone(&reservation),
+        );
+        map.insert(key, attempt)
+    };
+    let sweep = expiry::cleanup(db, clock).unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error.message,
+            "agent mailbox expiry sweep failed; sends continue"
+        );
+        Some(MailboxSweep::default())
+    });
+    finish_mailbox_sweep(db, now_unix_ms, reservation, previous, sweep)
+}
+
+fn finish_mailbox_sweep(
+    db: &Arc<Db>,
+    now_unix_ms: u64,
+    reservation: Arc<()>,
+    previous: Option<SweepTime>,
+    sweep: Option<MailboxSweep>,
+) -> MailboxSweep {
+    let key = Arc::as_ptr(db) as usize;
+    let mut guard = LAST_MAILBOX_SWEEP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.retain(|_, (weak, _, _, _)| weak.strong_count() > 0);
+    let owns_slot = map
+        .get(&key)
+        .is_some_and(|(_, _, _, token)| Arc::ptr_eq(token, &reservation));
+    if let Some(sweep) = sweep {
+        if owns_slot {
+            let completed = (
+                Arc::downgrade(db),
+                now_unix_ms,
+                sweep.corrupt_skipped,
+                reservation,
+            );
+            map.insert(key, completed);
+        }
+        return sweep;
+    }
+    let corrupt_skipped = previous.as_ref().map_or(0, |(_, _, corrupt, _)| *corrupt);
+    if owns_slot {
+        if let Some(previous) = previous {
+            map.insert(key, previous);
+        } else {
+            map.remove(&key);
+        }
+    }
+    tracing::debug!(
+        deleted = 0,
+        corrupt_skipped,
+        skipped_busy = true,
+        "agent mailbox expiry sweep skipped; corrupt count cached; next call retries"
+    );
+    MailboxSweep {
+        deleted: 0,
+        corrupt_skipped,
+    }
+}
+
+/// Records a corrupt mailbox row; returns `true` the first time this key is
+/// seen (and so was logged).
+fn note_corrupt_mailbox_row(key: &[u8], detail: &str) -> bool {
+    let mut guard = LOGGED_CORRUPT_MAILBOX_KEYS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let logged = guard.get_or_insert_with(LoggedKeys::new);
+    if logged.len() >= MAX_LOGGED_CORRUPT_MAILBOX_KEYS || !logged.insert(key.to_vec()) {
+        return false;
+    }
+    tracing::error!(
+        code = error_codes::STORAGE_CORRUPTED,
+        row_key = %String::from_utf8_lossy(key),
+        detail,
+        "corrupt agent mailbox row skipped during expiry sweep"
+    );
+    true
+}
+
+#[cfg(test)]
+use expiry::test_cleanup_57::cleanup_expired_mailbox_rows;
 
 fn queue_depth_for_recipient(
     db: &Db,
@@ -1541,10 +1785,8 @@ fn queue_depth_for_recipient(
 
 fn readback_exact_mailbox_row(db: &Db, row_key: &str) -> Result<MailboxRowReadback, ErrorData> {
     let stored = db
-        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+        .get_cf_exact(cf::CF_KV, row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
-        .into_iter()
-        .find_map(|(key, value)| (key == row_key.as_bytes()).then_some(value))
         .ok_or_else(|| {
             mcp_error(
                 error_codes::STORAGE_READ_FAILED,
@@ -1555,7 +1797,7 @@ fn readback_exact_mailbox_row(db: &Db, row_key: &str) -> Result<MailboxRowReadba
         cf_name: cf::CF_KV.to_owned(),
         row_key: row_key.to_owned(),
         value_len_bytes: stored.len() as u64,
-        value_sha256: hash_bytes(&stored),
+        value_sha256: keyed_hash_bytes(&stored),
     })
 }
 
@@ -1796,24 +2038,16 @@ fn scan_receipts(
     let mut receipts = Vec::new();
     let mut expired_keys = Vec::new();
     for (key, encoded) in rows {
-        let receipt: MailboxReceipt = synapse_storage::decode_json(&encoded).map_err(|error| {
-            mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "decode receipt row {}: {error}",
-                    String::from_utf8_lossy(&key)
-                ),
-            )
-        })?;
+        let receipt: MailboxReceipt = match synapse_storage::decode_json(&encoded) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                note_corrupt_mailbox_row(&key, &format!("decode receipt failed: {error}"));
+                continue;
+            }
+        };
         if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
-            return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!(
-                    "receipt row {} has schema_version {}, expected {RECEIPT_SCHEMA_VERSION}",
-                    String::from_utf8_lossy(&key),
-                    receipt.schema_version
-                ),
-            ));
+            note_corrupt_mailbox_row(&key, "unsupported receipt schema_version");
+            continue;
         }
         if receipt.expires_at_unix_ms <= now_unix_ms {
             expired_keys.push(key);
@@ -1979,9 +2213,18 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("sha256:{}", hex_bytes(digest.as_ref()))
+/// Keyed digest marker (#166): `hmac-sha256:<hex>`, HMAC-SHA256 under the
+/// per-install key (see `crate::content_digest`). Mailbox rows and event
+/// content carry agent/user payloads, so a plain SHA-256 would let low-entropy
+/// content be brute-forced offline from the journal. Equal bytes still give
+/// equal digests within one install. Rows written before #166 carry the older
+/// unkeyed `sha256:<hex>` form; digests are write-only readbacks that nothing
+/// parses back, so old rows are simply displayed as stored.
+pub(crate) fn keyed_hash_bytes(bytes: &[u8]) -> String {
+    format!(
+        "hmac-sha256:{}",
+        crate::content_digest::keyed_digest_hex(bytes)
+    )
 }
 
 const fn default_message_ttl_ms() -> u64 {
@@ -1999,3 +2242,27 @@ const fn default_max_messages() -> usize {
 const fn default_true() -> bool {
     true
 }
+
+#[cfg(test)]
+#[path = "tests/mailbox_sweep_throttle.rs"]
+mod mailbox_sweep_throttle_tests;
+
+#[cfg(test)]
+#[path = "tests/mailbox_expiry_followup_57.rs"]
+mod mailbox_expiry_followup_57;
+
+#[cfg(test)]
+#[path = "tests/mailbox_corrupt_row_57.rs"]
+mod mailbox_corrupt_row_tests;
+
+#[cfg(test)]
+#[path = "tests/mailbox_keyed_digest_166.rs"]
+mod mailbox_keyed_digest_tests;
+
+#[cfg(test)]
+#[path = "tests/mailbox_receipts_send_lock_31.rs"]
+mod mailbox_receipts_send_lock_tests;
+
+#[cfg(test)]
+#[path = "tests/mailbox_recipient_corrupt_row_57.rs"]
+mod mailbox_recipient_corrupt_row_57_tests;

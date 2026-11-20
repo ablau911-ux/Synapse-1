@@ -4,33 +4,54 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam::channel::{self, Receiver, Sender, TrySendError};
 
 use crate::{
     CAPTURE_CHANNEL_CAPACITY, CaptureBackend, CaptureBackendPreference, CaptureConfig,
-    CaptureError, CaptureStats, CaptureTarget, CapturedFrame, FRAMES_DROPPED_METRIC,
-    ResolvedCaptureTarget,
+    CaptureError, CaptureStats, CaptureTarget, CapturedBgraBitmap, CapturedFrame,
+    FRAMES_DROPPED_METRIC, FrameFeed, ResolvedCaptureTarget,
     backend::{backend_after_fallback, should_fallback_to_dxgi},
     dpi::current_thread_priority,
     platform,
 };
 
+/// Last successfully copied CPU frame, retained for an idempotent start readback.
+/// Its original sequence and timestamp must not be presented as a new frame.
+#[derive(Clone, Debug)]
+pub struct CachedCaptureFrame {
+    pub bitmap: CapturedBgraBitmap,
+    pub frame_seq: u64,
+    pub dirty_region: Option<synapse_core::Rect>,
+    pub captured_at: Instant,
+}
+
 #[derive(Debug)]
 pub struct CaptureHandle {
     pub(crate) rx: Receiver<CapturedFrame>,
+    feed: Arc<FrameFeed>,
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) stats: Arc<CaptureStats>,
     join: Option<JoinHandle<Result<(), CaptureError>>>,
     target: ResolvedCaptureTarget,
     config: CaptureConfig,
+    capture_id: String,
+    cached_frame: Option<CachedCaptureFrame>,
 }
 
 impl CaptureHandle {
     #[must_use]
     pub fn receiver(&self) -> Receiver<CapturedFrame> {
         self.rx.clone()
+    }
+
+    /// Shared frame feed: every reader of this capture goes through it so
+    /// concurrent readers never take frames from each other (#111).
+    #[must_use]
+    pub fn feed(&self) -> Arc<FrameFeed> {
+        self.feed.clone()
     }
 
     #[must_use]
@@ -59,8 +80,25 @@ impl CaptureHandle {
     }
 
     #[must_use]
+    pub fn capture_id(&self) -> &str {
+        &self.capture_id
+    }
+
+    #[must_use]
     pub fn is_stop_requested(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Whether the capture worker is still running and has not been stopped.
+    /// A retained handle alone does not imply that the backend is healthy.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.is_stop_requested() && self.join.as_ref().is_some_and(|join| !join.is_finished())
+    }
+
+    #[must_use]
+    pub const fn cached_frame(&self) -> Option<&CachedCaptureFrame> {
+        self.cached_frame.as_ref()
     }
 
     /// Requests shutdown and joins the capture thread.
@@ -121,6 +159,23 @@ impl CaptureController {
         Ok(self.generation)
     }
 
+    /// Stops the active capture target, if any, and advances the generation so
+    /// old frame cursors no longer identify the current stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError`] if the active capture thread reports a terminal
+    /// error during shutdown.
+    pub fn stop(&mut self) -> Result<bool, CaptureError> {
+        let Some(previous) = self.active.take() else {
+            return Ok(false);
+        };
+        let stopped = previous.stop();
+        self.generation = self.generation.saturating_add(1);
+        stopped?;
+        Ok(true)
+    }
+
     #[must_use]
     pub const fn active(&self) -> Option<&CaptureHandle> {
         self.active.as_ref()
@@ -129,6 +184,26 @@ impl CaptureController {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Retains the newest copied frame only while its capture is still active.
+    /// Returns false when capture changed during the caller's frame readback.
+    pub fn remember_frame(&mut self, capture_id: &str, frame: CachedCaptureFrame) -> bool {
+        let Some(handle) = self
+            .active
+            .as_mut()
+            .filter(|handle| handle.capture_id == capture_id)
+        else {
+            return false;
+        };
+        if handle
+            .cached_frame
+            .as_ref()
+            .is_none_or(|cached| frame.frame_seq > cached.frame_seq)
+        {
+            handle.cached_frame = Some(frame);
+        }
+        true
     }
 }
 
@@ -189,13 +264,23 @@ pub fn spawn_capture_loop(config: CaptureConfig) -> Result<CaptureHandle, Captur
         })?;
 
     Ok(CaptureHandle {
+        feed: Arc::new(FrameFeed::new(rx.clone())),
         rx,
         stop,
         stats,
         join: Some(join),
         target,
         config,
+        capture_id: new_capture_id(),
+        cached_frame: None,
     })
+}
+
+fn new_capture_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{}-{nanos}", std::process::id())
 }
 #[derive(Clone)]
 // `tx`/`rx`/`stop` are consumed by the real Windows capture loop; off Windows the

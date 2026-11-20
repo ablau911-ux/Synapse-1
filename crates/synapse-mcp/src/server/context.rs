@@ -7,9 +7,9 @@ use super::{
     activate_profile, apply_profile_runtime_config_in_state, authorization_error, error_codes,
     mcp_error,
 };
+use crate::m3::episodes::hex_encode;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
@@ -22,7 +22,8 @@ use synapse_core::{
 use synapse_profiles::ForegroundProfileTransition;
 use synapse_reflex::{
     AimTrackTargetSnapshot, AimTrackTargetSource, EventBus, ReflexActionGate,
-    ReflexActionGateHandle, ReflexActionPermissionDenied, ResolvedElementBox,
+    ReflexActionGateHandle, ReflexActionPermissionDenied, ReflexForegroundTypeGuardHandle,
+    ResolvedElementBox,
 };
 
 type M2ActionContext = (
@@ -38,7 +39,6 @@ type M2ReleaseAllContext = (
 
 const PROFILE_CHANGED_KIND: &str = "profile-changed";
 const SCOPE_TRANSITIONED_KIND: &str = "scope-transitioned";
-const SCOPE_TRANSITION_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPROVAL_REQUEST_EVENT_KIND: &str = "approval_request";
 pub(crate) const APPROVAL_DECISION_EVENT_KIND: &str = "approval_decision";
 pub(crate) const APPROVAL_TIMEOUT_EVENT_KIND: &str = "approval_timeout";
@@ -67,6 +67,12 @@ impl SynapseService {
         })
     }
 
+    pub(crate) fn dashboard_capture_runtime_readback(
+        &self,
+    ) -> Result<synapse_core::CaptureRuntimeReadback, ErrorData> {
+        Ok(self.m1_state()?.capture_runtime_readback())
+    }
+
     pub(super) fn instructions(&self) -> &'static str {
         let recording_enabled = self
             .m2_state
@@ -93,15 +99,15 @@ impl SynapseService {
         });
         match (recording_enabled, m3_scaffold_ready) {
             (true, true) => {
-                "Synapse MCP server with M1 perception, M2 action, M3 autonomy, and 40-tool facade surface (recording enabled)"
+                "Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold (recording enabled)"
             }
             (false, true) => {
-                "Synapse MCP server with M1 perception, M2 action, M3 autonomy, and 40-tool facade surface"
+                "Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold"
             }
             (true, false) => {
-                "Synapse MCP server with M1 perception and M2 action (recording enabled)"
+                "Synapse M1 perception MCP server with M2 action scaffold (recording enabled)"
             }
-            (false, false) => "Synapse MCP server with M1 perception and M2 action",
+            (false, false) => "Synapse M1 perception MCP server with M2 action scaffold",
         }
     }
 
@@ -181,20 +187,25 @@ impl SynapseService {
             })
     }
 
-    /// OS-input safety: the intended delivery window implied by the session's
-    /// bound target (`target set` / CDP binding). A dead target window yields
-    /// `None`, so keyboard input then fails closed with
-    /// `ACTION_INPUT_TARGET_REQUIRED` instead of typing into the foreground.
+    /// The window HWND of the session's bound target (`target set` / CDP binding).
+    fn session_target_hwnd(&self, session_id: Option<&str>) -> Result<Option<i64>, ErrorData> {
+        Ok(self.session_target(session_id)?.map(|target| match target {
+            crate::server::SessionTarget::Window { hwnd } => hwnd,
+            crate::server::SessionTarget::Cdp { window_hwnd, .. } => window_hwnd,
+        }))
+    }
+
+    /// OS-input safety: the delivery window implied by the session's bound
+    /// target, attached to every action handle of the session. A dead target
+    /// window yields `None` here so background routes still run; OS-input
+    /// routes refuse it through [`Self::resolve_input_delivery_target`]
+    /// (`TARGET_WINDOW_NOT_FOUND`), and the backend guard fails closed.
     fn session_target_input_delivery_target(
         &self,
         session_id: Option<&str>,
     ) -> Result<Option<synapse_action::InputDeliveryTarget>, ErrorData> {
-        let Some(target) = self.session_target(session_id)? else {
+        let Some(hwnd) = self.session_target_hwnd(session_id)? else {
             return Ok(None);
-        };
-        let hwnd = match target {
-            crate::server::SessionTarget::Window { hwnd } => hwnd,
-            crate::server::SessionTarget::Cdp { window_hwnd, .. } => window_hwnd,
         };
         match synapse_action::InputDeliveryTarget::resolve_window(hwnd, "session_target") {
             Ok(target) => Ok(Some(target)),
@@ -210,29 +221,53 @@ impl SynapseService {
         }
     }
 
+    /// The implicit delivery window of `handle`'s session: the bound session
+    /// target (even when its window is dead, so it is refused rather than
+    /// replaced), else the window this session last focused explicitly.
+    pub(crate) fn implicit_input_delivery_hwnd(
+        &self,
+        handle: &synapse_action::ActionHandle,
+    ) -> Result<Option<(i64, &'static str)>, ErrorData> {
+        if let Some(hwnd) = self.session_target_hwnd(handle.session_id())? {
+            return Ok(Some((hwnd, "session_target")));
+        }
+        Ok(handle
+            .delivery_target()
+            .map_err(|error| crate::m2::action_error_to_mcp(&error))?
+            .map(|target| (target.root_hwnd, target.source)))
+    }
+
     /// OS-input safety: resolves the intended delivery window for one action
     /// call — an explicit per-call HWND wins, then the session target, then
-    /// the window this session last focused explicitly.
+    /// the window this session last focused explicitly. The human foreground
+    /// is never a target.
     ///
     /// # Errors
     ///
-    /// Returns `ACTION_TARGET_INVALID` when an explicit HWND is not a live
-    /// window.
+    /// Returns `TARGET_WINDOW_NOT_FOUND` for a closed target window,
+    /// `ACTION_TARGET_INVALID` for a reused or otherwise unusable HWND, and
+    /// `ACTION_INPUT_TARGET_REQUIRED` when no delivery target is known.
     pub(crate) fn resolve_input_delivery_target(
         &self,
         explicit_hwnd: Option<i64>,
         handle: &synapse_action::ActionHandle,
-    ) -> Result<Option<synapse_action::InputDeliveryTarget>, ErrorData> {
-        if let Some(hwnd) = explicit_hwnd {
-            return synapse_action::InputDeliveryTarget::resolve_window(
-                hwnd,
-                "explicit_window_hwnd",
-            )
-            .map(Some)
-            .map_err(|error| crate::m2::action_error_to_mcp(&error));
-        }
+    ) -> Result<synapse_action::InputDeliveryTarget, ErrorData> {
+        let chosen = match explicit_hwnd {
+            Some(hwnd) => Some((hwnd, "explicit_window_hwnd")),
+            None => self.implicit_input_delivery_hwnd(handle)?,
+        };
+        let Some((hwnd, source)) = chosen else {
+            return Err(crate::m2::action_error_to_mcp(
+                &synapse_action::ActionError::InputTargetRequired {
+                    detail: format!(
+                        "OS input refused before delivery: no explicit window, session target, or explicitly focused window is known for this call. {}",
+                        synapse_action::delivery_target::INPUT_TARGET_REMEDIATION
+                    ),
+                },
+            ));
+        };
         handle
-            .delivery_target()
+            .delivery_target_for_window(hwnd, source)
             .map_err(|error| crate::m2::action_error_to_mcp(&error))
     }
 
@@ -266,28 +301,31 @@ impl SynapseService {
         &self,
         tool: &'static str,
     ) -> Result<ActionPreflightReadback, ErrorData> {
-        self.ensure_supported_use_allows_action_mode(tool, true)
+        self.ensure_supported_use_allows_action_for(tool, None)
     }
 
-    /// Profile/target policy preflight for the two panic-safe shell controls:
-    /// status is a read and cancel only reduces owned process authority. They
-    /// must remain callable while operator-panic K1/K2 is pending.
-    pub(super) fn ensure_supported_use_allows_shell_observe_or_cancel(
-        &self,
-    ) -> Result<ActionPreflightReadback, ErrorData> {
-        self.ensure_supported_use_allows_action_mode("act_run_shell", false)
-    }
-
-    fn ensure_supported_use_allows_action_mode(
+    /// Like [`Self::ensure_supported_use_allows_action`] but aware of the
+    /// element the action targets: a CDP web-node click/type is delivered over
+    /// CDP and survives a missing OS foreground (#153).
+    pub(super) fn ensure_supported_use_allows_action_for(
         &self,
         tool: &'static str,
-        enforce_operator_panic_admission: bool,
+        element_id: Option<&synapse_core::ElementId>,
     ) -> Result<ActionPreflightReadback, ErrorData> {
-        let operator_panic_epoch = if enforce_operator_panic_admission {
-            crate::m2::arm_operator_panic_action_admission(tool, "action_preflight_entry")?
-        } else {
-            synapse_action::operator_panic_epoch()
-        };
+        self.ensure_supported_use_allows_action_scoped(tool, element_id, false)
+    }
+
+    /// Like [`Self::ensure_supported_use_allows_action_for`] with an explicit
+    /// caller proof that this request never needs an OS foreground window
+    /// (`background_proven`): a session-claimed background point click (#7) or
+    /// an exactly claimed focus-recovery target (#6). Without that proof the
+    /// fail-closed default of `action_requires_live_foreground` applies.
+    pub(super) fn ensure_supported_use_allows_action_scoped(
+        &self,
+        tool: &'static str,
+        element_id: Option<&synapse_core::ElementId>,
+        background_proven: bool,
+    ) -> Result<ActionPreflightReadback, ErrorData> {
         let runtime = self.profile_runtime()?;
         let active_profile_id_before = runtime
             .active_profile_id()
@@ -302,7 +340,10 @@ impl SynapseService {
                 // tools and every other error kind (forced no-perception, forced
                 // internal, any non-A11Y_NO_FOREGROUND failure) stay fail-closed.
                 if error_data_code(&error) == Some(synapse_core::error_codes::A11Y_NO_FOREGROUND)
-                    && !super::action_preflight::tool_requires_live_foreground(tool)
+                    && (background_proven
+                        || !super::action_preflight::action_requires_live_foreground(
+                            tool, element_id,
+                        ))
                 {
                     tracing::info!(
                         code = synapse_core::error_codes::A11Y_NO_FOREGROUND,
@@ -311,7 +352,6 @@ impl SynapseService {
                     );
                     let preflight = super::action_preflight::no_foreground_preflight(
                         tool,
-                        operator_panic_epoch,
                         active_profile_id_before,
                     );
                     ensure_profile_scope_allows_action(
@@ -320,13 +360,12 @@ impl SynapseService {
                         self.allow_unknown_profile()?,
                     )
                     .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
-                    if enforce_operator_panic_admission {
-                        crate::m2::ensure_operator_panic_action_admission(
-                            tool,
-                            "action_preflight_no_foreground_exit",
-                            operator_panic_epoch,
-                        )?;
-                    }
+                    // #203: the live-server tool deny-list must hold exactly when
+                    // the operator is away (no foreground window).
+                    super::target_policy::ensure_supported_use_allows_without_foreground(
+                        &runtime, tool,
+                    )
+                    .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
                     return Ok(preflight);
                 }
                 return Err(error);
@@ -334,7 +373,6 @@ impl SynapseService {
         };
         let (foreground, preflight) = self.preflight_action_foreground(
             tool,
-            operator_panic_epoch,
             &runtime,
             active_profile_id_before,
             initial_foreground,
@@ -350,13 +388,7 @@ impl SynapseService {
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         super::target_policy::ensure_supported_use_allows(&runtime, &foreground, tool)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
-        if enforce_operator_panic_admission {
-            crate::m2::ensure_operator_panic_action_admission(
-                tool,
-                "action_preflight_exit",
-                operator_panic_epoch,
-            )?;
-        }
+        let preflight = self.ensure_everquest_live_ui_context_for_action(tool, preflight)?;
         Ok(preflight)
     }
 
@@ -631,7 +663,14 @@ impl SynapseService {
         by_session: &str,
     ) -> Result<crate::m3::approvals::ApprovalActivationDecisionResponse, ErrorData> {
         let db = self.m3_storage()?;
-        let command_payload = approval_activation_command_payload(params);
+        let command_payload = json!({
+            "bind": &params.bind,
+            "approval_id": &params.approval_id,
+            "activation_id": &params.activation_id,
+            "token": &params.token,
+            "decision": &params.decision,
+            "snooze_ms": params.snooze_ms,
+        });
         let command_before = json!({
             "source_of_truth": "CF_KV approval queue rows plus approval activation/audit rows",
             "approval_id": &params.approval_id,
@@ -909,12 +948,27 @@ impl SynapseService {
         Ok(())
     }
 
-    pub(super) fn reflex_action_gate(&self) -> Result<ReflexActionGateHandle, ErrorData> {
+    pub(crate) fn reflex_action_gate(&self) -> Result<ReflexActionGateHandle, ErrorData> {
+        self.reflex_action_gate_with_enforced(super::target_policy::supported_use_enforced())
+    }
+
+    /// Test seam for [`Self::reflex_action_gate`]: `enforced` replaces the
+    /// process-global `SYNAPSE_ENFORCE_SUPPORTED_USE` read, so a test can
+    /// prove reflex dispatch is refused for live-server profiles.
+    pub(crate) fn reflex_action_gate_with_enforced(
+        &self,
+        enforced: bool,
+    ) -> Result<ReflexActionGateHandle, ErrorData> {
         Ok(Arc::new(ReflexScopeActionGate {
+            supported_use_enforced: enforced,
             profile_runtime: self.profile_runtime()?,
+            target_claims: Arc::clone(&self.target_claims),
             m1_state: Arc::clone(&self.m1_state),
             allow_unknown_profile: self.allow_unknown_profile()?,
             event_bus: self.sse_state()?.event_bus(),
+            foreground_type_guard:
+                crate::m2::foreground_type_monitor::RoutineForegroundTypeGuard::for_current_runtime(
+                ),
         }))
     }
 
@@ -1033,14 +1087,12 @@ impl SynapseService {
         &self,
         foreground: &ForegroundContext,
     ) -> Result<ForegroundProfileTransition, ErrorData> {
-        let started = Instant::now();
         let runtime = self.profile_runtime()?;
         let transition = runtime
             .reevaluate_foreground(&foreground_window(foreground))
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let event_bus = self.sse_state()?.event_bus();
         publish_profile_transition_events(&event_bus, &transition, foreground);
-        record_scope_transition_budget(started.elapsed(), &transition);
         Ok(transition)
     }
 
@@ -1050,8 +1102,9 @@ impl SynapseService {
         recording: Option<&Arc<RecordingBackend>>,
     ) -> Result<(), ErrorData> {
         let expected = preflight.after.as_ref().unwrap_or(&preflight.before);
+        let events_before = recording_event_count(recording);
         let actual = self.current_audit_foreground().map_err(|error| {
-            act_type_foreground_lost_error(expected, None, Some(&error), recording)
+            act_type_foreground_lost_error(expected, None, Some(&error), recording, events_before)
         })?;
         if actual.hwnd == expected.hwnd {
             return Ok(());
@@ -1062,18 +1115,9 @@ impl SynapseService {
             Some(&actual),
             None,
             recording,
+            events_before,
         ))
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 /// Extract the structured `code` string an `mcp_error` carries in its data
@@ -1087,14 +1131,24 @@ fn error_data_code(error: &ErrorData) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// Events the recording backend has seen in total (O(1); keeps counting past
+/// the retained-window cap, unlike the length of the retained window) (#196).
+fn recording_event_count(recording: Option<&Arc<RecordingBackend>>) -> usize {
+    recording.map_or(0, |recording| recording.event_count())
+}
+
+#[cfg(test)]
+#[path = "tests/recording_event_count_196.rs"]
+mod recording_event_count_196_tests;
+
 fn act_type_foreground_lost_error(
     expected: &ForegroundProof,
     actual: Option<&ForegroundContext>,
     read_error: Option<&ErrorData>,
     recording: Option<&Arc<RecordingBackend>>,
+    recording_event_count_before: usize,
 ) -> ErrorData {
-    let recording_event_count_before = recording.map_or(0, |recording| recording.events().len());
-    let recording_event_count_after = recording.map_or(0, |recording| recording.events().len());
+    let recording_event_count_after = recording_event_count(recording);
     match actual {
         Some(actual) => {
             tracing::warn!(
@@ -1272,12 +1326,37 @@ fn ensure_profile_scope_allows_action(
 
 struct ReflexScopeActionGate {
     profile_runtime: Arc<synapse_profiles::ProfileRuntime>,
+    target_claims: super::target_claims::SharedTargetClaims,
     m1_state: super::SharedM1State,
     allow_unknown_profile: bool,
     event_bus: EventBus,
+    /// #188: every reflex/routine `TypeText` goes through this guard; `None`
+    /// (no tokio runtime at construction) keeps routine typing refused.
+    foreground_type_guard: Option<ReflexForegroundTypeGuardHandle>,
+    /// `SYNAPSE_ENFORCE_SUPPORTED_USE`, read once at construction (the
+    /// process env cannot change afterwards under `unsafe_code = "forbid"`).
+    supported_use_enforced: bool,
 }
 
 impl ReflexActionGate for ReflexScopeActionGate {
+    fn resolve_input_target(
+        &self,
+        reflex_id: &ReflexId,
+        target: Option<synapse_core::types::StoredInputTarget>,
+        owner: Option<&str>,
+    ) -> Result<synapse_action::InputDeliveryTarget, synapse_action::ActionError> {
+        super::target_claims::resolve_stored_input_target(
+            &self.target_claims,
+            reflex_id,
+            target,
+            owner,
+        )
+    }
+
+    fn foreground_type_guard(&self) -> Option<ReflexForegroundTypeGuardHandle> {
+        self.foreground_type_guard.clone()
+    }
+
     fn ensure_action_allowed(
         &self,
         _reflex_id: &ReflexId,
@@ -1286,23 +1365,22 @@ impl ReflexActionGate for ReflexScopeActionGate {
         const TOOL: &str = "reflex_dispatch";
         (|| {
             let foreground = current_reflex_action_foreground(&self.m1_state)?;
-            let started = Instant::now();
             let transition = self
                 .profile_runtime
                 .reevaluate_foreground(&foreground_window(&foreground))
                 .map_err(|error| mcp_error(error.code(), error.to_string()))?;
             publish_profile_transition_events(&self.event_bus, &transition, &foreground);
-            record_scope_transition_budget(started.elapsed(), &transition);
             ensure_profile_scope_allows_action(
                 &self.profile_runtime,
                 TOOL,
                 self.allow_unknown_profile,
             )
             .and_then(|()| {
-                super::target_policy::ensure_supported_use_allows(
+                super::target_policy::ensure_supported_use_allows_with(
                     &self.profile_runtime,
                     &foreground,
                     TOOL,
+                    self.supported_use_enforced,
                 )
             })
         })()
@@ -1461,37 +1539,6 @@ fn publish_profile_transition_events(
             old_scope = profile_use_scope_label(transition.effective_previous_scope),
             new_scope = profile_use_scope_label(transition.effective_active_scope),
             "scope-transitioned event published"
-        );
-    }
-}
-
-fn scope_transition_within_budget(elapsed: Duration) -> bool {
-    elapsed <= SCOPE_TRANSITION_BUDGET
-}
-
-fn record_scope_transition_budget(elapsed: Duration, transition: &ForegroundProfileTransition) {
-    let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-    let budget_ms = u64::try_from(SCOPE_TRANSITION_BUDGET.as_millis()).unwrap_or(u64::MAX);
-    let within_budget = scope_transition_within_budget(elapsed);
-    if within_budget {
-        tracing::debug!(
-            code = "SCOPE_TRANSITION_BUDGET_OBSERVED",
-            elapsed_us,
-            budget_ms,
-            within_budget,
-            changed = transition.changed,
-            scope_changed = transition.scope_changed,
-            "profile scope transition completed within its observable policy budget"
-        );
-    } else {
-        tracing::warn!(
-            code = "SCOPE_TRANSITION_BUDGET_EXCEEDED",
-            elapsed_us,
-            budget_ms,
-            within_budget,
-            changed = transition.changed,
-            scope_changed = transition.scope_changed,
-            "profile scope transition exceeded its policy budget; state and event publication still completed before return"
         );
     }
 }
@@ -1655,19 +1702,6 @@ fn m3_state_error(error: &anyhow::Error) -> ErrorData {
         synapse_core::error_codes::TOOL_INTERNAL_ERROR,
         error.to_string(),
     )
-}
-
-fn approval_activation_command_payload(
-    params: &crate::m3::approvals::ApprovalActivationParams,
-) -> Value {
-    json!({
-        "bind": &params.bind,
-        "approval_id": &params.approval_id,
-        "activation_id": &params.activation_id,
-        "token_sha256": crate::m3::approvals::activation_token_sha256(&params.token),
-        "decision": &params.decision,
-        "snooze_ms": params.snooze_ms,
-    })
 }
 
 #[cfg(debug_assertions)]

@@ -3,7 +3,7 @@ name = "synapse-reflex"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -23,6 +23,27 @@ uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
+
+[[bench]]
+name = "reflex_tick_jitter_idle"
+harness = false
+
+[[bench]]
+name = "reflex_tick_jitter_under_load"
+harness = false
+
+[[bench]]
+name = "event_to_subscriber"
+harness = false
+
+[[bench]]
+name = "reflex_combo_step_interval"
+harness = false
 
 [lints.rust]
 unsafe_code = "allow"

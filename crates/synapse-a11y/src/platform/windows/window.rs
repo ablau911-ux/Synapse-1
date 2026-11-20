@@ -1,39 +1,42 @@
 use std::{ffi::c_void, mem, path::Path};
 
-use synapse_core::{
-    AccessibleSubtree, ForegroundContext, Point, Rect,
-    win32_hwnd::{hwnd_from_wire, hwnd_to_wire, native_hwnds_equal},
-};
+use synapse_core::{AccessibleSubtree, ForegroundContext, Point, Rect};
 use uiautomation::{
     UIElement,
     types::{ElementMode, TreeScope},
 };
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WPARAM},
+        Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM},
+        System::StationsAndDesktops::{
+            CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, OpenInputDesktop,
+        },
         System::SystemInformation::GetTickCount,
         System::Threading::{
             AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
             PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
+        UI::HiDpi::GetDpiForWindow,
         UI::Input::KeyboardAndMouse::{
             GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
             KEYEVENTF_KEYUP, LASTINPUTINFO, SendInput, VIRTUAL_KEY, VK_MENU,
         },
         UI::WindowsAndMessaging::{
-            BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow, GetPropW,
-            GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-            IsWindowVisible, PostMessageW, RemovePropW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos,
-            ShowWindow, SwitchToThisWindow, WM_CLOSE,
+            BringWindowToTop, EnumWindows, GA_ROOT, GW_OWNER, GetAncestor, GetForegroundWindow,
+            GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+            IsWindowVisible, PostMessageW, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
+            WM_CLOSE,
         },
     },
-    core::{BOOL, PWSTR, w},
+    core::{BOOL, PWSTR},
 };
 
-use crate::{A11yError, A11yResult, ForegroundActivationIntent};
+use crate::{A11yError, A11yResult, ActivationStep, ForegroundActivationIntent, activation_plan};
 
 use super::common::{TreeView, cached_hwnd, create_cache_request, map_uia_error, with_automation};
+use super::valid_hwnd;
+
 pub fn focused_window() -> A11yResult<UIElement> {
     Err(A11yError::internal(
         "direct UIElement foreground lookup is disabled; use snapshot_focused_window so UIA stays on the dedicated MTA worker",
@@ -47,7 +50,7 @@ pub fn snapshot_focused_window(depth: u32) -> A11yResult<AccessibleSubtree> {
             detail: "GetForegroundWindow returned null".to_owned(),
         });
     }
-    super::snapshot::snapshot_window_from_hwnd(hwnd_to_wire(hwnd.0 as isize), depth)
+    super::snapshot::snapshot_window_from_hwnd(hwnd.0 as isize as i64, depth)
 }
 
 pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
@@ -57,18 +60,28 @@ pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
             detail: "GetForegroundWindow returned null".to_owned(),
         });
     }
-    foreground_context(hwnd_to_wire(hwnd.0 as isize))
+    foreground_context(hwnd.0 as isize as i64).map_err(crate::as_foreground_error)
 }
 
 pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
-    let _hwnd = hwnd_from_wire_value(hwnd)?;
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.0.is_null() {
+        return Err(A11yError::NoForeground {
+            detail: "HWND was null".to_owned(),
+        });
+    }
     Err(A11yError::internal(
         "direct UIElement HWND lookup is disabled; use snapshot_window_from_hwnd so UIA stays on the dedicated MTA worker",
     ))
 }
 
 pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -> A11yResult<()> {
-    let hwnd = hwnd_from_wire_value(hwnd)?;
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.0.is_null() {
+        return Err(A11yError::NoForeground {
+            detail: "HWND was null".to_owned(),
+        });
+    }
     tracing::info!(
         code = "FOREGROUND_ACTIVATION_INTENT_ACCEPTED",
         caller = intent.caller(),
@@ -76,89 +89,103 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
         hwnd = hwnd.0 as isize,
         "foreground activation entered explicit-intent guard"
     );
-    // OS-input safety: never steal focus from a human in a protected
-    // fullscreen/busy/presentation app (e.g. a game) that is not the target.
-    let target_identity = super::human_guard::window_root_identity(hwnd_to_wire(hwnd.0 as isize))?;
-    super::human_guard::ensure_human_foreground_allows_focus_change(
-        target_identity,
-        intent.caller(),
-    )?;
+    // #9: while the workstation is locked (or a secure desktop owns input) no
+    // activation can succeed and an input nudge would land on the lock
+    // surface. The plan is empty: refuse up front and send no input.
+    // #2322: a lease context restore plan has no input nudge at all.
+    let plan = activation_plan(intent, workstation_locked());
+    if plan.is_empty() {
+        return Err(A11yError::foreground_activation_refused(format!(
+            "workstation is locked or a secure desktop owns input; foreground activation of hwnd 0x{:x} is deferred until the desktop is available",
+            hwnd.0 as isize
+        )));
+    }
     restore_window_for_focus(hwnd);
-    let _ = unsafe { SetForegroundWindow(hwnd) };
-    if native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize) {
-        Ok(())
-    } else {
-        let current_thread = unsafe { GetCurrentThreadId() };
-        let foreground = unsafe { GetForegroundWindow() };
-        let foreground_thread = if foreground.0.is_null() {
-            0
-        } else {
-            unsafe { GetWindowThreadProcessId(foreground, None) }
-        };
-        let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
-        // The Alt nudge is an OS input batch delivered to whatever is
-        // foreground. Send it only when that foreground root belongs to the
-        // target's own process (re-checked immediately before delivery), and
-        // re-run the fullscreen guard so a human who entered a game since the
-        // first check is never disturbed.
-        super::human_guard::ensure_human_foreground_allows_focus_change(
-            target_identity,
-            intent.caller(),
-        )?;
-        match super::human_guard::foreground_root_identity() {
-            Ok(foreground_identity) if foreground_identity.pid == target_identity.pid => {
+    for step in plan {
+        let took = match step {
+            ActivationStep::Plain => {
+                let _ = unsafe { SetForegroundWindow(hwnd) };
+                unsafe { GetForegroundWindow() }.0 == hwnd.0
+            }
+            ActivationStep::AttachAndRaise => attach_and_raise(hwnd),
+            ActivationStep::InputNudge => {
                 if let Err(error) = send_foreground_activation_nudge() {
                     tracing::debug!(
                         error = %error,
                         "foreground activation input nudge failed before SetForegroundWindow retry"
                     );
                 }
+                attach_and_raise(hwnd)
             }
-            Ok(foreground_identity) => tracing::info!(
-                code = "FOREGROUND_ACTIVATION_NUDGE_SKIPPED_OTHER_PROCESS",
-                caller = intent.caller(),
-                foreground_root_hwnd = foreground_identity.root_hwnd,
-                foreground_pid = foreground_identity.pid,
-                target_root_hwnd = target_identity.root_hwnd,
-                target_pid = target_identity.pid,
-                "Alt nudge not sent: the foreground belongs to another process"
-            ),
-            Err(error) => tracing::info!(
-                code = "FOREGROUND_ACTIVATION_NUDGE_SKIPPED_NO_FOREGROUND",
-                caller = intent.caller(),
-                error = %error,
-                "Alt nudge not sent: the foreground could not be read"
-            ),
-        }
-        let attached_foreground = foreground_thread != 0
-            && foreground_thread != current_thread
-            && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
-        let attached_target = target_thread != 0
-            && target_thread != current_thread
-            && unsafe { AttachThreadInput(current_thread, target_thread, true) }.as_bool();
-
-        restore_window_for_focus(hwnd);
-        let _ = unsafe { BringWindowToTop(hwnd) };
-        unsafe { SwitchToThisWindow(hwnd, true) };
-        let focused = unsafe { SetForegroundWindow(hwnd) }.as_bool()
-            || native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize);
-
-        if attached_target {
-            let _ = unsafe { AttachThreadInput(current_thread, target_thread, false) };
-        }
-        if attached_foreground {
-            let _ = unsafe { AttachThreadInput(current_thread, foreground_thread, false) };
-        }
-
-        if focused {
-            Ok(())
-        } else {
-            Err(A11yError::internal(format!(
-                "SetForegroundWindow returned false for hwnd 0x{:x}",
-                hwnd.0 as isize
-            )))
+        };
+        if took {
+            return Ok(());
         }
     }
+    let foreground = unsafe { GetForegroundWindow() };
+    Err(A11yError::foreground_activation_refused(format!(
+        "SetForegroundWindow did not take for hwnd 0x{:x} ({}; input injected: {}); the foreground is still hwnd 0x{:x}",
+        hwnd.0 as isize,
+        intent.reason(),
+        plan.iter().any(|step| step.injects_input()),
+        foreground.0 as isize
+    )))
+}
+
+/// Input-free activation retry: attach this thread's input state to the
+/// foreground and target threads, raise the target, then detach. True when
+/// `SetForegroundWindow` reports success or the foreground reads back as the
+/// target.
+fn attach_and_raise(hwnd: HWND) -> bool {
+    let current_thread = unsafe { GetCurrentThreadId() };
+    let foreground = unsafe { GetForegroundWindow() };
+    let foreground_thread = if foreground.0.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(foreground, None) }
+    };
+    let target_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    let attached_foreground = foreground_thread != 0
+        && foreground_thread != current_thread
+        && unsafe { AttachThreadInput(current_thread, foreground_thread, true) }.as_bool();
+    let attached_target = target_thread != 0
+        && target_thread != current_thread
+        && unsafe { AttachThreadInput(current_thread, target_thread, true) }.as_bool();
+
+    restore_window_for_focus(hwnd);
+    let _ = unsafe { BringWindowToTop(hwnd) };
+    unsafe { SwitchToThisWindow(hwnd, true) };
+    let focused = unsafe { SetForegroundWindow(hwnd) }.as_bool()
+        || unsafe { GetForegroundWindow() }.0 == hwnd.0;
+
+    if attached_target {
+        let _ = unsafe { AttachThreadInput(current_thread, target_thread, false) };
+    }
+    if attached_foreground {
+        let _ = unsafe { AttachThreadInput(current_thread, foreground_thread, false) };
+    }
+    focused
+}
+
+/// True when the input desktop cannot be opened by this process (workstation
+/// locked / secure desktop such as UAC) or the foreground window belongs to a
+/// lock-surface process (`LockApp.exe`, `LogonUI.exe`).
+pub fn workstation_locked() -> bool {
+    // SAFETY: OpenInputDesktop takes no pointers; a returned handle is closed below.
+    match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
+        Ok(desktop) => {
+            // SAFETY: `desktop` is the live handle returned above.
+            let _ = unsafe { CloseDesktop(desktop) };
+        }
+        Err(_) => return true,
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return false;
+    }
+    let mut pid = 0_u32;
+    unsafe { GetWindowThreadProcessId(foreground, Some(&raw mut pid)) };
+    pid != 0 && process_path(pid).is_ok_and(|path| crate::is_lock_surface_process(&path))
 }
 
 fn send_foreground_activation_nudge() -> A11yResult<()> {
@@ -199,14 +226,20 @@ const fn virtual_key_input(vkey: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT
 }
 
 fn restore_window_for_focus(hwnd: HWND) {
-    let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    // SW_RESTORE also unmaximizes an ordinary maximized window. Only minimized
+    // windows need restoration before SetForegroundWindow.
     if unsafe { IsIconic(hwnd) }.as_bool() {
-        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
     }
 }
 
 pub fn is_window_minimized(hwnd: i64) -> A11yResult<bool> {
-    let hwnd = valid_hwnd(hwnd)?;
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.0.is_null() {
+        return Err(A11yError::NoForeground {
+            detail: "HWND was null".to_owned(),
+        });
+    }
     Ok(unsafe { IsIconic(hwnd) }.as_bool())
 }
 
@@ -236,19 +269,24 @@ pub fn millis_since_last_input() -> A11yResult<u64> {
 pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
     let hwnd = valid_hwnd(hwnd)?;
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    Ok(native_hwnds_equal(root.0 as isize, hwnd.0 as isize))
+    Ok(root.0 == hwnd.0)
 }
 
 pub fn top_level_root_hwnd(hwnd: i64) -> A11yResult<i64> {
     let seed = valid_hwnd(hwnd)?;
     let root = unsafe { GetAncestor(seed, GA_ROOT) };
     let root = if root.0.is_null() { seed } else { root };
-    let root = valid_hwnd(hwnd_to_wire(root.0 as isize))?;
-    Ok(hwnd_to_wire(root.0 as isize))
+    let root = valid_hwnd(root.0 as isize as i64)?;
+    Ok(root.0 as isize as i64)
 }
 
 pub fn close_window(hwnd: i64) -> A11yResult<()> {
-    let hwnd = hwnd_from_wire_value(hwnd)?;
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.0.is_null() {
+        return Err(A11yError::NoForeground {
+            detail: "HWND was null".to_owned(),
+        });
+    }
     unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.map_err(|err| {
         A11yError::internal(format!(
             "PostMessageW(WM_CLOSE) failed for hwnd 0x{:x}: {err}",
@@ -268,7 +306,7 @@ pub fn snapshot_window_for_process(pid: u32, depth: u32) -> A11yResult<Accessibl
     let hwnd = find_window_for_pid(pid).ok_or_else(|| A11yError::NoForeground {
         detail: format!("no visible top-level window for pid {pid}"),
     })?;
-    super::snapshot::snapshot_window_from_hwnd(hwnd_to_wire(hwnd.0 as isize), depth)
+    super::snapshot::snapshot_window_from_hwnd(hwnd.0 as isize as i64, depth)
 }
 
 pub fn top_level_window_hwnd_by_name(name: String) -> A11yResult<Option<i64>> {
@@ -292,6 +330,16 @@ pub fn top_level_window_hwnd_by_name(name: String) -> A11yResult<Option<i64>> {
 }
 
 pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
+    foreground_context_with_dpi_reader(hwnd, |raw| {
+        // SAFETY: GetDpiForWindow reads a validated HWND and returns 0 if it becomes invalid.
+        unsafe { GetDpiForWindow(raw) }
+    })
+}
+
+pub(crate) fn foreground_context_with_dpi_reader(
+    hwnd: i64,
+    read_dpi: impl FnOnce(HWND) -> u32,
+) -> A11yResult<ForegroundContext> {
     let hwnd = valid_hwnd(hwnd)?;
     let mut pid = 0_u32;
     unsafe {
@@ -303,14 +351,14 @@ pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
         |name| name.to_string_lossy().into_owned(),
     );
     Ok(ForegroundContext {
-        hwnd: hwnd_to_wire(hwnd.0 as isize),
+        hwnd: hwnd.0 as isize as i64,
         pid,
         process_name,
         process_path,
         window_title: window_title(hwnd),
         window_bounds: window_rect(hwnd)?,
         monitor_index: 0,
-        dpi_scale: 1.0,
+        dpi_scale: dpi_scale_from_dpi(read_dpi(hwnd)),
         profile_id: None,
         steam_appid: None,
         is_fullscreen: false,
@@ -321,69 +369,9 @@ pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
 pub fn visible_top_level_window_contexts() -> A11yResult<Vec<ForegroundContext>> {
     Ok(visible_top_level_hwnds()?
         .into_iter()
-        .filter_map(|hwnd| foreground_context(hwnd_to_wire(hwnd.0 as isize)).ok())
+        .filter_map(|hwnd| foreground_context(hwnd.0 as isize as i64).ok())
         .filter(|context| !context.window_title.is_empty())
         .collect())
-}
-
-// #2270: a property belongs to the native window lifetime, not its recyclable
-// numeric HWND or an MCP session. It contains an integer identity, never a
-// pointer to allocated data. Reading it does not adopt or activate any tab.
-pub fn chrome_window_id(hwnd: i64) -> A11yResult<Option<i64>> {
-    let window = valid_hwnd(hwnd)?;
-    let value = unsafe { GetPropW(window, w!("Synapse.ChromeWindowId.v1")) };
-    let number = value.0.addr();
-    if number == 0 {
-        Ok(None)
-    } else {
-        i32::try_from(number)
-            .ok()
-            .filter(|id| *id > 0)
-            .map(|id| Some(i64::from(id)))
-            .ok_or_else(|| A11yError::internal("Invalid native Chrome window identity property"))
-    }
-}
-
-pub fn remember_chrome_window_id(hwnd: i64, id: i64) -> A11yResult<()> {
-    let number = i32::try_from(id)
-        .ok()
-        .filter(|id| *id > 0)
-        .ok_or_else(|| A11yError::internal("Chrome window identity must be a positive i32"))?;
-    let window = valid_hwnd(hwnd)?;
-    if let Some(previous) = chrome_window_id(hwnd)? {
-        if previous != id {
-            return Err(A11yError::internal(
-                "Native Chrome window identity conflict",
-            ));
-        }
-        return Ok(());
-    }
-    let number = usize::try_from(number)
-        .map_err(|_| A11yError::internal("Chrome window identity exceeds native property range"))?;
-    let value = HANDLE(std::ptr::without_provenance_mut(number));
-    unsafe { SetPropW(window, w!("Synapse.ChromeWindowId.v1"), Some(value)) }
-        .map_err(|error| A11yError::internal(format!("Retain Chrome window identity: {error}")))?;
-    if chrome_window_id(hwnd)? != Some(id) {
-        return Err(A11yError::internal(
-            "Native Chrome window identity readback mismatch",
-        ));
-    }
-    Ok(())
-}
-
-pub fn forget_chrome_window_id(hwnd: i64, expected: i64) -> A11yResult<()> {
-    let window = valid_hwnd(hwnd)?;
-    if chrome_window_id(hwnd)? == Some(expected) {
-        unsafe { RemovePropW(window, w!("Synapse.ChromeWindowId.v1")) }.map_err(|error| {
-            A11yError::internal(format!("Clear stale Chrome window identity: {error}"))
-        })?;
-    }
-    if chrome_window_id(hwnd)? == Some(expected) {
-        return Err(A11yError::internal(
-            "Stale native Chrome window identity survived removal",
-        ));
-    }
-    Ok(())
 }
 
 pub fn focused_element() -> A11yResult<UIElement> {
@@ -398,6 +386,69 @@ pub fn element_from_point(point: Point) -> A11yResult<UIElement> {
         "direct UIElement point lookup is disabled; use element_node_from_point so UIA stays on the dedicated MTA worker",
     ))
 }
+/// Per-window DPI scale for a raw HWND value (1.0 for an invalid window).
+#[must_use]
+pub fn window_dpi_scale_for_hwnd(hwnd: i64) -> f32 {
+    window_dpi_scale(HWND(hwnd as isize as *mut core::ffi::c_void))
+}
+
+/// Bound on the owner walk; also stops a cycle if ownership changes mid-walk.
+const OWNER_CHAIN_MAX_DEPTH: usize = 64;
+
+/// `GW_OWNER` chain of a raw HWND as `(owner hwnd, owner pid)`, nearest owner
+/// first, excluding the window itself. Empty for a null, invalid or unowned
+/// window. Bounded and cycle-safe.
+#[must_use]
+pub fn window_owner_chain(hwnd: i64) -> Vec<(i64, u32)> {
+    let mut owners: Vec<(i64, u32)> = Vec::new();
+    if hwnd == 0 {
+        return owners;
+    }
+    let mut current = HWND(hwnd as isize as *mut c_void);
+    for _ in 0..OWNER_CHAIN_MAX_DEPTH {
+        // SAFETY: GetWindow only reads window-manager state for the handle and
+        // returns an error (never UB) for an invalid or destroyed HWND.
+        let Ok(owner) = (unsafe { GetWindow(current, GW_OWNER) }) else {
+            break;
+        };
+        let value = owner.0 as isize as i64;
+        if value == 0 || value == hwnd || owners.iter().any(|(seen, _)| *seen == value) {
+            break;
+        }
+        let mut pid = 0_u32;
+        // SAFETY: queries the owner handle into a live local; on failure the
+        // PID stays zero.
+        unsafe { GetWindowThreadProcessId(owner, Some(&raw mut pid)) };
+        owners.push((value, pid));
+        current = owner;
+    }
+    owners
+}
+
+/// Per-window DPI scale (`GetDpiForWindow` / 96). A window at 120 DPI is 1.25.
+fn window_dpi_scale(hwnd: HWND) -> f32 {
+    dpi_scale_from_dpi(unsafe { GetDpiForWindow(hwnd) })
+}
+
+/// `GetDpiForWindow` returns 0 for an invalid window; treat that as unscaled.
+fn dpi_scale_from_dpi(dpi: u32) -> f32 {
+    if dpi == 0 {
+        return 1.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    {
+        dpi as f32 / 96.0
+    }
+}
+
+#[cfg(test)]
+#[path = "window_dpi_tests_223.rs"]
+mod window_dpi_tests_223;
+
+#[cfg(test)]
+#[path = "window_owner_chain_tests_217.rs"]
+mod window_owner_chain_tests_217;
+
 fn window_title(hwnd: HWND) -> String {
     let mut buffer = vec![0_u16; 512];
     let len = unsafe { GetWindowTextW(hwnd, &mut buffer) };
@@ -454,7 +505,12 @@ pub fn set_window_bounds(
     width: Option<i32>,
     height: Option<i32>,
 ) -> A11yResult<WindowBoundsOutcome> {
-    let handle = valid_hwnd(hwnd)?;
+    let handle = HWND(hwnd as *mut c_void);
+    if !unsafe { IsWindow(Some(handle)) }.as_bool() {
+        return Err(A11yError::internal(format!(
+            "set_window_bounds: HWND 0x{hwnd:x} is not a live top-level window"
+        )));
+    }
     // Preserve the current value on any axis the caller did not specify.
     let current = window_rect(handle)?;
     let pos_x = x.unwrap_or(current.x);
@@ -561,22 +617,10 @@ const fn is_invalid_window_handle_error(error: &windows::core::Error) -> bool {
     u32::from_ne_bytes(error.code().0.to_ne_bytes()) == 0x8007_0578
 }
 
-fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
-    let hwnd = hwnd_from_wire_value(hwnd)?;
-    if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        Ok(hwnd)
-    } else {
-        Err(A11yError::NoForeground {
-            detail: format!("HWND 0x{:x} is not a valid window", hwnd.0 as isize),
-        })
-    }
-}
+#[cfg(test)]
+#[path = "restore_focus_placement_tests_66.rs"]
+mod restore_focus_placement_tests_66;
 
-fn hwnd_from_wire_value(hwnd: i64) -> A11yResult<HWND> {
-    let native = hwnd_from_wire(hwnd).ok_or_else(|| A11yError::NoForeground {
-        detail: format!(
-            "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
-        ),
-    })?;
-    Ok(HWND(native as *mut c_void))
-}
+#[cfg(test)]
+#[path = "foreground_context_dpi_223.rs"]
+mod foreground_context_dpi_223;

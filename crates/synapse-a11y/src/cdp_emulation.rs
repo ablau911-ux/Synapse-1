@@ -989,15 +989,14 @@ async fn run_device_metrics_command(
     use chromiumoxide::cdp::browser_protocol::emulation::{
         ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
@@ -1063,15 +1062,14 @@ async fn run_device_descriptor_command(
         SetEmitTouchEventsForMouseConfiguration, SetEmitTouchEventsForMouseParams,
         SetTouchEmulationEnabledParams, SetUserAgentOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
@@ -1194,15 +1192,14 @@ async fn run_geolocation_command(
     use chromiumoxide::cdp::browser_protocol::emulation::{
         ClearGeolocationOverrideParams, SetGeolocationOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
@@ -1301,15 +1298,14 @@ async fn run_locale_timezone_command(
     use chromiumoxide::cdp::browser_protocol::emulation::{
         SetLocaleOverrideParams, SetTimezoneOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
@@ -1364,15 +1360,14 @@ async fn run_media_command(
 ) -> A11yResult<()> {
     use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
@@ -1418,15 +1413,14 @@ async fn run_network_conditions_command(
     use chromiumoxide::cdp::browser_protocol::network::{
         ConnectionType, EmulateNetworkConditionsParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;

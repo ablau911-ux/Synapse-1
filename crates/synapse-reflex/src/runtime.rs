@@ -27,6 +27,7 @@ pub struct ReflexRuntime {
     pub(crate) reflexes: Vec<ScheduledReflex>,
     pub(crate) disabled_reflex_ids: HashSet<ReflexId>,
     pub(crate) scheduler: Option<SchedulerHandle>,
+    pub(crate) clamp_count_cache: crate::storage::ClampCountCache,
 }
 
 impl fmt::Debug for ReflexRuntime {
@@ -81,6 +82,7 @@ impl ReflexRuntime {
             reflexes: Vec::new(),
             disabled_reflex_ids: HashSet::new(),
             scheduler: None,
+            clamp_count_cache: crate::storage::ClampCountCache::default(),
         })
     }
 

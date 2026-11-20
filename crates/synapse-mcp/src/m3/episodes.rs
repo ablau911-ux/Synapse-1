@@ -28,7 +28,7 @@ use synapse_core::error_codes;
 use synapse_core::types::{EpisodeBoundary, EpisodeRecord, TimelineActor, TimelineRecord};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{
-    cf, decode_json, encode_json, episodes as episode_codec, timeline as timeline_codec,
+    Db, cf, decode_json, encode_json, episodes as episode_codec, timeline as timeline_codec,
 };
 
 use crate::m1::mcp_error;
@@ -44,7 +44,10 @@ pub const MAX_SCAN_ROWS_PER_CALL: usize = 200_000;
 /// Maximum local days replaced per call.
 pub const MAX_DAYS_PER_CALL: u32 = 92;
 /// Chunk size for bounded storage reads inside one call.
-const SCAN_CHUNK_ROWS: usize = 4_096;
+pub(super) const SCAN_CHUNK_ROWS: usize = 4_096;
+/// Serializes `segment_episodes` calls (the tool and the periodic catch-up
+/// of #607): one caller replaces a day at a time.
+static SEGMENT_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -226,7 +229,7 @@ pub(crate) fn now_ts_ns() -> u64 {
 
 /// First decodable timeline codec key timestamp, if any.
 fn first_timeline_ts(
-    runtime: &MutexGuard<'_, ReflexRuntime>,
+    db: &Db,
     scanned_rows: &mut u64,
     invalid_rows: &mut u64,
 ) -> Result<Option<u64>, ErrorData> {
@@ -238,8 +241,8 @@ fn first_timeline_ts(
                  pass an explicit start_ts_ns",
             ));
         }
-        let (rows, more) = runtime
-            .storage_cf_rows_from(cf::CF_TIMELINE, &start, SCAN_CHUNK_ROWS)
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_TIMELINE, &start, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             return Ok(None);
@@ -267,7 +270,7 @@ fn first_timeline_ts(
 
 /// Collects and decodes the timeline rows of one local day, in key order.
 fn day_timeline_rows(
-    runtime: &MutexGuard<'_, ReflexRuntime>,
+    db: &Db,
     day_start_ns: u64,
     day_end_ns: u64,
     scanned_rows: &mut u64,
@@ -277,8 +280,8 @@ fn day_timeline_rows(
     let mut next_populated_ts: Option<u64> = None;
     let mut start = timeline_codec::timeline_scan_start(day_start_ns);
     'scan: loop {
-        let (rows, more) = runtime
-            .storage_cf_rows_from(cf::CF_TIMELINE, &start, SCAN_CHUNK_ROWS)
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_TIMELINE, &start, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             break;
@@ -326,16 +329,12 @@ fn day_timeline_rows(
 }
 
 /// Existing `CF_EPISODES` keys with start timestamps in `[start_ns, end_ns)`.
-fn existing_episode_keys(
-    runtime: &MutexGuard<'_, ReflexRuntime>,
-    start_ns: u64,
-    end_ns: u64,
-) -> Result<Vec<Vec<u8>>, ErrorData> {
+fn existing_episode_keys(db: &Db, start_ns: u64, end_ns: u64) -> Result<Vec<Vec<u8>>, ErrorData> {
     let mut keys = Vec::new();
     let mut start = episode_codec::episode_scan_start(start_ns);
     'scan: loop {
-        let (rows, more) = runtime
-            .storage_cf_rows_from(cf::CF_EPISODES, &start, SCAN_CHUNK_ROWS)
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_EPISODES, &start, SCAN_CHUNK_ROWS)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if rows.is_empty() {
             break;
@@ -373,7 +372,7 @@ fn existing_episode_keys(
 }
 
 pub fn segment_episodes(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
+    db: &Db,
     params: &EpisodeSegmentParams,
 ) -> Result<EpisodeSegmentResponse, ErrorData> {
     if let (Some(start), Some(end)) = (params.start_ts_ns, params.end_ts_ns)
@@ -389,15 +388,17 @@ pub fn segment_episodes(
         ..SegmentationConfig::default()
     };
 
-    let runtime = lock_runtime(runtime)?;
-    if !params.dry_run && !runtime.storage_pressure_permits_write(cf::CF_EPISODES) {
+    let _segmenting = SEGMENT_LOCK
+        .lock()
+        .map_err(|_err| internal("episode segmentation lock poisoned"))?;
+    if !params.dry_run && !db.pressure_permits_write(cf::CF_EPISODES) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "episode_segment refused under disk pressure: cf_name={} pressure_level={:?}; \
                  nothing was deleted or written",
                 cf::CF_EPISODES,
-                runtime.storage_pressure_level()
+                db.pressure_level()
             ),
         ));
     }
@@ -408,7 +409,7 @@ pub fn segment_episodes(
     // Effective range: explicit bounds, else first row → end of today.
     let range_start = match params.start_ts_ns {
         Some(start) => start,
-        None => match first_timeline_ts(&runtime, &mut scanned_rows, &mut invalid_rows)? {
+        None => match first_timeline_ts(db, &mut scanned_rows, &mut invalid_rows)? {
             Some(ts_ns) => ts_ns,
             None => {
                 return Ok(EpisodeSegmentResponse {
@@ -469,13 +470,8 @@ pub fn segment_episodes(
         let day_end = next_local_day_start(day_start)?;
         let end_is_day_boundary = day_end < range_end_snapped;
 
-        let (records, next_populated_ts) = day_timeline_rows(
-            &runtime,
-            day_start,
-            day_end,
-            &mut scanned_rows,
-            &mut invalid_rows,
-        )?;
+        let (records, next_populated_ts) =
+            day_timeline_rows(db, day_start, day_end, &mut scanned_rows, &mut invalid_rows)?;
         let timeline_rows = u64::try_from(records.len()).unwrap_or(u64::MAX);
 
         let segmentation =
@@ -491,7 +487,7 @@ pub fn segment_episodes(
 
         // Replacement unit: this day. Collect stale keys, build new rows,
         // and swap them in one atomic flushed batch.
-        let stale_keys = existing_episode_keys(&runtime, day_start, day_end)?;
+        let stale_keys = existing_episode_keys(db, day_start, day_end)?;
         let mut new_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(segmentation.episodes.len());
         for (ordinal, episode) in segmentation.episodes.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_e| {
@@ -507,8 +503,7 @@ pub fn segment_episodes(
         let deleted = u64::try_from(stale_keys.len()).unwrap_or(u64::MAX);
         let written = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
         if !params.dry_run && (deleted > 0 || written > 0) {
-            runtime
-                .storage_replace_rows(cf::CF_EPISODES, stale_keys, new_rows)
+            db.mutate_batch_pressure_bypass(cf::CF_EPISODES, stale_keys, new_rows)
                 .map_err(|error| {
                     mcp_error(
                         error.code(),
@@ -550,7 +545,7 @@ pub fn segment_episodes(
             None => range_end_snapped,
         };
         day_start = if target_day > day_end {
-            let stale_between = existing_episode_keys(&runtime, day_end, target_day)?;
+            let stale_between = existing_episode_keys(db, day_end, target_day)?;
             if stale_between.is_empty() {
                 target_day
             } else {
@@ -737,7 +732,7 @@ pub fn required_permissions_get(_params: &EpisodeGetParams) -> RequiredPermissio
     required([Permission::ReadStorage])
 }
 
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
     if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
@@ -1232,3 +1227,7 @@ fn timeline_kind_name(kind: synapse_core::types::TimelineKind) -> String {
         |value| value.as_str().unwrap_or_default().to_owned(),
     )
 }
+
+#[cfg(test)]
+#[path = "tests/episode_pressure_shed_270.rs"]
+mod episode_pressure_shed_270_tests;

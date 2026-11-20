@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use synapse_core::Rect;
+use synapse_core::{ConfidenceSource, Rect};
 
 use crate::{PerceptionError, PerceptionResult};
 
@@ -10,18 +10,7 @@ pub struct TextRegion {
     pub bbox: Rect,
     pub confidence: f32,
     #[serde(default)]
-    pub confidence_source: TextRegionConfidenceSource,
-}
-
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TextRegionConfidenceSource {
-    Engine,
-    Uia,
-    Synthetic,
-    Heuristic,
-    #[default]
-    Unsupported,
+    pub confidence_source: ConfidenceSource,
 }
 
 pub trait OcrProvider {
@@ -116,6 +105,15 @@ pub fn read_text_from_bgra_bitmap(
     platform::read_text_from_bgra_bitmap(region, width, height, bytes)
 }
 
+#[cfg(windows)]
+/// The language tag the `WinRT` OCR engine reads with on this PC (the
+/// Windows profile language, e.g. `en-US`); `None` when no engine can be
+/// created. `read_text` names it in its reply's `lang` (#314).
+#[must_use]
+pub fn ocr_engine_language() -> Option<String> {
+    platform::ocr_engine_language()
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
     use std::{
@@ -124,9 +122,9 @@ mod platform {
     };
 
     use serde::Deserialize;
-    use synapse_core::Rect;
+    use synapse_core::{ConfidenceSource, Rect};
 
-    use super::{PerceptionError, PerceptionResult, TextRegion, TextRegionConfidenceSource};
+    use super::{PerceptionError, PerceptionResult, TextRegion};
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -138,7 +136,7 @@ mod platform {
         h: i32,
         confidence: f32,
         #[serde(default)]
-        confidence_source: TextRegionConfidenceSource,
+        confidence_source: ConfidenceSource,
     }
 
     #[derive(Debug, Deserialize)]
@@ -305,7 +303,7 @@ try {
 mod platform {
     use synapse_core::Rect;
 
-    use super::{PerceptionError, PerceptionResult, TextRegion, TextRegionConfidenceSource};
+    use super::{PerceptionError, PerceptionResult, TextRegion};
 
     pub fn read_text(_region: Rect) -> PerceptionResult<Vec<TextRegion>> {
         Err(PerceptionError::OcrBackendUnavailable {
@@ -316,19 +314,20 @@ mod platform {
 }
 
 #[cfg(windows)]
+#[path = "."]
 mod platform {
     use std::sync::OnceLock;
 
     use image::{ImageBuffer, Rgba, imageops::FilterType};
     use synapse_capture::screen_region_to_bgra_bitmap;
-    use synapse_core::Rect;
+    use synapse_core::{ConfidenceSource, Rect};
     use windows::{
         Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
         Media::Ocr::{OcrEngine, OcrResult},
         Storage::Streams::DataWriter,
     };
 
-    use super::{PerceptionError, PerceptionResult, TextRegion, TextRegionConfidenceSource};
+    use super::{PerceptionError, PerceptionResult, TextRegion};
 
     const OCR_MIN_RECOGNITION_HEIGHT_PX: u32 = 64;
     const OCR_MAX_UPSCALE: u32 = 6;
@@ -380,14 +379,69 @@ mod platform {
         select_ocr_candidate(primary, fallback)
     }
 
+    pub fn ocr_engine_language() -> Option<String> {
+        let language = ocr_engine().ok()?.RecognizerLanguage().ok()?;
+        Some(language.LanguageTag().ok()?.to_string())
+    }
+
     fn ocr_engine() -> PerceptionResult<&'static OcrEngine> {
-        static ENGINE: OnceLock<Result<OcrEngine, String>> = OnceLock::new();
-        ENGINE
-            .get_or_init(|| {
-                OcrEngine::TryCreateFromUserProfileLanguages().map_err(|err| err.to_string())
-            })
-            .as_ref()
-            .map_err(|detail| backend_unavailable(detail.clone()))
+        static ENGINE: OnceLock<OcrEngine> = OnceLock::new();
+        successful_engine_with(&ENGINE, || {
+            OcrEngine::TryCreateFromUserProfileLanguages().map_err(ocr_engine_creation_error)
+        })
+    }
+
+    fn successful_engine_with<T>(
+        cache: &OnceLock<T>,
+        create: impl FnOnce() -> PerceptionResult<T>,
+    ) -> PerceptionResult<&T> {
+        if let Some(engine) = cache.get() {
+            return Ok(engine);
+        }
+        let engine = create()?;
+        // Only successful engines persist; failed creation is retried next request.
+        Ok(cache.get_or_init(|| engine))
+    }
+
+    #[cfg(test)]
+    #[path = "ocr_engine_variants_83.rs"]
+    mod ocr_engine_variants_83;
+
+    fn ocr_engine_creation_error(error: windows::core::Error) -> PerceptionError {
+        let context = "WinRT OCR recognizer unavailable for user profile languages";
+        if error.code().is_err() {
+            return backend_unavailable(format!("{context}: {error}"));
+        }
+        // TryCreate can return null with S_OK. windows-rs projects that to an
+        // empty error; the success message does not explain the missing engine.
+        backend_unavailable(format!(
+            "{context}; no installed WinRT recognizer supports the user profile languages; {}",
+            available_recognizer_language_context()
+        ))
+    }
+
+    fn available_recognizer_language_context() -> String {
+        let tags = OcrEngine::AvailableRecognizerLanguages().and_then(|languages| {
+            (0..languages.Size()?)
+                .map(|index| {
+                    languages
+                        .GetAt(index)?
+                        .LanguageTag()
+                        .map(|tag| tag.to_string_lossy())
+                })
+                .collect::<windows::core::Result<Vec<String>>>()
+        });
+        match tags {
+            Ok(mut tags) => {
+                tags.sort_unstable();
+                tags.dedup();
+                format!("available recognizer languages: [{}]", tags.join(", "))
+            }
+            Err(error) if error.code().is_err() => {
+                format!("available recognizer language enumeration failed: {error}")
+            }
+            Err(_) => "available recognizer language enumeration returned no result".to_owned(),
+        }
     }
 
     fn text_regions_from_result(
@@ -431,7 +485,7 @@ mod platform {
                         h: round_scaled_to_i32(bbox.Height, scale).max(1),
                     },
                     confidence: 0.0,
-                    confidence_source: TextRegionConfidenceSource::Unsupported,
+                    confidence_source: ConfidenceSource::Unsupported,
                 });
             }
         }

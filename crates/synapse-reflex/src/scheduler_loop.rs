@@ -24,6 +24,8 @@ use super::{
 use crate::{
     EventBus, REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_TRACK_LOST_KIND, ReflexActionGateHandle,
     SubscriberHandle,
+    dispatch::REFLEX_INPUT_TARGET_REFUSED_KIND,
+    enqueue_audit,
     error::ReflexResult,
     kinds::{
         aim_track::{AimTrackController, AimTrackTargetSourceHandle},
@@ -33,10 +35,7 @@ use crate::{
         on_event::OnEventState,
         path_follow::PathFollowController,
     },
-    write_audit,
 };
-
-const REFLEX_FIRES_METRIC: &str = "reflex_fires_total";
 
 #[derive(Clone, Debug)]
 pub(super) struct RuntimeReflex {
@@ -70,6 +69,7 @@ pub(super) struct RuntimeState {
     pub(super) statuses: Arc<Mutex<Vec<ReflexStatus>>>,
     pub(super) config: SchedulerConfig,
     pub(super) audit_db: Option<Arc<Db>>,
+    pub(super) audit_producer: Option<crate::audit::AuditProducer>,
     pub(super) audit_context: Option<StoredAuditContext>,
     pub(super) action_gate: Option<ReflexActionGateHandle>,
     pub(super) tick_index: u64,
@@ -304,6 +304,8 @@ pub(super) fn status_for_reflex(
         lifetime: reflex.lifetime.clone(),
         exclusive: reflex.exclusive,
         last_error_code: None,
+        input_target: reflex.input_target,
+        last_error: None,
     }
 }
 
@@ -324,14 +326,6 @@ fn kind_summary(reflex: &ScheduledReflex) -> String {
 }
 
 pub(super) fn mark_reflex_fired(runtime: &RuntimeState, index: usize) {
-    if let Some(runtime_reflex) = runtime.reflexes.get(index) {
-        metrics::counter!(
-            REFLEX_FIRES_METRIC,
-            "kind" => kind_summary(&runtime_reflex.reflex),
-            "reflex_id" => format!("slot:{index}")
-        )
-        .increment(1);
-    }
     let expired = runtime
         .reflexes
         .get(index)
@@ -349,6 +343,7 @@ pub(super) fn mark_reflex_fired(runtime: &RuntimeState, index: usize) {
         status.last_fired_at = Some(Utc::now());
         status.fire_count = status.fire_count.saturating_add(1);
         status.last_error_code = None;
+        status.last_error = None;
         if expired {
             expired_status = Some(status.clone());
         }
@@ -425,9 +420,72 @@ pub(super) fn mark_reflex_path_follow_completed(
     }
 }
 
-pub(super) fn mark_reflex_error(runtime: &RuntimeState, index: usize, code: &str) {
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.last_error_code = Some(code.to_owned());
+pub(super) fn mark_reflex_error(runtime: &RuntimeState, index: usize, error: &crate::ReflexError) {
+    let target_refusal = matches!(error, crate::ReflexError::InputTarget { .. });
+    let stop = target_refusal
+        && runtime
+            .reflexes
+            .get(index)
+            .is_some_and(|entry| target_refusal_stops_reflex(error.code(), &entry.reflex.lifetime));
+    if stop && let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
+        control.active = false;
+    }
+    let stopped_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
+        if stop {
+            status.state = ReflexState::ActionDenied;
+        }
+        status.last_error_code = Some(error.code().to_owned());
+        status.last_error = target_refusal.then(|| error.to_string());
+        stop.then(|| status.clone())
+    } else {
+        None
+    };
+    if let Some(status) = stopped_status {
+        write_input_target_refused_audit(runtime, &status);
+    }
+}
+
+/// A target refusal ends the reflex when retrying can never succeed (no stored
+/// target) or when the reflex had its one chance (one-shot). A persistent reflex
+/// whose window is merely not claimed/in front stays armed and retries.
+fn target_refusal_stops_reflex(code: &str, lifetime: &ReflexLifetime) -> bool {
+    code == error_codes::ACTION_INPUT_TARGET_REQUIRED || *lifetime == ReflexLifetime::OneShot
+}
+
+/// Terminal row for a reflex stopped by a target refusal, so the refusal stays
+/// readable (`reflex_list include_expired`) after the runtime drops the reflex.
+fn write_input_target_refused_audit(runtime: &RuntimeState, status: &ReflexStatus) {
+    let Some(db) = runtime.audit_producer.as_ref() else {
+        return;
+    };
+    let audit = StoredReflexAudit {
+        schema_version: SCHEMA_VERSION,
+        audit_id: Uuid::now_v7().to_string(),
+        reflex_id: status.id.clone(),
+        ts_ns: now_ts_ns(),
+        status: ReflexState::ActionDenied,
+        event_id: None,
+        audit_context: runtime.audit_context.clone(),
+        steps: Vec::new(),
+        error_code: status.last_error_code.clone(),
+        details: json!({
+            "kind": REFLEX_INPUT_TARGET_REFUSED_KIND,
+            "kind_summary": status.kind_summary,
+            "tick_index": runtime.tick_index,
+            "input_target": status.input_target,
+            "detail": status.last_error,
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    };
+    if let Err(error) = enqueue_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_input_target",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "reflex input-target refusal audit write failed"
+        );
     }
 }
 
@@ -502,7 +560,7 @@ fn write_lifetime_expired_audit_inner(
     reason: &str,
     completion: Option<(&'static str, Value)>,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(db) = runtime.audit_producer.as_ref() else {
         return;
     };
     let mut details = json!({
@@ -528,7 +586,7 @@ fn write_lifetime_expired_audit_inner(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
+    if let Err(error) = enqueue_audit(db, &audit) {
         tracing::warn!(
             component = "reflex_lifetime",
             reflex_id = %audit.reflex_id,
@@ -545,7 +603,7 @@ fn write_track_lost_audit(
     lost_for: Duration,
     target_context: &serde_json::Value,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(db) = runtime.audit_producer.as_ref() else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -568,7 +626,7 @@ fn write_track_lost_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
+    if let Err(error) = enqueue_audit(db, &audit) {
         tracing::warn!(
             component = "reflex_track_lost",
             reflex_id = %audit.reflex_id,
@@ -610,5 +668,6 @@ pub(super) fn mark_reflex_active_if_starved(runtime: &RuntimeState, index: usize
     {
         status.state = ReflexState::Active;
         status.last_error_code = None;
+        status.last_error = None;
     }
 }

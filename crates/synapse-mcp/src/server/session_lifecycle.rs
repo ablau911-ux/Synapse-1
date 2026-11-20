@@ -28,8 +28,8 @@ use crate::{
 };
 
 use super::{
-    AuthorityFinalizerDrainFailure, AuthorityFinalizerDrainReadback, CdpTargetOwner, SessionTarget,
-    SharedCdpTargetOwners, SharedSessionTargets, SynapseService,
+    CdpTargetOwner, SessionTarget, SharedCdpTargetOwners, SharedLeaseTransitionGate,
+    SharedSessionTargets, SynapseService,
     session_registry::{SharedSessionRegistry, unix_time_ms_now},
     target_claims::{self, SharedTargetClaims, TargetClaimCleanupReport},
     url_redaction::redact_url_for_public_readback,
@@ -46,7 +46,8 @@ pub(crate) const SPAWNED_AGENT_PROCESS_EXITED_REASON: &str = "spawned_agent_proc
 
 pub(crate) type SharedSessionProcessResources =
     Arc<Mutex<BTreeMap<String, BTreeMap<u32, SessionProcessResource>>>>;
-pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeSet<String>>>;
+pub(crate) type SharedTerminatedSessions =
+    Arc<Mutex<super::terminated_sessions::TerminatedSessions>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTeardownOptions {
@@ -73,6 +74,18 @@ pub(crate) fn mcp_session_store_key(session_id: &str) -> Vec<u8> {
     format!("{MCP_SESSION_STORE_PREFIX}{session_id}").into_bytes()
 }
 
+static SESSION_STORE_ROW_GATE: Mutex<()> = Mutex::new(());
+
+/// #215: serializes read-modify-write and delete of persisted MCP session rows
+/// (`mcp/session/v1/*` in `CF_KV`). The HTTP session store's activity refresh
+/// and every row delete take it, so a refresh can never resurrect a row that
+/// teardown just deleted. Hold it only across synchronous storage calls.
+pub(crate) fn lock_session_store_rows() -> std::sync::MutexGuard<'static, ()> {
+    SESSION_STORE_ROW_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 pub(crate) struct SessionProcessResource {
     pub session_id: String,
@@ -84,6 +97,10 @@ pub(crate) struct SessionProcessResource {
     pub agent_cli: Option<String>,
     pub process_job: Option<OwnedProcessJob>,
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
+    /// #75: processes (pid -> start time) a failed teardown could not remove;
+    /// the next attempt re-verifies and re-terminates them even when the root
+    /// pid is already gone, so a retry never starts from an empty ownership set.
+    pub retained_processes: BTreeMap<u32, u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -156,6 +173,7 @@ impl SessionProcessResource {
             agent_cli: None,
             process_job: Some(process_job),
             desktop_lease: None,
+            retained_processes: BTreeMap::new(),
         }
     }
 
@@ -175,7 +193,6 @@ impl SessionProcessResource {
 
 #[derive(Clone)]
 pub(crate) struct SessionLifecycleState {
-    authority_service: SynapseService,
     started_at: Instant,
     action_handle: ActionHandle,
     m3_state: SharedM3State,
@@ -186,6 +203,8 @@ pub(crate) struct SessionLifecycleState {
     target_claims: SharedTargetClaims,
     session_processes: SharedSessionProcessResources,
     terminated_sessions: SharedTerminatedSessions,
+    lease_transition_gate: SharedLeaseTransitionGate,
+    seat_supervisor: Arc<synapse_seats::SeatSupervisor>,
     sse_state: SseState,
 }
 
@@ -201,6 +220,7 @@ pub struct SessionTeardownReport {
     pub termination_marker_failed: bool,
     pub termination_marker_error_message: Option<String>,
     pub input: SessionInputCleanupReport,
+    pub seats: SessionSeatCleanupReport,
     pub target: SessionTargetCleanupReport,
     pub continuity: SessionContinuityCleanupReport,
     pub audit_session: SessionAuditSessionCleanupReport,
@@ -217,6 +237,16 @@ pub struct SessionTeardownReport {
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct SessionSeatCleanupReport {
+    pub source_of_truth: &'static str,
+    pub owned_before: usize,
+    pub closed: usize,
+    pub failed: usize,
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionInputCleanupReport {
     pub snapshot_read_before: bool,
     pub owned_inputs_before: usize,
@@ -228,6 +258,10 @@ pub struct SessionInputCleanupReport {
     pub retained_shared_inputs: u32,
     pub lease_released: bool,
     pub expired_lease_cleanup_completed: bool,
+    pub lease_row_existed_before: bool,
+    pub lease_row_deleted: bool,
+    pub lease_row_exists_after: bool,
+    pub lease_release_event_written: bool,
     pub snapshot_read_after: bool,
     pub owned_inputs_after: usize,
     pub lease_held_after: bool,
@@ -298,9 +332,6 @@ pub struct SessionContinuityCleanupReport {
     pub lease_row_existed_before: bool,
     pub lease_row_deleted: bool,
     pub lease_row_exists_after: bool,
-    pub profile_row_existed_before: bool,
-    pub profile_row_deleted: bool,
-    pub profile_row_exists_after: bool,
     pub failed: bool,
     pub error_message: Option<String>,
 }
@@ -633,31 +664,85 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
-fn stdout_summary(path: &Path) -> (u64, Option<String>) {
-    let Ok(stdout) = fs::read(path) else {
+/// How much of the end of `stdout.jsonl` is parsed for the last event type.
+const STDOUT_SUMMARY_TAIL_BYTES: u64 = 256 * 1024;
+
+/// #212: streams the file in fixed-size chunks to count non-empty lines and
+/// parses only the tail for the last event type, so a multi-GB `stdout.jsonl`
+/// neither spikes memory nor is read twice.
+pub(super) fn stdout_summary(path: &Path) -> (u64, Option<String>) {
+    let Ok(mut file) = fs::File::open(path) else {
         return (0, None);
     };
-    let stdout = String::from_utf8_lossy(&stdout);
-    let mut line_count = 0;
-    let mut last_event_type = None;
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
+    let Ok(line_count) = count_non_empty_lines(&mut file) else {
+        return (0, None);
+    };
+    (line_count, last_event_type_in_tail(&mut file))
+}
+
+fn count_non_empty_lines(file: &mut fs::File) -> std::io::Result<u64> {
+    use std::io::Read as _;
+
+    let mut chunk = vec![0_u8; 64 * 1024];
+    let mut count = 0_u64;
+    let mut line_has_content = false;
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
         }
-        line_count += 1;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(event_type) = value.get("type").and_then(|value| value.as_str()) {
-                last_event_type = Some(event_type.to_owned());
-            } else if let Some(event_type) = value
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(|value| value.as_str())
-            {
-                last_event_type = Some(event_type.to_owned());
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                if line_has_content {
+                    count += 1;
+                    line_has_content = false;
+                }
+            } else if !byte.is_ascii_whitespace() {
+                line_has_content = true;
             }
         }
     }
-    (line_count, last_event_type)
+    if line_has_content {
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn last_event_type_in_tail(file: &mut fs::File) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(STDOUT_SUMMARY_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.by_ref()
+        .take(STDOUT_SUMMARY_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .ok()?;
+    let text = String::from_utf8_lossy(&tail);
+    let mut lines = text.lines();
+    if start > 0 {
+        // The window may begin mid-record; drop the partial first line.
+        lines.next();
+    }
+    // Newest event first: stop at the first line that carries a type.
+    lines
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| {
+            value
+                .get("type")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    value
+                        .get("item")
+                        .and_then(|item| item.get("type"))
+                        .and_then(|value| value.as_str())
+                })
+                .map(ToOwned::to_owned)
+        })
+        .next()
 }
 
 impl SessionTeardownReport {
@@ -673,6 +758,7 @@ impl SessionTeardownReport {
             termination_marker_failed: false,
             termination_marker_error_message: None,
             input: SessionInputCleanupReport::default(),
+            seats: SessionSeatCleanupReport::default(),
             target: SessionTargetCleanupReport::default(),
             continuity: SessionContinuityCleanupReport::default(),
             audit_session: SessionAuditSessionCleanupReport::default(),
@@ -697,6 +783,9 @@ impl SessionTeardownReport {
         if self.input.failed {
             self.failure_count = self.failure_count.saturating_add(1);
         }
+        self.failure_count = self
+            .failure_count
+            .saturating_add(u32::try_from(self.seats.failed).unwrap_or(u32::MAX));
         if self.target.failed {
             self.failure_count = self.failure_count.saturating_add(1);
         }
@@ -736,7 +825,6 @@ impl SessionTeardownReport {
 impl SynapseService {
     pub(crate) fn session_lifecycle_state(&self) -> Result<SessionLifecycleState, ErrorData> {
         Ok(SessionLifecycleState {
-            authority_service: self.clone(),
             started_at: self.started_at,
             action_handle: self.unscoped_action_handle().map_err(|error| {
                 mcp_error(
@@ -752,6 +840,8 @@ impl SynapseService {
             target_claims: Arc::clone(&self.target_claims),
             session_processes: Arc::clone(&self.session_processes),
             terminated_sessions: Arc::clone(&self.terminated_sessions),
+            lease_transition_gate: self.lease_transition_gate(),
+            seat_supervisor: self.seat_supervisor_handle(),
             sse_state: self.sse_state()?,
         })
     }
@@ -903,30 +993,243 @@ impl SynapseService {
     }
 }
 
+/// #75: retry teardown ids. HTTP keep-alive membership suppresses a retry only
+/// for non-spawn sessions; confirmed OS-dead spawned owners always retry (the
+/// 30 s retry cadence in `failed_cleanup_retry_ids` bounds the rate).
+pub(crate) fn retry_teardown_ids(
+    retries: &BTreeSet<String>,
+    dead_owner_retries: &BTreeSet<String>,
+    http_active: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    retries
+        .iter()
+        .filter(|id| dead_owner_retries.contains(*id) || !http_active.contains(*id))
+        .cloned()
+        .collect()
+}
+
 impl SessionLifecycleState {
-    pub(crate) async fn drain_authority_finalizers(
+    /// Periodic metadata retention; never terminates a process or deletes its
+    /// durable history. Registry cadence limits this to one pass per 30 seconds.
+    pub(crate) async fn failed_cleanup_retry_candidates(
         &self,
-    ) -> Result<AuthorityFinalizerDrainReadback, AuthorityFinalizerDrainFailure> {
-        self.authority_service.drain_authority_finalizers().await
+    ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+        let (entries, due) = match self.session_registry.lock() {
+            Ok(mut registry) => (
+                registry.failed_cleanup_entries(),
+                registry.failed_cleanup_retry_ids(unix_time_ms_now()),
+            ),
+            Err(_) => return (BTreeSet::new(), BTreeSet::new(), BTreeSet::new()),
+        };
+        // Failed cleanup must not bypass ownership protection through another
+        // resource ledger on intervening maintenance ticks, including closed rows.
+        let mut protected: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect();
+        if due.is_empty() {
+            return (BTreeSet::new(), BTreeSet::new(), protected);
+        }
+        let live_pids = tokio::task::spawn_blocking(|| {
+            let mut system = sysinfo::System::new();
+            if system.refresh_processes(sysinfo::ProcessesToUpdate::All, false) == 0
+                || system
+                    .process(sysinfo::Pid::from_u32(std::process::id()))
+                    .is_none()
+            {
+                return None;
+            }
+            Some(
+                system
+                    .processes()
+                    .keys()
+                    .map(|pid| pid.as_u32())
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+        let mut retries = BTreeSet::new();
+        let mut dead_owner_retries = BTreeSet::new();
+        for entry in entries {
+            if !due.contains(&entry.session_id) {
+                continue;
+            }
+            // #213: a teardown still running is in progress, not failed; the
+            // session stays protected and is retried only once it finished.
+            if self.session_teardown_in_progress(&entry.session_id) {
+                continue;
+            }
+            if let Some(spawned) = &entry.spawned_agent {
+                let mut pids = vec![spawned.launcher_process_id];
+                pids.extend(spawned.agent_process_id);
+                pids.extend(
+                    spawned
+                        .control
+                        .as_ref()
+                        .map(|control| control.app_server_process_id),
+                );
+                pids.retain(|pid| *pid != 0);
+                if pids.is_empty()
+                    || live_pids
+                        .as_ref()
+                        .is_none_or(|live| pids.iter().any(|pid| live.contains(pid)))
+                {
+                    continue;
+                }
+            }
+            if self
+                .session_registry
+                .lock()
+                .is_ok_and(|registry| registry.cleanup_retry_unchanged(&entry))
+            {
+                protected.remove(&entry.session_id);
+                // #75: spawned owners reaching here are confirmed OS-dead.
+                if entry.spawned_agent.is_some() {
+                    dead_owner_retries.insert(entry.session_id.clone());
+                }
+                retries.insert(entry.session_id);
+            }
+        }
+        (retries, dead_owner_retries, protected)
     }
 
-    pub(crate) fn input_owner_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
-        self.action_handle
-            .session_inputs_snapshot()
-            .map(|snapshot| {
-                snapshot
-                    .sessions
-                    .into_iter()
-                    .map(|session| session.session_id)
-                    .collect()
-            })
-            .map_err(|error| {
-                format!(
-                    "read action session-input ownership before daemon shutdown: code={} detail={}",
-                    error.code(),
-                    error.detail()
+    pub(crate) async fn prune_expired_registry_entries(
+        &self,
+        session_manager: &rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        failed_cleanup_sessions: &BTreeSet<String>,
+    ) {
+        let candidates = match self.session_registry.lock() {
+            Ok(mut registry) => registry.expired_retention_candidates(unix_time_ms_now()),
+            Err(_) => return,
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let has_spawned = candidates.iter().any(|entry| entry.spawned_agent.is_some());
+        let live_pids = if has_spawned {
+            tokio::task::spawn_blocking(|| {
+                let mut system = sysinfo::System::new();
+                let count = system.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
+                // A failed Windows Toolhelp snapshot returns zero. Access-denied
+                // processes still have PID entries; never infer death from an
+                // absent process handle/name. Our own PID must be observable.
+                if count == 0
+                    || system
+                        .process(sysinfo::Pid::from_u32(std::process::id()))
+                        .is_none()
+                {
+                    return None;
+                }
+                Some(
+                    system
+                        .processes()
+                        .keys()
+                        .map(|pid| pid.as_u32())
+                        .collect::<BTreeSet<_>>(),
                 )
             })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        // Hold current admission/ownership readbacks through the short removal
+        // section. Revision comparison also catches restoration before rmcp has
+        // installed the restored session in its in-memory map.
+        let active = session_manager.sessions.read().await;
+        let Ok(owned) = self.session_processes.lock() else {
+            return;
+        };
+        let Ok(mut registry) = self.session_registry.lock() else {
+            return;
+        };
+        let before = registry.retention_counts().0;
+        let mut active_pinned = 0_u64;
+        let mut cleanup_failed_pinned = 0_u64;
+        let mut ownership_pinned = 0_u64;
+        let mut changed = 0_u64;
+        let mut pruned = 0_u64;
+        let now = unix_time_ms_now();
+        for candidate in &candidates {
+            if candidate.cleanup_failed || failed_cleanup_sessions.contains(&candidate.session_id) {
+                cleanup_failed_pinned += 1;
+                continue;
+            }
+            if active.contains_key(candidate.session_id.as_str()) {
+                active_pinned += 1;
+                continue;
+            }
+            if owned
+                .get(&candidate.session_id)
+                .is_some_and(|jobs| !jobs.is_empty())
+            {
+                ownership_pinned += 1;
+                continue;
+            }
+            if let Some(spawned) = &candidate.spawned_agent {
+                let mut pids = vec![spawned.launcher_process_id];
+                pids.extend(spawned.agent_process_id);
+                pids.extend(
+                    spawned
+                        .control
+                        .as_ref()
+                        .map(|control| control.app_server_process_id),
+                );
+                pids.retain(|pid| *pid != 0);
+                if pids.is_empty()
+                    || live_pids
+                        .as_ref()
+                        .is_none_or(|live| pids.iter().any(|pid| live.contains(pid)))
+                {
+                    ownership_pinned += 1;
+                    continue;
+                }
+            }
+            if registry.prune_expired_candidate(candidate, now) {
+                pruned += 1;
+            } else {
+                changed += 1;
+            }
+        }
+        let (after, pruned_total) = registry.retention_counts();
+        tracing::info!(
+            code = "MCP_SESSION_REGISTRY_RETENTION",
+            before,
+            after,
+            pruned,
+            pruned_total,
+            candidates = candidates.len(),
+            active_pinned,
+            ownership_pinned,
+            cleanup_failed_pinned,
+            changed,
+            stale_after_ms = registry.stale_after_ms(),
+            process_snapshot_available = live_pids.is_some(),
+            "readback=session_registry after=expired_inactive_metadata_pruned"
+        );
+    }
+
+    /// #213: whether a teardown of `session_id` is running or queued right now.
+    pub(crate) fn session_teardown_in_progress(&self, session_id: &str) -> bool {
+        teardown_gate::SessionTeardownGate::global().is_in_progress(session_id)
+    }
+
+    /// #214: the ids in `candidates` that session teardown already marked
+    /// terminated (used to find terminated sessions still open in rmcp).
+    pub(crate) fn terminated_among(&self, candidates: &BTreeSet<String>) -> Vec<String> {
+        self.terminated_sessions.lock().map_or_else(
+            |_poisoned| Vec::new(),
+            |terminated| {
+                candidates
+                    .iter()
+                    .filter(|session_id| terminated.contains(session_id.as_str()))
+                    .cloned()
+                    .collect()
+            },
+        )
     }
 
     pub(crate) fn is_session_terminated(&self, session_id: &str) -> bool {
@@ -942,27 +1245,6 @@ impl SessionLifecycleState {
     ) -> Result<SessionTeardownReport, ErrorData> {
         self.teardown_session_with_options(session_id, reason, SessionTeardownOptions::default())
             .await
-    }
-
-    /// Teardown entry point for a caller that already owns this session's
-    /// authority gate (for example, two-session target-claim adoption).
-    pub(crate) async fn teardown_session_authority_locked(
-        &self,
-        session_id: &str,
-        reason: &str,
-    ) -> Result<SessionTeardownReport, ErrorData> {
-        let report = self
-            .teardown_session_with_options_report_authority_locked(
-                session_id,
-                reason,
-                SessionTeardownOptions::default(),
-            )
-            .await?;
-        if report.failure_count == 0 {
-            Ok(report)
-        } else {
-            Err(session_teardown_error(report))
-        }
     }
 
     pub(crate) async fn teardown_session_with_options(
@@ -988,26 +1270,41 @@ impl SessionLifecycleState {
         options: SessionTeardownOptions,
     ) -> Result<SessionTeardownReport, ErrorData> {
         validate_lifecycle_session_id(session_id)?;
-        // This is the normal lifecycle authority boundary. The only prelocked
-        // path is the explicit two-session target-adoption entry point above.
-        let _authority_gate = self
-            .authority_service
-            .lock_session_authority(session_id)
-            .await?;
-        self.teardown_session_with_options_report_authority_locked(session_id, reason, options)
-            .await
-    }
-
-    async fn teardown_session_with_options_report_authority_locked(
-        &self,
-        session_id: &str,
-        reason: &str,
-        options: SessionTeardownOptions,
-    ) -> Result<SessionTeardownReport, ErrorData> {
-        validate_lifecycle_session_id(session_id)?;
+        // Pin existing metadata before the first await: cancellation or an
+        // early error must not let a later retention pass forget this cleanup.
+        if let Ok(mut registry) = self.session_registry.lock() {
+            registry.record_cleanup_result(session_id, false);
+        }
+        // #213: one teardown per session at a time. A second caller (DELETE,
+        // retry, sweep, agent_kill, adopt) waits here instead of racing the
+        // first over the same owner rows; the permit drops on completion or
+        // cancellation.
+        // Shared with the blocking cleanup tasks: if this future is cancelled
+        // (e.g. the stale sweep's 120 s timeout) while they still run, the
+        // session stays "in progress" until they finish, so a retry cannot
+        // start a concurrent second teardown.
+        let teardown_permit = Arc::new(
+            teardown_gate::SessionTeardownGate::global()
+                .begin(session_id)
+                .await,
+        );
         let mut report = SessionTeardownReport::new(session_id, reason);
         self.mark_terminated_session(&mut report);
-        report.input = self.cleanup_inputs_and_lease(session_id).await;
+        // #22: a spawned agent's scoped credential dies with its session, before
+        // any later cleanup step can fail.
+        if let Some(spawn_id) = crate::spawn_credentials::registry().revoke_session(session_id) {
+            tracing::info!(
+                code = "SPAWN_CREDENTIAL_REVOKED",
+                session_id,
+                spawn_id = %spawn_id,
+                reason,
+                "scoped spawn credential revoked at session teardown"
+            );
+        }
+        report.input = self
+            .cleanup_inputs_and_lease(session_id, "session_teardown")
+            .await;
+        report.seats = self.cleanup_seats(session_id).await;
         report.target = self.cleanup_target(session_id);
         report.continuity = self.cleanup_continuity(session_id);
         report.audit_session = self.cleanup_audit_session(session_id);
@@ -1015,14 +1312,20 @@ impl SessionLifecycleState {
         report.cdp =
             cleanup_session_cdp_targets(&self.m3_state, &self.cdp_target_owners, session_id).await;
         report.target_claims = self.cleanup_target_claims(session_id);
-        report.shell = cleanup_shell_jobs(session_id, reason);
-        report.processes = self.cleanup_owned_processes(session_id, options);
+        report.shell =
+            cleanup_shell_jobs_off_worker(session_id, reason, Arc::clone(&teardown_permit)).await;
+        report.processes = self
+            .cleanup_owned_processes_off_worker(session_id, options, Arc::clone(&teardown_permit))
+            .await;
         let registry_reason = reconciled_teardown_exit_reason(reason, &report.processes);
         report.reason.clone_from(&registry_reason);
         report.subscriptions = self.cleanup_subscriptions(session_id);
         report.session_store = self.delete_session_store_row(session_id);
         report.registry = self.record_registry_closed(session_id, &registry_reason);
         report.finalize();
+        if let Ok(mut registry) = self.session_registry.lock() {
+            registry.record_cleanup_result(session_id, report.failure_count == 0);
+        }
         if report.failure_count == 0 {
             tracing::info!(
                 code = "MCP_SESSION_TEARDOWN_COMPLETED",
@@ -1059,45 +1362,27 @@ impl SessionLifecycleState {
             report.error_message = Some(error.message.to_string());
             return report;
         }
-        let _authority_gate = match self
-            .authority_service
-            .lock_session_authority(session_id)
-            .await
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                report.failed = true;
-                report.error_message = Some(error.message.to_string());
-                tracing::error!(
-                    code = error_codes::TOOL_INTERNAL_ERROR,
-                    session_id,
-                    reason,
-                    error = ?error,
-                    "daemon-shutdown input cleanup could not acquire the session authority gate"
-                );
-                return report;
-            }
-        };
         report.browser_continuity = self.browser_continuity_for_daemon_shutdown(session_id);
         report.process_jobs =
             self.disarm_owned_process_jobs_for_daemon_shutdown(session_id, reason);
-        report.input = self.cleanup_inputs_and_lease(session_id).await;
-        match super::session_continuity::delete_persisted_session_lease_row(
-            &self.m3_state,
-            session_id,
-        ) {
-            Ok(readback) => {
-                report.lease_row_existed_before = readback.row_existed_before;
-                report.lease_row_deleted = readback.row_deleted;
-                report.lease_row_exists_after = readback.row_exists_after;
-            }
-            Err(error) => {
-                report.failed = true;
-                report.error_message = Some(error);
-            }
-        }
+        report.input = self
+            .cleanup_inputs_and_lease(session_id, "daemon_shutdown")
+            .await;
+        let seat_cleanup = self.cleanup_seats(session_id).await;
+        report.lease_row_existed_before = report.input.lease_row_existed_before;
+        report.lease_row_deleted = report.input.lease_row_deleted;
+        report.lease_row_exists_after = report.input.lease_row_exists_after;
         if report.input.failed {
             report.failed = true;
+        }
+        if seat_cleanup.failed > 0 {
+            report.failed = true;
+            report.error_message.get_or_insert_with(|| {
+                format!(
+                    "{} isolated browser seat(s) failed to close during daemon shutdown",
+                    seat_cleanup.failed
+                )
+            });
         }
         if report.process_jobs.failed > 0 {
             report.failed = true;
@@ -1121,6 +1406,27 @@ impl SessionLifecycleState {
             report = ?report,
             "readback=session_input_ownership edge=daemon_shutdown after_cleanup"
         );
+        report
+    }
+
+    async fn cleanup_seats(&self, session_id: &str) -> SessionSeatCleanupReport {
+        let owner = synapse_seats::OwnerId::new(session_id);
+        let owned_before = self.seat_supervisor.list(&owner).await;
+        let results = self.seat_supervisor.close_owner(&owner).await;
+        let mut report = SessionSeatCleanupReport {
+            source_of_truth: "SeatSupervisor registry + owned Chromium process/profile close readback",
+            owned_before: owned_before.len(),
+            ..SessionSeatCleanupReport::default()
+        };
+        for result in results {
+            match result {
+                Ok(_seat) => report.closed = report.closed.saturating_add(1),
+                Err(error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    report.failures.push(error.to_string());
+                }
+            }
+        }
         report
     }
 
@@ -1195,27 +1501,17 @@ impl SessionLifecycleState {
     }
 
     pub(crate) async fn cleanup_expired_lease_inputs_once(&self) {
+        // Lazy expiry: reading the lease is what moves a lapsed owner into the
+        // expired-cleanup registry. Do it here so expiry is journaled
+        // `lease_expired` and held inputs are released before the orphan sweep
+        // can close the row as `orphan_sweep` (#95).
+        let _lease_status_readback = synapse_action::lease::status();
         let pending = synapse_action::lease::expired_cleanup_snapshot();
         for expired in pending {
             let Some(session_id) = expired.owner_session_id.clone() else {
                 continue;
             };
-            let _authority_gate = match self
-                .authority_service
-                .lock_session_authority(&session_id)
-                .await
-            {
-                Ok(guard) => guard,
-                Err(error) => {
-                    tracing::error!(
-                        code = error_codes::TOOL_INTERNAL_ERROR,
-                        session_id,
-                        error = ?error,
-                        "expired-lease cleanup could not acquire the session authority gate"
-                    );
-                    continue;
-                }
-            };
+            let _transition = self.lease_transition_gate.lock().await;
             let before = self.action_handle.session_inputs_snapshot();
             let before_lease = synapse_action::lease::status();
             let result = self
@@ -1226,6 +1522,12 @@ impl SessionLifecycleState {
             let after_lease = synapse_action::lease::status();
             match result {
                 Ok(summary) => {
+                    let reconciliation =
+                        super::session_continuity::reconcile_persisted_session_lease_row(
+                            &self.m3_state,
+                            &session_id,
+                            "lease_expired",
+                        );
                     tracing::warn!(
                         code = "MCP_SESSION_LEASE_EXPIRED_INPUT_CLEANUP",
                         session_id,
@@ -1240,6 +1542,7 @@ impl SessionLifecycleState {
                         after = ?after,
                         before_lease = ?before_lease,
                         after_lease = ?after_lease,
+                        reconciliation = ?reconciliation,
                         "readback=session_input_ownership edge=input_lease_expired after_cleanup"
                     );
                 }
@@ -1260,6 +1563,98 @@ impl SessionLifecycleState {
         }
     }
 
+    /// Retry path for lease-release journaling (#93/#94/#95): closes persisted
+    /// lease rows whose lease is gone, so a skipped or failed `LeaseReleased`
+    /// write (expiry, emergency preempt, force-clear, crash) is repaired on the
+    /// next sweep instead of leaving `held_open` elevated forever.
+    pub(crate) async fn reconcile_orphaned_lease_rows_once(&self) {
+        let _transition = self.lease_transition_gate.lock().await;
+        match super::session_continuity::reconcile_orphaned_session_lease_rows(
+            &self.m3_state,
+            "orphan_sweep",
+        ) {
+            Ok(0) => {}
+            Ok(closed) => tracing::warn!(
+                code = "MCP_SESSION_LEASE_ORPHAN_SWEEP_CLOSED",
+                closed,
+                "readback=CF_SESSIONS+CF_AGENT_EVENTS after=orphaned_lease_rows_closed"
+            ),
+            Err(error) => tracing::error!(
+                code = "MCP_SESSION_LEASE_ORPHAN_SWEEP_FAILED",
+                error = %error,
+                "orphaned session lease sweep could not scan CF_SESSIONS"
+            ),
+        }
+    }
+
+    /// #147: a crashed client's HTTP session stays "active" for the 24 h
+    /// keep-alive, so its seats (a private Chromium + profile) are reclaimed
+    /// after the shorter seat-owner MCP-idle limit. Closes ONLY the owner's
+    /// seats; the session, leases, targets and clipboard are untouched so a
+    /// connected-but-idle client keeps working. Returns seats closed.
+    pub(crate) async fn reclaim_idle_seat_owners_once(&self) -> usize {
+        let Some(limit_ms) = super::seat_owner_idle::seat_owner_idle_limit_from_env() else {
+            return 0;
+        };
+        self.reclaim_idle_seat_owners(limit_ms).await
+    }
+
+    /// [`Self::reclaim_idle_seat_owners_once`] with an explicit MCP-idle limit
+    /// instead of the env-configured one (test seam).
+    pub(crate) async fn reclaim_idle_seat_owners(&self, limit_ms: u64) -> usize {
+        let owners = match self.seat_supervisor.try_owner_ids() {
+            Ok(owners) => owners,
+            Err(error) => {
+                tracing::warn!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    detail = %error,
+                    "seat registry was busy during idle seat-owner scan; retrying next sweep"
+                );
+                return 0;
+            }
+        };
+        if owners.is_empty() {
+            return 0;
+        }
+        let registry_reads = match self.session_registry.lock() {
+            Ok(registry) => registry.reads(unix_time_ms_now()),
+            Err(_poisoned) => return 0,
+        };
+        // Only an SSE stream attached now counts; a subscription row alone
+        // survives a client crash and must not keep the seat (#147).
+        let streaming: BTreeSet<String> = self
+            .sse_state
+            .attached_owner_session_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let activity: Vec<super::seat_owner_idle::SessionActivity<'_>> =
+            registry_reads.iter().map(Into::into).collect();
+        let idle = super::seat_owner_idle::idle_seat_owners(
+            owners.iter().map(synapse_seats::OwnerId::as_str),
+            &activity,
+            &streaming,
+            limit_ms,
+        );
+        let mut closed = 0_usize;
+        for owner in idle {
+            let report = self.cleanup_seats(&owner).await;
+            if report.owned_before == 0 {
+                continue;
+            }
+            closed = closed.saturating_add(report.closed);
+            tracing::warn!(
+                code = "MCP_SEAT_OWNER_IDLE_RECLAIM",
+                session_id = %owner,
+                limit_ms,
+                reason = super::seat_owner_idle::SEAT_OWNER_IDLE_REASON,
+                report = ?report,
+                "readback=seat_registry edge=owner_mcp_idle after=seats_closed_session_kept"
+            );
+        }
+        closed
+    }
+
     pub(crate) fn stale_session_candidates(
         &self,
         active_sessions: &BTreeSet<String>,
@@ -1272,14 +1667,21 @@ impl SessionLifecycleState {
         // *liveness* action). Read the registry once and partition spawned-agent
         // sessions by a real process probe: live ones are protected from
         // idle-driven teardown; exited ones remain reap candidates.
-        let registry_reads = match self.session_registry.lock() {
-            Ok(registry) => registry.reads(unix_time_ms_now()),
+        let (registry_reads, failed_cleanup) = match self.session_registry.lock() {
+            Ok(registry) => (
+                registry.reads(unix_time_ms_now()),
+                registry
+                    .failed_cleanup_entries()
+                    .into_iter()
+                    .map(|entry| entry.session_id)
+                    .collect::<BTreeSet<String>>(),
+            ),
             Err(_poisoned) => {
                 tracing::error!(
                     code = error_codes::TOOL_INTERNAL_ERROR,
                     "session registry lock poisoned during stale-candidate scan; spawned-agent liveness protection unavailable this pass"
                 );
-                Vec::new()
+                (Vec::new(), BTreeSet::new())
             }
         };
         let (live_spawn_sessions, exited_spawn_sessions) =
@@ -1384,6 +1786,18 @@ impl SessionLifecycleState {
                 add_if_stale(&mut candidates, &live, &session_id, HTTP_STALE_REASON);
             }
         }
+        match self.seat_supervisor.try_owner_ids() {
+            Ok(owners) => {
+                for owner in owners {
+                    add_if_stale(&mut candidates, &live, owner.as_str(), HTTP_STALE_REASON);
+                }
+            }
+            Err(error) => tracing::warn!(
+                code = error_codes::TOOL_INTERNAL_ERROR,
+                detail = %error,
+                "seat registry was busy during stale-session candidate scan; retrying next sweep"
+            ),
+        }
         // Non-spawn (operator/human) sessions still reap on MCP-idle staleness
         // for input/lease/target cleanup. Spawned-agent sessions are
         // intentionally excluded here; their liveness is governed solely by the
@@ -1393,7 +1807,14 @@ impl SessionLifecycleState {
                 add_if_stale(&mut candidates, &live, &read.session_id, HTTP_STALE_REASON);
             }
         }
+        // #75: an OS-dead spawned owner is reaped even while its HTTP session
+        // is still in the manager map (abrupt death skips DELETE, leaving the
+        // session "active" for the 24 h keep-alive). Only failed-cleanup
+        // ownership stays protected; it is retried by its own path.
         for read in exited_spawn_sessions {
+            if failed_cleanup.contains(&read.session_id) {
+                continue;
+            }
             let reason = spawned_agent_exit_reason(read);
             if candidates.insert(read.session_id.clone(), reason) != Some(reason) {
                 tracing::warn!(
@@ -1406,20 +1827,20 @@ impl SessionLifecycleState {
                 );
             }
         }
+        // #213: never re-select a session whose teardown is still running.
+        candidates.retain(|session_id, _reason| !self.session_teardown_in_progress(session_id));
         candidates
     }
 
-    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
+    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> BTreeSet<String> {
         let registry_reads = match self.session_registry.lock() {
             Ok(registry) => registry.reads(unix_time_ms_now()),
             Err(_poisoned) => {
-                let detail = "session registry lock poisoned during daemon-shutdown spawned-agent liveness scan; restart handoff cannot safely classify idle-evicted spawned sessions";
                 tracing::error!(
                     code = error_codes::TOOL_INTERNAL_ERROR,
-                    detail,
-                    "daemon-shutdown spawned-agent liveness Source of Truth is unavailable"
+                    "session registry lock poisoned during daemon-shutdown spawned-agent liveness scan; restart handoff cannot include idle-evicted spawned sessions this pass"
                 );
-                return Err(detail.to_owned());
+                Vec::new()
             }
         };
         let live_spawn_sessions =
@@ -1432,7 +1853,7 @@ impl SessionLifecycleState {
                 "readback=session_registry edge=daemon_shutdown before=live_spawned_process_handoff"
             );
         }
-        Ok(live_spawn_sessions)
+        live_spawn_sessions
     }
 
     fn browser_continuity_for_daemon_shutdown(
@@ -1581,7 +2002,18 @@ impl SessionLifecycleState {
         match self.terminated_sessions.lock() {
             Ok(mut terminated) => {
                 report.already_terminated = terminated.contains(&report.session_id);
+                let evicted_before = terminated.stats().evicted_total;
                 report.marked_terminated = terminated.insert(report.session_id.clone());
+                let stats = terminated.stats();
+                if stats.evicted_total > evicted_before {
+                    tracing::info!(
+                        code = "SESSION_TERMINATED_REGISTRY_EVICTED",
+                        occupancy = stats.len,
+                        capacity = stats.capacity,
+                        evicted_total = stats.evicted_total,
+                        "terminated-session registry full; oldest ids forgotten"
+                    );
+                }
             }
             Err(_error) => {
                 report.termination_marker_failed = true;
@@ -1596,7 +2028,15 @@ impl SessionLifecycleState {
         }
     }
 
-    async fn cleanup_inputs_and_lease(&self, session_id: &str) -> SessionInputCleanupReport {
+    async fn cleanup_inputs_and_lease(
+        &self,
+        session_id: &str,
+        reason_code: &str,
+    ) -> SessionInputCleanupReport {
+        // Let an in-flight act_foreground escalation of this session unwind
+        // first (#53); taken before the transition gate its unwind needs.
+        super::act_foreground_slot::await_session_escalation(session_id).await;
+        let _transition = self.lease_transition_gate.lock().await;
         let before_snapshot = self.action_handle.session_inputs_snapshot();
         let before_lease = synapse_action::lease::status();
         let mut report = SessionInputCleanupReport {
@@ -1620,6 +2060,25 @@ impl SessionLifecycleState {
                 report.retained_shared_inputs = summary.input_summary.retained_shared_inputs;
                 report.lease_released = summary.lease_released;
                 report.expired_lease_cleanup_completed = summary.expired_lease_cleanup_completed;
+                match super::session_continuity::reconcile_persisted_session_lease_row(
+                    &self.m3_state,
+                    session_id,
+                    reason_code,
+                ) {
+                    Ok(readback) => {
+                        report.lease_row_existed_before = readback.row_existed_before;
+                        report.lease_row_deleted = readback.row_deleted;
+                        report.lease_row_exists_after = readback.row_exists_after;
+                        report.lease_release_event_written = readback.release_event_written;
+                    }
+                    Err(error) => {
+                        report.failed = true;
+                        report.error_code = Some(error_codes::STORAGE_CORRUPTED.to_owned());
+                        report.error_message = Some(format!(
+                            "input cleanup completed but persisted lease reconciliation failed: {error}"
+                        ));
+                    }
+                }
             }
             Err(error) => {
                 report.failed = true;
@@ -1646,6 +2105,16 @@ impl SessionLifecycleState {
     }
 
     fn cleanup_target(&self, session_id: &str) -> SessionTargetCleanupReport {
+        // #299: the session's agents lose their targets with the session.
+        let agent_targets_cleared = super::agent_scope::forget_session(session_id);
+        if agent_targets_cleared > 0 {
+            tracing::info!(
+                code = "MCP_SESSION_AGENT_TARGETS_CLEARED",
+                session_id,
+                agent_targets_cleared,
+                "readback=agent_target_registry outcome=session_agents_cleared"
+            );
+        }
         match self.session_targets.lock() {
             Ok(mut targets) => {
                 let before = targets.len();
@@ -1672,25 +2141,26 @@ impl SessionLifecycleState {
     }
 
     fn cleanup_continuity(&self, session_id: &str) -> SessionContinuityCleanupReport {
-        let mut report = match super::session_continuity::delete_persisted_session_continuity_rows(
+        match super::session_continuity::delete_persisted_session_target_row(
             &self.m3_state,
             session_id,
         ) {
             Ok(readback) => SessionContinuityCleanupReport {
-                target_row_existed_before: readback.target_row_existed_before,
-                target_row_deleted: readback.target_row_deleted,
-                target_row_exists_after: readback.target_row_exists_after,
-                lease_row_existed_before: readback.lease_row_existed_before,
-                lease_row_deleted: readback.lease_row_deleted,
-                lease_row_exists_after: readback.lease_row_exists_after,
-                ..SessionContinuityCleanupReport::default()
+                target_row_existed_before: readback.row_existed_before,
+                target_row_deleted: readback.row_deleted,
+                target_row_exists_after: readback.row_exists_after,
+                lease_row_existed_before: false,
+                lease_row_deleted: false,
+                lease_row_exists_after: false,
+                failed: false,
+                error_message: None,
             },
             Err(error) => {
                 tracing::error!(
                     code = error_codes::TOOL_INTERNAL_ERROR,
                     session_id,
                     detail = %error,
-                    "session lifecycle failed to delete persisted continuity rows"
+                    "session lifecycle failed to delete persisted target continuity row"
                 );
                 SessionContinuityCleanupReport {
                     failed: true,
@@ -1698,27 +2168,7 @@ impl SessionLifecycleState {
                     ..SessionContinuityCleanupReport::default()
                 }
             }
-        };
-        match self
-            .authority_service
-            .delete_tool_profile_assignment_for_terminated_session(session_id)
-        {
-            Ok((existed_before, deleted)) => {
-                report.profile_row_existed_before = existed_before;
-                report.profile_row_deleted = deleted;
-                report.profile_row_exists_after = false;
-            }
-            Err(error) => {
-                report.failed = true;
-                report.profile_row_exists_after = true;
-                let detail = error.message.to_string();
-                report.error_message = Some(match report.error_message.take() {
-                    Some(existing) => format!("{existing}; profile cleanup: {detail}"),
-                    None => detail,
-                });
-            }
         }
-        report
     }
 
     fn cleanup_audit_session(&self, session_id: &str) -> SessionAuditSessionCleanupReport {
@@ -1787,10 +2237,53 @@ impl SessionLifecycleState {
         }
     }
 
+    /// #212: process-tree cleanup polls the OS with blocking sleeps (up to
+    /// ~35 s per spawned-agent resource). Run it on the blocking pool so a
+    /// teardown never parks a tokio worker thread.
+    async fn cleanup_owned_processes_off_worker(
+        &self,
+        session_id: &str,
+        options: SessionTeardownOptions,
+        teardown_permit: Arc<teardown_gate::SessionTeardownPermit<'static>>,
+    ) -> SessionProcessCleanupReport {
+        let state = self.clone();
+        let owned_session_id = session_id.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            // #213: the permit lives until this blocking work ends.
+            let _teardown_permit = teardown_permit;
+            state.cleanup_owned_processes(&owned_session_id, options)
+        })
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    session_id,
+                    detail = %error,
+                    "session process cleanup task did not complete"
+                );
+                SessionProcessCleanupReport {
+                    failed: 1,
+                    ..SessionProcessCleanupReport::default()
+                }
+            }
+        }
+    }
+
     fn cleanup_owned_processes(
         &self,
         session_id: &str,
         options: SessionTeardownOptions,
+    ) -> SessionProcessCleanupReport {
+        self.cleanup_owned_processes_with(session_id, options, &m4::terminate_owned_process_tree)
+    }
+
+    fn cleanup_owned_processes_with(
+        &self,
+        session_id: &str,
+        options: SessionTeardownOptions,
+        terminate: &dyn Fn(u32) -> m4::OwnedProcessTerminationReadback,
     ) -> SessionProcessCleanupReport {
         let resources = match self.session_processes.lock() {
             Ok(mut processes) => processes.remove(session_id).unwrap_or_default(),
@@ -1805,8 +2298,9 @@ impl SessionLifecycleState {
             owned_before: resources.len(),
             ..SessionProcessCleanupReport::default()
         };
+        let mut retained = BTreeMap::new();
         for mut resource in resources.into_values() {
-            let process_ids = m4::owned_process_tree_ids(resource.pid);
+            let process_ids = resource_process_ids(&resource);
             let live_before = m4::owned_live_process_ids(&process_ids);
             let job_handle_dropped = resource.process_job.is_some();
             let agent_spawn_cleanup = AgentSpawnCleanupRead::for_resource(&resource);
@@ -1849,11 +2343,34 @@ impl SessionLifecycleState {
                 !remaining_after_natural_wait.is_empty() && remaining.is_empty();
             let mut force_termination_status = None;
             if !remaining.is_empty() {
+                let remaining_before_force = remaining.clone();
                 report.force_termination_attempted =
                     report.force_termination_attempted.saturating_add(1);
-                let forced = m4::terminate_owned_process_tree(resource.pid);
+                let forced = terminate(resource.pid);
                 force_termination_status = Some(forced.status);
                 remaining = forced.remaining_process_ids;
+                // Survivors retained from an earlier failed pass may no longer
+                // hang under the root pid; terminate each by identity.
+                let orphans = remaining_before_force
+                    .iter()
+                    .copied()
+                    .filter(|pid| *pid != resource.pid)
+                    .filter(|pid| resource.retained_processes.contains_key(pid))
+                    .filter(|pid| !remaining.contains(pid))
+                    .collect::<Vec<_>>();
+                for orphan in orphans {
+                    remaining.extend(terminate(orphan).remaining_process_ids);
+                }
+                remaining.sort_unstable();
+                remaining.dedup();
+            }
+            // #75 debug-only fault hook: report a survivor so reviewers can
+            // verify ownership retention and the verified retry live.
+            #[cfg(debug_assertions)]
+            if let Some(pid) = cleanup_fault_hook::forced_failure_pid(&process_ids) {
+                remaining.push(pid);
+                remaining.sort_unstable();
+                remaining.dedup();
             }
             if let Some(cleanup) = &agent_spawn_cleanup {
                 if !cleanup.has_terminal_completion_status() {
@@ -1928,12 +2445,13 @@ impl SessionLifecycleState {
             } else {
                 report.failed = report.failed.saturating_add(1);
             }
+            let retain_for_retry = !remaining.is_empty();
             report.items.push(SessionProcessCleanupItem {
                 tool: resource.tool.to_owned(),
                 pid: resource.pid,
-                resource_id: resource.resource_id,
-                launch_target: resource.launch_target,
-                agent_cli: resource.agent_cli,
+                resource_id: resource.resource_id.clone(),
+                launch_target: resource.launch_target.clone(),
+                agent_cli: resource.agent_cli.clone(),
                 registered_at_unix_ms: resource.registered_at_unix_ms,
                 process_ids_before: process_ids,
                 live_process_ids_before: live_before,
@@ -1956,8 +2474,27 @@ impl SessionLifecycleState {
                 desktop_window_termination_attempted,
                 desktop_window_termination_status,
                 desktop_window_process_ids_after,
-                remaining_process_ids_after: remaining,
+                remaining_process_ids_after: remaining.clone(),
             });
+            if retain_for_retry {
+                // #75: keep ownership of everything that failed teardown; the
+                // failure flag may only clear once a retry verifies exit.
+                let start_times = m4::process_start_times(&remaining);
+                resource.retained_processes = remaining
+                    .iter()
+                    .map(|pid| (*pid, start_times.get(pid).copied().unwrap_or(0)))
+                    .collect();
+                retained.insert(resource.pid, resource);
+            }
+        }
+        if !retained.is_empty() {
+            match self.session_processes.lock() {
+                Ok(mut processes) => processes
+                    .entry(session_id.to_owned())
+                    .or_default()
+                    .extend(retained),
+                Err(_error) => report.failed = report.failed.saturating_add(1),
+            }
         }
         report
     }
@@ -1991,6 +2528,7 @@ impl SessionLifecycleState {
     }
 
     fn delete_session_store_row(&self, session_id: &str) -> SessionStoreCleanupReport {
+        let _row_gate = lock_session_store_rows();
         let key = mcp_session_store_key(session_id);
         let key_string = String::from_utf8_lossy(&key).into_owned();
         let db = match session_store_db(&self.m3_state) {
@@ -2055,7 +2593,9 @@ impl SessionLifecycleState {
     ) -> SessionRegistryCleanupReport {
         let transitioned = match self.session_registry.lock() {
             Ok(mut registry) => {
+                let retry_journal = registry.closure_journal_failed(session_id);
                 registry.record_closed_with_reason(session_id, unix_time_ms_now(), Some(reason))
+                    || retry_journal
             }
             Err(_error) => {
                 return SessionRegistryCleanupReport {
@@ -2078,8 +2618,16 @@ impl SessionLifecycleState {
             // Terminal lifecycle fact: journal it durably (#897). The agent's
             // task outcome is unknown to teardown, hence `indeterminate`.
             match self.journal_session_exited_event(session_id, reason) {
-                Ok(()) => report.journal_event_written = true,
+                Ok(()) => {
+                    report.journal_event_written = true;
+                    if let Ok(mut registry) = self.session_registry.lock() {
+                        registry.record_closure_journal_result(session_id, true);
+                    }
+                }
                 Err(error) => {
+                    if let Ok(mut registry) = self.session_registry.lock() {
+                        registry.record_closure_journal_result(session_id, false);
+                    }
                     report.failed = true;
                     report.error_message = Some(error);
                 }
@@ -2101,6 +2649,67 @@ impl SessionLifecycleState {
         super::agent_events::record_agent_event_durable(&db, &record)
             .map(|_readback| ())
             .map_err(|error| format!("journal session exited event: {error}"))
+    }
+}
+
+/// Process tree of the resource root plus survivors retained by an earlier
+/// failed teardown, keeping only retained pids that still match the recorded
+/// start time (a recycled pid must never be treated as owned).
+fn resource_process_ids(resource: &SessionProcessResource) -> Vec<u32> {
+    let mut ids = m4::owned_process_tree_ids(resource.pid);
+    let current = m4::process_start_times(
+        &resource
+            .retained_processes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+    ids.extend(
+        resource
+            .retained_processes
+            .iter()
+            .filter_map(|(pid, start)| {
+                (current
+                    .get(pid)
+                    .is_some_and(|now| *start == 0 || now == start))
+                .then_some(*pid)
+            }),
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// #212: shell-job cleanup waits on process trees with blocking sleeps; keep it
+/// off the async workers.
+async fn cleanup_shell_jobs_off_worker(
+    session_id: &str,
+    reason: &str,
+    teardown_permit: Arc<teardown_gate::SessionTeardownPermit<'static>>,
+) -> SessionShellCleanupReport {
+    let owned_session_id = session_id.to_owned();
+    let owned_reason = reason.to_owned();
+    match crate::m4::spawn_shell_job_blocking(move || {
+        // #213: the permit lives until this blocking work ends.
+        let _teardown_permit = teardown_permit;
+        cleanup_shell_jobs(&owned_session_id, &owned_reason)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::error!(
+                code = error_codes::TOOL_INTERNAL_ERROR,
+                session_id,
+                detail = %error,
+                "session shell-job cleanup task did not complete"
+            );
+            SessionShellCleanupReport {
+                failed: 1,
+                error_message: Some(format!("shell-job cleanup task did not complete: {error}")),
+                ..SessionShellCleanupReport::default()
+            }
+        }
     }
 }
 
@@ -2319,8 +2928,38 @@ fn remove_session_cdp_target_owners(
     Ok(owned)
 }
 
-#[cfg(windows)]
+/// Upper bound for closing one owned CDP target during teardown (#210). The
+/// attach handshake has its own bound; this also covers a browser that accepts
+/// the connection and then never answers `Target.closeTarget`.
+const CDP_CLEANUP_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn close_cdp_target_for_cleanup(
+    target_id: &str,
+    owner: &CdpTargetOwner,
+) -> Result<CdpCleanupCloseOutcome, String> {
+    close_cdp_target_bounded(target_id, owner, CDP_CLEANUP_CLOSE_TIMEOUT).await
+}
+
+/// A timeout is an error, never a reclaim: the owner row stays so the retry
+/// path closes the tab once the browser answers again.
+async fn close_cdp_target_bounded(
+    target_id: &str,
+    owner: &CdpTargetOwner,
+    limit: Duration,
+) -> Result<CdpCleanupCloseOutcome, String> {
+    tokio::time::timeout(limit, close_cdp_target_once(target_id, owner))
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(format!(
+                "closing CDP target {target_id:?} on {:?} timed out after {} ms",
+                owner.endpoint,
+                limit.as_millis()
+            ))
+        })
+}
+
+#[cfg(windows)]
+async fn close_cdp_target_once(
     target_id: &str,
     owner: &CdpTargetOwner,
 ) -> Result<CdpCleanupCloseOutcome, String> {
@@ -2339,26 +2978,47 @@ async fn close_cdp_target_for_cleanup(
     synapse_a11y::cdp_close_target(&owner.endpoint, target_id)
         .await
         .map(|_closed| CdpCleanupCloseOutcome::Closed)
-        .or_else(|error| match error {
-            synapse_a11y::A11yError::CdpUnreachable { detail } => {
-                tracing::warn!(
-                    code = error_codes::A11Y_CDP_UNREACHABLE,
-                    hwnd = owner.window_hwnd,
-                    endpoint = %owner.endpoint,
-                    cdp_target_id = %owner.cdp_target_id,
-                    detail = %detail,
-                    "session lifecycle reclaimed persisted CDP owner row after owner endpoint became unreachable"
-                );
-                Ok(CdpCleanupCloseOutcome::EndpointUnreachable)
-            }
-            other => Err(other.to_string()),
-        })
+        .or_else(|error| raw_cdp_close_error_outcome(error, owner))
 }
 
+/// Maps a raw-CDP `Target.closeTarget` failure to a cleanup outcome. A tab the
+/// user already closed (#211) and an unreachable owner endpoint both reclaim the
+/// owner row; anything else is a real failure that keeps the row for retry.
+#[cfg(windows)]
+fn raw_cdp_close_error_outcome(
+    error: synapse_a11y::A11yError,
+    owner: &CdpTargetOwner,
+) -> Result<CdpCleanupCloseOutcome, String> {
+    if synapse_a11y::is_cdp_close_target_absent(&error) {
+        tracing::info!(
+            hwnd = owner.window_hwnd,
+            endpoint = %owner.endpoint,
+            cdp_target_id = %owner.cdp_target_id,
+            "session lifecycle found the raw-CDP target already closed; reclaiming owner row"
+        );
+        return Ok(CdpCleanupCloseOutcome::AlreadyAbsent);
+    }
+    match error {
+        synapse_a11y::A11yError::CdpUnreachable { detail } => {
+            tracing::warn!(
+                code = error_codes::A11Y_CDP_UNREACHABLE,
+                hwnd = owner.window_hwnd,
+                endpoint = %owner.endpoint,
+                cdp_target_id = %owner.cdp_target_id,
+                detail = %detail,
+                "session lifecycle reclaimed persisted CDP owner row after owner endpoint became unreachable"
+            );
+            Ok(CdpCleanupCloseOutcome::EndpointUnreachable)
+        }
+        other => Err(other.to_string()),
+    }
+}
+
+/// Normal-bridge tab-lane endpoint of any declared browser (legacy
+/// `chrome-extension://<id>/chrome.tabs|chrome.debugger` rows included).
 #[cfg(windows)]
 fn is_chrome_bridge_endpoint(endpoint: &str) -> bool {
-    endpoint.starts_with("chrome-extension://")
-        && (endpoint.ends_with("/chrome.tabs") || endpoint.ends_with("/chrome.debugger"))
+    synapse_browsers::BrowserRegistry::global().is_bridge_tab_lane_endpoint(endpoint)
 }
 
 #[cfg(windows)]
@@ -2369,7 +3029,7 @@ fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> b
 }
 
 #[cfg(not(windows))]
-async fn close_cdp_target_for_cleanup(
+async fn close_cdp_target_once(
     target_id: &str,
     owner: &CdpTargetOwner,
 ) -> Result<CdpCleanupCloseOutcome, String> {
@@ -2615,3 +3275,46 @@ fn session_teardown_error(report: SessionTeardownReport) -> ErrorData {
         })),
     )
 }
+
+#[cfg(test)]
+#[path = "tests/session_dead_spawn_owner_75.rs"]
+mod dead_spawn_owner_tests_75;
+
+#[cfg(debug_assertions)]
+#[path = "session_cleanup_fault_hook.rs"]
+mod cleanup_fault_hook;
+
+#[path = "session_teardown_gate.rs"]
+mod teardown_gate;
+
+#[cfg(test)]
+#[path = "tests/session_cleanup_fault_hook_75.rs"]
+mod cleanup_fault_hook_75_tests;
+
+#[cfg(test)]
+#[path = "tests/session_failed_process_retain_75.rs"]
+mod failed_process_retain_tests_75;
+
+#[cfg(test)]
+#[path = "tests/expired_lease_journal_95.rs"]
+mod expired_lease_journal_95_tests;
+
+#[cfg(test)]
+#[path = "tests/terminated_sessions_eviction_14.rs"]
+mod terminated_sessions_eviction_14_tests;
+
+#[cfg(test)]
+#[path = "tests/session_cdp_close_absent_211.rs"]
+mod session_cdp_close_absent_211_tests;
+
+#[cfg(test)]
+#[path = "tests/session_teardown_off_worker_212.rs"]
+mod session_teardown_off_worker_212_tests;
+
+#[cfg(test)]
+#[path = "tests/session_teardown_serialized_213.rs"]
+mod session_teardown_serialized_213_tests;
+
+#[cfg(test)]
+#[path = "tests/session_cdp_close_timeout_210.rs"]
+mod session_cdp_close_timeout_210_tests;

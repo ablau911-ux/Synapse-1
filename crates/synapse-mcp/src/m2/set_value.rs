@@ -53,10 +53,7 @@ pub struct ActSetValueResponse {
     pub elapsed_ms: u32,
 }
 
-pub(crate) async fn act_set_value_with_boundary(
-    params: ActSetValueParams,
-    boundary: super::OperatorPanicActionBoundary,
-) -> Result<ActSetValueResponse, ErrorData> {
+pub async fn act_set_value(params: ActSetValueParams) -> Result<ActSetValueResponse, ErrorData> {
     let started = Instant::now();
     validate_set_value_params(&params)?;
     let requested_len = char_count(&params.text)?;
@@ -69,7 +66,6 @@ pub(crate) async fn act_set_value_with_boundary(
     let before_len = char_count(&before.value)?;
     let before_readback = value_readback_json(&params.element_id, &before);
 
-    boundary.ensure("immediately_before_set_element_value")?;
     let set_readback = match synapse_a11y::set_element_value(&params.element_id, &params.text) {
         Ok(readback) => readback,
         Err(error) => {
@@ -342,6 +338,7 @@ fn postcondition_verified_state(
     detail: impl Into<String>,
 ) -> ActPostcondition {
     ActPostcondition {
+        related_window_observed: None,
         status: "verified_state".to_owned(),
         observed_delta: Some(changed),
         source_of_truth: Some(source_of_truth.to_owned()),

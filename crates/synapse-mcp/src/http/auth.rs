@@ -13,13 +13,11 @@ use subtle::ConstantTimeEq;
 
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
-const BRIDGE_REGISTER_TOKEN_HEADER: &str = "x-synapse-bridge-register-token";
-const BRIDGE_REGISTER_TOKEN_DOMAIN: &[u8] = b"synapse.chrome_bridge.register.v1";
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 #[derive(Clone, Debug)]
 pub(super) struct HttpAuth {
     token_digest: [u8; 32],
-    bridge_register_token_digest: [u8; 32],
     source: TokenSource,
     bind_addr: SocketAddr,
 }
@@ -52,10 +50,20 @@ impl HttpAuth {
         let (token, source) = load_token()?;
         Ok(Self {
             token_digest: digest_token(&token),
-            bridge_register_token_digest: digest_token(&derive_bridge_register_token(&token)),
             source,
             bind_addr,
         })
+    }
+
+    /// Test seam: an `HttpAuth` for a known token (source `env`), so a test
+    /// can build the authenticated router without the token file or env.
+    #[cfg(test)]
+    pub(super) fn from_token(token: &str, bind_addr: SocketAddr) -> Self {
+        Self {
+            token_digest: digest_token(token),
+            source: TokenSource::Env,
+            bind_addr,
+        }
     }
 
     pub(super) const fn source_label(&self) -> &'static str {
@@ -72,24 +80,6 @@ impl HttpAuth {
         } else {
             Err(AuthFailure::Invalid)
         }
-    }
-
-    pub(super) fn authorize_bridge_register(&self, headers: &HeaderMap) -> Result<(), AuthFailure> {
-        let token = bridge_register_token(headers)?;
-        let candidate_digest = digest_token(token);
-        if bool::from(
-            self.bridge_register_token_digest
-                .as_slice()
-                .ct_eq(candidate_digest.as_slice()),
-        ) {
-            Ok(())
-        } else {
-            Err(AuthFailure::Invalid)
-        }
-    }
-
-    pub(super) fn requires_bearer(&self) -> bool {
-        !self.bind_addr.ip().is_loopback()
     }
 
     pub(super) fn validate_origin_and_host(
@@ -115,36 +105,97 @@ pub(super) async fn require_http_security(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if auth.bind_addr.ip().is_loopback() && validate_host(request.headers()).is_ok() {
-        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
+    if auth.bind_addr.ip().is_loopback()
+        && validate_host(request.headers()).is_ok()
+        && crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
             request.headers(),
             request.uri(),
-        ) {
-            return next.run(request).await;
-        }
-        if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_request(
-            request.headers(),
-            request.uri(),
-        ) {
-            return match auth.authorize_bridge_register(request.headers()) {
-                Ok(()) => next.run(request).await,
-                Err(failure) => unauthorized(failure),
-            };
-        }
+        )
+    {
+        return next.run(request).await;
     }
     if let Err(failure) = auth.validate_origin_and_host(request.headers()) {
         return forbidden(failure);
     }
-    // Local-first trust model: a loopback-bound daemon relies on the bind plus
-    // the Host/Origin guard above, so local MCP clients need no bearer token.
-    // A non-loopback bind still requires the token.
-    if !auth.requires_bearer() {
-        return next.run(request).await;
-    }
     match auth.authorize(request.headers()) {
         Ok(()) => next.run(request).await,
+        Err(AuthFailure::Invalid) => match bearer_token(request.headers()) {
+            Ok(token) => {
+                let token = token.to_owned();
+                authorize_spawn_scoped(&token, request, next).await
+            }
+            Err(failure) => unauthorized(failure),
+        },
         Err(failure) => unauthorized(failure),
     }
+}
+
+/// #22: a non-master bearer may be a per-spawn scoped credential, valid only
+/// for its own spawn's MCP session, event ingress, and Codex request bridge.
+async fn authorize_spawn_scoped(token: &str, request: Request<Body>, next: Next) -> Response {
+    use crate::spawn_credentials::{ScopedGrant, ScopedRequest, registry};
+
+    let scoped = ScopedRequest::from_http(request.method(), request.uri(), request.headers());
+    let body_check = scoped.requires_body_spawn_id();
+    let grant = match registry().authorize(token, &scoped) {
+        Ok(grant) => grant,
+        Err(refusal) => {
+            tracing::warn!(
+                code = synapse_core::error_codes::HTTP_TOKEN_INVALID,
+                reason = refusal.reason(),
+                path = request.uri().path(),
+                "HTTP scoped spawn credential rejected"
+            );
+            return unauthorized(AuthFailure::Invalid);
+        }
+    };
+    let request = if body_check {
+        match require_body_spawn_id(request, grant.spawn_id()).await {
+            Ok(request) => request,
+            Err(response) => return response,
+        }
+    } else {
+        request
+    };
+    match grant {
+        ScopedGrant::Request { .. } => next.run(request).await,
+        ScopedGrant::Initialize(claim) => {
+            let response = next.run(request).await;
+            let session_id = response
+                .status()
+                .is_success()
+                .then(|| response.headers().get(MCP_SESSION_ID_HEADER))
+                .flatten()
+                .and_then(|value| value.to_str().ok());
+            claim.bind(session_id);
+            response
+        }
+    }
+}
+
+async fn require_body_spawn_id(
+    request: Request<Body>,
+    spawn_id: &str,
+) -> Result<Request<Body>, Response> {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(
+        body,
+        crate::server::codex_app_server_bridge::MAX_CODEX_APP_SERVER_REQUEST_BODY_BYTES,
+    )
+    .await
+    .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+    let named = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("spawn_id")?.as_str().map(ToOwned::to_owned));
+    if named.as_deref() != Some(spawn_id) {
+        tracing::warn!(
+            code = synapse_core::error_codes::HTTP_TOKEN_INVALID,
+            reason = "scoped_credential_body_spawn_mismatch",
+            "HTTP scoped spawn credential rejected"
+        );
+        return Err(unauthorized(AuthFailure::Invalid));
+    }
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 /// Load the daemon bearer token value (file or env), for in-process consumers
@@ -197,19 +248,6 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthFailure> {
     let scheme = parts.next().ok_or(AuthFailure::Malformed)?;
     let token = parts.next().ok_or(AuthFailure::Malformed)?.trim();
     if !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() {
-        return Err(AuthFailure::Malformed);
-    }
-    Ok(token)
-}
-
-fn bridge_register_token(headers: &HeaderMap) -> Result<&str, AuthFailure> {
-    let token = headers
-        .get(BRIDGE_REGISTER_TOKEN_HEADER)
-        .ok_or(AuthFailure::Missing)?
-        .to_str()
-        .map_err(|_| AuthFailure::Malformed)?
-        .trim();
-    if token.is_empty() {
         return Err(AuthFailure::Malformed);
     }
     Ok(token)
@@ -270,24 +308,6 @@ fn digest_token(token: &str) -> [u8; 32] {
     let digest = Sha256::digest(token.as_bytes());
     let mut output = [0_u8; 32];
     output.copy_from_slice(&digest);
-    output
-}
-
-fn derive_bridge_register_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(BRIDGE_REGISTER_TOKEN_DOMAIN);
-    hasher.update([0]);
-    hasher.update(token.as_bytes());
-    hex_lower(&hasher.finalize())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[(byte >> 4) as usize]));
-        output.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
     output
 }
 

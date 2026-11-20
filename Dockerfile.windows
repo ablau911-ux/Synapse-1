@@ -1,0 +1,67 @@
+# escape=`
+# Windows-container image for the Synapse MCP daemon.
+#
+# IMPORTANT: this is a WINDOWS container. Build it on a Windows Docker host in
+# Windows-container mode (not Docker Desktop Linux mode).
+#
+# The official `rust` image has NO Windows tags, so the build stage starts from
+# Windows Server Core and installs the toolchain itself:
+#   - VS Build Tools 2022 (MSVC C++ + Windows 11 SDK)  -> cl.exe/link.exe + headers
+#     for windows-capture / uiautomation / wasapi native deps
+#   - LLVM 18 (libclang)                               -> rocksdb bindgen
+#   - rustup pinned to 1.95 (workspace edition 2024)   -> x86_64-pc-windows-msvc
+#
+# The build also needs network egress: the `directml` feature of synapse-models
+# pulls ONNX Runtime via `ort/download-binaries`, emitting onnxruntime.dll
+# (+ DirectML provider DLL) into target\release next to the exe. Those DLLs are
+# copied into the runtime image alongside synapse-mcp.exe.
+
+FROM mcr.microsoft.com/windows/servercore:ltsc2022 AS build
+SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';"]
+WORKDIR C:\src
+
+# VS Build Tools 2022: MSVC C++ toolchain + Windows 11 SDK
+RUN Invoke-WebRequest https://aka.ms/vs/17/release/vs_buildtools.exe -OutFile vs.exe; `
+    Start-Process -Wait -FilePath .\vs.exe -ArgumentList '--quiet','--wait','--norestart','--nocache', `
+      '--add','Microsoft.VisualStudio.Workload.VCTools', `
+      '--add','Microsoft.VisualStudio.Component.VC.Tools.x86.x64', `
+      '--add','Microsoft.VisualStudio.Component.Windows11SDK.22621'; `
+    Remove-Item vs.exe
+
+# LLVM for libclang (rocksdb bindgen)
+RUN Invoke-WebRequest https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe -OutFile llvm.exe; `
+    Start-Process -Wait -FilePath .\llvm.exe -ArgumentList '/S'; `
+    Remove-Item llvm.exe
+ENV LIBCLANG_PATH="C:\Program Files\LLVM\bin"
+
+# rustup + MSVC toolchain (workspace pins rust-version = 1.95, edition 2024)
+RUN Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe; `
+    .\rustup-init.exe -y --default-toolchain 1.95.0 --default-host x86_64-pc-windows-msvc --profile minimal; `
+    Remove-Item rustup-init.exe
+
+ENV CARGO_TERM_COLOR=always `
+    RUSTFLAGS="-C target-feature=+crt-static"
+
+COPY . .
+
+# Build inside the VC dev environment so cl.exe / link.exe / SDK headers resolve.
+RUN cmd /S /C "\"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat\" && set PATH=%USERPROFILE%\.cargo\bin;%PATH% && cargo build --locked --release --bin synapse-mcp"
+
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+SHELL ["powershell", "-NoProfile", "-Command", "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue';"]
+WORKDIR C:\synapse
+
+ENV SYNAPSE_BIND=0.0.0.0:7700 `
+    SYNAPSE_MODE=http
+
+# Binary + the ONNX Runtime DLLs emitted next to it by the directml feature.
+COPY --from=build C:/src/target/release/synapse-mcp.exe C:/synapse/synapse-mcp.exe
+COPY --from=build C:/src/target/release/*.dll C:/synapse/
+
+# NOTE: onnxruntime.dll is a prebuilt Microsoft binary and may depend on the
+# VC++ runtime (msvcp140.dll / vcruntime140.dll). If the daemon fails to load
+# the DLL on a bare Server Core runtime, install the VC++ 2015-2022 redist in
+# this stage. Verify on first build.
+
+EXPOSE 7700
+ENTRYPOINT ["C:\\synapse\\synapse-mcp.exe", "--mode", "http", "--allow-non-loopback"]

@@ -10,6 +10,9 @@ use axum::{
 };
 use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, SessionConfig};
 
+use super::session_admission::{self as admission, SessionAdmission};
+use super::session_guards as guards;
+
 const SESSION_IDLE_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS";
 const DEFAULT_SESSION_IDLE_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const MAX_MCP_REQUEST_BYTES: usize = 1024 * 1024;
@@ -21,8 +24,12 @@ tokio::task_local! {
 
 #[derive(Clone)]
 pub(super) struct SessionRequestState {
+    session_manager: Arc<LocalSessionManager>,
     session_registry: crate::server::session_registry::SharedSessionRegistry,
+    activity_db: Option<Arc<synapse_storage::Db>>,
     terminated_sessions: crate::server::session_lifecycle::SharedTerminatedSessions,
+    inflight_ids: super::inflight_ids::InflightRequestIds,
+    admission: SessionAdmission,
 }
 
 #[derive(Clone)]
@@ -96,14 +103,37 @@ impl SessionFailure {
     }
 }
 
+impl SessionRequestState {
+    pub(super) fn with_activity_db(mut self, db: Arc<synapse_storage::Db>) -> Self {
+        self.activity_db = Some(db);
+        self
+    }
+
+    /// The shared in-flight request registry, so the stale sweep does not close
+    /// a session that is still answering a request (#214).
+    pub(super) fn inflight_ids(&self) -> super::inflight_ids::InflightRequestIds {
+        self.inflight_ids.clone()
+    }
+
+    pub(super) fn admission(&self) -> SessionAdmission {
+        self.admission.clone()
+    }
+}
+
 impl SessionCleanupState {
     pub(super) fn request_state(
+        session_manager: Arc<LocalSessionManager>,
         session_registry: crate::server::session_registry::SharedSessionRegistry,
         terminated_sessions: crate::server::session_lifecycle::SharedTerminatedSessions,
     ) -> SessionRequestState {
         SessionRequestState {
+            session_manager,
             session_registry,
+            activity_db: None,
             terminated_sessions,
+            inflight_ids: super::inflight_ids::InflightRequestIds::default(),
+            // `load_session_config` already failed startup on an invalid value.
+            admission: SessionAdmission::from_env().unwrap_or_default(),
         }
     }
 
@@ -122,13 +152,29 @@ pub(crate) fn current_mcp_session_id() -> Option<String> {
     CURRENT_MCP_SESSION_ID.try_with(Clone::clone).ok().flatten()
 }
 
+/// Runs `future` with the given MCP session id in task-local scope, so work
+/// moved onto its own task keeps the request's session attribution.
+pub(crate) async fn with_current_mcp_session_id<F>(
+    session_id: Option<String>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_MCP_SESSION_ID.scope(session_id, future).await
+}
+
 pub(super) fn load_session_config() -> anyhow::Result<SessionConfig> {
     let mut config = SessionConfig::default();
     let idle_timeout_secs = session_idle_timeout_secs()?;
     config.keep_alive = Some(Duration::from_secs(idle_timeout_secs));
+    let max_sessions = SessionAdmission::from_env()
+        .with_context(|| format!("validate {}", admission::MAX_SESSIONS_ENV))?
+        .max_sessions();
     tracing::info!(
         code = "MCP_HTTP_SESSION_CONFIGURED",
         idle_timeout_s = idle_timeout_secs,
+        max_sessions,
         "HTTP MCP session lifecycle configured"
     );
     Ok(config)
@@ -142,11 +188,37 @@ pub(super) async fn require_mcp_session(
     if !is_mcp_endpoint(request.uri().path()) {
         return next.run(request).await;
     }
+    let mut request = request;
+    if request.method() == Method::POST
+        && let Err(response) = guards::normalize_json_content_type(request.headers_mut())
+    {
+        return response;
+    }
     let session_id = session_id_from_header(&request);
+    let trusted_local_agent = session_id.is_none()
+        && request.method() == Method::POST
+        && request
+            .headers()
+            .get(crate::local_agent_capability::HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(crate::local_agent_capability::matches);
     let request = match enforce_session_header(request).await {
         Ok(request) => request,
         Err(response) => return response,
     };
+    // #13: reserve a session slot for an initialize before it reaches rmcp;
+    // held until the response head exists (the session is then in the map).
+    let admission_guard = if session_id.is_none() && request.method() == Method::POST {
+        match state.admission.admit(&state.session_manager).await {
+            Ok(guard) => Some(guard),
+            Err(denied) => return admission::capacity_exceeded_response(&denied),
+        }
+    } else {
+        None
+    };
+    let mut prevalidated_session = false;
+    let mut deferred_action = None;
+    let mut inflight_claim = None;
     let request = match session_id.as_deref() {
         Some(session_id) => {
             if session_is_terminated(&state.terminated_sessions, session_id) {
@@ -168,24 +240,84 @@ pub(super) async fn require_mcp_session(
                 );
                 return session_invalid_for(SessionFailure::Terminated, Some(session_id));
             }
-            match record_session_request(&state.session_registry, session_id, request).await {
-                Ok(request) => request,
+            let (request, info) = match read_session_request(request).await {
+                Ok(read) => read,
                 Err(response) => return response,
+            };
+            let SessionRequestInfo {
+                action,
+                request_id,
+                initialize,
+                invalid_message,
+            } = info;
+            // #29: a live session is already initialized; a repeat would be
+            // accepted by rmcp's default handler and answered as if it
+            // renegotiated. Unknown ids stay on the rmcp 404/restore path.
+            if let Some(initialize) = initialize.as_ref()
+                && session_is_active(&state.session_manager, session_id).await
+            {
+                return guards::already_initialized_response(session_id, initialize);
             }
+            if let Some(error) = invalid_message {
+                return guards::invalid_message_response(&error);
+            }
+            if let Some(request_id) = request_id.as_deref() {
+                match state.inflight_ids.claim(session_id, request_id) {
+                    super::inflight_ids::ClaimOutcome::Held(claim) => inflight_claim = Some(claim),
+                    super::inflight_ids::ClaimOutcome::Unguarded => {}
+                    super::inflight_ids::ClaimOutcome::Duplicate => {
+                        return super::inflight_ids::duplicate_inflight_response(
+                            session_id, request_id,
+                        );
+                    }
+                }
+            }
+            prevalidated_session = session_is_active(&state.session_manager, session_id).await;
+            if prevalidated_session {
+                if let Err(response) = record_session_heartbeat(&state, session_id, action) {
+                    return response;
+                }
+            } else {
+                deferred_action = action;
+            }
+            request
         }
         None => request,
     };
     let diagnostic_session_id = session_id.clone();
     CURRENT_MCP_SESSION_ID
         .scope(session_id, async move {
+            let _admission_guard = admission_guard;
             let response = next.run(request).await;
+            if trusted_local_agent
+                && response.status().is_success()
+                && let Some(session_id) = response
+                    .headers()
+                    .get(SESSION_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                && let Ok(mut registry) = state.session_registry.lock()
+            {
+                registry.trust_local_agent(session_id);
+            }
             if response.status() == StatusCode::NOT_FOUND {
                 return session_invalid_for(
                     SessionFailure::UnknownOrExpired,
                     diagnostic_session_id.as_deref(),
                 );
             }
-            response
+            if !prevalidated_session
+                && response.status().is_success()
+                && let Some(session_id) = diagnostic_session_id.as_deref()
+                && session_is_active(&state.session_manager, session_id).await
+                && !session_is_terminated(&state.terminated_sessions, session_id)
+                && let Err(error) = record_session_heartbeat(&state, session_id, deferred_action)
+            {
+                return error;
+            }
+            match inflight_claim {
+                Some(claim) => super::inflight_ids::hold_until_body_done(response, claim),
+                None => response,
+            }
         })
         .await
 }
@@ -325,6 +457,11 @@ async fn allow_initialize_without_session(
         .await
         .map_err(|_| payload_too_large())?;
     let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+    if let Err(error) = &parsed
+        && guards::is_json_content_type(&parts.headers)
+    {
+        return Err(guards::malformed_json_response(error));
+    }
     let is_initialize = parsed.as_ref().is_ok_and(jsonrpc_method_is_initialize);
     let request = Request::from_parts(parts, Body::from(bytes));
     if parsed.is_err() || is_initialize {
@@ -334,33 +471,57 @@ async fn allow_initialize_without_session(
     }
 }
 
-async fn record_session_request(
-    session_registry: &crate::server::session_registry::SharedSessionRegistry,
-    session_id: &str,
+/// What the middleware learned from a session-bound `POST /mcp` body.
+#[derive(Default)]
+struct SessionRequestInfo {
+    action: Option<String>,
+    request_id: Option<String>,
+    invalid_message: Option<serde_json::Error>,
+    /// The parsed payload when it is, or batches, an `initialize` request (#29).
+    initialize: Option<serde_json::Value>,
+}
+
+async fn read_session_request(
     request: Request<Body>,
-) -> Result<Request<Body>, Response> {
+) -> Result<(Request<Body>, SessionRequestInfo), Response> {
     if request.method() != Method::POST {
-        record_session_heartbeat(session_registry, session_id, None)?;
-        return Ok(request);
+        return Ok((request, SessionRequestInfo::default()));
     }
 
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
-    let action = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| jsonrpc_action_label(&value));
-    record_session_heartbeat(session_registry, session_id, action)?;
-    Ok(Request::from_parts(parts, Body::from(bytes)))
+    let parsed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => Some(value),
+        Err(error) if guards::is_json_content_type(&parts.headers) => {
+            return Err(guards::malformed_json_response(&error));
+        }
+        Err(_) => None,
+    };
+    let invalid_message = if guards::is_json_content_type(&parts.headers) {
+        serde_json::from_slice::<rmcp::model::ClientJsonRpcMessage>(&bytes).err()
+    } else {
+        None
+    };
+    let info = SessionRequestInfo {
+        invalid_message,
+        action: parsed.as_ref().and_then(jsonrpc_action_label),
+        request_id: parsed
+            .as_ref()
+            .and_then(super::inflight_ids::jsonrpc_request_id),
+        initialize: parsed.filter(guards::contains_initialize),
+    };
+    Ok((Request::from_parts(parts, Body::from(bytes)), info))
 }
 
 fn record_session_heartbeat(
-    session_registry: &crate::server::session_registry::SharedSessionRegistry,
+    state: &SessionRequestState,
     session_id: &str,
     action: Option<String>,
 ) -> Result<(), Response> {
-    let mut registry = session_registry.lock().map_err(|_error| {
+    let now = crate::server::session_registry::unix_time_ms_now();
+    let mut registry = state.session_registry.lock().map_err(|_error| {
         tracing::error!(
             code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
             session_id,
@@ -368,11 +529,20 @@ fn record_session_heartbeat(
         );
         session_registry_failed()
     })?;
-    registry.record_seen(
-        session_id,
-        action,
-        crate::server::session_registry::unix_time_ms_now(),
-    );
+    registry.record_request_seen(session_id, action, now);
+    let activity = state
+        .activity_db
+        .as_ref()
+        .and_then(|_| registry.reserve_activity_persistence(session_id, now));
+    drop(registry);
+    if let (Some(db), Some(activity)) = (&state.activity_db, activity) {
+        super::transport::spawn_session_activity_persistence(
+            Arc::clone(db),
+            Arc::clone(&state.session_registry),
+            session_id.to_owned(),
+            activity,
+        );
+    }
     Ok(())
 }
 
@@ -478,3 +648,39 @@ fn session_registry_failed() -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "tests/inflight_duplicate_id_20.rs"]
+mod inflight_duplicate_id_20;
+
+#[cfg(test)]
+#[path = "tests/session_router_support.rs"]
+mod session_router_support;
+
+#[cfg(test)]
+#[path = "tests/malformed_json_28.rs"]
+mod malformed_json_28;
+
+#[cfg(test)]
+#[path = "tests/double_initialize_29.rs"]
+mod double_initialize_29;
+
+#[cfg(test)]
+#[path = "tests/session_admission_13.rs"]
+mod session_admission_13;
+
+#[cfg(test)]
+#[path = "tests/session_test_support.rs"]
+mod session_test_support;
+
+#[cfg(test)]
+#[path = "tests/session_admission_ceiling_13.rs"]
+mod session_admission_ceiling_13;
+
+#[cfg(test)]
+#[path = "tests/inflight_counters_20.rs"]
+mod inflight_counters_20;
+
+#[cfg(test)]
+#[path = "tests/stalled_initialize_37.rs"]
+mod stalled_initialize_37;

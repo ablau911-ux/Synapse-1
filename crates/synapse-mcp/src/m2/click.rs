@@ -7,15 +7,47 @@ use synapse_core::{Action, Backend, ButtonAction, ElementId, MouseTarget, Point,
 
 use crate::m1::mcp_error;
 
-#[cfg(windows)]
-use windows::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, IsWindow},
-};
-
 mod element;
+pub(crate) use element::click_metadata_refusal_error;
+#[cfg(test)]
+pub(crate) use element::dispatch_189_test_support;
+#[cfg(windows)]
+pub(crate) use element::hwnd_message_readback_for_root;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod foreground_gate;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod hit_test;
+mod hwnd_post;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod point_element;
+mod point_post;
+pub(crate) use point_post::{
+    ClaimedPointTarget, PointClickRoute, claimed_background_point_possible,
+    current_point_click_route,
+    execute_claimed_point_postmessage_click as act_click_claimed_point_postmessage,
+    point_click_resolves_root, unclaimed_point_target_error,
+};
 mod record;
+mod remote_delivery;
+pub(crate) use remote_delivery::{
+    carry_remote_click_delivery, remote_bridge_click_error, remote_cdp_click_failure,
+    remote_click_error, remote_click_with,
+};
 mod schema;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "click/tests/hit_test_197.rs"]
+mod hit_test_197_tests;
+
+#[cfg(test)]
+#[path = "click/tests/foreground_gate_187.rs"]
+mod foreground_gate_187_tests;
+
+#[cfg(test)]
+#[path = "click/tests/foreground_authorization_190.rs"]
+mod foreground_authorization_190_tests;
 
 pub use schema::{
     ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget, ActClickTierAttempt,
@@ -42,70 +74,186 @@ pub(crate) const CLICK_REASON_NO_OBSERVED_DELTA: &str = "no_observed_delta";
 pub(crate) const CLICK_REASON_SELECTION_ONLY: &str = "selection_only";
 pub(crate) const CLICK_REASON_FOREGROUND_REFUSED: &str = "foreground_refused";
 pub(crate) const CLICK_REASON_ERROR: &str = "error";
+/// #189: the delivery call did not report back, so the input may have been delivered.
+pub(crate) const CLICK_REASON_DELIVERY_UNKNOWN: &str = "delivery_unknown";
 
-#[derive(Clone, Debug, Default)]
+use crate::server::user_active_gate::UserActiveGate;
+use foreground_gate::enforce_foreground_click_auth;
+pub(crate) use foreground_gate::{ClaimFacts, ForegroundClickAuth, authorize_foreground_click};
+
+/// Session plus the authorization for the real-foreground (SendInput) tier
+/// (#187). The tier is only reachable when `gate` is `Ok`; a denial is carried
+/// until a click actually needs SendInput so background tiers keep working.
+#[derive(Clone, Debug)]
 pub(crate) struct ForegroundClickPolicy {
     session_id: Option<String>,
-    hidden_desktop_refusal: Option<HiddenDesktopForegroundRefusal>,
+    gate: Result<ForegroundClickAuth, ErrorData>,
+    /// #258: physical user-activity gate, checked right before SendInput.
+    user_active: Option<UserActiveGate>,
 }
 
-#[derive(Clone, Debug)]
-struct HiddenDesktopForegroundRefusal {
-    session_id: String,
-    desktop_names: Vec<String>,
+impl Default for ForegroundClickPolicy {
+    fn default() -> Self {
+        Self::allowed(None)
+    }
 }
 
 impl ForegroundClickPolicy {
+    /// Profile-sanctioned foreground tier (direct callers, recording tests).
     pub(crate) fn allowed(session_id: Option<String>) -> Self {
+        Self::authorized(session_id, Ok(ForegroundClickAuth::Profile))
+    }
+
+    pub(crate) fn authorized(
+        session_id: Option<String>,
+        gate: Result<ForegroundClickAuth, ErrorData>,
+    ) -> Self {
         Self {
             session_id,
-            hidden_desktop_refusal: None,
+            gate,
+            user_active: None,
         }
     }
 
-    pub(crate) fn refuse_hidden_desktop(session_id: String, desktop_names: Vec<String>) -> Self {
-        Self {
-            session_id: Some(session_id.clone()),
-            hidden_desktop_refusal: Some(HiddenDesktopForegroundRefusal {
-                session_id,
-                desktop_names,
-            }),
-        }
+    /// #258: also refuse the SendInput tier while the human is active.
+    pub(crate) fn with_user_active_gate(mut self, user_active: UserActiveGate) -> Self {
+        self.user_active = Some(user_active);
+        self
     }
 
     fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
-    fn foreground_refusal_error(&self, tool: &'static str) -> Option<ErrorData> {
-        let refusal = self.hidden_desktop_refusal.as_ref()?;
-        let detail = format!(
-            "{tool} cannot use the visible foreground input tier because MCP session {:?} owns hidden desktop(s) {:?}; hidden Win32 desktops are not the active input desktop, so raw SendInput/cursor delivery is refused. Use a background CDP/UIA/PostMessage target route or a separate Windows session/RDP path for raw-input-required apps.",
-            refusal.session_id, refusal.desktop_names
-        );
-        Some(ErrorData::new(
-            ErrorCode(-32099),
-            detail,
-            Some(json!({
-                "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
-                "reason": "hidden_desktop_foreground_tier_refused",
-                "tool": tool,
-                "session_id": refusal.session_id,
-                "desktop_names": refusal.desktop_names,
-                "foreground_tier_allowed": false,
-            })),
-        ))
+    /// Audit label for how the SendInput tier is sanctioned (#190); `None`
+    /// when the tier is refused.
+    const fn foreground_authorization(&self) -> Option<&'static str> {
+        match &self.gate {
+            Ok(ForegroundClickAuth::Profile) => Some(FOREGROUND_AUTH_PROFILE),
+            Ok(ForegroundClickAuth::Claimed { .. }) => Some(FOREGROUND_AUTH_CLAIMED_TARGET),
+            Err(_) => None,
+        }
+    }
+
+    /// #107: the window this session's claimed route names; `None` for the
+    /// profile route or a refused tier.
+    const fn claimed_root(&self) -> Option<i64> {
+        match &self.gate {
+            Ok(ForegroundClickAuth::Claimed { root_hwnd }) => Some(*root_hwnd),
+            Ok(ForegroundClickAuth::Profile) | Err(_) => None,
+        }
+    }
+
+    /// Gate for one SendInput click: the stored authorization, then the live
+    /// foreground proof for the claimed route, then the live physical
+    /// user-activity check (#258).
+    fn authorize_delivery(&self, point: Option<Point>) -> Result<(), ErrorData> {
+        match &self.gate {
+            Ok(auth) => enforce_foreground_click_auth(*auth, point)?,
+            Err(denial) => return Err(denial.clone()),
+        }
+        self.user_active
+            .as_ref()
+            .map_or(Ok(()), UserActiveGate::check)
+    }
+
+    /// #258 test seam: [`Self::authorize_delivery`] for tests outside `m2::click`
+    /// (the policy built by `foreground_click_policy_for_request`).
+    #[cfg(test)]
+    pub(crate) fn authorize_delivery_for_test(
+        &self,
+        point: Option<Point>,
+    ) -> Result<(), ErrorData> {
+        self.authorize_delivery(point)
     }
 }
+
+fn point_target_screen_point(target: &ActClickTarget) -> Option<Point> {
+    match target {
+        ActClickTarget::Point(point) => Some(Point {
+            x: point.x,
+            y: point.y,
+        }),
+        ActClickTarget::Element(_) => None,
+    }
+}
+
+#[allow(dead_code)]
+pub async fn act_click_with_handle(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    params: ActClickParams,
+) -> Result<ActClickResponse, ErrorData> {
+    act_click_with_handle_and_lease(handle, recording, params, ForegroundClickPolicy::default())
+        .await
+}
+
+/// `foreground_authorization` value for the #187 claimed-window route.
+pub(crate) const FOREGROUND_AUTH_CLAIMED_TARGET: &str = "claimed_target";
+/// `foreground_authorization` value for a profile-sanctioned foreground tier.
+pub(crate) const FOREGROUND_AUTH_PROFILE: &str = "profile";
 
 pub(crate) async fn act_click_with_handle_and_lease(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActClickParams,
     foreground_click_policy: ForegroundClickPolicy,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
-    validate_click_params(&params)?;
+    let authorization = foreground_click_policy.foreground_authorization();
+    let result = dispatch_click(handle, recording, params, foreground_click_policy).await;
+    stamp_foreground_authorization(result, authorization)
+}
+
+/// Records on every foreground (SendInput) tier attempt how that tier was
+/// sanctioned, on the response and on an error's `data.tier_attempts`, so the
+/// audit can tell the claimed-window route from a policy violation (#190).
+pub(crate) fn stamp_foreground_authorization(
+    result: Result<ActClickResponse, ErrorData>,
+    authorization: Option<&'static str>,
+) -> Result<ActClickResponse, ErrorData> {
+    let Some(authorization) = authorization else {
+        return result;
+    };
+    match result {
+        Ok(mut response) => {
+            for attempt in &mut response.tier_attempts {
+                if attempt.tier == CLICK_TIER_FOREGROUND {
+                    attempt.foreground_authorization = Some(authorization.to_owned());
+                }
+            }
+            Ok(response)
+        }
+        Err(mut error) => {
+            if let Some(attempts) = error
+                .data
+                .as_mut()
+                .and_then(|data| data.get_mut("tier_attempts"))
+                .and_then(Value::as_array_mut)
+            {
+                for attempt in attempts.iter_mut().filter(|attempt| {
+                    attempt.get("tier").and_then(Value::as_str) == Some(CLICK_TIER_FOREGROUND)
+                }) {
+                    if let Some(attempt) = attempt.as_object_mut() {
+                        attempt.insert(
+                            "foreground_authorization".to_owned(),
+                            Value::String(authorization.to_owned()),
+                        );
+                    }
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn dispatch_click(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    params: ActClickParams,
+    foreground_click_policy: ForegroundClickPolicy,
+) -> Result<ActClickResponse, ErrorData> {
+    // #189 R5: request validation precedes every dispatching call.
+    validate_click_params(&params).map_err(element::mark_click_not_dispatched)?;
     if params.deprecated_curve_alias_used {
         tracing::warn!(
             code = "M2_ACT_CLICK_DEPRECATED_CURVE_ALIAS",
@@ -121,20 +269,15 @@ pub(crate) async fn act_click_with_handle_and_lease(
     if let ActClickTarget::Element(element) = &params.target
         && let Some(backend) = synapse_a11y::cdp_backend_from_element_id(&element.element_id)
     {
-        ensure_element_transport_backend_allowed(&params, "CDP")?;
-        return execute_cdp_click(
-            &params,
-            element,
-            backend,
-            double_click_timing,
-            started,
-            boundary,
-        )
-        .await;
+        ensure_element_transport_backend_allowed(&params, "CDP")
+            .map_err(element::mark_click_not_dispatched)?;
+        return execute_cdp_click(&params, element, backend, double_click_timing, started).await;
     }
     if let ActClickTarget::Element(element) = &params.target {
-        reject_click_modifiers_for_non_cdp(&params, "native/UIA element targets")?;
-        ensure_element_transport_backend_allowed(&params, "UIA")?;
+        reject_click_modifiers_for_non_cdp(&params, "native/UIA element targets")
+            .map_err(element::mark_click_not_dispatched)?;
+        ensure_element_transport_backend_allowed(&params, "UIA")
+            .map_err(element::mark_click_not_dispatched)?;
         return element::execute_element_click(
             handle,
             &params,
@@ -143,13 +286,13 @@ pub(crate) async fn act_click_with_handle_and_lease(
             double_click_timing,
             started,
             foreground_click_policy,
-            boundary,
         )
         .await;
     }
 
-    reject_click_modifiers_for_non_cdp(&params, "coordinate point targets")?;
-    let target = point_mouse_target(&params.target)?;
+    reject_click_modifiers_for_non_cdp(&params, "coordinate point targets")
+        .map_err(element::mark_click_not_dispatched)?;
+    let target = point_mouse_target(&params.target).map_err(element::mark_click_not_dispatched)?;
     let mut actions = Vec::with_capacity(usize::from(params.clicks) + 1);
     actions.push(Action::MouseMove {
         to: target,
@@ -167,15 +310,9 @@ pub(crate) async fn act_click_with_handle_and_lease(
     }
 
     let tier_attempts = if let Some(recording) = recording {
-        boundary.ensure("immediately_before_coordinate_recording_dispatch")?;
-        if let Err(error) = record::execute_recording(
-            &recording,
-            &actions,
-            params.clicks,
-            double_click_timing,
-            boundary,
-        )
-        .await
+        if let Err(error) =
+            record::execute_recording(&recording, &actions, params.clicks, double_click_timing)
+                .await
         {
             let error_code = click_error_code(&error);
             let reason_code = click_reason_for_error_code(&error_code);
@@ -202,9 +339,9 @@ pub(crate) async fn act_click_with_handle_and_lease(
             &foreground_click_policy,
             params.hold_ms,
             &mut tier_attempts,
+            point_target_screen_point(&params.target),
         )?;
-        boundary.ensure("immediately_before_coordinate_action_dispatch")?;
-        match record::execute_actor_actions(handle, actions, double_click_timing, boundary).await {
+        match record::execute_actor_actions(handle, actions, double_click_timing).await {
             Ok(()) => {
                 tier_attempts.push(click_tier_delivered(
                     CLICK_TIER_FOREGROUND,
@@ -248,47 +385,6 @@ pub(crate) async fn act_click_with_handle_and_lease(
     })
 }
 
-pub(crate) async fn act_click_postmessage_with_params(
-    params: &ActClickParams,
-    mut prior_attempts: Vec<ActClickTierAttempt>,
-    boundary: super::OperatorPanicActionBoundary,
-) -> Result<ActClickResponse, ErrorData> {
-    validate_click_params(params)?;
-    let started = Instant::now();
-    let double_click_timing = cached_double_click_timing();
-    match &params.target {
-        ActClickTarget::Element(element) => {
-            ensure_element_transport_backend_allowed(params, "PostMessage")?;
-            element::execute_element_postmessage_click(
-                params,
-                element,
-                prior_attempts,
-                double_click_timing,
-                started,
-                boundary,
-            )
-            .await
-        }
-        ActClickTarget::Point(point) => {
-            let detail = format!(
-                "act_click PostMessage tier requires an element target resolved to an HWND, got point ({}, {})",
-                point.x, point.y
-            );
-            prior_attempts.push(click_tier_failed(
-                CLICK_TIER_POSTMESSAGE,
-                CLICK_REASON_TARGET_INVALID,
-                error_codes::ACTION_TARGET_INVALID,
-                false,
-                detail.clone(),
-            ));
-            Err(attach_click_tier_attempts(
-                mcp_error(error_codes::ACTION_TARGET_INVALID, detail),
-                prior_attempts,
-            ))
-        }
-    }
-}
-
 /// Routes a click on a CDP web element id through CDP (#686): resolve the
 /// browser's debug endpoint from the element's window, scroll the node into
 /// view, and dispatch the click in viewport coordinates. Fail-loud if the
@@ -300,7 +396,6 @@ async fn execute_cdp_click(
     backend_node_id: i64,
     double_click_timing: synapse_action::DoubleClickTiming,
     started: Instant,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     use synapse_core::MouseButton;
 
@@ -310,7 +405,10 @@ async fn execute_cdp_click(
         .map_err(|err| {
             let detail = format!("web element id is malformed: {err}");
             attach_click_tier_attempts(
-                mcp_error(error_codes::ACTION_ELEMENT_NOT_RESOLVED, detail.clone()),
+                element::mark_click_not_dispatched(mcp_error(
+                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                    detail.clone(),
+                )),
                 vec![click_tier_failed(
                     CLICK_TIER_CDP,
                     CLICK_REASON_TARGET_INVALID,
@@ -334,7 +432,10 @@ async fn execute_cdp_click(
             let detail =
                 format!("act_click button {other:?} is not supported for web (CDP) elements");
             return Err(attach_click_tier_attempts(
-                mcp_error(error_codes::TOOL_PARAMS_INVALID, detail.clone()),
+                element::mark_click_not_dispatched(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    detail.clone(),
+                )),
                 vec![click_tier_failed(
                     CLICK_TIER_CDP,
                     CLICK_REASON_PARAMS_INVALID,
@@ -347,67 +448,76 @@ async fn execute_cdp_click(
     };
     let modifiers = cdp_click_modifier_bits(&params.modifiers);
 
-    if let Some(endpoint) = synapse_a11y::endpoint_for_window(hwnd) {
-        boundary.ensure("immediately_before_cdp_click_node")?;
-        synapse_a11y::cdp_click_node(
-            &endpoint,
-            &title_hint,
-            target_id_hint.as_deref(),
-            backend_node_id,
-            button,
-            i64::from(params.clicks),
-            modifiers,
-        )
-        .await
-        .map_err(|err| {
-            let error = action_error_to_mcp(&a11y_to_action_error(&err));
-            attach_click_tier_attempts(
-                error,
-                vec![click_tier_failed(
-                    CLICK_TIER_CDP,
-                    click_reason_for_error_code(err.code()),
-                    err.code(),
-                    false,
-                    err.to_string(),
-                )],
+    remote_click_with(async {
+        if let Some(endpoint) = synapse_a11y::endpoint_for_window(hwnd) {
+            synapse_a11y::cdp_click_node(
+                &endpoint,
+                &title_hint,
+                target_id_hint.as_deref(),
+                backend_node_id,
+                button,
+                i64::from(params.clicks),
+                modifiers,
             )
-        })?;
-    } else {
-        let bridge_button = match button {
-            synapse_a11y::CdpMouseButton::Left => {
-                crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Left
-            }
-            synapse_a11y::CdpMouseButton::Right => {
-                crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Right
-            }
-            synapse_a11y::CdpMouseButton::Middle => {
-                crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Middle
-            }
-        };
-        boundary.ensure("immediately_before_chrome_bridge_click_node")?;
-        crate::chrome_debugger_bridge::click_node(
-            hwnd,
-            &title_hint,
-            target_id_hint.as_deref(),
-            backend_node_id,
-            bridge_button,
-            i64::from(params.clicks),
-        )
-        .await
-        .map_err(|err| {
-            let detail = format!("Chrome debugger extension click failed: {}", err.detail());
-            attach_click_tier_attempts(
-                mcp_error(err.code(), detail.clone()),
-                vec![click_tier_failed(
-                    CLICK_TIER_CDP,
-                    click_reason_for_error_code(err.code()),
-                    err.code(),
-                    false,
-                    detail,
-                )],
+            .await
+            .map_err(|err| {
+                let error = remote_cdp_click_failure(
+                    &err,
+                    action_error_to_mcp(&a11y_to_action_error(&err)),
+                );
+                attach_click_tier_attempts(
+                    error,
+                    vec![click_tier_failed(
+                        CLICK_TIER_CDP,
+                        click_reason_for_error_code(err.code()),
+                        err.code(),
+                        false,
+                        err.to_string(),
+                    )],
+                )
+            })?;
+        } else {
+            let bridge_button = match button {
+                synapse_a11y::CdpMouseButton::Left => {
+                    crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Left
+                }
+                synapse_a11y::CdpMouseButton::Right => {
+                    crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Right
+                }
+                synapse_a11y::CdpMouseButton::Middle => {
+                    crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Middle
+                }
+            };
+            crate::chrome_debugger_bridge::click_node(
+                hwnd,
+                &title_hint,
+                target_id_hint.as_deref(),
+                backend_node_id,
+                bridge_button,
+                i64::from(params.clicks),
             )
-        })?;
-    }
+            .await
+            .map_err(|err| {
+                let detail = format!("Chrome debugger extension click failed: {}", err.detail());
+                attach_click_tier_attempts(
+                    remote_delivery::stamp_bridge_dispatch_stage(
+                        mcp_error(err.code(), detail.clone()),
+                        err.dispatch_stage(),
+                    ),
+                    vec![click_tier_failed(
+                        CLICK_TIER_CDP,
+                        click_reason_for_error_code(err.code()),
+                        err.code(),
+                        false,
+                        detail,
+                    )],
+                )
+            })?;
+        }
+
+        Ok(())
+    })
+    .await?;
 
     Ok(ActClickResponse {
         ok: true,
@@ -449,6 +559,7 @@ pub(crate) fn click_tier_delivered(
         error_code: None,
         detail: Some(detail.into()),
         required_foreground,
+        foreground_authorization: None,
     };
     log_click_tier_attempt(&attempt);
     attempt
@@ -468,6 +579,7 @@ pub(crate) fn click_tier_failed(
         error_code: Some(error_code.into()),
         detail: Some(detail.into()),
         required_foreground,
+        foreground_authorization: None,
     };
     log_click_tier_attempt(&attempt);
     attempt
@@ -475,8 +587,24 @@ pub(crate) fn click_tier_failed(
 
 pub(crate) fn attach_click_tier_attempts(
     mut error: ErrorData,
-    tier_attempts: Vec<ActClickTierAttempt>,
+    mut tier_attempts: Vec<ActClickTierAttempt>,
 ) -> ErrorData {
+    if error
+        .data
+        .as_ref()
+        .is_some_and(|data| data["delivered"] == true)
+        && !tier_attempts
+            .iter()
+            .any(|attempt| attempt.status == "delivered")
+        && let Some(failed) = tier_attempts.last().cloned()
+    {
+        let delivered = click_tier_delivered(
+            failed.tier,
+            failed.required_foreground,
+            "input delivered before this tier reported failure",
+        );
+        tier_attempts.insert(tier_attempts.len().saturating_sub(1), delivered);
+    }
     let attempts = serde_json::to_value(&tier_attempts).unwrap_or_else(|err| {
         json!([{
             "tier": "telemetry",
@@ -536,10 +664,6 @@ pub(crate) fn click_params_can_route_background_first(params: &ActClickParams) -
 }
 
 pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i64>, ErrorData> {
-    let verify_target_window_hwnd = params
-        .verify_target_window_hwnd
-        .map(|hwnd| crate::m1::validate_hwnd_shape("act_click", "verify_target_window_hwnd", hwnd))
-        .transpose()?;
     match &params.target {
         ActClickTarget::Element(element) => {
             let parsed_hwnd = element
@@ -555,24 +679,18 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
                     )
                 })?
                 .hwnd;
-            let hwnd = verified_top_level_hwnd(parsed_hwnd).map_err(|detail| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "act_click element id {} could not be normalized for target-window verification: {detail}",
-                        element.element_id
-                    ),
-                )
-            })?;
-            if let Some(expected) = verify_target_window_hwnd {
-                let expected_root = verified_top_level_hwnd(expected).map_err(|detail| {
-                    mcp_error(
-                        error_codes::ACTION_TARGET_INVALID,
-                        format!(
-                            "act_click verify_target_window_hwnd 0x{expected:x} could not be normalized for element-target verification: {detail}"
-                        ),
-                    )
-                })?;
+            let hwnd = crate::m2::live_target_root(
+                parsed_hwnd,
+                &format!(
+                    "act_click element id {} target window check",
+                    element.element_id
+                ),
+            )?;
+            if let Some(expected) = params.verify_target_window_hwnd {
+                let expected_root = crate::m2::live_target_root(
+                    expected,
+                    "act_click verify_target_window_hwnd check for element target",
+                )?;
                 if expected_root != hwnd {
                     return Err(mcp_error(
                         error_codes::ACTION_TARGET_INVALID,
@@ -584,16 +702,13 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
             }
             Ok(Some(hwnd))
         }
-        ActClickTarget::Point(_) => verify_target_window_hwnd
+        ActClickTarget::Point(_) => params
+            .verify_target_window_hwnd
             .map(|hwnd| {
-                verified_top_level_hwnd(hwnd).map_err(|detail| {
-                    mcp_error(
-                        error_codes::ACTION_TARGET_INVALID,
-                        format!(
-                            "act_click verify_target_window_hwnd 0x{hwnd:x} could not be normalized for point-target verification: {detail}"
-                        ),
-                    )
-                })
+                crate::m2::live_target_root(
+                    hwnd,
+                    "act_click verify_target_window_hwnd check for point target",
+                )
             })
             .transpose(),
     }
@@ -617,52 +732,28 @@ pub(crate) fn click_target_foreground_guard_hwnds(
                     )
                 })?
                 .hwnd;
-            let root_hwnd = verified_top_level_hwnd(element_hwnd).map_err(|detail| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "act_click element id {} HWND 0x{element_hwnd:x} could not be normalized for foreground guard: {detail}",
-                        element.element_id
-                    ),
-                )
-            })?;
+            let root_hwnd = crate::m2::live_target_root(
+                element_hwnd,
+                &format!(
+                    "act_click element id {} target window check before delivery",
+                    element.element_id
+                ),
+            )?;
             Ok(Some((element_hwnd, root_hwnd)))
         }
-        ActClickTarget::Point(_) => Ok(None),
+        // #107: a point click that names its window runs under the same
+        // foreground guard as element clicks (settle, restore, report).
+        ActClickTarget::Point(_) => params
+            .verify_target_window_hwnd
+            .map(|hwnd| {
+                crate::m2::live_target_root(
+                    hwnd,
+                    "act_click verify_target_window_hwnd check before delivery",
+                )
+                .map(|root_hwnd| (root_hwnd, root_hwnd))
+            })
+            .transpose(),
     }
-}
-
-#[cfg(windows)]
-fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
-    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
-        format!(
-            "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
-        )
-    })?;
-    let seed = HWND(native as *mut std::ffi::c_void);
-    if seed.0.is_null() || !unsafe { IsWindow(Some(seed)) }.as_bool() {
-        return Err(format!("element HWND 0x{hwnd:x} is not a live window"));
-    }
-    let root = unsafe { GetAncestor(seed, GA_ROOT) };
-    let root = if root.0.is_null() { seed } else { root };
-    if !unsafe { IsWindow(Some(root)) }.as_bool() {
-        return Err(format!(
-            "top-level root HWND 0x{:x} for element HWND 0x{hwnd:x} is not live",
-            root.0 as usize
-        ));
-    }
-    Ok(synapse_core::win32_hwnd::hwnd_to_wire(root.0 as isize))
-}
-
-#[cfg(not(windows))]
-fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
-    synapse_core::win32_hwnd::hwnd_from_wire(hwnd)
-        .map(|_native| hwnd)
-        .ok_or_else(|| {
-            format!(
-                "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
-            )
-        })
 }
 
 pub(crate) fn click_error_code(error: &ErrorData) -> String {
@@ -675,18 +766,11 @@ pub(crate) fn click_error_code(error: &ErrorData) -> String {
         .to_owned()
 }
 
-pub(crate) fn error_has_click_tier_attempts(error: &ErrorData) -> bool {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("tier_attempts"))
-        .and_then(Value::as_array)
-        .is_some_and(|attempts| !attempts.is_empty())
-}
-
 pub(crate) fn click_reason_for_error_code(error_code: &str) -> &'static str {
     match error_code {
-        error_codes::FOREGROUND_ACTIVATION_REFUSED => CLICK_REASON_FOREGROUND_REFUSED,
+        error_codes::FOREGROUND_ACTIVATION_REFUSED | error_codes::TOOL_PROFILE_POLICY_DENIED => {
+            CLICK_REASON_FOREGROUND_REFUSED
+        }
         error_codes::ACTION_FOREGROUND_LEASE_BUSY => "foreground_lease_busy",
         error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED => CLICK_REASON_PATTERN_UNSUPPORTED,
         error_codes::TRANSIENT_ELEMENT_EXPIRED | error_codes::A11Y_ELEMENT_STALE => {
@@ -712,16 +796,24 @@ pub(super) fn acquire_click_foreground_lease(
     foreground_click_policy: &ForegroundClickPolicy,
     hold_ms: u32,
     tier_attempts: &mut Vec<ActClickTierAttempt>,
+    click_point: Option<Point>,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
-    if let Some(error) = foreground_click_policy.foreground_refusal_error("act_click") {
+    if let Err(error) = foreground_click_policy.authorize_delivery(click_point) {
+        let error_code = click_error_data_code(&error)
+            .unwrap_or(error_codes::TOOL_PROFILE_POLICY_DENIED)
+            .to_owned();
         tier_attempts.push(click_tier_failed(
             CLICK_TIER_FOREGROUND,
-            CLICK_REASON_FOREGROUND_REFUSED,
-            error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            click_reason_for_error_code(&error_code),
+            error_code,
             true,
             error.message.to_string(),
         ));
-        return Err(attach_click_tier_attempts(error, tier_attempts.clone()));
+        // #189: a refused SendInput tier sent no input.
+        return Err(attach_click_tier_attempts(
+            element::mark_click_not_dispatched(error),
+            tier_attempts.clone(),
+        ));
     }
     match crate::m2::acquire_foreground_input_lease_with_ttl(
         "act_click",
@@ -740,7 +832,10 @@ pub(super) fn acquire_click_foreground_lease(
                 true,
                 error.message.to_string(),
             ));
-            Err(attach_click_tier_attempts(error, tier_attempts.clone()))
+            Err(attach_click_tier_attempts(
+                element::mark_click_not_dispatched(error),
+                tier_attempts.clone(),
+            ))
         }
     }
 }
@@ -916,6 +1011,9 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
         ActionError::ElementPatternUnsupported { element_id, detail } => {
             element_pattern_unsupported_error(element_id, detail)
         }
+        ActionError::ClickNotDispatched { source, .. } => {
+            element::mark_click_not_dispatched(action_error_to_mcp(source))
+        }
         _ => crate::m2::action_error_to_mcp(error),
     }
 }
@@ -990,6 +1088,7 @@ fn element_pattern_unsupported_error(element_id: &ElementId, detail: &str) -> Er
                 "root_hwnd": root_hwnd,
                 "attempted_patterns": SUPPORTED_UIA_CLICK_PATTERNS,
                 "source_of_truth": "live UI Automation control-pattern availability on the re-resolved element",
+                "dispatch_not_started": true,
                 "router_escalation_required": true,
                 "router_next_tier": "postmessage",
                 "detail": detail,

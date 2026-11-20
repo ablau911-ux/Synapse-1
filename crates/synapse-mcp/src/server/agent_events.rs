@@ -10,10 +10,11 @@
 //!
 //! # Durability contract (#897 acceptance)
 //!
-//! [`record_agent_event`] uses `Db::put_batch`, which returns only after
-//! the row reaches RocksDB with a synced WAL. [`record_agent_event_durable`]
-//! additionally calls `Db::flush()` at terminal lifecycle boundaries
-//! (exited, spawn failure, session deleted).
+//! [`record_agent_event`] rides the storage batcher (`Db::put_batch`,
+//! flushed every 100 ms / 64 KiB): a daemon crash loses at most the
+//! in-flight batch. [`record_agent_event_durable`] additionally calls
+//! `Db::flush()` so terminal lifecycle facts (exited, spawn failure,
+//! session deleted) survive an immediate crash.
 //!
 //! # Failure contract
 //!
@@ -27,7 +28,7 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Mutex, OnceLock,
         atomic::{AtomicU32, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -37,11 +38,12 @@ use rmcp::model::ErrorCode;
 use serde_json::json;
 use synapse_core::{AgentEventKind, AgentEventRecord};
 use synapse_storage::{
-    Db, StorageError, StorageResult, agent_events::agent_event_key, cf, encode_json,
+    CrossCfBatchMutation, Db, StorageError, StorageResult, agent_events::agent_event_key, cf,
+    encode_json,
 };
 
 use super::ErrorData;
-use super::session_registry::{SessionRegistry, SharedSessionRegistry, unix_time_ms_now};
+use super::session_registry::{SharedSessionRegistry, unix_time_ms_now};
 
 /// Hard cap on one encoded journal row. Agent events are bounded metadata;
 /// anything larger indicates a writer leaking content into the journal.
@@ -51,7 +53,7 @@ pub(crate) const MAX_AGENT_EVENT_VALUE_BYTES: usize = 16 * 1024;
 /// within one clock tick; wraps harmlessly because `ts_ns` dominates the key.
 static NEXT_AGENT_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-static SESSION_REGISTRY_ACTIVITY_SINK: OnceLock<Mutex<Option<Weak<Mutex<SessionRegistry>>>>> =
+static SESSION_REGISTRY_ACTIVITY_SINK: OnceLock<Mutex<Option<SharedSessionRegistry>>> =
     OnceLock::new();
 
 /// Physical readback of one persisted journal row.
@@ -77,10 +79,7 @@ pub(crate) fn install_session_registry_activity_sink(registry: SharedSessionRegi
     let slot = SESSION_REGISTRY_ACTIVITY_SINK.get_or_init(|| Mutex::new(None));
     match slot.lock() {
         Ok(mut guard) => {
-            // The process-global projection hook must not keep a failed or
-            // stopped daemon's session/service graph alive. Each event upgrades
-            // the current generation only while applying its refresh.
-            *guard = Some(Arc::downgrade(&registry));
+            *guard = Some(registry);
             tracing::info!(
                 code = "AGENT_EVENT_SESSION_REGISTRY_ACTIVITY_SINK_INSTALLED",
                 "agent activity rows will refresh SessionRegistry last_seen"
@@ -135,6 +134,161 @@ pub(crate) fn record_agent_events(
     Ok(readbacks)
 }
 
+/// Commits agent journal rows together with `CF_SESSIONS` ownership-row
+/// mutations in one RocksDB batch.
+///
+/// Input-lease lifecycle changes use this narrow path so a crash cannot leave
+/// a durable ownership marker without its corresponding journal edge (or the
+/// inverse). The journal records remain subject to the normal validation and
+/// state projection after the atomic write succeeds.
+pub(crate) fn record_agent_events_with_session_mutations(
+    db: &Db,
+    session_deletes: &[Vec<u8>],
+    session_puts: &[(Vec<u8>, Vec<u8>)],
+    records: &[AgentEventRecord],
+) -> StorageResult<Vec<AgentEventWriteReadback>> {
+    let mut mutations = Vec::with_capacity(
+        session_deletes
+            .len()
+            .saturating_add(session_puts.len())
+            .saturating_add(records.len()),
+    );
+    mutations.extend(
+        session_deletes
+            .iter()
+            .cloned()
+            .map(|key| CrossCfBatchMutation::Delete {
+                cf_name: cf::CF_SESSIONS,
+                key,
+            }),
+    );
+    mutations.extend(
+        session_puts
+            .iter()
+            .cloned()
+            .map(|(key, value)| CrossCfBatchMutation::Put {
+                cf_name: cf::CF_SESSIONS,
+                key,
+                value,
+            }),
+    );
+
+    let mut readbacks = Vec::with_capacity(records.len());
+    for record in records {
+        let encoded = validate_and_encode(record).inspect_err(|error| {
+            tracing::error!(
+                code = "AGENT_EVENT_WRITE_FAILED",
+                kind = ?record.kind,
+                session_id = ?record.session_id,
+                spawn_id = ?record.spawn_id,
+                reason_code = ?record.reason_code,
+                detail = %error,
+                "agent event refused before cross-column-family transition write"
+            );
+        })?;
+        let seq = NEXT_AGENT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+        readbacks.push(AgentEventWriteReadback {
+            ts_ns: record.ts_ns,
+            seq,
+            value_len_bytes: encoded.len(),
+        });
+        mutations.push(CrossCfBatchMutation::Put {
+            cf_name: cf::CF_AGENT_EVENTS,
+            key: agent_event_key(record.ts_ns, seq),
+            value: encoded,
+        });
+    }
+
+    #[cfg(test)]
+    refuse_lease_release_batch_for_test(db, records)?;
+    db.mutate_cross_cf_batch_pressure_bypass(mutations)
+        .inspect_err(|error| {
+            tracing::error!(
+                code = "AGENT_EVENT_WRITE_FAILED",
+                record_count = records.len(),
+                session_delete_count = session_deletes.len(),
+                session_put_count = session_puts.len(),
+                detail = %error,
+                "cross-column-family lease lifecycle transition write failed"
+            );
+        })?;
+    super::agent_state::observe_recorded_events(db, records);
+    refresh_installed_session_registry_activity(records);
+    Ok(readbacks)
+}
+
+#[cfg(test)]
+type LeaseReleaseFaults =
+    std::collections::BTreeMap<(usize, String), std::sync::Arc<std::sync::atomic::AtomicBool>>;
+
+#[cfg(test)]
+fn lease_release_faults() -> &'static std::sync::Mutex<LeaseReleaseFaults> {
+    static FAULTS: std::sync::OnceLock<std::sync::Mutex<LeaseReleaseFaults>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) struct LeaseReleaseBatchFaultGuard {
+    key: (usize, String),
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for LeaseReleaseBatchFaultGuard {
+    fn drop(&mut self) {
+        self.armed.store(false, Ordering::SeqCst);
+        let mut faults = lease_release_faults()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if faults
+            .get(&self.key)
+            .is_some_and(|value| std::sync::Arc::ptr_eq(value, &self.armed))
+        {
+            faults.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_lease_release_batch_for_test(
+    db: &Db,
+    session_id: &str,
+) -> LeaseReleaseBatchFaultGuard {
+    let key = (std::ptr::from_ref(db) as usize, session_id.to_owned());
+    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    lease_release_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone(), std::sync::Arc::clone(&armed));
+    LeaseReleaseBatchFaultGuard { key, armed }
+}
+
+#[cfg(test)]
+fn refuse_lease_release_batch_for_test(db: &Db, records: &[AgentEventRecord]) -> StorageResult<()> {
+    let faults = lease_release_faults()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for record in records
+        .iter()
+        .filter(|record| record.kind == synapse_core::AgentEventKind::LeaseReleased)
+    {
+        let Some(session_id) = record.session_id.as_ref() else {
+            continue;
+        };
+        if faults
+            .get(&(std::ptr::from_ref(db) as usize, session_id.clone()))
+            .is_some_and(|armed| armed.swap(false, Ordering::SeqCst))
+        {
+            return Err(synapse_storage::StorageError::WriteFailed {
+                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                detail: "injected lease release atomic batch failure".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn refresh_installed_session_registry_activity(records: &[AgentEventRecord]) {
     let Some(registry) = installed_session_registry_activity_sink() else {
         return;
@@ -154,7 +308,7 @@ fn refresh_installed_session_registry_activity(records: &[AgentEventRecord]) {
 fn installed_session_registry_activity_sink() -> Option<SharedSessionRegistry> {
     let slot = SESSION_REGISTRY_ACTIVITY_SINK.get()?;
     match slot.lock() {
-        Ok(guard) => guard.as_ref().and_then(Weak::upgrade),
+        Ok(guard) => guard.clone(),
         Err(_poisoned) => {
             tracing::error!(
                 code = "AGENT_EVENT_SESSION_LAST_SEEN_REFRESH_FAILED",

@@ -8,16 +8,16 @@ use super::{
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 
 use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 const COOKIES_TOOL: &str = "browser_cookies";
 const STORAGE_TOOL: &str = "browser_storage";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const REDACTION_POLICY: &str = "browser_storage_secret_value_and_url_v2";
 const REDACTED_VALUE: &str = "[redacted]";
+/// The field the masker sets to `true` on every masked value (#2396).
+const VALUE_REDACTED_FIELD: &str = "value_redacted";
 
 mod load_state_validation;
 
@@ -72,7 +72,6 @@ pub struct BrowserCookiesParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -146,7 +145,6 @@ pub struct BrowserStorageParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -287,11 +285,13 @@ impl SynapseService {
                 ),
             ));
         }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        let browser_rows = synapse_browsers::BrowserRegistry::global();
+        if !browser_rows.has_bridge_tab_prefix(&cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "{tool} requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "{tool} requires a normal Chrome bridge tab target ({}); got {cdp_target_id:?}",
+                    browser_rows.tab_target_shapes()
                 ),
             ));
         }
@@ -318,14 +318,6 @@ impl SynapseService {
             "expiresUnixSeconds": params.expires_unix_seconds,
             "session": params.session,
         });
-        if matches!(
-            params.operation,
-            BrowserCookiesOperation::Set | BrowserCookiesOperation::Clear
-        ) {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_cookies_before_set_or_clear",
-            )?;
-        }
         let mut readback = crate::chrome_debugger_bridge::cookies(
             window_hwnd,
             cdp_target_id,
@@ -341,14 +333,6 @@ impl SynapseService {
                 ),
             )
         })?;
-        if matches!(
-            params.operation,
-            BrowserCookiesOperation::Set | BrowserCookiesOperation::Clear
-        ) {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_cookies_after_set_or_clear",
-            )?;
-        }
         let redacted_value_count = redact_browser_secret_values(&mut readback)
             + u32::try_from(redact_url_fields_for_public_readback(&mut readback))
                 .unwrap_or(u32::MAX);
@@ -386,16 +370,6 @@ impl SynapseService {
             "clearBeforeLoad": params.clear_before_load,
             "url": params.url,
         });
-        if matches!(
-            params.operation,
-            BrowserStorageOperation::Set
-                | BrowserStorageOperation::Clear
-                | BrowserStorageOperation::LoadState
-        ) {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_storage_before_page_state_mutation",
-            )?;
-        }
         let mut readback = crate::chrome_debugger_bridge::storage_state(
             window_hwnd,
             cdp_target_id,
@@ -411,16 +385,6 @@ impl SynapseService {
                 ),
             )
         })?;
-        if matches!(
-            params.operation,
-            BrowserStorageOperation::Set
-                | BrowserStorageOperation::Clear
-                | BrowserStorageOperation::LoadState
-        ) {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_storage_after_page_state_mutation",
-            )?;
-        }
         let redacted_value_count = redact_browser_secret_values(&mut readback)
             + u32::try_from(redact_url_fields_for_public_readback(&mut readback))
                 .unwrap_or(u32::MAX);
@@ -540,7 +504,7 @@ fn normalize_keyed_storage_get_result_value(
         "value",
         "value_kind",
         "value_len",
-        "value_redacted",
+        VALUE_REDACTED_FIELD,
         "value_sha256",
         "redaction_policy",
     ] {
@@ -552,37 +516,36 @@ fn normalize_keyed_storage_get_result_value(
 
 fn redact_browser_secret_fields(fields: &mut Map<String, Value>) -> u32 {
     let mut redacted = 0;
-    if let Some(raw_value) = fields.get("value").cloned() {
-        let already_placeholder = raw_value.as_str() == Some(REDACTED_VALUE);
-        if !already_placeholder {
-            if fields
-                .get("value_redacted")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                tracing::error!(
-                    code = "BROWSER_STORAGE_PRE_REDACTED_VALUE_INCONSISTENT",
-                    "browser storage payload claimed value_redacted=true while value still contained non-placeholder data; raw value suppressed"
-                );
-            }
-            let evidence = secret_value_evidence(&raw_value);
-            fields.insert("value".to_owned(), Value::String(REDACTED_VALUE.to_owned()));
-            fields.insert("value_redacted".to_owned(), Value::Bool(true));
-            fields.insert(
-                "value_len".to_owned(),
-                Value::Number(serde_json::Number::from(evidence.value_len)),
+    if let Some(raw_value) = fields.get("value")
+        && raw_value.as_str() != Some(REDACTED_VALUE)
+        && let Some(evidence) = secret_value_evidence(raw_value)
+    {
+        if fields
+            .get(VALUE_REDACTED_FIELD)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            tracing::error!(
+                code = "BROWSER_STORAGE_PRE_REDACTED_VALUE_INCONSISTENT",
+                "browser storage payload claimed value_redacted=true while value still contained non-placeholder data; raw value suppressed"
             );
-            fields.insert(
-                "value_sha256".to_owned(),
-                Value::String(evidence.value_sha256),
-            );
-            fields.insert("value_kind".to_owned(), Value::String(evidence.value_kind));
-            fields.insert(
-                "redaction_policy".to_owned(),
-                Value::String(REDACTION_POLICY.to_owned()),
-            );
-            redacted += 1;
         }
+        fields.insert("value".to_owned(), Value::String(REDACTED_VALUE.to_owned()));
+        fields.insert(VALUE_REDACTED_FIELD.to_owned(), Value::Bool(true));
+        fields.insert(
+            "value_len".to_owned(),
+            Value::Number(serde_json::Number::from(evidence.value_len)),
+        );
+        fields.insert(
+            "value_sha256".to_owned(),
+            Value::String(evidence.value_sha256),
+        );
+        fields.insert("value_kind".to_owned(), Value::String(evidence.value_kind));
+        fields.insert(
+            "redaction_policy".to_owned(),
+            Value::String(REDACTION_POLICY.to_owned()),
+        );
+        redacted += 1;
     }
     redacted
         + fields
@@ -598,10 +561,10 @@ struct SecretValueEvidence {
     value_kind: String,
 }
 
-fn secret_value_evidence(value: &Value) -> SecretValueEvidence {
+fn secret_value_evidence(value: &Value) -> Option<SecretValueEvidence> {
     let (value_kind, bytes) = match value {
         Value::String(text) => ("string".to_owned(), text.as_bytes().to_vec()),
-        Value::Null => ("null".to_owned(), b"null".to_vec()),
+        Value::Null => return None,
         Value::Bool(flag) => ("bool".to_owned(), flag.to_string().into_bytes()),
         Value::Number(number) => ("number".to_owned(), number.to_string().into_bytes()),
         Value::Array(_) => (
@@ -613,11 +576,14 @@ fn secret_value_evidence(value: &Value) -> SecretValueEvidence {
             serialized_value_bytes_for_redaction(value),
         ),
     };
-    SecretValueEvidence {
+    Some(SecretValueEvidence {
         value_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        value_sha256: format!("sha256:{}", sha256_hex(&bytes)),
+        value_sha256: format!(
+            "hmac-sha256:{}",
+            crate::content_digest::keyed_digest_hex(&bytes)
+        ),
         value_kind,
-    }
+    })
 }
 
 fn serialized_value_bytes_for_redaction(value: &Value) -> Vec<u8> {
@@ -634,16 +600,6 @@ fn serialized_value_bytes_for_redaction(value: &Value) -> Vec<u8> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    encoded
-}
-
 fn log_redaction_summary(tool: &str, cdp_target_id: &str, redacted_value_count: u32) {
     tracing::info!(
         code = "BROWSER_STORAGE_VALUES_REDACTED",
@@ -654,3 +610,7 @@ fn log_redaction_summary(tool: &str, cdp_target_id: &str, redacted_value_count: 
         "redacted browser cookie/storage values from MCP output"
     );
 }
+
+#[cfg(test)]
+#[path = "browser_storage_absent_value_table.rs"]
+mod absent_value_table;

@@ -224,10 +224,16 @@ pub fn normalize_replay_path(
 
 #[must_use]
 pub fn replay_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map_or_else(std::env::temp_dir, PathBuf::from)
-        .join("synapse")
-        .join("replays")
+    replay_root_under(
+        &std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from),
+    )
+}
+
+/// The replay root inside the data directory `base` (`LOCALAPPDATA` or the
+/// temp dir for the live root): `<base>/synapse/replays`.
+#[must_use]
+pub fn replay_root_under(base: &Path) -> PathBuf {
+    base.join("synapse").join("replays")
 }
 
 fn parse_grants(raw: &str) -> Result<RequiredPermissions> {
@@ -249,13 +255,22 @@ fn parse_grants(raw: &str) -> Result<RequiredPermissions> {
 }
 
 fn default_grants(audio_enabled: bool) -> RequiredPermissions {
-    // Fail closed by default: a stock daemon may read state, but write and
-    // synthetic-input capabilities require explicit operator opt-in.
+    // Permissive by default: every non-audio permission is granted so a stock
+    // daemon can fully drive the Windows desktop. READ_AUDIO is a real
+    // capability dependency (requires --enable-audio / SYNAPSE_ENABLE_AUDIO),
+    // not a guardrail, so it stays conditional.
     let mut granted = required([
         Permission::ReadEvents,
+        Permission::WriteReflex,
         Permission::ReadReflex,
         Permission::ReadProfile,
+        Permission::WriteProfileActive,
+        Permission::WriteReplay,
         Permission::ReadStorage,
+        Permission::WriteStorage,
+        Permission::InputKeyboard,
+        Permission::InputMouse,
+        Permission::InputPad,
     ]);
     if audio_enabled {
         granted.insert(Permission::ReadAudio);

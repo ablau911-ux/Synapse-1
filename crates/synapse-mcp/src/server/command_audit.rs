@@ -3,14 +3,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use rmcp::ErrorData;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use synapse_storage::cf;
 
 use super::SynapseService;
 use crate::m1::mcp_error;
+use crate::m3::episodes::hex_encode;
 
 const COMMAND_AUDIT_ROW_KIND: &str = "command_audit";
 const COMMAND_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -22,9 +25,13 @@ const COMMAND_AUDIT_QUERY_MAX_LIMIT: usize = 250;
 const COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT: usize = 1000;
 const COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT: usize = 5000;
 const COMMAND_AUDIT_QUERY_BATCH_ROWS: usize = 256;
-const COMMAND_AUDIT_KEY_LEN: usize = 12;
 
 static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static COMMAND_AUDIT_FORCE_FAIL: Cell<bool> = const { Cell::new(false) };
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct CommandAuditInput {
@@ -112,29 +119,12 @@ pub(crate) struct CommandAuditQueryResponse {
     pub matched_rows: usize,
     pub returned_count: usize,
     pub corrupt_row_count: usize,
-    pub noncanonical_key_count: usize,
     pub partial: bool,
     pub exhausted: bool,
     pub start_key_hex: Option<String>,
     pub next_start_key_hex: Option<String>,
-    /// Iteration direction actually applied. `"newest_first"` is the unwindowed
-    /// default (no `start_key_hex`/`start_ts_ns`): it returns the most recent
-    /// matches as a complete page. `"oldest_first"` is explicit forward paging
-    /// (a `start_key_hex` or `start_ts_ns` was supplied) and keeps the
-    /// fail-closed partial-page contract. #1550.
-    pub scan_order: &'static str,
-    /// True when matches older than the returned window exist. For newest-first
-    /// this is an honest "there is more history", NOT a failure — page older by
-    /// passing `end_ts_ns = oldest_returned_ts_ns`.
-    pub has_older: bool,
-    /// Timestamp of the oldest row returned this page (newest-first only), so a
-    /// caller can continue older without guessing a `start_ts_ns` a priori.
-    pub oldest_returned_ts_ns: Option<u64>,
     pub rows: Vec<CommandAuditQueryRow>,
 }
-
-pub(crate) const AUDIT_SCAN_ORDER_NEWEST_FIRST: &str = "newest_first";
-pub(crate) const AUDIT_SCAN_ORDER_OLDEST_FIRST: &str = "oldest_first";
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CommandAuditQueryFilters {
@@ -170,6 +160,94 @@ pub(crate) struct CommandAuditQueryRow {
     pub payload_truncated: Option<bool>,
     pub source_of_truth: Value,
     pub record: Value,
+}
+
+pub(crate) struct CommandAuditTailQuery {
+    limit: usize,
+    scan_limit: usize,
+    filters: CommandAuditQueryFilters,
+}
+
+impl CommandAuditTailQuery {
+    pub(crate) fn new(
+        limit: usize,
+        scan_limit: usize,
+        filters: CommandAuditQueryFilters,
+        start_key_hex: Option<&str>,
+    ) -> Result<Option<Self>, ErrorData> {
+        audit_query_limit(
+            Some(limit),
+            COMMAND_AUDIT_QUERY_DEFAULT_LIMIT,
+            COMMAND_AUDIT_QUERY_MAX_LIMIT,
+            "limit",
+        )?;
+        audit_query_limit(
+            Some(scan_limit),
+            COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT,
+            COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT,
+            "scan_limit",
+        )?;
+        if start_key_hex.is_some_and(|key| !key.trim().is_empty()) || filters.start_ts_ns.is_some()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            limit,
+            scan_limit,
+            filters,
+        }))
+    }
+
+    pub(crate) fn page(
+        self,
+        tail: Vec<(Vec<u8>, Vec<u8>)>,
+        digest: impl Fn(&[u8]) -> String,
+    ) -> CommandAuditQueryResponse {
+        // A full physical window means older rows MAY remain, as upstream reports.
+        let tail_capped = tail.len() >= self.scan_limit;
+        let mut scanned_rows = 0_usize;
+        let mut corrupt_row_count = 0_usize;
+        let mut returned = Vec::new();
+        let mut has_older = false;
+        for (key, value) in tail.into_iter().rev() {
+            scanned_rows = scanned_rows.saturating_add(1);
+            let row = match synapse_storage::decode_json::<Value>(&value) {
+                Ok(row) => row,
+                Err(_) => {
+                    corrupt_row_count = corrupt_row_count.saturating_add(1);
+                    continue;
+                }
+            };
+            if !audit_row_matches(&row, &self.filters) {
+                continue;
+            }
+            if returned.len() >= self.limit {
+                has_older = true;
+                break;
+            }
+            let value_sha256 = digest(&value);
+            returned.push(command_audit_query_row(&key, &value, row, value_sha256));
+        }
+        has_older |= tail_capped;
+        let returned_count = returned.len();
+        CommandAuditQueryResponse {
+            source_of_truth: "CF_ACTION_LOG newest-first bounded tail scan",
+            cf_name: cf::CF_ACTION_LOG,
+            filters: self.filters,
+            limit: self.limit,
+            scan_limit: self.scan_limit,
+            scanned_rows,
+            matched_rows: returned_count,
+            returned_count,
+            corrupt_row_count,
+            partial: false,
+            exhausted: !has_older,
+            // No forward cursor was supplied. Keep that fact distinct from a row key.
+            start_key_hex: None,
+            next_start_key_hex: None,
+            rows: returned,
+        }
+    }
 }
 
 impl CommandAuditInput {
@@ -293,15 +371,23 @@ impl SynapseService {
             }
         }
 
-        // #1550: the natural unwindowed "what did X just do?" call supplies
-        // neither a cursor nor a start timestamp. Oldest-first from an empty key
-        // exhausts scan_limit deep in weeks-old history and hard-errors, so
-        // default to a newest-first scan that returns the most recent matches as
-        // a complete page. Any explicit cursor or start window keeps the forward
-        // paging contract below unchanged.
         let start_key_hex_param = normalized_filter(params.start_key_hex);
-        if start_key_hex_param.is_none() && filters.start_ts_ns.is_none() {
-            return self.command_audit_query_newest_first(limit, scan_limit, filters);
+        if let Some(query) = CommandAuditTailQuery::new(
+            limit,
+            scan_limit,
+            filters.clone(),
+            start_key_hex_param.as_deref(),
+        )? {
+            let runtime = self.reflex_runtime()?;
+            let runtime = runtime.lock().map_err(|_error| {
+                command_audit_internal_error(
+                    "reflex runtime lock poisoned while querying action audit (newest-first)",
+                )
+            })?;
+            let tail = runtime
+                .storage_cf_tail_rows(cf::CF_ACTION_LOG, scan_limit)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            return Ok(query.page(tail, sha256_hex));
         }
         let start_key = match start_key_hex_param {
             Some(start_key_hex) => {
@@ -323,7 +409,6 @@ impl SynapseService {
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
         let mut corrupt_row_count = 0_usize;
-        let mut noncanonical_key_count = 0_usize;
         let mut returned = Vec::new();
         let mut next_start_key_hex = None;
         let mut more_after_window = false;
@@ -355,15 +440,7 @@ impl SynapseService {
                         continue;
                     }
                 };
-                let Some((key_ts_ns, _key_seq)) = decode_command_audit_key(&key) else {
-                    noncanonical_key_count = noncanonical_key_count.saturating_add(1);
-                    continue;
-                };
                 let ts_ns = audit_row_ts_ns(&row);
-                if ts_ns != key_ts_ns {
-                    corrupt_row_count = corrupt_row_count.saturating_add(1);
-                    continue;
-                }
                 if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
                     stopped_at_end_ts = true;
                     break;
@@ -377,7 +454,12 @@ impl SynapseService {
                     break;
                 }
                 matched_rows = matched_rows.saturating_add(1);
-                returned.push(command_audit_query_row(&key, &value, row));
+                returned.push(command_audit_query_row(
+                    &key,
+                    &value,
+                    row,
+                    sha256_hex(&value),
+                ));
                 next_start_key_hex = Some(hex_encode(&key_after(&key)));
             }
 
@@ -411,118 +493,10 @@ impl SynapseService {
             matched_rows,
             returned_count,
             corrupt_row_count,
-            noncanonical_key_count,
             partial,
             exhausted: !partial,
             start_key_hex,
             next_start_key_hex,
-            scan_order: AUDIT_SCAN_ORDER_OLDEST_FIRST,
-            has_older: partial,
-            oldest_returned_ts_ns: None,
-            rows: returned,
-        })
-    }
-
-    /// Newest-first bounded tail scan of `CF_ACTION_LOG` for the unwindowed
-    /// default (#1550). Reuses the reverse-tail primitive already backing
-    /// `command_audit_snapshot`, walks the most recent `scan_limit` rows from
-    /// newest to oldest, and returns up to `limit` matches as a **complete
-    /// page** — filling `limit` (or capping `scan_limit`) reports `has_older`
-    /// honestly instead of hard-erroring the way forward paging must.
-    fn command_audit_query_newest_first(
-        &self,
-        limit: usize,
-        scan_limit: usize,
-        filters: CommandAuditQueryFilters,
-    ) -> Result<CommandAuditQueryResponse, ErrorData> {
-        let runtime = self.reflex_runtime()?;
-        let runtime = runtime.lock().map_err(|_error| {
-            command_audit_internal_error(
-                "reflex runtime lock poisoned while querying action audit (newest-first)",
-            )
-        })?;
-        // Ascending (oldest->newest) tail of at most scan_limit rows; iterate it
-        // in reverse to emit newest-first. `tail_capped` means older rows exist
-        // beyond this window.
-        let tail = runtime
-            .storage_cf_tail_rows(cf::CF_ACTION_LOG, scan_limit)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let tail_capped = tail.len() >= scan_limit;
-
-        let mut scanned_rows = 0_usize;
-        let mut matched_rows = 0_usize;
-        let mut corrupt_row_count = 0_usize;
-        let mut noncanonical_key_count = 0_usize;
-        let mut returned = Vec::new();
-        let mut has_older = false;
-
-        for (key, value) in tail.into_iter().rev() {
-            scanned_rows = scanned_rows.saturating_add(1);
-            let row = match synapse_storage::decode_json::<Value>(&value) {
-                Ok(row) => row,
-                Err(_error) => {
-                    corrupt_row_count = corrupt_row_count.saturating_add(1);
-                    continue;
-                }
-            };
-            let Some((key_ts_ns, key_seq)) = decode_command_audit_key(&key) else {
-                noncanonical_key_count = noncanonical_key_count.saturating_add(1);
-                continue;
-            };
-            let ts_ns = audit_row_ts_ns(&row);
-            if ts_ns != key_ts_ns {
-                corrupt_row_count = corrupt_row_count.saturating_add(1);
-                continue;
-            }
-            // In newest-first mode end_ts_ns is an upper bound: skip rows newer
-            // than it (they are outside the requested window), keep scanning down.
-            if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
-                continue;
-            }
-            if !audit_row_matches(&row, &filters) {
-                continue;
-            }
-            if returned.len() >= limit {
-                has_older = true;
-                break;
-            }
-            matched_rows = matched_rows.saturating_add(1);
-            returned.push((ts_ns, key_seq, command_audit_query_row(&key, &value, row)));
-        }
-        returned.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-        let newest_start_key_hex = returned
-            .first()
-            .map(|(_ts_ns, _seq, row)| row.key_hex.clone());
-        let oldest_returned_ts_ns = returned.last().map(|(ts_ns, _seq, _row)| *ts_ns);
-        let returned: Vec<CommandAuditQueryRow> = returned
-            .into_iter()
-            .map(|(_ts_ns, _seq, row)| row)
-            .collect();
-
-        // If we consumed the whole scan window without filling `limit` but the
-        // window itself was capped, older matches may still exist beyond it.
-        if !has_older && tail_capped {
-            has_older = true;
-        }
-        let returned_count = returned.len();
-        Ok(CommandAuditQueryResponse {
-            source_of_truth: "CF_ACTION_LOG newest-first bounded tail scan",
-            cf_name: cf::CF_ACTION_LOG,
-            filters,
-            limit,
-            scan_limit,
-            scanned_rows,
-            matched_rows,
-            returned_count,
-            corrupt_row_count,
-            noncanonical_key_count,
-            partial: false,
-            exhausted: !has_older,
-            start_key_hex: newest_start_key_hex,
-            next_start_key_hex: None,
-            scan_order: AUDIT_SCAN_ORDER_NEWEST_FIRST,
-            has_older,
-            oldest_returned_ts_ns,
             rows: returned,
         })
     }
@@ -532,6 +506,13 @@ impl SynapseService {
         phase: &'static str,
         input: CommandAuditInput,
     ) -> Result<CommandAuditRowReadback, ErrorData> {
+        #[cfg(test)]
+        if COMMAND_AUDIT_FORCE_FAIL.with(Cell::get) {
+            return Err(command_audit_internal_error(
+                "command audit forced failure for test",
+            ));
+        }
+
         let (ts_ns, seq) = next_command_audit_key_parts();
         let key = command_audit_key(ts_ns, seq);
         let key_hex = hex_encode(&key);
@@ -594,8 +575,15 @@ impl SynapseService {
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while writing command audit")
         })?;
+        // Command audit is the fail-closed precondition for control-plane
+        // mutations, including recovery actions under Level4 pressure. Keep
+        // this bounded row durable even when ordinary action-log ingestion is
+        // shed; the bypass still enforces the CF hard cap and syncs the WAL.
         runtime
-            .storage_put_action_log_rows(vec![(key.clone(), encoded.clone())])
+            .storage_put_rows_pressure_bypass(
+                cf::CF_ACTION_LOG,
+                vec![(key.clone(), encoded.clone())],
+            )
             .map_err(|error| {
                 command_audit_internal_error(format!("command audit write failed: {error}"))
             })?;
@@ -760,12 +748,17 @@ fn command_audit_snapshot_row(key: &[u8], row: &Value) -> CommandAuditSnapshotRo
     }
 }
 
-fn command_audit_query_row(key: &[u8], encoded_value: &[u8], row: Value) -> CommandAuditQueryRow {
+fn command_audit_query_row(
+    key: &[u8],
+    encoded_value: &[u8],
+    row: Value,
+    value_sha256: String,
+) -> CommandAuditQueryRow {
     let row_kind = audit_row_kind(&row).to_owned();
     CommandAuditQueryRow {
         key_hex: hex_encode(key),
         value_len_bytes: encoded_value.len() as u64,
-        value_sha256: sha256_hex(encoded_value),
+        value_sha256,
         row_kind: row_kind.clone(),
         audit_id: string_field(&row, "audit_id"),
         ts_ns: audit_row_ts_ns(&row),
@@ -1003,36 +996,17 @@ fn next_command_audit_key_parts() -> (u64, u32) {
 }
 
 fn command_audit_key(ts_ns: u64, seq: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(COMMAND_AUDIT_KEY_LEN);
+    let mut key = Vec::with_capacity(12);
     key.extend_from_slice(&ts_ns.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
 }
 
-fn decode_command_audit_key(key: &[u8]) -> Option<(u64, u32)> {
-    if key.len() != COMMAND_AUDIT_KEY_LEN {
-        return None;
-    }
-    let mut ts_ns = [0_u8; 8];
-    ts_ns.copy_from_slice(&key[..8]);
-    let mut seq = [0_u8; 4];
-    seq.copy_from_slice(&key[8..]);
-    Some((u64::from_be_bytes(ts_ns), u32::from_be_bytes(seq)))
-}
-
+/// Keyed `hmac-sha256:` digest (#174): command payloads and audit rows carry
+/// agent-supplied arguments, so a plain SHA-256 would be brute-forceable.
+/// Digests are write-only readbacks; nothing parses them back.
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("sha256:{}", hex_encode(digest.as_ref()))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+    crate::content_digest::keyed_prefixed_digest(bytes)
 }
 
 fn error_data_code(error: &ErrorData) -> Option<&str> {

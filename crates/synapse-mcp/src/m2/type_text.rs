@@ -5,25 +5,46 @@ use rmcp::model::ErrorCode;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use synapse_action::{
-    ActionBackend, ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend,
-};
+use synapse_action::{ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend};
 use synapse_core::{
     Action, Backend, ElementId, KeystrokeDynamics, KeystrokeNaturalParams, UiaPattern, error_codes,
 };
 
 use crate::m1::mcp_error;
 use crate::m2::default_auto_wait_timeout_ms;
+use crate::m2::foreground_type_monitor::execute_on_foreground_target;
 use crate::m2::postcondition::{
     ActPostcondition, no_observed_delta_error, postcondition_failed_error,
     postcondition_not_requested, postcondition_observed_delta, text_signature,
 };
+
+// The human foreground is diagnostic context, never an implicit input target.
+pub(crate) fn resolve_type_delivery_target(
+    explicit_window_hwnd: Option<i64>,
+    session_target_hwnd: Option<i64>,
+    _preflight_foreground_hwnd: i64,
+) -> Result<i64, ActionError> {
+    explicit_window_hwnd.or(session_target_hwnd).ok_or_else(|| ActionError::InputTargetRequired {
+        detail: "typing requires an explicit window or session target; the human foreground is not a target".to_owned(),
+    })
+}
+
+#[cfg(test)]
+#[path = "tests/type_delivery_294.rs"]
+mod type_delivery_294;
 
 const MIN_SAFE_LINEAR_MS_PER_CHAR: u32 = 20;
 const TYPE_TIER_CDP: &str = "cdp";
 const TYPE_TIER_UIA: &str = "uia";
 const TYPE_TIER_WIN32_MESSAGE: &str = "win32_message";
 const TYPE_TIER_FOREGROUND: &str = "foreground";
+/// UTF-16 unit ceiling for one text-delivery request. Shared by `act_type`
+/// and `act_set_field_text` so no tool accepts a payload that could park the
+/// global input emitter (#50).
+pub(crate) const MAX_ACT_TYPE_UTF16_UNITS: usize = 65_536;
+const MAX_FOREGROUND_TYPE_UTF16_UNITS: usize = 4_096;
+const MAX_FOREGROUND_TYPE_PROJECTED_MS: u64 = 20_000;
+const FOREGROUND_TYPE_DISPATCH_COST_MS_PER_UNIT: u64 = 2;
 const MIN_VERIFY_TIMEOUT_MS: u32 = 50;
 const MAX_VERIFY_TIMEOUT_MS: u32 = 5000;
 const DEFAULT_ACT_TYPE_VERIFY_TIMEOUT_MS: u32 = 2000;
@@ -76,7 +97,6 @@ pub struct ActTypeParams {
     #[serde(default)]
     #[schemars(
         default,
-        range(min = 1, max = 4_294_967_295_u64),
         description = "Optional top-level HWND that foreground act_type visual verification must use as its physical Source of Truth when semantic text readback is unavailable. Requires verify_delta=true and no into_element or expected_browser_url_regex."
     )]
     pub verify_target_window_hwnd: Option<i64>,
@@ -145,7 +165,6 @@ async fn cdp_type_into_element(
     started: Instant,
     verify_delta: bool,
     verify_timeout_ms: u32,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActTypeResponse, ErrorData> {
     use synapse_core::error_codes;
 
@@ -183,7 +202,6 @@ async fn cdp_type_into_element(
     } else {
         None
     };
-    boundary.ensure("immediately_before_cdp_type_node")?;
     cdp_or_extension_type_node(
         endpoint.as_deref(),
         hwnd,
@@ -319,11 +337,13 @@ async fn cdp_or_extension_type_node(
     .map_err(CdpTypeTransportError::Extension)
 }
 
-pub(crate) async fn act_type_with_handle_and_boundary(
+/// `foreground_target_hwnd` is the explicit or session-bound delivery window.
+/// The #188 monitor interrupts typing when that window loses foreground.
+pub async fn act_type_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActTypeParams,
-    boundary: super::OperatorPanicActionBoundary,
+    foreground_target_hwnd: i64,
 ) -> Result<ActTypeResponse, ErrorData> {
     let started = Instant::now();
     validate_type_params(&params)?;
@@ -342,16 +362,13 @@ pub(crate) async fn act_type_with_handle_and_boundary(
                 started,
                 params.verify_delta,
                 params.verify_timeout_ms,
-                boundary,
             )
             .await;
         }
         ensure_value_pattern_target_safe_for_act_type(element_id)?;
         let readback = if params.verify_delta {
-            verified_set_element_value(element_id, &emitted, params.verify_timeout_ms, boundary)
-                .await?
+            verified_set_element_value(element_id, &emitted, params.verify_timeout_ms).await?
         } else {
-            boundary.ensure("immediately_before_uia_set_element_value")?;
             synapse_a11y::set_element_value(element_id, &emitted).map_err(a11y_error_to_mcp)?
         };
         let readback_matches = uia_readback_matches_emitted(&readback, &emitted);
@@ -405,14 +422,15 @@ pub(crate) async fn act_type_with_handle_and_boundary(
         });
     }
 
-    let action = action_from_type_params(&params)?;
+    let action = action_from_foreground_type_params(&params)?;
 
-    boundary.ensure("immediately_before_foreground_type_dispatch")?;
     if let Some(recording) = recording {
         execute_recording(&recording, &action)?;
     } else {
-        handle
-            .execute(action)
+        // #188: SendInput types into whatever is in front, so refuse unless the
+        // preflight target is the foreground and stop (release interrupt) on
+        // every departure from it while typing.
+        execute_on_foreground_target(&handle, action, foreground_target_hwnd)
             .await
             .map_err(|error| action_error_to_mcp(&error))?;
     }
@@ -430,6 +448,17 @@ pub(crate) async fn act_type_with_handle_and_boundary(
     })
 }
 
+/// Builds the typing action for SendInput/foreground delivery: the action from
+/// [`action_from_type_params`] plus the foreground monopolization budget (#50).
+pub fn action_from_foreground_type_params(params: &ActTypeParams) -> Result<Action, ErrorData> {
+    let action = action_from_type_params(params)?;
+    validate_foreground_type_budget(params)?;
+    Ok(action)
+}
+
+/// Builds the typing action with only the absolute size/param validation.
+/// Background (CDP / Chrome bridge / native message) routes use this: the
+/// foreground time budget must not apply where no SendInput is used (#50).
 pub fn action_from_type_params(params: &ActTypeParams) -> Result<Action, ErrorData> {
     validate_type_params(params)?;
     if let Some(element_id) = &params.into_element {
@@ -452,10 +481,8 @@ async fn verified_set_element_value(
     element_id: &ElementId,
     emitted: &str,
     verify_timeout_ms: u32,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<synapse_a11y::ElementValueSetReadback, ErrorData> {
     let before = synapse_a11y::element_value(element_id).map_err(a11y_error_to_mcp)?;
-    boundary.ensure("immediately_before_verified_uia_set_element_value")?;
     match synapse_a11y::set_element_value(element_id, emitted) {
         Ok(dispatch_readback) => {
             tokio::time::sleep(std::time::Duration::from_millis(u64::from(
@@ -696,6 +723,7 @@ fn verify_uia_type_delta(
         let expected_value = expected_set_value(readback, emitted);
         if readback.after_value == expected_value {
             return Ok(ActPostcondition {
+                related_window_observed: None,
                 status: "verified_state".to_owned(),
                 observed_delta: Some(false),
                 source_of_truth: Some(set_source_of_truth(readback).to_owned()),
@@ -804,6 +832,7 @@ fn verify_uia_password_length_delta(
     }
     if before_len == after_len {
         return Ok(ActPostcondition {
+            related_window_observed: None,
             status: "verified_state".to_owned(),
             observed_delta: Some(false),
             source_of_truth: Some(set_source_of_truth(readback).to_owned()),
@@ -1045,7 +1074,7 @@ impl TypeBackend {
     }
 }
 
-fn validate_type_params(params: &ActTypeParams) -> Result<(), ErrorData> {
+pub(crate) fn validate_type_params(params: &ActTypeParams) -> Result<(), ErrorData> {
     if params.text.is_empty() && !params.press_enter_after {
         return Err(empty_text_params_error());
     }
@@ -1054,6 +1083,10 @@ fn validate_type_params(params: &ActTypeParams) -> Result<(), ErrorData> {
             detail: "act_type use_scancodes=true is not wired for the M2 unicode typing path"
                 .to_owned(),
         }));
+    }
+    let utf16_units = emitted_utf16_units(params);
+    if utf16_units > MAX_ACT_TYPE_UTF16_UNITS {
+        return Err(type_request_size_error(utf16_units));
     }
     if !(MIN_VERIFY_TIMEOUT_MS..=MAX_VERIFY_TIMEOUT_MS).contains(&params.verify_timeout_ms) {
         return Err(verify_timeout_params_error(params.verify_timeout_ms));
@@ -1068,6 +1101,68 @@ fn validate_type_params(params: &ActTypeParams) -> Result<(), ErrorData> {
                 params.linear_ms_per_char, MIN_SAFE_LINEAR_MS_PER_CHAR
             ),
         ));
+    }
+    Ok(())
+}
+
+fn emitted_utf16_units(params: &ActTypeParams) -> usize {
+    params.text.encode_utf16().count() + usize::from(params.press_enter_after)
+}
+
+fn validate_foreground_type_budget(params: &ActTypeParams) -> Result<(), ErrorData> {
+    validate_foreground_type_text_budget(
+        &params.text,
+        params.press_enter_after,
+        &params
+            .dynamics
+            .to_keystroke_dynamics(params.linear_ms_per_char),
+    )
+}
+
+/// Per-key cost in ms of a dynamics tier: Burst 0, Linear its fixed pacing,
+/// Natural the tier's mean inter-key interval (rounded up). Single source for
+/// the foreground budget so every SendInput caller projects its real tier.
+pub(crate) fn keystroke_budget_iki_ms(dynamics: &KeystrokeDynamics) -> u64 {
+    match dynamics {
+        KeystrokeDynamics::Burst => 0,
+        KeystrokeDynamics::Linear { ms_per_char } => u64::from(*ms_per_char),
+        KeystrokeDynamics::Natural { params } => {
+            let mean = f64::from(params.mean_iki_ms);
+            if mean.is_finite() && mean > 0.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let ms = mean.ceil() as u64; // saturating cast; mean is finite and > 0
+                ms
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Foreground monopolization budget for any text delivered through the global
+/// input emitter (SendInput), not just `act_type`: refuses requests whose
+/// UTF-16 size or projected dispatch duration would park the emitter past the
+/// foreground lease TTL (#50). Callers must invoke this before
+/// target/click/focus work. Never call it for background/CDP/bridge typing.
+pub(crate) fn validate_foreground_type_text_budget(
+    text: &str,
+    press_enter_after: bool,
+    dynamics: &KeystrokeDynamics,
+) -> Result<(), ErrorData> {
+    let utf16_units = text.encode_utf16().count() + usize::from(press_enter_after);
+    let utf16_units_u64 = u64::try_from(utf16_units).unwrap_or(u64::MAX);
+    let inter_key_ms = keystroke_budget_iki_ms(dynamics);
+    let projected_ms = utf16_units_u64
+        .saturating_mul(FOREGROUND_TYPE_DISPATCH_COST_MS_PER_UNIT)
+        .saturating_add(
+            utf16_units_u64
+                .saturating_sub(1)
+                .saturating_mul(inter_key_ms),
+        );
+    if utf16_units > MAX_FOREGROUND_TYPE_UTF16_UNITS
+        || projected_ms > MAX_FOREGROUND_TYPE_PROJECTED_MS
+    {
+        return Err(foreground_type_budget_error(utf16_units, projected_ms));
     }
     Ok(())
 }
@@ -1092,23 +1187,17 @@ fn char_count(text: &str) -> Result<u32, ErrorData> {
 }
 
 fn execute_recording(recording: &RecordingBackend, action: &Action) -> Result<(), ErrorData> {
-    let before_events = recording.events();
-    let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
-    recording
-        .execute(action, &mut emit_state)
+    let new_events = recording
+        .execute_capturing(action, &mut emit_state)
         .map_err(|error| action_error_to_mcp(&error))?;
-    let after_events = recording.events();
-    let new_events = &after_events[before_event_count..];
-    let recorded_ikis = recorded_ikis(new_events);
+    let recorded_ikis = recorded_ikis(&new_events);
     tracing::info!(
         code = "M2_ACT_TYPE_RECORDING_READBACK",
         kind = "act_type",
-        before_event_count,
-        after_event_count = after_events.len(),
+        recorded_event_total = recording.event_count(),
         new_event_count = new_events.len(),
         ?recorded_ikis,
-        ?new_events,
         "readback=recording_backend tool=act_type after_events_readback"
     );
     Ok(())
@@ -1145,6 +1234,41 @@ fn type_params_error(requested_linear_ms_per_char: u32, message: impl Into<Strin
             "target_readback_required": true,
             "backend_tier_used": TYPE_TIER_FOREGROUND,
             "required_foreground": true,
+        })),
+    )
+}
+
+fn type_request_size_error(requested_utf16_units: usize) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_type payload has {requested_utf16_units} UTF-16 units; maximum is {MAX_ACT_TYPE_UTF16_UNITS}"
+        ),
+        Some(json!({
+            "code": synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "reason": "type_text_request_too_large",
+            "requested_utf16_units": requested_utf16_units,
+            "maximum_utf16_units": MAX_ACT_TYPE_UTF16_UNITS,
+            "guidance": "split the value into bounded requests; use act set_field or browser_form for large element values",
+        })),
+    )
+}
+
+fn foreground_type_budget_error(requested_utf16_units: usize, projected_ms: u64) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "foreground typing projects {projected_ms} ms for {requested_utf16_units} UTF-16 units; limits are {MAX_FOREGROUND_TYPE_PROJECTED_MS} ms and {MAX_FOREGROUND_TYPE_UTF16_UNITS} UTF-16 units"
+        ),
+        Some(json!({
+            "code": synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "reason": "foreground_type_budget_exceeded",
+            "requested_utf16_units": requested_utf16_units,
+            "projected_ms": projected_ms,
+            "maximum_projected_ms": MAX_FOREGROUND_TYPE_PROJECTED_MS,
+            "maximum_foreground_utf16_units": MAX_FOREGROUND_TYPE_UTF16_UNITS,
+            "guidance": "split foreground typing into bounded requests; use act set_field or browser_form for large element values",
+            "refused_before_delivery": true,
         })),
     )
 }
@@ -1208,3 +1332,7 @@ const fn default_use_scancodes() -> bool {
 const fn default_press_enter_after() -> bool {
     false
 }
+
+#[cfg(test)]
+#[path = "tests/type_budget_50b.rs"]
+mod type_budget_50b;

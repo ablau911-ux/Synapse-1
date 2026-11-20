@@ -4,6 +4,7 @@ use super::common::{delegate_error, facade_params_error, validate_exact_operatio
 use crate::m3::{
     armed_routines::{ArmedRoutineTickParams, ArmedRoutineTickResponse},
     profile_authoring::{RoutineAutomateParams, RoutineAutomateResponse},
+    reflex::{ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse},
     routines::{
         RoutineFeedbackParams, RoutineFeedbackResponse, RoutineInspectParams,
         RoutineInspectResponse, RoutineLabelExportParams, RoutineLabelExportResponse,
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const ROUTINE_TOOL: &str = "routine";
 const ROUTINE_SOURCE_OF_TRUTH: &str =
-    "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows";
+    "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows + CF_REFLEX_AUDIT";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +30,8 @@ pub enum RoutineOperation {
     Label,
     Automate,
     ArmedTick,
+    ReflexRegister,
+    ReflexList,
 }
 
 impl RoutineOperation {
@@ -42,6 +45,8 @@ impl RoutineOperation {
             Self::Label => "label",
             Self::Automate => "automate",
             Self::ArmedTick => "armed_tick",
+            Self::ReflexRegister => "reflex_register",
+            Self::ReflexList => "reflex_list",
         }
     }
 }
@@ -66,6 +71,10 @@ pub struct RoutineParams {
     pub automate: Option<RoutineAutomateParams>,
     #[serde(default)]
     pub armed_tick: Option<ArmedRoutineTickParams>,
+    #[serde(default)]
+    pub reflex_register: Option<ReflexRegisterParams>,
+    #[serde(default)]
+    pub reflex_list: Option<ReflexListParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -90,6 +99,10 @@ pub struct RoutineResponse {
     pub automate: Option<RoutineAutomateResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed_tick: Option<ArmedRoutineTickResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_register: Option<ReflexRegisterResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflex_list: Option<ReflexListResponse>,
 }
 
 pub(super) async fn handle(
@@ -309,6 +322,39 @@ pub(super) async fn handle(
                 |out| out.automate = Some(response),
             )))
         }
+        RoutineOperation::ReflexRegister => {
+            let spec = params
+                .0
+                .reflex_register
+                .ok_or_else(|| missing_routine_spec("reflex_register"))?;
+            let response = service
+                .reflex_register(Parameters(spec), request_context)
+                .await?
+                .0;
+            Ok(Json(routine_response(
+                operation,
+                format!(
+                    "CF_REFLEX_AUDIT registration for reflex_id={}",
+                    response.reflex_id
+                ),
+                |out| out.reflex_register = Some(response),
+            )))
+        }
+        RoutineOperation::ReflexList => {
+            let spec = params
+                .0
+                .reflex_list
+                .ok_or_else(|| missing_routine_spec("reflex_list"))?;
+            let response = service.reflex_list(Parameters(spec)).await?.0;
+            Ok(Json(routine_response(
+                operation,
+                format!(
+                    "reflex scheduler statuses and CF_REFLEX_AUDIT, returned={}",
+                    response.reflexes.len()
+                ),
+                |out| out.reflex_list = Some(response),
+            )))
+        }
         RoutineOperation::ArmedTick => {
             let spec = params
                 .0
@@ -359,6 +405,8 @@ pub(super) fn validate_routine_facade_params(params: &RoutineParams) -> Result<(
             ("label", params.label.is_some()),
             ("automate", params.automate.is_some()),
             ("armed_tick", params.armed_tick.is_some()),
+            ("reflex_register", params.reflex_register.is_some()),
+            ("reflex_list", params.reflex_list.is_some()),
         ],
     )
 }
@@ -408,6 +456,8 @@ fn routine_response(
         label: None,
         automate: None,
         armed_tick: None,
+        reflex_register: None,
+        reflex_list: None,
     };
     populate(&mut response);
     response

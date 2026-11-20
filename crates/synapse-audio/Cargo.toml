@@ -3,7 +3,7 @@ name = "synapse-audio"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -17,6 +17,9 @@ synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["d
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 wasapi.workspace = true

@@ -9,14 +9,15 @@ use std::{
     process::ExitCode,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use super::dashboard_facade_guard::DashboardFacade;
+use super::shutdown_sessions::ShutdownSessionGate;
 use anyhow::Context;
-#[cfg(windows)]
 use axum::serve::Listener;
 use axum::{
     Json, Router,
@@ -30,20 +31,25 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
-use futures_util::{SinkExt, StreamExt, future::join_all, stream::SplitSink};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder as HyperServerBuilder,
+    service::TowerToHyperService,
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::local::SessionError,
     session::{SessionState, SessionStore, SessionStoreError, local::LocalSessionManager},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use synapse_action::ActionStateSnapshot;
 use synapse_core::{AgentEventKind, AgentEventRecord, EventFilter, EventSource, Health};
 use synapse_storage::{Db, cf};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::broadcast,
+    sync::{broadcast, mpsc, watch},
     task::JoinHandle,
     time,
 };
@@ -57,10 +63,6 @@ use windows::Win32::Networking::WinSock::{
 use std::os::windows::io::AsRawSocket;
 
 use crate::{
-    emitter_shutdown::{
-        M2EmitterOwner, ShutdownTaskOwner, drain_m2_emitter_owner, take_m2_emitter_owner,
-        wait_for_m2_emitter_done,
-    },
     http::auth::{self, HttpAuth},
     http::session,
     http::sse::{self, SseState},
@@ -77,15 +79,8 @@ use crate::{
 };
 
 type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>;
-type HttpBackgroundTaskOwner = (&'static str, ShutdownTaskOwner<()>);
-const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
+const M2_EMITTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
-const MCP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
-const DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_BACKGROUND_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
-const HTTP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-const HTTP_SERVER_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const DASHBOARD_CONTEXT_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -93,175 +88,6 @@ const DASHBOARD_SPAWN_FAN_OUT_MAX: u32 = 5;
 const DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS: u64 = 3_000;
 const DASHBOARD_ASCIICAST_DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DASHBOARD_ASCIICAST_HARD_MAX_BYTES: u64 = 64 * 1024 * 1024;
-static HTTP_ACCEPTED_SOCKETS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static HTTP_ACCEPTED_SOCKETS_CURRENT: AtomicU64 = AtomicU64::new(0);
-static HTTP_MCP_REQUEST_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static HTTP_MCP_REQUEST_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static HTTP_MCP_REQUEST_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
-static HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static HTTP_MCP_LAST_EVENT: Mutex<Option<HttpMcpTransportEvent>> = Mutex::new(None);
-
-#[derive(Clone, Debug)]
-struct HttpMcpTransportEvent {
-    request_id: u64,
-    phase: &'static str,
-    method: String,
-    path: String,
-    status_code: Option<u16>,
-    elapsed_ms: Option<u128>,
-    unix_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-struct HttpTransportDiagnosticsSnapshot {
-    accepted_sockets_total: u64,
-    accepted_sockets_current: u64,
-    mcp_request_started_total: u64,
-    mcp_request_completed_total: u64,
-    mcp_request_in_flight: u64,
-    mcp_request_error_status_total: u64,
-    last_event: Option<HttpMcpTransportEvent>,
-}
-
-pub(crate) fn http_transport_diagnostics_detail() -> String {
-    http_transport_diagnostics_detail_from_snapshot(http_transport_diagnostics_snapshot())
-}
-
-fn http_transport_diagnostics_snapshot() -> HttpTransportDiagnosticsSnapshot {
-    HttpTransportDiagnosticsSnapshot {
-        accepted_sockets_total: HTTP_ACCEPTED_SOCKETS_TOTAL.load(Ordering::Relaxed),
-        accepted_sockets_current: HTTP_ACCEPTED_SOCKETS_CURRENT.load(Ordering::Relaxed),
-        mcp_request_started_total: HTTP_MCP_REQUEST_STARTED_TOTAL.load(Ordering::Relaxed),
-        mcp_request_completed_total: HTTP_MCP_REQUEST_COMPLETED_TOTAL.load(Ordering::Relaxed),
-        mcp_request_in_flight: HTTP_MCP_REQUEST_IN_FLIGHT.load(Ordering::Relaxed),
-        mcp_request_error_status_total: HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL.load(Ordering::Relaxed),
-        last_event: HTTP_MCP_LAST_EVENT
-            .lock()
-            .ok()
-            .and_then(|event| event.clone()),
-    }
-}
-
-fn http_transport_diagnostics_detail_from_snapshot(
-    snapshot: HttpTransportDiagnosticsSnapshot,
-) -> String {
-    let last_event = snapshot.last_event.map_or_else(
-        || "none".to_owned(),
-        |event| {
-            format!(
-                "request_id:{} phase:{} method:{} path:{} status:{} elapsed_ms:{} unix_ms:{}",
-                event.request_id,
-                event.phase,
-                event.method,
-                event.path,
-                event
-                    .status_code
-                    .map_or_else(|| "none".to_owned(), |status| status.to_string()),
-                event
-                    .elapsed_ms
-                    .map_or_else(|| "none".to_owned(), |elapsed| elapsed.to_string()),
-                event.unix_ms
-            )
-        },
-    );
-    format!(
-        "mcp_transport_diagnostics=request_started_total:{} request_completed_total:{} request_in_flight:{} request_error_status_total:{} accepted_sockets_total:{} accepted_sockets_current:{} last_event=\"{}\" classification_hint=\"if client send errors occur while process/socket SoT is listening and request_started_total does not increase, the request did not reach the daemon HTTP middleware; if started increases without completed, inspect request_in_flight and daemon_lifecycle in-flight tools; if completed status is 5xx/4xx, inspect status and daemon-tool-events\"",
-        snapshot.mcp_request_started_total,
-        snapshot.mcp_request_completed_total,
-        snapshot.mcp_request_in_flight,
-        snapshot.mcp_request_error_status_total,
-        snapshot.accepted_sockets_total,
-        snapshot.accepted_sockets_current,
-        last_event.replace('"', "'")
-    )
-}
-
-fn store_http_mcp_last_event(event: HttpMcpTransportEvent) {
-    if let Ok(mut last_event) = HTTP_MCP_LAST_EVENT.lock() {
-        *last_event = Some(event);
-    }
-}
-
-fn saturating_decrement(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_sub(1))
-    });
-}
-
-fn record_http_mcp_request_started(method: &str, path: &str) -> u64 {
-    let request_id = HTTP_MCP_REQUEST_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-    HTTP_MCP_REQUEST_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-    store_http_mcp_last_event(HttpMcpTransportEvent {
-        request_id,
-        phase: "started",
-        method: method.to_owned(),
-        path: path.to_owned(),
-        status_code: None,
-        elapsed_ms: None,
-        unix_ms: dashboard_unix_time_ms(),
-    });
-    request_id
-}
-
-fn record_http_mcp_request_completed(
-    request_id: u64,
-    method: &str,
-    path: &str,
-    status: StatusCode,
-    elapsed: Duration,
-) {
-    HTTP_MCP_REQUEST_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
-    saturating_decrement(&HTTP_MCP_REQUEST_IN_FLIGHT);
-    if status.is_client_error() || status.is_server_error() {
-        HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    }
-    synapse_telemetry::metrics::counter!(
-        synapse_telemetry::metrics::HTTP_REQUESTS_TOTAL,
-        "path" => normalized_http_metric_path(path),
-        "status" => http_status_metric_label(status)
-    )
-    .increment(1);
-    store_http_mcp_last_event(HttpMcpTransportEvent {
-        request_id,
-        phase: "completed",
-        method: method.to_owned(),
-        path: path.to_owned(),
-        status_code: Some(status.as_u16()),
-        elapsed_ms: Some(elapsed.as_millis()),
-        unix_ms: dashboard_unix_time_ms(),
-    });
-}
-
-fn emit_http_active_sessions(count: usize) {
-    synapse_telemetry::metrics::gauge!(synapse_telemetry::metrics::HTTP_ACTIVE_SESSIONS)
-        .set(usize_metric_value(count));
-}
-
-fn usize_metric_value(value: usize) -> f64 {
-    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
-}
-
-fn normalized_http_metric_path(path: &str) -> String {
-    match path {
-        "/mcp" | "/health" | "/agent-events" | "/events" => path.to_owned(),
-        "" => "/".to_owned(),
-        _ => "__other__".to_owned(),
-    }
-}
-
-fn http_status_metric_label(status: StatusCode) -> &'static str {
-    if status.is_success() {
-        "2xx"
-    } else if status.is_redirection() {
-        "3xx"
-    } else if status.is_client_error() {
-        "4xx"
-    } else if status.is_server_error() {
-        "5xx"
-    } else {
-        "other"
-    }
-}
 
 #[derive(Clone)]
 struct HttpState {
@@ -270,6 +96,7 @@ struct HttpState {
     session_manager: Arc<LocalSessionManager>,
     shutdown_cancel: CancellationToken,
     drain_state: crate::server::drain::DaemonDrainState,
+    shutdown_sessions: ShutdownSessionGate,
     active_http_sockets: ActiveHttpSockets,
     sse_state: SseState,
     /// Journal handle for the push-telemetry ingress (#899); the same DB the
@@ -277,80 +104,29 @@ struct HttpState {
     agent_events_db: Arc<Db>,
 }
 
-struct HttpRouterRuntime {
-    app: Router,
+pub(super) struct HttpRouterRuntime {
+    pub(super) app: Router,
     session_manager: Arc<LocalSessionManager>,
     session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
     drain_state: crate::server::drain::DaemonDrainState,
-    background_tasks: Vec<HttpBackgroundTaskOwner>,
+    shutdown_sessions: ShutdownSessionGate,
 }
 
 #[derive(Debug, Serialize)]
 struct DaemonShutdownInputCleanupReport {
     reason: &'static str,
-    authority_finalizer_drain_readback: Option<crate::server::AuthorityFinalizerDrainReadback>,
-    authority_finalizer_drain_error: Option<String>,
     active_sessions_before: usize,
-    live_spawn_snapshot_read_before: bool,
-    live_spawn_snapshot_error: Option<String>,
     live_spawn_sessions_before: usize,
-    close_candidate_sessions_before: usize,
-    input_owner_snapshot_read_before: bool,
-    input_owner_session_ids_before: Vec<String>,
     shutdown_sessions_before: usize,
-    shutdown_session_ids: Vec<String>,
     cleaned_sessions: usize,
-    session_cleanup_timeout_ms: u64,
-    session_cleanup_timeouts: Vec<String>,
     orphan_lease_owner_cleanup:
         Option<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
     final_lease_held: bool,
     final_lease_owner_session_id: Option<String>,
     final_lease_is_operator: bool,
     lease_still_held_after_cleanup: bool,
-    input_owner_snapshot_read_after: bool,
-    input_owner_session_ids_after: Vec<String>,
-    input_owner_snapshot_errors: Vec<String>,
     failure_count: usize,
     session_reports: Vec<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
-}
-
-impl DaemonShutdownInputCleanupReport {
-    fn authority_finalizer_owners_quiescent(&self) -> bool {
-        self.authority_finalizer_drain_readback
-            .as_ref()
-            .is_some_and(crate::server::AuthorityFinalizerDrainReadback::safe_to_unlock)
-    }
-
-    fn all_input_owners_quiescent(&self) -> bool {
-        self.authority_finalizer_owners_quiescent()
-            && self.failure_count == 0
-            && self.live_spawn_snapshot_read_before
-            && self.live_spawn_snapshot_error.is_none()
-            && self.input_owner_snapshot_read_before
-            && self.input_owner_snapshot_errors.is_empty()
-            && !self.lease_still_held_after_cleanup
-            && (!self.final_lease_held || self.final_lease_is_operator)
-            && self.input_owner_snapshot_read_after
-            && self.input_owner_session_ids_after.is_empty()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-struct M3StorageOwnerReadback {
-    strong_owner_count: usize,
-    expected_owner_count: usize,
-    owners_quiescent: bool,
-}
-
-fn m3_storage_owner_readback<T>(owner: &Arc<T>) -> M3StorageOwnerReadback {
-    let strong_owner_count = Arc::strong_count(owner);
-    let expected_owner_count = 1;
-    M3StorageOwnerReadback {
-        strong_owner_count,
-        expected_owner_count,
-        owners_quiescent: strong_owner_count == expected_owner_count,
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -363,8 +139,6 @@ struct McpSessionShutdownCloseReport {
     failure_count: usize,
     session_ids: Vec<String>,
     failures: Vec<String>,
-    sessions_after: usize,
-    session_ids_after: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,7 +148,7 @@ struct ActiveHttpSocketShutdownReport {
     shutdown_attempted: usize,
     shutdown_succeeded: usize,
     failure_count: usize,
-    tracked_after_shutdown_attempt: usize,
+    tracked_after: usize,
     sockets: Vec<ActiveHttpSocketShutdownRow>,
     failures: Vec<String>,
 }
@@ -394,914 +168,8 @@ struct ActiveHttpSocketShutdownRow {
     accepted_at_unix_ms: u128,
 }
 
-#[derive(Debug, Serialize)]
-struct HttpShutdownFailure {
-    phase: &'static str,
-    detail: String,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct HttpShutdownFailures {
-    failures: Vec<HttpShutdownFailure>,
-}
-
-#[derive(Debug, Serialize)]
-struct HttpBackgroundTaskDrainReport {
-    tasks_before: usize,
-    graceful_joined: usize,
-    abort_requests_sent: usize,
-    joined_after_abort: usize,
-    still_live_task_names: Vec<&'static str>,
-    failures: Vec<String>,
-}
-
-#[derive(Debug)]
-struct HttpActivityOwnerDrainReport {
-    recorder_expected: bool,
-    recorder_present: bool,
-    recorder_owners_quiescent: bool,
-    a11y_expected: bool,
-    a11y_present: bool,
-    a11y_owners_quiescent: bool,
-    retained_a11y_bridge_task_owners: usize,
-    win_event_shutdown_history: crate::WinEventShutdownHistoryReadback,
-    recorder_retained_owner_readback:
-        crate::m3::activity_recorder::ActivityRecorderRetainedOwnerReadback,
-    retained_interaction_hook_owners: usize,
-    failures: Vec<String>,
-}
-
-impl HttpActivityOwnerDrainReport {
-    fn safe_to_unlock(&self) -> bool {
-        (!self.recorder_expected || self.recorder_present)
-            && self.recorder_owners_quiescent
-            && (!self.a11y_expected || self.a11y_present)
-            && self.a11y_owners_quiescent
-            && self.retained_a11y_bridge_task_owners == 0
-            && self.win_event_shutdown_history.owners_quiescent()
-            && self.recorder_retained_owner_readback.safe_to_unlock()
-            && self.retained_interaction_hook_owners == 0
-    }
-
-    fn verdict(&self) -> anyhow::Result<()> {
-        if self.failures.is_empty() && self.safe_to_unlock() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "activity owner shutdown failed: {}; readback={self:?}",
-                self.failures.join("; ")
-            )
-        }
-    }
-}
-
-async fn drain_http_activity_owners(
-    m3_state: &crate::m3::SharedM3State,
-    recorder_expected: bool,
-    a11y_expected: bool,
-) -> HttpActivityOwnerDrainReport {
-    let mut failures = Vec::new();
-    let (recorder, a11y_bridge) = match m3_state.lock() {
-        Ok(mut state) => (
-            state.activity_recorder.take(),
-            state.a11y_event_bridge.take(),
-        ),
-        Err(error) => {
-            failures.push(format!(
-                "m3 state lock poisoned while taking recorder/a11y owners: {error}"
-            ));
-            (None, None)
-        }
-    };
-    let recorder_present = recorder.is_some();
-    let a11y_present = a11y_bridge.is_some();
-    if recorder_expected && !recorder_present {
-        failures.push("eagerly configured activity recorder was missing at shutdown".to_owned());
-    }
-    if a11y_expected && !a11y_present {
-        failures.push("eagerly configured a11y bridge was missing at shutdown".to_owned());
-    }
-
-    // Stop the event source first so no new record can race the recorder's
-    // session_end boundary. The bridge report includes its exact Tokio owner;
-    // dropping the subscription joins the OS hook thread before that await.
-    let a11y_owners_quiescent = if let Some(bridge) = a11y_bridge {
-        let report = bridge.shutdown().await;
-        let quiescent = report.owners_quiescent();
-        if let Err(error) = report.verdict() {
-            failures.push(format!("a11y bridge: {error:#}"));
-        }
-        quiescent
-    } else {
-        !a11y_expected
-    };
-
-    let recorder_owners_quiescent = if let Some(recorder) = recorder {
-        let report = recorder.shutdown().await;
-        let quiescent = report.owners_quiescent();
-        if let Err(error) = report.verdict() {
-            failures.push(format!("activity recorder: {error:#}"));
-        }
-        quiescent
-    } else {
-        !recorder_expected
-    };
-    let retained_a11y_bridge_task_owners = crate::m3::a11y_events::retained_live_owner_count();
-    if retained_a11y_bridge_task_owners != 0 {
-        failures.push(format!(
-            "{retained_a11y_bridge_task_owners} a11y bridge task owner(s) remain retained after bounded cleanup"
-        ));
-    }
-    let win_event_shutdown_history = crate::win_event_shutdown_history_readback();
-    if let Err(error) = win_event_shutdown_history.verdict() {
-        failures.push(format!("WinEvent shutdown history: {error:#}"));
-    }
-    let recorder_retained_owner_readback = crate::m3::activity_recorder::retained_owner_readback();
-    if !recorder_retained_owner_readback.safe_to_unlock() {
-        failures.push(format!(
-            "recorder retained-owner state is not safe to unlock after bounded cleanup: {recorder_retained_owner_readback:?}"
-        ));
-    }
-    let retained_interaction_hook_owners =
-        crate::m3::interaction_cadence::retained_live_owner_count();
-    if retained_interaction_hook_owners != 0 {
-        failures.push(format!(
-            "{retained_interaction_hook_owners} interaction-hook thread owner(s) remain live after bounded cleanup"
-        ));
-    }
-
-    HttpActivityOwnerDrainReport {
-        recorder_expected,
-        recorder_present,
-        recorder_owners_quiescent,
-        a11y_expected,
-        a11y_present,
-        a11y_owners_quiescent,
-        retained_a11y_bridge_task_owners,
-        win_event_shutdown_history,
-        recorder_retained_owner_readback,
-        retained_interaction_hook_owners,
-        failures,
-    }
-}
-
-impl HttpBackgroundTaskDrainReport {
-    fn owners_quiescent(&self) -> bool {
-        self.still_live_task_names.is_empty()
-    }
-
-    fn verdict(&self) -> anyhow::Result<()> {
-        if self.failures.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "HTTP background-task shutdown failed: {}; readback={self:?}",
-                self.failures.join("; ")
-            )
-        }
-    }
-}
-
-impl HttpShutdownFailures {
-    fn push(&mut self, phase: &'static str, detail: impl Into<String>) {
-        self.failures.push(HttpShutdownFailure {
-            phase,
-            detail: detail.into(),
-        });
-    }
-
-    fn inspect_session_close(&mut self, report: &McpSessionShutdownCloseReport) {
-        if report.failure_count != 0 || report.sessions_after != 0 {
-            self.push("session_close", format!("report={report:?}"));
-        }
-    }
-
-    fn inspect_socket_shutdown(&mut self, report: &ActiveHttpSocketShutdownReport) {
-        // A successful `shutdown(SD_BOTH)` wakes connection tasks but does not
-        // itself drop their tracked stream wrappers. Registry emptiness is a
-        // distinct postcondition read after the HTTP server has stopped.
-        if report.failure_count != 0 {
-            self.push("socket_shutdown", format!("report={report:?}"));
-        }
-    }
-
-    fn inspect_final_socket_count(&mut self, result: Result<usize, String>) {
-        match result {
-            Ok(0) => {}
-            Ok(tracked_count) => self.push(
-                "socket_registry_readback",
-                format!("tracked_count={tracked_count}"),
-            ),
-            Err(error) => self.push("socket_registry_readback", error),
-        }
-    }
-
-    fn inspect_final_session_ids(&mut self, session_ids: &BTreeSet<String>) {
-        if !session_ids.is_empty() {
-            self.push(
-                "session_manager_readback",
-                format!(
-                    "session_count={} session_ids={session_ids:?}",
-                    session_ids.len()
-                ),
-            );
-        }
-    }
-
-    fn inspect_input_cleanup(&mut self, report: &DaemonShutdownInputCleanupReport) {
-        if report.failure_count != 0 || report.lease_still_held_after_cleanup {
-            self.push("input_cleanup", format!("report={report:?}"));
-        }
-    }
-
-    fn inspect_result<E>(&mut self, phase: &'static str, result: Result<(), E>)
-    where
-        E: std::fmt::Display,
-    {
-        if let Err(error) = result {
-            self.push(phase, error.to_string());
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.failures.is_empty()
-    }
-
-    fn into_result(self) -> anyhow::Result<()> {
-        use std::io::Write as _;
-
-        if self.is_empty() {
-            return Ok(());
-        }
-        tracing::error!(
-            code = "MCP_HTTP_SHUTDOWN_POSTCONDITION_FAILED",
-            failure_count = self.failures.len(),
-            failures = ?self.failures,
-            "HTTP shutdown completed every cleanup phase but one or more required postconditions failed"
-        );
-        let stderr = std::io::stderr();
-        let mut stderr = stderr.lock();
-        let _ = writeln!(
-            stderr,
-            "synapse-mcp shutdown error: code=MCP_HTTP_SHUTDOWN_POSTCONDITION_FAILED failure_count={} failures={:?}",
-            self.failures.len(),
-            self.failures
-        );
-        anyhow::bail!(
-            "HTTP shutdown postconditions failed ({}): {:?}",
-            self.failures.len(),
-            self.failures
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HttpLifetimeOwnerReadback {
-    authority_finalizers_quiescent: bool,
-    session_input_owners_quiescent: bool,
-    session_manager_quiescent: bool,
-    active_socket_owners_quiescent: bool,
-    server_dispatch_quiescent: bool,
-    background_tasks_quiescent: bool,
-    m2_emitter_safe: bool,
-    activity_owners_quiescent: bool,
-    win_event_shutdown_history_quiescent: bool,
-    storage_service_owners_quiescent: bool,
-    operator_hotkey_quiescent: bool,
-    operator_panic_k2_tasks_quiescent: bool,
-}
-
-#[derive(Debug)]
-struct HttpOperatorOwnerDrain {
-    hotkey_report: Option<synapse_action::OperatorHotkeyShutdownReport>,
-    install_unwind_retained_live_owner: bool,
-    k2_report: crate::safety::OperatorPanicK2TaskDrainReport,
-}
-
-impl HttpOperatorOwnerDrain {
-    fn hotkey_owners_quiescent(&self) -> bool {
-        !self.install_unwind_retained_live_owner
-            && self
-                .hotkey_report
-                .as_ref()
-                .is_none_or(synapse_action::OperatorHotkeyShutdownReport::owners_quiescent)
-    }
-
-    fn k2_tasks_quiescent(&self) -> bool {
-        self.k2_report.owners_quiescent()
-    }
-
-    fn inspect_failures(&self, failures: &mut HttpShutdownFailures) {
-        if self.install_unwind_retained_live_owner {
-            failures.push(
-                "operator_hotkey_install_unwind",
-                "operator-hotkey installation unwind retained a live exact owner",
-            );
-        }
-        if let Some(report) = self.hotkey_report.as_ref() {
-            failures.inspect_result(
-                "operator_hotkey_shutdown",
-                report.verdict().map_err(|error| anyhow::anyhow!("{error}")),
-            );
-        }
-        failures.inspect_result("operator_panic_k2_drain", self.k2_report.verdict());
-    }
-}
-
-async fn drain_http_operator_owners(
-    guard: &mut Option<synapse_action::OperatorHotkeyGuard>,
-    reason: &'static str,
-) -> HttpOperatorOwnerDrain {
-    let k2_owners_before = crate::safety::operator_panic_k2_task_owner_readback();
-    let hotkey_report = crate::safety::shutdown_operator_hotkey(guard, reason);
-    let install_unwind_retained_live_owner =
-        crate::safety::operator_hotkey_install_unwind_retained_live_owner();
-    let hotkey_owners_quiescent = !install_unwind_retained_live_owner
-        && hotkey_report
-            .as_ref()
-            .is_none_or(synapse_action::OperatorHotkeyShutdownReport::owners_quiescent);
-    let k2_report =
-        crate::safety::drain_operator_panic_k2_tasks(reason, hotkey_owners_quiescent).await;
-    let report = HttpOperatorOwnerDrain {
-        hotkey_report,
-        install_unwind_retained_live_owner,
-        k2_report,
-    };
-    tracing::info!(
-        code = "MCP_HTTP_OPERATOR_OWNER_DRAIN_READBACK",
-        reason,
-        k2_owners_before = ?k2_owners_before,
-        report = ?report,
-        "readback=operator_hotkey_and_k2_owners edge=http_shutdown after_checked_drain"
-    );
-    report
-}
-
-impl HttpLifetimeOwnerReadback {
-    const fn safe_to_unlock(self) -> bool {
-        self.authority_finalizers_quiescent
-            && self.session_input_owners_quiescent
-            && self.session_manager_quiescent
-            && self.active_socket_owners_quiescent
-            && self.server_dispatch_quiescent
-            && self.background_tasks_quiescent
-            && self.m2_emitter_safe
-            && self.activity_owners_quiescent
-            && self.win_event_shutdown_history_quiescent
-            && self.storage_service_owners_quiescent
-            && self.operator_hotkey_quiescent
-            && self.operator_panic_k2_tasks_quiescent
-    }
-}
-
-const fn http_lifetime_locks_safe_to_close(
-    owners: HttpLifetimeOwnerReadback,
-    desktop_worker_active_owner_count: usize,
-    retained_shutdown_task_owners_quiescent: bool,
-    unresolved_shell_child_owners_quiescent: bool,
-    activity_recorder_retained_owners_quiescent: bool,
-) -> bool {
-    owners.safe_to_unlock()
-        && desktop_worker_active_owner_count == 0
-        && retained_shutdown_task_owners_quiescent
-        && unresolved_shell_child_owners_quiescent
-        && activity_recorder_retained_owners_quiescent
-}
-
-fn close_or_retain_http_lifetime_locks(
-    shell_job_store: crate::single_instance::ShellJobStoreLockGuard,
-    single_instance: crate::single_instance::SingleInstanceGuard,
-    owners: HttpLifetimeOwnerReadback,
-    reason: &'static str,
-) -> anyhow::Result<()> {
-    // Re-read the process-global retained-owner ledger at the destructive
-    // boundary. A worker may have outlived an earlier transport instance even
-    // though it is not represented by this HTTP runtime's local task vectors.
-    let desktop_worker_owner_report = crate::desktop_worker::desktop_worker_retained_owner_report();
-    let desktop_worker_owners_quiescent = desktop_worker_owner_report.active_owner_count == 0;
-    let retained_shutdown_task_owner_report =
-        crate::emitter_shutdown::retained_shutdown_task_owner_report();
-    let retained_shutdown_task_owners_quiescent =
-        retained_shutdown_task_owner_report.safe_to_unlock();
-    let unresolved_shell_child_owner_report = crate::m4::unresolved_shell_child_owner_report();
-    let unresolved_shell_child_owners_quiescent =
-        unresolved_shell_child_owner_report.safe_to_unlock();
-    let activity_recorder_retained_owner_readback =
-        crate::m3::activity_recorder::retained_owner_readback();
-    let activity_recorder_retained_owners_quiescent =
-        activity_recorder_retained_owner_readback.safe_to_unlock();
-    if !http_lifetime_locks_safe_to_close(
-        owners,
-        desktop_worker_owner_report.active_owner_count,
-        retained_shutdown_task_owners_quiescent,
-        unresolved_shell_child_owners_quiescent,
-        activity_recorder_retained_owners_quiescent,
-    ) {
-        tracing::error!(
-            code = "MCP_HTTP_LIFETIME_LOCKS_RETAINED",
-            reason,
-            owners = ?owners,
-            desktop_worker_owners_quiescent,
-            desktop_worker_owner_report = ?desktop_worker_owner_report,
-            retained_shutdown_task_owners_quiescent,
-            retained_shutdown_task_owner_report = ?retained_shutdown_task_owner_report,
-            unresolved_shell_child_owners_quiescent,
-            unresolved_shell_child_owner_report = ?unresolved_shell_child_owner_report,
-            activity_recorder_retained_owners_quiescent,
-            activity_recorder_retained_owner_readback = ?activity_recorder_retained_owner_readback,
-            "one or more daemon-owned task sets remained live; retaining both lifetime locks until process teardown"
-        );
-        use std::io::Write as _;
-        if let Err(stderr_error) = writeln!(
-            std::io::stderr().lock(),
-            "synapse-mcp fatal shutdown error: reason={reason} owners={owners:?} desktop_worker_owners_quiescent={desktop_worker_owners_quiescent} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owners_quiescent={retained_shutdown_task_owners_quiescent} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owners_quiescent={unresolved_shell_child_owners_quiescent} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owners_quiescent={activity_recorder_retained_owners_quiescent} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}; daemon lifetime locks retained until process teardown"
-        ) {
-            tracing::error!(
-                code = "MCP_HTTP_LIFETIME_LOCK_RETAIN_STDERR_WRITE_FAILED",
-                reason,
-                error = %stderr_error,
-                "failed to write retained HTTP lifetime-lock failure to stderr"
-            );
-        }
-        // Deliberately retain the exact file handles. Dropping either guard
-        // here would admit a successor while an old task can still mutate the
-        // DB, shell-job store, input state, or audit ledger. The OS releases
-        // both locks only when this process is torn down.
-        std::mem::forget(shell_job_store);
-        std::mem::forget(single_instance);
-        anyhow::bail!(
-            "refused to release HTTP daemon lifetime locks after {reason}: owners={owners:?} desktop_worker_owners_quiescent={desktop_worker_owners_quiescent} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owners_quiescent={retained_shutdown_task_owners_quiescent} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owners_quiescent={unresolved_shell_child_owners_quiescent} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owners_quiescent={activity_recorder_retained_owners_quiescent} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}"
-        );
-    }
-    crate::single_instance::close_daemon_lifetime_locks(shell_job_store, single_instance)
-        .map(|_readback| ())
-        .map_err(anyhow::Error::new)
-        .context("close daemon lifetime locks after HTTP transport cleanup")
-}
-
-async fn drain_http_background_tasks(
-    tasks: Vec<HttpBackgroundTaskOwner>,
-) -> HttpBackgroundTaskDrainReport {
-    let tasks_before = tasks.len();
-    // Supervise every independent task concurrently. One non-cooperative task
-    // gets its own graceful and post-abort deadlines without serially adding
-    // those deadlines to every later task's shutdown latency.
-    let outcomes = join_all(tasks.into_iter().map(|(name, mut task)| async move {
-        match time::timeout(HTTP_BACKGROUND_TASK_STOP_TIMEOUT, &mut task).await {
-            Ok(result) => {
-                let outcome = match result {
-                    Ok(()) => (name, true, false, true, None),
-                    Err(error) => (
-                        name,
-                        true,
-                        false,
-                        true,
-                        Some(format!("{name}: join failed: {error}")),
-                    ),
-                };
-                task.acknowledge_terminal_outcome();
-                outcome
-            }
-            Err(_elapsed) => {
-                task.abort();
-                match time::timeout(HTTP_BACKGROUND_TASK_ABORT_TIMEOUT, &mut task).await {
-                    Ok(result) => {
-                        let outcome = (
-                            name,
-                            false,
-                            true,
-                            true,
-                            Some(format!(
-                                "{name}: did not stop within {} ms after shutdown cancellation; abort_join={result:?}",
-                                HTTP_BACKGROUND_TASK_STOP_TIMEOUT.as_millis()
-                            )),
-                        );
-                        task.acknowledge_terminal_outcome();
-                        outcome
-                    }
-                    Err(_elapsed) => (
-                        name,
-                        false,
-                        true,
-                        false,
-                        Some(format!(
-                            "{name}: did not stop within {} ms after shutdown cancellation and did not join within {} ms after abort; exact JoinHandle retained until process teardown",
-                            HTTP_BACKGROUND_TASK_STOP_TIMEOUT.as_millis(),
-                            HTTP_BACKGROUND_TASK_ABORT_TIMEOUT.as_millis()
-                        )),
-                    ),
-                }
-            }
-        }
-    }))
-    .await;
-    let mut graceful_joined = 0;
-    let mut abort_requests_sent = 0;
-    let mut joined_after_abort = 0;
-    let mut still_live_task_names = Vec::new();
-    let mut failures = Vec::new();
-    for (name, joined_during_grace, abort_requested, terminal_readback, failure) in outcomes {
-        graceful_joined += usize::from(joined_during_grace);
-        abort_requests_sent += usize::from(abort_requested);
-        joined_after_abort += usize::from(abort_requested && terminal_readback);
-        if !terminal_readback {
-            still_live_task_names.push(name);
-        }
-        if let Some(failure) = failure {
-            failures.push(failure);
-        }
-    }
-    HttpBackgroundTaskDrainReport {
-        tasks_before,
-        graceful_joined,
-        abort_requests_sent,
-        joined_after_abort,
-        still_live_task_names,
-        failures,
-    }
-}
-
-struct HttpRuntimeStartup {
-    background_tasks: Vec<HttpBackgroundTaskOwner>,
-    operator_hotkey_guard: Option<synapse_action::OperatorHotkeyGuard>,
-    runtime: HttpRouterRuntime,
-}
-
-struct HttpRuntimeStartupFailure {
-    phase: &'static str,
-    error: anyhow::Error,
-    background_tasks: Vec<HttpBackgroundTaskOwner>,
-    operator_hotkey_guard: Option<synapse_action::OperatorHotkeyGuard>,
-}
-
-impl HttpRuntimeStartupFailure {
-    fn new(
-        phase: &'static str,
-        error: anyhow::Error,
-        background_tasks: Vec<HttpBackgroundTaskOwner>,
-        operator_hotkey_guard: Option<synapse_action::OperatorHotkeyGuard>,
-    ) -> Self {
-        Self {
-            phase,
-            error,
-            background_tasks,
-            operator_hotkey_guard,
-        }
-    }
-}
-
-fn own_http_background_task(name: &'static str, task: JoinHandle<()>) -> HttpBackgroundTaskOwner {
-    (name, ShutdownTaskOwner::new(name, task))
-}
-
-fn start_http_runtime(
-    service: &SynapseService,
-    shutdown_cancel: &CancellationToken,
-    local_addr: SocketAddr,
-    sse_state: SseState,
-    active_http_sockets: ActiveHttpSockets,
-) -> Result<HttpRuntimeStartup, HttpRuntimeStartupFailure> {
-    let mut background_tasks = Vec::new();
-    let routine_miner = match crate::m3::routine_miner_job::spawn_periodic_miner(
-        service.m3_state_handle(),
-        shutdown_cancel.clone(),
-    )
-    .context("spawn periodic routine miner")
-    {
-        Ok(task) => task,
-        Err(error) => {
-            return Err(HttpRuntimeStartupFailure::new(
-                "routine_miner",
-                error,
-                background_tasks,
-                None,
-            ));
-        }
-    };
-    if let Some(task) = routine_miner {
-        background_tasks.push(own_http_background_task("routine_miner", task));
-    }
-
-    let intent_detector = match crate::m3::intent_events::spawn_intent_detector(
-        service.m3_state_handle(),
-        shutdown_cancel.clone(),
-    )
-    .context("spawn periodic intent detector")
-    {
-        Ok(task) => task,
-        Err(error) => {
-            return Err(HttpRuntimeStartupFailure::new(
-                "intent_detector",
-                error,
-                background_tasks,
-                None,
-            ));
-        }
-    };
-    if let Some(task) = intent_detector {
-        background_tasks.push(own_http_background_task("intent_detector", task));
-    }
-
-    let armed_routine_runner =
-        match crate::server::suggestions::spawn_periodic_armed_routine_runner(
-            service.clone(),
-            shutdown_cancel.clone(),
-        )
-        .context("spawn periodic armed routine runner")
-        {
-            Ok(task) => task,
-            Err(error) => {
-                return Err(HttpRuntimeStartupFailure::new(
-                    "armed_routine_runner",
-                    error,
-                    background_tasks,
-                    None,
-                ));
-            }
-        };
-    if let Some(task) = armed_routine_runner {
-        background_tasks.push(own_http_background_task("armed_routine_runner", task));
-    }
-
-    let transcript_ingest =
-        match crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
-            service.m3_state_handle(),
-            shutdown_cancel.clone(),
-        )
-        .context("spawn periodic transcript ingester")
-        {
-            Ok(task) => task,
-            Err(error) => {
-                return Err(HttpRuntimeStartupFailure::new(
-                    "transcript_ingest",
-                    error,
-                    background_tasks,
-                    None,
-                ));
-            }
-        };
-    if let Some(task) = transcript_ingest {
-        background_tasks.push(own_http_background_task("transcript_ingest", task));
-    }
-
-    let ambient_ingest = match crate::server::ambient_agents::spawn_periodic_ambient_ingest(
-        service.m3_state_handle(),
-        shutdown_cancel.clone(),
-    )
-    .context("spawn periodic ambient agent discovery")
-    {
-        Ok(task) => task,
-        Err(error) => {
-            return Err(HttpRuntimeStartupFailure::new(
-                "ambient_ingest",
-                error,
-                background_tasks,
-                None,
-            ));
-        }
-    };
-    if let Some(task) = ambient_ingest {
-        background_tasks.push(own_http_background_task("ambient_ingest", task));
-    }
-
-    let operator_hotkey_guard = match crate::safety::install_operator_hotkey(service.clone())
-        .context("install operator panic hotkey")
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            return Err(HttpRuntimeStartupFailure::new(
-                "operator_hotkey",
-                error,
-                background_tasks,
-                None,
-            ));
-        }
-    };
-    let runtime = match router(
-        shutdown_cancel,
-        local_addr,
-        sse_state,
-        service.clone(),
-        active_http_sockets,
-    )
-    .context("build HTTP MCP router")
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return Err(HttpRuntimeStartupFailure::new(
-                "http_router",
-                error,
-                background_tasks,
-                operator_hotkey_guard,
-            ));
-        }
-    };
-    Ok(HttpRuntimeStartup {
-        background_tasks,
-        operator_hotkey_guard,
-        runtime,
-    })
-}
-
-async fn fail_http_startup_after_service(
-    failure: HttpRuntimeStartupFailure,
-    service: SynapseService,
-    m3_state: crate::m3::SharedM3State,
-    m2_emitter_owner: M2EmitterOwner,
-    recorder_expected: bool,
-    a11y_expected: bool,
-    shutdown_cancel: CancellationToken,
-    connection_closed_cancel: CancellationToken,
-    shell_job_store_lock_guard: crate::single_instance::ShellJobStoreLockGuard,
-    single_instance_guard: crate::single_instance::SingleInstanceGuard,
-) -> anyhow::Result<ExitCode> {
-    let HttpRuntimeStartupFailure {
-        phase,
-        error,
-        background_tasks,
-        mut operator_hotkey_guard,
-    } = failure;
-    let primary_detail = format!("{error:#}");
-    tracing::error!(
-        code = "MCP_HTTP_STARTUP_TRANSACTION_FAILED",
-        phase,
-        detail = %primary_detail,
-        "HTTP startup failed after daemon task activation; cancelling and reading every exact owner before lifetime-lock disposition"
-    );
-    shutdown_cancel.cancel();
-    connection_closed_cancel.cancel();
-
-    let mut failures = HttpShutdownFailures::default();
-    failures.push(phase, primary_detail.clone());
-
-    let operator_panic_k2_owners_before = crate::safety::operator_panic_k2_task_owner_readback();
-    let hotkey_report =
-        crate::safety::shutdown_operator_hotkey(&mut operator_hotkey_guard, "http_startup_failure");
-    let install_unwind_retained_live_owner =
-        crate::safety::operator_hotkey_install_unwind_retained_live_owner();
-    let operator_hotkey_quiescent = !install_unwind_retained_live_owner
-        && hotkey_report
-            .as_ref()
-            .is_none_or(synapse_action::OperatorHotkeyShutdownReport::owners_quiescent);
-    if install_unwind_retained_live_owner {
-        failures.push(
-            "operator_hotkey_install_unwind",
-            "operator-hotkey installation unwind retained a live exact owner",
-        );
-    }
-    if let Some(report) = hotkey_report.as_ref() {
-        failures.inspect_result(
-            "operator_hotkey_shutdown",
-            report.verdict().map_err(anyhow::Error::msg),
-        );
-    }
-    let operator_panic_k2_drain = crate::safety::drain_operator_panic_k2_tasks(
-        "http_startup_failure",
-        operator_hotkey_quiescent,
-    )
-    .await;
-    let operator_panic_k2_tasks_quiescent = operator_panic_k2_drain.owners_quiescent();
-    failures.inspect_result("operator_panic_k2_drain", operator_panic_k2_drain.verdict());
-
-    let authority_result = service.drain_authority_finalizers().await;
-    let authority_finalizers_quiescent = match &authority_result {
-        Ok(readback) => readback.safe_to_unlock(),
-        Err(error) => error.readback.safe_to_unlock(),
-    };
-    failures.inspect_result(
-        "authority_finalizer_drain",
-        authority_result
-            .map(|_readback| ())
-            .map_err(anyhow::Error::new),
-    );
-
-    let activity_drain =
-        drain_http_activity_owners(&m3_state, recorder_expected, a11y_expected).await;
-    let activity_owners_quiescent = activity_drain.safe_to_unlock();
-    let win_event_shutdown_history_quiescent =
-        activity_drain.win_event_shutdown_history.owners_quiescent();
-    failures.inspect_result("activity_owner_drain", activity_drain.verdict());
-
-    let background_task_drain = drain_http_background_tasks(background_tasks).await;
-    let background_tasks_quiescent = background_task_drain.owners_quiescent();
-    failures.inspect_result("background_task_drain", background_task_drain.verdict());
-
-    let m2_emitter_drain =
-        drain_m2_emitter_owner(Some(m2_emitter_owner), "http", "http_startup_failure").await;
-    let m2_emitter_safe = m2_emitter_drain.safe_to_unlock();
-    failures.inspect_result("m2_emitter_drain", m2_emitter_drain.verdict());
-
-    let (session_registry_readback_ok, session_registry_rows) =
-        match service.session_registry_handle().lock() {
-            Ok(registry) => (
-                true,
-                registry.reads(crate::server::session_registry::unix_time_ms_now()),
-            ),
-            Err(error) => {
-                failures.push(
-                    "session_registry_readback",
-                    format!("session registry lock poisoned during startup cleanup: {error}"),
-                );
-                (false, Vec::new())
-            }
-        };
-    if !session_registry_rows.is_empty() {
-        failures.push(
-            "session_registry_readback",
-            format!(
-                "startup failure left {} session registry rows: {session_registry_rows:?}",
-                session_registry_rows.len()
-            ),
-        );
-    }
-    let lease_after = synapse_action::lease::status();
-    if lease_after.held {
-        failures.push(
-            "input_lease_readback",
-            format!("input lease remained held after startup cleanup: {lease_after:?}"),
-        );
-    }
-    let session_manager_quiescent =
-        session_registry_readback_ok && session_registry_rows.is_empty();
-    let session_input_owners_quiescent = authority_finalizers_quiescent && !lease_after.held;
-
-    drop(service);
-    drop(shutdown_cancel);
-    drop(connection_closed_cancel);
-    let storage_owner_readback = m3_storage_owner_readback(&m3_state);
-    if !storage_owner_readback.owners_quiescent {
-        failures.push(
-            "storage_service_owner_readback",
-            format!("readback={storage_owner_readback:?}"),
-        );
-    }
-    drop(m3_state);
-    let owners = HttpLifetimeOwnerReadback {
-        authority_finalizers_quiescent,
-        session_input_owners_quiescent,
-        session_manager_quiescent,
-        active_socket_owners_quiescent: true,
-        server_dispatch_quiescent: true,
-        background_tasks_quiescent,
-        m2_emitter_safe,
-        activity_owners_quiescent,
-        win_event_shutdown_history_quiescent,
-        storage_service_owners_quiescent: storage_owner_readback.owners_quiescent,
-        operator_hotkey_quiescent,
-        operator_panic_k2_tasks_quiescent,
-    };
-    if !operator_hotkey_quiescent {
-        crate::safety::retain_operator_hotkey_guard_to_process_exit(
-            &mut operator_hotkey_guard,
-            "http_startup_failure",
-        );
-    }
-    let lifetime_lock_close = close_or_retain_http_lifetime_locks(
-        shell_job_store_lock_guard,
-        single_instance_guard,
-        owners,
-        "http_startup_failure",
-    );
-    let lifetime_locks_closed = lifetime_lock_close.is_ok();
-    failures.inspect_result("lifetime_lock_close", lifetime_lock_close);
-    if lifetime_locks_closed {
-        let lifecycle_result = crate::daemon_lifecycle::record_startup_exit(
-            "startup_http_runtime_failed",
-            serde_json::json!({
-                "phase": phase,
-                "detail": primary_detail,
-                "authority_finalizers_quiescent": authority_finalizers_quiescent,
-                "session_input_owners_quiescent": session_input_owners_quiescent,
-                "session_manager_quiescent": session_manager_quiescent,
-                "background_tasks_quiescent": background_tasks_quiescent,
-                "storage_service_owners": storage_owner_readback,
-                "m2_emitter": format!("{m2_emitter_drain:?}"),
-                "activity_owners": format!("{activity_drain:?}"),
-                "operator_hotkey": format!("{hotkey_report:?}"),
-                "operator_hotkey_install_unwind_retained_live_owner": install_unwind_retained_live_owner,
-                "operator_panic_k2_owners_before": operator_panic_k2_owners_before,
-                "operator_panic_k2_drain": operator_panic_k2_drain,
-                "session_registry_rows": session_registry_rows.len(),
-                "lease_after": lease_after,
-                "lifetime_locks_closed": true,
-            }),
-        )
-        .context("record daemon lifecycle HTTP runtime startup failure after lock close");
-        failures.inspect_result("startup_lifecycle_record", lifecycle_result);
-    } else {
-        tracing::error!(
-            code = "MCP_HTTP_STARTUP_EXIT_RECORD_SUPPRESSED",
-            phase,
-            owners = ?owners,
-            "startup-exit lifecycle record suppressed because daemon lifetime locks were retained or failed to close"
-        );
-    }
-    failures.into_result()?;
-    anyhow::bail!("HTTP startup transaction failed without a recorded failure")
-}
-
 #[derive(Clone, Default)]
-struct ActiveHttpSockets {
+pub(super) struct ActiveHttpSockets {
     #[cfg(windows)]
     inner: Arc<Mutex<BTreeMap<usize, ActiveHttpSocketInfo>>>,
     #[cfg(windows)]
@@ -1314,6 +182,24 @@ struct ActiveHttpSocketInfo {
     raw_socket: usize,
     peer_addr: String,
     accepted_at_unix_ms: u128,
+}
+
+#[cfg(windows)]
+impl super::socket_close_policy::SocketClosePolicy {
+    fn apply_to(&self, stream: &tokio::net::TcpStream, reason: &'static str) {
+        if !self.is_abortive() {
+            return;
+        }
+        if let Err(error) = stream.set_zero_linger() {
+            tracing::error!(
+                code = "MCP_HTTP_ACCEPTED_SOCKET_ZERO_LINGER_FAILED",
+                error = %error,
+                raw_socket = stream.as_raw_socket() as usize,
+                reason,
+                "failed to configure an intentionally aborted HTTP socket"
+            );
+        }
+    }
 }
 
 impl ActiveHttpSockets {
@@ -1346,8 +232,6 @@ impl ActiveHttpSockets {
 
     #[cfg(windows)]
     fn register(&self, raw_socket: usize, peer_addr: SocketAddr) {
-        HTTP_ACCEPTED_SOCKETS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        HTTP_ACCEPTED_SOCKETS_CURRENT.fetch_add(1, Ordering::Relaxed);
         let info = ActiveHttpSocketInfo {
             raw_socket,
             peer_addr: peer_addr.to_string(),
@@ -1378,7 +262,6 @@ impl ActiveHttpSockets {
 
     #[cfg(windows)]
     fn unregister(&self, raw_socket: usize) {
-        saturating_decrement(&HTTP_ACCEPTED_SOCKETS_CURRENT);
         match self.inner.lock() {
             Ok(mut sockets) => {
                 let removed = sockets.remove(&raw_socket).is_some();
@@ -1402,10 +285,17 @@ impl ActiveHttpSockets {
     }
 
     #[cfg(windows)]
-    fn shutdown_socket_on_drop(&self, raw_socket: usize, reason: &'static str) {
-        if !self.shutdown_on_drop_enabled() {
+    fn shutdown_socket_on_drop(&self, stream: &tokio::net::TcpStream, reason: &'static str) {
+        let policy = super::socket_close_policy::SocketClosePolicy::for_drop(
+            self.shutdown_on_drop_enabled(),
+        );
+        policy.apply_to(stream, reason);
+        if !policy.is_abortive() {
             return;
         }
+        let raw_socket = stream.as_raw_socket() as usize;
+        // SAFETY: no pointers are passed; `raw_socket` is a plain SOCKET value still tracked by the
+        // owning stream, and an invalid one makes the call return SOCKET_ERROR instead of faulting.
         let shutdown_result = unsafe { winsock_shutdown(SOCKET(raw_socket), SD_BOTH) };
         if shutdown_result == 0 {
             tracing::warn!(
@@ -1415,6 +305,8 @@ impl ActiveHttpSockets {
                 "accepted HTTP socket was shut down during drop after daemon restart drain began"
             );
         } else {
+            // SAFETY: WSAGetLastError only reads this thread's Winsock error slot, set by the
+            // failed call above.
             let error = unsafe { WSAGetLastError() };
             tracing::warn!(
                 code = "MCP_HTTP_ACCEPTED_SOCKET_DROP_SHUTDOWN_FAILED",
@@ -1439,7 +331,7 @@ impl ActiveHttpSockets {
                         shutdown_attempted: 0,
                         shutdown_succeeded: 0,
                         failure_count: 1,
-                        tracked_after_shutdown_attempt: 0,
+                        tracked_after: 0,
                         sockets: Vec::new(),
                         failures: vec![format!("registry_lock_poisoned:{error}")],
                     };
@@ -1449,10 +341,15 @@ impl ActiveHttpSockets {
             let mut succeeded = 0;
             for socket in &tracked {
                 let shutdown_result =
+                    // SAFETY: no pointers are passed; `raw_socket` is a plain SOCKET value from the
+                    // tracked registry, and an invalid one makes the call return SOCKET_ERROR
+                    // instead of faulting.
                     unsafe { winsock_shutdown(SOCKET(socket.raw_socket), SD_BOTH) };
                 if shutdown_result == 0 {
                     succeeded += 1;
                 } else {
+                    // SAFETY: WSAGetLastError only reads this thread's Winsock error slot, set by
+                    // the failed call above.
                     let error = unsafe { WSAGetLastError() };
                     failures.push(format!(
                         "raw_socket={} peer_addr={} wsa_error={}",
@@ -1460,20 +357,14 @@ impl ActiveHttpSockets {
                     ));
                 }
             }
-            let tracked_after_shutdown_attempt = match self.inner.lock() {
-                Ok(sockets) => sockets.len(),
-                Err(error) => {
-                    failures.push(format!("registry_readback_lock_poisoned:{error}"));
-                    0
-                }
-            };
+            let tracked_after = self.inner.lock().map_or(0, |sockets| sockets.len());
             ActiveHttpSocketShutdownReport {
                 reason,
                 tracked_before: tracked.len(),
                 shutdown_attempted: tracked.len(),
                 shutdown_succeeded: succeeded,
                 failure_count: failures.len(),
-                tracked_after_shutdown_attempt,
+                tracked_after,
                 sockets: tracked
                     .into_iter()
                     .map(|socket| ActiveHttpSocketShutdownRow {
@@ -1493,61 +384,157 @@ impl ActiveHttpSockets {
                 shutdown_attempted: 0,
                 shutdown_succeeded: 0,
                 failure_count: 0,
-                tracked_after_shutdown_attempt: 0,
+                tracked_after: 0,
                 sockets: Vec::new(),
                 failures: Vec::new(),
             }
         }
     }
-
-    /// Separately read the accepted-socket registry after the listener and all
-    /// connection tasks have stopped. This is the registry Source of Truth;
-    /// the earlier socket-shutdown syscall result is only a trigger verdict.
-    #[cfg(windows)]
-    fn final_tracked_count(&self) -> Result<usize, String> {
-        self.inner
-            .lock()
-            .map(|sockets| sockets.len())
-            .map_err(|error| format!("registry_lock_poisoned:{error}"))
-    }
-
-    #[cfg(not(windows))]
-    fn final_tracked_count(&self) -> Result<usize, String> {
-        Ok(0)
-    }
 }
 
-#[cfg(windows)]
+type AdmittedConnection = (TrackedTcpStream, SocketAddr);
+
 struct TrackedTcpListener {
     inner: TcpListener,
+    admission: crate::http::connection_admission::HttpConnectionAdmission,
+    /// Over-budget connections that proved to be liveness requests (#19).
+    triaged_tx: mpsc::UnboundedSender<AdmittedConnection>,
+    triaged_rx: mpsc::UnboundedReceiver<AdmittedConnection>,
+    #[cfg(windows)]
     sockets: ActiveHttpSockets,
 }
 
-#[cfg(windows)]
+impl TrackedTcpListener {
+    fn new(
+        inner: TcpListener,
+        admission: crate::http::connection_admission::HttpConnectionAdmission,
+        #[cfg(windows)] sockets: ActiveHttpSockets,
+    ) -> Self {
+        let (triaged_tx, triaged_rx) = mpsc::unbounded_channel();
+        Self {
+            inner,
+            admission,
+            triaged_tx,
+            triaged_rx,
+            #[cfg(windows)]
+            sockets,
+        }
+    }
+
+    /// Normal budget is full. A complete liveness head already queued on the socket is admitted
+    /// to the reserve at once, whatever the triage pool holds (#19); anything undecided is held
+    /// (bounded) only to peek for a complete liveness head.
+    fn admit_over_budget(
+        &self,
+        stream: tokio::net::TcpStream,
+        addr: SocketAddr,
+    ) -> Option<AdmittedConnection> {
+        match crate::http::liveness_triage::classify_ready_head(&stream) {
+            crate::http::liveness_triage::HeadClass::Liveness => {
+                let Some(permit) = self.admission.try_admit_liveness() else {
+                    reject_connection(&self.admission, stream, addr);
+                    return None;
+                };
+                let tracked = TrackedTcpStream::adopt(
+                    stream,
+                    addr,
+                    permit,
+                    #[cfg(windows)]
+                    &self.sockets,
+                );
+                return Some((tracked, addr));
+            }
+            crate::http::liveness_triage::HeadClass::Other => {
+                reject_connection(&self.admission, stream, addr);
+                return None;
+            }
+            crate::http::liveness_triage::HeadClass::Incomplete => {}
+        }
+        self.defer_to_liveness_triage(stream, addr);
+        None
+    }
+
+    fn defer_to_liveness_triage(&self, stream: tokio::net::TcpStream, addr: SocketAddr) {
+        let Some(triage_permit) = self.admission.try_triage() else {
+            reject_connection(&self.admission, stream, addr);
+            return;
+        };
+        let admission = self.admission.clone();
+        let triaged = self.triaged_tx.clone();
+        #[cfg(windows)]
+        let sockets = self.sockets.clone();
+        tokio::spawn(async move {
+            let _triage_permit = triage_permit;
+            let is_liveness = crate::http::liveness_triage::await_liveness_head(
+                &stream,
+                admission.triage_deadline(),
+            )
+            .await;
+            let Some(permit) = is_liveness
+                .then(|| admission.try_admit_liveness())
+                .flatten()
+            else {
+                reject_connection(&admission, stream, addr);
+                return;
+            };
+            let tracked = TrackedTcpStream::adopt(
+                stream,
+                addr,
+                permit,
+                #[cfg(windows)]
+                &sockets,
+            );
+            let _ = triaged.send((tracked, addr));
+        });
+    }
+}
+
+fn reject_connection(
+    admission: &crate::http::connection_admission::HttpConnectionAdmission,
+    stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+) {
+    admission.note_rejected();
+    #[cfg(windows)]
+    super::socket_close_policy::SocketClosePolicy::capacity_rejected()
+        .apply_to(&stream, "connection_capacity");
+    tracing::warn!(
+        code = synapse_core::error_codes::HTTP_CONNECTION_CAPACITY,
+        peer_addr = %addr,
+        active_connections = admission.active_connections(),
+        max_connections = admission.max_connections(),
+        rejected_total = admission.rejected_total(),
+        "HTTP connection rejected at pre-parse capacity"
+    );
+    drop(stream);
+}
+
 impl Listener for TrackedTcpListener {
     type Io = TrackedTcpStream;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            match self.inner.accept().await {
+            let accepted = tokio::select! {
+                accepted = self.inner.accept() => accepted,
+                Some(triaged) = self.triaged_rx.recv() => return triaged,
+            };
+            match accepted {
                 Ok((stream, addr)) => {
-                    if let Err(error) = stream.set_zero_linger() {
-                        tracing::error!(
-                            code = "MCP_HTTP_ACCEPTED_SOCKET_ZERO_LINGER_FAILED",
-                            error = %error,
-                            peer_addr = %addr,
-                            "failed to configure accepted HTTP socket for abortive close on daemon shutdown"
-                        );
-                    }
-                    let raw_socket = stream.as_raw_socket() as usize;
-                    self.sockets.register(raw_socket, addr);
+                    let Some(permit) = self.admission.try_admit() else {
+                        if let Some(admitted) = self.admit_over_budget(stream, addr) {
+                            return admitted;
+                        }
+                        continue;
+                    };
                     return (
-                        TrackedTcpStream {
-                            inner: stream,
-                            sockets: self.sockets.clone(),
-                            raw_socket,
-                        },
+                        TrackedTcpStream::adopt(
+                            stream,
+                            addr,
+                            permit,
+                            #[cfg(windows)]
+                            &self.sockets,
+                        ),
                         addr,
                     );
                 }
@@ -1561,23 +548,64 @@ impl Listener for TrackedTcpListener {
     }
 }
 
-#[cfg(windows)]
 struct TrackedTcpStream {
     inner: tokio::net::TcpStream,
+    _permit: crate::http::connection_admission::ConnectionPermit,
+    header_timeout: Duration,
+    keep_alive: bool,
+    #[cfg(windows)]
     sockets: ActiveHttpSockets,
+    #[cfg(windows)]
     raw_socket: usize,
+}
+
+impl TrackedTcpStream {
+    fn adopt(
+        stream: tokio::net::TcpStream,
+        addr: SocketAddr,
+        permit: crate::http::connection_admission::ConnectionPermit,
+        #[cfg(windows)] sockets: &ActiveHttpSockets,
+    ) -> Self {
+        let header_timeout = permit.header_timeout();
+        let keep_alive = permit.keep_alive();
+        #[cfg(windows)]
+        let raw_socket = {
+            let raw_socket = stream.as_raw_socket() as usize;
+            sockets.register(raw_socket, addr);
+            raw_socket
+        };
+        #[cfg(not(windows))]
+        let _ = addr;
+        Self {
+            inner: stream,
+            _permit: permit,
+            header_timeout,
+            keep_alive,
+            #[cfg(windows)]
+            sockets: sockets.clone(),
+            #[cfg(windows)]
+            raw_socket,
+        }
+    }
+
+    const fn header_timeout(&self) -> Duration {
+        self.header_timeout
+    }
+
+    const fn keep_alive(&self) -> bool {
+        self.keep_alive
+    }
 }
 
 #[cfg(windows)]
 impl Drop for TrackedTcpStream {
     fn drop(&mut self) {
         self.sockets
-            .shutdown_socket_on_drop(self.raw_socket, "tracked_tcp_stream_drop");
+            .shutdown_socket_on_drop(&self.inner, "tracked_tcp_stream_drop");
         self.sockets.unregister(self.raw_socket);
     }
 }
 
-#[cfg(windows)]
 impl AsyncRead for TrackedTcpStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1588,7 +616,6 @@ impl AsyncRead for TrackedTcpStream {
     }
 }
 
-#[cfg(windows)]
 impl AsyncWrite for TrackedTcpStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -1615,6 +642,7 @@ pub(super) async fn serve(
     m4_config: M4ServiceConfig,
 ) -> anyhow::Result<ExitCode> {
     synapse_action::install_panic_hook();
+    HTTP_SERVE_STARTED.get_or_init(std::time::Instant::now);
 
     // Validate the bind address first — a pure argument check with no side
     // effects. Doing this before acquiring the single-instance lock means a
@@ -1641,9 +669,9 @@ pub(super) async fn serve(
         .db_path
         .clone()
         .unwrap_or_else(crate::m3::default_db_path);
-    let single_instance_guard = match crate::single_instance::SingleInstanceGuard::acquire(&db_path)
-    {
-        Ok(guard) => {
+    // #170: the shared step runs crash recovery only once this process owns the lock.
+    let startup_lock =
+        crate::acquire_lock_then_recover(&db_path, m3_config.db_path.as_deref(), |guard| {
             tracing::info!(
                 code = "MCP_DAEMON_SINGLE_INSTANCE_ACQUIRED",
                 lock_path = %guard.lock_path().display(),
@@ -1651,12 +679,13 @@ pub(super) async fn serve(
                 pid = std::process::id(),
                 "daemon single-instance lock acquired"
             );
-            guard
-        }
-        Err(crate::single_instance::SingleInstanceError::AlreadyRunning {
+        })?;
+    let _single_instance = match startup_lock {
+        crate::StartupLock::Owned(guard) => guard,
+        crate::StartupLock::AlreadyRunning {
             lock_path,
             holder_pid,
-        }) => {
+        } => {
             tracing::error!(
                 code = "MCP_DAEMON_ALREADY_RUNNING",
                 lock_path = %lock_path.display(),
@@ -1666,92 +695,7 @@ pub(super) async fn serve(
             );
             return Ok(ExitCode::from(3));
         }
-        Err(err @ crate::single_instance::SingleInstanceError::Io { .. }) => {
-            return Err(anyhow::Error::new(err)).context("acquire daemon single-instance lock");
-        }
     };
-
-    let shell_job_root = match crate::m4::shell_job_root_dir() {
-        Ok(root) => root,
-        Err(error) => {
-            let detail = error.message.to_string();
-            let error_data = error.data.unwrap_or(serde_json::Value::Null);
-            tracing::error!(
-                code = "MCP_DAEMON_SHELL_JOB_STORE_ROOT_RESOLUTION_FAILED",
-                mode = "http",
-                bind = %addr,
-                db_path = %db_path.display(),
-                detail = %detail,
-                error_data = ?error_data,
-                "refusing to start: durable shell-job store root could not be resolved"
-            );
-            anyhow::bail!("resolve durable shell-job store root: {detail}; data={error_data}");
-        }
-    };
-    let shell_job_store_lock_guard = match crate::single_instance::ShellJobStoreLockGuard::acquire(
-        &shell_job_root,
-    ) {
-        Ok(guard) => {
-            tracing::info!(
-                code = "MCP_DAEMON_SHELL_JOB_STORE_LOCK_ACQUIRED",
-                mode = "http",
-                bind = %addr,
-                store_root = %guard.store_root().display(),
-                lock_path = %guard.lock_path().display(),
-                pid = std::process::id(),
-                "daemon acquired exclusive shell-job store ownership"
-            );
-            guard
-        }
-        Err(crate::single_instance::ShellJobStoreLockError::AlreadyOwned {
-            store_root,
-            lock_path,
-            holder_pid,
-        }) => {
-            tracing::error!(
-                code = "MCP_DAEMON_SHELL_JOB_STORE_ALREADY_OWNED",
-                mode = "http",
-                bind = %addr,
-                store_root = %store_root.display(),
-                lock_path = %lock_path.display(),
-                holder_pid = holder_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
-                db_path = %db_path.display(),
-                "refusing to start: another daemon owns the durable shell-job store"
-            );
-            return Ok(ExitCode::from(3));
-        }
-        Err(error @ crate::single_instance::ShellJobStoreLockError::Io { .. }) => {
-            tracing::error!(
-                code = "MCP_DAEMON_SHELL_JOB_STORE_LOCK_FAILED",
-                mode = "http",
-                bind = %addr,
-                detail = %error,
-                db_path = %db_path.display(),
-                "refusing to start: durable shell-job store ownership could not be acquired"
-            );
-            return Err(anyhow::Error::new(error))
-                .context("acquire durable shell-job store lifetime lock");
-        }
-    };
-    let canonical_shell_job_root = shell_job_store_lock_guard.store_root().to_path_buf();
-    if let Err(error) = crate::m4::freeze_shell_job_root_for_daemon(&canonical_shell_job_root) {
-        let detail = error.message.to_string();
-        let error_data = error.data.unwrap_or(serde_json::Value::Null);
-        tracing::error!(
-            code = "MCP_DAEMON_SHELL_JOB_STORE_ROOT_FREEZE_FAILED",
-            mode = "http",
-            bind = %addr,
-            db_path = %db_path.display(),
-            shell_job_root = %canonical_shell_job_root.display(),
-            detail = %detail,
-            error_data = ?error_data,
-            "refusing to start: guarded shell-job store root could not be frozen for daemon operations"
-        );
-        anyhow::bail!(
-            "freeze guarded durable shell-job store root {}: {detail}; data={error_data}",
-            canonical_shell_job_root.display()
-        );
-    }
 
     let lifecycle_paths =
         crate::daemon_lifecycle::configure(crate::daemon_lifecycle::DaemonLifecycleConfig {
@@ -1761,6 +705,20 @@ pub(super) async fn serve(
         })
         .context("configure daemon lifecycle ledger")?;
     crate::daemon_lifecycle::install_panic_hook();
+    if let Some(run_id) = crate::daemon_lifecycle::current_run_id() {
+        crate::daemon_heartbeat::start_from_env(
+            std::path::Path::new(&lifecycle_paths.db_path),
+            &run_id,
+        );
+    }
+    crate::process_priority::apply_from_env();
+    #[cfg(windows)]
+    if let Err(error) = crate::os_shutdown::install() {
+        tracing::error!(
+            code = "MCP_OS_SHUTDOWN_HANDLERS_INSTALL_FAILED", %error,
+            "OS shutdown evidence may be unavailable; continuing HTTP serve"
+        );
+    }
     tracing::info!(
         code = "MCP_DAEMON_LIFECYCLE_READY",
         run_current_path = %lifecycle_paths.run_current_path,
@@ -1769,38 +727,6 @@ pub(super) async fn serve(
         exit_events_path = %lifecycle_paths.exit_events_path,
         "daemon lifecycle ledger ready"
     );
-
-    // #1568: corrupt durable shell-job evidence is a startup safety gate. Run
-    // it after the independent shell-job lifetime lock proves this process owns
-    // that store and before binding a listener or constructing request-serving
-    // state. Ordinary TTL retention inside this pass remains best-effort.
-    if let Err(error) = crate::m4::reap_stale_shell_jobs_on_startup() {
-        let detail = error.message.to_string();
-        let error_data = error.data.unwrap_or(serde_json::Value::Null);
-        tracing::error!(
-            code = "MCP_DAEMON_STARTUP_SHELL_JOB_RECOVERY_FAILED",
-            mode = "http",
-            bind = %addr,
-            db_path = %db_path.display(),
-            shell_job_root = %canonical_shell_job_root.display(),
-            detail = %detail,
-            error_data = ?error_data,
-            "refusing to start: corrupt durable shell-job recovery did not reach a verified terminal disposition"
-        );
-        crate::daemon_lifecycle::record_startup_exit(
-            "startup_corrupt_shell_job_recovery_failed",
-            serde_json::json!({
-                "mode": "http",
-                "bind": addr.to_string(),
-                "db_path": db_path.display().to_string(),
-                "shell_job_root": canonical_shell_job_root.display().to_string(),
-                "detail": detail,
-                "error_data": error_data,
-            }),
-        )
-        .context("record daemon lifecycle startup corrupt-shell-job recovery failure")?;
-        return Ok(ExitCode::from(4));
-    }
 
     if !addr.ip().is_loopback() {
         tracing::warn!(
@@ -1816,6 +742,7 @@ pub(super) async fn serve(
     let shutdown_cancel = CancellationToken::new();
     let connection_closed_cancel = CancellationToken::new();
     let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
+    let storage_pressure_pinned = m3_config.storage_pressure_free_bytes_sample.is_some();
     let service = http_service(
         shutdown_cancel.clone(),
         connection_closed_cancel.clone(),
@@ -1825,50 +752,21 @@ pub(super) async fn serve(
         m4_config,
     )
     .context("initialize shared HTTP service state")?;
-    let m3_state_for_recorder = service.m3_state_handle();
-    let m2_emitter_owner = take_m2_emitter_owner(&service);
 
-    // Eager storage open + maintenance startup: validate RocksDB and retain the
-    // periodic GC/pressure task handles before serving any MCP request, so a
-    // lock/schema/task/probe fault fails fast instead of reporting healthy
-    // storage while retention is inert. The handle is cached and reused by the
-    // reflex runtime, so there is no open-then-reopen race.
+    // Eager storage open: validate RocksDB at startup rather than lazily on the
+    // first reflex tool call, so a lock/schema fault fails fast with a clear
+    // error and the daemon refuses to start half-broken (instead of every tool
+    // call failing later). The handle is cached and reused by the reflex
+    // runtime, so there is no open-then-reopen race.
     {
-        let open_or_maintenance_result = match m3_state_for_recorder.lock() {
-            Ok(mut state) => Some(
-                state
-                    .ensure_storage()
-                    .and_then(|_| state.ensure_storage_maintenance_tasks()),
-            ),
-            Err(poisoned) => {
-                drop(poisoned);
-                None
-            }
+        let m3_handle = service.m3_state_handle();
+        let open_result = {
+            let mut state = m3_handle.lock().map_err(|_poisoned| {
+                anyhow::anyhow!("m3 service state lock poisoned during startup storage open")
+            })?;
+            state.ensure_storage()
         };
-        let Some(open_or_maintenance_result) = open_or_maintenance_result else {
-            drop(listener);
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "storage_state_lock",
-                    anyhow::anyhow!(
-                        "m3 service state lock poisoned during startup storage open/maintenance"
-                    ),
-                    Vec::new(),
-                    None,
-                ),
-                service,
-                Arc::clone(&m3_state_for_recorder),
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        };
-        if let Err(error) = open_or_maintenance_result {
+        if let Err(error) = open_result {
             let detail = error.to_string();
             if detail.to_lowercase().contains("lock") {
                 tracing::error!(
@@ -1879,36 +777,26 @@ pub(super) async fn serve(
                 );
             } else {
                 tracing::error!(
-                    code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
+                    code = "STORAGE_OPEN_FAILED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: storage open/maintenance startup failed at daemon startup"
+                    "refusing to start: storage open failed at daemon startup"
                 );
             }
-            drop(listener);
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "storage_open_or_maintenance_start",
-                    anyhow::anyhow!(detail),
-                    Vec::new(),
-                    None,
-                ),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                shell_job_store_lock_guard,
-                single_instance_guard,
+            crate::daemon_lifecycle::record_startup_exit(
+                "startup_storage_open_failed",
+                serde_json::json!({
+                    "db_path": db_path.display().to_string(),
+                    "detail": detail,
+                }),
             )
-            .await;
+            .context("record daemon lifecycle startup storage-open failure")?;
+            return Ok(ExitCode::from(4));
         }
         tracing::info!(
-            code = "MCP_DAEMON_STORAGE_OPENED_AND_MAINTENANCE_STARTED",
+            code = "MCP_DAEMON_STORAGE_OPENED",
             db_path = %db_path.display(),
-            "daemon storage opened eagerly and storage maintenance tasks started at startup"
+            "daemon storage opened eagerly at startup"
         );
     }
 
@@ -1916,36 +804,13 @@ pub(super) async fn serve(
     // timeline records whenever the daemon runs, before any tool call can
     // lazily start a recorder-less WinEvent bridge. A recorder that cannot
     // record is a startup failure, not a degraded mode.
+    let m3_state_for_recorder = service.m3_state_handle();
     {
-        let recorder_result = match m3_state_for_recorder.lock() {
-            Ok(mut state) => Some(state.ensure_activity_recorder(sse_state.event_bus())),
-            Err(poisoned) => {
-                drop(poisoned);
-                None
-            }
-        };
-        let Some(recorder_result) = recorder_result else {
-            drop(listener);
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "activity_recorder_state_lock",
-                    anyhow::anyhow!(
-                        "m3 service state lock poisoned during activity recorder startup"
-                    ),
-                    Vec::new(),
-                    None,
-                ),
-                service,
-                Arc::clone(&m3_state_for_recorder),
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
+        let recorder_result = {
+            let mut state = m3_state_for_recorder.lock().map_err(|_poisoned| {
+                anyhow::anyhow!("m3 service state lock poisoned during activity recorder startup")
+            })?;
+            state.ensure_activity_recorder(sse_state.event_bus())
         };
         if let Err(error) = recorder_result {
             let detail = format!("{error:#}");
@@ -1955,25 +820,15 @@ pub(super) async fn serve(
                 detail = %detail,
                 "refusing to start: activity recorder failed at daemon startup"
             );
-            drop(listener);
-            return fail_http_startup_after_service(
-                HttpRuntimeStartupFailure::new(
-                    "activity_recorder_start",
-                    anyhow::anyhow!(detail),
-                    Vec::new(),
-                    None,
-                ),
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                false,
-                false,
-                shutdown_cancel,
-                connection_closed_cancel,
-                shell_job_store_lock_guard,
-                single_instance_guard,
+            crate::daemon_lifecycle::record_startup_exit(
+                "startup_activity_recorder_failed",
+                serde_json::json!({
+                    "db_path": db_path.display().to_string(),
+                    "detail": detail,
+                }),
             )
-            .await;
+            .context("record daemon lifecycle startup activity-recorder failure")?;
+            return Ok(ExitCode::from(4));
         }
         tracing::info!(
             code = "MCP_DAEMON_ACTIVITY_RECORDER_STARTED",
@@ -1981,37 +836,90 @@ pub(super) async fn serve(
         );
     }
 
+    // Periodic storage GC + disk-pressure probe (#60): without these the daemon
+    // never enforced retention caps or detected disk pressure. The handle must
+    // outlive serve(); dropping it stops both tasks. A misconfigured interval
+    // is a startup failure, not a silently substituted default.
+    let _storage_maintenance = crate::m3::storage_maintenance::spawn_for_daemon(
+        &service.m3_state_handle(),
+        storage_pressure_pinned,
+    )
+    .context("spawn periodic storage maintenance")?;
+
+    // #1510: drain the durable shell-job store's terminal-job backlog once at
+    // boot. This daemon already holds the single-instance lock (acquired before
+    // binding the port), so it is the authoritative owner of the store. The pass
+    // is best-effort and never fails startup; ongoing retention is handled
+    // opportunistically on every session teardown.
+    crate::m4::reap_stale_shell_jobs_on_startup();
+
+    // Periodic routine miner (#848): keeps CF_ROUTINES tracking the episode
+    // store without manual routine_mine calls. A misconfigured schedule is a
+    // startup failure, not a silently substituted default.
+    let _routine_miner_task = crate::m3::routine_miner_job::spawn_periodic_miner(
+        service.m3_state_handle(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic routine miner")?;
+
+    // Periodic intent detector (#855): re-evaluates the live intent snapshot on
+    // a fixed interval and publishes intent-detected/confirmed/abandoned events
+    // on the shared bus for reflexes and the suggestion engine. A misconfigured
+    // schedule or detection floor is a startup failure, not a silent default.
+    let _intent_detector_task = crate::m3::intent_events::spawn_intent_detector(
+        service.m3_state_handle(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic intent detector")?;
+
+    // Periodic armed routine runner (#862): evaluates persisted arm rows and
+    // executes due installed automations through the same background-first
+    // plan executor as manual suggestion acceptance. Misconfigured schedules
+    // fail startup rather than silently substituting defaults.
+    let _armed_routine_task = crate::server::suggestions::spawn_periodic_armed_routine_runner(
+        service.clone(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic armed routine runner")?;
+
+    // Periodic transcript ingester (#900): tails spawned-agent stdout JSONL
+    // into CF_AGENT_TRANSCRIPTS. Same contract as the miner: a misconfigured
+    // schedule is a startup failure, not a silently substituted default.
+    let _transcript_ingest_task =
+        crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
+            service.m3_state_handle(),
+            shutdown_cancel.clone(),
+        )
+        .context("spawn periodic transcript ingester")?;
+
+    // Ambient agent discovery (#fleet-ambient): tails the persisted Claude
+    // session transcripts under ~/.claude/projects so agents the operator
+    // launched themselves (not via act_spawn_agent) are registered into the
+    // same journal → state-machine → dashboard read path. A misconfigured
+    // schedule or an unresolvable home anchor is a startup failure, never a
+    // watcher that silently observes nothing.
+    let _ambient_ingest_task = crate::server::ambient_agents::spawn_periodic_ambient_ingest(
+        service.m3_state_handle(),
+        shutdown_cancel.clone(),
+    )
+    .context("spawn periodic ambient agent discovery")?;
+
+    let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.clone())
+        .context("install operator panic hotkey")?;
+    let m2_emitter_done = service.m2_emitter_done_receiver();
     let active_http_sockets = ActiveHttpSockets::default();
-    let HttpRuntimeStartup {
-        mut background_tasks,
-        mut operator_hotkey_guard,
-        mut runtime,
-    } = match start_http_runtime(
-        &service,
+    let connection_admission =
+        crate::http::connection_admission::HttpConnectionAdmission::from_env()
+            .context("configure bounded HTTP connection admission")?;
+    let runtime = router(
         &shutdown_cancel,
         local_addr,
         sse_state,
+        service,
         active_http_sockets.clone(),
-    ) {
-        Ok(startup) => startup,
-        Err(failure) => {
-            drop(listener);
-            return fail_http_startup_after_service(
-                failure,
-                service,
-                m3_state_for_recorder,
-                m2_emitter_owner,
-                true,
-                true,
-                shutdown_cancel,
-                connection_closed_cancel,
-                shell_job_store_lock_guard,
-                single_instance_guard,
-            )
-            .await;
-        }
-    };
-    let m2_emitter_done = m2_emitter_owner.done_receiver();
+        connection_admission.clone(),
+    )
+    .context("build HTTP MCP router")?;
 
     tracing::info!(
         code = "MCP_HTTP_STARTED",
@@ -2020,125 +928,52 @@ pub(super) async fn serve(
     );
 
     let shutdown_cancel_for_http_endpoint = shutdown_cancel.clone();
-    let mut server_task = ShutdownTaskOwner::new(
-        "http_server_dispatch",
-        spawn_server(
-            listener,
-            runtime.app.clone(),
-            shutdown_cancel.clone(),
-            active_http_sockets.clone(),
-        ),
+    let mut server_task = spawn_server(
+        listener,
+        runtime.app,
+        shutdown_cancel.clone(),
+        active_http_sockets.clone(),
+        connection_admission,
     );
     let m2_done_after_server_stop = m2_emitter_done.clone();
     let m2_done_after_signal = m2_emitter_done.clone();
     let m2_done_after_http_endpoint = m2_emitter_done;
-    let (
-        code,
-        shutdown_source,
-        mut shutdown_failures,
-        authority_finalizers_quiescent,
-        session_input_owners_quiescent,
-        operator_owner_drain,
-    ) = tokio::select! {
+    let code = tokio::select! {
         result = &mut server_task => {
-            let mut failures = HttpShutdownFailures::default();
-            let server_result = result
-                .context("join HTTP MCP transport")
-                .and_then(|result| result.context("serve HTTP MCP transport"));
-            let shutdown_was_requested = shutdown_cancel.is_cancelled();
-            let source = if shutdown_was_requested {
-                "http_endpoint"
-            } else {
-                "server_task_unexpected_stop"
-            };
-            if shutdown_was_requested {
+            result.context("join HTTP MCP transport")?
+                .context("serve HTTP MCP transport")?;
+            if shutdown_cancel.is_cancelled() {
                 tracing::info!(
                     code = "MCP_HTTP_SERVER_STOPPED",
-                    source,
+                    source = "http_endpoint",
                     pid = std::process::id(),
                     "HTTP listener task stopped after shutdown endpoint cancellation"
                 );
-            } else {
-                tracing::error!(
-                    code = "MCP_HTTP_SERVER_STOPPED_UNEXPECTEDLY",
-                    source,
-                    pid = std::process::id(),
-                    "HTTP listener task stopped without a shutdown request; draining daemon state before failing"
+                connection_closed_cancel.cancel();
+                let socket_shutdown = active_http_sockets.shutdown_all("server_task_completed");
+                tracing::warn!(
+                    code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
+                    source = "server_task_completed",
+                    socket_shutdown = ?socket_shutdown,
+                    "accepted HTTP sockets explicitly shut down during daemon shutdown"
                 );
-                shutdown_cancel.cancel();
-            }
-            connection_closed_cancel.cancel();
-            let operator_owner_drain =
-                drain_http_operator_owners(&mut operator_hotkey_guard, source).await;
-            let session_close =
-                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, source).await;
-            tracing::warn!(
-                code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
-                source,
-                session_close = ?session_close,
-                "active MCP sessions received close attempts and the session-manager Source of Truth was reread"
-            );
-            failures.inspect_session_close(&session_close);
-            let socket_shutdown = active_http_sockets.shutdown_all(source);
-            tracing::warn!(
-                code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
-                source,
-                socket_shutdown = ?socket_shutdown,
-                "accepted HTTP sockets explicitly shut down during daemon shutdown"
-            );
-            failures.inspect_socket_shutdown(&socket_shutdown);
-            let cleanup = cleanup_active_session_inputs_for_shutdown(
-                &runtime.session_lifecycle,
-                &runtime.session_manager,
-                &session_close.session_ids,
-                source,
-            ).await;
-            tracing::info!(
-                code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
-                source,
-                cleanup = ?cleanup,
-                "readback=session_input_ownership edge=http_server_task_stop after_cleanup"
-            );
-            let authority_finalizers_quiescent =
-                cleanup.authority_finalizer_owners_quiescent();
-            let session_input_owners_quiescent = cleanup.all_input_owners_quiescent();
-            failures.inspect_input_cleanup(&cleanup);
-            let emitter_drain = wait_for_m2_emitter_done(
-                m2_done_after_server_stop,
-                "http",
-                source,
-            )
-            .await;
-            failures.inspect_result(
-                "m2_emitter_drain",
-                emitter_drain.context("drain M2 emitter after HTTP server task completed"),
-            );
-            failures.inspect_result("server_task", server_result);
-            if !shutdown_was_requested {
-                failures.push(
-                    "shutdown_request",
-                    "HTTP MCP transport stopped without a shutdown request",
+                let cleanup = cleanup_active_session_inputs_for_shutdown(
+                    &runtime.session_lifecycle,
+                    &runtime.session_manager,
+                    &runtime.shutdown_sessions,
+                "http_endpoint",
+                ).await;
+                tracing::info!(
+                    code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
+                    cleanup = ?cleanup,
+                    "readback=session_input_ownership edge=http_endpoint_shutdown after_cleanup"
                 );
+                wait_for_m2_emitter_done(m2_done_after_server_stop, "http_endpoint").await;
             }
-            (
-                ExitCode::SUCCESS,
-                source,
-                failures,
-                authority_finalizers_quiescent,
-                session_input_owners_quiescent,
-                operator_owner_drain,
-            )
+            ExitCode::SUCCESS
         }
         signal = wait_for_shutdown_signal("http") => {
-            let mut failures = HttpShutdownFailures::default();
-            if let Err(error) = &signal {
-                tracing::error!(
-                    code = "MCP_HTTP_SHUTDOWN_SIGNAL_WAIT_FAILED",
-                    source = "signal",
-                    error = %error,
-                    "HTTP shutdown-signal listener failed; draining daemon state before returning the error"
-                );
-            }
+            signal?;
             let drain = runtime.drain_state.mark_draining("signal");
             let shutdown_on_drop = active_http_sockets.begin_shutdown_on_drop("signal");
             tracing::warn!(
@@ -2147,20 +982,20 @@ pub(super) async fn serve(
                 shutdown_on_drop = ?shutdown_on_drop,
                 "accepted HTTP socket drop now performs socket shutdown during daemon restart drain"
             );
-            if signal.is_ok() {
-                tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "HTTP shutdown signal received");
-            }
-            let operator_owner_drain =
-                drain_http_operator_owners(&mut operator_hotkey_guard, "signal").await;
+            tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "HTTP shutdown signal received");
             let session_close =
-                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, "signal").await;
+                close_active_mcp_sessions_for_shutdown(
+                    &runtime.session_manager,
+                    &runtime.shutdown_sessions,
+                    "signal",
+                )
+                .await;
             tracing::warn!(
                 code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
                 source = "signal",
                 session_close = ?session_close,
-                "active MCP sessions received close attempts and the session-manager Source of Truth was reread"
+                "active MCP sessions closed before daemon cancellation so streamable HTTP clients release old daemon sockets"
             );
-            failures.inspect_session_close(&session_close);
             time::sleep(DRAIN_RESPONSE_GRACE_TIMEOUT).await;
             shutdown_cancel.cancel();
             connection_closed_cancel.cancel();
@@ -2171,12 +1006,11 @@ pub(super) async fn serve(
                 socket_shutdown = ?socket_shutdown,
                 "accepted HTTP sockets explicitly shut down during daemon shutdown"
             );
-            failures.inspect_socket_shutdown(&socket_shutdown);
-            let server_stop = wait_for_server_stop(&mut server_task, "signal").await;
+            wait_for_server_stop(&mut server_task, "signal").await?;
             let cleanup = cleanup_active_session_inputs_for_shutdown(
                 &runtime.session_lifecycle,
                 &runtime.session_manager,
-                &session_close.session_ids,
+                &runtime.shutdown_sessions,
                 "signal",
             ).await;
             tracing::info!(
@@ -2185,41 +1019,14 @@ pub(super) async fn serve(
                 cleanup = ?cleanup,
                 "readback=session_input_ownership edge=signal_shutdown after_cleanup"
             );
-            let authority_finalizers_quiescent =
-                cleanup.authority_finalizer_owners_quiescent();
-            let session_input_owners_quiescent = cleanup.all_input_owners_quiescent();
-            failures.inspect_input_cleanup(&cleanup);
-            let emitter_drain =
-                wait_for_m2_emitter_done(m2_done_after_signal, "http", "signal").await;
-            failures.inspect_result("server_stop", server_stop);
-            failures.inspect_result(
-                "shutdown_signal",
-                signal.context("wait for HTTP shutdown signal"),
-            );
-            failures.inspect_result(
-                "m2_emitter_drain",
-                emitter_drain.context("drain M2 emitter after HTTP signal shutdown"),
-            );
-            (
-                ExitCode::SUCCESS,
-                "signal",
-                failures,
-                authority_finalizers_quiescent,
-                session_input_owners_quiescent,
-                operator_owner_drain,
-            )
+            wait_for_m2_emitter_done(m2_done_after_signal, "signal").await;
+            ExitCode::SUCCESS
         }
         _ = shutdown_cancel_for_http_endpoint.cancelled() => {
-            let mut failures = HttpShutdownFailures::default();
-            // The `/shutdown` handler marks drain state, returns its ACCEPTED
-            // response, and only cancels this token after
-            // DRAIN_RESPONSE_GRACE_TIMEOUT. Reaching this branch therefore
-            // means the bounded response-flush grace has already elapsed.
             tracing::info!(
                 code = "MCP_HTTP_SHUTDOWN_TOKEN_CANCELLED",
                 source = "http_endpoint",
                 pid = std::process::id(),
-                response_grace_ms = DRAIN_RESPONSE_GRACE_TIMEOUT.as_millis(),
                 "HTTP shutdown endpoint cancellation observed by daemon supervisor"
             );
             let shutdown_on_drop = active_http_sockets.begin_shutdown_on_drop("http_endpoint");
@@ -2229,17 +1036,19 @@ pub(super) async fn serve(
                 shutdown_on_drop = ?shutdown_on_drop,
                 "accepted HTTP socket drop now performs socket shutdown during daemon restart drain"
             );
-            let operator_owner_drain =
-                drain_http_operator_owners(&mut operator_hotkey_guard, "http_endpoint").await;
             let session_close =
-                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, "http_endpoint").await;
+                close_active_mcp_sessions_for_shutdown(
+                    &runtime.session_manager,
+                    &runtime.shutdown_sessions,
+                    "http_endpoint",
+                )
+                .await;
             tracing::warn!(
                 code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
                 source = "http_endpoint",
                 session_close = ?session_close,
-                "active MCP sessions received close attempts and the session-manager Source of Truth was reread"
+                "active MCP sessions closed before daemon cancellation so streamable HTTP clients release old daemon sockets"
             );
-            failures.inspect_session_close(&session_close);
             connection_closed_cancel.cancel();
             let socket_shutdown = active_http_sockets.shutdown_all("http_endpoint");
             tracing::warn!(
@@ -2248,18 +1057,17 @@ pub(super) async fn serve(
                 socket_shutdown = ?socket_shutdown,
                 "accepted HTTP sockets explicitly shut down during daemon shutdown"
             );
-            failures.inspect_socket_shutdown(&socket_shutdown);
             tracing::info!(
                 code = "MCP_HTTP_CONNECTIONS_CANCELLED",
                 source = "http_endpoint",
                 pid = std::process::id(),
                 "connection-scoped work cancelled before waiting for HTTP listener stop"
             );
-            let server_stop = wait_for_server_stop(&mut server_task, "http_endpoint").await;
+            wait_for_server_stop(&mut server_task, "http_endpoint").await?;
             let cleanup = cleanup_active_session_inputs_for_shutdown(
                 &runtime.session_lifecycle,
                 &runtime.session_manager,
-                &session_close.session_ids,
+                &runtime.shutdown_sessions,
                 "http_endpoint",
             ).await;
             tracing::info!(
@@ -2267,204 +1075,44 @@ pub(super) async fn serve(
                 cleanup = ?cleanup,
                 "readback=session_input_ownership edge=http_endpoint_shutdown after_cleanup"
             );
-            let authority_finalizers_quiescent =
-                cleanup.authority_finalizer_owners_quiescent();
-            let session_input_owners_quiescent = cleanup.all_input_owners_quiescent();
-            failures.inspect_input_cleanup(&cleanup);
-            let emitter_drain =
-                wait_for_m2_emitter_done(m2_done_after_http_endpoint, "http", "http_endpoint")
-                    .await;
-            failures.inspect_result("server_stop", server_stop);
-            failures.inspect_result(
-                "m2_emitter_drain",
-                emitter_drain.context("drain M2 emitter after HTTP endpoint shutdown"),
-            );
-            (
-                ExitCode::SUCCESS,
-                "http_endpoint",
-                failures,
-                authority_finalizers_quiescent,
-                session_input_owners_quiescent,
-                operator_owner_drain,
-            )
+            wait_for_m2_emitter_done(m2_done_after_http_endpoint, "http_endpoint").await;
+            ExitCode::SUCCESS
         }
     };
-    let operator_hotkey_quiescent = operator_owner_drain.hotkey_owners_quiescent();
-    let operator_panic_k2_tasks_quiescent = operator_owner_drain.k2_tasks_quiescent();
-    operator_owner_drain.inspect_failures(&mut shutdown_failures);
-    let server_dispatch_quiescent = server_task.terminal_join_observed();
-    tracing::info!(
-        code = "MCP_HTTP_SERVER_TASK_FINAL_READBACK",
-        source = shutdown_source,
-        server_dispatch_quiescent,
-        "readback=http_server_join_handle edge=shutdown_supervisor after_stop_attempt"
-    );
-    if !server_dispatch_quiescent {
-        shutdown_failures.push(
-            "server_dispatch_readback",
-            "HTTP server dispatch JoinHandle remained live after stop/abort attempts",
-        );
-    }
-    let final_tracked_count = active_http_sockets.final_tracked_count();
-    let active_socket_owners_quiescent = final_tracked_count
-        .as_ref()
-        .is_ok_and(|tracked_count| *tracked_count == 0);
-    tracing::info!(
-        code = "MCP_HTTP_ACTIVE_SOCKET_REGISTRY_FINAL_READBACK",
-        source = shutdown_source,
-        final_tracked_count = ?final_tracked_count,
-        "readback=accepted_http_socket_registry edge=http_server_stopped after_cleanup"
-    );
-    shutdown_failures.inspect_final_socket_count(final_tracked_count);
-    let final_session_ids = active_http_session_ids(&runtime.session_manager).await;
-    let session_manager_quiescent = final_session_ids.is_empty();
-    tracing::info!(
-        code = "MCP_HTTP_SESSION_MANAGER_FINAL_READBACK",
-        source = shutdown_source,
-        final_session_count = final_session_ids.len(),
-        final_session_ids = ?final_session_ids,
-        "readback=local_session_manager edge=http_server_stopped after_cleanup"
-    );
-    shutdown_failures.inspect_final_session_ids(&final_session_ids);
-    // Stop the WinEvent source before the recorder so session_end is the final
-    // timeline row, then require terminal readback from all Tokio/OS owners.
-    let activity_drain = drain_http_activity_owners(&m3_state_for_recorder, true, true).await;
-    let activity_owners_quiescent = activity_drain.safe_to_unlock();
-    let win_event_shutdown_history_quiescent =
-        activity_drain.win_event_shutdown_history.owners_quiescent();
-    shutdown_failures.inspect_result("activity_owner_drain", activity_drain.verdict());
-
-    let m2_emitter_drain =
-        drain_m2_emitter_owner(Some(m2_emitter_owner), "http", shutdown_source).await;
-    let m2_emitter_safe = m2_emitter_drain.safe_to_unlock();
-    shutdown_failures.inspect_result("m2_emitter_owner_join", m2_emitter_drain.verdict());
-    background_tasks.append(&mut runtime.background_tasks);
-    let background_task_drain = drain_http_background_tasks(background_tasks).await;
-    let background_tasks_quiescent = background_task_drain.owners_quiescent();
-    tracing::info!(
-        code = "MCP_HTTP_BACKGROUND_TASKS_FINAL_READBACK",
-        source = shutdown_source,
-        background_tasks_quiescent,
-        report = ?background_task_drain,
-        "readback=http_background_join_handles edge=shutdown_supervisor after_drain"
-    );
-    shutdown_failures.inspect_result(
-        "background_task_drain",
-        background_task_drain
-            .verdict()
-            .context("drain HTTP daemon background tasks before releasing lifetime locks"),
-    );
-
-    // The custom daemon lock must outlive every RocksDB/service owner. Dropping
-    // these Arcs and callbacks before unlock prevents a successor from winning
-    // daemon.lock only to collide with this process's still-live RocksDB LOCK.
-    drop(runtime);
-    drop(service);
-    drop(shutdown_cancel);
-    drop(connection_closed_cancel);
-    let storage_owner_readback = m3_storage_owner_readback(&m3_state_for_recorder);
-    tracing::info!(
-        code = "MCP_HTTP_STORAGE_SERVICE_OWNER_FINAL_READBACK",
-        source = shutdown_source,
-        readback = ?storage_owner_readback,
-        "readback=m3_storage_arc_owners edge=shutdown_supervisor after_expected_owner_drop"
-    );
-    if !storage_owner_readback.owners_quiescent {
-        shutdown_failures.push(
-            "storage_service_owner_readback",
-            format!("readback={storage_owner_readback:?}"),
-        );
-    }
-    drop(m3_state_for_recorder);
-    let owners = HttpLifetimeOwnerReadback {
-        authority_finalizers_quiescent,
-        session_input_owners_quiescent,
-        session_manager_quiescent,
-        active_socket_owners_quiescent,
-        server_dispatch_quiescent,
-        background_tasks_quiescent,
-        m2_emitter_safe,
-        activity_owners_quiescent,
-        win_event_shutdown_history_quiescent,
-        storage_service_owners_quiescent: storage_owner_readback.owners_quiescent,
-        operator_hotkey_quiescent,
-        operator_panic_k2_tasks_quiescent,
-    };
-    if !operator_hotkey_quiescent {
-        crate::safety::retain_operator_hotkey_guard_to_process_exit(
-            &mut operator_hotkey_guard,
-            shutdown_source,
-        );
-    }
-    let unresolved_shell_child_owner_report_before_lifecycle =
-        crate::m4::unresolved_shell_child_owner_report();
-    let unresolved_shell_child_owners_quiescent_before_lifecycle =
-        unresolved_shell_child_owner_report_before_lifecycle.safe_to_unlock();
-    if !unresolved_shell_child_owners_quiescent_before_lifecycle {
-        shutdown_failures.push(
-            "unresolved_shell_child_owner_readback",
-            format!("readback={unresolved_shell_child_owner_report_before_lifecycle:?}"),
-        );
-    }
-    let lifecycle_finalization = if owners.safe_to_unlock()
-        && unresolved_shell_child_owners_quiescent_before_lifecycle
-    {
+    // Stop the activity recorder last so the timeline closes with a
+    // session_end row covering the whole daemon lifetime (#837).
+    let recorder = m3_state_for_recorder
+        .lock()
+        .ok()
+        .and_then(|mut state| state.activity_recorder.take());
+    if let Some(recorder) = recorder {
+        recorder.shutdown().await;
+        let (rows_written, write_failures) = recorder.readback();
         tracing::info!(
-            code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_START",
-            source = "http_service_completed",
-            pid = std::process::id(),
-            "locking daemon lifecycle finalization before releasing HTTP lifetime locks"
+            code = "MCP_DAEMON_ACTIVITY_RECORDER_STOPPED",
+            rows_written,
+            write_failures,
+            "activity recorder stopped at daemon shutdown"
         );
-        match crate::daemon_lifecycle::begin_graceful_exit_finalization() {
-            Ok(finalization) => Some(finalization),
-            Err(error) => {
-                shutdown_failures.push(
-                    "lifecycle_finalization_begin",
-                    format!(
-                        "lock graceful lifecycle transaction before HTTP lifetime-lock close: {error:#}"
-                    ),
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Keep the exact listener output unacknowledged across every awaited
-    // cleanup phase. Cancellation before this final synchronous lock gate must
-    // remain a sticky incident rather than losing the transport verdict.
-    if server_task.terminal_join_observed() {
-        server_task.acknowledge_terminal_outcome();
     }
-    drop(server_task);
-    let lifetime_lock_close = close_or_retain_http_lifetime_locks(
-        shell_job_store_lock_guard,
-        single_instance_guard,
-        owners,
-        shutdown_source,
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_START",
+        source = "http_service_completed",
+        pid = std::process::id(),
+        "writing daemon lifecycle graceful HTTP service completion"
     );
-    shutdown_failures.inspect_result("lifetime_lock_close", lifetime_lock_close);
-    shutdown_failures.into_result()?;
-    let lifecycle_finalization = lifecycle_finalization.ok_or_else(|| {
-        anyhow::anyhow!(
-            "HTTP shutdown postconditions passed without an owned lifecycle finalization guard"
-        )
-    })?;
-    crate::daemon_lifecycle::record_graceful_exit_after_lifetime_lock_close(
-        lifecycle_finalization,
-        "http_service_completed",
-    )
-    .map_err(|error| {
-        tracing::error!(
-            code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_FAILED",
-            source = "http_service_completed",
-            pid = std::process::id(),
-            error = %error,
-            "failed to write daemon lifecycle graceful HTTP service completion"
-        );
-        error
-    })
-    .context("record daemon lifecycle graceful HTTP service completion")?;
+    crate::daemon_lifecycle::record_graceful_exit("http_service_completed")
+        .map_err(|error| {
+            tracing::error!(
+                code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_FAILED",
+                source = "http_service_completed",
+                pid = std::process::id(),
+                error = %error,
+                "failed to write daemon lifecycle graceful HTTP service completion"
+            );
+            error
+        })
+        .context("record daemon lifecycle graceful HTTP service completion")?;
     tracing::info!(
         code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_OK",
         source = "http_service_completed",
@@ -2499,8 +1147,32 @@ fn router(
     sse_state: SseState,
     service: SynapseService,
     active_http_sockets: ActiveHttpSockets,
+    connection_admission: crate::http::connection_admission::HttpConnectionAdmission,
 ) -> anyhow::Result<HttpRouterRuntime> {
-    let auth = Arc::new(HttpAuth::load(bind_addr).context("load HTTP bearer token")?);
+    let auth = HttpAuth::load(bind_addr).context("load HTTP bearer token")?;
+    router_with_auth(
+        shutdown_cancel,
+        bind_addr,
+        sse_state,
+        service,
+        active_http_sockets,
+        auth,
+        connection_admission,
+    )
+}
+
+/// [`router`] with the bearer authority injected instead of loaded from the
+/// real token file/env (test seam: drives the real dashboard + protected app).
+pub(super) fn router_with_auth(
+    shutdown_cancel: &CancellationToken,
+    bind_addr: SocketAddr,
+    sse_state: SseState,
+    service: SynapseService,
+    active_http_sockets: ActiveHttpSockets,
+    auth: HttpAuth,
+    connection_admission: crate::http::connection_admission::HttpConnectionAdmission,
+) -> anyhow::Result<HttpRouterRuntime> {
+    let auth = Arc::new(auth);
     tracing::info!(
         code = "MCP_HTTP_AUTH_CONFIGURED",
         source = auth.source_label(),
@@ -2510,6 +1182,7 @@ fn router(
     let drain_state = service.drain_state_handle();
     let session_registry = service.session_registry_handle();
     let terminated_sessions = service.terminated_sessions_handle();
+    let shutdown_sessions = ShutdownSessionGate::new(shutdown_cancel);
     let session_lifecycle = service
         .session_lifecycle_state()
         .map_err(|error| anyhow::anyhow!("initialize session lifecycle state: {error:?}"))?;
@@ -2519,18 +1192,15 @@ fn router(
         session_store_db(&health_service).context("open storage for agent-event ingress")?;
     // #898: install the live-event sink, rebuild agent states from the
     // journal, and start the heartbeat/process-probe liveness sweep.
-    let liveness_config = crate::server::agent_state::load_liveness_config()
-        .map_err(|detail| anyhow::anyhow!("agent liveness configuration invalid: {detail}"))?;
-    crate::server::agent_state::rebuild_from_journal(&agent_events_db)
-        .context("rebuild agent state tracker from CF_AGENT_EVENTS")?;
-    // Install process-global projections only after every fallible router
-    // preflight has passed. Both sinks are non-owning/one-shot callbacks and no
-    // fallible return remains after this point.
     crate::server::agent_events::install_session_registry_activity_sink(Arc::clone(
         &session_registry,
     ));
     crate::server::agent_state::install_event_bus(sse_state.event_bus());
-    let agent_liveness_task = spawn_agent_liveness_sweep(
+    let liveness_config = crate::server::agent_state::load_liveness_config()
+        .map_err(|detail| anyhow::anyhow!("agent liveness configuration invalid: {detail}"))?;
+    crate::server::agent_state::rebuild_from_journal(&agent_events_db)
+        .context("rebuild agent state tracker from CF_AGENT_EVENTS")?;
+    let _agent_liveness_task = spawn_agent_liveness_sweep(
         Arc::clone(&agent_events_db),
         liveness_config,
         shutdown_cancel.child_token(),
@@ -2538,27 +1208,63 @@ fn router(
     // #948: start the AFK escalation delivery worker (Tier 0 on-PC toast +
     // operator-supplied Tier 1 webhook ladder). Installs the wake signal that
     // `agent_state::emit_transitions` pulses on each live attention transition.
-    let escalation_worker = crate::server::escalation::spawn_worker(
+    let _escalation_worker = crate::server::escalation::spawn_worker(
         Arc::clone(&agent_events_db),
         shutdown_cancel.child_token(),
     );
+    // #56: expire workspace blackboard rows in every run namespace, not only
+    // the namespace a put happens to touch. Runs at startup, then periodically.
+    health_service.purge_legacy_ocr_cache_rows();
+    let _workspace_reaper = health_service
+        .spawn_workspace_reaper(shutdown_cancel.child_token())
+        .map_err(|detail| anyhow::anyhow!("start workspace reaper: {detail}"))?;
     let session_request = session::SessionCleanupState::request_state(
+        Arc::clone(&session_manager),
         Arc::clone(&session_registry),
         terminated_sessions,
-    );
+    )
+    .with_activity_db(Arc::clone(&agent_events_db));
+    {
+        let session_manager = Arc::clone(&session_manager);
+        let session_admission = session_request.admission();
+        let inflight_ids = session_request.inflight_ids();
+        health_service.install_http_telemetry_reader(move |active_sessions| {
+            let active_sessions = active_sessions.unwrap_or_else(|| {
+                session_manager
+                    .sessions
+                    .try_read()
+                    .map_or(0, |sessions| sessions.len())
+            });
+            crate::server::HttpHealthTelemetry {
+                active_sessions,
+                max_sessions: session_admission.max_sessions(),
+                session_capacity_rejections_total: session_admission.rejected_total(),
+                active_connections: connection_admission.active_connections(),
+                connection_limit: connection_admission.max_connections(),
+                connection_admission_rejections_total: connection_admission.rejected_total(),
+                header_read_timeouts_total: connection_admission.header_read_timeouts_total(),
+                inflight_requests: inflight_ids.inflight_count(),
+                duplicate_inflight_rejections_total: inflight_ids.duplicate_rejections_total(),
+            }
+        });
+    }
     let session_cleanup =
         session::SessionCleanupState::new(Arc::clone(&session_manager), session_lifecycle.clone());
-    let stale_cleanup_task = spawn_stale_session_input_cleanup(
+    // #169: the gate owns the sweeper's stop token and join handle so shutdown
+    // can stop it before snapshotting and draining sessions.
+    shutdown_sessions.register_sweeper(super::stale_sweep::spawn(
         Arc::clone(&session_manager),
         session_lifecycle.clone(),
-        shutdown_cancel.child_token(),
-    );
+        session_request.inflight_ids(),
+        shutdown_sessions.sweeper_stop_token(),
+    ));
     let state = HttpState {
         bind_addr,
         health_service,
         session_manager: Arc::clone(&session_manager),
         shutdown_cancel: shutdown_cancel.clone(),
         drain_state: drain_state.clone(),
+        shutdown_sessions: shutdown_sessions.clone(),
         active_http_sockets,
         sse_state,
         agent_events_db,
@@ -2591,7 +1297,9 @@ fn router(
         )
         .route(
             "/chrome-debugger/native/message",
-            post(crate::chrome_debugger_bridge::http_message),
+            post(crate::chrome_debugger_bridge::http_message).layer(DefaultBodyLimit::max(
+                crate::chrome_debugger_bridge::MAX_BRIDGE_HTTP_MESSAGE_BYTES,
+            )),
         )
         .route(
             "/chrome-debugger/native/next",
@@ -2621,8 +1329,7 @@ fn router(
         .layer(middleware::from_fn_with_state(
             auth,
             auth::require_http_security,
-        ))
-        .layer(middleware::from_fn(record_mcp_transport_diagnostics));
+        ));
     let dashboard_routes = Router::new()
         .route("/dashboard", get(dashboard_index))
         .route("/dashboard/assets/{asset}", get(dashboard_asset))
@@ -2852,7 +1559,13 @@ fn router(
             post(dashboard_context_plan)
                 .layer(DefaultBodyLimit::max(DASHBOARD_CONTEXT_BODY_LIMIT_BYTES)),
         )
-        .route("/approval/activate", get(approval_activate));
+        .route("/approval/activate", get(approval_activate))
+        // #167: Host/Origin guard (cross-site POST + WebSocket hijack). Layered
+        // on the dashboard routes only; `/mcp` keeps its bearer boundary.
+        .layer(middleware::from_fn_with_state(
+            super::dashboard_origin_guard::DashboardOriginGuard::new(bind_addr.port()),
+            super::dashboard_origin_guard::require_dashboard_origin,
+        ));
     let app = Router::new()
         .merge(dashboard_routes)
         .merge(protected_routes)
@@ -2863,11 +1576,7 @@ fn router(
         session_manager,
         session_lifecycle,
         drain_state,
-        background_tasks: vec![
-            own_http_background_task("agent_liveness", agent_liveness_task),
-            own_http_background_task("escalation_worker", escalation_worker),
-            own_http_background_task("stale_session_cleanup", stale_cleanup_task),
-        ],
+        shutdown_sessions,
     })
 }
 
@@ -2888,6 +1597,10 @@ fn streamable_service(
         session_config.keep_alive,
         service.session_registry_handle(),
     ));
+    let _activity_refresh = spawn_session_store_activity_refresh(
+        Arc::clone(&session_store),
+        shutdown_cancel.child_token(),
+    );
     let mut config = StreamableHttpServerConfig::default()
         .with_cancellation_token(shutdown_cancel.child_token());
     config.session_store = Some(session_store);
@@ -2900,34 +1613,6 @@ fn streamable_service(
         config,
     );
     Ok((service, session_manager))
-}
-
-fn spawn_stale_session_input_cleanup(
-    session_manager: Arc<LocalSessionManager>,
-    session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
-    shutdown_cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = time::interval(STALE_SESSION_INPUT_CLEANUP_INTERVAL);
-        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = shutdown_cancel.cancelled() => {
-                    tracing::debug!(
-                        code = "MCP_HTTP_SESSION_INPUT_STALE_CLEANUP_STOPPED",
-                        "stopping stale HTTP session held-input cleanup"
-                    );
-                    break;
-                }
-                _ = interval.tick() => {
-                    cleanup_stale_session_resources_once(
-                        &session_lifecycle,
-                        &session_manager,
-                    ).await;
-                }
-            }
-        }
-    })
 }
 
 /// #898 liveness sweep: periodically cross-checks heartbeat silence with the
@@ -2958,24 +1643,31 @@ fn spawn_agent_liveness_sweep(
                 }
                 _ = interval.tick() => {
                     let db = Arc::clone(&agent_events_db);
-                    // `block_in_place` keeps blocking Win32 probes off this
-                    // reactor worker without creating a nested JoinHandle that
-                    // an aborted outer sweep could detach. Tokio cannot cancel
-                    // the in-place closure; the exact outer owner remains
-                    // nonterminal until the probe returns and is retained by
-                    // the shutdown supervisor on deadline.
-                    let transition_count = tokio::task::block_in_place(move || {
+                    // Process probes are blocking Win32 calls; keep them off
+                    // the async reactor.
+                    let sweep = tokio::task::spawn_blocking(move || {
                         crate::server::agent_state::liveness_sweep_once(
                             &db,
                             crate::server::session_registry::unix_time_ms_now(),
                         )
-                    });
-                    if transition_count > 0 {
-                        tracing::info!(
-                            code = "AGENT_LIVENESS_SWEEP_TRANSITIONS",
-                            transition_count,
-                            "liveness sweep emitted state transitions"
-                        );
+                    })
+                    .await;
+                    match sweep {
+                        Ok(transition_count) if transition_count > 0 => {
+                            tracing::info!(
+                                code = "AGENT_LIVENESS_SWEEP_TRANSITIONS",
+                                transition_count,
+                                "liveness sweep emitted state transitions"
+                            );
+                        }
+                        Ok(_quiet) => {}
+                        Err(join_error) => {
+                            tracing::error!(
+                                code = "AGENT_LIVENESS_SWEEP_FAILED",
+                                detail = %join_error,
+                                "liveness sweep task panicked"
+                            );
+                        }
                     }
                 }
             }
@@ -2983,59 +1675,15 @@ fn spawn_agent_liveness_sweep(
     })
 }
 
-async fn cleanup_stale_session_resources_once(
-    session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
-    session_manager: &LocalSessionManager,
-) {
-    let active_sessions = active_http_session_ids(session_manager).await;
-    session_lifecycle.cleanup_expired_lease_inputs_once().await;
-    let stale_sessions = session_lifecycle.stale_session_candidates(&active_sessions);
-    for (session_id, reason) in stale_sessions {
-        match session_lifecycle
-            .teardown_session(&session_id, reason)
-            .await
-        {
-            Ok(report) => {
-                tracing::info!(
-                    code = "MCP_HTTP_SESSION_STALE_LIFECYCLE_CLEANUP",
-                    session_id = %session_id,
-                    reason,
-                    active_session_count = active_sessions.len(),
-                    report = ?report,
-                    "readback=session_lifecycle edge=http_session_gone after_cleanup"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    session_id = %session_id,
-                    reason,
-                    active_session_count = active_sessions.len(),
-                    detail = %error.message,
-                    data = ?error.data,
-                    "HTTP MCP stale-session lifecycle cleanup failed"
-                );
-            }
-        }
-    }
-}
-
-async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {
-    let sessions: BTreeSet<String> = session_manager
-        .sessions
-        .read()
-        .await
-        .keys()
-        .map(|session_id| session_id.as_ref().to_owned())
-        .collect();
-    emit_http_active_sessions(sessions.len());
-    sessions
-}
-
 async fn close_active_mcp_sessions_for_shutdown(
     session_manager: &LocalSessionManager,
+    shutdown_sessions: &ShutdownSessionGate,
     reason: &'static str,
 ) -> McpSessionShutdownCloseReport {
+    // #169: stop the stale-session sweeper and snapshot live sessions BEFORE
+    // the map is drained, so the sweeper cannot tear down "vanished" sessions
+    // during the grace window and the shutdown cleanup still sees them.
+    shutdown_sessions.begin(session_manager).await;
     let (sessions_before, sessions) = {
         let mut guard = session_manager.sessions.write().await;
         let sessions_before = guard.len();
@@ -3045,47 +1693,27 @@ async fn close_active_mcp_sessions_for_shutdown(
             .collect::<Vec<_>>();
         (sessions_before, sessions)
     };
-    emit_http_active_sessions(0);
     let close_attempted = sessions.len();
     let session_ids = sessions
         .iter()
         .map(|(session_id, _)| session_id.clone())
         .collect::<Vec<_>>();
-    // A single wedged session must not suppress close attempts for every other
-    // session. Start every independent close concurrently and give each one its
-    // own deadline. rmcp's close only queues `SessionEvent::Close`; it does not
-    // join the private session worker/service task. Consequently this report is
-    // only a trigger/readback for the manager. The final accepted-socket,
-    // server-task, and M3 Arc strong-count readbacks independently prove that no
-    // per-session transport, service clone, or storage owner survived.
-    let close_results = join_all(sessions.into_iter().map(|(session_id, handle)| async move {
-        (
-            session_id,
-            time::timeout(MCP_SESSION_CLOSE_TIMEOUT, handle.close()).await,
-        )
-    }))
-    .await;
     let mut close_succeeded = 0;
     let mut already_terminated = 0;
     let mut failures = Vec::new();
-    for (session_id, result) in close_results {
-        match result {
-            Ok(Ok(())) => close_succeeded += 1,
-            Ok(Err(SessionError::SessionServiceTerminated)) => already_terminated += 1,
-            Ok(Err(error)) => failures.push(format!("{session_id}: close_failed: {error}")),
-            Err(_elapsed) => failures.push(format!(
-                "{session_id}: close_timeout_ms={}",
-                MCP_SESSION_CLOSE_TIMEOUT.as_millis()
-            )),
+    for (session_id, handle) in sessions {
+        match handle.close().await {
+            Ok(()) => {
+                close_succeeded += 1;
+            }
+            Err(SessionError::SessionServiceTerminated) => {
+                already_terminated += 1;
+            }
+            Err(error) => {
+                failures.push(format!("{session_id}: {error}"));
+            }
         }
     }
-    // Read the session-manager Source of Truth independently after every
-    // close attempt. `handle.close()` is a trigger result, not proof that no
-    // live session remains registered.
-    let session_ids_after = active_http_session_ids(session_manager)
-        .await
-        .into_iter()
-        .collect::<Vec<_>>();
     McpSessionShutdownCloseReport {
         reason,
         sessions_before,
@@ -3095,115 +1723,42 @@ async fn close_active_mcp_sessions_for_shutdown(
         failure_count: failures.len(),
         session_ids,
         failures,
-        sessions_after: session_ids_after.len(),
-        session_ids_after,
     }
 }
 
 async fn cleanup_active_session_inputs_for_shutdown(
     session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
     session_manager: &LocalSessionManager,
-    close_candidate_session_ids: &[String],
+    session_gate: &ShutdownSessionGate,
     reason: &'static str,
 ) -> DaemonShutdownInputCleanupReport {
-    // Cancellation/unwind finalizers own durable profile/lease/audit cleanup.
-    // Drain them before lifecycle teardown reads or deletes the same session
-    // Sources of Truth.
-    let (authority_finalizer_drain_readback, authority_finalizer_drain_error) =
-        match session_lifecycle.drain_authority_finalizers().await {
-            Ok(readback) => (Some(readback), None),
-            Err(error) => (Some(error.readback.clone()), Some(error.to_string())),
-        };
-    let active_sessions = active_http_session_ids(session_manager).await;
-    let (live_spawn_sessions, live_spawn_snapshot_error) =
-        match session_lifecycle.live_spawned_session_ids_for_shutdown() {
-            Ok(session_ids) => (session_ids, None),
-            Err(error) => (BTreeSet::new(), Some(error)),
-        };
-    let live_spawn_snapshot_read_before = live_spawn_snapshot_error.is_none();
-    let close_candidate_sessions = close_candidate_session_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut input_owner_snapshot_errors = Vec::new();
-    let input_owner_sessions_before = match session_lifecycle.input_owner_session_ids_for_shutdown()
-    {
-        Ok(session_ids) => session_ids
-            .into_iter()
-            .filter(|session_id| session_id != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
-            .collect::<BTreeSet<_>>(),
-        Err(error) => {
-            input_owner_snapshot_errors.push(format!("before_cleanup: {error}"));
-            BTreeSet::new()
-        }
-    };
-    let input_owner_snapshot_read_before = input_owner_snapshot_errors.is_empty();
-    let shutdown_sessions = shutdown_cleanup_session_ids(
-        &active_sessions,
-        &live_spawn_sessions,
-        &close_candidate_sessions,
-        &input_owner_sessions_before,
-    );
-    let shutdown_session_ids = shutdown_sessions.iter().cloned().collect::<Vec<_>>();
-    // The bounded authority-finalizer drain above can deliberately return with
-    // a retained cooperative owner. Never follow that bounded verdict with an
-    // unbounded reacquisition of the same session gate or an unbounded emitter
-    // acknowledgement. Start every independent cleanup so one retained owner
-    // cannot suppress the remaining attempts, and give each exact operation its
-    // own terminal deadline.
-    let cleanup_results = join_all(shutdown_sessions.iter().map(|session_id| {
-        await_daemon_session_input_cleanup(
-            session_id,
-            reason,
-            session_lifecycle.release_session_inputs_for_daemon_shutdown(session_id, reason),
-        )
-    }))
-    .await;
-    let mut session_cleanup_timeouts = Vec::new();
-    let session_reports = cleanup_results
-        .into_iter()
-        .map(|(report, timed_out)| {
-            if timed_out {
-                session_cleanup_timeouts.push(report.session_id.clone());
-            }
-            report
-        })
-        .collect::<Vec<_>>();
+    let active_sessions = session_gate.sessions_for_cleanup(session_manager).await;
+    let live_spawn_sessions = session_lifecycle.live_spawned_session_ids_for_shutdown();
+    let shutdown_sessions = shutdown_cleanup_session_ids(&active_sessions, &live_spawn_sessions);
+    let mut session_reports = Vec::with_capacity(shutdown_sessions.len());
+    for session_id in &shutdown_sessions {
+        session_reports.push(
+            session_lifecycle
+                .release_session_inputs_for_daemon_shutdown(session_id, reason)
+                .await,
+        );
+    }
     let mut orphan_lease_owner_cleanup = None;
     let mut final_lease = synapse_action::lease::status();
     if let Some(owner_session_id) = final_lease.owner_session_id.clone()
         && owner_session_id != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID
         && !shutdown_sessions.contains(&owner_session_id)
     {
-        let (report, timed_out) = await_daemon_session_input_cleanup(
-            &owner_session_id,
-            reason,
-            session_lifecycle.release_session_inputs_for_daemon_shutdown(&owner_session_id, reason),
-        )
-        .await;
-        if timed_out {
-            session_cleanup_timeouts.push(owner_session_id);
-        }
-        orphan_lease_owner_cleanup = Some(report);
+        orphan_lease_owner_cleanup = Some(
+            session_lifecycle
+                .release_session_inputs_for_daemon_shutdown(&owner_session_id, reason)
+                .await,
+        );
         final_lease = synapse_action::lease::status();
     }
     let final_lease_is_operator = final_lease.owner_session_id.as_deref()
         == Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID);
     let lease_still_held_after_cleanup = final_lease.held && !final_lease_is_operator;
-    let input_owner_sessions_after = match session_lifecycle.input_owner_session_ids_for_shutdown()
-    {
-        Ok(session_ids) => session_ids
-            .into_iter()
-            .filter(|session_id| session_id != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
-            .collect::<BTreeSet<_>>(),
-        Err(error) => {
-            input_owner_snapshot_errors.push(format!("after_cleanup: {error}"));
-            BTreeSet::new()
-        }
-    };
-    let input_owner_snapshot_read_after = !input_owner_snapshot_errors
-        .iter()
-        .any(|error| error.starts_with("after_cleanup:"));
     let mut failure_count = session_reports
         .iter()
         .filter(|report| report.failed)
@@ -3217,83 +1772,30 @@ async fn cleanup_active_session_inputs_for_shutdown(
     if lease_still_held_after_cleanup {
         failure_count += 1;
     }
-    failure_count += input_owner_snapshot_errors.len();
-    failure_count += input_owner_sessions_after.len();
-    failure_count += usize::from(authority_finalizer_drain_error.is_some());
-    failure_count += usize::from(live_spawn_snapshot_error.is_some());
     DaemonShutdownInputCleanupReport {
         reason,
-        authority_finalizer_drain_readback,
-        authority_finalizer_drain_error,
         active_sessions_before: active_sessions.len(),
-        live_spawn_snapshot_read_before,
-        live_spawn_snapshot_error,
         live_spawn_sessions_before: live_spawn_sessions.len(),
-        close_candidate_sessions_before: close_candidate_sessions.len(),
-        input_owner_snapshot_read_before,
-        input_owner_session_ids_before: input_owner_sessions_before.into_iter().collect(),
         shutdown_sessions_before: shutdown_sessions.len(),
-        shutdown_session_ids,
         cleaned_sessions: session_reports.len(),
-        session_cleanup_timeout_ms: u64::try_from(DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT.as_millis())
-            .unwrap_or(u64::MAX),
-        session_cleanup_timeouts,
         orphan_lease_owner_cleanup,
         final_lease_held: final_lease.held,
         final_lease_owner_session_id: final_lease.owner_session_id,
         final_lease_is_operator,
         lease_still_held_after_cleanup,
-        input_owner_snapshot_read_after,
-        input_owner_session_ids_after: input_owner_sessions_after.into_iter().collect(),
-        input_owner_snapshot_errors,
         failure_count,
         session_reports,
-    }
-}
-
-async fn await_daemon_session_input_cleanup<F>(
-    session_id: &str,
-    reason: &str,
-    cleanup: F,
-) -> (
-    crate::server::session_lifecycle::SessionShutdownInputCleanupReport,
-    bool,
-)
-where
-    F: std::future::Future<
-            Output = crate::server::session_lifecycle::SessionShutdownInputCleanupReport,
-        >,
-{
-    match time::timeout(DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT, cleanup).await {
-        Ok(report) => (report, false),
-        Err(_elapsed) => (
-            crate::server::session_lifecycle::SessionShutdownInputCleanupReport {
-                session_id: session_id.to_owned(),
-                reason: reason.to_owned(),
-                failed: true,
-                error_message: Some(format!(
-                    "daemon-shutdown session authority/input cleanup exceeded its {} ms terminal deadline; authority or emitter completion remains unproven",
-                    DAEMON_SESSION_INPUT_CLEANUP_TIMEOUT.as_millis()
-                )),
-                ..Default::default()
-            },
-            true,
-        ),
     }
 }
 
 fn shutdown_cleanup_session_ids(
     active_sessions: &BTreeSet<String>,
     live_spawn_sessions: &BTreeSet<String>,
-    close_candidate_sessions: &BTreeSet<String>,
-    input_owner_sessions: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     active_sessions
         .iter()
         .cloned()
         .chain(live_spawn_sessions.iter().cloned())
-        .chain(close_candidate_sessions.iter().cloned())
-        .chain(input_owner_sessions.iter().cloned())
         .collect()
 }
 
@@ -3314,6 +1816,9 @@ struct SynapseMcpSessionStore {
     session_registry: crate::server::session_registry::SharedSessionRegistry,
 }
 
+/// How often the daemon persists session activity for restart survival (#215).
+const SESSION_STORE_ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 impl SynapseMcpSessionStore {
     fn new(
         db: Arc<Db>,
@@ -3326,52 +1831,225 @@ impl SynapseMcpSessionStore {
             session_registry,
         }
     }
+
+    fn cache_persisted_activity(&self, session_id: &str, activity: u64) {
+        if let Ok(mut registry) = self.session_registry.lock() {
+            registry.seed_activity_persistence(session_id, activity);
+        } else {
+            tracing::warn!(session_id, "could not cache persisted session activity");
+        }
+    }
+
+    fn decode_persisted_session(
+        &self,
+        session_id: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<PersistedMcpSessionState>, SessionStoreError> {
+        let wrapper_error = match synapse_storage::decode_json(value) {
+            Ok(persisted) => return Ok(Some(persisted)),
+            Err(error) => error,
+        };
+        if synapse_storage::decode_json::<SessionState>(value).is_ok() {
+            self.db
+                .delete_batch(cf::CF_KV, [key])
+                .map_err(session_store_error)?;
+            delete_session_continuity_rows(&self.db, session_id)?;
+            tracing::warn!(
+                code = "MCP_HTTP_SESSION_STORE_LEGACY_STALE_DELETE",
+                session_id, detail = %wrapper_error,
+                "deleted legacy MCP HTTP session state without persistent TTL metadata"
+            );
+            return Ok(None);
+        }
+        tracing::error!(
+            code = "MCP_HTTP_SESSION_STORE_DECODE_FAILED",
+            session_id, detail = %wrapper_error,
+            "failed to decode persisted MCP HTTP session state"
+        );
+        Err(session_store_error(wrapper_error))
+    }
+
+    /// #215: persists each open session's last activity into its row's
+    /// `last_activity_unix_ms`, so the restore window (`ttl`) measures idle
+    /// time rather than age since `initialize`. Throttled per session; closed sessions and
+    /// rows that no longer exist are left alone. Returns rows rewritten.
+    fn refresh_activity(&self, now_unix_ms: u64) -> Result<usize, SessionStoreError> {
+        let mut registry =
+            self.session_registry
+                .lock()
+                .map_err(|_poisoned| -> SessionStoreError {
+                    Box::new(io::Error::other(
+                        "session registry lock poisoned during session-store activity refresh",
+                    ))
+                })?;
+        let reads = registry.reads(now_unix_ms);
+        let pending: Vec<_> = reads
+            .into_iter()
+            .filter_map(|read| {
+                registry
+                    .reserve_activity_persistence(&read.session_id, now_unix_ms)
+                    .map(|activity| (read.session_id, activity))
+            })
+            .collect();
+        drop(registry);
+        let mut refreshed = 0_usize;
+        for (session_id, activity) in pending {
+            refreshed += usize::from(persist_reserved_session_activity(
+                &self.db,
+                &self.session_registry,
+                &session_id,
+                activity,
+            ));
+        }
+        Ok(refreshed)
+    }
+}
+
+/// Persist a reserved activity sample on a blocking worker (#215).
+pub(super) fn persist_session_activity(
+    db: &Db,
+    session_id: &str,
+    now_unix_ms: u64,
+) -> Result<bool, SessionStoreError> {
+    let _row_gate = crate::server::session_lifecycle::lock_session_store_rows();
+    let key = mcp_session_store_key(session_id);
+    let Some(value) = db
+        .get_cf_exact(cf::CF_KV, &key)
+        .map_err(session_store_error)?
+    else {
+        // Teardown may already have removed the row. Never recreate it.
+        return Ok(false);
+    };
+    let mut persisted: PersistedMcpSessionState =
+        synapse_storage::decode_json(&value).map_err(session_store_error)?;
+    if now_unix_ms <= persisted.last_active_unix_ms() {
+        return Ok(false);
+    }
+    persisted.last_activity_unix_ms = Some(now_unix_ms);
+    let encoded = synapse_storage::encode_json(&persisted).map_err(session_store_error)?;
+    #[cfg(test)]
+    session_activity_requests_215::record_write_attempt(session_id);
+    db.put_batch(cf::CF_KV, [(key, encoded)])
+        .map_err(session_store_error)?;
+    Ok(true)
+}
+
+pub(super) fn spawn_session_activity_persistence(
+    db: Arc<Db>,
+    registry: crate::server::session_registry::SharedSessionRegistry,
+    session_id: String,
+    activity: u64,
+) {
+    drop(tokio::task::spawn_blocking(move || {
+        persist_reserved_session_activity(&db, &registry, &session_id, activity)
+    }));
+}
+
+fn persist_reserved_session_activity(
+    db: &Db,
+    registry: &crate::server::session_registry::SharedSessionRegistry,
+    session_id: &str,
+    activity: u64,
+) -> bool {
+    let result = persist_session_activity(db, session_id, activity);
+    let written = matches!(&result, Ok(true));
+    if let Ok(mut registry) = registry.lock() {
+        registry.finish_activity_persistence(session_id, written.then_some(activity));
+    } else {
+        tracing::warn!(
+            session_id,
+            "session activity completion could not lock registry"
+        );
+    }
+    if let Err(error) = result {
+        let code = error
+            .downcast_ref::<synapse_storage::StorageError>()
+            .map_or(
+                "MCP_HTTP_SESSION_STORE_ACTIVITY_REFRESH_FAILED",
+                synapse_storage::StorageError::code,
+            );
+        tracing::warn!(
+            code,
+            session_id, detail = %error,
+            "best-effort session activity was not persisted; request remains accepted"
+        );
+    }
+    written
+}
+
+fn spawn_session_store_activity_refresh(
+    store: Arc<SynapseMcpSessionStore>,
+    shutdown_cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(SESSION_STORE_ACTIVITY_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown_cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let worker_store = Arc::clone(&store);
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        unix_time_ms().and_then(|now| worker_store.refresh_activity(now))
+                    }).await.map_err(|error| -> SessionStoreError { Box::new(error) }).and_then(|result| result);
+                    match outcome {
+                        Ok(0) => {}
+                        Ok(refreshed) => tracing::debug!(
+                            code = "MCP_HTTP_SESSION_STORE_ACTIVITY_REFRESHED",
+                            refreshed,
+                            "readback=CF_KV after=session_activity_persisted"
+                        ),
+                        Err(error) => tracing::warn!(
+                            code = "MCP_HTTP_SESSION_STORE_ACTIVITY_REFRESH_FAILED",
+                            detail = %error,
+                            "could not persist session activity; retrying next interval"
+                        ),
+                    }
+                }
+            }
+        }
+    })
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PersistedMcpSessionState {
+    /// When the session was initialized. Never rewritten: the registry's
+    /// `started_at` and CDP-owner recovery compare against it.
     stored_at_unix_ms: u64,
+    /// #215: throttled last-request sample, so the restore window measures
+    /// idle time, not age. Absent in rows written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_activity_unix_ms: Option<u64>,
     state: SessionState,
+}
+
+impl PersistedMcpSessionState {
+    /// The instant the restore window counts from.
+    fn last_active_unix_ms(&self) -> u64 {
+        self.last_activity_unix_ms
+            .map_or(self.stored_at_unix_ms, |activity| {
+                activity.max(self.stored_at_unix_ms)
+            })
+    }
 }
 
 #[async_trait::async_trait]
 impl SessionStore for SynapseMcpSessionStore {
     async fn load(&self, session_id: &str) -> Result<Option<SessionState>, SessionStoreError> {
         let key = mcp_session_store_key(session_id);
-        let rows = self
+        let Some(value) = self
             .db
-            .scan_cf_prefix(cf::CF_KV, &key)
-            .map_err(session_store_error)?;
-        let Some((_key, value)) = rows.into_iter().find(|(row_key, _value)| row_key == &key) else {
+            .get_cf_exact(cf::CF_KV, &key)
+            .map_err(session_store_error)?
+        else {
             return Ok(None);
         };
         let now_ms = unix_time_ms()?;
-        let persisted = match synapse_storage::decode_json::<PersistedMcpSessionState>(&value) {
-            Ok(persisted) => persisted,
-            Err(wrapper_error) => {
-                if synapse_storage::decode_json::<SessionState>(&value).is_ok() {
-                    self.db
-                        .delete_batch(cf::CF_KV, [key])
-                        .map_err(session_store_error)?;
-                    delete_session_continuity_rows(&self.db, session_id)?;
-                    tracing::warn!(
-                        code = "MCP_HTTP_SESSION_STORE_LEGACY_STALE_DELETE",
-                        session_id,
-                        detail = %wrapper_error,
-                        "deleted legacy MCP HTTP session state without persistent TTL metadata"
-                    );
-                    return Ok(None);
-                }
-                tracing::error!(
-                    code = "MCP_HTTP_SESSION_STORE_DECODE_FAILED",
-                    session_id,
-                    detail = %wrapper_error,
-                    "failed to decode persisted MCP HTTP session state"
-                );
-                return Err(session_store_error(wrapper_error));
-            }
+        let Some(persisted) = self.decode_persisted_session(session_id, &key, &value)? else {
+            return Ok(None);
         };
-        if session_store_expired(persisted.stored_at_unix_ms, now_ms, self.ttl) {
+        if session_store_expired(persisted.last_active_unix_ms(), now_ms, self.ttl) {
             self.db
                 .delete_batch(cf::CF_KV, [key])
                 .map_err(session_store_error)?;
@@ -3380,6 +2058,7 @@ impl SessionStore for SynapseMcpSessionStore {
                 code = "MCP_HTTP_SESSION_STORE_EXPIRED",
                 session_id,
                 stored_at_unix_ms = persisted.stored_at_unix_ms,
+                last_active_unix_ms = persisted.last_active_unix_ms(),
                 now_unix_ms = now_ms,
                 ttl_ms = self.ttl.map(duration_millis_u64),
                 "deleted expired MCP HTTP session state from CF_KV"
@@ -3399,6 +2078,7 @@ impl SessionStore for SynapseMcpSessionStore {
             persisted.stored_at_unix_ms,
         )
         .map_err(session_store_error)?;
+        self.cache_persisted_activity(session_id, persisted.last_active_unix_ms());
         if newly_visible {
             journal_session_live_event(&self.db, session_id, &persisted.state, "session_restored")
                 .map_err(session_store_error)?;
@@ -3411,6 +2091,7 @@ impl SessionStore for SynapseMcpSessionStore {
         let stored_at_unix_ms = unix_time_ms()?;
         let persisted = PersistedMcpSessionState {
             stored_at_unix_ms,
+            last_activity_unix_ms: None,
             state: state.clone(),
         };
         let encoded = synapse_storage::encode_json(&persisted).map_err(session_store_error)?;
@@ -3431,6 +2112,7 @@ impl SessionStore for SynapseMcpSessionStore {
             stored_at_unix_ms,
         )
         .map_err(session_store_error)?;
+        self.cache_persisted_activity(session_id, stored_at_unix_ms);
         if newly_visible {
             journal_session_live_event(&self.db, session_id, state, "session_initialized")
                 .map_err(session_store_error)?;
@@ -3440,9 +2122,12 @@ impl SessionStore for SynapseMcpSessionStore {
 
     async fn delete(&self, session_id: &str) -> Result<(), SessionStoreError> {
         let key = mcp_session_store_key(session_id);
-        self.db
-            .delete_batch(cf::CF_KV, [key])
-            .map_err(session_store_error)?;
+        {
+            let _row_gate = crate::server::session_lifecycle::lock_session_store_rows();
+            self.db
+                .delete_batch(cf::CF_KV, [key])
+                .map_err(session_store_error)?;
+        }
         delete_session_continuity_rows(&self.db, session_id)?;
         tracing::info!(
             code = "MCP_HTTP_SESSION_STORE_DELETE",
@@ -3452,8 +2137,12 @@ impl SessionStore for SynapseMcpSessionStore {
         let transitioned = record_registry_closed(&self.session_registry, session_id)
             .map_err(session_store_error)?;
         if transitioned {
-            journal_session_exited_event(&self.db, session_id, "http_session_store_deleted")
-                .map_err(session_store_error)?;
+            let journal_result =
+                journal_session_exited_event(&self.db, session_id, "http_session_store_deleted");
+            if let Ok(mut registry) = self.session_registry.lock() {
+                registry.record_closure_journal_result(session_id, journal_result.is_ok());
+            }
+            journal_result.map_err(session_store_error)?;
         }
         Ok(())
     }
@@ -3542,11 +2231,10 @@ fn mcp_session_store_key(session_id: &str) -> Vec<u8> {
 }
 
 fn delete_session_continuity_rows(db: &Db, session_id: &str) -> Result<(), SessionStoreError> {
-    let readback =
-        crate::server::session_continuity::delete_persisted_session_continuity_rows_from_db(
-            db, session_id,
-        )
-        .map_err(|error| -> SessionStoreError { Box::new(io::Error::other(error)) })?;
+    let readback = crate::server::session_continuity::delete_persisted_session_target_row_from_db(
+        db, session_id,
+    )
+    .map_err(|error| -> SessionStoreError { Box::new(io::Error::other(error)) })?;
     tracing::info!(
         code = "MCP_HTTP_SESSION_CONTINUITY_DELETE",
         session_id,
@@ -3571,11 +2259,15 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn session_store_expired(stored_at_unix_ms: u64, now_unix_ms: u64, ttl: Option<Duration>) -> bool {
+fn session_store_expired(
+    last_active_unix_ms: u64,
+    now_unix_ms: u64,
+    ttl: Option<Duration>,
+) -> bool {
     let Some(ttl) = ttl else {
         return false;
     };
-    now_unix_ms.saturating_sub(stored_at_unix_ms) > duration_millis_u64(ttl)
+    now_unix_ms.saturating_sub(last_active_unix_ms) > duration_millis_u64(ttl)
 }
 
 fn http_service(
@@ -5316,19 +4008,9 @@ async fn dashboard_tray_state(State(state): State<HttpState>, headers: HeaderMap
     }
     let state_started = Instant::now();
     let mut timing_segments = Vec::new();
-    let sessions = dashboard_timed_state_segment(&mut timing_segments, "sessions", || match state
-        .health_service
-        .session_list_impl(false)
-    {
-        Ok(sessions) => DashboardPanel::ok(
-            "session_list dashboard primary agent feed + acknowledged escalation suppression",
-            dashboard_primary_session_list_data(
-                &sessions,
-                state.health_service.acked_open_attention_anchors_snapshot(),
-            ),
-        ),
-        Err(error) => DashboardPanel::error("session_list", format!("{error:?}")),
-    });
+    let sessions_started = Instant::now();
+    let sessions = dashboard_sessions_panel(&state).await;
+    dashboard_push_state_timing(&mut timing_segments, "sessions", sessions_started);
     let lease = dashboard_timed_state_segment(&mut timing_segments, "lease", || {
         DashboardPanel::ok("control_lease_status", synapse_action::lease::status())
     });
@@ -5381,29 +4063,10 @@ async fn dashboard_tray_state(State(state): State<HttpState>, headers: HeaderMap
     with_dashboard_security_headers(Json(response).into_response())
 }
 
-async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> Response {
-    if let Err(response) = dashboard_local_only(&state, &headers) {
-        return with_dashboard_security_headers(response);
-    }
-    let state_started = Instant::now();
-    let mut timing_segments = Vec::new();
-    let active_sessions_started = Instant::now();
-    let active_sessions = state.session_manager.sessions.read().await.len();
-    emit_http_active_sessions(active_sessions);
-    dashboard_push_state_timing(
-        &mut timing_segments,
-        "active_sessions",
-        active_sessions_started,
-    );
-    let health = dashboard_timed_state_segment(&mut timing_segments, "health", || {
-        state
-            .health_service
-            .health_payload_with_http_sessions(Some(active_sessions))
-    });
-    let sessions = dashboard_timed_state_segment(&mut timing_segments, "sessions", || match state
-        .health_service
-        .session_list_impl(false)
-    {
+/// Session-list panel for the dashboard state endpoints. The read model walks
+/// the process table and windows, so it runs on the blocking pool (#209).
+async fn dashboard_sessions_panel(state: &HttpState) -> DashboardPanel {
+    match state.health_service.session_list_impl_blocking(false).await {
         Ok(sessions) => DashboardPanel::ok(
             "session_list dashboard primary agent feed + acknowledged escalation suppression",
             dashboard_primary_session_list_data(
@@ -5412,7 +4075,38 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
             ),
         ),
         Err(error) => DashboardPanel::error("session_list", format!("{error:?}")),
+    }
+}
+
+async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let state_started = Instant::now();
+    let mut timing_segments = Vec::new();
+    let active_sessions_started = Instant::now();
+    let active_sessions = state.session_manager.sessions.read().await.len();
+    dashboard_push_state_timing(
+        &mut timing_segments,
+        "active_sessions",
+        active_sessions_started,
+    );
+    let health = dashboard_timed_state_segment(&mut timing_segments, "health", || {
+        match state
+            .health_service
+            .registered_http_telemetry(Some(active_sessions))
+        {
+            Some(telemetry) => state
+                .health_service
+                .health_payload_with_http_telemetry(telemetry),
+            None => state
+                .health_service
+                .health_payload_with_http_sessions(Some(active_sessions)),
+        }
     });
+    let sessions_started = Instant::now();
+    let sessions = dashboard_sessions_panel(&state).await;
+    dashboard_push_state_timing(&mut timing_segments, "sessions", sessions_started);
     let lease = dashboard_timed_state_segment(&mut timing_segments, "lease", || {
         DashboardPanel::ok("control_lease_status", synapse_action::lease::status())
     });
@@ -5634,7 +4328,7 @@ async fn dashboard_events_subscribe(
     let subscription_id =
         match state
             .sse_state
-            .subscribe(filter, kinds, request.snapshot_first, None)
+            .subscribe_dashboard(filter, kinds, request.snapshot_first)
         {
             Ok(subscription_id) => subscription_id,
             Err(error) => {
@@ -5747,18 +4441,18 @@ async fn dashboard_agent_recording(
             Some(serde_json::json!({ "spawn_id": spawn_id })),
         ));
     }
-    match dashboard_agent_recording_readback(&state, spawn_id, request) {
+    match dashboard_agent_recording_readback(&state, spawn_id, request).await {
         Ok(response) => with_dashboard_security_headers(Json(response).into_response()),
         Err(response) => with_dashboard_security_headers(response),
     }
 }
 
-fn dashboard_agent_recording_readback(
+async fn dashboard_agent_recording_readback(
     state: &HttpState,
     spawn_id: String,
     request: DashboardAgentRecordingQuery,
 ) -> Result<DashboardAgentRecordingResponse, Response> {
-    let seed = dashboard_agent_recording_seed(state, &spawn_id)?;
+    let seed = dashboard_agent_recording_seed(state, &spawn_id).await?;
     let cast_path = seed.log_dir.join("terminal.cast");
     let status_path = seed.log_dir.join("terminal-capture-status.json");
     let final_screen_path = seed.log_dir.join("terminal-final-screen.txt");
@@ -5858,13 +4552,14 @@ fn dashboard_agent_recording_readback(
     })
 }
 
-fn dashboard_agent_recording_seed(
+async fn dashboard_agent_recording_seed(
     state: &HttpState,
     spawn_id: &str,
 ) -> Result<DashboardAgentRecordingSeed, Response> {
     let sessions = state
         .health_service
-        .session_list_impl(true)
+        .session_list_impl_blocking(true)
+        .await
         .map_err(|error| {
             let code = dashboard_error_code(&error);
             dashboard_error_response(
@@ -6421,14 +5116,11 @@ fn dashboard_read_saved_view_by_key(
     db: &Db,
     row_key: &str,
 ) -> Result<Option<DashboardSavedViewRow>, Response> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+    let Some(value) = db
+        .get_cf_exact(cf::CF_KV, row_key.as_bytes())
         .map_err(|error| {
             dashboard_storage_error_response("dashboard saved view read failed", error)
-        })?;
-    let Some((_key, value)) = rows
-        .into_iter()
-        .find(|(key, _value)| key == row_key.as_bytes())
+        })?
     else {
         return Ok(None);
     };
@@ -6583,13 +5275,11 @@ async fn dashboard_local_model_spawn(
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
     }
-    let mut params = match dashboard_local_model_spawn_params(request) {
+    // The spawned agent phones home to THIS daemon's bind address.
+    let params = match dashboard_local_model_spawn_params(request, state.bind_addr) {
         Ok(params) => params,
         Err(response) => return with_dashboard_security_headers(response),
     };
-    // Anchor the spawned agent's MCP endpoint to THIS daemon's bind address so
-    // it phones home to the daemon that launched it (not the hardcoded default).
-    params.mcp_url = crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr);
     match state
         .health_service
         .dashboard_spawn_local_model_agent(params)
@@ -6628,7 +5318,7 @@ async fn dashboard_spawn_agent(
     };
     // Anchor browser-triggered spawns to this daemon, just like the legacy
     // local-model-only endpoint. The browser cannot override the MCP endpoint.
-    spawn_request.mcp_url = crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr);
+    spawn_request.mcp_url = Some(crate::m4::agent_mcp_url(None, &state.bind_addr.to_string()));
     let mut attempts = Vec::with_capacity(fan_out as usize);
     for index in 1..=fan_out {
         let attempt = match state
@@ -6758,10 +5448,11 @@ async fn dashboard_context_inject(
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
     }
-    let session_id = match dashboard_context_resolve_live_session_id(&state, &request.session_id) {
-        Ok(session_id) => session_id,
-        Err(response) => return with_dashboard_security_headers(response),
-    };
+    let session_id =
+        match dashboard_context_resolve_live_session_id(&state, &request.session_id).await {
+            Ok(session_id) => session_id,
+            Err(response) => return with_dashboard_security_headers(response),
+        };
     let packet = request.packet.trim();
     if packet.is_empty() {
         return with_dashboard_security_headers(dashboard_error_response(
@@ -6784,11 +5475,12 @@ async fn dashboard_context_inject(
     });
     let payload_sha256 = dashboard_payload_sha256(&payload);
     let result = match channel.as_str() {
-        "steer" => state.health_service.dashboard_agent_steer(
-            session_id,
-            packet.to_owned(),
-            request.request_receipt,
-        ),
+        "steer" => {
+            state
+                .health_service
+                .dashboard_agent_steer(session_id, packet.to_owned(), request.request_receipt)
+                .await
+        }
         "mailbox" => {
             let kind = request
                 .kind
@@ -6856,10 +5548,11 @@ async fn dashboard_context_plan(
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
     }
-    let session_id = match dashboard_context_resolve_live_session_id(&state, &request.session_id) {
-        Ok(session_id) => session_id,
-        Err(response) => return with_dashboard_security_headers(response),
-    };
+    let session_id =
+        match dashboard_context_resolve_live_session_id(&state, &request.session_id).await {
+            Ok(session_id) => session_id,
+            Err(response) => return with_dashboard_security_headers(response),
+        };
     let key = format!("plan/{session_id}");
     let payload = serde_json::json!({
         "schema_version": 1,
@@ -6892,6 +5585,7 @@ async fn dashboard_context_plan(
         match state
             .health_service
             .dashboard_agent_steer(session_id, instruction, true)
+            .await
         {
             Ok(readback) => DashboardContextPlanNotification::Delivered { readback },
             Err(error) => DashboardContextPlanNotification::Failed {
@@ -7038,7 +5732,7 @@ async fn dashboard_agent_interrupt(
         Ok(params) => params,
         Err(response) => return with_dashboard_security_headers(response),
     };
-    match state.health_service.dashboard_agent_interrupt_request(params) {
+    match state.health_service.dashboard_agent_interrupt_request(params).await {
         Ok(readback) => with_dashboard_security_headers(
             Json(DashboardControlResponse {
                 ok: true,
@@ -7070,7 +5764,7 @@ async fn dashboard_agent_pause(
         Ok(params) => params,
         Err(response) => return with_dashboard_security_headers(response),
     };
-    match state.health_service.dashboard_agent_pause_request(params) {
+    match state.health_service.dashboard_agent_pause_request(params).await {
         Ok(readback) => with_dashboard_security_headers(
             Json(DashboardControlResponse {
                 ok: true,
@@ -7102,7 +5796,7 @@ async fn dashboard_agent_resume(
         Ok(params) => params,
         Err(response) => return with_dashboard_security_headers(response),
     };
-    match state.health_service.dashboard_agent_resume_request(params) {
+    match state.health_service.dashboard_agent_resume_request(params).await {
         Ok(readback) => with_dashboard_security_headers(
             Json(DashboardControlResponse {
                 ok: true,
@@ -7134,10 +5828,9 @@ async fn dashboard_agent_respawn(
         Ok(params) => params,
         Err(response) => return with_dashboard_security_headers(response),
     };
-    let mcp_url = crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr);
     match state
         .health_service
-        .dashboard_agent_respawn_request(params, mcp_url)
+        .dashboard_agent_respawn_request(params)
         .await
     {
         Ok(readback) => with_dashboard_security_headers(
@@ -7253,7 +5946,7 @@ async fn dashboard_task_dispatch_once(
         concurrency_cap: request
             .concurrency_cap
             .unwrap_or_else(crate::server::agent_tasks::default_cap),
-        mcp_url: crate::m4::agent_spawn_mcp_url_for_bind(state.bind_addr),
+        mcp_url: Some(crate::m4::agent_mcp_url(None, &state.bind_addr.to_string())),
         wait_timeout_ms: request
             .wait_timeout_ms
             .unwrap_or_else(crate::m4::default_agent_spawn_wait_timeout_ms),
@@ -7732,13 +6425,13 @@ async fn dashboard_control_lease_force_release(
     match state
         .health_service
         .dashboard_control_lease_force_release(owner_session_id, confirmed)
+        .await
     {
         Ok(readback) => with_dashboard_security_headers(
             Json(DashboardControlResponse {
                 ok: true,
                 trigger: "dashboard.control_lease_force_release",
-                source_of_truth:
-                    "synapse_action::lease + CF_KV MCP session lease rows + CF_AGENT_EVENTS + CF_ACTION_LOG",
+                source_of_truth: crate::server::DASHBOARD_LEASE_SOURCE_OF_TRUTH,
                 readback,
             })
             .into_response(),
@@ -7768,13 +6461,13 @@ async fn dashboard_control_lease_handoff(
     match state
         .health_service
         .dashboard_control_lease_handoff(from_session_id, to_session_id, ttl_ms)
+        .await
     {
         Ok(readback) => with_dashboard_security_headers(
             Json(DashboardControlResponse {
                 ok: true,
                 trigger: "dashboard.control_lease_handoff",
-                source_of_truth:
-                    "synapse_action::lease + CF_KV MCP session lease rows + CF_AGENT_EVENTS + CF_ACTION_LOG",
+                source_of_truth: crate::server::DASHBOARD_LEASE_SOURCE_OF_TRUTH,
                 readback,
             })
             .into_response(),
@@ -7896,6 +6589,7 @@ async fn dashboard_template_delete(
 
 fn dashboard_local_model_spawn_params(
     request: DashboardLocalModelSpawnRequest,
+    bind_addr: SocketAddr,
 ) -> Result<crate::m4::ActSpawnAgentParams, Response> {
     let model_ref = request.model_ref.trim();
     if model_ref.is_empty() {
@@ -7925,7 +6619,7 @@ fn dashboard_local_model_spawn_params(
         working_dir: request
             .working_dir
             .and_then(|value| trim_optional_non_empty(&value)),
-        mcp_url: crate::m4::default_agent_spawn_mcp_url(),
+        mcp_url: crate::m4::agent_mcp_url(None, &bind_addr.to_string()),
         wait_timeout_ms: request
             .wait_timeout_ms
             .unwrap_or_else(crate::m4::default_agent_spawn_wait_timeout_ms),
@@ -7976,7 +6670,8 @@ fn dashboard_spawn_agent_request_params(
             working_dir: request
                 .working_dir
                 .and_then(|value| trim_optional_non_empty(&value)),
-            mcp_url: crate::m4::default_agent_spawn_mcp_url(),
+            // Set by the caller to this daemon's bind; the browser cannot choose it.
+            mcp_url: None,
             wait_timeout_ms: request
                 .wait_timeout_ms
                 .unwrap_or_else(crate::m4::default_agent_spawn_wait_timeout_ms),
@@ -8321,6 +7016,13 @@ fn dashboard_error_response(
     message: &str,
     data: Option<serde_json::Value>,
 ) -> Response {
+    let status = if code == synapse_core::error_codes::STORAGE_CF_HARD_CAP_REACHED
+        || code == synapse_core::error_codes::STORAGE_NAMESPACE_QUOTA_REACHED
+    {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        status
+    };
     (
         status,
         Json(serde_json::json!({
@@ -8376,7 +7078,7 @@ fn dashboard_hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn dashboard_context_resolve_live_session_id(
+async fn dashboard_context_resolve_live_session_id(
     state: &HttpState,
     requested_session_id: &str,
 ) -> Result<String, Response> {
@@ -8391,7 +7093,8 @@ fn dashboard_context_resolve_live_session_id(
     }
     let sessions = state
         .health_service
-        .session_list_impl(false)
+        .session_list_impl_blocking(false)
+        .await
         .map_err(|error| {
             dashboard_error_response(
                 StatusCode::BAD_REQUEST,
@@ -8426,18 +7129,26 @@ fn dashboard_context_resolve_live_session_id(
 
 fn dashboard_payload_sha256(value: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_else(|_| value.to_string().into_bytes());
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    crate::content_digest::keyed_prefixed_digest(&bytes)
 }
 
 fn dashboard_storage_error_response(
     message: &str,
     error: synapse_storage::StorageError,
 ) -> Response {
+    if matches!(
+        error,
+        synapse_storage::StorageError::HardCapReached { .. }
+            | synapse_storage::StorageError::NamespaceQuotaReached { .. }
+    ) {
+        tracing::warn!(code = error.code(), detail = %error, "dashboard storage hard cap reached");
+        return dashboard_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            error.code(),
+            message,
+            None,
+        );
+    }
     tracing::error!(
         code = synapse_core::error_codes::STORAGE_READ_FAILED,
         detail = %error,
@@ -8760,7 +7471,7 @@ fn context_panel(
     tool_names: &BTreeSet<&str>,
     sessions_panel: &DashboardPanel,
 ) -> DashboardPanel {
-    let workspace = if tool_names.contains("workspace_list") {
+    let workspace = if DashboardFacade::Workspace.available(tool_names) {
         match state
             .health_service
             .dashboard_workspace_list_snapshot(None, 200, true)
@@ -8788,7 +7499,7 @@ fn context_panel(
     };
 
     let mut inboxes = Vec::new();
-    if tool_names.contains("agent_inbox") {
+    if DashboardFacade::Agent.available(tool_names) {
         match dashboard_context_inbox_seeds(sessions_panel) {
             Ok(seeds) => {
                 for seed in seeds.iter().take(50) {
@@ -8925,8 +7636,8 @@ fn approval_panel(
     tool_names: &BTreeSet<&str>,
     kind: Option<crate::m3::approvals::ApprovalKind>,
 ) -> DashboardPanel {
-    if !tool_names.contains("approval_list") {
-        return deferred_panel("approval_list", tool_names);
+    if !DashboardFacade::Approval.available(tool_names) {
+        return deferred_panel(DashboardFacade::Approval.public_tool_name(), tool_names);
     }
     match state.health_service.approval_queue_snapshot(kind) {
         Ok(rows) => DashboardPanel::ok(
@@ -8942,8 +7653,8 @@ fn approval_panel(
 }
 
 fn tasks_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
-    if !tool_names.contains("task_list") {
-        return deferred_panel("task_list", tool_names);
+    if !DashboardFacade::Task.available(tool_names) {
+        return deferred_panel(DashboardFacade::Task.public_tool_name(), tool_names);
     }
     let list = match state.health_service.dashboard_task_snapshot(1000) {
         Ok(list) => list,
@@ -8971,8 +7682,8 @@ fn tasks_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel
 }
 
 fn local_model_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
-    if !tool_names.contains("local_model_list") {
-        return deferred_panel("local_model_list", tool_names);
+    if !DashboardFacade::Model.available(tool_names) {
+        return deferred_panel(DashboardFacade::Model.public_tool_name(), tool_names);
     }
     match state.health_service.local_model_registry_snapshot() {
         Ok(rows) => {
@@ -9018,8 +7729,8 @@ fn command_audit_panel(state: &HttpState) -> DashboardPanel {
 }
 
 fn hygiene_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
-    if !tool_names.contains("hygiene_report") {
-        return deferred_panel("hygiene_report", tool_names);
+    if !DashboardFacade::Hygiene.available(tool_names) {
+        return deferred_panel(DashboardFacade::Hygiene.public_tool_name(), tool_names);
     }
     match state.health_service.hygiene_report_snapshot(100) {
         Ok(response) => DashboardPanel::ok(
@@ -9053,9 +7764,11 @@ fn deferred_panel(tool: &'static str, tool_names: &BTreeSet<&str>) -> DashboardP
 /// or CSRF gate. Synapse is single-user on the operator's own machine; the OS
 /// login is the trust boundary and an app-layer credential is pure friction that
 /// has been removed twice. This guard is transport hardening, NOT authentication:
-/// it requires a loopback bind and a loopback `Host` header (blocking DNS-rebind /
-/// cross-origin reach) and nothing else. Do not add `Authorization`/cookie/token
-/// checks to any `/dashboard/*` route.
+/// it requires a loopback bind and a loopback `Host` header. Cross-site browser
+/// requests (CSRF, cross-site WebSocket) are refused by the Origin/Host layer in
+/// `dashboard_origin_guard` (#167): no credential, open to local clients (a
+/// missing `Origin` is allowed); only a foreign `Origin` is refused.
+/// Do not add `Authorization`/cookie/token checks to any `/dashboard/*` route.
 fn dashboard_local_only(state: &HttpState, headers: &HeaderMap) -> Result<(), Response> {
     if !state.bind_addr.ip().is_loopback() {
         return Err((StatusCode::FORBIDDEN, "DASHBOARD_LOOPBACK_BIND_REQUIRED").into_response());
@@ -9095,52 +7808,127 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-async fn record_mcp_transport_diagnostics(
-    request: Request<Body>,
-    next: middleware::Next,
-) -> Response {
-    let path = request.uri().path().to_owned();
-    if !path.starts_with("/mcp") {
-        return next.run(request).await;
-    }
-
-    let method = request.method().to_string();
-    let request_id = record_http_mcp_request_started(&method, &path);
-    let started = Instant::now();
-    let response = next.run(request).await;
-    record_http_mcp_request_completed(
-        request_id,
-        &method,
-        &path,
-        response.status(),
-        started.elapsed(),
-    );
-    response
-}
-
-const DASHBOARD_CSS_FILE: &str = "dashboard-CicCCuUG.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-D_jF422B.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-iB0LcOyc.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-BxEfo8oo.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-CicCCuUG.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-D_jF422B.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-iB0LcOyc.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BxEfo8oo.js");
 async fn health(State(state): State<HttpState>) -> Json<Health> {
     tracing::info!(
         code = "MCP_HTTP_HEALTH",
         "tool.invocation kind=health transport=http"
     );
     let active_sessions = state.session_manager.sessions.read().await.len();
-    emit_http_active_sessions(active_sessions);
-    Json(
-        state
-            .health_service
-            .health_payload_with_http_sessions(Some(active_sessions)),
+    Json(health_payload_off_async_worker(state.health_service.clone(), active_sessions).await)
+}
+
+/// Upper bound for one `/health` payload (#140). Kept below the 4 s probe
+/// timeout used by `synapse-setup.ps1` so a stalled payload answers degraded
+/// instead of timing the caller out.
+const HEALTH_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// #140: the health payload takes std mutexes and performs filesystem,
+/// registry and process-table reads; run it on the blocking pool so it can
+/// never stall a tokio worker that is serving other MCP sessions, and bound it
+/// so a contended mutex cannot hold the response forever.
+pub(crate) async fn health_payload_off_async_worker(
+    service: Arc<SynapseService>,
+    active_sessions: usize,
+) -> Health {
+    bounded_health_payload(
+        move || match service.registered_http_telemetry(Some(active_sessions)) {
+            Some(telemetry) => service.health_payload_with_http_telemetry(telemetry),
+            None => service.health_payload_with_http_sessions(Some(active_sessions)),
+        },
+        HEALTH_PAYLOAD_TIMEOUT,
+        degraded_health_payload,
     )
+    .await
+}
+
+/// Start of the HTTP daemon, for the uptime in the degraded `/health` payload.
+static HTTP_SERVE_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Cheap fallback `/health` payload (#140): no locks, files or process-table
+/// reads, only constants, the pid and the HTTP uptime. `ok` is `false` and a
+/// `health` subsystem carries the reason, so callers see a degraded daemon
+/// instead of waiting on a stalled probe.
+fn degraded_health_payload(reason: &str) -> Health {
+    let uptime_s = HTTP_SERVE_STARTED
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
+    let mut subsystems = std::collections::BTreeMap::new();
+    subsystems.insert(
+        "health".to_owned(),
+        synapse_core::SubsystemHealth {
+            status: "degraded".to_owned(),
+            detail: Some(reason.to_owned()),
+            ..synapse_core::SubsystemHealth::default()
+        },
+    );
+    // #140: `synapse-setup.ps1` reads `subsystems.chrome_bridge`; a missing key
+    // made forced maintenance abort on slow hosts. Report it as unknown, with
+    // the machine-readable reason, without touching any lock.
+    let bridge_reason = if reason.contains("exceeded") {
+        "health_timeout"
+    } else {
+        "health_unavailable"
+    };
+    subsystems.insert(
+        "chrome_bridge".to_owned(),
+        synapse_core::SubsystemHealth {
+            status: "unknown".to_owned(),
+            detail: Some(bridge_reason.to_owned()),
+            ..synapse_core::SubsystemHealth::default()
+        },
+    );
+    Health {
+        ok: false,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        build: option_env!("VERGEN_GIT_SHA").unwrap_or("dev").to_owned(),
+        pid: std::process::id(),
+        uptime_s,
+        tool_count: 0,
+        tool_surface_sha256: "unavailable".to_owned(),
+        tool_names: Vec::new(),
+        subsystems,
+    }
+}
+
+/// Runs `compute` on the blocking pool for at most `timeout`; a timeout or a
+/// failed blocking task yields `degraded(reason)` instead of recomputing on
+/// the async worker. A timed-out `compute` keeps running detached.
+async fn bounded_health_payload<C, D>(compute: C, timeout: Duration, degraded: D) -> Health
+where
+    C: FnOnce() -> Health + Send + 'static,
+    D: FnOnce(&str) -> Health,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(compute)).await {
+        Ok(Ok(health)) => health,
+        Ok(Err(error)) => {
+            tracing::error!(
+                code = "MCP_HTTP_HEALTH_BLOCKING_TASK_FAILED",
+                error = %error,
+                "health blocking task failed; answering degraded"
+            );
+            degraded("health blocking task failed")
+        }
+        Err(_elapsed) => {
+            let timeout_ms = timeout.as_millis();
+            tracing::error!(
+                code = "MCP_HTTP_HEALTH_TIMEOUT",
+                timeout_ms,
+                "health payload exceeded its bound; answering degraded"
+            );
+            degraded(&format!("health payload exceeded {timeout_ms} ms"))
+        }
+    }
 }
 
 async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let active_sessions = state.session_manager.sessions.read().await.len();
-    emit_http_active_sessions(active_sessions);
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
@@ -9158,6 +7946,18 @@ async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Respons
         shutdown_on_drop = ?shutdown_on_drop,
         delay_ms = DRAIN_RESPONSE_GRACE_TIMEOUT.as_millis(),
         "HTTP shutdown request accepted and daemon drain state marked before cancellation"
+    );
+    let session_close = close_active_mcp_sessions_for_shutdown(
+        &state.session_manager,
+        &state.shutdown_sessions,
+        "http_shutdown",
+    )
+    .await;
+    tracing::warn!(
+        code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
+        pid = std::process::id(),
+        session_close = ?session_close,
+        "active MCP sessions closed before daemon cancellation so streamable HTTP clients release old daemon sockets"
     );
     let shutdown_cancel = state.shutdown_cancel.clone();
     tokio::spawn(async move {
@@ -9187,7 +7987,7 @@ async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Respons
             "shutdown": "requested",
             "drain": drain,
             "active_sessions_before_shutdown": active_sessions,
-            "session_close": "scheduled_by_daemon_supervisor",
+            "session_close": session_close,
         })),
     )
         .into_response()
@@ -9358,18 +8158,82 @@ fn spawn_server(
     app: Router,
     shutdown_cancel: CancellationToken,
     active_http_sockets: ActiveHttpSockets,
+    connection_admission: crate::http::connection_admission::HttpConnectionAdmission,
 ) -> JoinHandle<io::Result<()>> {
     tokio::spawn(async move {
-        #[cfg(windows)]
-        let listener = TrackedTcpListener {
-            inner: listener,
-            sockets: active_http_sockets,
-        };
+        let mut listener = TrackedTcpListener::new(
+            listener,
+            connection_admission.clone(),
+            #[cfg(windows)]
+            active_http_sockets,
+        );
         #[cfg(not(windows))]
         let _ = active_http_sockets;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown_cancel.cancelled_owned().await })
-            .await
+        loop {
+            let (stream, peer_addr) = tokio::select! {
+                accepted = listener.accept() => accepted,
+                _ = shutdown_cancel.cancelled() => break,
+            };
+            let header_timeout = stream.header_timeout();
+            let keep_alive = stream.keep_alive();
+            let activity =
+                crate::http::connection_activity::ConnectionActivity::new(header_timeout);
+            let hyper_service =
+                TowerToHyperService::new(crate::http::connection_activity::ActivityService::new(
+                    app.clone(),
+                    Arc::clone(&activity),
+                ));
+            let shutdown = shutdown_cancel.clone();
+            let admission = connection_admission.clone();
+            tokio::spawn(async move {
+                let mut builder = HyperServerBuilder::new(TokioExecutor::new());
+                builder
+                    .http1()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(header_timeout)
+                    .keep_alive(keep_alive);
+                builder.http2().enable_connect_protocol();
+                let mut connection = Box::pin(
+                    builder.serve_connection_with_upgrades(TokioIo::new(stream), hyper_service),
+                );
+                tokio::select! {
+                    result = connection.as_mut() => {
+                        if let Err(error) = result {
+                            if error.downcast_ref::<hyper::Error>().is_some_and(hyper::Error::is_timeout) {
+                                admission.note_header_read_timeout();
+                                tracing::warn!(
+                                    code = "MCP_HTTP_HEADER_READ_TIMEOUT",
+                                    peer_addr = %peer_addr,
+                                    header_timeout_s = header_timeout.as_secs(),
+                                    "HTTP connection closed after incomplete request headers"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    code = "MCP_HTTP_CONNECTION_ENDED",
+                                    peer_addr = %peer_addr,
+                                    error = %error,
+                                    "HTTP connection ended"
+                                );
+                            }
+                        }
+                    }
+                    () = activity.expired() => {
+                        admission.note_header_read_timeout();
+                        tracing::warn!(
+                            code = "MCP_HTTP_CONNECTION_IDLE_DEADLINE",
+                            peer_addr = %peer_addr,
+                            deadline_s = header_timeout.as_secs(),
+                            "HTTP connection closed: no request exchange within the deadline"
+                        );
+                    }
+                    _ = shutdown.cancelled() => {
+                        connection.as_mut().graceful_shutdown();
+                        let _ = connection.await;
+                    }
+                }
+            });
+        }
+        Ok(())
     })
 }
 
@@ -9387,37 +8251,22 @@ async fn handle_http_accept_error(error: io::Error) {
 }
 
 async fn wait_for_server_stop(
-    server_task: &mut ShutdownTaskOwner<io::Result<()>>,
+    server_task: &mut JoinHandle<io::Result<()>>,
     source: &'static str,
 ) -> anyhow::Result<()> {
-    wait_for_server_stop_with_timeouts(
-        server_task,
-        source,
-        HTTP_SERVER_TASK_STOP_TIMEOUT,
-        HTTP_SERVER_TASK_ABORT_TIMEOUT,
-    )
-    .await
-}
-
-async fn wait_for_server_stop_with_timeouts(
-    server_task: &mut ShutdownTaskOwner<io::Result<()>>,
-    source: &'static str,
-    stop_timeout: Duration,
-    abort_timeout: Duration,
-) -> anyhow::Result<()> {
+    let timeout = Duration::from_secs(2);
     let started = Instant::now();
     tracing::info!(
         code = "MCP_HTTP_SERVER_STOP_WAIT",
         source,
-        timeout_ms = stop_timeout.as_millis(),
+        timeout_ms = timeout.as_millis(),
         "waiting for HTTP listener task to stop"
     );
-    match tokio::time::timeout(stop_timeout, &mut *server_task).await {
+    match tokio::time::timeout(timeout, &mut *server_task).await {
         Ok(result) => {
-            let stopped = result
-                .context("join stopped HTTP MCP transport")
-                .and_then(|result| result.context("stop HTTP MCP transport"));
-            stopped?;
+            result
+                .context("join stopped HTTP MCP transport")?
+                .context("stop HTTP MCP transport")?;
             tracing::info!(
                 code = "MCP_HTTP_SERVER_STOPPED",
                 source,
@@ -9430,59 +8279,98 @@ async fn wait_for_server_stop_with_timeouts(
             tracing::warn!(
                 code = "MCP_HTTP_SHUTDOWN_TIMEOUT",
                 source,
-                timeout_ms = stop_timeout.as_millis(),
+                timeout_ms = timeout.as_millis(),
                 elapsed_ms = started.elapsed().as_millis(),
                 "HTTP transport did not stop within shutdown timeout"
             );
-            let terminal_after_abort = match tokio::time::timeout(abort_timeout, &mut *server_task)
-                .await
-            {
-                Ok(result) => match result {
-                    Ok(Ok(())) => {
-                        tracing::info!(
-                            code = "MCP_HTTP_SERVER_STOPPED_AFTER_ABORT",
-                            source,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "HTTP listener task stopped after abort request"
-                        );
-                        "listener returned success only after its graceful deadline and abort request"
-                    }
-                    Ok(Err(error)) => {
-                        return Err(error).context(format!(
-                            "stop HTTP MCP transport after missing the {}ms graceful deadline and requesting abort",
-                            stop_timeout.as_millis()
-                        ));
-                    }
-                    Err(join_error) if join_error.is_cancelled() => {
-                        tracing::warn!(
-                            code = "MCP_HTTP_SERVER_ABORTED",
-                            source,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "HTTP listener task aborted after shutdown timeout"
-                        );
-                        "listener reached a cancelled terminal join only after its graceful deadline and abort request"
-                    }
-                    Err(join_error) => {
-                        return Err(join_error).context(format!(
-                            "join HTTP MCP transport after missing the {}ms graceful deadline and requesting abort",
-                            stop_timeout.as_millis()
-                        ));
-                    }
-                },
+            match tokio::time::timeout(timeout, &mut *server_task).await {
+                Ok(Ok(Ok(()))) => {
+                    tracing::info!(
+                        code = "MCP_HTTP_SERVER_STOPPED_AFTER_ABORT",
+                        source,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "HTTP listener task stopped after abort request"
+                    );
+                }
+                Ok(Ok(Err(error))) => {
+                    return Err(error).context("stop aborted HTTP MCP transport");
+                }
+                Ok(Err(join_error)) if join_error.is_cancelled() => {
+                    tracing::warn!(
+                        code = "MCP_HTTP_SERVER_ABORTED",
+                        source,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "HTTP listener task aborted after shutdown timeout"
+                    );
+                }
+                Ok(Err(join_error)) => {
+                    return Err(join_error).context("join aborted HTTP MCP transport");
+                }
                 Err(_elapsed) => {
                     anyhow::bail!(
                         "HTTP listener task did not stop after abort request within {}ms",
-                        abort_timeout.as_millis()
+                        timeout.as_millis()
                     );
                 }
-            };
-            anyhow::bail!(
-                "HTTP listener task missed its {}ms graceful shutdown deadline; {terminal_after_abort}",
-                stop_timeout.as_millis()
-            );
+            }
         }
     }
     Ok(())
+}
+
+async fn wait_for_m2_emitter_done(
+    done: Option<watch::Receiver<Option<ActionStateSnapshot>>>,
+    source: &'static str,
+) {
+    let Some(mut done) = done else {
+        tracing::warn!(
+            code = "MCP_M2_EMITTER_SHUTDOWN_UNOBSERVED",
+            source,
+            "M2 emitter final snapshot receiver was unavailable during HTTP shutdown"
+        );
+        return;
+    };
+
+    let result = time::timeout(M2_EMITTER_SHUTDOWN_TIMEOUT, async {
+        loop {
+            if done.borrow().is_some() {
+                break;
+            }
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+
+    match (result, done.borrow().as_ref()) {
+        (Ok(()), Some(snapshot)) => {
+            tracing::info!(
+                code = "MCP_M2_EMITTER_SHUTDOWN_DONE",
+                source,
+                held_keys = snapshot.held_keys.len(),
+                held_buttons = snapshot.held_buttons.len(),
+                held_pads = snapshot.pad_state.len(),
+                held_key_timer_count = snapshot.held_key_timer_count,
+                "readback=action_emitter_state edge=http_shutdown after_emitter_done"
+            );
+        }
+        (Ok(()), None) => {
+            tracing::warn!(
+                code = "MCP_M2_EMITTER_SHUTDOWN_UNOBSERVED",
+                source,
+                "M2 emitter ended without publishing a final snapshot during HTTP shutdown"
+            );
+        }
+        (Err(_elapsed), _) => {
+            tracing::error!(
+                code = "MCP_M2_EMITTER_SHUTDOWN_TIMEOUT",
+                source,
+                timeout_ms = M2_EMITTER_SHUTDOWN_TIMEOUT.as_millis(),
+                "M2 emitter did not publish final shutdown snapshot before HTTP daemon exit"
+            );
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -9508,3 +8396,50 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("wait for ctrl-c {phase}"))
 }
+
+#[cfg(test)]
+#[path = "../server/tests/health_latency_140.rs"]
+mod health_latency_140_tests;
+
+#[cfg(test)]
+#[path = "../server/tests/health_timeout_140.rs"]
+mod health_timeout_140_tests;
+
+#[cfg(test)]
+#[path = "tests/stale_sweep_hung_endpoint_210.rs"]
+mod stale_sweep_hung_endpoint_210_tests;
+
+#[cfg(test)]
+#[path = "tests/session_store_activity_215.rs"]
+mod session_store_activity_215_tests;
+
+#[cfg(test)]
+#[path = "tests/session_activity_requests_215.rs"]
+mod session_activity_requests_215;
+
+#[cfg(test)]
+#[path = "tests/liveness_admission_19.rs"]
+mod liveness_admission_19_tests;
+
+#[cfg(test)]
+#[path = "tests/connection_deadline_17.rs"]
+mod connection_deadline_17_tests;
+
+#[cfg(test)]
+#[path = "tests/degraded_health_single_bridge_240.rs"]
+mod degraded_health_single_bridge_240_tests;
+#[cfg(test)]
+#[path = "tests/shutdown_drain_order_169.rs"]
+mod shutdown_drain_order_169_tests;
+
+#[cfg(test)]
+#[path = "tests/connection_telemetry_17.rs"]
+mod connection_telemetry_17_tests;
+
+#[cfg(test)]
+#[path = "tests/liveness_fragmented_head_19.rs"]
+mod liveness_fragmented_head_19_tests;
+
+#[cfg(test)]
+#[path = "tests/dashboard_payload_digest_174.rs"]
+mod dashboard_payload_digest_174_tests;

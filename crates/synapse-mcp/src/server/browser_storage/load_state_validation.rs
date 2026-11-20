@@ -1,4 +1,4 @@
-use super::{BrowserStorageParams, STORAGE_TOOL};
+use super::{BrowserStorageParams, REDACTED_VALUE, STORAGE_TOOL, VALUE_REDACTED_FIELD};
 use rmcp::{ErrorData, model::ErrorCode};
 use serde_json::{Map, Value, json};
 use synapse_core::error_codes;
@@ -14,7 +14,12 @@ pub(super) fn validate_load_state_params(params: &BrowserStorageParams) -> Resul
             "pass a Playwright-style storageState object with optional cookies[] and origins[] arrays",
         )
     })?;
-    validate_payload(state)
+    validate_payload(state)?;
+    // #2396: a masked save cannot be restored; refuse before anything is sent.
+    if let Some(refusal) = LoadStateValues::from_state(state).refusal() {
+        return Err(refusal);
+    }
+    Ok(())
 }
 
 fn validate_payload(state: &Value) -> Result<(), ErrorData> {
@@ -295,3 +300,83 @@ fn params_error(
         })),
     )
 }
+
+/// #2396 (roadmap item #629): the cookie and storage values of one
+/// `load_state` call. Every `save_state` reply is masked by
+/// `redact_browser_secret_fields` (browser_storage.rs): each `value` becomes
+/// `REDACTED_VALUE` and the entry gets `VALUE_REDACTED_FIELD: true`. A state
+/// that holds such a mask cannot be restored (writing it would put the mask
+/// text into the page's real cookies and storage), so the whole call is
+/// refused before anything is sent to the extension.
+struct LoadStateValues {
+    /// State path (`state.cookies[3]`) and label (`cookie "sid"`) of the
+    /// first masked value; `None` when no value is masked.
+    first_masked: Option<(String, String)>,
+}
+
+impl LoadStateValues {
+    /// Reads `state.cookies[]`, then each origin's `localStorage[]` and
+    /// `sessionStorage[]`, in order. Shapes it does not know are left to the
+    /// existing validation.
+    fn from_state(state: &Value) -> Self {
+        for (index, cookie) in Self::list(state, "cookies").iter().enumerate() {
+            if Self::is_masked(cookie) {
+                return Self::masked(format!("state.cookies[{index}]"), "cookie", cookie);
+            }
+        }
+        for (origin_index, origin) in Self::list(state, "origins").iter().enumerate() {
+            for store in ["localStorage", "sessionStorage"] {
+                for (index, item) in Self::list(origin, store).iter().enumerate() {
+                    if Self::is_masked(item) {
+                        return Self::masked(
+                            format!("state.origins[{origin_index}].{store}[{index}]"),
+                            store,
+                            item,
+                        );
+                    }
+                }
+            }
+        }
+        Self { first_masked: None }
+    }
+
+    /// The refusal of a state that holds a masked value; `None` = accepted.
+    fn refusal(&self) -> Option<ErrorData> {
+        let (state_path, label) = self.first_masked.as_ref()?;
+        Some(invalid(
+            state_path.as_str(),
+            format!(
+                "{label} holds the masked value {REDACTED_VALUE} from save_state; a masked save cannot be restored"
+            ),
+            "load_state needs the real values: save_state replies mask every cookie and storage value, so pass values you hold yourself or leave the masked entries out",
+        ))
+    }
+
+    fn masked(state_path: String, kind: &str, entry: &Value) -> Self {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Self {
+            first_masked: Some((state_path, format!("{kind} {name:?}"))),
+        }
+    }
+
+    /// A value the masker wrote: the exact mask text, or the mask flag.
+    fn is_masked(entry: &Value) -> bool {
+        entry.get("value").and_then(Value::as_str) == Some(REDACTED_VALUE)
+            || entry.get(VALUE_REDACTED_FIELD).and_then(Value::as_bool) == Some(true)
+    }
+
+    fn list<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[path = "load_state_values_table_2396.rs"]
+mod load_state_values_table_2396;

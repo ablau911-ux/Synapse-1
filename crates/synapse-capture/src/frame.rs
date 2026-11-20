@@ -54,6 +54,20 @@ pub struct CapturedBgraBitmap {
     pub bytes: Vec<u8>,
 }
 
+/// A cropped rectangle of [`CapturedBgraBitmap`] pixels.
+///
+/// `region` is the clamped screen-space rect the bytes actually cover: when
+/// the requested rect extends past the bitmap, the crop is clipped, and word
+/// anchoring must use this rect — not the caller's unclamped request — or
+/// OCR boxes misproject by the clip delta.
+#[derive(Clone, Debug)]
+pub struct CroppedBgraBitmap {
+    pub region: Rect,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CapturedWindowBgraBitmap {
     pub bitmap: CapturedBgraBitmap,

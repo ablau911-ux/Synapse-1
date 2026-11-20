@@ -34,7 +34,7 @@ Counts below are `#[test]` + `#[tokio::test]` occurrences summed across each cra
 
 | Crate | ~`#[test]`/`#[tokio::test]` | Notable test files |
 |---|---|---|
-| `synapse-mcp` | ~860 | `src/local_agent.rs` (58), `src/m4.rs` (123), `src/chrome_debugger_bridge.rs` (31), `src/http/transport.rs` (29), `src/server/context.rs` (24), `src/m2/type_text.rs` (24), `src/m1.rs` (22), `src/server/agent_control/tests.rs` (35), `src/server/escalation/tests.rs` (21); plus ~50 `tests/*.rs` integration files (see §4) |
+| `synapse-mcp` | ~860 | `src/local_agent.rs` (58), `src/m4.rs` (123), `src/chrome_debugger_bridge.rs` (31), `src/http/transport.rs` (29), `src/server/context.rs` (24), `src/m2/type_text.rs` (24), `src/m1.rs` (22), `src/server/agent_control/tests.rs` (35), `src/server/escalation/tests.rs` (21), `src/server/everquest_autocombat.rs` (20); plus ~50 `tests/*.rs` integration files (see §4) |
 | `synapse-action` | ~155 | `tests/session_inputs.rs` (8), `tests/mouse_stroke.rs` (8), `tests/emitter_state.rs` (7), `src/rate_limit.rs` (8), `src/lease.rs` (13), `src/backend/vigem/tests.rs` (9), `src/backend/software/mouse.rs` (9), `src/invoke/tests.rs` (11) |
 | `synapse-core` | ~115 | `tests/action_serde_proptest.rs` (18), `tests/types.rs` (13), `tests/snapshots.rs` (7), `src/episodes.rs` (15), `src/types/agent_cost.rs` (13), `src/routines.rs` (12), `src/intent.rs` (10) |
 | `synapse-a11y` | ~120 | `src/tests.rs` (23), `src/cdp_action.rs` (19), `src/cdp_network.rs` (19), `src/cdp_dom.rs` (11), `tests/uwp_snapshot_regression.rs` (1, `#[ignore]`) |
@@ -45,6 +45,7 @@ Counts below are `#[test]` + `#[tokio::test]` occurrences summed across each cra
 | `synapse-models` | ~13 | `tests/model_loader.rs` (13) |
 | `synapse-audio` | ~22 | `tests/ring_detectors.rs` (5), `tests/direction.rs` (4), `tests/stt.rs` (3), `tests/runtime_scaffold.rs` (3) |
 | `synapse-capture` | ~22 | `src/tests.rs` (14), `src/platform/windows/bitmap.rs` (7) |
+| `synapse-everquest` | ~24 | `src/log.rs` (11), `src/map.rs` (6), `src/zone_graph.rs` (5), `tests/map_inventory.rs` (2) |
 | `synapse-telemetry` | ~7 | `src/metrics.rs` (3), `tests/file_sink.rs` (2), `tests/periodic_gc.rs` (1), `tests/periodic_gc_size_cap.rs` (1) |
 | `synapse-test-utils` | ~11 | `src/fixtures.rs` (10) — self-tests of the Notepad selection logic |
 | `synapse-overlay` | ~1 | `src/main.rs` (1) |
@@ -62,14 +63,14 @@ Totals are derived from the `Grep` per-file counts; treat as approximate. Per-cr
 | **End-to-end (e2e)** | Spawn the real `synapse-mcp` binary over stdio and drive it via JSON-RPC. | `StdioMcpClient` in `crates/synapse-test-utils/src/stdio_mcp_client.rs`; ~45 callers (see §4) | use of `StdioMcpClient` |
 | **Property tests** | `proptest`-style round-trip / invariant tests. | `synapse-core/tests/action_serde_proptest.rs`, `synapse-action/tests/dynamics_*_proptest.rs`, `synapse-storage/tests/compaction_ttl_proptest.rs` | `*proptest*` filenames |
 | **Snapshot/regression** | Golden snapshots and regression guards. | `crates/synapse-mcp/tests/snapshots/*.snap`, `*_regression.rs` (a11y/perception) | `.snap` files, `regression` in name |
-| **Manual FSV** | NOT a Rust test category — see §3.1. | docs + agent-run acceptance runbook | "FSV" references |
+| **Manual FSV** | NOT a Rust test category — see §3.1. | docs + operator runbook | "FSV" references |
 
 ### 3.1 What "FSV" means here
 
-**FSV = Full State Verification** (also written "Full State Verification (FSV)" in `CONTRIBUTING.md`). It is the project's **manual acceptance gate performed by the agent** on the configured Windows host — *not* an automated test type. Key points from source:
+**FSV = Full State Verification** (also written "Full State Verification (FSV)" in `CONTRIBUTING.md`). It is the project's **manual, human-at-the-machine acceptance gate** on the configured Windows host — *not* an automated test type. Key points from source:
 
 - `CONTRIBUTING.md` §4: "the project uses manual Full State Verification (FSV) on the configured Windows host as the shipping gate ... Automated tests are supporting evidence, not a substitute for verifying real behavior."
-- `docs/foreground-capability-acceptance-runbook.md` is "the **manual acceptance runbook** ... explicitly *not* an automated FSV harness." It directs the agent to trigger via the real wired MCP client, then read the Source-of-Truth (SoT) with a separate operation — "Do not use any script, helper client, or harness as acceptance."
+- `docs/foreground-capability-acceptance-runbook.md` is "the **manual acceptance runbook** ... explicitly *not* an automated FSV harness." It directs the operator to trigger via the real wired MCP client, then read the Source-of-Truth (SoT) with a separate operation — "Do not use any script, helper client, or harness as acceptance."
 - `manual-fsv-tmp/` is a gitignored scratch dir (`.gitignore` line 63: `/manual-fsv-tmp/`).
 - `manual_fsv` / `minimum_manual_fsv` also appear as **data fields** in curated profile manifests (`crates/synapse-profiles/tests/fixtures/profile_registry/.../*.toml`, key `curated.minimum_manual_fsv`) and the `profile_quality` tool (`manual_fsv_evidence_ref`). These record the minimal manual-FSV checklist a curated profile must pass; the Rust tests only assert that these fields exist/parse, not that FSV was performed.
 

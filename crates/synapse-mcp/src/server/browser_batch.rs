@@ -145,12 +145,6 @@ impl SynapseService {
             }
 
             steps_run += 1;
-            let mutates = browser_batch_action_mutates(&step.action);
-            if mutates {
-                super::operator_panic_boundary::ensure_mcp_mutation(
-                    "browser_batch_before_mutating_step",
-                )?;
-            }
             let outcome = self
                 .browser_batch_dispatch(
                     &step.action,
@@ -159,13 +153,6 @@ impl SynapseService {
                     &request_context,
                 )
                 .await;
-            let outcome = match outcome {
-                Ok(result) if mutates => super::operator_panic_boundary::ensure_mcp_mutation(
-                    "browser_batch_after_mutating_step",
-                )
-                .map(|()| result),
-                other => other,
-            };
             match outcome {
                 Ok(result) => {
                     steps_succeeded += 1;
@@ -352,20 +339,6 @@ impl SynapseService {
             )),
         }
     }
-}
-
-fn browser_batch_action_mutates(action: &str) -> bool {
-    matches!(
-        action,
-        "navigate"
-            | "click"
-            | "set_value"
-            | "fill_form"
-            | "file_upload"
-            | "scroll_into_view"
-            | "evaluate"
-            | "screenshot"
-    )
 }
 
 fn browser_batch_parse<T: for<'de> Deserialize<'de>>(

@@ -4,7 +4,7 @@ use regex::Regex;
 use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::{ForegroundContext, error_codes};
+use synapse_core::{ForegroundContext, Rect, error_codes};
 
 use crate::{
     m1::mcp_error,
@@ -22,7 +22,6 @@ const DEFAULT_FOCUS_STABLE_MS: u32 = 75;
 #[serde(deny_unknown_fields)]
 pub struct ActFocusWindowParams {
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub hwnd: Option<i64>,
     #[serde(default)]
     pub title_regex: Option<String>,
@@ -96,19 +95,24 @@ const fn default_focus_stable_ms() -> u32 {
     DEFAULT_FOCUS_STABLE_MS
 }
 
-pub(crate) async fn act_focus_window_with_boundary(
+/// `recovery_proven`: the caller already proved this session holds an exact
+/// target claim for the requested window (and the foreground lease), so a
+/// missing prior foreground is a recoverable state rather than an error (#6).
+pub async fn act_focus_window(
     params: ActFocusWindowParams,
-    boundary: super::OperatorPanicActionBoundary,
+    recovery_proven: bool,
 ) -> Result<ActFocusWindowResponse, ErrorData> {
+    #[cfg(test)]
+    refuse_forbidden_activation_for_test(&params)?;
     let started = Instant::now();
     validate_focus_window_params(&params)?;
     let requested = requested_target(&params)?;
     let target_readback = target_readback(&requested);
 
-    let before = synapse_a11y::current_foreground_context()
-        .map_err(|error| a11y_error_to_focus_mcp("before_foreground_read", error, None))?;
+    let before =
+        before_foreground_for_focus(synapse_a11y::current_foreground_context(), recovery_proven)?;
     let matched = resolve_focus_target(&requested)?;
-    let activation = activate_focus_window_once(&before, &matched, boundary)?;
+    let activation = activate_focus_window_once(&before, &matched)?;
     let verification = verify_focus_window(&params, &matched, &target_readback, activation).await?;
     let before_signature = hash_json(&before)?;
     let after_signature = hash_json(&verification.after)?;
@@ -159,6 +163,65 @@ pub(crate) async fn act_focus_window_with_boundary(
     })
 }
 
+/// #258 test seam: HWNDs whose activation tests forbid. A focus request for one
+/// fails `ACTION_TARGET_INVALID` before any OS read or activation, so a test can
+/// drive the real focus route past its gates without moving the owner's
+/// foreground. Not behaviour of any fix: nothing outside tests registers HWNDs.
+#[cfg(test)]
+fn forbidden_activations() -> &'static std::sync::Mutex<std::collections::BTreeSet<i64>> {
+    static FORBIDDEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<i64>>> =
+        std::sync::OnceLock::new();
+    FORBIDDEN.get_or_init(Default::default)
+}
+
+/// #258 test seam: forbids activating `hwnd` until the guard drops.
+#[cfg(test)]
+pub(crate) struct ForbiddenActivationGuard {
+    hwnd: i64,
+}
+
+#[cfg(test)]
+impl Drop for ForbiddenActivationGuard {
+    fn drop(&mut self) {
+        forbidden_activations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.hwnd);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn forbid_activation_for_test(hwnd: i64) -> ForbiddenActivationGuard {
+    forbidden_activations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(hwnd);
+    ForbiddenActivationGuard { hwnd }
+}
+
+#[cfg(test)]
+fn refuse_forbidden_activation_for_test(params: &ActFocusWindowParams) -> Result<(), ErrorData> {
+    let Some(hwnd) = params.hwnd else {
+        return Ok(());
+    };
+    let forbidden = forbidden_activations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&hwnd);
+    if forbidden {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!("{FORBIDDEN_ACTIVATION_MESSAGE} 0x{hwnd:x}"),
+        ));
+    }
+    Ok(())
+}
+
+/// #258 test seam: message prefix of a forbidden-activation refusal.
+#[cfg(test)]
+pub(crate) const FORBIDDEN_ACTIVATION_MESSAGE: &str =
+    "g258 test seam: activation forbidden for HWND";
+
 pub fn act_focus_window_request_details(params: &ActFocusWindowParams) -> Value {
     json!({
         "source_of_truth": SOURCE_OF_TRUTH,
@@ -176,6 +239,50 @@ pub fn act_focus_window_target_hwnd(params: &ActFocusWindowParams) -> Result<i64
     validate_focus_window_params(params)?;
     let requested = requested_target(params)?;
     Ok(resolve_focus_target(&requested)?.hwnd)
+}
+
+/// Interprets the pre-activation foreground read. With a proven exact-claim
+/// recovery, "no foreground window at all" (`A11Y_NO_FOREGROUND`) is exactly the
+/// state this tool exists to repair, so it reads back as an hwnd-0 placeholder
+/// and activation proceeds; the chosen HWND is still verified afterwards.
+/// Without that proof, and for every other read error, the call fails closed.
+fn before_foreground_for_focus(
+    read: Result<ForegroundContext, synapse_a11y::A11yError>,
+    recovery_proven: bool,
+) -> Result<ForegroundContext, ErrorData> {
+    match read {
+        Ok(context) => Ok(context),
+        Err(synapse_a11y::A11yError::NoForeground { .. }) if recovery_proven => {
+            Ok(missing_foreground_context())
+        }
+        Err(error) => Err(a11y_error_to_focus_mcp(
+            "before_foreground_read",
+            error,
+            None,
+        )),
+    }
+}
+
+fn missing_foreground_context() -> ForegroundContext {
+    ForegroundContext {
+        hwnd: 0,
+        pid: 0,
+        process_name: String::new(),
+        process_path: String::new(),
+        window_title: String::new(),
+        window_bounds: Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        },
+        monitor_index: 0,
+        dpi_scale: 1.0,
+        profile_id: None,
+        steam_appid: None,
+        is_fullscreen: false,
+        is_dwm_composed: false,
+    }
 }
 
 fn validate_focus_window_params(params: &ActFocusWindowParams) -> Result<(), ErrorData> {
@@ -224,7 +331,12 @@ fn requested_target(params: &ActFocusWindowParams) -> Result<RequestedFocusTarge
         ));
     }
     if let Some(hwnd) = params.hwnd {
-        let hwnd = crate::m1::validate_hwnd_shape(TOOL, "hwnd", hwnd)?;
+        if hwnd == 0 {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{TOOL} hwnd must be non-zero"),
+            ));
+        }
         return Ok(RequestedFocusTarget::Hwnd(hwnd));
     }
     if let Some(pid) = params.pid {
@@ -408,19 +520,26 @@ async fn verify_focus_window(
 fn activate_focus_window_once(
     before: &ForegroundContext,
     matched: &ForegroundContext,
-    boundary: super::OperatorPanicActionBoundary,
+) -> Result<FocusActivation, ErrorData> {
+    activate_focus_window_once_with(before, matched, |hwnd| {
+        synapse_a11y::focus_window_with_intent(
+            hwnd,
+            synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
+        )
+    })
+}
+
+fn activate_focus_window_once_with(
+    before: &ForegroundContext,
+    matched: &ForegroundContext,
+    activate: impl FnOnce(i64) -> synapse_a11y::A11yResult<()>,
 ) -> Result<FocusActivation, ErrorData> {
     let plan = focus_activation_plan(before.hwnd, matched.hwnd);
     if plan.attempts == 0 {
         return Ok(plan);
     }
 
-    boundary.ensure("immediately_before_focus_window_with_intent")?;
-    synapse_a11y::focus_window_with_intent(
-        matched.hwnd,
-        synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
-    )
-    .map_err(|error| {
+    activate(matched.hwnd).map_err(|error| {
         a11y_error_to_focus_mcp(
             "set_foreground_window",
             error,
@@ -457,6 +576,7 @@ fn postcondition_verified_state(
     detail: impl Into<String>,
 ) -> ActPostcondition {
     ActPostcondition {
+        related_window_observed: None,
         status: "verified_state".to_owned(),
         observed_delta: Some(changed),
         source_of_truth: Some(SOURCE_OF_TRUTH.to_owned()),
@@ -523,17 +643,35 @@ fn a11y_error_to_focus_mcp(
         detail = %error,
         "act_focus_window a11y operation failed"
     );
+    // #9: an activation refusal (lock screen / Windows foreground lock) is
+    // transient and delivered nothing: mark it retryable and keep the target.
+    let deferral = (operation == "set_foreground_window"
+        && matches!(
+            error,
+            synapse_a11y::A11yError::ForegroundActivationRefused { .. }
+        ))
+    .then(|| {
+        let target_hwnd = prior_readback
+            .as_ref()
+            .and_then(|prior| prior.pointer("/matched_window/hwnd"))
+            .and_then(Value::as_i64);
+        (synapse_a11y::workstation_locked(), target_hwnd)
+    });
+    let mut data = json!({
+        "code": code,
+        "tool": TOOL,
+        "operation": operation,
+        "source_of_truth": SOURCE_OF_TRUTH,
+        "detail": error.to_string(),
+        "prior_readback": prior_readback,
+    });
+    if let Some((lock_screen, target_hwnd)) = deferral {
+        super::foreground_deferral::mark_deferred(&mut data, lock_screen, target_hwnd);
+    }
     ErrorData::new(
         ErrorCode(-32099),
         format!("{TOOL} {operation} failed: {error}"),
-        Some(json!({
-            "code": code,
-            "tool": TOOL,
-            "operation": operation,
-            "source_of_truth": SOURCE_OF_TRUTH,
-            "detail": error.to_string(),
-            "prior_readback": prior_readback,
-        })),
+        Some(data),
     )
 }
 
@@ -629,3 +767,15 @@ fn window_summaries(contexts: &[ForegroundContext]) -> Vec<WindowSummary> {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "tests/focus_window_no_foreground_6.rs"]
+mod no_foreground_6;
+
+#[cfg(test)]
+#[path = "tests/focus_window_deferred_9.rs"]
+mod deferred_9;
+
+#[cfg(test)]
+#[path = "tests/focus_activation_deferral_9.rs"]
+mod focus_activation_deferral_9_tests;

@@ -142,4 +142,8 @@ pub struct ReflexStatus {
     pub exclusive: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_target: Option<super::StoredInputTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }

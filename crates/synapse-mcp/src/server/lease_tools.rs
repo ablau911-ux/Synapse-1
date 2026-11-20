@@ -21,7 +21,7 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_action::{LeaseError, LeaseOutcome, LeaseStatus, lease};
+use synapse_action::{LeaseOutcome, LeaseStatus, lease};
 use synapse_core::error_codes;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -58,10 +58,11 @@ const fn default_lease_ttl_ms() -> u64 {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLeaseResponse {
-    /// One of: `acquired`, `renewed`, `released`, `not_held`, `status`.
-    /// `not_held` is an idempotent release of a lease this session did not
-    /// hold (already expired or never acquired) — a success, not a failure.
+    /// One of: `acquired`, `renewed`, `released`, `status`.
     pub outcome: String,
+    /// For release replies, whether the lease was already unheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub already_released: Option<bool>,
     /// Whether the lease is currently held by anyone.
     pub held: bool,
     /// The session id of the current holder, if any.
@@ -70,15 +71,6 @@ pub struct ControlLeaseResponse {
     pub this_session_id: String,
     /// Whether the calling session is the current holder.
     pub is_owner: bool,
-    /// Release outcomes only (#1556): whether this call actually released a
-    /// lease. `false` on an idempotent no-op release of an unheld lease.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub released: Option<bool>,
-    /// Release outcomes only (#1556): whether a lease owned by this session was
-    /// held at release time. `false` when the lease had already expired or was
-    /// never acquired.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub was_held: Option<bool>,
     pub acquired_at_ms_ago: Option<u64>,
     pub renewed_at_ms_ago: Option<u64>,
     pub ttl_ms: Option<u64>,
@@ -116,12 +108,11 @@ impl ControlLeaseResponse {
         let is_owner = status.owner_session_id.as_deref() == Some(this_session_id.as_str());
         Self {
             outcome: outcome.to_owned(),
+            already_released: None,
             held: status.held,
             owner_session_id: status.owner_session_id.clone(),
             this_session_id,
             is_owner,
-            released: None,
-            was_held: None,
             acquired_at_ms_ago: status.acquired_at_ms_ago,
             renewed_at_ms_ago: status.renewed_at_ms_ago,
             ttl_ms: status.ttl_ms,
@@ -129,27 +120,15 @@ impl ControlLeaseResponse {
         }
     }
 
-    /// Readback for a release that actually freed a lease this session held.
-    fn released(this_session_id: String, status: &LeaseStatus) -> Self {
-        let mut response = Self::from_status("released", this_session_id, status);
-        response.released = Some(true);
-        response.was_held = Some(true);
-        response
-    }
-
-    /// Readback for an idempotent no-op release (#1556): the session held no
-    /// lease (already expired or never acquired), so nothing was freed. The
-    /// physical truth — lease unheld, nobody owns it — is stated explicitly.
-    fn release_noop(this_session_id: String) -> Self {
-        let mut response = Self::from_status("not_held", this_session_id, &LeaseStatus::unheld());
-        response.released = Some(false);
-        response.was_held = Some(false);
-        response
+    /// Whether this release reply freed a lease the caller held (#2325): an
+    /// `already_released` success is not a release by this call.
+    const fn released_by_this_call(&self) -> bool {
+        matches!(self.already_released, Some(false))
     }
 }
 
-const DASHBOARD_LEASE_SOURCE_OF_TRUTH: &str =
-    "synapse_action::lease + CF_KV MCP session lease rows + CF_AGENT_EVENTS + CF_ACTION_LOG";
+pub(crate) const DASHBOARD_LEASE_SOURCE_OF_TRUTH: &str =
+    "synapse_action::lease + CF_SESSIONS MCP session lease rows + CF_AGENT_EVENTS + CF_ACTION_LOG";
 pub(super) const LEASE_TTL_SOURCE_OF_TRUTH: &str =
     "request ttl_ms before synapse_action::lease mutation";
 
@@ -168,175 +147,138 @@ impl SynapseService {
             kind = "control_lease_acquire",
             "tool.invocation kind=control_lease_acquire"
         );
+        let session_id = require_lease_session_id(&request_context)?;
+        validate_lease_ttl_ms("control_lease_acquire", params.0.ttl_ms)?;
+        let mut promotion = super::act_foreground_slot::lock_lease_promotion(&session_id).await;
+        let admission = super::act_foreground_slot::admit_session_operation(
+            &session_id,
+            "control_lease_acquire",
+        );
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
+        // The promotion gate prevents fence claims/unwind between the owner
+        // check, audited acquire, and promotion; the transition gate excludes
+        // concurrent lease mutations throughout that same transaction.
+        let hold = match admission {
+            Ok(hold) => Some(hold),
+            Err(_)
+                if promotion.can_join()
+                    && lease::status().owner_session_id.as_deref() == Some(session_id.as_str()) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let result = self.control_lease_acquire_locked(params.0, &session_id);
+        if result.is_ok() && hold.is_none() {
+            promotion.promote();
+        }
+        result
+    }
+
+    /// Acquire/renew without the in-flight foreground-escalation guard; used
+    /// by the escalation itself.
+    pub(super) async fn control_lease_acquire_inner(
+        &self,
+        params: Parameters<ControlLeaseAcquireParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
         let params = params.0;
         validate_lease_ttl_ms("control_lease_acquire", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
-        let operator_panic_epoch_at_entry =
-            arm_control_lease_operator_panic_gate("control_lease_acquire", &session_id)?;
-        let authority_gate = self.lock_session_authority(&session_id).await;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_acquire",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_authority_gate_wait",
-        )?;
-        let _authority_gate = authority_gate?;
-        self.reject_terminated_session_tool_call("control_lease_acquire", &session_id)?;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_acquire",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_session_validation_before_mutation",
-        )?;
-        self.control_lease_acquire_authority_locked(params, session_id)
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
+        self.control_lease_acquire_locked(params, &session_id)
     }
 
-    /// Internal transaction step for callers that already hold this session's
-    /// authority gate (notably `act operation=foreground`).
-    pub(super) fn control_lease_acquire_authority_locked(
+    fn control_lease_acquire_locked(
         &self,
         params: ControlLeaseAcquireParams,
-        session_id: String,
+        session_id: &str,
     ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
-        self.restore_session_lease_if_needed(&session_id)?;
-        let command_payload = json!({ "ttl_ms": params.ttl_ms });
-        let command_before = json!({
+        self.restore_session_lease_if_needed(session_id)?;
+        let mut command = lease_acquire_audit(session_id, params.ttl_ms);
+        self.command_audit_intent(command.clone())?;
+        let (response, converted_from_auto) =
+            acquire_lease_for_session_tracked(session_id, params.ttl_ms)
+                .map_err(|error| self.audit_lease_acquire_failure(command.clone(), error, None))?;
+        self.persist_acquired_lease(session_id, &response, converted_from_auto)
+            .map_err(|(error, released)| {
+                self.audit_lease_acquire_failure(command.clone(), error, Some(released))
+            })?;
+        command.outcome = "ok";
+        command.after = json!({
             "source_of_truth": "synapse_action::lease",
-            "caller": lease_status_for_session(&session_id),
+            "response": &response,
+            "caller": lease_status_for_session(session_id),
         });
-        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
-            "control_lease_acquire",
-            "lease_acquire",
-            Some(session_id.clone()),
-            Some(session_id.clone()),
-            command_payload.clone(),
-            command_before.clone(),
-            Value::Null,
-            "pending",
-        ))?;
-        let response = match acquire_lease_for_session(&session_id, params.ttl_ms) {
-            Ok(response) => response,
-            Err(error) => {
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "control_lease_acquire",
-                        "lease_acquire",
-                        Some(session_id.clone()),
-                        Some(session_id.clone()),
-                        command_payload,
-                        command_before,
-                        json!({
-                            "source_of_truth": "synapse_action::lease",
-                            "caller": lease_status_for_session(&session_id),
-                        }),
-                        "error",
-                    )
-                    .with_error(
-                        super::command_audit::command_audit_error_from_error_data(&error),
-                    ),
-                )?;
-                return Err(error);
+        if let Err(error) = self.command_audit_final(command) {
+            if converted_from_auto {
+                let _restored = lease::restore_auto_if_owner(session_id);
+            } else if response.outcome == "acquired" {
+                let _released = self.rollback_unacknowledged_lease(session_id);
             }
-        };
+            return Err(error);
+        }
+        Ok(Json(response))
+    }
+
+    fn persist_acquired_lease(
+        &self,
+        session_id: &str,
+        response: &ControlLeaseResponse,
+        converted_from_auto: bool,
+    ) -> Result<(), (ErrorData, bool)> {
         let status = lease::status();
-        if let Err(error) = self.persist_session_lease(&session_id, &status) {
-            let released = lease::release_if_owner(&session_id);
+        let persist_result = if response.outcome == "acquired" {
+            self.persist_session_lease_with_acquisition_event(session_id, &status)
+        } else {
+            self.persist_session_lease(session_id, &status)
+        };
+        if let Err(error) = persist_result {
+            let restored_to_action =
+                converted_from_auto && lease::restore_auto_if_owner(session_id);
+            let released = response.outcome == "acquired"
+                && !converted_from_auto
+                && lease::release_if_owner(session_id);
             tracing::error!(
                 code = error_codes::TOOL_INTERNAL_ERROR,
                 session_id,
                 released_after_persist_failure = released,
+                restored_to_action,
                 error = ?error,
-                "input lease acquire failed durability write; released in-memory lease before returning error"
+                "input lease durability write failed; rolled back only this acquisition"
             );
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "control_lease_acquire",
-                    "lease_acquire",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": "synapse_action::lease",
-                        "released_after_persist_failure": released,
-                        "caller": lease_status_for_session(&session_id),
-                    }),
-                    "error",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&error),
-                ),
-            )?;
-            return Err(error);
+            return Err((error, released));
         }
-        // Journal first-time acquisitions (#897); renewals happen on every
-        // leased action and would flood the journal without adding signal.
-        // An acquisition that cannot be journaled is rolled back the same
-        // way as a persist failure: control-plane state must stay auditable.
-        if response.outcome == "acquired"
-            && let Err(journal_error) = self.journal_lease_event(
-                synapse_core::AgentEventKind::LeaseAcquired,
-                &session_id,
-                None,
-                status.ttl_ms,
-            )
-        {
-            let released = lease::release_if_owner(&session_id);
-            let persisted_row_deleted = self.delete_persisted_session_lease(&session_id).is_ok();
-            tracing::error!(
-                code = error_codes::TOOL_INTERNAL_ERROR,
-                session_id,
-                released_after_journal_failure = released,
-                persisted_row_deleted,
-                error = ?journal_error,
-                "input lease acquire could not journal its agent event; rolled the acquisition back"
-            );
-            let tool_error = super::agent_events::agent_event_tool_error(
-                "control_lease_acquire",
-                &journal_error,
-                false,
-            );
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "control_lease_acquire",
-                    "lease_acquire",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": "synapse_action::lease",
-                        "released_after_journal_failure": released,
-                        "persisted_row_deleted": persisted_row_deleted,
-                        "caller": lease_status_for_session(&session_id),
-                    }),
-                    "error",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&tool_error),
-                ),
-            )?;
-            return Err(tool_error);
+        Ok(())
+    }
+
+    fn audit_lease_acquire_failure(
+        &self,
+        mut command: super::command_audit::CommandAuditInput,
+        error: ErrorData,
+        released: Option<bool>,
+    ) -> ErrorData {
+        command.outcome = "error";
+        command.after = json!({
+            "source_of_truth": "synapse_action::lease",
+            "caller": command.actor_session_id.as_deref().map(lease_status_for_session),
+        });
+        if let Some(released) = released {
+            command.after["released_after_persist_failure"] = json!(released);
         }
-        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
-            "control_lease_acquire",
-            "lease_acquire",
-            Some(session_id.clone()),
-            Some(session_id.clone()),
-            command_payload,
-            command_before,
-            json!({
-                "source_of_truth": "synapse_action::lease",
-                "response": &response,
-                "caller": lease_status_for_session(&session_id),
-            }),
-            "ok",
-        ))?;
-        Ok(Json(response))
+        let command = command.with_error(
+            super::command_audit::command_audit_error_from_error_data(&error),
+        );
+        match self.command_audit_final(command) {
+            Ok(_) => error,
+            Err(audit_error) => audit_error,
+        }
     }
 
     #[tool(
-        description = "Release the input lease held by this MCP session. Idempotent: releasing a lease this session does not hold (already expired or never acquired) succeeds with outcome=not_held (released=false, was_held=false), not an error. Errors with ACTION_FOREGROUND_LEASE_NOT_HELD only when the lease is currently held by a DIFFERENT session.",
+        description = "Release the input lease held by this MCP session. An unheld or expired lease returns success with already_released=true. If another session holds the lease, returns ACTION_FOREGROUND_LEASE_NOT_HELD with the holder.",
         input_schema = empty_input_schema()
     )]
     pub async fn control_lease_release(
@@ -349,32 +291,27 @@ impl SynapseService {
             "tool.invocation kind=control_lease_release"
         );
         let session_id = require_lease_session_id(&request_context)?;
-        let operator_panic_epoch_at_entry =
-            arm_control_lease_operator_panic_gate("control_lease_release", &session_id)?;
-        let authority_gate = self.lock_session_authority(&session_id).await;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_release",
+        let _hold = super::act_foreground_slot::admit_session_operation(
             &session_id,
-            operator_panic_epoch_at_entry,
-            "after_authority_gate_wait",
-        )?;
-        let _authority_gate = authority_gate?;
-        self.reject_terminated_session_tool_call("control_lease_release", &session_id)?;
-        ensure_control_lease_operator_panic_not_observed(
             "control_lease_release",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_session_validation_before_mutation",
         )?;
-        self.control_lease_release_authority_locked(session_id)
+        let mut _physically_released = false;
+        self.control_lease_release_inner(request_context, &mut _physically_released)
+            .await
     }
 
-    /// Internal transaction step for callers that already hold this session's
-    /// authority gate (notably `act operation=foreground`).
-    pub(super) fn control_lease_release_authority_locked(
+    /// Release without the in-flight foreground-escalation guard; used by the
+    /// escalation's unwind. `physically_released` is set once the in-memory
+    /// lease release commits, so a caller can tell a later reconcile/audit
+    /// failure apart from a release that never happened.
+    pub(super) async fn control_lease_release_inner(
         &self,
-        session_id: String,
+        request_context: RequestContext<RoleServer>,
+        physically_released: &mut bool,
     ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
+        let session_id = require_lease_session_id(&request_context)?;
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
         self.restore_session_lease_if_needed(&session_id)?;
         let command_payload = json!({});
         let command_before = json!({
@@ -392,7 +329,10 @@ impl SynapseService {
             "pending",
         ))?;
         let response = match release_lease_for_session(&session_id) {
-            Ok(response) => response,
+            Ok(response) => {
+                *physically_released = response.released_by_this_call();
+                response
+            }
             Err(error) => {
                 self.command_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
@@ -415,7 +355,9 @@ impl SynapseService {
                 return Err(error);
             }
         };
-        if let Err(error) = self.delete_persisted_session_lease(&session_id) {
+        if let Err(error) =
+            reconcile_lease_release_after_mutation(self, &session_id, "explicit_release")
+        {
             self.command_audit_final(
                 super::command_audit::CommandAuditInput::mcp(
                     "control_lease_release",
@@ -436,37 +378,6 @@ impl SynapseService {
                 ),
             )?;
             return Err(error);
-        }
-        // The release is already committed; a journal failure is surfaced
-        // with that context instead of pretending the release failed.
-        if let Err(error) = self.journal_lease_event(
-            synapse_core::AgentEventKind::LeaseReleased,
-            &session_id,
-            None,
-            None,
-        ) {
-            let tool_error =
-                super::agent_events::agent_event_tool_error("control_lease_release", &error, true);
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "control_lease_release",
-                    "lease_release",
-                    Some(session_id.clone()),
-                    Some(session_id.clone()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": "synapse_action::lease",
-                        "response": &response,
-                        "caller": lease_status_for_session(&session_id),
-                    }),
-                    "error",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&tool_error),
-                ),
-            )?;
-            return Err(tool_error);
         }
         self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
             "control_lease_release",
@@ -501,29 +412,21 @@ impl SynapseService {
         let params = params.0;
         validate_lease_ttl_ms("control_lease_handoff", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
+        let _hold = super::act_foreground_slot::admit_session_operation(
+            &session_id,
+            "control_lease_handoff",
+        )?;
+        // A handoff to a session whose escalation is in flight would land a
+        // lease that escalation then misreads as pre-existing.
+        let _hold_recipient = super::act_foreground_slot::admit_session_operation(
+            &params.to_session,
+            "control_lease_handoff",
+        )?;
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
+        self.restore_session_lease_if_needed(&session_id)?;
         let to_session = params.to_session;
         self.ensure_handoff_recipient_live(&session_id, &to_session)?;
-        let operator_panic_epoch_at_entry =
-            arm_control_lease_operator_panic_gate("control_lease_handoff", &session_id)?;
-        let authority_gates = self
-            .lock_session_authorities(&[&session_id, &to_session])
-            .await;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_handoff",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_authority_gate_wait",
-        )?;
-        let _authority_gates = authority_gates?;
-        self.reject_terminated_session_tool_call("control_lease_handoff", &session_id)?;
-        self.reject_terminated_session_tool_call("control_lease_handoff", &to_session)?;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_handoff",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_session_validation_before_mutation",
-        )?;
-        self.restore_session_lease_if_needed(&session_id)?;
         let command_payload = json!({
             "to_session": &to_session,
             "ttl_ms": params.ttl_ms,
@@ -570,38 +473,41 @@ impl SynapseService {
         };
         let response =
             ControlLeaseResponse::from_status("handed_off", session_id.clone(), &handoff.current);
-        let persist_readback =
-            match self.persist_session_lease_handoff(&session_id, &to_session, &handoff.current) {
-                Ok(readback) => readback,
-                Err(error) => {
-                    self.rollback_handoff_after_persist_failure(
-                        &session_id,
-                        &to_session,
-                        &handoff.prior,
-                        &error,
-                    );
-                    self.command_audit_final(
-                        super::command_audit::CommandAuditInput::mcp(
-                            "control_lease_handoff",
-                            "lease_handoff",
-                            Some(session_id.clone()),
-                            Some(to_session.clone()),
-                            command_payload,
-                            command_before,
-                            json!({
-                                "source_of_truth": "synapse_action::lease",
-                                "from": lease_status_for_session(&session_id),
-                                "to": lease_status_for_session(&to_session),
-                            }),
-                            "error",
-                        )
-                        .with_error(
-                            super::command_audit::command_audit_error_from_error_data(&error),
-                        ),
-                    )?;
-                    return Err(error);
-                }
-            };
+        let persist_readback = match self.persist_session_lease_handoff_with_events(
+            &session_id,
+            &to_session,
+            &handoff.current,
+        ) {
+            Ok(readback) => readback,
+            Err(error) => {
+                self.rollback_handoff_after_persist_failure(
+                    &session_id,
+                    &to_session,
+                    &handoff.prior,
+                    &error,
+                );
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "control_lease_handoff",
+                        "lease_handoff",
+                        Some(session_id.clone()),
+                        Some(to_session.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": "synapse_action::lease",
+                            "from": lease_status_for_session(&session_id),
+                            "to": lease_status_for_session(&to_session),
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
         tracing::info!(
             code = "INPUT_LEASE_HANDOFF_COMMITTED",
             from_session_id = session_id,
@@ -613,36 +519,6 @@ impl SynapseService {
             to_row_session_id = ?persist_readback.to_row_session_id,
             "readback=input_lease edge=handoff_committed"
         );
-        // Handoff = one released + one acquired event, both tagged with the
-        // handoff reason so the journal reconstructs the transfer (#897).
-        // The handoff is already committed; journal failure surfaces as such.
-        if let Err(error) =
-            self.journal_lease_handoff_events(&session_id, &to_session, handoff.current.ttl_ms)
-        {
-            let tool_error =
-                super::agent_events::agent_event_tool_error("control_lease_handoff", &error, true);
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "control_lease_handoff",
-                    "lease_handoff",
-                    Some(session_id.clone()),
-                    Some(to_session.clone()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": "synapse_action::lease",
-                        "response": &response,
-                        "from": lease_status_for_session(&session_id),
-                        "to": lease_status_for_session(&to_session),
-                    }),
-                    "error",
-                )
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&tool_error),
-                ),
-            )?;
-            return Err(tool_error);
-        }
         self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
             "control_lease_handoff",
             "lease_handoff",
@@ -675,128 +551,27 @@ impl SynapseService {
             "tool.invocation kind=control_lease_status"
         );
         let session_id = require_lease_session_id(&request_context)?;
-        let operator_panic_epoch_at_entry =
-            arm_control_lease_operator_panic_gate("control_lease_status", &session_id)?;
-        let authority_gate = self.lock_session_authority(&session_id).await;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_status",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_authority_gate_wait",
-        )?;
-        let _authority_gate = authority_gate?;
-        self.reject_terminated_session_tool_call("control_lease_status", &session_id)?;
-        ensure_control_lease_operator_panic_not_observed(
-            "control_lease_status",
-            &session_id,
-            operator_panic_epoch_at_entry,
-            "after_session_validation_before_restore",
-        )?;
-        self.control_lease_status_authority_locked(session_id)
-    }
-
-    /// Status can restore a durable continuity row into process memory, so it
-    /// participates in the same authority transaction despite being a read in
-    /// the common case.
-    pub(super) fn control_lease_status_authority_locked(
-        &self,
-        session_id: String,
-    ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
         self.restore_session_lease_if_needed(&session_id)?;
         Ok(Json(lease_status_for_session(&session_id)))
     }
 }
 
-/// Arms raw lease-tool admission before it can wait on session authority. The
-/// physical operator panic control has precedence over every lease continuity
-/// restore or mutation, including status (which can restore a durable row).
-fn arm_control_lease_operator_panic_gate(
-    tool: &'static str,
-    session_id: &str,
-) -> Result<u64, ErrorData> {
-    let operator_panic_epoch_at_entry = synapse_action::operator_panic_epoch();
-    ensure_control_lease_operator_panic_not_observed(
-        tool,
-        session_id,
-        operator_panic_epoch_at_entry,
-        "before_authority_gate_wait",
-    )?;
-    Ok(operator_panic_epoch_at_entry)
-}
-
-fn ensure_control_lease_operator_panic_not_observed(
-    tool: &'static str,
-    session_id: &str,
-    operator_panic_epoch_at_entry: u64,
-    stage: &'static str,
-) -> Result<(), ErrorData> {
-    if super::operator_panic_boundary::is_mcp_request_guarded() {
-        super::operator_panic_boundary::ensure_mcp_mutation(stage)?;
-    }
-    let operator_panic = synapse_action::operator_panic_safety_readback();
-    control_lease_operator_panic_state_result(
-        tool,
-        session_id,
-        operator_panic_epoch_at_entry,
-        operator_panic.epoch,
-        operator_panic.pending,
-        stage,
+fn lease_acquire_audit(session_id: &str, ttl_ms: u64) -> super::command_audit::CommandAuditInput {
+    super::command_audit::CommandAuditInput::mcp(
+        "control_lease_acquire",
+        "lease_acquire",
+        Some(session_id.to_owned()),
+        Some(session_id.to_owned()),
+        json!({ "ttl_ms": ttl_ms }),
+        json!({
+            "source_of_truth": "synapse_action::lease",
+            "caller": lease_status_for_session(session_id),
+        }),
+        Value::Null,
+        "pending",
     )
-}
-
-fn control_lease_operator_panic_state_result(
-    tool: &'static str,
-    session_id: &str,
-    operator_panic_epoch_at_entry: u64,
-    operator_panic_epoch_after: u64,
-    operator_panic_safety_pending: bool,
-    stage: &'static str,
-) -> Result<(), ErrorData> {
-    if !operator_panic_safety_pending && operator_panic_epoch_after == operator_panic_epoch_at_entry
-    {
-        return Ok(());
-    }
-
-    let detail_code = match tool {
-        "control_lease_acquire" => "CONTROL_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED",
-        "control_lease_release" => "CONTROL_LEASE_RELEASE_OPERATOR_PANIC_PREARMED",
-        "control_lease_handoff" => "CONTROL_LEASE_HANDOFF_OPERATOR_PANIC_PREARMED",
-        "control_lease_status" => "CONTROL_LEASE_STATUS_OPERATOR_PANIC_PREARMED",
-        "dashboard_control_lease_force_release" => {
-            "DASHBOARD_CONTROL_LEASE_FORCE_RELEASE_OPERATOR_PANIC_PREARMED"
-        }
-        "dashboard_control_lease_handoff" => {
-            "DASHBOARD_CONTROL_LEASE_HANDOFF_OPERATOR_PANIC_PREARMED"
-        }
-        _ => "CONTROL_LEASE_OPERATOR_PANIC_PREARMED",
-    };
-    tracing::warn!(
-        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-        detail_code,
-        tool,
-        session_id,
-        stage,
-        operator_panic_epoch_at_entry,
-        operator_panic_epoch_after,
-        operator_panic_safety_pending,
-        "operator panic superseded a raw control-lease request before its authority transition"
-    );
-    Err(ErrorData::new(
-        ErrorCode(-32099),
-        format!("{tool} was superseded by the physical operator panic control"),
-        Some(json!({
-            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-            "detail_code": detail_code,
-            "tool": tool,
-            "session_id": session_id,
-            "stage": stage,
-            "operator_panic_epoch_at_entry": operator_panic_epoch_at_entry,
-            "operator_panic_epoch_after": operator_panic_epoch_after,
-            "operator_panic_safety_pending": operator_panic_safety_pending,
-            "source_of_truth": "synapse_action::operator_panic_epoch + operator_panic_outstanding",
-            "remediation": "the physical operator panic control supersedes this request; inspect operator-panic audit and retry only after the safety transaction is terminal and its lease state is understood",
-        })),
-    ))
 }
 
 pub(super) fn validate_lease_ttl_ms(tool: &'static str, ttl_ms: u64) -> Result<(), ErrorData> {
@@ -834,15 +609,18 @@ pub(super) fn validate_lease_ttl_ms(tool: &'static str, ttl_ms: u64) -> Result<(
     ))
 }
 
-/// Acquire/renew the lease for `session_id`. Contended → `ACTION_FOREGROUND_LEASE_BUSY`.
-/// Split out from the `#[tool]` method so the full outcome logic is unit-testable
-/// without constructing an MCP `RequestContext`.
-fn acquire_lease_for_session(
+/// Explicit acquire. The flag is `true` when the call took over a lease that
+/// the same session's foreground action had auto-acquired (#205): the action's
+/// guard will no longer release it, and the response reports a fresh
+/// `acquired` so the caller journals a `LeaseAcquired` for the new explicit
+/// hold instead of an unmatched row.
+fn acquire_lease_for_session_tracked(
     session_id: &str,
     ttl_ms: u64,
-) -> Result<ControlLeaseResponse, ErrorData> {
+) -> Result<(ControlLeaseResponse, bool), ErrorData> {
     let ttl = lease::ttl_from_ms(ttl_ms);
-    match lease::try_acquire(session_id, ttl) {
+    let (outcome, converted_from_auto) = lease::try_acquire_explicit(session_id, ttl);
+    match outcome {
         LeaseOutcome::Acquired(status) => {
             tracing::info!(
                 code = "INPUT_LEASE_ACQUIRED",
@@ -850,10 +628,21 @@ fn acquire_lease_for_session(
                 ttl_ms = status.ttl_ms,
                 "readback=input_lease outcome=acquired"
             );
-            Ok(ControlLeaseResponse::from_status(
-                "acquired",
-                session_id.to_owned(),
-                &status,
+            Ok((
+                ControlLeaseResponse::from_status("acquired", session_id.to_owned(), &status),
+                converted_from_auto,
+            ))
+        }
+        LeaseOutcome::Renewed(status) if converted_from_auto => {
+            tracing::info!(
+                code = "INPUT_LEASE_ACQUIRED",
+                session_id = %session_id,
+                ttl_ms = status.ttl_ms,
+                "readback=input_lease outcome=acquired takeover=action_auto_lease"
+            );
+            Ok((
+                ControlLeaseResponse::from_status("acquired", session_id.to_owned(), &status),
+                true,
             ))
         }
         LeaseOutcome::Renewed(status) => {
@@ -863,10 +652,9 @@ fn acquire_lease_for_session(
                 ttl_ms = status.ttl_ms,
                 "readback=input_lease outcome=renewed"
             );
-            Ok(ControlLeaseResponse::from_status(
-                "renewed",
-                session_id.to_owned(),
-                &status,
+            Ok((
+                ControlLeaseResponse::from_status("renewed", session_id.to_owned(), &status),
+                false,
             ))
         }
         LeaseOutcome::Busy {
@@ -903,40 +691,19 @@ fn acquire_lease_for_session(
 }
 
 fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, ErrorData> {
-    match lease::release(session_id) {
-        Ok(status) => {
-            tracing::info!(
-                code = "INPUT_LEASE_RELEASED",
-                session_id = %session_id,
-                "readback=input_lease outcome=released"
-            );
-            Ok(ControlLeaseResponse::released(
-                session_id.to_owned(),
-                &status,
-            ))
-        }
-        Err(error) => match &error {
-            // #1556: releasing an unheld/expired lease is the *expected* end
-            // state of a correct short-TTL client whose happy path outlived the
-            // lease (TTL max 30s). Make it idempotent: success with a physically
-            // honest readback (released=false, was_held=false, holder=null). The
-            // caller still audits it. Erroring here trained callers to swallow
-            // release errors, which masked the one case that matters below.
-            LeaseError::NotHeld { holder: None, .. } => {
-                tracing::info!(
-                    code = "INPUT_LEASE_RELEASE_NOOP",
-                    session_id = %session_id,
-                    "readback=input_lease outcome=not_held released=false was_held=false"
-                );
-                Ok(ControlLeaseResponse::release_noop(session_id.to_owned()))
-            }
-            // Held by a DIFFERENT live session — a real caller bug (releasing
-            // someone else's lease). Keep the hard fail-closed error.
-            LeaseError::NotHeld {
-                holder: Some(_), ..
-            } => Err(lease_not_held_error(session_id, &error)),
-        },
+    let (status, already_released) =
+        lease::release(session_id).map_err(|error| lease_not_held_error(session_id, &error))?;
+    if !already_released {
+        tracing::info!(
+            code = "INPUT_LEASE_RELEASED",
+            session_id = %session_id,
+            "readback=input_lease outcome=released"
+        );
     }
+    let mut response =
+        ControlLeaseResponse::from_status("released", session_id.to_owned(), &status);
+    response.already_released = Some(already_released);
+    Ok(response)
 }
 
 fn handoff_lease_for_session(
@@ -965,63 +732,33 @@ fn lease_status_for_session(session_id: &str) -> ControlLeaseResponse {
     ControlLeaseResponse::from_status("status", session_id.to_owned(), &status)
 }
 
+fn reconcile_lease_release_after_mutation(
+    service: &SynapseService,
+    session_id: &str,
+    reason_code: &str,
+) -> Result<(), ErrorData> {
+    let readback = super::session_continuity::reconcile_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+        reason_code,
+    )
+    .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, error))?;
+    // An absent row is not corruption (#94): auto-acquired foreground leases are
+    // never persisted/journaled, and a prior closer (orphan sweep, hotkey K2)
+    // already wrote the single balancing event and deleted the row. With no
+    // open journaled acquisition there is nothing to balance.
+    if !readback.release_event_written {
+        tracing::info!(
+            code = "MCP_SESSION_LEASE_RELEASE_NO_PERSISTED_ROW",
+            session_id,
+            reason_code,
+            "no persisted input lease lifecycle row to close"
+        );
+    }
+    Ok(())
+}
+
 impl SynapseService {
-    /// Journals one input-lease lifecycle event (#897).
-    fn journal_lease_event(
-        &self,
-        kind: synapse_core::AgentEventKind,
-        session_id: &str,
-        reason_code: Option<&str>,
-        ttl_ms: Option<u64>,
-    ) -> Result<(), synapse_storage::StorageError> {
-        let db = self
-            .m3_storage()
-            .map_err(|error| synapse_storage::StorageError::WriteFailed {
-                cf_name: synapse_storage::cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!("open storage for lease agent event: {}", error.message),
-            })?;
-        let mut record =
-            synapse_core::AgentEventRecord::new(super::agent_events::unix_time_ns_now(), kind);
-        record.session_id = Some(session_id.to_owned());
-        record.reason_code = reason_code.map(ToOwned::to_owned);
-        record.attributes.conversation_id = Some(session_id.to_owned());
-        record.payload = json!({ "ttl_ms": ttl_ms });
-        super::agent_events::record_agent_event(&db, &record).map(|_readback| ())
-    }
-
-    /// Journals the released/acquired event pair for a committed handoff in
-    /// one storage batch.
-    fn journal_lease_handoff_events(
-        &self,
-        from_session_id: &str,
-        to_session_id: &str,
-        ttl_ms: Option<u64>,
-    ) -> Result<(), synapse_storage::StorageError> {
-        let db = self
-            .m3_storage()
-            .map_err(|error| synapse_storage::StorageError::WriteFailed {
-                cf_name: synapse_storage::cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!(
-                    "open storage for lease handoff agent events: {}",
-                    error.message
-                ),
-            })?;
-        let ts_ns = super::agent_events::unix_time_ns_now();
-        let mut released =
-            synapse_core::AgentEventRecord::new(ts_ns, synapse_core::AgentEventKind::LeaseReleased);
-        released.session_id = Some(from_session_id.to_owned());
-        released.reason_code = Some("handoff".to_owned());
-        released.attributes.conversation_id = Some(from_session_id.to_owned());
-        released.payload = json!({ "to_session": to_session_id });
-        let mut acquired =
-            synapse_core::AgentEventRecord::new(ts_ns, synapse_core::AgentEventKind::LeaseAcquired);
-        acquired.session_id = Some(to_session_id.to_owned());
-        acquired.reason_code = Some("handoff".to_owned());
-        acquired.attributes.conversation_id = Some(to_session_id.to_owned());
-        acquired.payload = json!({ "from_session": from_session_id, "ttl_ms": ttl_ms });
-        super::agent_events::record_agent_events(&db, &[released, acquired]).map(|_readbacks| ())
-    }
-
     fn ensure_handoff_recipient_live(
         &self,
         from_session_id: &str,
@@ -1079,16 +816,29 @@ impl SynapseService {
             lease::ttl_from_ms(rollback_ttl_ms),
         ) {
             Ok(rollback) => {
-                let rollback_persist = self.persist_session_lease_handoff(
-                    to_session_id,
-                    from_session_id,
-                    &rollback.current,
-                );
+                // Restore the durable row only for a holder that had one. An
+                // action-acquired lease is never persisted or journaled; a row
+                // created here would have no `LeaseAcquired` and later be closed
+                // by the orphan sweep with an unmatched `LeaseReleased` (#205).
+                let holder_had_row = self.session_lease_row_exists(from_session_id);
+                let row_restored = matches!(holder_had_row, Ok(true));
+                let rollback_persist: Result<(), ErrorData> = match holder_had_row {
+                    Ok(true) => self
+                        .persist_session_lease_handoff(
+                            to_session_id,
+                            from_session_id,
+                            &rollback.current,
+                        )
+                        .map(|_readback| ()),
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
                 tracing::error!(
                     code = error_codes::TOOL_INTERNAL_ERROR,
                     from_session_id,
                     to_session_id,
                     rollback_persisted = rollback_persist.is_ok(),
+                    row_restored,
                     rollback_persist_error = ?rollback_persist.as_ref().err(),
                     original_error = ?error,
                     rollback = ?rollback,
@@ -1110,16 +860,20 @@ impl SynapseService {
         }
     }
 
-    pub(crate) fn dashboard_control_lease_force_release(
+    pub(crate) async fn dashboard_control_lease_force_release(
         &self,
         owner_session_id: String,
         confirmed: bool,
     ) -> Result<DashboardControlLeaseForceReleaseResponse, ErrorData> {
         validate_session_id(&owner_session_id)?;
-        let operator_panic_epoch_at_entry = arm_control_lease_operator_panic_gate(
-            "dashboard_control_lease_force_release",
+        // Not even an operator override may pull the lease out from under an
+        // in-flight escalation: its unwind owns that lease until it finishes.
+        let _hold = super::act_foreground_slot::admit_session_operation(
             &owner_session_id,
+            "dashboard_control_lease_force_release",
         )?;
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
         let before = lease_status_for_session(&owner_session_id);
         let command_payload = json!({
             "owner_session_id": &owner_session_id,
@@ -1168,39 +922,15 @@ impl SynapseService {
             )?;
             return Err(error);
         }
-        if let Err(error) = ensure_control_lease_operator_panic_not_observed(
-            "dashboard_control_lease_force_release",
-            &owner_session_id,
-            operator_panic_epoch_at_entry,
-            "after_confirmation_before_mutation",
-        ) {
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "control_lease_force_release",
-                    "lease_force_release",
-                    None,
-                    Some(owner_session_id.clone()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": DASHBOARD_LEASE_SOURCE_OF_TRUTH,
-                        "owner": lease_status_for_session(&owner_session_id),
-                    }),
-                    "error",
-                )
-                .with_channel("dashboard")
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&error),
-                ),
-            )?;
-            return Err(error);
-        }
         let released_prior =
             lease::force_clear_if_owner(&owner_session_id, "dashboard_force_release");
         let released = released_prior.is_some();
-        let mut persisted_row_deleted = false;
-        if released {
-            if let Err(error) = self.delete_persisted_session_lease(&owner_session_id) {
+        let persisted_row_deleted = if released {
+            if let Err(error) = reconcile_lease_release_after_mutation(
+                self,
+                &owner_session_id,
+                "dashboard_force_release",
+            ) {
                 self.command_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "control_lease_force_release",
@@ -1223,41 +953,40 @@ impl SynapseService {
                 )?;
                 return Err(error);
             }
-            persisted_row_deleted = true;
-            if let Err(error) = self.journal_lease_event(
-                synapse_core::AgentEventKind::LeaseReleased,
+            true
+        } else {
+            match super::session_continuity::reconcile_persisted_session_lease_row(
+                &self.m3_state_handle(),
                 &owner_session_id,
-                Some("dashboard_force_release"),
-                None,
+                "dashboard_force_release",
             ) {
-                let tool_error = super::agent_events::agent_event_tool_error(
-                    "control_lease_force_release",
-                    &error,
-                    true,
-                );
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "control_lease_force_release",
-                        "lease_force_release",
-                        None,
-                        Some(owner_session_id.clone()),
-                        command_payload,
-                        command_before,
-                        json!({
-                            "source_of_truth": DASHBOARD_LEASE_SOURCE_OF_TRUTH,
-                            "released": true,
-                            "owner": lease_status_for_session(&owner_session_id),
-                        }),
-                        "error",
-                    )
-                    .with_channel("dashboard")
-                    .with_error(
-                        super::command_audit::command_audit_error_from_error_data(&tool_error),
-                    ),
-                )?;
-                return Err(tool_error);
+                Ok(readback) => readback.row_deleted,
+                Err(error) => {
+                    let error = mcp_error(error_codes::STORAGE_CORRUPTED, error);
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "control_lease_force_release",
+                            "lease_force_release",
+                            None,
+                            Some(owner_session_id.clone()),
+                            command_payload,
+                            command_before,
+                            json!({
+                                "source_of_truth": DASHBOARD_LEASE_SOURCE_OF_TRUTH,
+                                "released": false,
+                                "owner": lease_status_for_session(&owner_session_id),
+                            }),
+                            "error",
+                        )
+                        .with_channel("dashboard")
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                    return Err(error);
+                }
             }
-        }
+        };
         let response = DashboardControlLeaseForceReleaseResponse {
             requested_owner_session_id: owner_session_id.clone(),
             confirmed,
@@ -1286,24 +1015,24 @@ impl SynapseService {
         Ok(response)
     }
 
-    pub(crate) fn dashboard_control_lease_handoff(
+    pub(crate) async fn dashboard_control_lease_handoff(
         &self,
         from_session_id: String,
         to_session_id: String,
         ttl_ms: u64,
     ) -> Result<DashboardControlLeaseHandoffResponse, ErrorData> {
         validate_session_id(&from_session_id)?;
-        let operator_panic_epoch_at_entry = arm_control_lease_operator_panic_gate(
-            "dashboard_control_lease_handoff",
+        let _hold_from = super::act_foreground_slot::admit_session_operation(
             &from_session_id,
+            "dashboard_control_lease_handoff",
         )?;
+        let _hold_to = super::act_foreground_slot::admit_session_operation(
+            &to_session_id,
+            "dashboard_control_lease_handoff",
+        )?;
+        let transition_gate = self.lease_transition_gate();
+        let _transition = transition_gate.lock().await;
         self.ensure_handoff_recipient_live(&from_session_id, &to_session_id)?;
-        ensure_control_lease_operator_panic_not_observed(
-            "dashboard_control_lease_handoff",
-            &from_session_id,
-            operator_panic_epoch_at_entry,
-            "before_continuity_restore",
-        )?;
         self.restore_session_lease_if_needed(&from_session_id)?;
         let before_from = lease_status_for_session(&from_session_id);
         let before_to = lease_status_for_session(&to_session_id);
@@ -1317,12 +1046,6 @@ impl SynapseService {
             "from": &before_from,
             "to": &before_to,
         });
-        ensure_control_lease_operator_panic_not_observed(
-            "dashboard_control_lease_handoff",
-            &from_session_id,
-            operator_panic_epoch_at_entry,
-            "before_audit_intent_and_mutation",
-        )?;
         self.command_audit_intent(
             super::command_audit::CommandAuditInput::mcp(
                 "control_lease_handoff",
@@ -1367,7 +1090,7 @@ impl SynapseService {
             from_session_id.clone(),
             &handoff.current,
         );
-        let persist_readback = match self.persist_session_lease_handoff(
+        let persist_readback = match self.persist_session_lease_handoff_with_events(
             &from_session_id,
             &to_session_id,
             &handoff.current,
@@ -1412,35 +1135,6 @@ impl SynapseService {
             to_row_exists_after = persist_readback.to_row_exists_after,
             "readback=input_lease edge=dashboard_handoff_committed"
         );
-        if let Err(error) = self.journal_lease_handoff_events(
-            &from_session_id,
-            &to_session_id,
-            handoff.current.ttl_ms,
-        ) {
-            let tool_error =
-                super::agent_events::agent_event_tool_error("control_lease_handoff", &error, true);
-            self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "control_lease_handoff",
-                    "lease_handoff",
-                    Some(from_session_id.clone()),
-                    Some(to_session_id.clone()),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": DASHBOARD_LEASE_SOURCE_OF_TRUTH,
-                        "from": lease_status_for_session(&from_session_id),
-                        "to": lease_status_for_session(&to_session_id),
-                    }),
-                    "error",
-                )
-                .with_channel("dashboard")
-                .with_error(
-                    super::command_audit::command_audit_error_from_error_data(&tool_error),
-                ),
-            )?;
-            return Err(tool_error);
-        }
         let dashboard_response = DashboardControlLeaseHandoffResponse {
             from_session_id: from_session_id.clone(),
             to_session_id: to_session_id.clone(),
@@ -1544,7 +1238,8 @@ fn recipient_unknown_error(
 
 fn lease_not_held_error(session_id: &str, error: &synapse_action::LeaseError) -> ErrorData {
     let holder = match error {
-        synapse_action::LeaseError::NotHeld { holder, .. } => holder.clone(),
+        synapse_action::LeaseError::NotHeld { holder, .. }
+        | synapse_action::LeaseError::CleanupBusy { holder } => holder.clone(),
     };
     ErrorData::new(
         ErrorCode(-32099),
@@ -1556,3 +1251,40 @@ fn lease_not_held_error(session_id: &str, error: &synapse_action::LeaseError) ->
         })),
     )
 }
+
+impl SynapseService {
+    /// Releases a lease whose acquisition could not be acknowledged to the
+    /// caller, reconciling the durable session lease row like an explicit
+    /// release. Returns whether this call released the lease.
+    pub(super) fn rollback_unacknowledged_lease(&self, session_id: &str) -> bool {
+        let released = release_lease_for_session(session_id)
+            .is_ok_and(|response| response.released_by_this_call());
+        let reconciled =
+            reconcile_lease_release_after_mutation(self, session_id, "unacknowledged_acquire")
+                .is_ok();
+        tracing::warn!(
+            code = "LEASE_ACQUIRE_ROLLED_BACK",
+            session_id,
+            released,
+            reconciled,
+            "input lease acquisition was rolled back because its final audit failed"
+        );
+        released
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/lease_release_rowless_94.rs"]
+mod lease_release_rowless_94_tests;
+
+#[cfg(test)]
+#[path = "tests/lease_source_of_truth_226.rs"]
+mod lease_source_of_truth_226_tests;
+
+#[cfg(test)]
+#[path = "tests/lease_explicit_over_auto_205.rs"]
+mod lease_explicit_over_auto_205_tests;
+
+#[cfg(test)]
+#[path = "tests/lease_tools_test_support.rs"]
+mod lease_tools_test_support;

@@ -12,7 +12,7 @@ use super::{
     Backends, EmitState,
 };
 use crate::{
-    ACTION_QUEUE_CAPACITY, ActionBackend, ActionError, ActionHandle, ActionMessage, ActionResult,
+    ACTION_QUEUE_CAPACITY, ActionAck, ActionBackend, ActionError, ActionHandle, ActionMessage,
     BackendResolutionPolicy,
 };
 use synapse_core::{Action, error_codes};
@@ -79,6 +79,64 @@ impl ActionEmitter {
             held_key_timer_ids: HashMap::new(),
             next_held_key_timer_id: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_rate_limits(
+        rx: mpsc::Receiver<ActionMessage>,
+        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
+        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
+        rate_limits: BackendRateLimits,
+    ) -> Self {
+        Self::with_rate_limits_and_policy(
+            rx,
+            safety_rx,
+            snapshot_rx,
+            backends,
+            rate_limits,
+            Arc::new(RwLock::new(BackendResolutionPolicy::default())),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_rate_limits_and_policy(
+        rx: mpsc::Receiver<ActionMessage>,
+        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
+        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
+        rate_limits: BackendRateLimits,
+        backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
+    ) -> Self {
+        let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
+        Self {
+            rx,
+            safety_rx,
+            snapshot_rx,
+            auto_release_tx,
+            auto_release_rx,
+            state: EmitState::new(),
+            backends,
+            backend_resolution,
+            rate_limits: BackendRateLimitControl::new(rate_limits),
+            held_key_timers: HashMap::new(),
+            held_key_timer_ids: HashMap::new(),
+            next_held_key_timer_id: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn channel_with_rate_limits(
+        rate_limits: BackendRateLimits,
+    ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
+        let backends = Backends::all_routed_to(Arc::new(crate::RecordingBackend::new()));
+        let (handle, rx, safety_rx) = ActionHandle::channel_with_safety_lane();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
+        (
+            handle,
+            ActionEmitterSnapshotHandle::new(snapshot_tx),
+            Self::with_rate_limits(rx, safety_rx, snapshot_rx, backends, rate_limits),
+        )
     }
 
     #[must_use]
@@ -195,8 +253,8 @@ impl ActionEmitter {
         loop {
             tokio::select! {
                 biased;
-                Some((action, ack, meta)) = self.safety_rx.recv() => {
-                    self.execute_actor_message(action, ack, meta).await;
+                Some((action, ack)) = self.safety_rx.recv() => {
+                    self.execute_actor_message(action, ack).await;
                 },
                 Some(auto_release) = self.auto_release_rx.recv() => {
                     if let Some(emitted_action) = self.auto_release_held_key(&auto_release) {
@@ -214,8 +272,8 @@ impl ActionEmitter {
                     self.release_all("connection_closed").await;
                     return self.snapshot();
                 },
-                Some((action, ack, meta)) = self.rx.recv() => {
-                    self.execute_actor_message(action, ack, meta).await;
+                Some((action, ack)) = self.rx.recv() => {
+                    self.execute_actor_message(action, ack).await;
                 },
                 else => {
                     self.release_all("connection_closed").await;
@@ -234,32 +292,37 @@ impl ActionEmitter {
         snapshot
     }
 
-    async fn execute_actor_message(
-        &mut self,
-        action: Action,
-        ack: tokio::sync::oneshot::Sender<ActionResult<()>>,
-        meta: crate::ActionEnqueueMeta,
-    ) {
-        let is_release_all = matches!(action, Action::ReleaseAll);
-        let result = match crate::handle::ensure_operator_panic_allows_action_since(
-            &action,
-            meta.operator_panic_epoch_at_enqueue,
-        ) {
-            Ok(()) => {
-                self.execute_with_delivery_target(action, meta.delivery_target)
-                    .await
+    async fn execute_actor_message(&mut self, action: Action, mut ack: ActionAck) {
+        if matches!(action, Action::ReleaseAll) {
+            // The primary slot (K1 hotkey only) is filled from inside the
+            // drain, right after the primary backend release (#95); the
+            // completion slot always gets the COMBINED result afterwards, so a
+            // failed secondary drain reaches every caller that waits for it.
+            let (completion, mut primary_slot) = ack.into_parts();
+            let result = self
+                .do_release_all("tool_invocation", &mut primary_slot)
+                .await;
+            if let Some(primary) = primary_slot.take() {
+                let _send_result = primary.send(result.clone());
             }
-            Err(error) => Err(error),
-        };
-        let _send_result = ack.send(result);
-        if is_release_all {
+            let _send_result = completion.send(result);
             self.reject_pending_normal_actions_after_release_all();
+            return;
         }
+        // #188: hand the backend the epoch read at enqueue, so an interrupt
+        // raised while the action was queued stops it before its first key.
+        self.state
+            .set_enqueued_release_epoch(Some(ack.release_epoch()));
+        self.state.set_delivery_target(ack.take_delivery_target());
+        let result = self.execute(action).await;
+        self.state.set_delivery_target(None);
+        self.state.set_enqueued_release_epoch(None);
+        let _send_result = ack.send(result);
     }
 
     fn reject_pending_normal_actions_after_release_all(&mut self) {
         let mut rejected = 0_u32;
-        while let Ok((action, ack, _operator_panic_epoch_at_enqueue)) = self.rx.try_recv() {
+        while let Ok((action, ack)) = self.rx.try_recv() {
             rejected = rejected.saturating_add(1);
             let kind = super::routing::action_kind(&action);
             let _send_result = ack.send(Err(ActionError::SafetyReleaseAllFired {

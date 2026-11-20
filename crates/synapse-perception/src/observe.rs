@@ -6,10 +6,11 @@ use std::{
 
 use chrono::Utc;
 use synapse_core::{
-    AccessibleNode, AudioContext, CaptureRuntimeReadback, CdpDiagnostics, ClipboardSummary,
-    DetectedEntity, EventSummary, FocusedElement, ForegroundContext, FsEvent, HudReadings,
-    InputBackendDiagnostics, Observation, ObservationCaptureConfig, ObservationDiagnostics,
-    ObservationElementsPage, PerceptionMode, SensorStatus, WebPerceptionPath,
+    AccessibleNode, AudioContext, CaptureRuntimeReadback, CdpDiagnostics, CdpStatus,
+    ClipboardSummary, DetectedEntity, EventSummary, FocusedElement, ForegroundContext, FsEvent,
+    HudReadings, InputBackendDiagnostics, Observation, ObservationCaptureConfig,
+    ObservationDiagnostics, ObservationElementsPage, PerceptionMode, SensorStatus,
+    WebPerceptionPath,
 };
 
 use crate::{PerceptionError, PerceptionResult};
@@ -152,6 +153,23 @@ const INTERACTABLE_ROLES: [&str; 28] = [
     "treeitem",
 ];
 
+/// True when `node` has stable identity and positive on-screen geometry.
+///
+/// Public perception can retain raw structural UIA nodes for diagnostics, but
+/// normal find/interactable results must not advertise an anonymous or
+/// zero-area node as a targetable control.  A non-empty accessible name or
+/// automation id is the minimum stable identity for a caller to reason about.
+#[must_use]
+pub fn is_usable_element(node: &AccessibleNode) -> bool {
+    node.bbox.w > 0
+        && node.bbox.h > 0
+        && (!node.name.trim().is_empty()
+            || node
+                .automation_id
+                .as_deref()
+                .is_some_and(|automation_id| !automation_id.trim().is_empty()))
+}
+
 /// True when `node` is an interactable control an agent can act on.
 ///
 /// Disabled nodes are never interactable. A node qualifies by role (covers CDP
@@ -162,7 +180,7 @@ const INTERACTABLE_ROLES: [&str; 28] = [
 /// `contenteditable` composers to the `document` role).
 #[must_use]
 pub fn is_interactable_node(node: &AccessibleNode) -> bool {
-    if !node.enabled {
+    if !node.enabled || !is_usable_element(node) {
         return false;
     }
     let role = normalized_role(&node.role);
@@ -170,6 +188,17 @@ pub fn is_interactable_node(node: &AccessibleNode) -> bool {
         return true;
     }
     if role == "document" {
+        // WebView2/Chromium expose the page root as a positive-area `document`
+        // with a `RootWebArea` automation id and a Value/Text pattern.  That is
+        // a container, not a form control; surfacing it as interactable invites
+        // callers to target an entire page as if it were an editable field.
+        if node
+            .automation_id
+            .as_deref()
+            .is_some_and(|automation_id| automation_id.eq_ignore_ascii_case("RootWebArea"))
+        {
+            return false;
+        }
         return node.patterns.iter().any(|pattern| {
             matches!(
                 pattern,
@@ -244,6 +273,12 @@ pub struct ObservationInput {
     pub sensor_latency_ms: BTreeMap<String, f32>,
     pub a11y_status: SensorStatus,
     pub capture_status: SensorStatus,
+    /// One target-owned frame per observation, including a cached failed attempt.
+    pub target_window_frame: std::sync::OnceLock<(
+        i64,
+        u32,
+        Option<std::sync::Arc<synapse_capture::CapturedBgraBitmap>>,
+    )>,
     pub detection_status: SensorStatus,
     pub audio_status: SensorStatus,
     pub mode_override: Option<PerceptionMode>,
@@ -275,6 +310,7 @@ impl ObservationInput {
             sensor_latency_ms: BTreeMap::new(),
             a11y_status: SensorStatus::Unavailable,
             capture_status: SensorStatus::Unavailable,
+            target_window_frame: std::sync::OnceLock::new(),
             detection_status: SensorStatus::Disabled,
             audio_status: SensorStatus::Disabled,
             mode_override: None,
@@ -322,11 +358,12 @@ impl ObservationAssembler {
         let (elements, elements_truncated, elements_page) =
             filter_elements(input.elements, include);
         let (entities, entities_truncated) = filter_entities(input.entities, include);
-        // #882: diagnostic payloads are opt-in. When the caller's include set
-        // does not request diagnostics, the heavy repeated blocks
-        // (input_backends, cdp probe evidence, capture config/runtime) are
-        // dropped from the wire shape. web_path stays — it is one enum and is
-        // the fidelity signal agents must always see (#682).
+        // Keep a failed CDP diagnosis even in the lean shape: OCR can set
+        // web_path=ocr while the page's interactive controls remain absent.
+        // Dropping the error here would make partial WebView2 UIA look complete.
+        let cdp_failed = cdp
+            .as_ref()
+            .is_some_and(|diagnostics| diagnostics.status != CdpStatus::Ok);
         let (capture_config, capture_runtime, input_backends, cdp) = if include.diagnostics {
             (
                 input.capture_config,
@@ -335,7 +372,7 @@ impl ObservationAssembler {
                 cdp,
             )
         } else {
-            (None, None, None, None)
+            (None, None, None, cdp_failed.then_some(cdp).flatten())
         };
         let mut observation = Observation {
             seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
@@ -394,8 +431,11 @@ impl ObservationAssembler {
                 size_estimate_tokens: 0,
             },
         };
-        update_size_fields(&mut observation)?;
-        update_size_fields(&mut observation)?;
+        observation
+            .refresh_size_fields()
+            .map_err(|err| PerceptionError::ObserveInternal {
+                detail: err.to_string(),
+            })?;
         Ok(observation)
     }
 }
@@ -563,18 +603,4 @@ fn ensure_any_sensor_available(
     Err(PerceptionError::ObserveNoPerceptionAvailable {
         detail: "all perception producers unavailable or disabled".to_owned(),
     })
-}
-
-fn update_size_fields(observation: &mut Observation) -> PerceptionResult<()> {
-    let size_bytes = u32::try_from(
-        serde_json::to_vec(observation)
-            .map_err(|err| PerceptionError::ObserveInternal {
-                detail: err.to_string(),
-            })?
-            .len(),
-    )
-    .unwrap_or(u32::MAX);
-    observation.diagnostics.size_bytes = size_bytes;
-    observation.diagnostics.size_estimate_tokens = size_bytes.div_ceil(4);
-    Ok(())
 }

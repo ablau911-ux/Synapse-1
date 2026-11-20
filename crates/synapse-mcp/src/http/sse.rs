@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use synapse_core::{Event, EventFilter};
 use synapse_reflex::{EventBus, EventBusError, PublishReport};
 
+mod attach;
 mod lossy;
 mod replay;
 mod ring;
@@ -22,6 +24,13 @@ use ring::Subscription;
 const LAST_EVENT_ID: &str = "Last-Event-ID";
 const SUBSCRIPTION_ID_HEADER: &str = "Synapse-Subscription-Id";
 const MANUAL_ENV: &str = "SYNAPSE_HTTP_SSE_MANUAL";
+const ORPHAN_GRACE_ENV: &str = "SYNAPSE_HTTP_SSE_ORPHAN_GRACE_SECS";
+/// How long a stream-less, stream-driven subscription stays resumable
+/// (EventSource reconnect with Last-Event-ID) before it is released (#173).
+const DEFAULT_ORPHAN_GRACE: Duration = Duration::from_secs(30);
+/// Under cap pressure orphans are reaped sooner, but never before a freshly
+/// subscribed dashboard scope had time to open its stream.
+const PRESSURE_REAP_MIN_IDLE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct SseState {
@@ -34,6 +43,7 @@ struct SseStateInner {
     subscriptions: Mutex<BTreeMap<String, Arc<Subscription>>>,
     subscription_owners: Mutex<BTreeMap<String, String>>,
     manual_routes_enabled: bool,
+    orphan_grace: Duration,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -82,13 +92,23 @@ pub enum SseCancelError {
 }
 
 impl SseState {
+    #[cfg(test)]
+    pub(crate) fn from_env() -> Self {
+        Self::with_max_subscriptions(synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO)
+    }
+
     pub(crate) fn with_max_subscriptions(max_subscriptions: NonZeroUsize) -> Self {
+        Self::with_limits(max_subscriptions, orphan_grace_from_env())
+    }
+
+    pub(crate) fn with_limits(max_subscriptions: NonZeroUsize, orphan_grace: Duration) -> Self {
         Self {
             inner: Arc::new(SseStateInner {
                 event_bus: EventBus::with_max_subscriptions(max_subscriptions),
                 subscriptions: Mutex::new(BTreeMap::new()),
                 subscription_owners: Mutex::new(BTreeMap::new()),
                 manual_routes_enabled: manual_routes_enabled(),
+                orphan_grace,
             }),
         }
     }
@@ -102,8 +122,59 @@ impl SseState {
             Ok(subscription) => subscription,
             Err(error) => return error.into_response(),
         };
+        let guard = stream::StreamGuard::attach(self, &subscription);
         let frames = replay::frames_after(&subscription, last_event_id);
-        stream::sse_response(subscription, frames, last_event_id)
+        stream::sse_response(subscription, frames, last_event_id, guard)
+    }
+
+    /// Dashboard subscription (#173): ownerless and released once its stream
+    /// is gone (after the resume grace) or it was never opened.
+    pub(crate) fn subscribe_dashboard(
+        &self,
+        filter: EventFilter,
+        kinds: Vec<String>,
+        snapshot_first: bool,
+    ) -> Result<String, SseSubscribeError> {
+        let subscription = self.create_subscription_with(filter, kinds, snapshot_first, None)?;
+        subscription.attachment().mark_reapable();
+        Ok(subscription.id().to_owned())
+    }
+
+    /// Releases reapable subscriptions that have had no attached stream for at
+    /// least `grace`. Returns the released ids.
+    pub(super) fn reap_orphans(&self, grace: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let orphan_ids: Vec<String> = match self.inner.subscriptions.lock() {
+            Ok(subscriptions) => subscriptions
+                .iter()
+                .filter(|(_, subscription)| subscription.attachment().is_orphan(now, grace))
+                .map(|(id, _)| id.clone())
+                .collect(),
+            Err(_) => return Vec::new(),
+        };
+        orphan_ids
+            .into_iter()
+            .filter(|id| self.cancel(id).is_ok())
+            .collect()
+    }
+
+    pub(super) fn schedule_orphan_reap(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = self.clone();
+        let grace = self.inner.orphan_grace;
+        runtime.spawn(async move {
+            tokio::time::sleep(grace).await;
+            let released = state.reap_orphans(grace);
+            if !released.is_empty() {
+                tracing::debug!(
+                    code = "SSE_ORPHAN_SUBSCRIPTIONS_RELEASED",
+                    released = released.len(),
+                    "released SSE subscriptions whose stream closed"
+                );
+            }
+        });
     }
 
     pub(crate) fn subscribe(
@@ -117,32 +188,44 @@ impl SseState {
             .map(|subscription| subscription.id().to_owned())
     }
 
+    pub(crate) fn subscribe_with_capacity(
+        &self,
+        filter: EventFilter,
+        kinds: Vec<String>,
+        snapshot_first: bool,
+        owner_session_id: Option<String>,
+        capacity: NonZeroUsize,
+    ) -> Result<String, SseSubscribeError> {
+        self.create_subscription_with_capacity(
+            filter,
+            kinds,
+            snapshot_first,
+            owner_session_id,
+            capacity,
+        )
+        .map(|subscription| subscription.id().to_owned())
+    }
+
     pub(crate) fn event_bus(&self) -> EventBus {
         self.inner.event_bus.clone()
     }
 
     pub(crate) fn active_subscription_count(&self) -> usize {
-        match self.inner.subscriptions.lock() {
-            Ok(subscriptions) => {
-                let count = subscriptions.len();
-                emit_sse_active_subscribers(count);
-                count
-            }
-            Err(_poisoned) => 0,
-        }
+        self.inner
+            .subscriptions
+            .lock()
+            .map_or(0, |subscriptions| subscriptions.len())
     }
 
     pub(crate) fn cancel(&self, id: &str) -> Result<(), SseCancelError> {
-        let (removed_from_map, active_count) = {
+        let removed_from_map = {
             let mut subscriptions = self
                 .inner
                 .subscriptions
                 .lock()
                 .map_err(|_| SseCancelError::StateUnavailable)?;
-            let removed = subscriptions.remove(id).is_some();
-            (removed, subscriptions.len())
+            subscriptions.remove(id).is_some()
         };
-        emit_sse_active_subscribers(active_count);
         {
             let mut owners = self
                 .inner
@@ -151,6 +234,36 @@ impl SseState {
                 .map_err(|_| SseCancelError::StateUnavailable)?;
             owners.remove(id);
         }
+        let removed_from_bus = self.inner.event_bus.unsubscribe(id);
+        if removed_from_map || removed_from_bus {
+            Ok(())
+        } else {
+            Err(SseCancelError::NotFound)
+        }
+    }
+
+    pub(crate) fn cancel_for_session(
+        &self,
+        id: &str,
+        owner_session_id: &str,
+    ) -> Result<(), SseCancelError> {
+        let removed_from_map = {
+            let mut subscriptions = self
+                .inner
+                .subscriptions
+                .lock()
+                .map_err(|_| SseCancelError::StateUnavailable)?;
+            let mut owners = self
+                .inner
+                .subscription_owners
+                .lock()
+                .map_err(|_| SseCancelError::StateUnavailable)?;
+            if owners.get(id).map(String::as_str) != Some(owner_session_id) {
+                return Err(SseCancelError::NotFound);
+            }
+            owners.remove(id);
+            subscriptions.remove(id).is_some()
+        };
         let removed_from_bus = self.inner.event_bus.unsubscribe(id);
         if removed_from_map || removed_from_bus {
             Ok(())
@@ -183,6 +296,32 @@ impl SseState {
             .lock()
             .map_err(|_| SseCancelError::StateUnavailable)?;
         Ok(owners.values().cloned().collect())
+    }
+
+    /// Owner sessions with a subscription whose SSE stream is attached now
+    /// (#147). A subscription row alone is not liveness: it survives a dropped
+    /// stream, so a crashed client would otherwise look active forever.
+    pub(crate) fn attached_owner_session_ids(&self) -> Result<Vec<String>, SseCancelError> {
+        // Lock order matches `cancel_for_session`: subscriptions, then owners.
+        let subscriptions = self
+            .inner
+            .subscriptions
+            .lock()
+            .map_err(|_| SseCancelError::StateUnavailable)?;
+        let owners = self
+            .inner
+            .subscription_owners
+            .lock()
+            .map_err(|_| SseCancelError::StateUnavailable)?;
+        Ok(owners
+            .iter()
+            .filter(|(id, _)| {
+                subscriptions
+                    .get(*id)
+                    .is_some_and(|subscription| subscription.attachment().is_attached())
+            })
+            .map(|(_, owner)| owner.clone())
+            .collect())
     }
 
     pub(crate) fn cancel_session_subscriptions(
@@ -265,8 +404,11 @@ impl SseState {
     }
 
     fn create_subscription(&self) -> Result<Arc<Subscription>, SseOpenError> {
-        self.create_subscription_with(EventFilter::All, Vec::new(), false, None)
-            .map_err(|error| SseOpenError::SubscribeUnavailable(error.code()))
+        let subscription = self
+            .create_subscription_with(EventFilter::All, Vec::new(), false, None)
+            .map_err(|error| SseOpenError::SubscribeUnavailable(error.code()))?;
+        subscription.attachment().mark_reapable();
+        Ok(subscription)
     }
 
     fn create_subscription_with(
@@ -276,13 +418,43 @@ impl SseState {
         snapshot_first: bool,
         owner_session_id: Option<String>,
     ) -> Result<Arc<Subscription>, SseSubscribeError> {
-        let handle = self
-            .inner
-            .event_bus
-            .subscribe(filter, kinds, snapshot_first)
-            .map_err(SseSubscribeError::from)?;
+        self.create_subscription_with_capacity(
+            filter,
+            kinds,
+            snapshot_first,
+            owner_session_id,
+            NonZeroUsize::new(synapse_reflex::SUBSCRIBER_QUEUE_CAPACITY)
+                .unwrap_or(NonZeroUsize::MIN),
+        )
+    }
+
+    fn create_subscription_with_capacity(
+        &self,
+        filter: EventFilter,
+        kinds: Vec<String>,
+        snapshot_first: bool,
+        owner_session_id: Option<String>,
+        capacity: NonZeroUsize,
+    ) -> Result<Arc<Subscription>, SseSubscribeError> {
+        let bus = &self.inner.event_bus;
+        let handle = match bus.subscribe_with_capacity(
+            filter.clone(),
+            kinds.clone(),
+            snapshot_first,
+            capacity,
+        ) {
+            Err(EventBusError::SubscriptionCapReached { .. })
+                if !self
+                    .reap_orphans(self.inner.orphan_grace.min(PRESSURE_REAP_MIN_IDLE))
+                    .is_empty() =>
+            {
+                bus.subscribe_with_capacity(filter, kinds, snapshot_first, capacity)
+            }
+            other => other,
+        }
+        .map_err(SseSubscribeError::from)?;
         let id = handle.id().to_owned();
-        let subscription = Arc::new(Subscription::new(handle));
+        let subscription = Arc::new(Subscription::with_capacity(handle, capacity.get()));
         {
             let mut subscriptions = self
                 .inner
@@ -290,7 +462,6 @@ impl SseState {
                 .lock()
                 .map_err(|_| SseSubscribeError::StateUnavailable)?;
             subscriptions.insert(id, Arc::clone(&subscription));
-            emit_sse_active_subscribers(subscriptions.len());
         }
         if let Some(owner_session_id) = owner_session_id {
             let mut owners = self
@@ -337,15 +508,6 @@ impl SseState {
         }
         subscription.push_events(events);
     }
-}
-
-fn emit_sse_active_subscribers(count: usize) {
-    synapse_telemetry::metrics::gauge!(synapse_telemetry::metrics::SSE_ACTIVE_SUBSCRIBERS)
-        .set(usize_metric_value(count));
-}
-
-fn usize_metric_value(value: usize) -> f64 {
-    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
 }
 
 impl SseOpenError {
@@ -406,6 +568,38 @@ impl From<EventBusError> for SseSubscribeError {
     }
 }
 
+fn orphan_grace_from_env() -> Duration {
+    std::env::var(ORPHAN_GRACE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_ORPHAN_GRACE, Duration::from_secs)
+}
+
 fn manual_routes_enabled() -> bool {
     std::env::var(MANUAL_ENV).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::match_wildcard_for_single_variants,
+    clippy::similar_names,
+    reason = "unit tests intentionally keep failure messages close to the assertion"
+)]
+mod tests;
+
+#[cfg(test)]
+#[path = "tests/orphan_release_173.rs"]
+mod orphan_release_173;
+
+#[cfg(test)]
+#[path = "tests/attached_owners_147.rs"]
+mod attached_owners_147;
+
+#[cfg(test)]
+#[path = "tests/seat_idle_reaper_147.rs"]
+mod seat_idle_reaper_147;
+
+#[cfg(test)]
+#[path = "sse/subscribe_capacity_26.rs"]
+mod subscribe_capacity_26_tests;

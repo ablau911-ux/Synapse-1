@@ -1,0 +1,23 @@
+services:
+  synapse-mcp:
+    image: synapse-mcp:windows-ltsc2022
+    build:
+      context: .
+      dockerfile: Dockerfile.windows
+    ports:
+      - "127.0.0.1:7700:7700"
+    environment:
+      SYNAPSE_BIND: 0.0.0.0:7700
+      SYNAPSE_MODE: http
+      SYNAPSE_BEARER_TOKEN: ${SYNAPSE_BEARER_TOKEN:?SYNAPSE_BEARER_TOKEN must be set and nonempty}
+    healthcheck:
+      test:
+        - CMD
+        - powershell
+        - -NoProfile
+        - -Command
+        - "try { $$headers = @{ Authorization = \"Bearer $$env:SYNAPSE_BEARER_TOKEN\"; Origin = \"http://localhost:7700\" }; $$response = Invoke-WebRequest -UseBasicParsing -Uri http://localhost:7700/health -Headers $$headers -TimeoutSec 5; if ($$response.StatusCode -ge 200 -and $$response.StatusCode -lt 300) { exit 0 } else { exit 1 } } catch { exit 1 }"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s

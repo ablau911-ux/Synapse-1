@@ -1,0 +1,44 @@
+{
+  "id": "brave",
+  "label": "Brave",
+  "family": "chromium",
+  "process_names": ["brave.exe"],
+  "exe_path_markers": [],
+  "exe_candidates": [
+    "%ProgramFiles%\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+    "%ProgramFiles(x86)%\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+    "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+  ],
+  "app_paths_name": "brave.exe",
+  "user_data_root": "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data",
+  "profile_layout": "multi",
+  "window_title_suffixes": [" - Brave"],
+  "tab_target_prefix": "brave-tab:",
+  "endpoint_base": "synapse-bridge://brave",
+  "health_key": "brave_bridge",
+  "registration_token_file": "browser-bridge-token-brave.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "brave://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "browser-extension\\brave"
+  },
+  "policy": {
+    "root": "Software\\Policies\\BraveSoftware\\Brave",
+    "extension_settings_value": "ExtensionSettings"
+  },
+  "native_messaging_cleanup_roots": [
+    "Software\\Google\\Chrome\\NativeMessagingHosts",
+    "Software\\Wow6432Node\\Google\\Chrome\\NativeMessagingHosts"
+  ],
+  "protected_extension_ids": ["mnojpmjdmbbfmejpflffifhffcmidifd"],
+  "cdp_product_tokens": ["Chrome"],
+  "unsupported_capabilities": [],
+  "debugger_api_expected": true,
+  "install_ui": {
+    "developer_mode_names": ["Developer mode"],
+    "load_unpacked_names": ["Load unpacked"]
+  },
+  "winget_id": "Brave.Brave"
+}

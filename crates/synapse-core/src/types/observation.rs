@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::ConfidenceSource;
+
 use super::{
     CdpDiagnostics, ElementId, EntityId, EventSummary, PerceptionMode, ProfileId, Rect,
     WebPerceptionPath,
@@ -116,6 +118,11 @@ pub struct AccessibleNode {
     pub patterns: Vec<UiaPattern>,
     pub children_count: u32,
     pub depth: u32,
+    /// Checked/selected/expanded state for elements exposing the Toggle,
+    /// SelectionItem or ExpandCollapse pattern (e.g. `toggle=1;selected=true`).
+    /// A click that flips it is an observable effect even when focus moved (#189).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_state: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -126,6 +133,38 @@ pub struct AccessibleSubtree {
     pub nodes: Vec<AccessibleNode>,
     pub max_depth: u32,
     pub truncated: bool,
+    /// Web-content Document the snapshot prioritized before the rest of the
+    /// window (#257). `None` when no unique visible Document was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_content_root: Option<ElementId>,
+    /// Coverage scope guaranteed first: `document` when
+    /// `selected_content_root` was collected before the rest of the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness_scope: Option<SnapshotScope>,
+    /// First limit that made the tree incomplete. Set whenever `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<SnapshotStopReason>,
+    /// Nodes whose children were cut by node budget, deadline or provider
+    /// error (not depth cuts). Deduplicated, capped at 32.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_subtree_roots: Vec<ElementId>,
+}
+
+/// Coverage scope a snapshot prioritized (#257).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotScope {
+    Document,
+}
+
+/// First collection limit that left a snapshot incomplete (#257).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotStopReason {
+    NodeBudget,
+    Deadline,
+    DepthLimit,
+    ProviderError,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -208,6 +247,8 @@ pub struct HudReading {
     pub raw_text: String,
     pub parsed: HudValue,
     pub confidence: f32,
+    #[serde(default)]
+    pub confidence_source: ConfidenceSource,
     pub stale_ms: u32,
 }
 
@@ -317,9 +358,9 @@ pub struct ObservationDiagnostics {
     /// fallthrough for browsers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp: Option<CdpDiagnostics>,
-    /// Which perception path produced web content for a Chromium-family
-    /// foreground (`cdp` / `ocr` / `uia_only`). `None` for non-browser
-    /// foregrounds. See [`WebPerceptionPath`] and epic #682/#687.
+    /// Which perception path produced web content for a Chromium-family or
+    /// embedded-WebView foreground (`cdp` / `ocr` / `uia_only`). `None` when no
+    /// web surface was detected. See [`WebPerceptionPath`] and epic #682/#687.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_path: Option<WebPerceptionPath>,
     pub elements_truncated: bool,
@@ -443,6 +484,43 @@ pub struct CaptureRuntimeReadback {
     pub stop_requested: bool,
 }
 
+impl Observation {
+    /// Recompute self-referential size fields until their serialized widths settle.
+    ///
+    /// The fields themselves change the JSON length at decimal boundaries, so
+    /// one or two serialization passes do not always describe the returned value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`serde_json::Error`] when the observation cannot be serialized
+    /// or its serialized size exceeds a `u32` byte count.
+    pub fn refresh_size_fields(&mut self) -> Result<(), serde_json::Error> {
+        loop {
+            let size_bytes = u32::try_from(serde_json::to_vec(&self)?.len()).map_err(|_| {
+                serde_json::Error::io(std::io::Error::other(
+                    "serialized observation exceeds u32 byte count",
+                ))
+            })?;
+            let size_estimate_tokens = size_bytes.div_ceil(4);
+            if self.diagnostics.size_bytes == size_bytes
+                && self.diagnostics.size_estimate_tokens == size_estimate_tokens
+            {
+                return Ok(());
+            }
+            self.diagnostics.size_bytes = size_bytes;
+            self.diagnostics.size_estimate_tokens = size_estimate_tokens;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureFrameCursor {
+    pub capture_id: String,
+    pub generation: u64,
+    pub frame_seq: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SensorStatus {
@@ -474,29 +552,23 @@ pub struct OcrResult {
     pub words: Vec<OcrWord>,
     pub confidence: f32,
     #[serde(default)]
-    pub confidence_source: OcrConfidenceSource,
+    pub confidence_source: ConfidenceSource,
     pub region: Rect,
     pub lang: String,
-    /// True when a clean OCR pass over a valid region produced zero glyphs — an
-    /// empty region is a valid observation, not a failure (#1557). Omitted
-    /// (defaults false) for populated results so existing readers are unchanged.
-    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
-    pub no_text: bool,
+    /// Best-effort cache persistence outcome, independent of text hygiene.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<OcrCacheWriteNotice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perceived_text_notice: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspected_injection: Vec<SuspectedInjectionAnnotation>,
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum OcrConfidenceSource {
-    Engine,
-    Uia,
-    Synthetic,
-    Heuristic,
-    #[default]
-    Unsupported,
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OcrCacheWriteNotice {
+    pub code: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -506,5 +578,5 @@ pub struct OcrWord {
     pub bbox: Rect,
     pub confidence: f32,
     #[serde(default)]
-    pub confidence_source: OcrConfidenceSource,
+    pub confidence_source: ConfidenceSource,
 }

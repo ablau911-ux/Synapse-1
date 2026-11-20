@@ -29,30 +29,21 @@
 //! lease are tagged `agent { session_id }` (the lease is the canonical "an
 //! agent owns the foreground" signal, epic #719); everything else is `human`.
 
+use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, VecDeque},
-    panic::AssertUnwindSafe,
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
-
-type RetainedRecorderTaskOwner = (&'static str, JoinHandle<()>);
-
-static RETAINED_RECORDER_TASK_OWNERS: OnceLock<Mutex<Vec<RetainedRecorderTaskOwner>>> =
-    OnceLock::new();
-static UNRESOLVED_RECORDER_DROP_PRODUCERS: AtomicU64 = AtomicU64::new(0);
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use futures_util::{FutureExt, future::join_all};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use synapse_a11y::{AccessibleEvent, AccessibleEventKind};
 use synapse_core::{
-    Event, EventSource, SCHEMA_VERSION, StoredEvent,
+    Event, EventSource, ForegroundContext, SCHEMA_VERSION, StoredEvent,
     types::{
         AccessibleNode, FsEventKind, Observation, TIMELINE_RECORD_VERSION, TimelineActor,
         TimelineKind, TimelineRecord,
@@ -61,11 +52,11 @@ use synapse_core::{
 use synapse_reflex::EventBus;
 use synapse_storage::{Db, cf, timeline::timeline_key};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
-use tokio_util::sync::CancellationToken;
 
+use super::episodes::now_ts_ns;
 use super::{
     demo_recording::DemoRecordControl,
     interaction_cadence::{
@@ -87,16 +78,7 @@ pub const IDLE_TIMEOUT_ENV: &str = "SYNAPSE_TIMELINE_IDLE_TIMEOUT_MS";
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 180_000;
 const MIN_IDLE_POLL_INTERVAL_MS: u64 = 250;
 const MAX_IDLE_POLL_INTERVAL_MS: u64 = 5_000;
-const RECORDER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const RECORDER_TASK_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-const RECORDER_PRODUCER_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
-const RECORDER_PRODUCER_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const RECORDER_INTERACTION_HOOK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-// The supervisor must outlive every legal inner stage: producer admission
-// drain (15s), hook stop (5s), producer stop+abort join (7s), and worker
-// stop+abort join (7s). Leave bounded headroom for checked storage readback.
-const RECORDER_SHUTDOWN_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(45);
-const RECORDER_SHUTDOWN_SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSIST_EVENT_KIND: &str = "assist.opportunity";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,446 +128,9 @@ impl RecorderConfig {
 enum RecorderMessage {
     Accessible(AccessibleEvent),
     Interaction(InteractionEvent),
-    IdleProbe {
-        idle_ms: u64,
-    },
-    FlushInteractions {
-        done: oneshot::Sender<()>,
-    },
-    Shutdown {
-        done: oneshot::Sender<Result<(), String>>,
-    },
-}
-
-#[derive(Debug, Default)]
-struct RecorderProducerGate {
-    state: Mutex<RecorderProducerGateState>,
-    quiescent: Condvar,
-}
-
-#[derive(Debug, Default)]
-struct RecorderProducerGateState {
-    closed: bool,
-    in_flight: usize,
-}
-
-struct RecorderProducerPermit<'a> {
-    gate: &'a RecorderProducerGate,
-}
-
-impl RecorderProducerGate {
-    fn enter(&self) -> Option<RecorderProducerPermit<'_>> {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if state.closed {
-            return None;
-        }
-        state.in_flight = state.in_flight.saturating_add(1);
-        Some(RecorderProducerPermit { gate: self })
-    }
-
-    fn close(&self) -> (bool, usize) {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state.closed = true;
-        (state.closed, state.in_flight)
-    }
-
-    fn readback(&self) -> (bool, usize) {
-        let state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        (state.closed, state.in_flight)
-    }
-
-    async fn wait_for_quiescence_async(&self, timeout: Duration) -> (bool, usize) {
-        let readback = self.readback();
-        if readback.1 == 0 {
-            return readback;
-        }
-        let wait_for_quiescence = async {
-            loop {
-                let readback = self.readback();
-                if readback.1 == 0 {
-                    return readback;
-                }
-                tokio::time::sleep(RECORDER_PRODUCER_DRAIN_POLL_INTERVAL).await;
-            }
-        };
-        match tokio::time::timeout(timeout, wait_for_quiescence).await {
-            Ok(readback) => readback,
-            Err(_elapsed) => self.readback(),
-        }
-    }
-}
-
-impl Drop for RecorderProducerPermit<'_> {
-    fn drop(&mut self) {
-        let mut state = match self.gate.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state.in_flight = state.in_flight.saturating_sub(1);
-        if state.in_flight == 0 {
-            self.gate.quiescent.notify_all();
-        }
-    }
-}
-
-struct RecorderTaskShutdownOwner {
-    name: &'static str,
-    task: Option<JoinHandle<()>>,
-}
-
-impl RecorderTaskShutdownOwner {
-    const fn new(name: &'static str, task: JoinHandle<()>) -> Self {
-        Self {
-            name,
-            task: Some(task),
-        }
-    }
-
-    fn task_mut(&mut self) -> &mut JoinHandle<()> {
-        let Some(task) = self.task.as_mut() else {
-            panic!("recorder shutdown owner must contain its task");
-        };
-        task
-    }
-
-    fn take_terminal(&mut self) {
-        drop(self.task.take());
-    }
-
-    fn abort_and_retain(&mut self, reason: &'static str) {
-        let Some(task) = self.task.take() else {
-            return;
-        };
-        task.abort();
-        retain_recorder_task_owner(self.name, task);
-        tracing::error!(
-            code = "TIMELINE_RECORDER_TASK_RETAINED",
-            task = self.name,
-            reason,
-            "exact activity-recorder JoinHandle retained until physical termination"
-        );
-    }
-}
-
-impl Drop for RecorderTaskShutdownOwner {
-    fn drop(&mut self) {
-        self.abort_and_retain("shutdown_future_cancelled_or_unwound");
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ActivityRecorderTaskDrainReport {
-    tasks_before: usize,
-    graceful_joined: usize,
-    abort_requests_sent: usize,
-    joined_after_abort: usize,
-    still_live_task_names: Vec<&'static str>,
-    failures: Vec<String>,
-}
-
-impl ActivityRecorderTaskDrainReport {
-    pub(crate) fn owners_quiescent(&self) -> bool {
-        self.still_live_task_names.is_empty()
-    }
-
-    fn verdict(&self) -> anyhow::Result<()> {
-        let accounted_tasks =
-            self.graceful_joined + self.joined_after_abort + self.still_live_task_names.len();
-        let accounted_aborts = self.joined_after_abort + self.still_live_task_names.len();
-        if self.failures.is_empty()
-            && self.owners_quiescent()
-            && self.tasks_before == accounted_tasks
-            && self.abort_requests_sent == accounted_aborts
-        {
-            Ok(())
-        } else {
-            anyhow::bail!("activity recorder task drain failed; readback={self:?}")
-        }
-    }
-
-    fn merge(mut self, mut other: Self) -> Self {
-        self.tasks_before += other.tasks_before;
-        self.graceful_joined += other.graceful_joined;
-        self.abort_requests_sent += other.abort_requests_sent;
-        self.joined_after_abort += other.joined_after_abort;
-        self.still_live_task_names
-            .append(&mut other.still_live_task_names);
-        self.failures.append(&mut other.failures);
-        self
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ActivityRecorderShutdownReport {
-    shutdown_message_delivered: bool,
-    shutdown_reply_received: bool,
-    worker_boundary_committed: bool,
-    fallback_attempted: bool,
-    fallback_committed: bool,
-    producer_gate_closed: bool,
-    producer_gate_in_flight: usize,
-    pipeline_task_owners_remaining: usize,
-    task_drain: ActivityRecorderTaskDrainReport,
-    owner_accounting_complete: bool,
-    retained_task_owners: usize,
-    interaction_hook_owners_quiescent: bool,
-    rows_written: u64,
-    write_failures: u64,
-    failures: Vec<String>,
-}
-
-impl ActivityRecorderShutdownReport {
-    pub(crate) fn owners_quiescent(&self) -> bool {
-        self.owner_accounting_complete
-            && self.producer_gate_closed
-            && self.producer_gate_in_flight == 0
-            && self.pipeline_task_owners_remaining == 0
-            && self.retained_task_owners == 0
-            && self.interaction_hook_owners_quiescent
-    }
-
-    pub(crate) fn verdict(&self) -> anyhow::Result<()> {
-        let mut failures = self.failures.clone();
-        if !self.shutdown_message_delivered {
-            failures.push("shutdown message was not delivered to the recorder worker".to_owned());
-        }
-        if !self.shutdown_reply_received {
-            failures.push("recorder worker did not reply to the shutdown request".to_owned());
-        }
-        if !self.worker_boundary_committed {
-            failures
-                .push("recorder worker did not commit its shutdown storage boundary".to_owned());
-        }
-        if self.fallback_attempted && !self.fallback_committed {
-            failures.push("direct shutdown-boundary fallback did not commit".to_owned());
-        }
-        if !self.producer_gate_closed {
-            failures.push("recorder producer admission gate remained open".to_owned());
-        }
-        if self.producer_gate_in_flight != 0 {
-            failures.push(format!(
-                "{} synchronous recorder producer(s) remained in flight",
-                self.producer_gate_in_flight
-            ));
-        }
-        if self.pipeline_task_owners_remaining != 0 {
-            failures.push(format!(
-                "{} recorder pipeline task owner(s) remained resident",
-                self.pipeline_task_owners_remaining
-            ));
-        }
-        if let Err(error) = self.task_drain.verdict() {
-            failures.push(error.to_string());
-        }
-        if !self.interaction_hook_owners_quiescent {
-            failures
-                .push("interaction-hook owners remained live after recorder shutdown".to_owned());
-        }
-        if !self.owner_accounting_complete {
-            failures.push(
-                "recorder shutdown could not account for every expected worker/idle/hook/bridge owner"
-                    .to_owned(),
-            );
-        }
-        if self.retained_task_owners != 0 {
-            failures.push(format!(
-                "{} recorder task owner(s) remain retained and physically live",
-                self.retained_task_owners
-            ));
-        }
-        if self.write_failures != 0 {
-            failures.push(format!(
-                "timeline writer reported {} failed writes after {} successful writes at recorder shutdown",
-                self.write_failures, self.rows_written
-            ));
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "activity recorder shutdown failed: {}; readback={self:?}",
-                failures.join("; ")
-            )
-        }
-    }
-}
-
-fn retain_recorder_task_owner(name: &'static str, task: JoinHandle<()>) {
-    let owners = RETAINED_RECORDER_TASK_OWNERS.get_or_init(|| Mutex::new(Vec::new()));
-    match owners.lock() {
-        Ok(mut owners) => owners.push((name, task)),
-        Err(poisoned) => poisoned.into_inner().push((name, task)),
-    }
-}
-
-#[must_use]
-pub(crate) fn retained_task_owner_count() -> usize {
-    let owners = RETAINED_RECORDER_TASK_OWNERS.get_or_init(|| Mutex::new(Vec::new()));
-    let mut owners = match owners.lock() {
-        Ok(owners) => owners,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let mut still_live = Vec::with_capacity(owners.len());
-    for (name, mut task) in std::mem::take(&mut *owners) {
-        if !task.is_finished() {
-            still_live.push((name, task));
-            continue;
-        }
-        match (&mut task).now_or_never() {
-            Some(Ok(())) => tracing::info!(
-                code = "TIMELINE_RECORDER_RETAINED_TASK_REAPED",
-                task = name,
-                "terminal retained recorder task owner joined and reaped"
-            ),
-            Some(Err(error)) => tracing::error!(
-                code = "TIMELINE_RECORDER_RETAINED_TASK_JOIN_FAILED",
-                task = name,
-                detail = %error,
-                "terminal retained recorder task owner failed while being reaped"
-            ),
-            None => {
-                // `is_finished` is only a hint until the JoinHandle itself
-                // yields. Preserve exact ownership if that observation races.
-                still_live.push((name, task));
-            }
-        }
-    }
-    let count = still_live.len();
-    *owners = still_live;
-    count
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ActivityRecorderRetainedOwnerReadback {
-    pub(crate) retained_task_owner_count: usize,
-    pub(crate) unresolved_drop_producer_count: u64,
-}
-
-impl ActivityRecorderRetainedOwnerReadback {
-    pub(crate) const fn safe_to_unlock(&self) -> bool {
-        self.retained_task_owner_count == 0 && self.unresolved_drop_producer_count == 0
-    }
-}
-
-#[must_use]
-pub(crate) fn retained_owner_readback() -> ActivityRecorderRetainedOwnerReadback {
-    ActivityRecorderRetainedOwnerReadback {
-        retained_task_owner_count: retained_task_owner_count(),
-        unresolved_drop_producer_count: UNRESOLVED_RECORDER_DROP_PRODUCERS.load(Ordering::Acquire),
-    }
-}
-
-fn close_producer_gate_for_drop(gate: &RecorderProducerGate) -> (bool, usize) {
-    gate.close()
-}
-
-fn record_unresolved_drop_producers(in_flight: usize) {
-    if in_flight == 0 {
-        return;
-    }
-    let increment = u64::try_from(in_flight).unwrap_or(u64::MAX);
-    let _prior = UNRESOLVED_RECORDER_DROP_PRODUCERS.fetch_update(
-        Ordering::AcqRel,
-        Ordering::Acquire,
-        |current| Some(current.saturating_add(increment)),
-    );
-}
-
-async fn drain_activity_recorder_tasks(
-    tasks: Vec<RecorderTaskShutdownOwner>,
-) -> ActivityRecorderTaskDrainReport {
-    let tasks_before = tasks.len();
-    let outcomes = join_all(tasks.into_iter().map(|mut owner| async move {
-        let name = owner.name;
-        match tokio::time::timeout(RECORDER_TASK_STOP_TIMEOUT, owner.task_mut()).await {
-            Ok(Ok(())) => {
-                owner.take_terminal();
-                (name, true, false, true, None)
-            }
-            Ok(Err(error)) => {
-                owner.take_terminal();
-                (
-                    name,
-                    true,
-                    false,
-                    true,
-                    Some(format!("{name}: join failed: {error}")),
-                )
-            }
-            Err(_elapsed) => {
-                owner.task_mut().abort();
-                match tokio::time::timeout(
-                    RECORDER_TASK_ABORT_JOIN_TIMEOUT,
-                    owner.task_mut(),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        owner.take_terminal();
-                        (
-                            name,
-                            false,
-                            true,
-                            true,
-                            Some(format!(
-                                "{name}: did not stop within {} ms after cooperative shutdown; abort_join={result:?}",
-                                RECORDER_TASK_STOP_TIMEOUT.as_millis()
-                            )),
-                        )
-                    }
-                    Err(_elapsed) => {
-                        owner.abort_and_retain("abort_join_timeout");
-                        (
-                            name,
-                            false,
-                            true,
-                            false,
-                            Some(format!(
-                                "{name}: did not stop within {} ms after cooperative shutdown and did not join within {} ms after abort; exact JoinHandle retained until physical termination",
-                                RECORDER_TASK_STOP_TIMEOUT.as_millis(),
-                                RECORDER_TASK_ABORT_JOIN_TIMEOUT.as_millis()
-                            )),
-                        )
-                    }
-                }
-            }
-        }
-    }))
-    .await;
-
-    let mut graceful_joined = 0;
-    let mut abort_requests_sent = 0;
-    let mut joined_after_abort = 0;
-    let mut still_live_task_names = Vec::new();
-    let mut failures = Vec::new();
-    for (name, joined_during_grace, abort_requested, terminal_readback, failure) in outcomes {
-        graceful_joined += usize::from(joined_during_grace);
-        abort_requests_sent += usize::from(abort_requested);
-        joined_after_abort += usize::from(abort_requested && terminal_readback);
-        if !terminal_readback {
-            still_live_task_names.push(name);
-        }
-        if let Some(failure) = failure {
-            failures.push(failure);
-        }
-    }
-    ActivityRecorderTaskDrainReport {
-        tasks_before,
-        graceful_joined,
-        abort_requests_sent,
-        joined_after_abort,
-        still_live_task_names,
-        failures,
-    }
+    IdleProbe { idle_ms: u64 },
+    FlushInteractions { done: oneshot::Sender<()> },
+    Shutdown { done: oneshot::Sender<()> },
 }
 
 /// Shared write path: every producer (worker, spawn, drop backstop) goes
@@ -639,16 +184,12 @@ impl TimelineWriter {
         Ok(())
     }
 
-    /// Syncs the storage WAL. `put_batch` already returns only after the
-    /// row reaches RocksDB with a synced WAL; shutdown still performs an
-    /// explicit sync at session boundaries.
-    fn flush_checked(&self) -> Result<()> {
-        self.db.flush().context("flush batched timeline writes")
-    }
-
+    /// Forces pending batched writes to disk. The batcher acks `put_batch`
+    /// on enqueue and flushes on a 100 ms cadence, so anything that must be
+    /// durable *now* (session boundaries at shutdown) needs an explicit
+    /// flush — a return value alone does not prove the row is on disk.
     fn flush_logged(&self) {
-        if let Err(error) = self.flush_checked() {
-            self.write_failures.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self.db.flush() {
             tracing::error!(
                 code = "TIMELINE_FLUSH_FAILED",
                 detail = %error,
@@ -725,26 +266,8 @@ struct ForegroundSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ForegroundTransition {
     Duplicate,
-    TitleChurnSuppressed(TitleChurnReason),
     TitleChanged,
     Switched,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TitleChurnReason {
-    VolatilePrefix,
-    VolatileSuffix,
-    ProgressPercent,
-}
-
-impl TitleChurnReason {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::VolatilePrefix => "volatile_prefix",
-            Self::VolatileSuffix => "volatile_suffix",
-            Self::ProgressPercent => "progress_percent",
-        }
-    }
 }
 
 fn classify_foreground_transition(
@@ -756,127 +279,12 @@ fn classify_foreground_transition(
             // Same window: only the title can have moved.
             if prev.title == next.title {
                 ForegroundTransition::Duplicate
-            } else if let Some(reason) = classify_title_churn(&prev.title, &next.title) {
-                ForegroundTransition::TitleChurnSuppressed(reason)
             } else {
                 ForegroundTransition::TitleChanged
             }
         }
         _ => ForegroundTransition::Switched,
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NormalizedTitle {
-    semantic: String,
-    reason: Option<TitleChurnReason>,
-}
-
-fn classify_title_churn(previous: &str, next: &str) -> Option<TitleChurnReason> {
-    let previous = normalize_title_for_churn(previous);
-    let next = normalize_title_for_churn(next);
-    if previous.semantic.is_empty() || previous.semantic != next.semantic {
-        return None;
-    }
-    previous.reason.or(next.reason)
-}
-
-fn normalize_title_for_churn(title: &str) -> NormalizedTitle {
-    let trimmed = title.trim();
-    if let Some(semantic) = strip_volatile_prefix(trimmed) {
-        return NormalizedTitle {
-            semantic,
-            reason: Some(TitleChurnReason::VolatilePrefix),
-        };
-    }
-    if let Some(semantic) = strip_volatile_suffix(trimmed) {
-        return NormalizedTitle {
-            semantic,
-            reason: Some(TitleChurnReason::VolatileSuffix),
-        };
-    }
-    if let Some(semantic) = strip_trailing_progress_percent(trimmed) {
-        return NormalizedTitle {
-            semantic,
-            reason: Some(TitleChurnReason::ProgressPercent),
-        };
-    }
-    NormalizedTitle {
-        semantic: trimmed.to_owned(),
-        reason: None,
-    }
-}
-
-fn strip_volatile_prefix(title: &str) -> Option<String> {
-    let mut chars = title.char_indices();
-    let (_first_at, first) = chars.next()?;
-    if !is_volatile_title_glyph(first) {
-        return None;
-    }
-    let after_first = &title[first.len_utf8()..];
-    if !after_first.chars().next().is_some_and(char::is_whitespace) {
-        return None;
-    }
-    let semantic = after_first.trim_start();
-    (!semantic.is_empty()).then(|| semantic.to_owned())
-}
-
-fn strip_volatile_suffix(title: &str) -> Option<String> {
-    let (last_at, last) = title.char_indices().next_back()?;
-    if !is_volatile_title_glyph(last) {
-        return None;
-    }
-    let before_last = &title[..last_at];
-    if !before_last
-        .chars()
-        .next_back()
-        .is_some_and(char::is_whitespace)
-    {
-        return None;
-    }
-    let semantic = before_last.trim_end();
-    (!semantic.is_empty()).then(|| semantic.to_owned())
-}
-
-fn strip_trailing_progress_percent(title: &str) -> Option<String> {
-    let before_percent = title.strip_suffix('%')?.trim_end();
-    let digit_start = before_percent
-        .char_indices()
-        .rev()
-        .find_map(|(index, ch)| {
-            (!ch.is_ascii_digit() && ch != '.').then_some(index + ch.len_utf8())
-        })
-        .unwrap_or(0);
-    let number = before_percent[digit_start..].trim();
-    if number.is_empty() || !number.chars().any(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    let semantic = before_percent[..digit_start].trim_end();
-    (!semantic.is_empty()).then(|| format!("{semantic} <%>"))
-}
-
-fn is_volatile_title_glyph(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{2800}'
-            ..='\u{28ff}'
-                | '◐'
-                | '◓'
-                | '◑'
-                | '◒'
-                | '◴'
-                | '◷'
-                | '◶'
-                | '◵'
-                | '◜'
-                | '◝'
-                | '◞'
-                | '◟'
-                | '|'
-                | '/'
-                | '-'
-                | '\\'
-    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -893,11 +301,6 @@ const fn idle_transition(currently_idle: bool, idle_ms: u64, timeout_ms: u64) ->
     } else {
         None
     }
-}
-
-fn now_ts_ns() -> u64 {
-    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    u64::try_from(nanos).unwrap_or(0)
 }
 
 /// Resolves who is driving the session right now. An agent session holding
@@ -1604,9 +1007,9 @@ fn bucket_start(ts_ns: u64) -> u64 {
     (ts_ns / INTERACTION_BUCKET_NS).saturating_mul(INTERACTION_BUCKET_NS)
 }
 
+/// Window titles and focused-element names can carry secrets; keyed (#136).
 fn sha256_hex(text: &str) -> String {
-    let digest = Sha256::digest(text.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    crate::content_digest::keyed_text_digest_hex(text)
 }
 
 fn focused_element_signature(node: &AccessibleNode) -> String {
@@ -2012,9 +1415,6 @@ impl WorkerState {
         }
         match classify_foreground_transition(self.foreground.as_ref(), &next) {
             ForegroundTransition::Duplicate => {}
-            ForegroundTransition::TitleChurnSuppressed(reason) => {
-                self.record_suppressed_title_change(&next, reason);
-            }
             ForegroundTransition::TitleChanged => {
                 let ts_ns = now_ts_ns();
                 self.write_title_change(&next, ts_ns);
@@ -2057,7 +1457,7 @@ impl WorkerState {
     }
 
     fn handle_name_change(&mut self, window_id: i64) {
-        let Some(previous) = self.foreground.clone() else {
+        let Some(previous) = self.foreground.as_ref() else {
             return;
         };
         if previous.hwnd != window_id {
@@ -2077,6 +1477,9 @@ impl WorkerState {
                 return;
             }
         };
+        if context.window_title == previous.title {
+            return;
+        }
         let next = ForegroundSnapshot {
             hwnd: context.hwnd,
             pid: context.pid,
@@ -2084,26 +1487,6 @@ impl WorkerState {
             process_path: context.process_path,
             title: context.window_title,
         };
-        match classify_foreground_transition(Some(&previous), &next) {
-            ForegroundTransition::Duplicate => return,
-            ForegroundTransition::TitleChurnSuppressed(reason) => {
-                self.record_suppressed_title_change(&next, reason);
-                self.foreground = Some(next);
-                return;
-            }
-            ForegroundTransition::Switched => {
-                tracing::debug!(
-                    code = "TIMELINE_NAMECHANGE_FOREGROUND_SWITCHED",
-                    hwnd = window_id,
-                    next_hwnd = next.hwnd,
-                    next_pid = next.pid,
-                    "NAMECHANGE readback no longer matches the previous foreground; next foreground poll will record the switch"
-                );
-                self.foreground = Some(next);
-                return;
-            }
-            ForegroundTransition::TitleChanged => {}
-        }
         let ts_ns = now_ts_ns();
         self.write_title_change(&next, ts_ns);
         self.assist.note_state_change();
@@ -2128,24 +1511,6 @@ impl WorkerState {
                 "pid": next.pid,
                 "hwnd": next.hwnd,
             }),
-        );
-    }
-
-    fn record_suppressed_title_change(&self, next: &ForegroundSnapshot, reason: TitleChurnReason) {
-        synapse_telemetry::metrics::counter!(
-            "timeline_title_changes_suppressed_total",
-            "app" => next.process_name.clone(),
-            "reason" => reason.as_str()
-        )
-        .increment(1);
-        tracing::debug!(
-            code = "TIMELINE_TITLE_CHANGE_SUPPRESSED",
-            app = %next.process_name,
-            hwnd = next.hwnd,
-            pid = next.pid,
-            reason = reason.as_str(),
-            semantic_title_sha256 = %sha256_hex(&normalize_title_for_churn(&next.title).semantic),
-            "suppressed volatile title-only churn; raw title omitted from metric labels and log"
         );
     }
 
@@ -2231,27 +1596,14 @@ impl WorkerState {
         self.apply_foreground(&context, "poll");
     }
 
-    fn write_session_end(&self, edge: &str) -> Result<()> {
-        if self.writer.suppressed(TimelineKind::SessionEnd, None) {
-            return Ok(());
-        }
-        self.writer
-            .try_write(
-                now_ts_ns(),
-                TimelineKind::SessionEnd,
-                TimelineActor::Human,
-                None,
-                session_end_payload(&self.writer, edge),
-            )
-            .inspect_err(|error| {
-                self.writer.write_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    code = "TIMELINE_WRITE_FAILED",
-                    kind = ?TimelineKind::SessionEnd,
-                    detail = %format!("{error:#}"),
-                    "failed to persist checked session_end row"
-                );
-            })
+    fn write_session_end(&self, edge: &str) {
+        self.writer.write_logged(
+            now_ts_ns(),
+            TimelineKind::SessionEnd,
+            TimelineActor::Human,
+            None,
+            session_end_payload(&self.writer, edge),
+        );
     }
 
     fn flush_interactions(&mut self) {
@@ -2391,19 +1743,9 @@ async fn run_worker(
             }
             RecorderMessage::Shutdown { done } => {
                 state.flush_interactions();
-                let storage_result = match state.write_session_end("shutdown") {
-                    Ok(()) => state.writer.flush_checked().map_err(|error| {
-                        state.writer.write_failures.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            code = "TIMELINE_FLUSH_FAILED",
-                            detail = %format!("{error:#}"),
-                            "failed to flush checked recorder shutdown boundary"
-                        );
-                        format!("{error:#}")
-                    }),
-                    Err(error) => Err(format!("{error:#}")),
-                };
-                let _ = done.send(storage_result);
+                state.write_session_end("shutdown");
+                state.writer.flush_logged();
+                let _ = done.send(());
                 tracing::info!(
                     code = "TIMELINE_RECORDER_STOPPED",
                     rows_written = state.writer.rows_written.load(Ordering::Relaxed),
@@ -2420,21 +1762,14 @@ async fn run_worker(
     );
 }
 
-async fn run_idle_probe(
-    sender: mpsc::UnboundedSender<RecorderMessage>,
-    poll_interval_ms: u64,
-    cancel: CancellationToken,
-) {
+async fn run_idle_probe(sender: mpsc::UnboundedSender<RecorderMessage>, poll_interval_ms: u64) {
     let period = Duration::from_millis(poll_interval_ms.max(1));
     // First tick after one full period (not immediately): spawn already
     // probed the idle source, and the WinEvent path covers startup state.
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            _ = interval.tick() => {}
-        }
+        interval.tick().await;
         match synapse_a11y::millis_since_last_input() {
             Ok(idle_ms) => {
                 if sender.send(RecorderMessage::IdleProbe { idle_ms }).is_err() {
@@ -2454,24 +1789,68 @@ async fn run_idle_probe(
 
 fn start_interaction_pipeline(
     recorder_sender: &mpsc::UnboundedSender<RecorderMessage>,
-) -> Result<(InteractionHook, RecorderTaskShutdownOwner)> {
+    live_input: &Arc<Mutex<LiveInputMarker>>,
+) -> Result<(InteractionHook, JoinHandle<()>)> {
     let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
     let hook = InteractionHook::start(interaction_tx)?;
     let recorder_sender = recorder_sender.clone();
-    let bridge = RecorderTaskShutdownOwner::new(
-        "interaction_bridge",
-        tokio::spawn(async move {
-            while let Some(event) = interaction_rx.recv().await {
-                if recorder_sender
-                    .send(RecorderMessage::Interaction(event))
-                    .is_err()
-                {
-                    return;
-                }
+    let live_input = Arc::clone(live_input);
+    let bridge = tokio::spawn(async move {
+        while let Some(event) = interaction_rx.recv().await {
+            let user_window = (!event.injected)
+                .then(|| super::input_window::resolve_user_window(&event))
+                .flatten();
+            let mut marker = match live_input.lock() {
+                Ok(marker) => marker,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            record_live_input(&mut marker, &event, user_window);
+            drop(marker);
+            if recorder_sender
+                .send(RecorderMessage::Interaction(event))
+                .is_err()
+            {
+                return;
             }
-        }),
-    );
+        }
+    });
     Ok((hook, bridge))
+}
+
+#[derive(Clone, Debug, Default)]
+struct LiveInputMarker {
+    monitor_started_ns: u64,
+    last_physical_ns: u64,
+    last_physical_kind: &'static str,
+    user_window: Option<ForegroundContext>,
+}
+
+fn record_live_input(
+    marker: &mut LiveInputMarker,
+    event: &InteractionEvent,
+    user_window: Option<ForegroundContext>,
+) {
+    if event.injected {
+        return;
+    }
+    marker.last_physical_ns = event.ts_ns;
+    marker.user_window = user_window;
+    marker.last_physical_kind = match event.kind {
+        InteractionEventKind::Keystroke => "keyboard",
+        InteractionEventKind::Click => "click",
+        InteractionEventKind::VerticalScroll { .. }
+        | InteractionEventKind::HorizontalScroll { .. } => "scroll",
+    };
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveInputReadback {
+    pub monitoring: bool,
+    /// When the input hook started (wall-clock ns); `None` before it runs.
+    pub monitor_started_ns: Option<u64>,
+    pub last_physical_ns: Option<u64>,
+    pub last_physical_kind: Option<&'static str>,
+    pub user_window: Option<ForegroundContext>,
 }
 
 /// Always-on operator-activity recorder. One per daemon; owns the timeline
@@ -2484,19 +1863,11 @@ pub struct ActivityRecorder {
     browser_nav_dedupe_keys: Mutex<VecDeque<String>>,
     shutdown_requested: AtomicBool,
     sink_closed_logged: AtomicBool,
-    producer_gate: RecorderProducerGate,
-    idle_probe_cancel: CancellationToken,
-    worker: Mutex<Option<RecorderTaskShutdownOwner>>,
-    idle_probe: Mutex<Option<RecorderTaskShutdownOwner>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    idle_probe: Mutex<Option<JoinHandle<()>>>,
     interaction_hook: Mutex<Option<InteractionHook>>,
-    interaction_bridge: Mutex<Option<RecorderTaskShutdownOwner>>,
-    retired_interaction_bridges: Mutex<Vec<RecorderTaskShutdownOwner>>,
-    interaction_hook_shutdown_reports:
-        Mutex<Vec<super::interaction_cadence::InteractionHookShutdownReport>>,
-    shutdown_report: Mutex<Option<ActivityRecorderShutdownReport>>,
-    shutdown_supervisor: Mutex<Option<JoinHandle<()>>>,
-    shutdown_supervisor_terminal: Mutex<Option<std::result::Result<(), String>>>,
-    shutdown_completion: watch::Sender<Option<ActivityRecorderShutdownReport>>,
+    interaction_bridge: Mutex<Option<JoinHandle<()>>>,
+    live_input: Arc<Mutex<LiveInputMarker>>,
 }
 
 impl std::fmt::Debug for ActivityRecorder {
@@ -2517,6 +1888,40 @@ impl std::fmt::Debug for ActivityRecorder {
 }
 
 impl ActivityRecorder {
+    #[must_use]
+    pub fn live_input_readback(&self) -> LiveInputReadback {
+        let monitoring = match self.interaction_hook.lock() {
+            Ok(hook) => hook.as_ref().is_some_and(|hook| {
+                hook.readback().keyboard_hook_installed && hook.readback().mouse_hook_installed
+            }),
+            Err(_) => false,
+        };
+        let marker = match self.live_input.lock() {
+            Ok(marker) => marker.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let started = marker.monitor_started_ns;
+        let since_start = |ns: u64| (started != 0 && ns >= started).then_some(ns);
+        let event_ns = since_start(marker.last_physical_ns);
+        // Owner-away mode: a physical mouse move also counts as the owner
+        // being present (coalesced in the hook; never a cadence event).
+        let move_ns = super::interaction_cadence::last_physical_move_ns().and_then(since_start);
+        let move_is_newest = move_ns > event_ns;
+        LiveInputReadback {
+            monitoring,
+            monitor_started_ns: (started != 0).then_some(started),
+            last_physical_ns: event_ns.max(move_ns),
+            last_physical_kind: if move_is_newest {
+                Some("mouse_move")
+            } else {
+                event_ns
+                    .filter(|_| !marker.last_physical_kind.is_empty())
+                    .map(|_| marker.last_physical_kind)
+            },
+            user_window: event_ns.and(marker.user_window),
+        }
+    }
+
     /// Starts the recorder: probes the idle source once (fail-fast on a
     /// platform where idle tracking cannot work), writes the `session_start`
     /// row synchronously (fail-fast on a broken write path), then spawns the
@@ -2580,39 +1985,12 @@ impl ActivityRecorder {
                     }),
                 )
                 .context("write CF_TIMELINE session_start row at recorder startup")?;
-            // Keep startup fail-loud by forcing an explicit WAL sync after
-            // the initial session row is written.
-            if let Err(primary) = writer
-                .flush_checked()
-                .context("flush CF_TIMELINE session_start row at recorder startup")
-            {
-                writer.write_failures.fetch_add(1, Ordering::Relaxed);
-                let cleanup = writer
-                    .try_write(
-                        now_ts_ns(),
-                        TimelineKind::SessionEnd,
-                        TimelineActor::Human,
-                        None,
-                        session_end_payload(&writer, "startup_session_start_flush_failed"),
-                    )
-                    .context("write compensating session_end after startup flush failure")
-                    .and_then(|()| {
-                        writer
-                            .flush_checked()
-                            .context("flush compensating session_end after startup flush failure")
-                    });
-                match cleanup {
-                    Ok(()) => anyhow::bail!(
-                        "{primary:#}; compensating session_end was committed before startup unwind"
-                    ),
-                    Err(cleanup_error) => {
-                        writer.write_failures.fetch_add(1, Ordering::Relaxed);
-                        anyhow::bail!(
-                            "{primary:#}; recorder startup storage cleanup also failed: {cleanup_error:#}"
-                        );
-                    }
-                }
-            }
+            // The batcher acks on enqueue; flush so a broken write path fails
+            // the daemon at startup instead of surfacing 100 ms later in a log.
+            writer
+                .db
+                .flush()
+                .context("flush CF_TIMELINE session_start row at recorder startup")?;
         }
 
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -2631,52 +2009,21 @@ impl ActivityRecorder {
             assist: AssistDetector::default(),
             assist_sink,
         };
-        // Interaction-hook installation is fallible and may itself create a
-        // bridge task. Complete it before the infallible Tokio spawns below so
-        // an installation error cannot detach already-started recorder owners.
-        let (interaction_hook, interaction_bridge) = if writer.control.is_paused()
-            || !config.interaction_hook_enabled
-        {
-            (None, None)
-        } else {
-            match start_interaction_pipeline(&sender) {
-                Ok((hook, bridge)) => (Some(hook), Some(bridge)),
-                Err(primary) => {
-                    let cleanup = writer
-                        .try_write(
-                            now_ts_ns(),
-                            TimelineKind::SessionEnd,
-                            TimelineActor::Human,
-                            None,
-                            session_end_payload(&writer, "startup_interaction_hook_failed"),
-                        )
-                        .context("write session_end after interaction-hook startup failure")
-                        .and_then(|()| {
-                            writer
-                                .flush_checked()
-                                .context("flush session_end after interaction-hook startup failure")
-                        });
-                    if let Err(cleanup_error) = cleanup {
-                        writer.write_failures.fetch_add(1, Ordering::Relaxed);
-                        anyhow::bail!(
-                            "start counts-only interaction cadence hook: {primary:#}; recorder startup storage cleanup also failed: {cleanup_error:#}"
-                        );
-                    }
-                    return Err(primary).context("start counts-only interaction cadence hook");
+        let worker = tokio::spawn(run_worker(receiver, state));
+        let idle_probe = tokio::spawn(run_idle_probe(sender.clone(), config.idle_poll_interval_ms));
+        let live_input = Arc::new(Mutex::new(LiveInputMarker::default()));
+        let (interaction_hook, interaction_bridge) =
+            if writer.control.is_paused() || !config.interaction_hook_enabled {
+                (None, None)
+            } else {
+                let (hook, bridge) = start_interaction_pipeline(&sender, &live_input)
+                    .context("start counts-only interaction cadence hook")?;
+                match live_input.lock() {
+                    Ok(mut marker) => marker.monitor_started_ns = now_ts_ns(),
+                    Err(poisoned) => poisoned.into_inner().monitor_started_ns = now_ts_ns(),
                 }
-            }
-        };
-        let idle_probe_cancel = CancellationToken::new();
-        let worker =
-            RecorderTaskShutdownOwner::new("worker", tokio::spawn(run_worker(receiver, state)));
-        let idle_probe = RecorderTaskShutdownOwner::new(
-            "idle_probe",
-            tokio::spawn(run_idle_probe(
-                sender.clone(),
-                config.idle_poll_interval_ms,
-                idle_probe_cancel.clone(),
-            )),
-        );
+                (Some(hook), Some(bridge))
+            };
         tracing::info!(
             code = "TIMELINE_RECORDER_STARTED",
             idle_timeout_ms = config.idle_timeout_ms,
@@ -2688,7 +2035,6 @@ impl ActivityRecorder {
                 .unwrap_or(0),
             "activity recorder started"
         );
-        let (shutdown_completion, _shutdown_completion_rx) = watch::channel(None);
         Ok(Self {
             sender,
             writer,
@@ -2697,27 +2043,17 @@ impl ActivityRecorder {
             browser_nav_dedupe_keys: Mutex::new(VecDeque::new()),
             shutdown_requested: AtomicBool::new(false),
             sink_closed_logged: AtomicBool::new(false),
-            producer_gate: RecorderProducerGate::default(),
-            idle_probe_cancel,
             worker: Mutex::new(Some(worker)),
             idle_probe: Mutex::new(Some(idle_probe)),
             interaction_hook: Mutex::new(interaction_hook),
             interaction_bridge: Mutex::new(interaction_bridge),
-            retired_interaction_bridges: Mutex::new(Vec::new()),
-            interaction_hook_shutdown_reports: Mutex::new(Vec::new()),
-            shutdown_report: Mutex::new(None),
-            shutdown_supervisor: Mutex::new(None),
-            shutdown_supervisor_terminal: Mutex::new(None),
-            shutdown_completion,
+            live_input,
         })
     }
 
     /// Cheap, non-blocking sink for the WinEvent bridge. Irrelevant kinds are
     /// filtered before crossing the channel.
     pub fn record_accessible_event(&self, event: &AccessibleEvent) {
-        let Some(_producer_permit) = self.producer_gate.enter() else {
-            return;
-        };
         self.writer.demo_recording.record_accessible_event(event);
         if !matches!(
             event.kind,
@@ -2749,9 +2085,6 @@ impl ActivityRecorder {
         clipboard: Option<&ClipboardTimelineSample>,
         fs_events: &[FsTimelineEvent],
     ) {
-        let Some(_producer_permit) = self.producer_gate.enter() else {
-            return;
-        };
         let mut wrote_any = false;
         if let Some(sample) = clipboard {
             wrote_any |= self.record_clipboard_sample(observation, sample);
@@ -2765,9 +2098,6 @@ impl ActivityRecorder {
     }
 
     pub fn record_browser_navigation(&self, event: BrowserNavigationEvent) -> bool {
-        let Some(_producer_permit) = self.producer_gate.enter() else {
-            return false;
-        };
         let dedupe_key = browser_nav_dedupe_key(&event);
         let event = redact_browser_navigation_event(event);
         let url = event.url.trim();
@@ -2841,409 +2171,48 @@ impl ActivityRecorder {
         }
     }
 
-    /// Graceful stop with terminal readback for every owned Tokio task.
-    /// Repeated callers receive the same completed physical report.
-    ///
-    /// The exact-owner drain runs in a supervisor task holding its own `Arc`.
-    /// Cancelling a caller therefore cannot drop the in-flight JoinHandles or
-    /// detach recorder work. The supervisor's exact JoinHandle remains stored
-    /// on the recorder, and every caller waits on the same completion channel.
-    /// The wait itself is bounded: a supervisor that cannot reach a terminal
-    /// result is aborted by exact handle, retained in the global owner ledger,
-    /// and reported as non-graceful instead of hanging daemon shutdown.
-    pub async fn shutdown(self: &Arc<Self>) -> ActivityRecorderShutdownReport {
-        let mut completion = self.shutdown_completion.subscribe();
+    /// Graceful stop: drains the worker, writes `session_end`, and stops the
+    /// idle probe. Idempotent.
+    pub async fn shutdown(&self) {
+        if self.shutdown_requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(probe) = self.take_task(&self.idle_probe) {
+            probe.abort();
+        }
+        self.stop_interaction_hook();
+        let (done_tx, done_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RecorderMessage::Shutdown { done: done_tx })
+            .is_err()
         {
-            let mut supervisor = match self.shutdown_supervisor.lock() {
-                Ok(supervisor) => supervisor,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let shutdown_already_terminal = self.cached_shutdown_report().is_some()
-                || match self.shutdown_supervisor_terminal.lock() {
-                    Ok(outcome) => outcome.is_some(),
-                    Err(poisoned) => poisoned.into_inner().is_some(),
-                };
-            if supervisor.is_none() && !shutdown_already_terminal {
-                let recorder = Arc::clone(self);
-                *supervisor = Some(tokio::spawn(async move {
-                    let outcome = AssertUnwindSafe(recorder.shutdown_inner())
-                        .catch_unwind()
-                        .await;
-                    let report = match outcome {
-                        Ok(report) => report,
-                        Err(payload) => {
-                            let detail = payload.downcast_ref::<&str>().map_or_else(
-                                || {
-                                    payload.downcast_ref::<String>().map_or_else(
-                                        || "non-string panic payload".to_owned(),
-                                        Clone::clone,
-                                    )
-                                },
-                                |detail| (*detail).to_owned(),
-                            );
-                            recorder.shutdown_supervisor_failure_report(format!(
-                                "recorder shutdown supervisor panicked: {detail}"
-                            ))
-                        }
-                    };
-                    recorder.publish_shutdown_report(report);
-                }));
-            }
-        }
-
-        let deadline = Instant::now() + RECORDER_SHUTDOWN_SUPERVISOR_TIMEOUT;
-        loop {
-            let cached_report = self.cached_shutdown_report();
-            if let Some(supervisor_outcome) = self.account_shutdown_supervisor(false) {
-                return match (cached_report, supervisor_outcome) {
-                    (Some(report), Ok(())) => report,
-                    (Some(report), Err(failure)) => {
-                        let report = self.with_shutdown_supervisor_failure(report, failure);
-                        self.publish_shutdown_report(report.clone());
-                        report
-                    }
-                    (None, Ok(())) => {
-                        let report = self.shutdown_supervisor_failure_report(
-                            "recorder shutdown supervisor terminated without publishing a report"
-                                .to_owned(),
-                        );
-                        self.publish_shutdown_report(report.clone());
-                        report
-                    }
-                    (None, Err(failure)) => {
-                        let report = self.shutdown_supervisor_failure_report(failure);
-                        self.publish_shutdown_report(report.clone());
-                        report
-                    }
-                };
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let failure = match self.account_shutdown_supervisor(true) {
-                    Some(Ok(())) => {
-                        return match self.cached_shutdown_report() {
-                            Some(report) => report,
-                            None => {
-                                let report = self.shutdown_supervisor_failure_report(
-                                    "recorder shutdown supervisor terminated without publishing a report"
-                                        .to_owned(),
-                                );
-                                self.publish_shutdown_report(report.clone());
-                                report
-                            }
-                        };
-                    }
-                    Some(Err(failure)) => failure,
-                    None => format!(
-                        "recorder shutdown supervisor exceeded its {} ms terminal deadline",
-                        RECORDER_SHUTDOWN_SUPERVISOR_TIMEOUT.as_millis()
-                    ),
-                };
-                let report = match self.cached_shutdown_report() {
-                    Some(report) => self.with_shutdown_supervisor_failure(report, failure),
-                    None => self.shutdown_supervisor_failure_report(failure),
-                };
-                self.publish_shutdown_report(report.clone());
-                return report;
-            }
-
-            let poll = remaining.min(RECORDER_SHUTDOWN_SUPERVISOR_POLL_INTERVAL);
-            match tokio::time::timeout(poll, completion.changed()).await {
-                Ok(Ok(())) | Err(_) => {}
-                Ok(Err(_closed)) => {
-                    let failure =
-                        "recorder shutdown completion channel closed before a report".to_owned();
-                    let _ = self.account_shutdown_supervisor(true);
-                    let report = match self.cached_shutdown_report() {
-                        Some(report) => self.with_shutdown_supervisor_failure(report, failure),
-                        None => self.shutdown_supervisor_failure_report(failure),
-                    };
-                    self.publish_shutdown_report(report.clone());
-                    return report;
-                }
-            }
-        }
-    }
-
-    fn cached_shutdown_report(&self) -> Option<ActivityRecorderShutdownReport> {
-        match self.shutdown_report.lock() {
-            Ok(report) => report.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
-    }
-
-    fn publish_shutdown_report(&self, report: ActivityRecorderShutdownReport) {
-        match self.shutdown_report.lock() {
-            Ok(mut cached) => *cached = Some(report.clone()),
-            Err(poisoned) => *poisoned.into_inner() = Some(report.clone()),
-        }
-        self.shutdown_completion.send_replace(Some(report));
-    }
-
-    fn account_shutdown_supervisor(
-        &self,
-        abort_live: bool,
-    ) -> Option<std::result::Result<(), String>> {
-        let cached = match self.shutdown_supervisor_terminal.lock() {
-            Ok(outcome) => outcome.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        if cached.is_some() {
-            return cached;
-        }
-
-        let mut supervisor = match self.shutdown_supervisor.lock() {
-            Ok(supervisor) => supervisor,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let task_finished = supervisor.as_ref().is_some_and(JoinHandle::is_finished);
-        if !task_finished && !abort_live {
-            return None;
-        }
-        let Some(mut task) = supervisor.take() else {
-            return None;
-        };
-        let outcome = if task_finished {
-            match (&mut task).now_or_never() {
-                Some(Ok(())) => Ok(()),
-                Some(Err(error)) => Err(format!(
-                    "recorder shutdown supervisor join failed after terminal readback: {error}"
-                )),
-                None => {
-                    // `is_finished` is only a hint until the JoinHandle yields.
-                    // Restore exact ownership and retry on the next poll.
-                    *supervisor = Some(task);
-                    return None;
-                }
-            }
-        } else {
-            task.abort();
-            retain_recorder_task_owner("shutdown_supervisor_timeout", task);
-            Err(format!(
-                "recorder shutdown supervisor exceeded its {} ms terminal deadline; exact JoinHandle aborted and retained until physical termination",
-                RECORDER_SHUTDOWN_SUPERVISOR_TIMEOUT.as_millis()
-            ))
-        };
-        match self.shutdown_supervisor_terminal.lock() {
-            Ok(mut cached) => *cached = Some(outcome.clone()),
-            Err(poisoned) => *poisoned.into_inner() = Some(outcome.clone()),
-        }
-        drop(supervisor);
-        Some(outcome)
-    }
-
-    fn with_shutdown_supervisor_failure(
-        &self,
-        mut report: ActivityRecorderShutdownReport,
-        failure: String,
-    ) -> ActivityRecorderShutdownReport {
-        report.owner_accounting_complete = false;
-        report.retained_task_owners = retained_task_owner_count();
-        report.pipeline_task_owners_remaining = self.pipeline_task_owner_count();
-        (report.producer_gate_closed, report.producer_gate_in_flight) =
-            self.producer_gate.readback();
-        if !report.failures.contains(&failure) {
-            report.failures.push(failure.clone());
-        }
-        if !report.task_drain.failures.contains(&failure) {
-            report.task_drain.failures.push(failure);
-        }
-        report
-    }
-
-    fn shutdown_supervisor_failure_report(
-        &self,
-        failure: String,
-    ) -> ActivityRecorderShutdownReport {
-        let (producer_gate_closed, producer_gate_in_flight) = self.producer_gate.readback();
-        ActivityRecorderShutdownReport {
-            shutdown_message_delivered: false,
-            shutdown_reply_received: false,
-            worker_boundary_committed: false,
-            fallback_attempted: false,
-            fallback_committed: false,
-            producer_gate_closed,
-            producer_gate_in_flight,
-            pipeline_task_owners_remaining: self.pipeline_task_owner_count(),
-            task_drain: ActivityRecorderTaskDrainReport {
-                tasks_before: 0,
-                graceful_joined: 0,
-                abort_requests_sent: 0,
-                joined_after_abort: 0,
-                still_live_task_names: Vec::new(),
-                failures: vec![failure.clone()],
-            },
-            owner_accounting_complete: false,
-            retained_task_owners: retained_task_owner_count(),
-            interaction_hook_owners_quiescent: false,
-            rows_written: self.writer.rows_written.load(Ordering::Relaxed),
-            write_failures: self.writer.write_failures.load(Ordering::Relaxed),
-            failures: vec![failure],
-        }
-    }
-
-    async fn shutdown_inner(&self) -> ActivityRecorderShutdownReport {
-        // Close admission first, then wait for every synchronous writer or
-        // pause/resume transition that entered before closure. A producer can
-        // be inside storage or hook teardown, so this boundary is bounded too:
-        // on timeout the recorder keeps every pipeline owner resident and
-        // returns a fail-closed readback instead of killing work underneath a
-        // still-active synchronous producer.
-        let (producer_gate_closed, _producer_gate_in_flight_at_close) = self.producer_gate.close();
-        self.shutdown_requested.store(true, Ordering::SeqCst);
-        let (producer_gate_closed_after_drain, producer_gate_in_flight) = self
-            .producer_gate
-            .wait_for_quiescence_async(RECORDER_PRODUCER_DRAIN_TIMEOUT)
-            .await;
-        let producer_gate_closed = producer_gate_closed && producer_gate_closed_after_drain;
-        if producer_gate_in_flight != 0 {
-            return self.shutdown_supervisor_failure_report(format!(
-                "{} synchronous recorder producer(s) remained in flight after the {} ms admission-drain deadline",
-                producer_gate_in_flight,
-                RECORDER_PRODUCER_DRAIN_TIMEOUT.as_millis()
-            ));
-        }
-        debug_assert!(producer_gate_closed);
-        self.idle_probe_cancel.cancel();
-        let interaction_pipeline_expected =
-            self.config.interaction_hook_enabled && !self.writer.control.is_paused();
-        let current_hook_report_present = self.stop_interaction_hook("recorder_shutdown").is_some();
-        let worker = self.take_task_owner(&self.worker);
-        let idle_probe = self.take_task_owner(&self.idle_probe);
-        let worker_owner_present = worker.is_some();
-        let idle_probe_owner_present = idle_probe.is_some();
-        let interaction_bridges = match self.retired_interaction_bridges.lock() {
-            Ok(mut bridges) => std::mem::take(&mut *bridges),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
-        let interaction_bridge_owner_count = interaction_bridges.len();
-
-        let mut failures = Vec::new();
-        let mut producer_tasks = Vec::new();
-        if let Some(idle_probe) = idle_probe {
-            producer_tasks.push(idle_probe);
-        } else {
-            failures
-                .push("activity recorder idle-probe JoinHandle was missing at shutdown".to_owned());
-        }
-        producer_tasks.extend(interaction_bridges);
-        // Producers must reach a terminal state before the worker receives its
-        // Shutdown boundary. Otherwise a bridge can enqueue cadence after the
-        // worker has written session_end, silently reordering or dropping it.
-        let producer_task_drain = drain_activity_recorder_tasks(producer_tasks).await;
-
-        let (shutdown_message_delivered, mut shutdown_ack) = if worker.is_some() {
-            let (done_tx, done_rx) = oneshot::channel();
-            if self
-                .sender
-                .send(RecorderMessage::Shutdown { done: done_tx })
-                .is_ok()
-            {
-                (true, Some(done_rx))
-            } else {
-                failures.push(
-                    "activity recorder worker channel closed before shutdown message".to_owned(),
-                );
-                (false, None)
-            }
-        } else {
-            failures.push("activity recorder worker JoinHandle was missing at shutdown".to_owned());
             tracing::error!(
                 code = "TIMELINE_RECORDER_SHUTDOWN_WORKER_GONE",
-                "activity recorder worker owner was missing at shutdown; direct boundary fallback is unsafe without terminal proof"
+                "activity recorder worker was already gone at shutdown; writing session_end directly"
             );
-            (false, None)
-        };
-
-        let mut worker_tasks = Vec::new();
-        if let Some(worker) = worker {
-            worker_tasks.push(worker);
+            self.write_session_end_direct("shutdown_worker_gone");
+            return;
         }
-        let worker_task_drain = drain_activity_recorder_tasks(worker_tasks).await;
-        let worker_proven_terminal = worker_owner_present && worker_task_drain.owners_quiescent();
-        let task_drain = producer_task_drain.merge(worker_task_drain);
-        let hook_reports = match self.interaction_hook_shutdown_reports.lock() {
-            Ok(mut reports) => std::mem::take(&mut *reports),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
-        let interaction_hook_owners_quiescent = hook_reports
-            .iter()
-            .all(super::interaction_cadence::InteractionHookShutdownReport::owners_quiescent);
-        let owner_accounting_complete = worker_owner_present
-            && idle_probe_owner_present
-            && (!interaction_pipeline_expected || current_hook_report_present)
-            && hook_reports.len() == interaction_bridge_owner_count;
-        for report in &hook_reports {
-            if let Err(error) = report.verdict() {
-                failures.push(format!("interaction hook: {error:#}"));
+        match tokio::time::timeout(SHUTDOWN_ACK_TIMEOUT, done_rx).await {
+            Ok(Ok(())) => {
+                if let Some(worker) = self.take_task(&self.worker) {
+                    let _ = worker.await;
+                }
             }
-        }
-
-        let (shutdown_reply_received, worker_boundary_committed, fallback_edge) = match shutdown_ack
-            .as_mut()
-        {
-            Some(receiver) => match receiver.try_recv() {
-                Ok(Ok(())) => (true, true, None),
-                Ok(Err(storage_error)) => {
-                    failures.push(format!(
-                        "activity recorder worker reported a failed shutdown storage boundary: {storage_error}"
-                    ));
-                    (true, false, Some("shutdown_storage_failed"))
-                }
-                Err(error) => {
-                    failures.push(format!(
-                        "activity recorder worker did not publish its shutdown reply after the join attempt: {error}"
-                    ));
-                    (false, false, Some("shutdown_unacknowledged"))
-                }
-            },
-            None => (false, false, Some("shutdown_worker_gone")),
-        };
-        let mut fallback_attempted = false;
-        let mut fallback_committed = false;
-        if let Some(edge) = fallback_edge {
-            if worker_proven_terminal {
-                fallback_attempted = true;
-                match self.write_session_end_direct(edge) {
-                    Ok(()) => fallback_committed = true,
-                    Err(fallback_error) => failures.push(format!(
-                        "direct session_end fallback failed after worker boundary failure: {fallback_error:#}"
-                    )),
-                }
-            } else {
-                failures.push(
-                    "direct session_end fallback was not attempted because the worker was not proven terminal"
-                        .to_owned(),
+            _ => {
+                tracing::error!(
+                    code = "TIMELINE_RECORDER_SHUTDOWN_TIMEOUT",
+                    timeout_ms =
+                        u64::try_from(SHUTDOWN_ACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    "activity recorder worker did not acknowledge shutdown; aborting it"
                 );
+                if let Some(worker) = self.take_task(&self.worker) {
+                    worker.abort();
+                }
+                self.write_session_end_direct("shutdown_timeout");
             }
         }
-        let (rows_written, write_failures) = self.readback();
-        let retained_task_owners = retained_task_owner_count();
-        let report = ActivityRecorderShutdownReport {
-            shutdown_message_delivered,
-            shutdown_reply_received,
-            worker_boundary_committed,
-            fallback_attempted,
-            fallback_committed,
-            producer_gate_closed,
-            producer_gate_in_flight,
-            pipeline_task_owners_remaining: self.pipeline_task_owner_count(),
-            task_drain,
-            owner_accounting_complete,
-            retained_task_owners,
-            interaction_hook_owners_quiescent,
-            rows_written,
-            write_failures,
-            failures,
-        };
-        tracing::info!(
-            code = "TIMELINE_RECORDER_SHUTDOWN_READBACK",
-            owners_quiescent = report.owners_quiescent(),
-            report = ?report,
-            "readback=activity_recorder_task_owners edge=shutdown after_join"
-        );
-        report
     }
 
     fn record_clipboard_sample(
@@ -3367,7 +2336,7 @@ impl ActivityRecorder {
         }
     }
 
-    /// Live counters for health/manual FSV readback.
+    /// Live counters for health/FSV readback.
     #[must_use]
     pub fn readback(&self) -> (u64, u64) {
         (
@@ -3376,7 +2345,7 @@ impl ActivityRecorder {
         )
     }
 
-    /// Suppressed-row counters: `(paused, excluded)` (#843 manual FSV readback).
+    /// Suppressed-row counters: `(paused, excluded)` (#843 FSV readback).
     #[must_use]
     pub fn suppressed_counters(&self) -> (u64, u64) {
         (
@@ -3397,20 +2366,12 @@ impl ActivityRecorder {
         paused_until_ns: Option<u64>,
         changed_by: &str,
     ) -> Result<RecorderControlOutcome> {
-        let _producer_permit = self
-            .producer_gate
-            .enter()
-            .context("timeline recorder is shutting down; pause was not applied")?;
         if self.config.interaction_hook_enabled {
             self.flush_interactions_blocking();
         }
         let outcome = pause_recording(&self.writer, paused_until_ns, changed_by)?;
         if !outcome.was_paused {
-            if let Some(report) = self.stop_interaction_hook("timeline_pause") {
-                report
-                    .verdict()
-                    .context("timeline paused but interaction-hook shutdown was incomplete")?;
-            }
+            self.stop_interaction_hook();
         }
         Ok(outcome)
     }
@@ -3423,10 +2384,6 @@ impl ActivityRecorder {
     /// or when the boundary row fails (resumed, write path broken — the
     /// error says so explicitly).
     pub fn resume(&self, changed_by: &str) -> Result<RecorderControlOutcome> {
-        let _producer_permit = self
-            .producer_gate
-            .enter()
-            .context("timeline recorder is shutting down; resume was not applied")?;
         let outcome = resume_recording(&self.writer, changed_by)?;
         if outcome.was_paused && self.config.interaction_hook_enabled {
             self.start_interaction_hook()
@@ -3435,30 +2392,7 @@ impl ActivityRecorder {
         Ok(outcome)
     }
 
-    fn pipeline_task_owner_count(&self) -> usize {
-        let worker = match self.worker.lock() {
-            Ok(owner) => usize::from(owner.is_some()),
-            Err(poisoned) => usize::from(poisoned.into_inner().is_some()),
-        };
-        let idle_probe = match self.idle_probe.lock() {
-            Ok(owner) => usize::from(owner.is_some()),
-            Err(poisoned) => usize::from(poisoned.into_inner().is_some()),
-        };
-        let interaction_bridge = match self.interaction_bridge.lock() {
-            Ok(owner) => usize::from(owner.is_some()),
-            Err(poisoned) => usize::from(poisoned.into_inner().is_some()),
-        };
-        let retired_interaction_bridges = match self.retired_interaction_bridges.lock() {
-            Ok(owners) => owners.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
-        };
-        worker + idle_probe + interaction_bridge + retired_interaction_bridges
-    }
-
-    fn take_task_owner(
-        &self,
-        slot: &Mutex<Option<RecorderTaskShutdownOwner>>,
-    ) -> Option<RecorderTaskShutdownOwner> {
+    fn take_task(&self, slot: &Mutex<Option<JoinHandle<()>>>) -> Option<JoinHandle<()>> {
         match slot.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -3473,8 +2407,12 @@ impl ActivityRecorder {
         if guard.is_some() {
             return Ok(());
         }
-        let (hook, bridge) = start_interaction_pipeline(&self.sender)
+        let (hook, bridge) = start_interaction_pipeline(&self.sender, &self.live_input)
             .context("start counts-only interaction cadence hook")?;
+        match self.live_input.lock() {
+            Ok(mut marker) => marker.monitor_started_ns = now_ts_ns(),
+            Err(poisoned) => poisoned.into_inner().monitor_started_ns = now_ts_ns(),
+        }
         tracing::info!(
             code = "TIMELINE_INTERACTION_HOOK_STARTED",
             thread_id = hook.readback().thread_id,
@@ -3490,45 +2428,24 @@ impl ActivityRecorder {
         Ok(())
     }
 
-    fn stop_interaction_hook(
-        &self,
-        reason: &'static str,
-    ) -> Option<super::interaction_cadence::InteractionHookShutdownReport> {
+    fn stop_interaction_hook(&self) {
         let mut guard = match self.interaction_hook.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let hook_report = guard
-            .take()
-            .map(|hook| hook.shutdown_checked(RECORDER_INTERACTION_HOOK_STOP_TIMEOUT, reason));
-        drop(guard);
-        if let Some(report) = hook_report.as_ref() {
+        if guard.take().is_some() {
             tracing::info!(
                 code = "TIMELINE_INTERACTION_HOOK_STOPPED",
-                owners_quiescent = report.owners_quiescent(),
-                report = ?report,
-                "interaction cadence hook shutdown completed with terminal readback"
+                "interaction cadence hook stopped"
             );
-            match self.interaction_hook_shutdown_reports.lock() {
-                Ok(mut reports) => reports.push(report.clone()),
-                Err(poisoned) => poisoned.into_inner().push(report.clone()),
-            }
         }
         let bridge = match self.interaction_bridge.lock() {
             Ok(mut bridge_guard) => bridge_guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(bridge) = bridge {
-            // Dropping the hook closes its sender, so the bridge exits
-            // cooperatively. Retain the exact JoinHandle until recorder
-            // shutdown proves the owner terminal; abort-and-drop here would
-            // detach it every time recording is paused.
-            match self.retired_interaction_bridges.lock() {
-                Ok(mut retired) => retired.push(bridge),
-                Err(poisoned) => poisoned.into_inner().push(bridge),
-            }
+            bridge.abort();
         }
-        hook_report
     }
 
     fn flush_interactions_blocking(&self) {
@@ -3544,7 +2461,7 @@ impl ActivityRecorder {
             );
             return;
         }
-        let deadline = Instant::now() + RECORDER_TASK_STOP_TIMEOUT;
+        let deadline = Instant::now() + SHUTDOWN_ACK_TIMEOUT;
         loop {
             match done_rx.try_recv() {
                 Ok(()) => return,
@@ -3569,34 +2486,23 @@ impl ActivityRecorder {
         }
     }
 
-    fn write_session_end_direct(&self, edge: &str) -> Result<()> {
-        if !self.writer.suppressed(TimelineKind::SessionEnd, None) {
-            self.writer
-                .try_write(
-                    now_ts_ns(),
-                    TimelineKind::SessionEnd,
-                    TimelineActor::Human,
-                    None,
-                    session_end_payload(&self.writer, edge),
-                )
-                .inspect_err(|error| {
-                    self.writer.write_failures.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        code = "TIMELINE_WRITE_FAILED",
-                        kind = ?TimelineKind::SessionEnd,
-                        detail = %format!("{error:#}"),
-                        "failed to persist checked direct session_end row"
-                    );
-                })?;
-        }
-        self.writer.flush_checked().inspect_err(|error| {
+    fn write_session_end_direct(&self, edge: &str) {
+        if let Err(error) = self.writer.try_write(
+            now_ts_ns(),
+            TimelineKind::SessionEnd,
+            TimelineActor::Human,
+            None,
+            session_end_payload(&self.writer, edge),
+        ) {
             self.writer.write_failures.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                code = "TIMELINE_FLUSH_FAILED",
+                code = "TIMELINE_WRITE_FAILED",
+                kind = ?TimelineKind::SessionEnd,
                 detail = %format!("{error:#}"),
-                "failed to flush checked direct session_end boundary"
+                "failed to persist session_end row"
             );
-        })
+        }
+        self.writer.flush_logged();
     }
 }
 
@@ -3611,85 +2517,21 @@ const fn fs_event_kind_name(kind: FsEventKind) -> &'static str {
 
 impl Drop for ActivityRecorder {
     fn drop(&mut self) {
-        let graceful_shutdown_started = self.shutdown_requested.swap(true, Ordering::SeqCst);
-        // Drop must never wait for a synchronous producer: checked async
-        // shutdown owns the bounded admission drain. Close admission, preserve
-        // a process-global sticky incident for any unresolved permit, then
-        // retain/abort the exact asynchronous owners below. The final daemon
-        // lifetime-lock gate reads that global incident before admitting a
-        // successor.
-        let (producer_gate_closed, producer_gate_in_flight) =
-            close_producer_gate_for_drop(&self.producer_gate);
-        if producer_gate_in_flight != 0 {
-            record_unresolved_drop_producers(producer_gate_in_flight);
-            tracing::error!(
-                code = "TIMELINE_RECORDER_DROP_PRODUCERS_UNRESOLVED",
-                producer_gate_closed,
-                producer_gate_in_flight,
-                retained_owner_readback = ?retained_owner_readback(),
-                "activity recorder Drop closed admission without blocking; unresolved synchronous producers remain a lifetime-lock incident"
-            );
+        if let Some(probe) = self.take_task(&self.idle_probe) {
+            probe.abort();
         }
-        self.idle_probe_cancel.cancel();
-        if let Some(mut probe) = self.take_task_owner(&self.idle_probe) {
-            probe.abort_and_retain("recorder_drop");
+        self.stop_interaction_hook();
+        if let Some(worker) = self.take_task(&self.worker) {
+            worker.abort();
         }
-        if let Some(report) = self.stop_interaction_hook("recorder_drop")
-            && let Err(error) = report.verdict()
-        {
-            tracing::error!(
-                code = "TIMELINE_INTERACTION_HOOK_DROP_INCOMPLETE",
-                detail = %format!("{error:#}"),
-                report = ?report,
-                "recorder drop could not prove the interaction-hook owner terminal"
-            );
-        }
-        let retired = match self.retired_interaction_bridges.lock() {
-            Ok(mut bridges) => std::mem::take(&mut *bridges),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
-        for mut bridge in retired {
-            bridge.abort_and_retain("recorder_drop");
-        }
-        if let Some(mut worker) = self.take_task_owner(&self.worker) {
-            worker.abort_and_retain("recorder_drop");
-        }
-        let supervisor = match self.shutdown_supervisor.lock() {
-            Ok(mut supervisor) => supervisor.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(mut supervisor) = supervisor {
-            if supervisor.is_finished() {
-                match (&mut supervisor).now_or_never() {
-                    Some(Ok(())) => {}
-                    Some(Err(error)) => tracing::error!(
-                        code = "TIMELINE_RECORDER_SHUTDOWN_SUPERVISOR_DROP_JOIN_FAILED",
-                        detail = %error,
-                        "terminal recorder shutdown supervisor failed before recorder drop"
-                    ),
-                    None => {
-                        supervisor.abort();
-                        retain_recorder_task_owner(
-                            "shutdown_supervisor_drop_readback_race",
-                            supervisor,
-                        );
-                    }
-                }
-            } else {
-                supervisor.abort();
-                retain_recorder_task_owner("shutdown_supervisor_drop_backstop", supervisor);
-            }
-        }
-        if !graceful_shutdown_started {
-            // A synchronous Drop cannot await Tokio task termination. Writing
-            // session_end here would falsely claim ordering while retained
-            // producers or the worker may still run. Preserve exact owners and
-            // emit a loud readback instead; checked shutdown owns the boundary.
-            tracing::error!(
-                code = "TIMELINE_RECORDER_DROP_WITHOUT_CHECKED_SHUTDOWN",
-                retained_task_owners = retained_task_owner_count(),
-                "activity recorder dropped without checked shutdown; no unordered session_end was written"
-            );
+        // Backstop: an unwound daemon still closes the recorder session so
+        // the timeline never shows a session_start without a matching end.
+        if !self.shutdown_requested.swap(true, Ordering::SeqCst) {
+            self.write_session_end_direct("drop");
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/live_user_input.rs"]
+mod live_user_input_tests;

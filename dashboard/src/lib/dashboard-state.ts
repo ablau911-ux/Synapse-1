@@ -1,4 +1,4 @@
-import { asArray, asRecord, rawText } from "@/lib/utils";
+import { asArray, asRecord, dashboardHeaders, rawText } from "@/lib/utils";
 
 export interface DashboardPanel<T = unknown> {
   status: "ok" | "error" | "unavailable";
@@ -927,7 +927,7 @@ export interface DashboardControlResponse {
 export type DashboardRouteReadback = Record<string, unknown>;
 
 function jsonHeaders(): Record<string, string> {
-  return { "Content-Type": "application/json" };
+  return { ...dashboardHeaders(), "Content-Type": "application/json" };
 }
 
 async function readJsonOrThrow(response: Response): Promise<Record<string, unknown>> {
@@ -994,7 +994,8 @@ export async function deleteTemplate(templateId: string): Promise<void> {
   const response = await fetch(`/dashboard/templates/${encodeURIComponent(templateId)}`, {
     method: "DELETE",
     cache: "no-store",
-    credentials: "same-origin"
+    credentials: "same-origin",
+    headers: dashboardHeaders()
   });
   await readJsonOrThrow(response);
 }

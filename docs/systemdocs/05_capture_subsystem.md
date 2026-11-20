@@ -348,6 +348,7 @@ Env override: `with_env_backend()` reads `SYNAPSE_CAPTURE_FORCE_DXGI`; values `1
 | `GraphicsApiUnsupported` | `detail: String` | `CAPTURE_GRAPHICS_API_UNSUPPORTED` | `CAPTURE_GRAPHICS_API_UNSUPPORTED: {detail}` |
 | `PrintWindowDisabled` | `detail: String` | `CAPTURE_PRINTWINDOW_DISABLED` | `CAPTURE_PRINTWINDOW_DISABLED: {detail}` |
 | `PrintWindowBlack` | `detail: String` | `CAPTURE_PRINTWINDOW_BLACK` | `CAPTURE_PRINTWINDOW_BLACK: {detail}` |
+| `WgcFrameTimeout` | `detail: String` | `CAPTURE_WGC_FRAME_TIMEOUT` | `CAPTURE_WGC_FRAME_TIMEOUT: {detail}` |
 | `TargetLost` | `detail: String` | `CAPTURE_TARGET_LOST` | `CAPTURE_TARGET_LOST: {detail}` |
 | `TargetInvalid` | `detail: String` | `CAPTURE_TARGET_INVALID` | `CAPTURE_TARGET_INVALID: {detail}` |
 | `NoDirtyRegions` | — | `CAPTURE_NO_DIRTY_REGIONS` | `CAPTURE_NO_DIRTY_REGIONS` |

@@ -1,0 +1,31 @@
+{
+  "manifest_version": 2,
+  "name": "Synapse Firefox Bridge",
+  "description": "Local Synapse bridge for normal-profile Firefox tab control through a direct localhost WebSocket.",
+  "version": "0.1.0",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "synapse-bridge@synapse.local",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": [
+    "alarms",
+    "cookies",
+    "downloads",
+    "scripting",
+    "storage",
+    "tabs",
+    "webNavigation",
+    "webRequest",
+    "<all_urls>",
+    "http://127.0.0.1:7700/*"
+  ],
+  "background": {
+    "page": "background.html",
+    "persistent": true
+  }
+}

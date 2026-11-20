@@ -27,7 +27,16 @@ use tokio::{net::TcpStream as TokioTcpStream, time::timeout};
 pub use synapse_core::{CdpCapability, CdpDiagnostics, CdpStatus};
 
 #[cfg(windows)]
-use crate::{A11yError, A11yResult};
+use crate::{A11yError, A11yResult, EndpointOwner, ProcessStep};
+
+#[cfg(windows)]
+#[path = "cdp_webview2.rs"]
+mod webview2;
+#[cfg(windows)]
+pub use webview2::{
+    WebView2HostScope, WebView2ProcessRow, resolve_owned_webview2_page_target,
+    webview2_browser_port_in_tree,
+};
 
 /// Default remote-debugging port probed when no launched port is registered for
 /// the foreground process. 9222 is Chrome's conventional debug port.
@@ -56,23 +65,9 @@ pub fn cdp_capabilities() -> Vec<CdpCapability> {
 
 #[must_use]
 pub fn is_chromium_family(process_name: &str) -> bool {
-    let lower = process_name.to_ascii_lowercase();
-    [
-        "chrome.exe",
-        "chromium.exe",
-        "msedge.exe",
-        "brave.exe",
-        "vivaldi.exe",
-        "opera.exe",
-        "chrome",
-        "chromium",
-        "msedge",
-        "brave",
-        "vivaldi",
-        "opera",
-    ]
-    .iter()
-    .any(|candidate| lower.ends_with(candidate))
+    // Iron Law 9: the Chromium image names live in `browsers/*.json`
+    // (`legacy_chromium_process_names` + every Chromium row's `process_names`).
+    synapse_browsers::BrowserRegistry::global().is_chromium_process(process_name)
 }
 
 // === Launched-port registry =================================================
@@ -248,15 +243,272 @@ pub async fn probe_chromium_cdp(
 /// Resolves a reachable CDP endpoint for the browser window `hwnd`.
 ///
 /// Used by action routing (#686). Looks up the window's pid, gathers its
-/// candidate debug ports (launched-port registry first, then defaults), and
-/// returns the first reachable `http://127.0.0.1:<port>`. `None` if the window
-/// is gone, not a Chromium browser, or has no reachable debug port.
+/// candidate debug ports (launched-port registry first, then defaults), keeps
+/// only the ports that serve this window (#2409, [`ports_serving_window`]),
+/// and returns the first reachable `http://127.0.0.1:<port>`. `None` if the
+/// window is gone, not a Chromium browser, or has no reachable debug port of
+/// its own.
 #[cfg(windows)]
 #[must_use]
 pub fn endpoint_for_window(hwnd: i64) -> Option<String> {
     let context = crate::foreground_context(hwnd).ok()?;
-    let ports = candidate_ports_for_pid(context.pid);
+    if !is_chromium_family(&context.process_name)
+        && let Some(port) = webview2_debug_port_for_host(context.pid)
+        && !ports_serving_window(context.pid, &[port]).is_empty()
+    {
+        let endpoint = endpoint_for_port(port);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            return Some(endpoint);
+        }
+    }
+    if !is_chromium_family(&context.process_name) {
+        return None;
+    }
+    let ports = ports_serving_window(context.pid, &candidate_ports_for_pid(context.pid));
     probe_chromium_cdp_blocking(&context.process_name, &ports, Duration::from_millis(250)).endpoint
+}
+
+/// #2409: the ports of `ports`, in their order, that serve the window
+/// `window_pid`: the process listening on the port is the window's own
+/// process or one it started ([`EndpointOwner`]). A port held by another
+/// browser is dropped, so a window never gets another browser's pages.
+#[cfg(windows)]
+#[must_use]
+pub fn ports_serving_window(window_pid: u32, ports: &[u16]) -> Vec<u16> {
+    let candidates: Vec<EndpointOwner> = ports
+        .iter()
+        .map(|port| {
+            let port_owner = listening_port_owner(*port);
+            let chain = port_owner.map_or_else(Vec::new, |owner| process_chain(owner, window_pid));
+            EndpointOwner::new(*port, window_pid, port_owner, chain)
+        })
+        .collect();
+    EndpointOwner::serving_ports(&candidates)
+}
+
+/// #2409: the one process listening for TCP on IPv4 `port` at 127.0.0.1 or
+/// 0.0.0.0 (the listeners a probe of 127.0.0.1 reaches). `None` when nothing
+/// listens there, when two processes do, or when the table cannot be read.
+#[cfg(windows)]
+fn listening_port_owner(port: u16) -> Option<u32> {
+    use windows::Win32::{
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
+        NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+        },
+        Networking::WinSock::AF_INET,
+    };
+
+    // MIB_TCPTABLE_OWNER_PID: the row count, then rows of six u32 fields.
+    const ROW_WORDS: usize = size_of::<MIB_TCPROW_OWNER_PID>() / 4;
+
+    let mut size = 0_u32;
+    let mut table: Vec<u32> = Vec::new();
+    // The first call asks for the size; the table may grow before the next.
+    for _ in 0..3 {
+        let buffer = (!table.is_empty()).then_some(table.as_mut_ptr().cast::<std::ffi::c_void>());
+        // SAFETY: `buffer` is None (size query) or points to `table`, which is
+        // 4-byte aligned and holds at least `size` bytes; the call writes at
+        // most `size` bytes there and sets `size` to the bytes it needs.
+        let status = unsafe {
+            GetExtendedTcpTable(
+                buffer,
+                &raw mut size,
+                false,
+                u32::from(AF_INET.0),
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if status == NO_ERROR.0 {
+            let entries = usize::try_from(*table.first()?).ok()?;
+            let mut owners: Vec<u32> = table
+                .get(1..)?
+                .chunks_exact(ROW_WORDS)
+                .take(entries)
+                .filter_map(|row| {
+                    let &[
+                        _state,
+                        address,
+                        local_port,
+                        _remote_address,
+                        _remote_port,
+                        pid,
+                    ] = row
+                    else {
+                        return None;
+                    };
+                    let address = Ipv4Addr::from(address.to_ne_bytes());
+                    // The port is in network byte order in the low 16 bits.
+                    let [high, low, ..] = local_port.to_ne_bytes();
+                    (u16::from_be_bytes([high, low]) == port
+                        && (address == Ipv4Addr::LOCALHOST || address.is_unspecified()))
+                    .then_some(pid)
+                })
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            return match owners.as_slice() {
+                [owner] => Some(*owner),
+                _ => None,
+            };
+        }
+        if status != ERROR_INSUFFICIENT_BUFFER.0 {
+            return None;
+        }
+        table = vec![0_u32; usize::try_from(size).ok()?.div_ceil(4)];
+    }
+    None
+}
+
+/// #2409: the port owner and its ancestors, nearest first, each with its
+/// parent and exact creation time. Stops after the window's own process, at a
+/// process that cannot be read, or after [`EndpointOwner::MAX_CHAIN_STEPS`]
+/// steps, so a cycle in the parent table cannot hang it.
+#[cfg(windows)]
+fn process_chain(owner_pid: u32, window_pid: u32) -> Vec<ProcessStep> {
+    let mut chain = Vec::new();
+    let mut pid = owner_pid;
+    while chain.len() < EndpointOwner::MAX_CHAIN_STEPS {
+        let Some((parent_pid, created)) = crate::launch_process_record(pid) else {
+            break;
+        };
+        chain.push(ProcessStep::new(pid, parent_pid, created));
+        if pid == window_pid {
+            break;
+        }
+        pid = parent_pid;
+    }
+    chain
+}
+
+/// Probe only the debug endpoint owned by a WebView2 host window. The host
+/// image itself is not Chromium, so the ordinary browser-name gate cannot be
+/// used for perception diagnostics.
+#[cfg(windows)]
+#[must_use]
+pub fn webview2_cdp_diagnostics_for_window(hwnd: i64) -> Option<CdpDiagnostics> {
+    let context = crate::foreground_context(hwnd).ok()?;
+    if is_chromium_family(&context.process_name) {
+        return None;
+    }
+    let Some(port) =
+        webview2_browser_port_for_host(context.pid, WebView2HostScope::DirectChildren)?
+    else {
+        return Some(CdpDiagnostics::unreachable_with_probe(
+            context.process_name,
+            error_codes::A11Y_CDP_UNREACHABLE,
+            Vec::new(),
+            "WebView2 browser child has no --remote-debugging-port; UIA may expose only part of the page. Launch this app through Synapse process launch with cdp_debug=true to enable complete page observation and background input",
+        ));
+    };
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    if !ports_serving_window(context.pid, &[port]).is_empty()
+        && TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+    {
+        Some(ok_diagnostics(&context.process_name, port, vec![port]))
+    } else {
+        Some(CdpDiagnostics::unreachable_with_probe(
+            context.process_name,
+            error_codes::A11Y_CDP_UNREACHABLE,
+            vec![port],
+            CDP_UNREACHABLE_DETAIL,
+        ))
+    }
+}
+
+/// Extract the loopback CDP port from the browser process directly owned by a
+/// WebView2 host. Child renderer/utility processes are excluded by their type.
+#[cfg(windows)]
+#[must_use]
+pub fn webview2_browser_debug_port(process_name: &str, arguments: &[String]) -> Option<u16> {
+    if !process_name.eq_ignore_ascii_case("msedgewebview2.exe")
+        || arguments.iter().any(|arg| arg.starts_with("--type="))
+    {
+        return None;
+    }
+    arguments.iter().find_map(|arg| {
+        arg.strip_prefix("--remote-debugging-port=")
+            .and_then(|port| port.trim_matches('"').parse::<u16>().ok())
+            .filter(|port| *port != 0)
+    })
+}
+
+#[cfg(windows)]
+#[must_use]
+pub fn webview2_debug_port_for_host(host_pid: u32) -> Option<u16> {
+    webview2_browser_port_for_host(host_pid, WebView2HostScope::DirectChildren).flatten()
+}
+
+/// Debug port of the WebView2 browser anywhere in the process tree of a process
+/// Synapse launched itself (a wrapper launcher may start the real host).
+#[cfg(windows)]
+#[must_use]
+pub fn webview2_debug_port_for_launched_tree(launched_pid: u32) -> Option<u16> {
+    webview2_browser_port_for_host(launched_pid, WebView2HostScope::LaunchedTree).flatten()
+}
+
+// `None` = no WebView2 browser child, `Some(None)` = child without a debug port,
+// `Some(Some(port))` = child with a port; callers distinguish all three cases.
+#[cfg(windows)]
+#[allow(clippy::option_option)]
+fn webview2_browser_port_for_host(host_pid: u32, scope: WebView2HostScope) -> Option<Option<u16>> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let rows = system
+        .processes()
+        .values()
+        .map(|process| {
+            let name = process.name().to_string_lossy().into_owned();
+            let arguments = if name.eq_ignore_ascii_case("msedgewebview2.exe") {
+                process
+                    .cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            WebView2ProcessRow {
+                pid: process.pid().as_u32(),
+                parent_pid: process.parent().map(Pid::as_u32),
+                name,
+                arguments,
+            }
+        })
+        .collect::<Vec<_>>();
+    webview2_browser_port_in_tree(host_pid, scope, &rows)
+}
+
+/// Native client-area origin in physical screen pixels. For WebView2 hosts the
+/// page viewport starts at the client area, below the non-client title bar.
+#[cfg(windows)]
+#[must_use]
+pub fn client_origin_screen(hwnd: i64) -> Option<synapse_core::Point> {
+    use std::ffi::c_void;
+    use windows::Win32::{
+        Foundation::{HWND, POINT},
+        Graphics::Gdi::ClientToScreen,
+    };
+
+    let mut origin = POINT { x: 0, y: 0 };
+    // SAFETY: the Win32 API writes one caller-owned POINT, and an invalid HWND
+    // returns false without dereferencing an invalid pointer.
+    if unsafe { ClientToScreen(HWND(hwnd as *mut c_void), &raw mut origin) }.as_bool() {
+        Some(synapse_core::Point {
+            x: origin.x,
+            y: origin.y,
+        })
+    } else {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -267,19 +519,94 @@ pub struct CdpAttachment {
     pub endpoint: String,
 }
 
+/// Drives a chromiumoxide connection handler and aborts it when dropped, so a
+/// caller cancelled by a timeout (or an early `?`) never leaks the handler task
+/// and its websocket (#210). `abort` stays available for explicit early stops.
+pub struct CdpHandlerTask(tokio::task::JoinHandle<()>);
+
+impl CdpHandlerTask {
+    #[must_use]
+    pub fn spawn(mut handler: chromiumoxide::Handler) -> Self {
+        use futures_util::StreamExt as _;
+        Self(tokio::spawn(async move {
+            while handler.next().await.is_some() {}
+        }))
+    }
+
+    pub fn abort(&self) {
+        self.0.abort();
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
+
+    /// Test hook: guards an arbitrary task the way `spawn` guards a handler.
+    #[cfg(test)]
+    pub(crate) const fn from_task(task: tokio::task::JoinHandle<()>) -> Self {
+        Self(task)
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/cdp_handler_task_210.rs"]
+mod cdp_handler_task_210_tests;
+
+#[cfg(all(test, windows))]
+#[path = "tests/endpoint_owner_os_2409.rs"]
+mod endpoint_owner_os_2409_tests;
+
+impl Drop for CdpHandlerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Attaches a `chromiumoxide` browser client to a reachable CDP endpoint.
 ///
 /// # Errors
 ///
 /// Returns `A11Y_CDP_UNREACHABLE` when `chromiumoxide` cannot connect to the
-/// supplied endpoint.
+/// supplied endpoint and `A11Y_CDP_ATTACH_FAILED` when the endpoint accepts the
+/// connection but does not finish the handshake within [`CDP_ATTACH_TIMEOUT`].
 #[cfg(windows)]
 pub async fn attach_chromiumoxide(endpoint: &str) -> A11yResult<CdpAttachment> {
-    let (browser, handler) = chromiumoxide::Browser::connect(endpoint)
-        .await
-        .map_err(|err| A11yError::CdpUnreachable {
-            detail: err.to_string(),
-        })?;
+    attach_chromiumoxide_with_timeout(endpoint, CDP_ATTACH_TIMEOUT).await
+}
+
+/// Upper bound for the `/json/version` request plus websocket handshake of one
+/// CDP attach (#210). A hung browser must not hang its callers forever.
+#[cfg(windows)]
+pub const CDP_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// [`attach_chromiumoxide`] with an explicit handshake bound.
+///
+/// # Errors
+///
+/// As [`attach_chromiumoxide`]; the timeout is `A11Y_CDP_ATTACH_FAILED`, not
+/// "unreachable", so cleanup callers keep their state and retry.
+#[cfg(windows)]
+pub async fn attach_chromiumoxide_with_timeout(
+    endpoint: &str,
+    limit: Duration,
+) -> A11yResult<CdpAttachment> {
+    let (browser, handler) = match timeout(limit, chromiumoxide::Browser::connect(endpoint)).await {
+        Ok(Ok(connected)) => connected,
+        Ok(Err(err)) => {
+            return Err(A11yError::CdpUnreachable {
+                detail: err.to_string(),
+            });
+        }
+        Err(_elapsed) => {
+            return Err(A11yError::CdpAttachFailed {
+                detail: format!(
+                    "CDP connect to {endpoint:?} timed out after {} ms",
+                    limit.as_millis()
+                ),
+            });
+        }
+    };
     Ok(CdpAttachment {
         browser,
         handler,
@@ -332,14 +659,10 @@ pub struct CdpActivateTabResult {
 /// `A11Y_CDP_ATTACH_FAILED` when `Target.getTargets` itself fails.
 #[cfg(windows)]
 pub async fn cdp_list_targets(endpoint: &str) -> A11yResult<Vec<CdpTargetSummary>> {
-    use futures_util::StreamExt as _;
-
     let CdpAttachment {
-        browser,
-        mut handler,
-        ..
+        browser, handler, ..
     } = attach_chromiumoxide(endpoint).await?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
     let result = cdp_list_targets_with_browser(&browser).await;
     handler_task.abort();
     result
@@ -355,14 +678,11 @@ pub async fn cdp_list_targets(endpoint: &str) -> A11yResult<Vec<CdpTargetSummary
 #[cfg(windows)]
 pub async fn cdp_open_background_tab(endpoint: &str, url: &str) -> A11yResult<CdpOpenTabResult> {
     use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
-    use futures_util::StreamExt as _;
 
     let CdpAttachment {
-        browser,
-        mut handler,
-        ..
+        browser, handler, ..
     } = attach_chromiumoxide(endpoint).await?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let before = cdp_list_targets_with_browser(&browser).await?;
@@ -406,6 +726,34 @@ pub async fn cdp_open_background_tab(endpoint: &str, url: &str) -> A11yResult<Cd
     result
 }
 
+#[cfg(windows)]
+const CLOSE_TARGET_ABSENT_DETAIL_PREFIX: &str =
+    "Target.closeTarget refused: Target.getTargets readback did not contain target_id";
+
+/// The error [`cdp_close_target`] returns when `Target.getTargets` does not
+/// list `target_id` before the close (the tab is already gone, e.g. the user
+/// closed it). Callers that only need the tab gone use
+/// [`is_cdp_close_target_absent`] to treat this as success (#211).
+#[cfg(windows)]
+#[must_use]
+pub fn cdp_close_target_absent_error(target_id: &str) -> A11yError {
+    A11yError::CdpAxtreeFailed {
+        detail: format!("{CLOSE_TARGET_ABSENT_DETAIL_PREFIX} {target_id:?} before close"),
+    }
+}
+
+/// Whether `error` is the "target absent before close" failure from
+/// [`cdp_close_target`].
+#[cfg(windows)]
+#[must_use]
+pub fn is_cdp_close_target_absent(error: &A11yError) -> bool {
+    matches!(
+        error,
+        A11yError::CdpAxtreeFailed { detail }
+            if detail.starts_with(CLOSE_TARGET_ABSENT_DETAIL_PREFIX)
+    )
+}
+
 /// Closes `target_id` with `Target.closeTarget`, then reads `Target.getTargets`
 /// until the target is absent.
 ///
@@ -417,23 +765,16 @@ pub async fn cdp_open_background_tab(endpoint: &str, url: &str) -> A11yResult<Cd
 #[cfg(windows)]
 pub async fn cdp_close_target(endpoint: &str, target_id: &str) -> A11yResult<CdpCloseTabResult> {
     use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
-    use futures_util::StreamExt as _;
 
     let CdpAttachment {
-        browser,
-        mut handler,
-        ..
+        browser, handler, ..
     } = attach_chromiumoxide(endpoint).await?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let before = cdp_list_targets_with_browser(&browser).await?;
         if !before.iter().any(|target| target.target_id == target_id) {
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: format!(
-                    "Target.closeTarget refused: Target.getTargets readback did not contain target_id {target_id:?} before close"
-                ),
-            });
+            return Err(cdp_close_target_absent_error(target_id));
         }
         browser
             .execute(CloseTargetParams::new(target_id.to_owned()))
@@ -464,14 +805,11 @@ pub async fn cdp_activate_target(
     target_id: &str,
 ) -> A11yResult<CdpActivateTabResult> {
     use chromiumoxide::cdp::browser_protocol::target::ActivateTargetParams;
-    use futures_util::StreamExt as _;
 
     let CdpAttachment {
-        browser,
-        mut handler,
-        ..
+        browser, handler, ..
     } = attach_chromiumoxide(endpoint).await?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let result = async {
         let targets = cdp_list_targets_with_browser(&browser).await?;

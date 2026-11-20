@@ -19,7 +19,7 @@ use crate::m3::{
     },
     storage::{
         StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-        StorageSummaryResponse,
+        StoragePutProbeRowsParams, StoragePutProbeRowsResponse, StorageSummaryResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -27,6 +27,7 @@ use crate::m3::{
 pub enum StorageOperation {
     Inspect,
     Summary,
+    PutProbeRows,
     GcOnce,
 }
 
@@ -35,6 +36,7 @@ impl StorageOperation {
         match self {
             Self::Inspect => "inspect",
             Self::Summary => "summary",
+            Self::PutProbeRows => "put_probe_rows",
             Self::GcOnce => "gc_once",
         }
     }
@@ -49,6 +51,8 @@ pub struct StorageParams {
     #[serde(default)]
     pub summary: Option<StorageInspectParams>,
     #[serde(default)]
+    pub put_probe_rows: Option<StoragePutProbeRowsParams>,
+    #[serde(default)]
     pub gc_once: Option<StorageGcOnceParams>,
 }
 
@@ -62,6 +66,8 @@ pub struct StorageResponse {
     pub inspect: Option<StorageInspectResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<StorageSummaryResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put_probe_rows: Option<StoragePutProbeRowsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_once: Option<StorageGcOnceResponse>,
 }
@@ -255,10 +261,6 @@ pub struct SetupStatusResponse {
     pub source_of_truth: &'static str,
     pub pid: u32,
     pub bind: String,
-    pub source_dir: String,
-    pub setup_script_file: FileReadback,
-    pub setup_repair_command_args: Vec<String>,
-    pub setup_repair_mcp_tool: String,
     pub token_file: FileReadback,
     pub daemon_run_file: FileReadback,
     pub shared_daemon_run_file: FileReadback,
@@ -316,43 +318,6 @@ pub struct AgentEventIngressStats {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct MetricsRecorderTelemetry {
-    pub source_of_truth: &'static str,
-    pub installed: bool,
-    pub recorder: String,
-    pub registry_metric_count: usize,
-    pub rendered_bytes: usize,
-    pub recorded_metric_names: Vec<String>,
-    pub recorded_metric_samples: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ToolSurfacePayloadContributor {
-    pub name: String,
-    pub openai_tool_bytes: usize,
-    pub input_schema_bytes: usize,
-    pub description_bytes: usize,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ToolSurfacePayloadTelemetry {
-    pub source_of_truth: &'static str,
-    pub tool_count: usize,
-    pub openai_tools_bytes: usize,
-    pub openai_tools_chars: usize,
-    pub approx_tokens_chars_div_4: u64,
-    pub approx_tokens_chars_div_3_5: u64,
-    pub input_schema_bytes: usize,
-    pub output_schema_bytes: usize,
-    pub budget_openai_tools_bytes: usize,
-    pub over_budget_by_bytes: usize,
-    pub top_contributors: Vec<ToolSurfacePayloadContributor>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ToolSurfaceTelemetry {
     pub source_of_truth: &'static str,
     pub profile: String,
@@ -377,8 +342,19 @@ pub struct ToolSurfaceTelemetry {
     pub facade_contract_tool_count: usize,
     pub facade_contract_operation_count: usize,
     pub facade_contract_mutating_operation_count: usize,
-    pub model_payload: ToolSurfacePayloadTelemetry,
     pub codex_client_surface: CodexClientSurfaceSnapshot,
+}
+
+/// #2323: bounded readback of the daemon's metrics recorder.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsRecorderTelemetry {
+    pub source_of_truth: &'static str,
+    pub installed: bool,
+    pub install_error: Option<String>,
+    pub metric_names: Vec<String>,
+    pub samples: Vec<String>,
+    pub rejected_sample_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -387,7 +363,6 @@ pub struct TelemetryStatusResponse {
     pub source_of_truth: &'static str,
     pub metrics_recorder: MetricsRecorderTelemetry,
     pub tool_surface: ToolSurfaceTelemetry,
-    pub tool_usage: crate::daemon_lifecycle::ToolUsageTelemetry,
     pub storage_summary: StorageSummaryResponse,
     pub agent_event_ingress: AgentEventIngressStats,
     pub cf_row_counts: BTreeMap<String, u64>,

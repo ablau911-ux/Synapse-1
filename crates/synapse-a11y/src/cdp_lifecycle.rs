@@ -283,7 +283,7 @@ struct CaptureSlot {
     armed_at_unix_ms: u64,
     capacity: usize,
     _browser: Browser,
-    handler_task: JoinHandle<()>,
+    handler_task: crate::cdp::CdpHandlerTask,
     listener_task: JoinHandle<()>,
 }
 
@@ -333,13 +333,13 @@ pub async fn lifecycle_capture_ensure(
     }
 
     let capacity = capacity.clamp(1, MAX_LIFECYCLE_BUFFER_CAPACITY);
-    let (browser, mut handler) =
+    let (browser, handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
                 detail: format!("page event capture connect {endpoint}: {err}"),
             })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_task = crate::cdp::CdpHandlerTask::spawn(handler);
 
     let armed = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;

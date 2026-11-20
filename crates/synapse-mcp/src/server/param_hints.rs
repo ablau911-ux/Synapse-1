@@ -1,140 +1,76 @@
-//! Enrich `#[serde(deny_unknown_fields)]` param-deserialize failures into
-//! actionable, self-correcting errors (#1593).
-//!
-//! Every facade param struct is `deny_unknown_fields` (fail-closed by design),
-//! but rmcp surfaces the raw serde message `failed to deserialize parameters:
-//! unknown field \`X\`, expected one of \`a\`, \`b\`` — which lists the accepted
-//! fields but never tells the agent where the field it passed actually belongs.
-//! Telemetry showed three recurring dead-ends: camelCase instead of snake_case
-//! (`awaitPromise` -> `await_promise`), a nested-spec field hoisted to the
-//! envelope top level (`timeout_ms` on `browser_wait` -> `wait.<condition>.
-//! timeout_ms`), and an operation *value* passed as a field (`set` on `profile`,
-//! which is a value of `operation`).
-//!
-//! This module does NOT weaken the contract — the call still errors. It only
-//! rewrites the opaque serde message into a richer, structured error that names
-//! the likely correct location. The mechanism is deliberately generic: it parses
-//! serde's own `expected one of ...` field list out of the message and matches
-//! the offending field against it (case-fold + camelCase→snake_case + bounded
-//! Levenshtein), so any typo on any facade is caught without a hand-maintained
-//! per-field list. A small [`registry_hint`] handles the two mistake classes a
-//! flat field list cannot express: hoisted nested fields and
-//! operation-value-as-field.
+//! Parameter hints for refused facade calls (upstream ee274ba0, 3d7d8c34).
+//! Facade params are `deny_unknown_fields`: a wrong field still fails the
+//! call. These pure helpers only make the refusal say where the field belongs,
+//! and fold an envelope-level target alias into the selected operation spec
+//! (fail closed on conflict).
+// handler.rs calls `param_hint_message`; `merge_target_alias` waits for the
+// browser facade envelope aliases (not wired yet). Remove with that wiring.
+#![allow(dead_code)]
 
-use rmcp::model::{ErrorCode, ErrorData};
-use serde_json::json;
-use synapse_core::error_codes;
+/// rmcp 1.7 wraps every `Parameters<T>` deserialize failure with this prefix.
+pub(crate) const DESERIALIZE_PREFIX: &str = "failed to deserialize parameters:";
 
-/// rmcp wraps every `Parameters<T>` deserialize failure with this prefix
-/// (`rmcp::handler::server::tool`). We only enrich errors that carry it so we
-/// never touch domain errors that happen to share the INVALID_PARAMS code.
-const DESERIALIZE_PREFIX: &str = "failed to deserialize parameters:";
+/// Longest field name worth matching or echoing; longer names are hostile or
+/// garbage and get a truncated echo and no suggestion.
+const MAX_HINT_FIELD_CHARS: usize = 64;
 
-/// Parsed shape of serde's `unknown field` error: the offending field plus the
-/// list of accepted fields serde already emitted. Both are borrowed from the
-/// raw message.
-struct UnknownField<'a> {
-    field: &'a str,
-    accepted: Vec<&'a str>,
-}
-
-/// A concrete, actionable correction for an unknown field.
-enum Hint {
-    /// The field is a near-miss for a real accepted field (typo / camelCase).
-    DidYouMean { candidate: String },
-    /// The field was hoisted to the wrong nesting level; it belongs elsewhere.
-    NestedLocation { location: String },
-    /// The field is actually a value of a discriminator enum, not a field.
-    OperationValue {
-        operation_field: String,
-        note: String,
-    },
-}
-
-/// Enrich a raw rmcp param-deserialize error into a structured, actionable
-/// [`ErrorData`]. Returns `None` when the message is not an enrichable
-/// `unknown field` deserialize failure (e.g. a type mismatch or missing field),
-/// letting the caller keep its existing normalization.
-pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> Option<ErrorData> {
-    let inner = raw_message.strip_prefix(DESERIALIZE_PREFIX)?.trim();
-    let parsed = parse_unknown_field(inner)?;
-    let hint =
-        registry_hint(tool, parsed.field).or_else(|| generic_hint(parsed.field, &parsed.accepted));
-
-    let (message, remediation, mut data) = match &hint {
-        Some(Hint::DidYouMean { candidate }) => (
-            format!(
-                "{tool}: unknown field `{}` — did you mean `{candidate}`? (facade fields are snake_case and fail-closed)",
-                parsed.field
-            ),
-            format!("rename `{}` to `{candidate}`", parsed.field),
-            json!({ "hint_kind": "did_you_mean", "did_you_mean": candidate }),
-        ),
-        Some(Hint::NestedLocation { location }) => (
-            format!(
-                "{tool}: unknown field `{}` at the envelope top level — it belongs on {location}",
-                parsed.field
-            ),
-            format!("move `{}` to {location}", parsed.field),
-            json!({ "hint_kind": "nested_location", "belongs_at": location }),
-        ),
-        Some(Hint::OperationValue {
-            operation_field,
-            note,
-        }) => (
-            format!(
-                "{tool}: unknown field `{}` — `{}` is a value of `{operation_field}`, not a field. {note}",
-                parsed.field, parsed.field
-            ),
-            format!(
-                "pass {operation_field}=\"{}\" instead of a `{}` field",
-                parsed.field, parsed.field
-            ),
-            json!({ "hint_kind": "operation_value", "operation_field": operation_field }),
-        ),
-        None => (
-            format!(
-                "{tool}: unknown field `{}`; accepted fields are {}",
-                parsed.field,
-                format_accepted(&parsed.accepted)
-            ),
-            format!(
-                "pass only accepted fields: {}",
-                format_accepted(&parsed.accepted)
-            ),
-            json!({ "hint_kind": "no_match" }),
-        ),
-    };
-
-    if let Some(object) = data.as_object_mut() {
-        object.insert("code".to_owned(), json!(error_codes::TOOL_PARAMS_INVALID));
-        object.insert("tool".to_owned(), json!(tool));
-        object.insert("unknown_field".to_owned(), json!(parsed.field));
-        object.insert("accepted_fields".to_owned(), json!(parsed.accepted));
-        object.insert("remediation".to_owned(), json!(remediation));
-        object.insert(
-            "source_of_truth".to_owned(),
-            json!(
-                "serde deny_unknown_fields on the typed facade params (fail-closed); this hint is advisory"
-            ),
-        );
+/// The refusal text for an rmcp `unknown field` param error when a correction
+/// is known; `None` keeps the raw message (other errors, no confident match).
+/// The call stays refused either way: nothing is retried or corrected.
+#[must_use]
+pub(crate) fn param_hint_message(tool: &str, raw_message: &str) -> Option<String> {
+    let inner = raw_message.strip_prefix(DESERIALIZE_PREFIX)?.trim_start();
+    let (field, accepted) = parse_unknown_field(inner)?;
+    let length = field.chars().count();
+    if length > MAX_HINT_FIELD_CHARS {
+        let shown: String = field.chars().take(MAX_HINT_FIELD_CHARS).collect();
+        return Some(format!(
+            "{tool}: unknown field `{shown}...` ({length} characters); the call was not run."
+        ));
     }
-
-    Some(ErrorData::new(ErrorCode(-32099), message, Some(data)))
+    if field.is_empty() {
+        return None;
+    }
+    let hint = registry_hint(tool, field)
+        .or_else(|| near_miss(field, &accepted).map(|name| format!("did you mean `{name}`?")))?;
+    Some(format!(
+        "{tool}: unknown field `{field}`; {hint} Facade fields are snake_case and unknown fields are refused; the call was not run."
+    ))
 }
 
-/// Parse serde's `unknown field \`X\`, expected one of \`a\`, \`b\`` message.
-///
-/// serde formats the accepted set with arity-dependent phrasing (`there are no
-/// fields`, `expected \`a\``, `expected \`a\` or \`b\``, `expected one of \`a\`,
-/// \`b\`, \`c\``). Rather than match each phrasing we extract every
-/// backtick-delimited token: the first is the offending field and the rest are
-/// the accepted fields. This is robust to all arities and to nested failures
-/// (where the accepted list is the nested struct's fields).
-fn parse_unknown_field(message: &str) -> Option<UnknownField<'_>> {
-    let rest = message.strip_prefix("unknown field ")?;
+/// Folds an envelope-level target alias (`cdp_target_id`, `window_hwnd`) into
+/// the selected operation spec. Equal values are one target; different values,
+/// or an alias on an operation that does not act on a single target, are
+/// refused without echoing either value.
+pub(crate) fn merge_target_alias<T: PartialEq>(
+    tool: &str,
+    field: &str,
+    envelope: Option<T>,
+    spec: Option<T>,
+    single_target_operation: bool,
+) -> Result<Option<T>, String> {
+    let Some(envelope) = envelope else {
+        return Ok(spec);
+    };
+    if !single_target_operation {
+        return Err(format!(
+            "{tool}: top-level {field} is refused for this operation because it does not act on a single target; remove {field}. The call was not run."
+        ));
+    }
+    match spec {
+        None => Ok(Some(envelope)),
+        Some(spec) if spec == envelope => Ok(Some(spec)),
+        Some(_) => Err(format!(
+            "{tool}: top-level {field} conflicts with the {field} inside the operation spec; pass it once. The call was not run."
+        )),
+    }
+}
+
+/// serde's `unknown field `X`, expected one of `a`, `b`` (every arity): the
+/// first backticked token is the field, the rest are the accepted fields.
+fn parse_unknown_field(message: &str) -> Option<(&str, Vec<&str>)> {
+    let mut remaining = message.strip_prefix("unknown field ")?;
     let mut tokens = Vec::new();
-    let mut remaining = rest;
     while let Some(open) = remaining.find('`') {
         let after = &remaining[open + 1..];
         let close = after.find('`')?;
@@ -142,88 +78,64 @@ fn parse_unknown_field(message: &str) -> Option<UnknownField<'_>> {
         remaining = &after[close + 1..];
     }
     let (field, accepted) = tokens.split_first()?;
-    Some(UnknownField {
-        field,
-        accepted: accepted.to_vec(),
-    })
+    Some((field, accepted.to_vec()))
 }
 
-/// Per-facade corrections for mistakes a flat accepted-field list cannot express:
-/// nested fields hoisted to the envelope, and operation *values* passed as
-/// fields. Kept deliberately small and anchored to telemetry-verified mistakes;
-/// generic typo matching in [`generic_hint`] covers the long tail.
-fn registry_hint(tool: &str, field: &str) -> Option<Hint> {
+/// Mistakes a flat accepted-field list cannot express: a nested field hoisted
+/// to the envelope, an operation value passed as a field, and `act`, which has
+/// no per-call target.
+fn registry_hint(tool: &str, field: &str) -> Option<String> {
     match (tool, field) {
-        // `browser_wait` accepts only `operation`, `wait`, and (since #1593) the
-        // top-level `cdp_target_id`/`window_hwnd` target aliases. The polling
-        // budget fields live on the nested condition spec, not the envelope.
-        ("browser_wait", "timeout_ms" | "polling_interval_ms" | "interval_ms") => {
-            Some(Hint::NestedLocation {
-                location: format!(
-                    "the nested condition spec: wait.<condition>.{field} (e.g. wait.text.{field})"
-                ),
-            })
-        }
-        // `profile` operation values passed as fields. `ProfileOperation` values
-        // are status/set/grant_reality_write/revoke_reality_write.
-        ("profile", "status" | "set" | "grant_reality_write" | "revoke_reality_write") => {
-            Some(Hint::OperationValue {
-                operation_field: "operation".to_owned(),
-                note: format!(
-                    "pass the `{field}` operation's own fields (e.g. profile, reason, confirm_break_glass) at the top level"
-                ),
-            })
-        }
-        // `act` resolves its target from the session binding, not a per-call
-        // field, so there is no envelope target alias to fold into.
-        ("act", "cdp_target_id" | "window_hwnd") => Some(Hint::NestedLocation {
-            location:
-                "the session target binding: set it first with `set_target` (or `target` operation=set); `act` has no per-call target field"
-                    .to_owned(),
-        }),
+        ("browser_wait", "timeout_ms" | "polling_interval_ms") => Some(format!(
+            "it belongs on the nested condition spec: wait.<condition>.{field} (e.g. wait.text.{field})."
+        )),
+        ("profile", "status" | "set") => Some(format!(
+            "`{field}` is a value of `operation`, not a field: pass operation={field}."
+        )),
+        ("act", "cdp_target_id" | "window_hwnd") => Some(
+            "act has no per-call target field: bind the session target first with target operation=set, then call act."
+                .to_owned(),
+        ),
         _ => None,
     }
 }
 
-/// Generic near-miss matching against serde's accepted-field list, in order of
-/// confidence: exact camelCase→snake_case, case/underscore-insensitive equality,
-/// then bounded Levenshtein distance.
-fn generic_hint(field: &str, accepted: &[&str]) -> Option<Hint> {
-    if accepted.is_empty() {
-        return None;
-    }
+/// The accepted field `field` most likely meant: camelCase to snake_case, then
+/// case/underscore folding, then one unique closest name within a small edit
+/// distance. A tie is ambiguous and suggests nothing.
+fn near_miss<'a>(field: &str, accepted: &[&'a str]) -> Option<&'a str> {
     let snake = to_snake_case(field);
-    if let Some(hit) = accepted.iter().find(|candidate| **candidate == snake) {
-        return Some(Hint::DidYouMean {
-            candidate: (*hit).to_owned(),
-        });
+    if let Some(hit) = accepted.iter().copied().find(|name| *name == snake) {
+        return Some(hit);
     }
     let folded = fold_key(field);
     if let Some(hit) = accepted
         .iter()
-        .find(|candidate| fold_key(candidate) == folded)
+        .copied()
+        .find(|name| fold_key(name) == folded)
     {
-        return Some(Hint::DidYouMean {
-            candidate: (*hit).to_owned(),
-        });
+        return Some(hit);
     }
     let lower = field.to_ascii_lowercase();
-    let mut best: Option<(usize, &str)> = None;
-    for candidate in accepted {
-        let distance = levenshtein(&lower, &candidate.to_ascii_lowercase());
-        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
-            best = Some((distance, candidate));
+    let threshold = (field.chars().count() / 3).max(2);
+    let mut best: Option<(usize, &'a str)> = None;
+    let mut tied = false;
+    for &name in accepted {
+        let distance = levenshtein(&lower, &name.to_ascii_lowercase());
+        match best {
+            Some((best_distance, _)) if distance > best_distance => {}
+            Some((best_distance, _)) if distance == best_distance => tied = true,
+            _ => {
+                best = Some((distance, name));
+                tied = false;
+            }
         }
     }
-    let (distance, candidate) = best?;
-    let threshold = (field.chars().count() / 3).max(2);
-    (distance <= threshold).then(|| Hint::DidYouMean {
-        candidate: candidate.to_owned(),
-    })
+    let (distance, name) = best?;
+    (distance <= threshold && !tied).then_some(name)
 }
 
-/// Case- and underscore-insensitive key used to detect camelCase/case-only
-/// variants: `awaitPromise`, `await_promise`, and `AwaitPromise` all fold equal.
+/// `awaitPromise`, `await_promise` and `AwaitPromise` fold equal.
 fn fold_key(value: &str) -> String {
     value
         .chars()
@@ -232,8 +144,6 @@ fn fold_key(value: &str) -> String {
         .collect()
 }
 
-/// Convert `camelCase`/`PascalCase` to `snake_case`. Runs of uppercase and
-/// digits are handled conservatively; already-snake input is returned unchanged.
 fn to_snake_case(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 4);
     for (index, character) in value.char_indices() {
@@ -249,11 +159,11 @@ fn to_snake_case(value: &str) -> String {
     out
 }
 
-/// Standard Levenshtein edit distance (two-row DP) over char sequences.
+/// Levenshtein edit distance over chars (two-row dynamic programming).
 fn levenshtein(left: &str, right: &str) -> usize {
     let right_chars: Vec<char> = right.chars().collect();
     let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
-    let mut current = vec![0usize; right_chars.len() + 1];
+    let mut current = vec![0_usize; right_chars.len() + 1];
     for (row, left_char) in left.chars().enumerate() {
         current[0] = row + 1;
         for (column, right_char) in right_chars.iter().enumerate() {
@@ -267,10 +177,6 @@ fn levenshtein(left: &str, right: &str) -> usize {
     previous[right_chars.len()]
 }
 
-fn format_accepted(accepted: &[&str]) -> String {
-    accepted
-        .iter()
-        .map(|field| format!("`{field}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+#[cfg(test)]
+#[path = "param_hints_table_hints.rs"]
+mod param_hints_table_hints;

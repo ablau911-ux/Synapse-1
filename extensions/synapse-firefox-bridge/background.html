@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <!-- Module scripts run in document order: the namespace alias first, then
+         the shared worker (assembled beside this page by
+         scripts\install-synapse-gecko-bridge.ps1). -->
+    <script type="module" src="gecko_background.js"></script>
+    <script type="module" src="service_worker.js"></script>
+  </head>
+  <body></body>
+</html>

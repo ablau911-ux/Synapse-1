@@ -3,8 +3,8 @@
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
-        chrome_debugger_endpoint, require_target_session_id, validate_cdp_target_id,
+        browser_raw_cdp_required_error, cdp_target_id_audit_ref, require_target_session_id,
+        validate_cdp_target_id,
     },
     tool, tool_router,
 };
@@ -53,7 +53,6 @@ pub struct BrowserHandleDialogParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Operation to run. Defaults to status/readback.
     #[serde(default)]
@@ -221,13 +220,8 @@ impl SynapseService {
         cdp_target_id: &str,
         dialog: &NormalizedBrowserHandleDialogParams,
     ) -> Result<BrowserHandleDialogResponse, ErrorData> {
-        // `status` arms the persistent dialog listener with a default policy,
-        // so every operation is mutation-capable at this choke point.
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_handle_dialog_before_mutation",
-        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            if cdp_target_id.starts_with("chrome-tab:") {
+            if synapse_browsers::BrowserRegistry::global().has_bridge_tab_prefix(cdp_target_id) {
                 let operation = browser_dialog_operation_name(dialog.operation);
                 let default_policy = dialog
                     .default_policy
@@ -251,14 +245,12 @@ impl SynapseService {
                         ),
                     )
                 })?;
-                super::operator_panic_boundary::ensure_mcp_mutation(
-                    "browser_handle_dialog_after_bridge_mutation",
-                )?;
-                let endpoint = result
-                    .extension_id
-                    .as_deref()
-                    .map(chrome_debugger_endpoint)
-                    .unwrap_or_else(chrome_debugger_default_endpoint);
+                let endpoint = synapse_browsers::BrowserRegistry::global()
+                    .bridge_endpoint_for_reported_target(
+                        cdp_target_id,
+                        result.extension_id.as_deref(),
+                        synapse_browsers::BridgeLane::Tabs,
+                    );
                 tracing::info!(
                     code = "CHROME_BRIDGE_BACKGROUND_DIALOG_READBACK",
                     session_id = %session_id,
@@ -343,9 +335,6 @@ impl SynapseService {
                 )
             }
         };
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_handle_dialog_after_raw_mutation",
-        )?;
         let read = synapse_a11y::dialog_capture_read(cdp_target_id, &read_filter);
         tracing::info!(
             code = "CDP_BACKGROUND_DIALOG_READBACK",

@@ -23,7 +23,6 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const SYNAPSE_TOOL_CATALOG: &str = "synapse_tool_catalog";
@@ -348,14 +347,23 @@ impl Runner {
             .append(true)
             .open(&stdout_path)
             .with_context(|| format!("open {}", stdout_path.display()))?;
-        let token = crate::http::load_token_value().context("load Synapse bearer token")?;
+        let token =
+            crate::spawn_credentials::client_bearer_token().context("load Synapse bearer token")?;
         let client_info = ClientInfo::new(
             ClientCapabilities::default(),
             Implementation::new("synapse-local-model-agent", env!("CARGO_PKG_VERSION")),
         );
+        let capability = std::env::var(crate::local_agent_capability::ENV)
+            .context("local-agent capability missing from Synapse launch")?;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            crate::local_agent_capability::HEADER.parse()?,
+            capability.parse()?,
+        );
         let transport = StreamableHttpClientTransport::from_config(
             StreamableHttpClientTransportConfig::with_uri(cli.mcp_url.clone())
-                .auth_header(token.clone()),
+                .auth_header(token.clone())
+                .custom_headers(headers),
         );
         let mcp = client_info
             .serve(transport)
@@ -3906,7 +3914,7 @@ fn parse_non_stream_response(text: &str) -> anyhow::Result<ChatCompletion> {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         usage: value.get("usage").and_then(Usage::from_value),
-        raw_sha256: sha256_hex(text.as_bytes()),
+        raw_sha256: crate::content_digest::keyed_prefixed_digest(text.as_bytes()),
     })
 }
 
@@ -4009,7 +4017,7 @@ async fn parse_streaming_response(response: reqwest::Response) -> anyhow::Result
         tool_calls,
         finish_reason,
         usage,
-        raw_sha256: sha256_hex(&raw),
+        raw_sha256: crate::content_digest::keyed_prefixed_digest(&raw),
     })
 }
 
@@ -4310,19 +4318,6 @@ fn error_code_from_detail(detail: &str) -> &str {
         }
     }
     "LOCAL_MODEL_AGENT_FAILED"
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    out
 }
 
 fn unix_time_ms_now() -> u64 {

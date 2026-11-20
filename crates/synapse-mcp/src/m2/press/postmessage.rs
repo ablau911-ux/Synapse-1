@@ -1,10 +1,18 @@
 use rmcp::ErrorData;
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 use synapse_action::ActionError;
 use synapse_core::Key;
 
+#[cfg(windows)]
+use super::key_delivery_plan::{
+    KeyboardCandidate, KeyboardTargetPicker, PostKeyPlan, class_keyboard_score, is_rich_edit_class,
+    postmessage_key_delivery_plan,
+};
 use super::{action_error_to_mcp, key_label};
+
+#[cfg(all(test, windows))]
+#[path = "key_up_reparent_62.rs"]
+mod key_up_reparent_62;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,7 +32,6 @@ struct WindowCandidate {
     root_hwnd: windows::Win32::Foundation::HWND,
     hwnd: windows::Win32::Foundation::HWND,
     class_name: String,
-    score: u8,
 }
 
 #[cfg(windows)]
@@ -40,132 +47,207 @@ pub(crate) fn hwnd_keyboard_target_state(
     hwnd_keyboard_target_state_impl(root_hwnd).map_err(|error| action_error_to_mcp(&error))
 }
 
+/// The state of the control the keys were sent to (#2340 part B): the check
+/// reads this control, never a fresh pick.
+pub(crate) fn delivered_keyboard_target_state(
+    root_hwnd: i64,
+    target_hwnd: i64,
+) -> Result<HwndKeyboardTargetState, ErrorData> {
+    delivered_keyboard_target_state_impl(root_hwnd, target_hwnd)
+        .map_err(|error| action_error_to_mcp(&error))
+}
+
 pub(crate) async fn post_key_sequence(
     root_hwnd: i64,
+    target_hwnd: i64,
     keys: &[Key],
     hold_ms: u32,
-    boundary: crate::m2::OperatorPanicActionBoundary,
+    dispatch: impl FnOnce(i64, &mut dyn FnMut(i64) -> Result<(), ErrorData>) -> Result<(), ErrorData>,
 ) -> Result<HwndKeyboardTargetState, ErrorData> {
-    post_key_sequence_impl(root_hwnd, keys, hold_ms, boundary).await
+    let mut pending = None;
+    dispatch(root_hwnd, &mut |checked_root| {
+        if checked_root != root_hwnd {
+            return Err(crate::m1::mcp_error(
+                synapse_core::error_codes::ACTION_TARGET_INVALID,
+                "act_press checked root differs from the captured target; no input was sent",
+            ));
+        }
+        pending = Some(
+            post_key_sequence_start(checked_root, target_hwnd, keys, hold_ms)
+                .map_err(|error| action_error_to_mcp(&error))?,
+        );
+        Ok(())
+    })?;
+    let pending = pending.ok_or_else(|| {
+        crate::m1::mcp_error(
+            synapse_core::error_codes::ACTION_TARGET_INVALID,
+            "act_press dispatch did not deliver to the checked root",
+        )
+    })?;
+    post_key_sequence_finish(root_hwnd, pending, hold_ms)
+        .await
+        .map_err(|error| action_error_to_mcp(&error))
 }
 
 #[cfg(windows)]
-async fn post_key_sequence_impl(
+struct PendingKeySequence {
+    key_specs: Vec<KeySpec>,
+    target_hwnd: i64,
+    release_keys: bool,
+}
+
+#[cfg(not(windows))]
+struct PendingKeySequence;
+
+#[cfg(windows)]
+fn post_key_sequence_start(
     root_hwnd: i64,
+    target_hwnd: i64,
     keys: &[Key],
     hold_ms: u32,
-    boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
-    let key_specs = keys
-        .iter()
-        .map(key_spec)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| action_error_to_mcp(&error))?;
+) -> Result<PendingKeySequence, ActionError> {
+    post_key_sequence_start_with(root_hwnd, target_hwnd, keys, hold_ms, |_| {})
+}
+
+#[cfg(windows)]
+fn post_key_sequence_start_with(
+    root_hwnd: i64,
+    target_hwnd: i64,
+    keys: &[Key],
+    hold_ms: u32,
+    after_select: impl FnOnce(i64),
+) -> Result<PendingKeySequence, ActionError> {
+    let key_specs = keys.iter().map(key_spec).collect::<Result<Vec<_>, _>>()?;
     // #1332: a Shift+navigation chord extends the selection ONLY if the control
     // reads the OS Shift key-state, which PostMessage WM_KEYDOWN cannot set — the
     // caret would just move WITHOUT selecting (a silent false success). Fail loud
     // with the correct alternatives instead.
     if let Some(nav) = shift_navigation_chord(&key_specs) {
-        return Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+        return Err(ActionError::BackendUnavailable {
             detail: format!(
                 "act_press PostMessage cannot extend a selection with Shift+{nav}: WM_KEYDOWN cannot set the OS Shift key-state the control reads, so the caret would move without selecting. Use target_act verb=set_selection for an exact background selection, or acquire the foreground input lease (backend=hardware) for real Shift+navigation."
             ),
-        }));
+        });
     }
-    let mut release_keys = false;
-    let target_hwnd = {
-        let target =
-            best_keyboard_target(root_hwnd).map_err(|error| action_error_to_mcp(&error))?;
-        if is_ctrl_a_shortcut(&key_specs) {
-            boundary.ensure("immediately_before_postmessage_select_all")?;
-            select_all_edit_target(&target).map_err(|error| action_error_to_mcp(&error))?;
-            hwnd_to_i64(target.hwnd)
-        } else if let Some(chord) = edit_control_chord(&key_specs) {
-            // #1331: PostMessage WM_KEYDOWN cannot set OS key-state, so editing
-            // chords (Ctrl+C/X/V/Z, Ctrl+Y/Ctrl+Shift+Z) never reach the control
-            // as accelerators. Deliver the equivalent edit-control message directly
-            // and verify the real effect (clipboard sequence number for copy/cut,
-            // window-text change for paste/undo/redo) so we never falsely report
-            // success on a chord the control ignored.
-            boundary.ensure("immediately_before_postmessage_edit_chord")?;
-            send_edit_control_chord(&target, &chord)
-                .map_err(|error| action_error_to_mcp(&error))?;
-            hwnd_to_i64(target.hwnd)
-        } else if is_plain_printable_text(&key_specs) {
-            boundary.ensure("immediately_before_postmessage_plain_text")?;
-            post_char_messages(target.hwnd, &key_specs)
-                .map_err(|error| action_error_to_mcp(&error))?;
-            hwnd_to_i64(target.hwnd)
-        } else {
-            for spec in &key_specs {
-                boundary.ensure("immediately_before_postmessage_key_down")?;
-                post_key_message(
-                    target.hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
-                    spec,
-                )
-                .map_err(|error| action_error_to_mcp(&error))?;
-            }
-            release_keys = true;
-            boundary.ensure("immediately_before_postmessage_key_chars")?;
-            post_char_messages(target.hwnd, &key_specs)
-                .map_err(|error| action_error_to_mcp(&error))?;
-            hwnd_to_i64(target.hwnd)
-        }
+    // #2340 part B: the caller picked the control once; the check reads it too.
+    after_select(target_hwnd);
+    ensure_keyboard_target_root(root_hwnd, target_hwnd)?;
+    let target_window = hwnd_from_i64(target_hwnd)?;
+    let target = WindowCandidate {
+        root_hwnd: hwnd_from_i64(root_hwnd)?,
+        hwnd: target_window,
+        class_name: window_class_name(target_window),
     };
+    let mut release_keys = false;
+    if is_ctrl_a_shortcut(&key_specs) {
+        select_all_edit_target(&target)?;
+    } else if let Some(chord) = edit_control_chord(&key_specs) {
+        // #1331: PostMessage WM_KEYDOWN cannot set OS key-state, so editing
+        // chords (Ctrl+C/X/V/Z, Ctrl+Y/Ctrl+Shift+Z) never reach the control
+        // as accelerators. Deliver the equivalent edit-control message directly
+        // and verify the real effect (clipboard sequence number for copy/cut,
+        // window-text change for paste/undo/redo) so we never falsely report
+        // success on a chord the control ignored.
+        send_edit_control_chord(&target, &chord)?;
+    } else {
+        // #371: a lone WM_CHAR suits text controls only; key-binding windows
+        // (winit, games, canvases) read WM_KEYDOWN/WM_KEYUP.
+        match postmessage_key_delivery_plan(
+            &target.class_name,
+            is_plain_printable_text(&key_specs),
+            hold_ms,
+        ) {
+            PostKeyPlan::CharOnly => post_char_messages(target.hwnd, &key_specs)?,
+            PostKeyPlan::KeyDownUp { emit_char } => {
+                for spec in &key_specs {
+                    post_key_message(
+                        target.hwnd,
+                        windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                        spec,
+                    )?;
+                }
+                release_keys = true;
+                if emit_char {
+                    post_char_messages(target.hwnd, &key_specs)?;
+                }
+            }
+        }
+    }
+    Ok(PendingKeySequence {
+        key_specs,
+        target_hwnd,
+        release_keys,
+    })
+}
+
+#[cfg(windows)]
+async fn post_key_sequence_finish(
+    root_hwnd: i64,
+    pending: PendingKeySequence,
+    hold_ms: u32,
+) -> Result<HwndKeyboardTargetState, ActionError> {
+    let PendingKeySequence {
+        key_specs,
+        target_hwnd,
+        release_keys,
+    } = pending;
     if hold_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
     }
-    let boundary_error = boundary
-        .ensure("after_postmessage_key_hold_before_release")
-        .err();
-    let target = hwnd_from_i64(target_hwnd).map_err(|error| action_error_to_mcp(&error))?;
-    let mut release_error = None;
+    let target = hwnd_from_i64(target_hwnd)?;
     if release_keys {
+        ensure_keyboard_target_root(root_hwnd, target_hwnd)?;
         for spec in key_specs.iter().rev() {
-            if let Err(error) = post_key_message(
+            post_key_message(
                 target,
                 windows::Win32::UI::WindowsAndMessaging::WM_KEYUP,
                 spec,
-            ) && release_error.is_none()
-            {
-                release_error = Some(action_error_to_mcp(&error));
-            }
+            )?;
         }
     }
-    if let Some(error) = boundary_error {
-        if let Some(release_error) = release_error {
-            tracing::error!(
-                code = synapse_core::error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-                detail_code = "POSTMESSAGE_KEY_RELEASE_AFTER_OPERATOR_PANIC_FAILED",
-                detail = %release_error,
-                "operator panic superseded held PostMessage keys and best-effort key-up cleanup failed"
-            );
-        }
-        return Err(error);
+    delivered_keyboard_target_state_impl(root_hwnd, target_hwnd)
+}
+
+#[cfg(windows)]
+fn ensure_keyboard_target_root(root_hwnd: i64, target_hwnd: i64) -> Result<(), ActionError> {
+    let actual_root = synapse_action::delivery_target::live_root_hwnd(
+        target_hwnd,
+        "act_press keyboard destination check",
+    )?;
+    if actual_root != root_hwnd {
+        return Err(ActionError::TargetInvalid {
+            detail: "act_press keyboard destination left the checked root".to_owned(),
+        });
     }
-    if let Some(error) = release_error {
-        return Err(error);
-    }
-    let target = best_keyboard_target(root_hwnd).map_err(|error| action_error_to_mcp(&error))?;
-    target_state(target).map_err(|error| action_error_to_mcp(&error))
+    Ok(())
 }
 
 #[cfg(not(windows))]
-async fn post_key_sequence_impl(
+fn post_key_sequence_start(
     _root_hwnd: i64,
+    _target_hwnd: i64,
     _keys: &[Key],
     _hold_ms: u32,
-    _boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
-    Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+) -> Result<PendingKeySequence, ActionError> {
+    Err(ActionError::BackendUnavailable {
         detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
-    }))
+    })
+}
+
+#[cfg(not(windows))]
+async fn post_key_sequence_finish(
+    _root_hwnd: i64,
+    _pending: PendingKeySequence,
+    _hold_ms: u32,
+) -> Result<HwndKeyboardTargetState, ActionError> {
+    Err(ActionError::BackendUnavailable {
+        detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
+    })
 }
 
 #[cfg(windows)]
 fn hwnd_keyboard_target_state_impl(root_hwnd: i64) -> Result<HwndKeyboardTargetState, ActionError> {
-    target_state(best_keyboard_target(root_hwnd)?)
+    target_state(KeyboardTargetPicker::for_root(root_hwnd)?.target()?)
 }
 
 #[cfg(not(windows))]
@@ -178,55 +260,107 @@ fn hwnd_keyboard_target_state_impl(
 }
 
 #[cfg(windows)]
-fn best_keyboard_target(root_hwnd: i64) -> Result<WindowCandidate, ActionError> {
-    use std::ffi::c_void;
-    use windows::Win32::{
-        Foundation::LPARAM,
-        UI::{
-            Input::KeyboardAndMouse::IsWindowEnabled,
-            WindowsAndMessaging::{EnumChildWindows, IsWindow, IsWindowVisible},
-        },
-    };
+fn delivered_keyboard_target_state_impl(
+    root_hwnd: i64,
+    target_hwnd: i64,
+) -> Result<HwndKeyboardTargetState, ActionError> {
+    ensure_keyboard_target_root(root_hwnd, target_hwnd)?;
+    let target = hwnd_from_i64(target_hwnd)?;
+    target_state(WindowCandidate {
+        root_hwnd: hwnd_from_i64(root_hwnd)?,
+        hwnd: target,
+        class_name: window_class_name(target),
+    })
+}
 
-    let root = hwnd_from_i64(root_hwnd)?;
-    if !unsafe { IsWindow(Some(root)) }.as_bool() {
-        return Err(ActionError::TargetInvalid {
-            detail: format!("act_press PostMessage root hwnd 0x{root_hwnd:x} is not a live window"),
-        });
+#[cfg(not(windows))]
+fn delivered_keyboard_target_state_impl(
+    _root_hwnd: i64,
+    _target_hwnd: i64,
+) -> Result<HwndKeyboardTargetState, ActionError> {
+    Err(ActionError::BackendUnavailable {
+        detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
+    })
+}
+
+/// #2328: the OS part of the keyboard target picker. `for_root` enumerates the
+/// visible, enabled windows under the claimed root (the root last) and reads
+/// the thread focus; `target` turns the pick into the delivery target.
+#[cfg(windows)]
+impl KeyboardTargetPicker {
+    fn for_root(root_hwnd: i64) -> Result<Self, ActionError> {
+        use std::ffi::c_void;
+        use windows::Win32::{
+            Foundation::LPARAM,
+            UI::{
+                Input::KeyboardAndMouse::IsWindowEnabled,
+                WindowsAndMessaging::{EnumChildWindows, IsWindowVisible},
+            },
+        };
+
+        let root = hwnd_from_i64(root_hwnd)?;
+        synapse_action::delivery_target::ensure_live_window(
+            root_hwnd,
+            "act_press PostMessage root window",
+        )?;
+        let mut context = ChildEnumContext {
+            root_hwnd: root,
+            candidates: Vec::new(),
+        };
+        let context_ptr = (&raw mut context).cast::<c_void>();
+        // SAFETY: `enum_keyboard_child` matches the WNDENUMPROC signature, and `lparam` is the
+        // address of the live local `context`, which outlives this synchronous call and is not
+        // otherwise accessed until it returns. A stale root HWND just makes the enumeration fail.
+        let _ = unsafe {
+            EnumChildWindows(
+                Some(root),
+                Some(enum_keyboard_child),
+                LPARAM(context_ptr as isize),
+            )
+        };
+        let root_class_name = window_class_name(root);
+        let root_candidate = WindowCandidate {
+            root_hwnd: root,
+            hwnd: root,
+            class_name: root_class_name,
+        };
+        let candidates: Vec<KeyboardCandidate> = context
+            .candidates
+            .into_iter()
+            .chain(std::iter::once(root_candidate))
+            // SAFETY: HWND is a plain handle value that is never dereferenced; IsWindowVisible only
+            // reads it and returns FALSE for a stale or invalid handle.
+            .filter(|candidate| unsafe { IsWindowVisible(candidate.hwnd) }.as_bool())
+            // SAFETY: HWND is a plain handle value that is never dereferenced; IsWindowEnabled only
+            // reads it and returns FALSE for a stale or invalid handle.
+            .filter(|candidate| unsafe { IsWindowEnabled(candidate.hwnd) }.as_bool())
+            .map(|candidate| {
+                KeyboardCandidate::new(hwnd_to_i64(candidate.hwnd), candidate.class_name)
+            })
+            .collect();
+        let thread_focus = synapse_a11y::focused_hwnd_in_window(root_hwnd)
+            .ok()
+            .flatten();
+        Ok(Self::new(root_hwnd, candidates, thread_focus))
     }
-    let mut context = ChildEnumContext {
-        root_hwnd: root,
-        candidates: Vec::new(),
-    };
-    let context_ptr = (&raw mut context).cast::<c_void>();
-    let _ = unsafe {
-        EnumChildWindows(
-            Some(root),
-            Some(enum_keyboard_child),
-            LPARAM(context_ptr as isize),
-        )
-    };
-    let root_class_name = window_class_name(root);
-    let root_candidate = WindowCandidate {
-        root_hwnd: root,
-        hwnd: root,
-        score: class_keyboard_score(&root_class_name),
-        class_name: root_class_name,
-    };
-    context
-        .candidates
-        .into_iter()
-        .chain(std::iter::once(root_candidate))
-        .filter(|candidate| unsafe { IsWindowVisible(candidate.hwnd) }.as_bool())
-        .filter(|candidate| unsafe { IsWindowEnabled(candidate.hwnd) }.as_bool())
-        .max_by_key(|candidate| candidate.score)
-        .ok_or_else(|| ActionError::ElementNotResolved {
+
+    fn target(&self) -> Result<WindowCandidate, ActionError> {
+        let root_hwnd = self.root_hwnd();
+        let chosen = self.pick().ok_or_else(|| ActionError::ElementNotResolved {
             detail: format!(
                 "act_press PostMessage could not resolve an enabled keyboard target under hwnd 0x{root_hwnd:x}"
             ),
+        })?;
+        Ok(WindowCandidate {
+            root_hwnd: hwnd_from_i64(root_hwnd)?,
+            hwnd: hwnd_from_i64(chosen.hwnd())?,
+            class_name: chosen.class_name().to_owned(),
         })
+    }
 }
 
+// SAFETY: only ever passed to EnumChildWindows by `KeyboardTargetPicker::for_root`, which supplies a
+// valid `*mut ChildEnumContext` as `lparam`; the signature matches WNDENUMPROC.
 #[cfg(windows)]
 unsafe extern "system" fn enum_keyboard_child(
     hwnd: windows::Win32::Foundation::HWND,
@@ -236,7 +370,11 @@ unsafe extern "system" fn enum_keyboard_child(
         Input::KeyboardAndMouse::IsWindowEnabled, WindowsAndMessaging::IsWindowVisible,
     };
 
+    // SAFETY: `lparam` is the `&raw mut context` passed by the enclosing EnumChildWindows call
+    // in `KeyboardTargetPicker::for_root`; it is valid and exclusively borrowed for that call.
     let context = unsafe { &mut *(lparam.0 as *mut ChildEnumContext) };
+    // SAFETY: HWND is a plain handle value supplied by the enumeration; both calls only read it
+    // and return FALSE for an invalid handle.
     if unsafe { IsWindowVisible(hwnd) }.as_bool() && unsafe { IsWindowEnabled(hwnd) }.as_bool() {
         let class_name = window_class_name(hwnd);
         let score = class_keyboard_score(&class_name);
@@ -245,26 +383,10 @@ unsafe extern "system" fn enum_keyboard_child(
                 root_hwnd: context.root_hwnd,
                 hwnd,
                 class_name,
-                score,
             });
         }
     }
     windows::core::BOOL(1)
-}
-
-#[cfg(windows)]
-fn class_keyboard_score(class_name: &str) -> u8 {
-    let lowered = class_name.to_ascii_lowercase();
-    if lowered.contains("edit") || lowered.contains("richedit") {
-        return 100;
-    }
-    if lowered.contains("text") || lowered.contains("scintilla") {
-        return 80;
-    }
-    if lowered.contains("document") || lowered.contains("chrome_renderwidgethosthwnd") {
-        return 40;
-    }
-    1
 }
 
 #[cfg(windows)]
@@ -300,6 +422,9 @@ fn select_all_edit_target(target: &WindowCandidate) -> Result<(), ActionError> {
 
     const EM_SETSEL: u32 = 0x00B1;
     const TIMEOUT_MS: u32 = 250;
+    // SAFETY: wparam/lparam are plain integers (select-all range 0..-1), never pointers, and the
+    // result out-pointer is None, so nothing is dereferenced in the target process; the
+    // SMTO_ABORTIFHUNG 250 ms timeout bounds the call and a stale HWND yields a 0 result.
     let result = unsafe {
         SendMessageTimeoutW(
             target.hwnd,
@@ -398,6 +523,7 @@ fn edit_control_chord(key_specs: &[KeySpec]) -> Option<EditChord> {
 #[cfg(windows)]
 pub(crate) fn clipboard_sequence_number() -> u32 {
     use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+    // SAFETY: GetClipboardSequenceNumber takes no arguments and only reads a system counter.
     unsafe { GetClipboardSequenceNumber() }
 }
 
@@ -439,8 +565,7 @@ fn send_edit_control_chord(target: &WindowCandidate, chord: &EditChord) -> Resul
         UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW},
     };
 
-    let class_name = target.class_name.to_ascii_lowercase();
-    if chord.richedit_only && !class_name.contains("richedit") {
+    if chord.richedit_only && !is_rich_edit_class(&target.class_name) {
         return Err(ActionError::BackendUnavailable {
             detail: format!(
                 "act_press PostMessage {} (redo) requires a rich-edit target; resolved hwnd 0x{:x} class {:?} has no standard redo message — use the foreground input lease for redo on this control",
@@ -453,6 +578,9 @@ fn send_edit_control_chord(target: &WindowCandidate, chord: &EditChord) -> Resul
 
     const TIMEOUT_MS: u32 = 250;
     let mut message_result = 0_usize;
+    // SAFETY: wparam/lparam are zero, never pointers; the result out-pointer refers to the live
+    // local `message_result`. The SMTO_ABORTIFHUNG 250 ms timeout bounds the call and a stale
+    // HWND yields a 0 result.
     let send_result = unsafe {
         SendMessageTimeoutW(
             target.hwnd,
@@ -485,7 +613,7 @@ fn target_state(target: WindowCandidate) -> Result<HwndKeyboardTargetState, Acti
         hwnd: hwnd_to_i64(target.hwnd),
         class_name: target.class_name,
         text_len: Some(text.chars().count()),
-        text_sha256: Some(hex_encode(&Sha256::digest(text.as_bytes()))),
+        text_sha256: Some(crate::content_digest::keyed_text_digest_hex(&text)),
         selection_start: selection.map(|(start, _end)| start),
         selection_end: selection.map(|(_start, end)| end),
     })
@@ -651,6 +779,8 @@ fn post_key_message(
         },
     };
 
+    // SAFETY: MapVirtualKeyW takes two plain integers and only does a keyboard-layout table
+    // lookup; it has no pointer arguments.
     let scan = unsafe { MapVirtualKeyW(u32::from(key.vk), MAPVK_VK_TO_VSC) } & 0xff;
     let mut bits = 1_u32 | (scan << 16);
     if message == WM_KEYUP {
@@ -658,6 +788,9 @@ fn post_key_message(
         bits |= 1 << 31;
     }
     let lparam = LPARAM(isize::try_from(bits).unwrap_or(isize::MAX));
+    // SAFETY: wparam (virtual-key code) and lparam (packed key flags) are plain integers, never
+    // pointers, so nothing can dangle in the target's queue; a stale HWND makes PostMessageW
+    // return an error, which is mapped below.
     unsafe { PostMessageW(Some(hwnd), message, WPARAM(usize::from(key.vk)), lparam) }.map_err(
         |error| ActionError::BackendUnavailable {
             detail: format!(
@@ -682,9 +815,14 @@ fn post_char_message(
         },
     };
 
+    // SAFETY: MapVirtualKeyW takes two plain integers and only does a keyboard-layout table
+    // lookup; it has no pointer arguments.
     let scan = unsafe { MapVirtualKeyW(u32::from(key.vk), MAPVK_VK_TO_VSC) } & 0xff;
     let bits = 1_u32 | (scan << 16);
     let lparam = LPARAM(isize::try_from(bits).unwrap_or(isize::MAX));
+    // SAFETY: wparam (UTF-16 code unit) and lparam (packed key flags) are plain integers, never
+    // pointers, so nothing can dangle in the target's queue; a stale HWND makes PostMessageW
+    // return an error, which is mapped below.
     unsafe { PostMessageW(Some(hwnd), WM_CHAR, WPARAM(usize::from(char_code)), lparam) }.map_err(
         |error| ActionError::BackendUnavailable {
             detail: format!(
@@ -706,6 +844,9 @@ fn window_text(hwnd: windows::Win32::Foundation::HWND) -> Result<String, ActionE
 
     const TIMEOUT_MS: u32 = 250;
     let mut length_result = 0_usize;
+    // SAFETY: WM_GETTEXTLENGTH carries zero wparam/lparam (no pointers); the result out-pointer
+    // refers to the live local `length_result`. The SMTO_ABORTIFHUNG 250 ms timeout bounds the
+    // call and a stale HWND yields a 0 result.
     let length_lresult = unsafe {
         SendMessageTimeoutW(
             hwnd,
@@ -723,6 +864,10 @@ fn window_text(hwnd: windows::Win32::Foundation::HWND) -> Result<String, ActionE
     let capacity = length_result.saturating_add(1).min(1_048_576);
     let mut buffer = vec![0_u16; capacity];
     let mut copied = 0_usize;
+    // SAFETY: lparam points at `buffer`, a live UTF-16 allocation of exactly `buffer.len()`
+    // elements, which is the capacity passed in wparam; the call is synchronous so `buffer`
+    // outlives it. WM_GETTEXT is a system message whose buffer the OS marshals, including
+    // across processes. The out-pointer refers to the live local `copied`.
     let copied_lresult = unsafe {
         SendMessageTimeoutW(
             hwnd,
@@ -752,6 +897,9 @@ fn edit_selection(hwnd: windows::Win32::Foundation::HWND) -> Option<(u32, u32)> 
     const TIMEOUT_MS: u32 = 250;
     let mut start = 0_u32;
     let mut end = 0_u32;
+    // SAFETY: wparam/lparam point at the live locals `start` and `end` (EM_GETSEL out-params),
+    // which outlive this synchronous call; EM_GETSEL is a system message whose DWORD out-pointers
+    // the OS marshals, including across processes. The result out-pointer is None.
     let result = unsafe {
         SendMessageTimeoutW(
             hwnd,
@@ -771,6 +919,8 @@ fn window_class_name(hwnd: windows::Win32::Foundation::HWND) -> String {
     use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
 
     let mut buffer = vec![0_u16; 256];
+    // SAFETY: `buffer` is a live, writable UTF-16 slice and GetClassNameW writes at most its
+    // length; a stale HWND returns 0, which yields an empty class name.
     let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
     String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
 }
@@ -780,27 +930,15 @@ fn hwnd_from_i64(hwnd: i64) -> Result<windows::Win32::Foundation::HWND, ActionEr
     use std::ffi::c_void;
     use windows::Win32::Foundation::HWND;
 
-    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
-        ActionError::TargetInvalid {
-            detail: format!(
-                "act_press PostMessage target hwnd {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
-            ),
-        }
-    })?;
-    Ok(HWND(native as *mut c_void))
+    if hwnd == 0 {
+        return Err(ActionError::TargetInvalid {
+            detail: "act_press PostMessage target hwnd is null".to_owned(),
+        });
+    }
+    Ok(HWND(hwnd as isize as *mut c_void))
 }
 
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: windows::Win32::Foundation::HWND) -> i64 {
-    synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
+    hwnd.0 as isize as i64
 }

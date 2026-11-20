@@ -11,7 +11,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use chrono::Utc;
@@ -22,6 +22,7 @@ use synapse_core::{SCHEMA_VERSION, error_codes};
 use synapse_storage::{Db, cf, decode_json, encode_json};
 use uuid::Uuid;
 
+use super::episodes::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
@@ -29,16 +30,16 @@ use super::{
     permissions::{Permission, RequiredPermissions, required},
 };
 
+#[path = "terminal_retention.rs"]
+pub(crate) mod terminal_retention;
+use self::terminal_retention::{QueueRowSummary, TERMINAL_RETENTION, plan_terminal_prune};
+
 const ITEM_PREFIX: &str = "approval/v1/item/";
 const AUDIT_PREFIX: &str = "approval/v1/audit/";
 const ACTIVATION_PREFIX: &str = "approval/v1/activation/";
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
 const MAX_SCAN_ROWS: usize = 20_000;
-const SCAN_CHUNK_ROWS: usize = 4_096;
-const TERMINAL_ITEM_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
-const TERMINAL_ITEM_RETAIN_ROWS: usize = 5_000;
-const DELETE_BATCH_ROWS: usize = 512;
 const MAX_TITLE_CHARS: usize = 160;
 const MAX_BODY_CHARS: usize = 4_000;
 const MAX_PAYLOAD_JSON_BYTES: usize = 64 * 1024;
@@ -51,6 +52,20 @@ const MAX_SNOOZE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const ACTIVATION_TOKEN_PREFIX: &str = "act1-";
 const APPROVAL_PROTOCOL_SCHEME: &str = "synapse-approval";
 const TIMEOUT_DECIDER_SESSION: &str = "timeout";
+
+// The daemon exclusively owns its database.  Serialize each approval
+// read/modify/write transition across MCP, HTTP, toast, and background paths;
+// the storage write queue alone cannot make the preceding read atomic.
+static APPROVAL_TRANSITIONS: Mutex<()> = Mutex::new(());
+
+pub(crate) fn lock_approval_transitions() -> Result<MutexGuard<'static, ()>, ErrorData> {
+    APPROVAL_TRANSITIONS.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "approval transition lock poisoned; restart the daemon before retrying",
+        )
+    })
+}
 
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
@@ -325,6 +340,8 @@ pub struct ApprovalDecideParams {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalToastState {
     pub requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown: Option<bool>,
     pub suppress_popup: bool,
     pub actionable_buttons: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +408,7 @@ pub struct ApprovalActivationDecisionResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalToastDelivery {
     pub requested: bool,
+    pub shown: Option<bool>,
     pub suppress_popup: bool,
     pub actionable_buttons: bool,
     pub activation_id: Option<String>,
@@ -556,6 +574,7 @@ pub fn request_approval(
     by_session: &str,
 ) -> Result<ApprovalRequestResponse, ErrorData> {
     validate_request(params)?;
+    let _transition = lock_approval_transitions()?;
     let now = now_unix_ms();
     if let Some(existing) = find_pending_dedupe(db, params.dedupe_key.as_deref(), now)? {
         let audit = write_audit(
@@ -606,6 +625,7 @@ pub fn request_approval(
         operator_response: None,
         toast: ApprovalToastState {
             requested: params.notify,
+            shown: None,
             suppress_popup: params.suppress_popup,
             actionable_buttons: false,
             activation_id: None,
@@ -644,6 +664,7 @@ pub fn update_approval_toast_state(
     by_session: &str,
 ) -> Result<(ApprovalItemRecord, ApprovalRowEvidence, ApprovalRowEvidence), ErrorData> {
     validate_approval_id(approval_id)?;
+    let _transition = lock_approval_transitions()?;
     let now = now_unix_ms();
     let key = item_key(approval_id);
     let (mut item, _before_row) = read_item_by_key(db, &key)?.ok_or_else(|| {
@@ -653,6 +674,7 @@ pub fn update_approval_toast_state(
     })?;
     item.toast = ApprovalToastState {
         requested: delivery.requested,
+        shown: delivery.shown,
         suppress_popup: delivery.suppress_popup,
         actionable_buttons: delivery.actionable_buttons,
         activation_id: delivery.activation_id,
@@ -688,6 +710,7 @@ pub fn prepare_activation_links(
 ) -> Result<ApprovalActivationLinks, ErrorData> {
     validate_approval_id(approval_id)?;
     validate_bind_addr(bind_addr)?;
+    let _transition = lock_approval_transitions()?;
     let activation_id = format!("actv1-{}", Uuid::now_v7().simple());
     let token = format!(
         "{ACTIVATION_TOKEN_PREFIX}{}{}",
@@ -698,7 +721,7 @@ pub fn prepare_activation_links(
         schema_version: SCHEMA_VERSION,
         activation_id: activation_id.clone(),
         approval_id: approval_id.to_owned(),
-        token_sha256: activation_token_sha256(&token),
+        token_sha256: token_sha256_hex(token.as_bytes()),
         created_at_unix_ms: now_unix_ms(),
         used_at_unix_ms: None,
         used_by_session: None,
@@ -772,6 +795,7 @@ pub fn decide_approval_from_activation(
     by_session: &str,
 ) -> Result<ApprovalActivationDecisionResponse, ErrorData> {
     validate_activation_params(params)?;
+    let transition = lock_approval_transitions()?;
     let decision = ApprovalDecision::from_activation_text(params.decision.as_str())
         .ok_or_else(|| invalid("activation decision must be accept, decline, or snooze"))?;
     let key = activation_key(&params.approval_id, &params.activation_id);
@@ -787,13 +811,14 @@ pub fn decide_approval_from_activation(
             params.activation_id
         )));
     }
-    let expected_hash = activation_token_sha256(&params.token);
+    let expected_hash = token_sha256_hex(params.token.as_bytes());
     if activation.token_sha256 != expected_hash {
         return Err(invalid(
             "activation token did not match the stored token hash",
         ));
     }
-    let decision_response = decide_approval(
+    let decision_response = decide_approval_locked(
+        &transition,
         db,
         &ApprovalDecideParams {
             approval_id: params.approval_id.clone(),
@@ -826,6 +851,7 @@ pub fn list_approvals(
     params: &ApprovalListParams,
 ) -> Result<ApprovalListResponse, ErrorData> {
     validate_list(params)?;
+    let _transition = lock_approval_transitions()?;
     let now = now_unix_ms();
     let materialized_timeouts = materialize_timeouts(db, now)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
@@ -838,7 +864,7 @@ pub fn list_approvals(
         .kinds
         .as_deref()
         .map(|values| values.iter().copied().collect::<BTreeSet<_>>());
-    let mut start_key = match params
+    let start_key = match params
         .cursor
         .as_deref()
         .map(str::trim)
@@ -849,54 +875,37 @@ pub fn list_approvals(
         })?),
         None => ITEM_PREFIX.as_bytes().to_vec(),
     };
+    let rows = db
+        .scan_cf_prefix_from(cf::CF_KV, ITEM_PREFIX.as_bytes(), &start_key)
+        .map_err(storage_error)?;
     let mut items = Vec::new();
     let mut scanned_rows = 0_u64;
     let mut next_cursor = None;
-    'scan: loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_KV, &start_key, SCAN_CHUNK_ROWS)
-            .map_err(storage_error)?;
-        if rows.is_empty() {
-            break;
+    for (key, value) in rows {
+        scanned_rows = scanned_rows.saturating_add(1);
+        let item = decode_item(&key, &value)?;
+        if !params.include_terminal && item.status.is_terminal() {
+            continue;
         }
-        let mut last_key = None;
-        for (key, value) in rows {
-            if !key.starts_with(ITEM_PREFIX.as_bytes()) {
-                break 'scan;
-            }
-            scanned_rows = scanned_rows.saturating_add(1);
-            let item = decode_item(&key, &value)?;
-            last_key = Some(key.clone());
-            if !params.include_terminal && item.status.is_terminal() {
+        if let Some(filter) = &status_filter {
+            if !filter.contains(&item.status) {
                 continue;
             }
-            if let Some(filter) = &status_filter {
-                if !filter.contains(&item.status) {
-                    continue;
-                }
-            }
-            if let Some(filter) = &kind_filter {
-                if !filter.contains(&item.kind) {
-                    continue;
-                }
-            }
-            let row = row_evidence(cf::CF_KV, &key, &value);
-            items.push(ApprovalQueueItem {
-                item,
-                item_row: row,
-            });
-            if items.len() == limit_usize {
-                next_cursor = Some(hex_encode(&key));
-                break 'scan;
+        }
+        if let Some(filter) = &kind_filter {
+            if !filter.contains(&item.kind) {
+                continue;
             }
         }
-        if !more {
+        let row = row_evidence(cf::CF_KV, &key, &value);
+        items.push(ApprovalQueueItem {
+            item,
+            item_row: row,
+        });
+        if items.len() == limit_usize {
+            next_cursor = Some(hex_encode(&key));
             break;
         }
-        let Some(key) = last_key else {
-            break;
-        };
-        start_key = key_after(&key);
     }
     Ok(ApprovalListResponse {
         now_unix_ms: now,
@@ -908,6 +917,19 @@ pub fn list_approvals(
 }
 
 pub fn decide_approval(
+    db: &Arc<Db>,
+    params: &ApprovalDecideParams,
+    by_session: &str,
+) -> Result<ApprovalDecideResponse, ErrorData> {
+    let transition = lock_approval_transitions()?;
+    decide_approval_locked(&transition, db, params, by_session)
+}
+
+// Toast activation consumption already holds the transition guard while it
+// validates and marks the one-time token. Re-entering the public function
+// there would deadlock, so the shared implementation accepts that guard.
+fn decide_approval_locked(
+    _transition: &MutexGuard<'_, ()>,
     db: &Arc<Db>,
     params: &ApprovalDecideParams,
     by_session: &str,
@@ -1276,121 +1298,6 @@ fn validate_activation_token(value: &str) -> Result<(), ErrorData> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ApprovalItemRow {
-    key: Vec<u8>,
-    value: Vec<u8>,
-    item: ApprovalItemRecord,
-}
-
-fn scan_item_rows(db: &Arc<Db>) -> Result<Vec<ApprovalItemRow>, ErrorData> {
-    let mut start = ITEM_PREFIX.as_bytes().to_vec();
-    let mut out = Vec::new();
-    loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
-            .map_err(storage_error)?;
-        if rows.is_empty() {
-            break;
-        }
-        let mut stop = false;
-        let mut last_key = None;
-        for (key, value) in rows {
-            if !key.starts_with(ITEM_PREFIX.as_bytes()) {
-                stop = true;
-                break;
-            }
-            let item = decode_item(&key, &value)?;
-            out.push(ApprovalItemRow {
-                key: key.clone(),
-                value,
-                item,
-            });
-            last_key = Some(key);
-        }
-        if stop || !more {
-            break;
-        }
-        let Some(key) = last_key else {
-            break;
-        };
-        start = key_after(&key);
-    }
-    Ok(out)
-}
-
-fn delete_keys(db: &Arc<Db>, mut keys: Vec<Vec<u8>>, context: &str) -> Result<usize, ErrorData> {
-    keys.sort();
-    keys.dedup();
-    let deleted = keys.len();
-    for chunk in keys.chunks(DELETE_BATCH_ROWS) {
-        db.delete_batch(cf::CF_KV, chunk.iter().cloned())
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("{context} failed to delete terminal rows: {error}"),
-                )
-            })?;
-    }
-    Ok(deleted)
-}
-
-fn prune_terminal_item_rows(
-    db: &Arc<Db>,
-    now: u64,
-    rows: &[ApprovalItemRow],
-) -> Result<usize, ErrorData> {
-    let mut terminal = rows
-        .iter()
-        .filter(|row| row.item.status.is_terminal())
-        .map(|row| (row.item.updated_at_unix_ms, row.key.clone()))
-        .collect::<Vec<_>>();
-    terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut delete = terminal
-        .iter()
-        .filter(|(updated_at, _key)| updated_at.saturating_add(TERMINAL_ITEM_RETENTION_MS) <= now)
-        .map(|(_updated_at, key)| key.clone())
-        .collect::<Vec<_>>();
-
-    if terminal.len() > TERMINAL_ITEM_RETAIN_ROWS {
-        let over_cap = terminal.len() - TERMINAL_ITEM_RETAIN_ROWS;
-        delete.extend(
-            terminal
-                .iter()
-                .take(over_cap)
-                .map(|(_updated_at, key)| key.clone()),
-        );
-    }
-
-    let deleted = delete_keys(db, delete, "approval terminal retention")?;
-    if deleted > 0 {
-        tracing::info!(
-            code = "APPROVAL_ITEM_RETENTION_PRUNED",
-            scanned_rows = rows.len(),
-            terminal_rows = terminal.len(),
-            deleted_rows = deleted,
-            retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
-            retention_ms = TERMINAL_ITEM_RETENTION_MS,
-            "readback=CF_KV approval terminal item rows pruned"
-        );
-    } else if rows.len() > MAX_SCAN_ROWS {
-        tracing::warn!(
-            code = "APPROVAL_ITEM_QUEUE_LARGE",
-            scanned_rows = rows.len(),
-            terminal_rows = terminal.len(),
-            retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
-            "approval item scan exceeded historical hard limit but continued"
-        );
-    }
-    Ok(deleted)
-}
-
-fn prune_terminal_items(db: &Arc<Db>, now: u64) -> Result<usize, ErrorData> {
-    let rows = scan_item_rows(db)?;
-    prune_terminal_item_rows(db, now, &rows)
-}
-
 fn find_pending_dedupe(
     db: &Arc<Db>,
     dedupe_key: Option<&str>,
@@ -1400,23 +1307,27 @@ fn find_pending_dedupe(
         return Ok(None);
     };
     materialize_timeouts(db, now)?;
-    let rows = scan_item_rows(db)?;
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, ITEM_PREFIX.as_bytes())
+        .map_err(storage_error)?;
     if rows.len() > MAX_SCAN_ROWS {
-        tracing::warn!(
-            code = "APPROVAL_DEDUPE_QUEUE_LARGE",
-            scanned_rows = rows.len(),
-            "approval_request dedupe scan exceeded historical hard limit but continued"
-        );
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "approval_request dedupe scan exceeded {MAX_SCAN_ROWS} rows; queue requires compaction before dedupe can be trusted"
+            ),
+        ));
     }
-    for row in rows {
+    for (key, value) in rows {
+        let item = decode_item(&key, &value)?;
         if matches!(
-            row.item.status,
+            item.status,
             ApprovalStatus::Pending | ApprovalStatus::Snoozed
-        ) && row.item.dedupe_key.as_deref() == Some(dedupe_key.as_str())
+        ) && item.dedupe_key.as_deref() == Some(dedupe_key.as_str())
         {
             return Ok(Some(ApprovalQueueItem {
-                item: row.item,
-                item_row: row_evidence(cf::CF_KV, &row.key, &row.value),
+                item,
+                item_row: row_evidence(cf::CF_KV, &key, &value),
             }));
         }
     }
@@ -1427,51 +1338,86 @@ fn materialize_timeouts(
     db: &Arc<Db>,
     now: u64,
 ) -> Result<Vec<ApprovalMaterializedTimeout>, ErrorData> {
-    let rows = scan_item_rows(db)?;
+    // No scan limit here: this pass prunes finished rows (#307), which is how a
+    // queue that already passed MAX_SCAN_ROWS recovers.
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, ITEM_PREFIX.as_bytes())
+        .map_err(storage_error)?;
     let mut materialized = Vec::new();
-    for row in &rows {
-        let mut item = row.item.clone();
-        if item.status.is_terminal() {
-            continue;
-        }
-        let Some(deadline) = item.expires_at_unix_ms else {
-            continue;
+    let mut summaries = Vec::with_capacity(rows.len());
+    for (key, value) in rows {
+        let mut item = decode_item(&key, &value)?;
+        let due = !item.status.is_terminal()
+            && item
+                .expires_at_unix_ms
+                .is_some_and(|deadline| now >= deadline);
+        let written = if due {
+            let before = item.status;
+            item.status = item.timeout_decision.status();
+            item.updated_at_unix_ms = now;
+            item.decided_at_unix_ms = Some(now);
+            item.decided_by_session = Some(TIMEOUT_DECIDER_SESSION.to_owned());
+            item.decision_note = Some(format!(
+                "timeout default materialized as {}",
+                item.timeout_decision.as_str()
+            ));
+            item.expires_at_unix_ms = None;
+            Some(write_item_and_audit(
+                db,
+                &item,
+                &item.approval_id,
+                "timeout_default",
+                now,
+                TIMEOUT_DECIDER_SESSION,
+                Some(before),
+                item.status,
+                item.decision_note.clone(),
+            )?)
+        } else {
+            None
         };
-        if now < deadline {
-            continue;
-        }
-        let before = item.status;
-        item.status = item.timeout_decision.status();
-        item.updated_at_unix_ms = now;
-        item.decided_at_unix_ms = Some(now);
-        item.decided_by_session = Some(TIMEOUT_DECIDER_SESSION.to_owned());
-        item.decision_note = Some(format!(
-            "timeout default materialized as {}",
-            item.timeout_decision.as_str()
-        ));
-        item.expires_at_unix_ms = None;
-        let (row, audit_row) = write_item_and_audit(
-            db,
-            &item,
-            &item.approval_id,
-            "timeout_default",
-            now,
-            TIMEOUT_DECIDER_SESSION,
-            Some(before),
-            item.status,
-            item.decision_note.clone(),
-        )?;
-        materialized.push(ApprovalMaterializedTimeout {
-            item,
-            item_row: row,
-            audit_row,
+        summaries.push(QueueRowSummary {
+            key,
+            terminal: item.status.is_terminal(),
+            cleanup_pending: false,
+            updated_at_unix_ms: item.updated_at_unix_ms,
         });
+        if let Some((row, audit_row)) = written {
+            materialized.push(ApprovalMaterializedTimeout {
+                item,
+                item_row: row,
+                audit_row,
+            });
+        }
     }
-    prune_terminal_item_rows(db, now, &rows)?;
-    if !materialized.is_empty() {
-        prune_terminal_items(db, now)?;
-    }
+    prune_terminal_items(db, now, &summaries)?;
     Ok(materialized)
+}
+
+/// #307: delete finished (accepted/declined/ignored) approval item rows past
+/// retention. Every caller holds the approval transition lock, and a finished
+/// approval never changes again, so no live decision can be lost. Audit and
+/// activation rows stay as the history.
+fn prune_terminal_items(
+    db: &Arc<Db>,
+    now: u64,
+    rows: &[QueueRowSummary],
+) -> Result<usize, ErrorData> {
+    let doomed = plan_terminal_prune(rows, now, TERMINAL_RETENTION);
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let deleted = doomed.len();
+    db.delete_batch(cf::CF_KV, doomed).map_err(storage_error)?;
+    tracing::info!(
+        code = "APPROVAL_ITEM_RETENTION_PRUNED",
+        scanned_rows = rows.len(),
+        deleted_rows = deleted,
+        retain_terminal_rows = TERMINAL_RETENTION.max_terminal_rows,
+        retention_ms = TERMINAL_RETENTION.max_age_ms,
+        "readback=CF_KV approval finished item rows pruned"
+    );
+    Ok(deleted)
 }
 
 fn write_item_and_audit(
@@ -1703,7 +1649,7 @@ fn row_evidence(cf_name: &str, key: &[u8], value: &[u8]) -> ApprovalRowEvidence 
         key: String::from_utf8_lossy(key).into_owned(),
         key_hex: hex_encode(key),
         value_len_bytes: u64::try_from(value.len()).unwrap_or(u64::MAX),
-        value_sha256: sha256_hex(value),
+        value_sha256: keyed_row_digest(value),
     }
 }
 
@@ -1730,16 +1676,6 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn url_encode(value: &str) -> String {
@@ -1844,11 +1780,16 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Plain SHA-256 on purpose (#174): the activation token is a 256-bit random
+/// secret, so its digest is not brute-forceable, and `token_sha256` rows
+/// already persisted must keep comparing equal on activation.
+fn token_sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{}", hex_encode(&digest))
 }
 
-pub(crate) fn activation_token_sha256(token: &str) -> String {
-    sha256_hex(token.as_bytes())
+/// Keyed readback digest (#174) of an approval row (titles, bodies and
+/// payloads are agent text). Write-only evidence; nothing compares it.
+fn keyed_row_digest(bytes: &[u8]) -> String {
+    crate::content_digest::keyed_prefixed_digest(bytes)
 }

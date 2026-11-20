@@ -36,7 +36,7 @@ use synapse_core::{AgentEndState, AgentEventRecord, GenAiOperationName};
 use synapse_storage::{Db, StorageError};
 
 use super::agent_events::{AgentEventWriteReadback, record_agent_event, unix_time_ns_now};
-use super::agent_mailbox::hash_bytes;
+use super::agent_mailbox::keyed_hash_bytes;
 
 /// Claude Code hook events the spawn-injected settings subscribe to. The
 /// settings generator in `m4_tools` and the validator allowlist both read
@@ -704,7 +704,10 @@ fn insert_optional_str(payload: &mut Map<String, Value>, object: &Map<String, Va
 /// never store verbatim.
 fn insert_content_digest(payload: &mut Map<String, Value>, name: &str, content: &[u8]) {
     payload.insert(format!("{name}_bytes"), Value::from(content.len()));
-    payload.insert(format!("{name}_sha256"), Value::from(hash_bytes(content)));
+    payload.insert(
+        format!("{name}_sha256"),
+        Value::from(keyed_hash_bytes(content)),
+    );
 }
 
 /// Digest of an arbitrary JSON field (object/array/scalar), measured over its

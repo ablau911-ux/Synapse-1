@@ -1,4 +1,11 @@
-use std::{panic, sync::OnceLock, time::Duration};
+use std::{
+    panic,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use synapse_core::error_codes;
 
@@ -7,6 +14,36 @@ use crate::RELEASE_ALL_HANDLE;
 const PANIC_RELEASE_ALL_TIMEOUT_MS: u64 = 10;
 
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static RELEASE_CLOCK_EPOCH: OnceLock<Instant> = OnceLock::new();
+/// Nanoseconds since [`RELEASE_CLOCK_EPOCH`] (plus one, so zero means "unset")
+/// at which the most recent `ReleaseAll` was enqueued.
+static RELEASE_ALL_ENQUEUED_AT: AtomicU64 = AtomicU64::new(0);
+
+fn release_clock_now_marker(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+/// Records the enqueue instant of a `ReleaseAll` so the emitter can report how
+/// long it waited in the queue (#95 per-phase timing).
+pub(crate) fn mark_release_all_enqueued() {
+    let epoch = *RELEASE_CLOCK_EPOCH.get_or_init(Instant::now);
+    RELEASE_ALL_ENQUEUED_AT.store(release_clock_now_marker(epoch), Ordering::Release);
+}
+
+/// Consumes the enqueue mark and returns the queue wait, or `None` when the
+/// `ReleaseAll` did not come through a marking enqueue path.
+pub(crate) fn take_release_all_queue_wait() -> Option<Duration> {
+    let marked = RELEASE_ALL_ENQUEUED_AT.swap(0, Ordering::AcqRel);
+    if marked == 0 {
+        return None;
+    }
+    let epoch = *RELEASE_CLOCK_EPOCH.get()?;
+    Some(Duration::from_nanos(
+        release_clock_now_marker(epoch).saturating_sub(marked),
+    ))
+}
 
 #[tracing::instrument(skip_all)]
 pub fn install_panic_hook() {

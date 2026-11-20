@@ -1,23 +1,15 @@
-use std::sync::{Once, OnceLock};
+use std::sync::Once;
 
 pub use ::metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
 };
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use thiserror::Error;
 
 pub const CARDINALITY_LIMIT: u16 = 1_000;
 
+pub use synapse_core::metric_labels::{SUBSCRIBER_SLOT_COUNT, subscriber_slot_label};
+
 pub const EVENTS_DROPPED_FOR_SUBSCRIBER: &str = "events_dropped_for_subscriber";
-pub const EVENTS_PUBLISHED_TOTAL: &str = "events_published_total";
-pub const REFLEX_FIRES_TOTAL: &str = "reflex_fires_total";
-pub const REFLEX_TICK_JITTER_US: &str = "reflex_tick_jitter_us";
-pub const REFLEX_RECURSION_CLAMPS_TOTAL: &str = "reflex_recursion_clamps_total";
-pub const REFLEX_STARVED_TOTAL: &str = "reflex_starved_total";
 pub const CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
-pub const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
-pub const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
-pub const STORAGE_WRITE_BATCH_FLUSHES_TOTAL: &str = "storage_write_batch_flushes_total";
 pub const PROFILES_ACTIVE: &str = "profiles_active";
 pub const PROFILE_RELOADS_TOTAL: &str = "profile_reloads_total";
 pub const AUDIO_LOOPBACK_UNDERRUNS_TOTAL: &str = "audio_loopback_underruns_total";
@@ -74,55 +66,10 @@ pub const M3_METRICS: &[MetricSpec] = &[
         name: EVENTS_DROPPED_FOR_SUBSCRIBER,
         kind: MetricKind::Counter,
         unit: Some(Unit::Count),
-        labels: &["subscription_id"],
+        labels: &["subscriber_slot"],
         max_label_combinations: 64,
-        label_policy: "bounded subscriber slot, not raw UUID",
+        label_policy: "subscriber_slot is a stable hash bucket 0..63 of the subscription id (see subscriber_slot_label), never the raw UUID",
         description: "Events dropped by a bounded per-subscriber event queue.",
-    },
-    MetricSpec {
-        name: EVENTS_PUBLISHED_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["source", "kind"],
-        max_label_combinations: 832,
-        label_policy: "EventSource enum by normalized M3 event kind bucket.",
-        description: "Events published onto the M3 event bus.",
-    },
-    MetricSpec {
-        name: REFLEX_FIRES_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["kind", "reflex_id"],
-        max_label_combinations: 64,
-        label_policy: "reflex kind by bounded active reflex slot, not raw reflex UUID.",
-        description: "Reflex fire outcomes accepted by the scheduler.",
-    },
-    MetricSpec {
-        name: REFLEX_TICK_JITTER_US,
-        kind: MetricKind::Histogram,
-        unit: Some(Unit::Microseconds),
-        labels: &[],
-        max_label_combinations: 1,
-        label_policy: "unlabeled scheduler distribution.",
-        description: "Reflex scheduler tick jitter in microseconds.",
-    },
-    MetricSpec {
-        name: REFLEX_RECURSION_CLAMPS_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &[],
-        max_label_combinations: 1,
-        label_policy: "unlabeled recursion-guard clamp counter.",
-        description: "Times the on-event recursion guard clamped reflex firing.",
-    },
-    MetricSpec {
-        name: REFLEX_STARVED_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["reflex_id"],
-        max_label_combinations: 32,
-        label_policy: "bounded active reflex slot, not raw reflex UUID.",
-        description: "Reflexes marked starved by conflict resolution.",
     },
     MetricSpec {
         name: CACHE_EVICTIONS_TOTAL,
@@ -132,33 +79,6 @@ pub const M3_METRICS: &[MetricSpec] = &[
         max_label_combinations: 64,
         label_policy: "column-family closed set by eviction reason closed set.",
         description: "Rows evicted from storage caches or column-family retention.",
-    },
-    MetricSpec {
-        name: STORAGE_DISK_PRESSURE_LEVEL,
-        kind: MetricKind::Gauge,
-        unit: Some(Unit::Count),
-        labels: &[],
-        max_label_combinations: 1,
-        label_policy: "unlabeled gauge; value is 0..4.",
-        description: "Current storage disk pressure level.",
-    },
-    MetricSpec {
-        name: STORAGE_CF_BYTES,
-        kind: MetricKind::Gauge,
-        unit: Some(Unit::Bytes),
-        labels: &["cf"],
-        max_label_combinations: 16,
-        label_policy: "column-family closed set.",
-        description: "Estimated live bytes per storage column family.",
-    },
-    MetricSpec {
-        name: STORAGE_WRITE_BATCH_FLUSHES_TOTAL,
-        kind: MetricKind::Counter,
-        unit: Some(Unit::Count),
-        labels: &["trigger"],
-        max_label_combinations: 8,
-        label_policy: "flush trigger closed set.",
-        description: "Storage write batch flushes by trigger.",
     },
     MetricSpec {
         name: PROFILES_ACTIVE,
@@ -244,59 +164,6 @@ pub const M3_METRICS: &[MetricSpec] = &[
 ];
 
 static REGISTER_M3_METRICS: Once = Once::new();
-static PROMETHEUS_RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
-
-pub const PROMETHEUS_RECORDER_SOURCE_OF_TRUTH: &str =
-    "process-global metrics recorder + metrics_exporter_prometheus PrometheusHandle::render";
-
-#[derive(Debug, Error)]
-pub enum MetricsRecorderError {
-    #[error("METRICS_RECORDER_INSTALL_FAILED: {0}")]
-    Install(String),
-}
-
-#[must_use]
-pub fn prometheus_recorder_installed() -> bool {
-    PROMETHEUS_RECORDER.get().is_some()
-}
-
-/// Installs the process-global metrics recorder once and returns its render handle.
-///
-/// # Errors
-///
-/// Returns [`MetricsRecorderError`] when the exporter cannot build or when
-/// another global recorder has already been installed outside this module.
-pub fn install_prometheus_recorder() -> Result<PrometheusHandle, MetricsRecorderError> {
-    if let Some(handle) = PROMETHEUS_RECORDER.get() {
-        return Ok(handle.clone());
-    }
-
-    let handle = match PrometheusBuilder::new().install_recorder() {
-        Ok(handle) => handle,
-        Err(error) => {
-            if let Some(handle) = PROMETHEUS_RECORDER.get() {
-                return Ok(handle.clone());
-            }
-            return Err(MetricsRecorderError::Install(error.to_string()));
-        }
-    };
-    if PROMETHEUS_RECORDER.set(handle.clone()).is_ok() {
-        Ok(handle)
-    } else if let Some(handle) = PROMETHEUS_RECORDER.get() {
-        Ok(handle.clone())
-    } else {
-        Err(MetricsRecorderError::Install(
-            "prometheus recorder handle could not be published".to_owned(),
-        ))
-    }
-}
-
-#[must_use]
-pub fn render_prometheus() -> Option<String> {
-    PROMETHEUS_RECORDER
-        .get()
-        .map(metrics_exporter_prometheus::PrometheusHandle::render)
-}
 
 pub fn register_m3_metrics() {
     REGISTER_M3_METRICS.call_once(|| {
@@ -327,7 +194,7 @@ pub const fn m3_metric_specs() -> &'static [MetricSpec] {
     M3_METRICS
 }
 
-fn describe_metric(spec: MetricSpec) {
+pub(crate) fn describe_metric(spec: MetricSpec) {
     match (spec.kind, spec.unit) {
         (MetricKind::Counter, Some(unit)) => describe_counter!(spec.name, unit, spec.description),
         (MetricKind::Counter, None) => describe_counter!(spec.name, spec.description),
@@ -339,3 +206,7 @@ fn describe_metric(spec: MetricSpec) {
         (MetricKind::Histogram, None) => describe_histogram!(spec.name, spec.description),
     }
 }
+
+#[cfg(test)]
+#[path = "subscriber_slot_tests.rs"]
+mod subscriber_slot_tests;

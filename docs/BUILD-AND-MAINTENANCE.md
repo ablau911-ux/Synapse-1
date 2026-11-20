@@ -23,6 +23,11 @@ cargo build
 Use `cargo build --release` only when shipping or running the optimized daemon,
 not as compile feedback during edits.
 
+## Script Tests
+
+`scripts/tests/*.Tests.ps1` target Pester 3.4.0 (legacy `Should Be` syntax); run them in one pass with
+`Import-Module Pester -RequiredVersion 3.4.0; Invoke-Pester scripts/tests` (Pester 5/6 are not supported).
+
 ## Defender Exclusions
 
 Defender real-time scanning of Cargo output can slow local builds. The helper
@@ -64,16 +69,24 @@ closed if that suppression changes.
 ## Repo Maintenance
 
 `scripts/repo-maintenance.ps1` is dry-run by default. It scans git repos under
-`-Root` (default `C:\code`) and:
+`-Root` (default: the parent directory of this checkout) and:
 
 - prunes merged or remote-gone worktrees without touching active, dirty, or
   unmerged work;
 - deletes local branches whose remote branch is gone;
-- runs `cargo sweep` for stale build artifacts.
+- runs `cargo sweep` for stale build artifacts when it is installed;
+- reports native size caps even when `cargo-sweep` is absent; deleting entire
+  `target\debug` or report/evidence directories requires an explicit
+  `-PurgeGeneratedArtifacts -ArtifactRepoPath <exact repo>` invocation, which
+  the scheduled task does not use; evidence/report directories with files
+  modified in the last 30 days are preserved even during an explicit purge;
+- warns when durable runtime state appears below Cargo `target\`.
 
 ```powershell
 pwsh -File .\scripts\repo-maintenance.ps1
 pwsh -File .\scripts\repo-maintenance.ps1 -Apply
+pwsh -File .\scripts\repo-maintenance.ps1 -Apply -MaxTargetDebugGB 20 -MaxGeneratedEvidenceGB 5
+pwsh -File .\scripts\repo-maintenance.ps1 -Root C:\Users\Adam\Synapse -Apply -PurgeGeneratedArtifacts -ArtifactRepoPath C:\Users\Adam\Synapse
 ```
 
 `scripts/install-maintenance-task.ps1` registers or removes the weekly
@@ -84,6 +97,15 @@ pwsh -File .\scripts\install-maintenance-task.ps1
 pwsh -File .\scripts\install-maintenance-task.ps1 -Remove
 Get-ScheduledTask -TaskName SynapseRepoMaintenance
 ```
+
+Durable runtime state must not live under Cargo `target\`. Keep VM disks,
+databases, downloaded media, browser profiles, and long-lived logs under
+`%LOCALAPPDATA%\synapse\runtime` or another named runtime directory with its own
+retention policy. Cargo `target\` is build output and should be safe to delete.
+
+Generated test evidence should be bounded by size, not only by age. A week of
+active testing can keep every file "young" while still producing tens of
+gigabytes of screenshots, traces, coverage reports, and JSON readbacks.
 
 ## Root Cause
 

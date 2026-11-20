@@ -5,7 +5,7 @@ use synapse_core::{Action, ReflexId, error_codes};
 use super::RuntimeState;
 use crate::{
     dispatch::ReflexActionDispatchContext,
-    error::ReflexResult,
+    error::{ReflexError, ReflexResult},
     kinds::combo::{ComboContext, ComboController, ComboParams},
 };
 
@@ -15,12 +15,12 @@ pub(super) fn step_active_combos(
     dispatched_actions: &mut usize,
     dispatch_blocked: &mut bool,
 ) {
-    let dispatch_context = dispatch_context(runtime);
     let mut next_active = Vec::with_capacity(runtime.active_combos.len());
     let active_combos = std::mem::take(&mut runtime.active_combos);
     let mut active_combos = active_combos.into_iter();
     while let Some(mut combo) = active_combos.next() {
         let reflex_id = combo.reflex_id().clone();
+        let dispatch_context = dispatch_context(runtime, &reflex_id);
         match combo.step_dispatch_with(
             &ComboContext {
                 tick_elapsed: elapsed,
@@ -35,14 +35,20 @@ pub(super) fn step_active_combos(
                 }
             }
             Err(error) => {
-                *dispatch_blocked = true;
+                let target_refusal = matches!(error, ReflexError::InputTarget { .. });
                 let action_denied = error.code() == error_codes::REFLEX_ACTION_PERMISSION_DENIED;
-                if action_denied
-                    && let Some(index) =
-                        super::scheduler_loop::status_index(&runtime.statuses, &reflex_id)
-                {
-                    super::mark_reflex_action_denied(runtime, index);
+                let index = super::scheduler_loop::status_index(&runtime.statuses, &reflex_id);
+                if let Some(index) = index {
+                    if action_denied {
+                        super::mark_reflex_action_denied(runtime, index);
+                    } else {
+                        super::mark_reflex_error(runtime, index, &error);
+                    }
                 }
+                if target_refusal {
+                    continue;
+                }
+                *dispatch_blocked = true;
                 if !action_denied {
                     next_active.push(combo);
                     next_active.extend(active_combos);
@@ -65,7 +71,7 @@ pub(super) fn dispatch_reflex_action(
     reflex_id: &ReflexId,
     action: Action,
 ) -> ReflexResult<usize> {
-    let dispatch_context = dispatch_context(runtime);
+    let dispatch_context = dispatch_context(runtime, reflex_id);
     match action {
         Action::Combo { steps, backend } => {
             dispatch_context.ensure_action_allowed(
@@ -85,7 +91,11 @@ pub(super) fn dispatch_reflex_action(
                 Ok(output) => output.action_count(),
                 Err(_error) => 0,
             };
-            if !completed {
+            if !completed
+                && !result
+                    .as_ref()
+                    .is_err_and(|error| matches!(error, ReflexError::InputTarget { .. }))
+            {
                 runtime.active_combos.push(combo);
             }
             result?;
@@ -98,12 +108,21 @@ pub(super) fn dispatch_reflex_action(
     }
 }
 
-fn dispatch_context(runtime: &RuntimeState) -> ReflexActionDispatchContext {
-    ReflexActionDispatchContext::new(
+fn dispatch_context(runtime: &RuntimeState, reflex_id: &ReflexId) -> ReflexActionDispatchContext {
+    let context = ReflexActionDispatchContext::new(
         runtime.action_handle.clone(),
         runtime.action_gate.clone(),
         runtime.audit_db.clone(),
         runtime.audit_context.clone(),
         runtime.tick_index,
-    )
+    );
+    if let Some(entry) = runtime
+        .reflexes
+        .iter()
+        .find(|entry| &entry.reflex.reflex_id == reflex_id)
+    {
+        context.with_reflex_target(&entry.reflex)
+    } else {
+        context
+    }
 }

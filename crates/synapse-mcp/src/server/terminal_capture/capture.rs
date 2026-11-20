@@ -441,29 +441,69 @@ pub(crate) fn spawn_capture_to_asciicast(
     spec: CaptureSpec,
     artifacts: CaptureArtifacts,
 ) -> anyhow::Result<SpawnedCapture> {
-    let pty_system = native_pty_system();
-    let size = PtySize {
+    let pair = native_pty_system().openpty(PtySize {
         rows: spec.rows,
         cols: spec.cols,
         pixel_width: 0,
         pixel_height: 0,
-    };
-    let pair = pty_system
-        .openpty(size)
-        .map_err(|error| anyhow::anyhow!("PTY_OPEN_FAILED: {error}"))?;
+    })?;
+    let child = pair.slave.spawn_command(command_from_spec(&spec))?;
+    drop(pair.slave);
+    finish_spawn_capture(spec, artifacts, pair.master, child)
+}
 
-    let command = command_from_spec(&spec);
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| anyhow::anyhow!("PTY_SPAWN_FAILED: {error}"))?;
+/// Assign the agent's job while its ConPTY child is suspended, then resume it.
+pub(crate) fn spawn_capture_to_asciicast_with_job<A>(
+    spec: CaptureSpec,
+    artifacts: CaptureArtifacts,
+    resource_id: &str,
+    assign: A,
+) -> anyhow::Result<(SpawnedCapture, crate::m4::OwnedProcessJob)>
+where
+    A: FnOnce(
+        u32,
+        &'static str,
+        Option<&str>,
+    ) -> Result<crate::m4::OwnedProcessJob, rmcp::ErrorData>,
+{
+    #[cfg(windows)]
+    let (master, child, job) = super::confined_conpty::spawn(&spec, resource_id, assign)?;
+    #[cfg(not(windows))]
+    let (master, child, job) = {
+        let pair = native_pty_system().openpty(PtySize {
+            rows: spec.rows,
+            cols: spec.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut child = pair.slave.spawn_command(command_from_spec(&spec))?;
+        let pid = child
+            .process_id()
+            .ok_or_else(|| anyhow::anyhow!("PTY_PROCESS_ID_UNAVAILABLE"))?;
+        let job = match assign(pid, "act_spawn_agent", Some(resource_id)) {
+            Ok(job) => job,
+            Err(error) => {
+                kill_spawned_child(child.as_mut(), Some(pid), "job_assignment_failed");
+                return Err(anyhow::anyhow!("PTY_JOB_ASSIGN_FAILED: {error}"));
+            }
+        };
+        drop(pair.slave);
+        (pair.master, child, job)
+    };
+    let spawned = finish_spawn_capture(spec, artifacts, master, child)?;
+    Ok((spawned, job))
+}
+
+fn finish_spawn_capture(
+    spec: CaptureSpec,
+    artifacts: CaptureArtifacts,
+    master: Box<dyn MasterPty + Send>,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+) -> anyhow::Result<SpawnedCapture> {
     let Some(process_id) = child.process_id() else {
         kill_spawned_child(child.as_mut(), None, "process_id_unavailable");
         return Err(anyhow::anyhow!("PTY_PROCESS_ID_UNAVAILABLE"));
     };
-    drop(pair.slave);
-    let master = pair.master;
-
     let reader = match master.try_clone_reader() {
         Ok(reader) => reader,
         Err(error) => {
@@ -682,9 +722,13 @@ fn command_from_spec(spec: &CaptureSpec) -> CommandBuilder {
     if let Some(cwd) = spec.cwd.as_ref() {
         command.cwd(cwd);
     }
-    // portable-pty's CommandBuilder launches with an EMPTY environment. On
-    // Windows a process started without SystemRoot/PATH fails at DLL init with
+    // portable-pty's CommandBuilder::new seeds itself with the daemon's whole
+    // environment (plus registry env on Windows), so it is cleared first: the
+    // child sees exactly `spec.env`, which the caller builds from the #22
+    // child-environment policy. `spec.env` must therefore carry SystemRoot/PATH
+    // itself, otherwise a Windows process fails at DLL init with
     // STATUS_DLL_INIT_FAILED (0xC0000142) before main runs.
+    command.env_clear();
     for (key, value) in &spec.env {
         command.env(key, value);
     }
@@ -1069,3 +1113,7 @@ struct ReaderOutcome {
 /// streaming endpoint can dump the current screen on attach while the capture
 /// loop keeps feeding it. (Wired into the spawn path as #914 lands.)
 pub(crate) type SharedShadowScreen = Arc<Mutex<ShadowScreen>>;
+
+#[cfg(test)]
+#[path = "tests/command_env_22.rs"]
+mod command_env_22;

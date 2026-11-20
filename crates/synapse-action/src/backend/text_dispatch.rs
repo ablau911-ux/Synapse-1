@@ -23,13 +23,29 @@ pub(super) fn text_dispatch_plan(
     text: &str,
     dynamics: &KeystrokeDynamics,
 ) -> Vec<TextDispatchStep> {
+    let mut previous = None;
     sample_typing_schedule(text, dynamics, None)
         .into_iter()
-        .map(|event| TextDispatchStep {
-            iki_ms_before: event.iki_ms_before,
-            inputs: dispatch_inputs(event.r#char),
+        .map(|event| {
+            let inputs = if is_crlf_line_feed(previous, event.r#char) {
+                // "\r\n" is one line break: its '\r' already pressed Enter.
+                // The '\n' keeps its step (and its delay) but presses nothing.
+                Vec::new()
+            } else {
+                dispatch_inputs(event.r#char)
+            };
+            previous = Some(event.r#char);
+            TextDispatchStep {
+                iki_ms_before: event.iki_ms_before,
+                inputs,
+            }
         })
         .collect()
+}
+
+/// True for the '\n' of a Windows "\r\n" line ending.
+const fn is_crlf_line_feed(previous: Option<char>, ch: char) -> bool {
+    ch == '\n' && matches!(previous, Some('\r'))
 }
 
 fn dispatch_inputs(ch: char) -> Vec<TextDispatchInput> {
@@ -46,3 +62,7 @@ fn dispatch_inputs(ch: char) -> Vec<TextDispatchInput> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/text_dispatch_plan.rs"]
+mod plan_tests;

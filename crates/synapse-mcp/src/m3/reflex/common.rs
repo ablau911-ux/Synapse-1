@@ -9,7 +9,9 @@ use synapse_core::{
 use synapse_reflex::ReflexError;
 
 use crate::{
-    m2::{ActPressParams, ActTypeParams, action_from_press_params, action_from_type_params},
+    m2::{
+        ActPressParams, ActTypeParams, action_from_foreground_type_params, action_from_press_params,
+    },
     m3::a11y_events,
 };
 
@@ -622,8 +624,10 @@ fn action_from_demo_step(index: usize, step: ReflexThenStep) -> Result<Action, R
                     detail: format!("then.steps[{index}].act_type params invalid: {error}"),
                 }
             })?;
-            action_from_type_params(&params).map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("then.steps[{index}].act_type params invalid: {error}"),
+            action_from_foreground_type_params(&params).map_err(|error| {
+                ReflexError::ParamsInvalid {
+                    detail: format!("then.steps[{index}].act_type params invalid: {error}"),
+                }
             })
         }
         "act_press" => {

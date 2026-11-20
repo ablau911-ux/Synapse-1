@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use synapse_core::{ElementId, UiaPattern, error_codes};
 
 use crate::m1::mcp_error;
-use crate::m2::set_value::ActSetValueParams;
+use crate::m2::set_value::{ActSetValueParams, act_set_value};
 use crate::m2::{
     default_auto_wait_timeout_ms,
     postcondition::{ActPostcondition, default_verify_timeout_ms, text_signature},
@@ -39,6 +39,7 @@ pub(crate) const TIER_CDP: &str = "cdp";
 pub(crate) const TIER_FOREGROUND_KEYS: &str = "foreground_keys";
 const METHOD_CDP_REPLACE: &str = "cdp_select_all_insert_text";
 const METHOD_CDP_CLEAR: &str = "cdp_select_all_delete";
+const METHOD_CDP_SET_VALUE: &str = "cdp_native_value_setter";
 pub(crate) const METHOD_FOREGROUND_REPLACE: &str = "foreground_click_select_all_type";
 pub(crate) const METHOD_FOREGROUND_CLEAR: &str = "foreground_click_select_all_delete";
 const SOURCE_CDP_NODE_VALUE: &str = "cdp_node.value";
@@ -77,7 +78,6 @@ pub struct ActSetFieldTextLocator {
     /// Explicit top-level target window. If omitted, Synapse uses the active
     /// session window/CDP target, or the legacy element_id's HWND as a hint.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub role: Option<String>,
@@ -147,10 +147,18 @@ pub(crate) fn validate_set_field_text_params(
         ));
     }
     crate::m2::validate_auto_wait_timeout(TOOL, params.auto_wait, params.auto_wait_timeout_ms)?;
-    if u32::try_from(params.text.chars().count()).is_err() {
+    // #50: the same request-size ceiling as act_type. The foreground tier
+    // types this text through the global input emitter, and the CDP/native
+    // tiers still copy it through every transport, so a multi-MB payload is
+    // refused up front instead of monopolizing delivery.
+    let utf16_units = params.text.encode_utf16().count();
+    if utf16_units > crate::m2::MAX_ACT_TYPE_UTF16_UNITS {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("{TOOL} text has more than u32::MAX chars"),
+            format!(
+                "{TOOL} text has {utf16_units} UTF-16 units; maximum is {}; split the value into bounded requests",
+                crate::m2::MAX_ACT_TYPE_UTF16_UNITS
+            ),
         ));
     }
     Ok(())
@@ -267,7 +275,6 @@ pub(crate) fn chromium_editable_requires_foreground(
 pub(crate) async fn act_set_field_text_web(
     params: &ActSetFieldTextParams,
     backend_node_id: i64,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
     let started = std::time::Instant::now();
     let element_id = required_element_id(params)?;
@@ -317,7 +324,6 @@ pub(crate) async fn act_set_field_text_web(
     .await
     .map_err(|error| cdp_tier_error(element_id, backend_node_id, "before_value_read", &error))?;
 
-    boundary.ensure("immediately_before_cdp_set_node_text")?;
     let readback = synapse_a11y::cdp_set_node_text(
         &endpoint,
         &title_hint,
@@ -341,7 +347,9 @@ pub(crate) async fn act_set_field_text_web(
     .await
     .map_err(|error| cdp_tier_error(element_id, backend_node_id, "after_value_read", &error))?;
 
-    let method = if readback.cleared_with_delete {
+    let method = if readback.selection_mode == synapse_a11y::CDP_NATIVE_VALUE_SETTER {
+        METHOD_CDP_SET_VALUE
+    } else if readback.cleared_with_delete {
         METHOD_CDP_CLEAR
     } else {
         METHOD_CDP_REPLACE
@@ -368,17 +376,13 @@ pub(crate) async fn act_set_field_text_web(
 /// re-shaped into the `act_set_field_text` wire response.
 pub(crate) async fn act_set_field_text_native(
     params: &ActSetFieldTextParams,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
     let started = std::time::Instant::now();
-    let response = super::set_value::act_set_value_with_boundary(
-        ActSetValueParams {
-            element_id: required_element_id(params)?.clone(),
-            text: params.text.clone(),
-            verify_timeout_ms: params.verify_timeout_ms,
-        },
-        boundary,
-    )
+    let response = act_set_value(ActSetValueParams {
+        element_id: required_element_id(params)?.clone(),
+        text: params.text.clone(),
+        verify_timeout_ms: params.verify_timeout_ms,
+    })
     .await?;
     let postcondition = ActPostcondition {
         detail: response
@@ -496,6 +500,7 @@ pub(crate) fn finish_replace_response(
         after_sha256: after_sha256.clone(),
         changed,
         postcondition: ActPostcondition {
+            related_window_observed: None,
             status: "verified_state".to_owned(),
             observed_delta: Some(changed),
             source_of_truth: Some(source_of_truth.to_owned()),

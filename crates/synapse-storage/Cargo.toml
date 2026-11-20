@@ -3,11 +3,12 @@ name = "synapse-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [features]
 default = []
+test-support = []
 
 [dependencies]
 rocksdb = { workspace = true, features = ["lz4", "zstd", "multi-threaded-cf"] }
@@ -19,6 +20,18 @@ synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+insta.workspace = true
+metrics.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+anyhow.workspace = true
+
+[[bench]]
+name = "batch_throughput"
+harness = false
 
 [lints]
 workspace = true

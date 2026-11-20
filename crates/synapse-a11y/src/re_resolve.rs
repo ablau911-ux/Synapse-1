@@ -40,6 +40,86 @@ pub enum ElementClickAction {
     },
 }
 
+/// #2348 round 2 (FF-06): how one `act select` reached a native list.
+/// `OptionRoute` (platform/windows/option_route.rs) chooses it from facts
+/// read on the element; the reply names it and reads back where it says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOptionDelivery {
+    /// `SelectionItemPattern.Select` on the option (a list box, or a list
+    /// that is already open).
+    UiaSelectionItemPattern,
+    /// `ExpandCollapsePattern.Expand`, `Select` on the option, then
+    /// `Collapse` again (a closed list that shows no option yet).
+    UiaExpandThenSelect,
+    /// A classic Win32 combo box: `CB_SETCURSEL`, then `CBN_SELCHANGE` to its
+    /// parent window, as the combo box itself does when a person picks.
+    ComboBoxMessages,
+}
+
+impl NativeOptionDelivery {
+    /// Where the pick is read back.
+    #[must_use]
+    pub const fn source_of_truth(self) -> &'static str {
+        match self {
+            Self::UiaSelectionItemPattern | Self::UiaExpandThenSelect => {
+                "uia_selection_item_pattern.is_selected"
+            }
+            Self::ComboBoxMessages => "combo_box.cb_getcursel",
+        }
+    }
+}
+
+/// #2348: readback of [`select_element_option`]: the option a native list or
+/// combo box holds after the pick, read back where its `delivery` says
+/// ([`NativeOptionDelivery::source_of_truth`]).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NativeOptionReadback {
+    /// The option's visible name.
+    name: String,
+    /// Its place among the options, from 0.
+    index: usize,
+    /// How many options the element has.
+    option_count: usize,
+    was_selected: bool,
+    is_selected: bool,
+    /// How the option was reached (`OptionRoute`, #2348 round 2).
+    delivery: NativeOptionDelivery,
+}
+
+impl NativeOptionReadback {
+    #[must_use]
+    pub(crate) const fn new(
+        name: String,
+        index: usize,
+        option_count: usize,
+        was_selected: bool,
+        is_selected: bool,
+        delivery: NativeOptionDelivery,
+    ) -> Self {
+        Self {
+            name,
+            index,
+            option_count,
+            was_selected,
+            is_selected,
+            delivery,
+        }
+    }
+
+    /// The option was selected before the call (nothing was sent then).
+    #[must_use]
+    pub const fn was_selected(&self) -> bool {
+        self.was_selected
+    }
+
+    /// How the option was reached.
+    #[must_use]
+    pub const fn delivery(&self) -> NativeOptionDelivery {
+        self.delivery
+    }
+}
+
 /// Readback from setting an element's native text/value on the UIA worker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -148,6 +228,18 @@ pub fn element_bounding_rect(id: &ElementId) -> A11yResult<Rect> {
     platform::element_bounding_rect(id)
 }
 
+/// Resolves an element and reads its UI Automation `FrameworkId` live
+/// (`WPF`, `XAML`, `WinForm`, `Win32` ...).
+///
+/// # Errors
+///
+/// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
+/// structured UIA error for OS failures, or `A11Y_NOT_AVAILABLE` on
+/// non-Windows platforms.
+pub fn element_framework_id(id: &ElementId) -> A11yResult<String> {
+    platform::element_framework_id(id)
+}
+
 /// Attempts a semantic UIA click for an element using supported UIA control
 /// patterns.
 ///
@@ -163,6 +255,42 @@ pub fn element_bounding_rect(id: &ElementId) -> A11yResult<Rect> {
 /// non-Windows platforms.
 pub fn click_element_action(id: &ElementId) -> A11yResult<ElementClickAction> {
     platform::click_element_action(id)
+}
+
+/// Invokes a re-resolved element using its UIA InvokePattern.
+///
+/// # Errors
+///
+/// Returns a UIA error if the element or pattern is unavailable or invoke fails.
+pub fn invoke_element_pattern(id: &ElementId) -> A11yResult<()> {
+    platform::invoke_element_pattern(id)
+}
+
+/// #2348: selects one option of a native list or combo box by `choice`
+/// (visible name, value or index), through SelectionItemPattern; a combo box
+/// with no option yet is opened through ExpandCollapse first. An option that
+/// is already selected is success and nothing is sent.
+///
+/// # Errors
+///
+/// `ACTION_TARGET_INVALID` (`OptionRefused`) when the element has no option,
+/// none with that name, or two; a typed UIA pattern error otherwise;
+/// `A11Y_NOT_AVAILABLE` on non-Windows.
+pub fn select_element_option(
+    id: &ElementId,
+    choice: &crate::OptionChoice,
+) -> A11yResult<NativeOptionReadback> {
+    platform::select_element_option(id, choice)
+}
+
+/// Sets a UIA TogglePattern to the requested state and returns its before/after states.
+///
+/// # Errors
+///
+/// Returns a UIA error if the element or pattern is unavailable or the requested
+/// state cannot be read back.
+pub fn set_element_checked(id: &ElementId, checked: bool) -> A11yResult<(String, String)> {
+    platform::set_element_checked(id, checked)
 }
 
 /// Sets UIA focus on a re-resolved element without returning the COM element.

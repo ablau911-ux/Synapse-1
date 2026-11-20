@@ -90,16 +90,17 @@ Base per-CF options: `write_buffer_size = 64 MiB`, `max_write_buffer_number = 3`
 
 | CF group | Compression | Prefix extractor | Periodic compaction | Other |
 |---|---|---|---|---|
-| `CF_EVENTS`, `CF_ACTION_LOG`, `CF_REFLEX_AUDIT` | Lz4 | fixed 8-byte | — | — |
+| `CF_EVENTS`, `CF_ACTION_LOG`, `CF_REFLEX_AUDIT` | Lz4 | fixed 8-byte | 86 400 s | finite TTL |
 | `CF_MODEL_CACHE` | **None** | — | — | `write_buffer_size = 256 MiB` |
-| `CF_OBSERVATIONS`, `CF_SESSIONS` | Zstd | — | — | — |
+| `CF_OBSERVATIONS`, `CF_SESSIONS` | Zstd | — | 86 400 s | finite TTL |
 | `CF_TIMELINE`, `CF_EPISODES`, `CF_AGENT_EVENTS` | Zstd | fixed 8-byte | 86 400 s | long-retention TTL profile |
 | `CF_AGENT_TRANSCRIPTS` | Zstd | — (variable-length keys) | 86 400 s | long-retention TTL profile |
-| all others | Lz4 (base) | — | — | — |
+| all other TTL-governed CFs | Lz4 (base) | — | 86 400 s | finite TTL |
+| all non-TTL CFs | Lz4 (base) | — | — | — |
 
 After the match, every CF gets `compaction::install_ttl_filter(...)` (see §5.1) and `apply_block_cache(...)`.
 
-The fixed 8-byte prefix extractor matches the 8-byte big-endian `ts_ns` prefix of timeline-style keys, accelerating time-range prefix scans. Periodic compaction forces cold SST files through the TTL compaction filter at least daily, so long-TTL rows still expire even without write churn.
+The fixed 8-byte prefix extractor matches the 8-byte big-endian `ts_ns` prefix of timeline-style keys, accelerating time-range prefix scans. Every TTL-governed CF requests periodic compaction on a daily cadence so cold SST files become eligible for the TTL filter without write churn. RocksDB scheduling and load can delay the actual compaction beyond that cadence.
 
 ---
 
@@ -169,12 +170,18 @@ Both are re-exported from the crate root (`pub use codecs::{decode_json, encode_
 
 `install_ttl_filter(options, cf_name)` attaches a RocksDB compaction filter named `synapse_ttl_<cf_name>` when the CF has a finite TTL (resolved via `ttl_ns_for_cf`, which looks the CF up in `retention::DEFAULTS`). On each row examined during compaction it calls `ttl_decision(ttl_ns, now_ns, value)`:
 
-- Extract the top-level JSON field `"ts_ns"` from the value **bytes** (`extract_ts_ns` — a byte-window search for `"ts_ns"`, skip whitespace, require `:`, then parse the digit run as `u64`).
+- Deserialize only the top-level JSON field `"ts_ns"` as `u64`. Nested fields are ignored; malformed JSON, a missing/wrong-type field, and duplicate root fields cannot establish a trustworthy retention age.
 - If `now_ns - ts_ns > ttl_ns` → `CompactionDecision::Remove`; otherwise `CompactionDecision::Keep`. A value lacking a parseable `ts_ns` is always kept.
+
+TTL is physical reclamation at compaction time, not read-time filtering. The scan helpers return rows still present in RocksDB, so an expired row can remain visible after its nominal horizon until a compaction examines its SST. The 86,400-second periodic setting is an eligibility cadence rather than a real-time deletion deadline; write, pressure, GC, or manual compaction can examine a row earlier, while RocksDB scheduling can process it later.
+
+Malformed, missing, wrong-type, and duplicate root timestamps are retained deliberately (fail closed) because storage cannot infer their age safely. Each compaction encounter increments `storage_ttl_unparseable_rows_total{cf,reason}`, where `reason` is the fixed value `missing` or `invalid`; it does not identify or count unique rows. This bounded-cardinality signal makes persistent corrupt or legacy envelopes observable without unsafe deletion.
 
 This is why every long-retention record type keeps `ts_ns` as a required top-level field. `current_time_ns()` is `SystemTime::now()` since `UNIX_EPOCH` (a test-only fixed clock exists). TTL unit conversion (`ttl_to_ns`): `Hours(h) = h*3600*1e9`, `Days(d) = d*24*3600*1e9`; `None` and `LruOnly` yield no TTL filter.
 
-Constants: `NANOS_PER_SECOND = 1_000_000_000`, `SECONDS_PER_HOUR = 3600`, `HOURS_PER_DAY = 24`, `TS_NS_FIELD = b"\"ts_ns\""`.
+Per-CF writer contract (#43): `CF_PROCESS_HISTORY`, `CF_AGENT_TRANSCRIPTS` and `CF_OCR_CACHE` writers stamp a root `ts_ns` (insert/ingestion time; OCR rows keep it in the plaintext sealed envelope); `CF_TELEMETRY` has no writer yet and any future writer must stamp it. `CF_SESSIONS` is deliberately exempt from the compaction filter (`COMPACTION_TTL_EXEMPT_CFS`): it holds live lease/target/profile state removed by explicit reconcile paths, so a timestamp TTL could delete a live session's rows. Rows without `ts_ns` in a TTL CF are legacy: kept and counted.
+
+Constants: `NANOS_PER_SECOND = 1_000_000_000`, `SECONDS_PER_HOUR = 3600`, `HOURS_PER_DAY = 24`.
 
 ### 5.2 Garbage collection (`crates/synapse-storage/src/gc.rs`)
 
@@ -187,6 +194,8 @@ Per-CF pass (`run_cf`):
 3. `hard_cap_reached = before_value >= hard_cap` → logs `STORAGE_CF_HARD_CAP_REACHED` warning. (GC does **not** itself force the CF under the hard cap; it logs and continues with soft-cap eviction.)
 4. If `before_value > soft_cap` and keys is non-empty → `evict_oldest`.
 5. Re-measure `after_value` / estimated key counts; on eviction, increment the `cache_evictions_total` metric (labels `cf`, `reason="soft_cap"`) and log.
+
+**`CF_KV` namespace quotas (#164).** `CF_KV` shares one hard cap, so write admission (`Db::check_hard_cap`, `kv_quota.rs`) also enforces per-namespace budgets from `retention::KV_NAMESPACE_QUOTAS` (mailbox `agent-mailbox/v1`, workspace `workspace-blackboard/v1`, 16 MiB each; route memory `route-memory/v1`, 4 MiB (#2326); workspace ledger `workspace-ledger/v1`, 8 MiB; override `SYNAPSE_KV_QUOTA_<NAME>_MIB`); a full namespace is refused with `STORAGE_NAMESPACE_QUOTA_REACHED` and the rest of `CF_KV` keeps writing. Batches made only of `retention::KV_CRITICAL_PREFIXES` rows (MCP sessions, approvals, escalations, shell idempotency, agent tasks) skip the shared cap so they always write.
 
 `evict_oldest`: computes `remove_count`, then `delete_range_cf(start, end)` over the oldest keys, `flush_cf`, then `compact_range_cf(.., None, None)` (full-CF compaction to reclaim tombstone space). `end` is `keys[remove_count]`, or for the tail case `key_after(last)` (last key with a trailing `0x00`).
 
@@ -231,7 +240,7 @@ Thresholds (`PressureThresholds`, defaults; `GB = 1e9`, `MB = 1e6`):
 | Level3 | all **except** the rebuildable/cache set: `CF_OBSERVATIONS`, `CF_OCR_CACHE`, `CF_TELEMETRY`, `CF_MODEL_CACHE`, `CF_PROCESS_HISTORY`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS` |
 | Level4 | **only** `CF_REFLEX_AUDIT` and `CF_SESSIONS` |
 
-`CF_AGENT_EVENTS` stays writable even at Level3 (control-plane audit journal). When a write is shed, `put_batch` increments `storage_writes_shed_total` (label `cf`), logs `STORAGE_WRITE_FAILED`, and returns `StorageError::WriteShed`. Deletes are always allowed under pressure.
+`CF_AGENT_EVENTS` stays writable even at Level3 (control-plane audit journal). When a write is shed, `put_batch` increments `storage_writes_shed_total` (label `cf`) by the number of dropped rows, logs `STORAGE_WRITE_SHED`, and returns `Err(StorageError::WriteShed { cf_name, pressure_level, dropped_rows })`. No row in the refused batch is persisted. Callers must preserve `StorageError::code()` so policy refusals remain distinguishable from genuine write failures (`STORAGE_WRITE_FAILED`). Deletes are always allowed under pressure.
 
 `PressureState`: `level: AtomicU8`, `emitted_codes: Mutex<Vec<&str>>`. API on `Db`: `pressure_level()`, `pressure_permits_write(cf)`, `pressure_transition_codes()`, `run_pressure_check_once()`, `run_pressure_check_with_free_bytes_sample(free_bytes)` (test), `spawn_pressure_task()`. `PressureReport` fields: `free_bytes`, `previous_level`, `current_level`, `emitted_code`, `compacted_cfs`, `gc_advised`. Disk probing is abstracted behind the `DiskProbe` trait (`Fs2DiskProbe` in production, `SequenceDiskProbe` for tests). `PressureTask` aborts on drop.
 
@@ -291,7 +300,7 @@ Record: `EpisodeRecord` (`crates/synapse-core/src/types/episode.rs`), `EPISODE_R
 
 ### 6.3 Agent events — `CF_AGENT_EVENTS`
 
-Key codec: `crates/synapse-storage/src/agent_events.rs`. `AGENT_EVENT_KEY_LEN = 12`. Key = `ts_ns (8 BE) ‖ seq (4 BE)`; `seq` is a process-wide monotonic counter (ordering authority within a tick). `agent_event_key`, `agent_event_scan_start`, `decode_agent_event_key` (`AGENT_EVENT_KEY_INVALID`). Append-only; `Db::put_batch` returns after a synced WAL write; terminal-state writers call `Db::flush()`.
+Key codec: `crates/synapse-storage/src/agent_events.rs`. `AGENT_EVENT_KEY_LEN = 12`. Key = `ts_ns (8 BE) ‖ seq (4 BE)`; `seq` is a process-wide monotonic counter (ordering authority within a tick). `agent_event_key`, `agent_event_scan_start`, `decode_agent_event_key` (`AGENT_EVENT_KEY_INVALID`). Append-only; rides the batcher (flushed every 100 ms / 64 KiB); terminal-state writers call `Db::flush()`.
 
 Record: `AgentEventRecord` (`crates/synapse-core/src/types/agent_event.rs`), `AGENT_EVENT_RECORD_VERSION = 1`. Bounds: `AGENT_EVENT_MAX_ID_CHARS = 512`, `AGENT_EVENT_MAX_REASON_CHARS = 128`.
 
@@ -414,15 +423,15 @@ Writes are aggregated through a single background `Batcher` thread (spawned in `
 
 | Method | Path | Pressure gate | Behavior |
 |---|---|---|---|
-| `put_batch(cf, kvs)` | batcher | yes (returns `WriteShed` per §5.3) | writes the submitted batch with synced WAL before returning; empty input is a no-op |
+| `put_batch(cf, kvs)` | batcher | yes (sheds per §5.3) | enqueues to batcher; empty input is a no-op |
 | `put_batch_pressure_bypass(cf, kvs)` | direct | **no** | synchronous `WriteBatch` + `flush_cf`; reserved for maintenance rewrites |
 | `mutate_batch_pressure_bypass(cf, deletes, puts)` | direct | no | atomic deletes-then-puts + `flush_cf`; for coordination state with no release gap |
 | `delete_batch(cf, keys)` | direct | n/a (always allowed) | `WriteBatch` deletes + `flush_cf` |
-| `flush()` | batcher | - | synchronous WAL flush |
+| `flush()` | batcher | — | synchronous flush of pending batch |
 
-All paths first resolve the CF handle and return `StorageError::WriteFailed` if it is missing. Pressure-gated `put_batch` returns `StorageError::WriteShed` when policy rejects rows, so callers can surface or retry recording gaps.
+All paths first resolve the CF handle and return `StorageError::WriteFailed` if it is missing.
 
-Batcher mechanics: the worker accepts `Write`/`Flush`/`Shutdown` commands over a `sync_channel(1)`. A `Write` command builds one `WriteBatch`, calls `write_opt` with `WriteOptions::set_sync(true)`, calls `flush_wal(true)`, and only then replies to the caller. `Flush` and `Shutdown` call `flush_wal(true)`. On `Drop`, the batcher sends `Shutdown`, waits up to `2 * FLUSH_INTERVAL`, and joins the worker.
+Batcher mechanics: constants `FLUSH_INTERVAL = 100 ms`, `FLUSH_BYTES = 64 * 1024` (64 KiB). The worker holds a `PendingBatch { writes, bytes, first_write_at }`. On a `Write` command it enqueues, and flushes (async, `sync=false`) when `pending.bytes >= FLUSH_BYTES`. Otherwise `receive_next` waits up to `FLUSH_INTERVAL - elapsed` since the first pending write; a `RecvTimeoutError::Timeout` triggers a non-sync flush. `Flush` and `Shutdown` commands flush with `sync=true`. `flush_pending` builds a `WriteBatch` of `put_cf` ops, calls `write_opt` with `WriteOptions::set_sync(sync)`, and on `sync` also `flush_wal(true)`. On `Drop`, the batcher sends `Shutdown`, waits up to `2 * FLUSH_INTERVAL`, and joins the worker. Commands are `Write`/`Flush`/`Shutdown`, each replying over a `sync_channel(1)`.
 
 ---
 
@@ -436,7 +445,7 @@ Batcher mechanics: the worker accepts `Write`/`Flush`/`Shutdown` commands over a
 | `EncodeJson` | `type_name: &'static str`, `source: serde_json::Error` | `STORAGE_WRITE_FAILED` |
 | `DecodeJson` | `type_name: &'static str`, `source: serde_json::Error` | `STORAGE_READ_FAILED` |
 | `WriteFailed` | `cf_name: String`, `detail: String` | `STORAGE_WRITE_FAILED` |
-| `WriteShed` | `cf_name: String`, `pressure_level: String`, `rows: usize` | `STORAGE_WRITE_FAILED` |
+| `WriteShed` | `cf_name: String`, `pressure_level: DiskPressureLevel`, `dropped_rows: usize` | `STORAGE_WRITE_SHED` |
 | `ReadFailed` | `cf_name: String`, `detail: String` | `STORAGE_READ_FAILED` |
 | `SchemaMismatch` | `expected: u32`, `actual: u32` | `STORAGE_SCHEMA_MISMATCH` |
 

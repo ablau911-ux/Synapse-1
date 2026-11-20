@@ -28,6 +28,7 @@ use synapse_storage::{
     timeline as timeline_codec,
 };
 
+use super::episodes::{hex_encode, now_ts_ns};
 use crate::m1::mcp_error;
 
 use super::{
@@ -36,6 +37,9 @@ use super::{
     permissions::{Permission, RequiredPermissions, required},
     profile_authoring::ProfileAuthoringCandidate,
 };
+
+#[path = "hygiene_span_digest.rs"]
+mod span_digest;
 
 const FLAG_PREFIX: &str = "hygiene/flag/v1/";
 const DEFAULT_MIN_SCORE: u32 = 50;
@@ -161,10 +165,18 @@ pub struct HygieneFlagRecord {
     pub source_key_hex: String,
     /// Field path within the decoded source row.
     pub source_field: String,
+    /// Keyed (`hmac-sha256:`) digest of the whole source text. Empty on rows
+    /// migrated from the legacy plain-SHA-256 shape.
     pub source_text_sha256: String,
     pub span_start: u32,
     pub span_end: u32,
+    /// Legacy read-only field (#161): pre-fix rows persisted the detected span
+    /// in plaintext. Never written or returned; the startup migration clears it.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
     pub span_text: String,
+    /// Keyed digest (`hmac-sha256:` prefix) of the flagged span. Unprefixed
+    /// values are legacy plain SHA-256.
     pub span_text_sha256: String,
     pub score: u32,
     pub heuristics: Vec<String>,
@@ -638,6 +650,7 @@ pub fn query_flags(
     };
 
     let runtime = lock_runtime(runtime)?;
+    span_digest::ensure_legacy_flags_migrated(&runtime);
     let mut flags = Vec::new();
     let mut scanned_rows = 0_u64;
     let mut next_cursor = None;
@@ -760,6 +773,7 @@ pub fn report(
     };
 
     let runtime = lock_runtime(runtime)?;
+    span_digest::ensure_legacy_flags_migrated(&runtime);
 
     // 1. Page over flag rows applying min_score + optional detected_at window.
     let mut page: Vec<HygieneStoredFlag> = Vec::new();
@@ -1323,6 +1337,7 @@ pub(crate) fn resolve_clean_flags(
     runtime: &ReflexRuntime,
     selector: &CleanFlagSelector,
 ) -> Result<Vec<HygieneStoredFlag>, ErrorData> {
+    span_digest::ensure_legacy_flags_migrated(runtime);
     match selector {
         CleanFlagSelector::Ids(ids) => {
             let mut wanted: BTreeSet<&str> = BTreeSet::new();
@@ -1526,7 +1541,15 @@ pub fn redact(
             continue;
         };
 
-        let mut document: Value = serde_json::from_slice(&value).map_err(|error| {
+        let plain = row_plaintext(&source_cf, &value).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "HYGIENE_REDACT_ROW_UNSEAL_FAILED in {source_cf} at {source_key_hex}: {error}"
+                ),
+            )
+        })?;
+        let mut document: Value = serde_json::from_slice(&plain).map_err(|error| {
             mcp_error(
                 error_codes::STORAGE_READ_FAILED,
                 format!(
@@ -1575,12 +1598,30 @@ pub fn redact(
                     format!("HYGIENE_REDACT_ROW_ENCODE_FAILED at {source_key_hex}: {error}"),
                 )
             })?;
+            let encoded = row_for_storage(&source_cf, &value, encoded).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("HYGIENE_REDACT_ROW_SEAL_FAILED at {source_key_hex}: {error}"),
+                )
+            })?;
             guard
                 .storage_replace_rows(&source_cf, Vec::new(), vec![(key.clone(), encoded)])
                 .map_err(|error| {
                     mcp_error(
                         error.code(),
                         format!("HYGIENE_REDACT_WRITE_FAILED at {source_key_hex}: {error}"),
+                    )
+                })?;
+            // Reclaim older plaintext versions from SSTs before reporting success.
+            let mut compact_end = key.clone();
+            compact_end.push(0);
+            guard
+                .storage_flush()
+                .and_then(|()| guard.storage_compact_cf_range(&source_cf, &key, &compact_end))
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("HYGIENE_REDACT_COMPACT_FAILED at {source_key_hex}: {error}"),
                     )
                 })?;
             verify_redacted_row(
@@ -1713,17 +1754,21 @@ enum SpanRedaction {
     Stale,
 }
 
-/// Masks a single flag's span in `document`, anchored on the recorded span text
-/// (verified by SHA-256), located by the recorded byte offsets first and a
-/// substring search as a fallback for offset drift.
+/// Masks a single flag's span in `document`. The span is anchored on its
+/// recorded digest (keyed, or legacy SHA-256), located by the recorded byte
+/// offsets first and a digest-window search as a fallback for offset drift;
+/// the span text itself is never stored (#161).
 fn redact_one_span(
     document: &mut Value,
     flag: &HygieneFlagRecord,
     marker: &str,
 ) -> Result<SpanRedaction, ErrorData> {
-    // The stored flag must be internally consistent: span_text must hash to
-    // span_text_sha256. A mismatch is a corrupt flag, surfaced loudly.
-    if sha256_hex(flag.span_text.as_bytes()) != flag.span_text_sha256 {
+    // A legacy row that still carries its text must be internally consistent:
+    // span_text must hash to span_text_sha256. A mismatch is a corrupt flag,
+    // surfaced loudly.
+    if !flag.span_text.is_empty()
+        && !span_digest::span_digest_matches(&flag.span_text_sha256, &flag.span_text)
+    {
         return Err(mcp_error(
             error_codes::STORAGE_READ_FAILED,
             format!(
@@ -1740,16 +1785,7 @@ fn redact_one_span(
         return Ok(SpanRedaction::FieldMissing);
     };
 
-    let needle = &flag.span_text;
-    // Prefer the exact recorded offsets when they still bracket the needle.
-    let start = usize::try_from(flag.span_start).unwrap_or(usize::MAX);
-    let end = usize::try_from(flag.span_end).unwrap_or(usize::MAX);
-    let at_offset = start <= end
-        && end <= current.len()
-        && current.is_char_boundary(start)
-        && current.is_char_boundary(end)
-        && &current[start..end] == needle;
-    if at_offset {
+    if let Some((start, end)) = span_digest::locate_span(current, flag) {
         let mut next = String::with_capacity(current.len() - (end - start) + marker.len());
         next.push_str(&current[..start]);
         next.push_str(marker);
@@ -1757,15 +1793,7 @@ fn redact_one_span(
         *current = next;
         return Ok(SpanRedaction::Redacted);
     }
-    // Offset drifted (e.g. an earlier redaction shortened the field): locate the
-    // recorded text by content.
-    if let Some(found) = current.find(needle.as_str()) {
-        let next = current.replacen(needle.as_str(), marker, 1);
-        let _ = found;
-        *current = next;
-        return Ok(SpanRedaction::Redacted);
-    }
-    // Needle absent: already cleaned if the marker is present, otherwise the row
+    // Span absent: already cleaned if the marker is present, otherwise the row
     // changed for reasons we did not cause.
     if current.contains(marker) {
         Ok(SpanRedaction::AlreadyClean)
@@ -1796,7 +1824,13 @@ fn verify_redacted_row(
                 format!("HYGIENE_REDACT_READBACK_ABSENT: redacted row {source_key_hex} vanished"),
             )
         })?;
-    let document: Value = serde_json::from_slice(&value).map_err(|error| {
+    let plain = row_plaintext(source_cf, &value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("HYGIENE_REDACT_READBACK_UNSEAL_FAILED at {source_key_hex}: {error}"),
+        )
+    })?;
+    let document: Value = serde_json::from_slice(&plain).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("HYGIENE_REDACT_READBACK_DECODE_FAILED at {source_key_hex}: {error}"),
@@ -1815,7 +1849,7 @@ fn verify_redacted_row(
                 ),
             ));
         };
-        if field.contains(flag.record.span_text.as_str()) {
+        if span_digest::locate_span(field, &flag.record).is_some() {
             return Err(mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
@@ -1954,7 +1988,7 @@ pub(crate) fn invalidate_cleaned_flags(
 
     // 5. Write one taint record per impacted artifact, then read one back to
     //    prove the ledger landed.
-    let tainted_at_ns = now_ns();
+    let tainted_at_ns = now_ts_ns();
     let mut taint_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut routine_ids: Vec<String> = impacted_routine_ids.iter().cloned().collect();
     routine_ids.sort();
@@ -2145,6 +2179,11 @@ fn read_taint_records(
 
 fn taint_key(artifact_kind: &str, artifact_id: &str) -> Vec<u8> {
     format!("{TAINT_PREFIX}{artifact_kind}/{artifact_id}").into_bytes()
+}
+
+/// `CF_KV` key prefix shared by every taint row of `artifact_kind`.
+pub(crate) fn taint_key_prefix(artifact_kind: &str) -> Vec<u8> {
+    taint_key(artifact_kind, "")
 }
 
 fn decode_taint_record(
@@ -2522,11 +2561,6 @@ fn scan_impacted_candidates(
     ))
 }
 
-fn now_ns() -> u64 {
-    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    u64::try_from(nanos).unwrap_or(0)
-}
-
 #[must_use]
 pub fn scan_perceived_text(
     source_path: impl Into<String>,
@@ -2725,7 +2759,7 @@ fn add_match(
     matches.push(HygieneTextMatch {
         span_start: span_start_u32,
         span_end: span_end_u32,
-        span_text_sha256: sha256_hex(span_text.as_bytes()),
+        span_text_sha256: span_digest::keyed_span_digest(&span_text),
         span_text,
         score,
         heuristics,
@@ -3086,7 +3120,7 @@ fn records_for_matches(
     source_text: &str,
     matches: &[HygieneTextMatch],
 ) -> Vec<HygieneFlagRecord> {
-    let source_text_sha256 = sha256_hex(source_text.as_bytes());
+    let source_text_sha256 = span_digest::keyed_span_digest(source_text);
     matches
         .iter()
         .map(|item| {
@@ -3108,7 +3142,8 @@ fn records_for_matches(
                 source_text_sha256: source_text_sha256.clone(),
                 span_start: item.span_start,
                 span_end: item.span_end,
-                span_text: item.span_text.clone(),
+                // #161: the matched text is never persisted, only its digest.
+                span_text: String::new(),
                 span_text_sha256: item.span_text_sha256.clone(),
                 score: item.score,
                 heuristics: item.heuristics.clone(),
@@ -3125,9 +3160,10 @@ fn write_flag_records(
     if records.is_empty() {
         return Ok((0, Vec::new()));
     }
+    span_digest::ensure_legacy_flags_migrated(runtime);
     if !runtime.storage_pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "hygiene flag write refused under disk pressure: cf_name={}",
                 cf::CF_KV
@@ -3182,6 +3218,32 @@ fn write_flag_records(
         });
     }
     Ok((readbacks.len() as u64, readbacks))
+}
+
+/// Row JSON for a stored value: `CF_OCR_CACHE` rows are DPAPI-sealed (#52) and
+/// are unwrapped here; every other source CF stores plain JSON.
+fn row_plaintext<'a>(
+    source_cf: &str,
+    stored: &'a [u8],
+) -> anyhow::Result<std::borrow::Cow<'a, [u8]>> {
+    if source_cf == SOURCE_CF_OCR_CACHE {
+        crate::ocr_cache_seal::open(stored)
+    } else {
+        Ok(std::borrow::Cow::Borrowed(stored))
+    }
+}
+
+/// Inverse of [`row_plaintext`] for a redacted row about to be written back.
+fn row_for_storage(
+    source_cf: &str,
+    original_stored: &[u8],
+    plain_json: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    if source_cf == SOURCE_CF_OCR_CACHE {
+        crate::ocr_cache_seal::reseal(original_stored, &plain_json)
+    } else {
+        Ok(plain_json)
+    }
 }
 
 fn ensure_source_row_exists(
@@ -3338,16 +3400,6 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
@@ -3397,3 +3449,15 @@ fn lock_runtime(
 fn invalid(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, detail.into())
 }
+
+#[cfg(test)]
+#[path = "tests/hygiene_ocr_redact.rs"]
+mod hygiene_ocr_redact_tests;
+
+#[cfg(test)]
+#[path = "tests/hygiene_span_digest_161.rs"]
+mod hygiene_span_digest_161_tests;
+
+#[cfg(all(test, windows))]
+#[path = "tests/hygiene_sst_plaintext_52.rs"]
+mod hygiene_sst_plaintext_52_tests;

@@ -20,6 +20,7 @@ use synapse_profiles::{
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, encode_json};
 
+use super::episodes::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
@@ -3621,6 +3622,8 @@ fn contribution_audit_row(
     Ok(Some(ProfileRegistryAuditEvidenceRow {
         cf_name: cf::CF_ACTION_LOG.to_owned(),
         key_hex: hex_encode(key),
+        // #174 structural exemption: exact serialized row integrity in the
+        // contribution bundle, not a digest of an extracted user message.
         value_sha256: sha256_hex(value),
         profile_id: string_field(&decoded, "profile_id"),
         foreground_profile_id: decoded
@@ -3655,6 +3658,8 @@ fn contribution_quality_summary(
         cf_name: cf::CF_PROFILES.to_owned(),
         key: String::from_utf8_lossy(key).into_owned(),
         key_hex: hex_encode(key),
+        // #174 structural exemption: persisted quality-row integrity binding
+        // for contribution verification, not user/agent content identity.
         value_sha256: sha256_hex(value),
         profile_id: string_field(&decoded, "profile_id"),
         evidence_hash: string_field(&decoded, "evidence_hash"),
@@ -4491,16 +4496,6 @@ fn head_key(source_id: &str) -> String {
 
 fn quality_key(profile_id: &str) -> String {
     format!("profile_quality/v1/{profile_id}")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

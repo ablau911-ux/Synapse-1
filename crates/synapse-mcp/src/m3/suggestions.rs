@@ -38,7 +38,7 @@ use synapse_storage::{Db, cf, decode_json, encode_json};
 
 use crate::m1::mcp_error;
 
-use super::episodes::{key_after, now_ts_ns};
+use super::episodes::{hex_encode, key_after, now_ts_ns};
 use super::intent::{IntentCurrentParams, current_intents};
 use super::permissions::{Permission, RequiredPermissions, required};
 use super::plan::{PlanBackend, PlanDocument, PlanStep, Postcondition};
@@ -67,8 +67,7 @@ const ASSIST_PLAN_RECORD_VERSION: u32 = 1;
 const ENGINE_VERSION_DEFAULTS: &str = "see SuggestionConfig::from_env";
 
 /// Engine knobs. Defaults are deliberately conservative (anti-Clippy);
-/// every one is overridable by env so supporting regression checks and manual
-/// verification can use deterministic thresholds.
+/// every one is overridable by env so the gates are FSV-testable.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SuggestionConfig {
     /// Minimum intent confidence to surface (default 0.6).
@@ -172,7 +171,6 @@ pub struct AssistMitigation {
     pub source_event_id: String,
     pub detector: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub target_window_hwnd: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pid: Option<u32>,
@@ -445,21 +443,18 @@ fn event_key_ts_ns(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(bytes))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
+// Plain SHA-256 on purpose (#174): integrity binding between the id-index row
+// and the primary row it points at. The primary row sits in the same DB in
+// cleartext, so the digest reveals nothing new, and rows persisted before this
+// change must keep verifying (a keyed form would flag them all as corrupt).
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(&digest[..])
 }
 
+// Plain SHA-256 on purpose (#174): derives a stable routine id from event ids and
+// the detector name (structural, not typed content); persisted routine ids must
+// not change across upgrades.
 fn sha256_short_hex(material: &str) -> String {
     let digest = Sha256::digest(material.as_bytes());
     hex_encode(&digest[..8])
@@ -581,12 +576,6 @@ fn assist_candidate_from_event(
         .clamp(0.0, 1.0);
     let window = event.data.get("window").unwrap_or(&Value::Null);
     let target_window_hwnd = window.get("hwnd").and_then(Value::as_i64);
-    if let Some(hwnd) = target_window_hwnd {
-        validate_stored_assist_target_hwnd(
-            &format!("CF_EVENTS assist row {}", event.event_id),
-            hwnd,
-        )?;
-    }
     let target_pid = window
         .get("pid")
         .and_then(Value::as_u64)
@@ -640,28 +629,6 @@ fn assist_candidate_from_event(
         remaining_step_count: 1,
         mitigation,
     }))
-}
-
-pub(crate) fn validate_stored_assist_target_hwnd(
-    record_ref: &str,
-    hwnd: i64,
-) -> Result<i64, ErrorData> {
-    if crate::m1::window_hwnd_shape_is_canonical(hwnd) {
-        return Ok(hwnd);
-    }
-    tracing::error!(
-        code = error_codes::STORAGE_CORRUPTED,
-        source_of_truth = record_ref,
-        field = "target_window_hwnd",
-        actual_value = hwnd,
-        accepted_range = "1..=u32::MAX",
-        remediation = "remove or repair the corrupt assist event/suggestion row and regenerate it from a live canonical window readback",
-        "stored assist target contains a noncanonical HWND"
-    );
-    Err(mcp_error(
-        error_codes::STORAGE_CORRUPTED,
-        format!("{record_ref} has noncanonical target_window_hwnd={hwnd}; expected 1..=4294967295"),
-    ))
 }
 
 fn load_recent_assist_opportunities(
@@ -917,7 +884,7 @@ fn write_suggestion(db: &Arc<Db>, record: &SuggestionRecord) -> Result<(), Error
     )
     .map_err(|error| {
         mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error.code(),
             format!(
                 "failed to persist suggestion {} and suggestion_id index atomically: {error}",
                 record.suggestion_id
@@ -1057,7 +1024,7 @@ pub fn accept_suggestion_for_execution(
     validate_suggestion_id("suggestion_accept", suggestion_id)?;
     let Some(mut record) = load_suggestion_by_id(db, suggestion_id)? else {
         return Err(mcp_error(
-            error_codes::STORAGE_READ_FAILED,
+            error_codes::SUGGESTION_NOT_FOUND,
             format!("SUGGESTION_NOT_FOUND: suggestion_id {suggestion_id} is not in CF_KV"),
         ));
     };
@@ -1081,7 +1048,7 @@ pub fn accept_suggestion_for_execution(
     if !dry_run {
         if !db.pressure_permits_write(cf::CF_KV) {
             return Err(mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error_codes::STORAGE_WRITE_SHED,
                 format!(
                     "suggestion_accept refused under disk pressure: pressure_level={:?}",
                     db.pressure_level()
@@ -1161,7 +1128,7 @@ pub fn suggestion_tick(
 
     if !db.pressure_permits_write(cf::CF_KV) && !params.dry_run {
         return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
+            error_codes::STORAGE_WRITE_SHED,
             format!(
                 "suggestion_tick refused under disk pressure: pressure_level={:?}",
                 db.pressure_level()
@@ -1502,7 +1469,6 @@ pub struct SuggestionAcceptParams {
     /// use the MCP session's existing CDP/window target; if neither exists, the
     /// step is refused with evidence instead of using the human foreground.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub browser_window_hwnd: Option<i64>,
     /// Timeout applied to launch-window/postcondition waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1549,3 +1515,15 @@ pub fn list_suggestions(
         returned,
     })
 }
+
+#[cfg(test)]
+#[path = "tests/suggestion_taxonomy_97.rs"]
+mod suggestion_taxonomy_97_tests;
+
+#[cfg(test)]
+#[path = "tests/suggestion_read_io_97.rs"]
+mod suggestion_read_io_97_tests;
+
+#[cfg(test)]
+#[path = "tests/suggestion_pressure_shed_270.rs"]
+mod suggestion_pressure_shed_270_tests;

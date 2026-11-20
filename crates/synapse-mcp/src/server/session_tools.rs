@@ -4,7 +4,10 @@
 //! the existing active-target registry and input lease snapshot at read time.
 //! It does not gate any action/perception path.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -18,6 +21,8 @@ use super::{
     ErrorData, Json, Parameters, SessionTarget, SynapseService, TargetWire,
     agent_state::{AgentAttentionClass, AgentLifecycleState, AgentStateRead},
     mcp_error,
+    seat_tools::{self, SeatActParams, SeatCreateParams, SeatIdParams, SeatOperationResponse},
+    session_ambient_scan::ScanCache,
     session_registry::{SessionRegistryRead, SpawnedAgentRead, unix_time_ms_now},
     target_claims::{self, TargetClaimRead},
     tool, tool_router,
@@ -29,6 +34,9 @@ const SESSION_TARGET_ROW_PREFIX: &str = "mcp/session-target/v1/";
 const SESSION_LIST_DEFAULT_LIMIT: usize = 50;
 const SESSION_LIST_MAX_LIMIT: usize = 500;
 const DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS: u64 = 60_000;
+/// How long one ambient process/window scan is shared between `session list` calls (#209).
+const AMBIENT_SCAN_CACHE_TTL: Duration = Duration::from_secs(2);
+static AMBIENT_SCAN_CACHE: ScanCache<AmbientScan> = ScanCache::new(AMBIENT_SCAN_CACHE_TTL);
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -112,12 +120,28 @@ pub struct SessionEndParams {
 #[serde(rename_all = "snake_case")]
 pub enum SessionOperation {
     List,
+    SeatCreate,
+    SeatList,
+    SeatGet,
+    SeatAct,
+    SeatCapture,
+    SeatPause,
+    SeatResume,
+    SeatClose,
 }
 
 impl SessionOperation {
     const fn as_str(self) -> &'static str {
         match self {
             Self::List => "list",
+            Self::SeatCreate => "seat_create",
+            Self::SeatList => "seat_list",
+            Self::SeatGet => "seat_get",
+            Self::SeatAct => "seat_act",
+            Self::SeatCapture => "seat_capture",
+            Self::SeatPause => "seat_pause",
+            Self::SeatResume => "seat_resume",
+            Self::SeatClose => "seat_close",
         }
     }
 }
@@ -140,6 +164,12 @@ pub struct SessionParams {
     pub operation: SessionOperation,
     #[serde(default, flatten)]
     pub list: SessionListParams,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_create: Option<SeatCreateParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_id: Option<SeatIdParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_act: Option<SeatActParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -147,7 +177,37 @@ pub struct SessionParams {
 pub struct SessionResponse {
     pub operation: SessionOperation,
     pub source_of_truth: &'static str,
-    pub list: SessionListResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<SessionListResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<SeatOperationResponse>,
+}
+
+fn require_seat_field<T>(
+    value: Option<T>,
+    operation: &'static str,
+    field: &'static str,
+) -> Result<T, ErrorData> {
+    value.ok_or_else(|| {
+        seat_tools::seat_operation_error(
+            operation,
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{operation} requires {field}"),
+            "provide the typed field shown by the session tool schema and retry",
+        )
+    })
+}
+
+fn seat_session_response(
+    operation: SessionOperation,
+    seat: SeatOperationResponse,
+) -> SessionResponse {
+    SessionResponse {
+        operation,
+        source_of_truth: seat.source_of_truth,
+        list: None,
+        seat: Some(seat),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -565,11 +625,12 @@ pub struct SessionEndResponse {
 #[tool_router(router = session_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public session facade. operation=list reads the MCP session registry joined with session-target rows, target claims, agent logical foreground, input lease, and compact pagination. Unknown operations fail schema validation; this facade is read-only and never ends sessions."
+        description = "Public session facade. operation=list reads MCP session state. seat_create/seat_list/seat_get/seat_act/seat_capture/seat_pause/seat_resume/seat_close manage a private Chromium process/profile owned by the calling MCP session. Browser seats use target-scoped CDP only, never the human foreground or normal Chrome profile, and are reclaimed by session teardown. Unknown operations fail schema validation."
     )]
     pub async fn session(
         &self,
         params: Parameters<SessionParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<SessionResponse>, ErrorData> {
         let params = params.0;
         tracing::info!(
@@ -582,10 +643,75 @@ impl SynapseService {
             SessionOperation::List => Ok(Json(SessionResponse {
                 operation: SessionOperation::List,
                 source_of_truth: ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH,
-                list: self.session_list_impl_with_options(SessionListOptions::from_tool_params(
-                    params.list,
-                )?)?,
+                list: Some(
+                    self.session_list_blocking(SessionListOptions::from_tool_params(params.list)?)
+                        .await?,
+                ),
+                seat: None,
             })),
+            SessionOperation::SeatCreate => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_create")?;
+                let create = require_seat_field(params.seat_create, "seat_create", "seat_create")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatCreate,
+                    seat_tools::create(self, owner, create).await?,
+                )))
+            }
+            SessionOperation::SeatList => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_list")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatList,
+                    seat_tools::list(self, owner).await?,
+                )))
+            }
+            SessionOperation::SeatGet => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_get")?;
+                let id = require_seat_field(params.seat_id, "seat_get", "seat_id")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatGet,
+                    seat_tools::get(self, owner, id.seat_id).await?,
+                )))
+            }
+            SessionOperation::SeatAct => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_act")?;
+                let action = require_seat_field(params.seat_act, "seat_act", "seat_act")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatAct,
+                    seat_tools::act(self, owner, action).await?,
+                )))
+            }
+            SessionOperation::SeatCapture => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_capture")?;
+                let id = require_seat_field(params.seat_id, "seat_capture", "seat_id")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatCapture,
+                    seat_tools::capture(self, owner, id).await?,
+                )))
+            }
+            SessionOperation::SeatPause => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_pause")?;
+                let id = require_seat_field(params.seat_id, "seat_pause", "seat_id")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatPause,
+                    seat_tools::pause(self, owner, id).await?,
+                )))
+            }
+            SessionOperation::SeatResume => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_resume")?;
+                let id = require_seat_field(params.seat_id, "seat_resume", "seat_id")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatResume,
+                    seat_tools::resume(self, owner, id).await?,
+                )))
+            }
+            SessionOperation::SeatClose => {
+                let owner = seat_tools::trusted_seat_owner(&request_context, "seat_close")?;
+                let id = require_seat_field(params.seat_id, "seat_close", "seat_id")?;
+                Ok(Json(seat_session_response(
+                    SessionOperation::SeatClose,
+                    seat_tools::close(self, owner, id).await?,
+                )))
+            }
         }
     }
 
@@ -601,8 +727,26 @@ impl SynapseService {
             kind = "session_list",
             "tool.invocation kind=session_list"
         );
-        self.session_list_impl_with_options(SessionListOptions::from_tool_params(params.0)?)
+        self.session_list_blocking(SessionListOptions::from_tool_params(params.0)?)
+            .await
             .map(Json)
+    }
+
+    /// Runs the list read model on the blocking pool: it walks the process
+    /// table and enumerates windows, which must not stall a tokio worker (#209).
+    async fn session_list_blocking(
+        &self,
+        options: SessionListOptions,
+    ) -> Result<SessionListResponse, ErrorData> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.session_list_impl_with_options(options))
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("session_list blocking task failed: {error}"),
+                )
+            })?
     }
 
     #[tool(
@@ -727,6 +871,16 @@ impl SynapseService {
 }
 
 impl SynapseService {
+    /// Blocking-pool entry point for async callers such as the dashboard (#209).
+    pub(crate) async fn session_list_impl_blocking(
+        &self,
+        include_closed: bool,
+    ) -> Result<SessionListResponse, ErrorData> {
+        self.session_list_blocking(SessionListOptions::full_internal(include_closed))
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) fn session_list_impl(
         &self,
         include_closed: bool,
@@ -813,8 +967,12 @@ impl SynapseService {
         let raw_unbound_agent_states = super::agent_state::unbound_reads(now_unix_ms);
         let (unbound_agent_states, terminal_unbound_agent_states, unbound_agent_filter) =
             split_unbound_agent_states(raw_unbound_agent_states);
-        let mut attached_agent_registry =
-            build_attached_agent_registry(&sessions, &unbound_agent_states, now_unix_ms);
+        let mut attached_agent_registry = build_attached_agent_registry(
+            &sessions,
+            &unbound_agent_states,
+            now_unix_ms,
+            options.include_attached_agent_rows,
+        );
         if !options.include_attached_agent_rows {
             attached_agent_registry.rows.clear();
         }
@@ -1208,20 +1366,51 @@ fn build_attached_agent_registry(
     sessions: &[SessionSummary],
     unbound_agent_states: &[AgentStateRead],
     now_unix_ms: u64,
+    include_rows: bool,
 ) -> AttachedAgentRegistryReadback {
-    let (windows_by_pid, window_lookup_error) = attached_agent_window_index();
-    let ambient_process_candidates =
-        ambient_agent_process_candidates(&windows_by_pid, &BTreeSet::new());
+    // The cwd is only shown on rows; skip reading it from every PEB when the
+    // rows are omitted. Counts still need the command lines (#209).
+    let scan = AMBIENT_SCAN_CACHE.get(include_rows, || scan_ambient_agents(include_rows));
     build_attached_agent_registry_with_process_probe(
         sessions,
         unbound_agent_states,
         now_unix_ms,
         &|pid| crate::m4::owned_process_tree_ids(pid),
         &|process_ids| crate::m4::owned_live_process_ids(process_ids),
-        &windows_by_pid,
-        window_lookup_error,
-        ambient_process_candidates,
+        &scan.windows_by_pid,
+        scan.window_lookup_error.clone(),
+        scan.candidates.clone(),
     )
+}
+
+/// One OS scan: visible top-level windows plus claude/codex-looking processes.
+struct AmbientScan {
+    windows_by_pid: BTreeMap<u32, AttachedAgentWindowReadback>,
+    window_lookup_error: Option<String>,
+    candidates: Vec<AmbientAgentProcessCandidate>,
+}
+
+/// Test seam (#209): number of real ambient OS scans run (cache misses).
+/// Process-wide; tests compare against a value read before their call.
+#[cfg(test)]
+static AMBIENT_SCAN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam (#209): see [`AMBIENT_SCAN_COUNT`].
+#[cfg(test)]
+pub(crate) fn ambient_scan_count() -> u64 {
+    AMBIENT_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn scan_ambient_agents(need_cwd: bool) -> AmbientScan {
+    #[cfg(test)]
+    AMBIENT_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (windows_by_pid, window_lookup_error) = attached_agent_window_index();
+    let candidates = ambient_agent_process_candidates(&windows_by_pid, &BTreeSet::new(), need_cwd);
+    AmbientScan {
+        windows_by_pid,
+        window_lookup_error,
+        candidates,
+    }
 }
 
 fn build_attached_agent_registry_with_process_probe(
@@ -1547,17 +1736,16 @@ fn insert_ambient_agent_process_rows(
 fn ambient_agent_process_candidates(
     windows_by_pid: &BTreeMap<u32, AttachedAgentWindowReadback>,
     represented_process_ids: &BTreeSet<u32>,
+    need_cwd: bool,
 ) -> Vec<AmbientAgentProcessCandidate> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+    let mut refresh = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    if need_cwd {
+        refresh = refresh.with_cwd(UpdateKind::Always);
+    }
     let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
-    );
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
     system
         .processes()
         .iter()
@@ -2065,6 +2253,8 @@ fn ensure_cross_session_cleanup_allowed(
         let owner_in_flight =
             match crate::daemon_lifecycle::in_flight_tool_calls_for_session(requested_session_id) {
                 Ok(calls) => calls,
+                #[cfg(test)]
+                Err(error) if error.to_string().contains("ledger is not configured") => Vec::new(),
                 Err(error) => {
                     return Err(mcp_error(
                         error_codes::TOOL_INTERNAL_ERROR,
@@ -2093,6 +2283,8 @@ fn ensure_cross_session_cleanup_allowed(
         let owner_in_flight =
             match crate::daemon_lifecycle::in_flight_tool_calls_for_session(requested_session_id) {
                 Ok(calls) => calls,
+                #[cfg(test)]
+                Err(error) if error.to_string().contains("ledger is not configured") => Vec::new(),
                 Err(error) => {
                     return Err(mcp_error(
                         error_codes::TOOL_INTERNAL_ERROR,
@@ -2374,3 +2566,11 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), ErrorData> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/session_list_blocking_209.rs"]
+mod session_list_blocking_209;
+
+#[cfg(test)]
+#[path = "tests/session_list_offload_209.rs"]
+mod session_list_offload_209;

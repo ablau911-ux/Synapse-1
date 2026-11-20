@@ -9,19 +9,31 @@ use crate::m1::mcp_error;
 
 const MAX_HOLD_MS: u32 = 30_000;
 
+#[cfg(windows)]
+mod key_delivery_plan;
+#[cfg(windows)]
+mod key_route;
 mod keys;
 mod live;
 mod postmessage;
 mod record;
 mod schema;
+#[cfg(test)]
+mod tests;
 
 use schema::press_postcondition_not_requested;
 pub use schema::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
 };
 
+#[cfg(windows)]
+pub(crate) use key_delivery_plan::is_text_control_class;
+#[cfg(windows)]
+pub(crate) use key_route::{KeyChord, KeyLane, KeyRoute};
+pub(crate) use keys::{canonical_key_name, is_text_producing_key};
 pub(crate) use postmessage::HwndKeyboardTargetState;
 pub(crate) use postmessage::clipboard_sequence_number;
+pub(crate) use postmessage::delivered_keyboard_target_state;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedKeymapPress {
@@ -31,12 +43,11 @@ pub(crate) struct ResolvedKeymapPress {
     pub press: ActPressParams,
 }
 
-pub(crate) async fn act_press_with_handle_and_boundary(
+pub async fn act_press_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     connection_closed_cancel: Option<CancellationToken>,
     params: ActPressParams,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActPressResponse, ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
@@ -50,7 +61,6 @@ pub(crate) async fn act_press_with_handle_and_boundary(
     validate_hold_ms(params.hold_ms)?;
     let action = press_action(keys.clone(), params.hold_ms, backend);
 
-    boundary.ensure("immediately_before_press_dispatch")?;
     if let Some(recording) = recording {
         record::execute_recording(&recording, &action)?;
     } else {
@@ -60,7 +70,6 @@ pub(crate) async fn act_press_with_handle_and_boundary(
             params.hold_ms,
             backend,
             connection_closed_cancel,
-            boundary,
         )
         .await?;
     }
@@ -76,8 +85,24 @@ pub(crate) async fn act_press_with_handle_and_boundary(
     })
 }
 
-// Test-exercised keymap helper (see m2::press::tests); production keymap
-// routing carries the request-captured boundary into the physical helper.
+pub async fn act_keymap_with_handle(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    connection_closed_cancel: Option<CancellationToken>,
+    profile: &Profile,
+    params: ActKeymapParams,
+) -> Result<ActKeymapResponse, ErrorData> {
+    let resolved = resolve_keymap_press(profile, &params)?;
+    let response = act_press_with_handle(
+        handle,
+        recording,
+        connection_closed_cancel,
+        resolved.press.clone(),
+    )
+    .await?;
+
+    Ok(act_keymap_response_from_press(&resolved, response))
+}
 
 pub fn action_from_press_params(params: &ActPressParams) -> Result<Action, ErrorData> {
     validate_hold_ms(params.hold_ms)?;
@@ -93,7 +118,6 @@ pub(crate) async fn act_press_cdp_target(
     endpoint: &str,
     cdp_target_id: &str,
     params: ActPressParams,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActPressResponse, ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
@@ -105,7 +129,6 @@ pub(crate) async fn act_press_cdp_target(
     })?;
     validate_hold_ms(params.hold_ms)?;
     let strokes = cdp_key_strokes(&keys)?;
-    boundary.ensure("immediately_before_cdp_press_key_sequence")?;
     synapse_a11y::cdp_press_key_sequence(endpoint, cdp_target_id, strokes, params.hold_ms)
         .await
         .map_err(|error| {
@@ -129,8 +152,9 @@ pub(crate) async fn act_press_cdp_target(
 
 pub(crate) async fn act_press_postmessage_target(
     root_hwnd: i64,
+    target_hwnd: i64,
     params: ActPressParams,
-    boundary: super::OperatorPanicActionBoundary,
+    dispatch: impl FnOnce(i64, &mut dyn FnMut(i64) -> Result<(), ErrorData>) -> Result<(), ErrorData>,
 ) -> Result<ActPressResponse, ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
@@ -141,7 +165,7 @@ pub(crate) async fn act_press_postmessage_target(
         )
     })?;
     validate_hold_ms(params.hold_ms)?;
-    postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await?;
+    postmessage::post_key_sequence(root_hwnd, target_hwnd, &keys, params.hold_ms, dispatch).await?;
     Ok(ActPressResponse {
         ok: true,
         keys_pressed: key_count,
@@ -188,6 +212,7 @@ pub(crate) fn resolve_keymap_press(
         hold_ms: params.hold_ms,
         backend: params.backend,
         verify_delta: false,
+        force_foreground_key_delivery: false,
         allow_foreground_change: false,
         expected_foreground_process_regex: None,
         expected_foreground_title_regex: None,

@@ -1,0 +1,640 @@
+use std::collections::BTreeSet;
+
+use anyhow::{Context, ensure};
+use serde_json::{Value, json};
+use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
+
+#[allow(dead_code)]
+mod support;
+
+/// The normal-profile discovery surface (a fresh HTTP session, no debug env)
+/// is exactly the public facade set the daemon itself declares in `health`
+/// (`tool_names`, `tool_count`): no implementation tool leaks into discovery
+/// and no public facade is missing.
+#[tokio::test]
+async fn must_pass_normal_tools_list_equals_public_tool_names() -> anyhow::Result<()> {
+    let daemon = support::HttpDaemon::start(&[]).await?;
+    let mut session = daemon.session("m4-tools-list-normal", &[]).await?;
+    let listed = session.tools_list().await?;
+    let listed: BTreeSet<String> = listed["tools"]
+        .as_array()
+        .context("tools array missing")?
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect();
+    let health = session.tools_call("health", json!({})).await?;
+    let public: BTreeSet<String> = health["structuredContent"]["tool_names"]
+        .as_array()
+        .context("health tool_names missing")?
+        .iter()
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect();
+    ensure!(
+        listed == public,
+        "normal tools/list must equal the public tool names: only listed={:?} only public={:?}",
+        listed.difference(&public).collect::<Vec<_>>(),
+        public.difference(&listed).collect::<Vec<_>>()
+    );
+    ensure!(
+        health["structuredContent"]["tool_count"].as_u64() == Some(u64::try_from(listed.len())?),
+        "tool_count must equal the listed public surface: {}",
+        health["structuredContent"]["tool_count"]
+    );
+    drop(daemon.stop().await?);
+    Ok(())
+}
+
+/// A public facade's closed root schema refuses an unknown field at call time
+/// on the default (no debug env) surface.
+#[tokio::test]
+async fn must_fail_public_facade_unknown_field_refused() -> anyhow::Result<()> {
+    let mut client = StdioMcpClient::launch_and_init().await?;
+    for (tool, args) in [
+        (
+            "shell",
+            json!({"operation": "run", "command": "whoami.exe", "bogus_root_field": 1}),
+        ),
+        (
+            "process",
+            json!({"operation": "list", "bogus_root_field": 1}),
+        ),
+    ] {
+        let error = client.tools_call_error(tool, args.clone()).await?;
+        ensure!(
+            error["data"]["code"] == json!("TOOL_PARAMS_INVALID"),
+            "{tool} {args}: unknown root field must be TOOL_PARAMS_INVALID: {error}"
+        );
+        ensure!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("bogus_root_field")),
+            "{tool} {args}: refusal must name the unknown field: {error}"
+        );
+    }
+    let status = client.shutdown().await?;
+    ensure!(status.success(), "daemon exit {status:?}");
+    Ok(())
+}
+
+// The exact full tool surface is recorded by the insta snapshot in
+// `m4_tools_list_snapshot_defaults_and_closed_schemas` — that snapshot is the
+// single source of truth (golden master) for the names and the count. There is
+// deliberately NO hardcoded `EXPECTED_TOOLS` array/count literal here: a second
+// hand-maintained copy of the surface silently drifts whenever a tool lands
+// under `[skip ci]` (the old array was stale by 13 tools by #903). Adding or
+// removing a tool is now a single reviewable `cargo insta review` of the
+// snapshot, never a stale magic array. This test asserts only the structural
+// invariants the snapshot cannot express on its own (non-empty surface, unique
+// names, closed schemas, defaults/required fields). See #953.
+
+#[tokio::test]
+async fn must_pass_m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<()> {
+    // Run with debug tools enabled so the asserted surface + snapshot covers the
+    // full tool set, including the SYNAPSE_DEBUG_TOOLS-gated storage probes.
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        None,
+        &[
+            ("SYNAPSE_DEBUG_TOOLS", "1"),
+            ("SYNAPSE_ENABLE_EVERQUEST", "1"),
+        ],
+    )
+    .await?;
+    let response = client.tools_list().await?;
+    let tools = response
+        .get("tools")
+        .and_then(Value::as_array)
+        .context("tools array missing")?;
+
+    let names = sorted_tool_names(tools)?;
+    // Structural invariants only — the exact names/count are pinned by the insta
+    // snapshot below (the single source of truth), so a drift fails loudly there
+    // and is fixed with `cargo insta review`, not by editing a magic array (#953).
+    ensure!(
+        !names.is_empty(),
+        "tools/list returned an empty tool surface"
+    );
+    assert_no_duplicate_names(&names)?;
+
+    assert_schema_roots_closed(tools)?;
+    assert_act_run_shell_semantics_described(tools)?;
+    assert_act_press_foreground_policy_described(tools)?;
+    let defaults = m4_default_readbacks(tools)?;
+
+    let snapshot = json!({
+        "count": names.len(),
+        "tools": names,
+        "m4_defaults": defaults,
+    });
+    insta::assert_json_snapshot!("m4_tools_list", snapshot);
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+    Ok(())
+}
+
+/// The closed schema roots advertised by tools/list (`additionalProperties:
+/// false`) are enforced at call time: an otherwise-valid M4 call carrying one
+/// unknown top-level field is refused with `TOOL_PARAMS_INVALID`. The payloads
+/// are harmless even if the refusal regressed (`cmd /c exit 0`, a launch target
+/// that does not exist).
+#[tokio::test]
+async fn must_fail_m4_closed_schema_root_refuses_unknown_field_at_call_time() -> anyhow::Result<()>
+{
+    let mut client =
+        StdioMcpClient::launch_and_init_with_env(None, &[("SYNAPSE_DEBUG_TOOLS", "1")]).await?;
+    let response = client.tools_list().await?;
+    let tools = response
+        .get("tools")
+        .and_then(Value::as_array)
+        .context("tools array missing")?;
+
+    let cases = [
+        (
+            "act_run_shell",
+            json!({"command": "cmd.exe", "args": ["/c", "exit", "0"], "not_in_schema": true}),
+        ),
+        (
+            "act_launch",
+            json!({
+                "target": "C:\\synapse-no-such-dir\\no-such-program.exe",
+                "not_in_schema": true
+            }),
+        ),
+    ];
+    for (tool, args) in cases {
+        let advertised = tool_by_name(tools, tool)?;
+        ensure!(
+            advertised["inputSchema"]["additionalProperties"] == json!(false),
+            "{tool} must advertise a closed input schema"
+        );
+        ensure!(
+            advertised["inputSchema"]["properties"]
+                .get("not_in_schema")
+                .is_none(),
+            "{tool} must not advertise the probe field"
+        );
+        let error = client.tools_call_error(tool, args.clone()).await?;
+        ensure!(
+            error["data"]["code"] == json!("TOOL_PARAMS_INVALID"),
+            "{tool} accepted an unknown field ({args}): {error}"
+        );
+    }
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+    Ok(())
+}
+
+fn sorted_tool_names(tools: &[Value]) -> anyhow::Result<Vec<String>> {
+    let mut names = tools
+        .iter()
+        .map(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("tool name missing")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn assert_no_duplicate_names(names: &[String]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        ensure!(seen.insert(name), "duplicate tool name: {name}");
+    }
+    Ok(())
+}
+
+fn assert_schema_roots_closed(tools: &[Value]) -> anyhow::Result<()> {
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .context("tool name missing")?;
+        for schema_key in ["inputSchema", "outputSchema"] {
+            let Some(schema) = tool.get(schema_key) else {
+                continue;
+            };
+            ensure!(
+                schema.get("type") == Some(&json!("object")),
+                "{name}.{schema_key}.type must be object"
+            );
+            ensure!(
+                schema.get("additionalProperties") == Some(&json!(false)),
+                "{name}.{schema_key}.additionalProperties must be false"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn assert_act_run_shell_semantics_described(tools: &[Value]) -> anyhow::Result<()> {
+    let tool = tool_by_name(tools, "act_run_shell")?;
+    let tool_description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .context("act_run_shell description missing")?;
+    ensure!(
+        tool_description.contains("executable path/name only")
+            && tool_description.contains("explicit shell executable")
+            && tool_description.contains("execution_mode controls routing")
+            && tool_description.contains("MCP client-call budget")
+            && tool_description
+                .contains("durable_timeout_ms is an explicit durable job lifetime cap"),
+        "act_run_shell description must explain executable-plus-args semantics: {tool_description}"
+    );
+
+    let command_description = value_at(tool, "inputSchema.properties.command.description")?
+        .as_str()
+        .context("act_run_shell command description missing")?;
+    ensure!(
+        command_description.contains("Executable path or program name only")
+            && command_description.contains("Do not include arguments"),
+        "act_run_shell command schema must reject shell-command-string ambiguity: {command_description}"
+    );
+
+    let args_description = value_at(tool, "inputSchema.properties.args.description")?
+        .as_str()
+        .context("act_run_shell args description missing")?;
+    ensure!(
+        args_description.contains("Arguments passed literally")
+            && args_description.contains("not parsed by a shell"),
+        "act_run_shell args schema must explain literal argument passing: {args_description}"
+    );
+
+    let timeout_description = value_at(tool, "inputSchema.properties.timeout_ms.description")?
+        .as_str()
+        .context("act_run_shell timeout_ms description missing")?;
+    ensure!(
+        timeout_description.contains("Caller-requested inline wait budget")
+            && timeout_description.contains("execution_mode=inline")
+            && timeout_description.contains("MCP client-call budget")
+            && timeout_description.contains("execution_mode=auto"),
+        "act_run_shell timeout_ms schema must separate inline and durable timeout semantics: {timeout_description}"
+    );
+
+    let execution_mode_description =
+        value_at(tool, "inputSchema.properties.execution_mode.description")?
+            .as_str()
+            .context("act_run_shell execution_mode description missing")?;
+    ensure!(
+        execution_mode_description.contains("auto preserves compatibility")
+            && execution_mode_description.contains("MCP client-call budget")
+            && execution_mode_description.contains("durable immediately returns"),
+        "act_run_shell execution_mode schema must describe routing choices: {execution_mode_description}"
+    );
+
+    let durable_timeout_description = value_at(
+        tool,
+        "inputSchema.properties.durable_timeout_ms.description",
+    )?
+    .as_str()
+    .context("act_run_shell durable_timeout_ms description missing")?;
+    ensure!(
+        durable_timeout_description.contains("Optional explicit durable job lifetime cap")
+            && durable_timeout_description
+                .contains("Applied only if this request creates a durable/background job")
+            && durable_timeout_description.contains("ignored when execution completes inline")
+            && durable_timeout_description.contains("Omit for an unbounded durable job"),
+        "act_run_shell durable_timeout_ms schema must describe durable lifetime semantics: {durable_timeout_description}"
+    );
+
+    let start_tool = tool_by_name(tools, "act_run_shell_start")?;
+    let start_description = start_tool
+        .get("description")
+        .and_then(Value::as_str)
+        .context("act_run_shell_start description missing")?;
+    ensure!(
+        start_description.contains("Omitting timeout_ms")
+            && start_description.contains("unbounded")
+            && start_description.contains("explicit lifetime cap"),
+        "act_run_shell_start description must explain durable lifetime cap semantics: {start_description}"
+    );
+
+    let start_timeout_description =
+        value_at(start_tool, "inputSchema.properties.timeout_ms.description")?
+            .as_str()
+            .context("act_run_shell_start timeout_ms description missing")?;
+    ensure!(
+        start_timeout_description.contains("Optional explicit durable job lifetime cap")
+            && start_timeout_description.contains("Omit for an unbounded job"),
+        "act_run_shell_start timeout_ms schema must explain unbounded default: {start_timeout_description}"
+    );
+    Ok(())
+}
+
+fn assert_act_press_foreground_policy_described(tools: &[Value]) -> anyhow::Result<()> {
+    let tool = tool_by_name(tools, "act_press")?;
+
+    let allow_description = value_at(
+        tool,
+        "inputSchema.properties.allow_foreground_change.description",
+    )?
+    .as_str()
+    .context("act_press allow_foreground_change description missing")?;
+    ensure!(
+        allow_description.contains("accept a foreground-window identity change")
+            && allow_description.contains("unexpected focus loss still fails closed"),
+        "act_press allow_foreground_change schema must describe fail-closed foreground transition semantics: {allow_description}"
+    );
+
+    let process_description = value_at(
+        tool,
+        "inputSchema.properties.expected_foreground_process_regex.description",
+    )?
+    .as_str()
+    .context("act_press expected_foreground_process_regex description missing")?;
+    ensure!(
+        process_description.contains("after-read foreground process name")
+            && process_description.contains("Invalid regexes fail before key input is sent"),
+        "act_press expected_foreground_process_regex schema must describe pre-input regex validation: {process_description}"
+    );
+
+    let title_description = value_at(
+        tool,
+        "inputSchema.properties.expected_foreground_title_regex.description",
+    )?
+    .as_str()
+    .context("act_press expected_foreground_title_regex description missing")?;
+    ensure!(
+        title_description.contains("after-read foreground window title")
+            && title_description.contains("Invalid regexes fail before key input is sent"),
+        "act_press expected_foreground_title_regex schema must describe pre-input regex validation: {title_description}"
+    );
+
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "schema readback table is intentionally kept as one ordered assertion"
+)]
+fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
+    let mut readbacks = Vec::new();
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_keymap",
+        "inputSchema.properties.hold_ms.default",
+        &json!(33),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_keymap",
+        "inputSchema.properties.backend.default",
+        &json!("auto"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_click",
+        "inputSchema.properties.hold_ms.default",
+        &json!(120),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.velocity_profile.default",
+        &json!("constant"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.motion_model.default",
+        &json!({"kind": "path"}),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.backend.default",
+        &json!("auto"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_combo",
+        "inputSchema.properties.backend.default",
+        &json!("auto"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_run_shell",
+        "inputSchema.properties.args.default",
+        &json!([]),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_run_shell",
+        "inputSchema.properties.env.default",
+        &json!({}),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_run_shell",
+        "inputSchema.properties.timeout_ms.default",
+        &json!(30000),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_run_shell_start",
+        "inputSchema.properties.args.default",
+        &json!([]),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_run_shell_start",
+        "inputSchema.properties.env.default",
+        &json!({}),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_run_shell_status",
+        "inputSchema.properties.tail_bytes.default",
+        &json!(65536),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_launch",
+        "inputSchema.properties.args.default",
+        &json!([]),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_launch",
+        "inputSchema.properties.env.default",
+        &json!({}),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_launch",
+        "inputSchema.properties.timeout_ms.default",
+        &json!(10000),
+    )?;
+    read_required(&mut readbacks, tools, "act_combo", "steps")?;
+    read_required(&mut readbacks, tools, "act_keymap", "alias")?;
+    read_property(&mut readbacks, tools, "act_stroke", "path")?;
+    read_property(&mut readbacks, tools, "act_stroke", "target")?;
+    read_property(&mut readbacks, tools, "act_stroke", "from")?;
+    read_property(&mut readbacks, tools, "act_stroke", "to")?;
+    read_required(&mut readbacks, tools, "act_stroke", "duration_or_speed")?;
+    read_required(&mut readbacks, tools, "act_run_shell", "command")?;
+    read_required(&mut readbacks, tools, "act_run_shell_start", "command")?;
+    read_required(&mut readbacks, tools, "act_run_shell_status", "job_id")?;
+    read_required(&mut readbacks, tools, "act_run_shell_cancel", "job_id")?;
+    read_required(&mut readbacks, tools, "act_launch", "target")?;
+    read_required(&mut readbacks, tools, "notify_human", "title")?;
+    read_required(&mut readbacks, tools, "notify_human", "body")?;
+    read_required(&mut readbacks, tools, "notify_human", "kind")?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "notify_human",
+        "inputSchema.properties.suppress_popup.default",
+        &json!(false),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.profile_id.default",
+        &json!("everquest.live"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.state_row_key.default",
+        &json!("everquest/current_state/v1/everquest.live"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_exits.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_landmarks.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_transitions.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_hazards.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.stale_after_seconds.default",
+        &json!(300),
+    )?;
+    read_required(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "summary_id",
+    )?;
+    Ok(readbacks)
+}
+
+fn read_default(
+    readbacks: &mut Vec<Value>,
+    tools: &[Value],
+    tool_name: &str,
+    path: &str,
+    expected: &Value,
+) -> anyhow::Result<()> {
+    let actual = value_at(tool_by_name(tools, tool_name)?, path)?.clone();
+    assert_eq!(&actual, expected, "{tool_name}.{path}");
+    readbacks.push(json!({
+        "tool": tool_name,
+        "path": path,
+        "actual": actual,
+    }));
+    Ok(())
+}
+
+fn read_required(
+    readbacks: &mut Vec<Value>,
+    tools: &[Value],
+    tool_name: &str,
+    field: &str,
+) -> anyhow::Result<()> {
+    let required = value_at(tool_by_name(tools, tool_name)?, "inputSchema.required")?;
+    let required = required
+        .as_array()
+        .with_context(|| format!("{tool_name}.inputSchema.required must be an array"))?;
+    ensure!(
+        required.iter().any(|value| value.as_str() == Some(field)),
+        "{tool_name}.inputSchema.required must contain {field}"
+    );
+    readbacks.push(json!({
+        "tool": tool_name,
+        "path": "inputSchema.required",
+        "actual_contains": field,
+    }));
+    Ok(())
+}
+
+fn read_property(
+    readbacks: &mut Vec<Value>,
+    tools: &[Value],
+    tool_name: &str,
+    field: &str,
+) -> anyhow::Result<()> {
+    value_at(
+        tool_by_name(tools, tool_name)?,
+        &format!("inputSchema.properties.{field}"),
+    )?;
+    readbacks.push(json!({
+        "tool": tool_name,
+        "path": "inputSchema.properties",
+        "actual_contains": field,
+    }));
+    Ok(())
+}
+
+fn tool_by_name<'a>(tools: &'a [Value], name: &str) -> anyhow::Result<&'a Value> {
+    tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .with_context(|| format!("tool missing from tools/list: {name}"))
+}
+
+fn value_at<'a>(value: &'a Value, path: &str) -> anyhow::Result<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current
+            .get(segment)
+            .with_context(|| format!("missing path {path}"))?;
+    }
+    Ok(current)
+}

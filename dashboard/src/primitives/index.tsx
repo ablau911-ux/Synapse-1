@@ -34,13 +34,13 @@ export function PageHeader({
   actions: ReactNode;
 }) {
   return (
-    <header className="mb-6 flex flex-col gap-4 border-b border-border pb-4 md:flex-row md:items-end md:justify-between">
+    <header className="mb-6 flex flex-col gap-4 border-b border-border pb-4">
       <div className="min-w-0">
         <p className="text-label font-medium uppercase text-muted">Synapse Command Center</p>
         <h1 className="mt-1 text-2xl font-semibold tracking-normal text-primary">{title}</h1>
         <div className="mt-2 text-sm text-secondary">{subtitle}</div>
       </div>
-      <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>
+      <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">{actions}</div>
     </header>
   );
 }
@@ -375,7 +375,7 @@ export function TranscriptTurn({ row }: { row: Record<string, unknown> }) {
   const eventKind = rawText(record.event_kind);
 
   return (
-    <article className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+    <article className="min-w-0 rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <FileText aria-hidden="true" className="h-4 w-4 shrink-0 text-info" />

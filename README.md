@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=for-the-badge&logo=windows" alt="Windows">
   <img src="https://img.shields.io/badge/built%20with-Rust-CE412B?style=for-the-badge&logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/protocol-MCP-7C3AED?style=for-the-badge" alt="MCP">
-  <img src="https://img.shields.io/badge/MCP%20tools-40-0ea5e9?style=for-the-badge" alt="40 MCP tools">
+  <img src="https://img.shields.io/badge/MCP%20tools-44-0ea5e9?style=for-the-badge" alt="44 MCP tools">
 </p>
 
 <p align="center">
@@ -136,17 +136,16 @@ isolated session, while you keep working.
 
 Everything runs **on your machine**. No screen-scraping cloud service, no remote agent,
 no data leaving your PC. Synapse is Windows-native to the metal: Win32 `SendInput`, UI
-Automation, Windows Graphics Capture / DXGI, optional debug-gated WASAPI audio capture,
-and local process control.
+Automation, Windows Graphics Capture / DXGI, WASAPI audio, and local process control.
 
 ---
 
 ## What you can do with it
 
-Synapse exposes **40 focused MCP tools** — a small, clean facade surface where every tool
-takes an explicit `operation`, and every mutating action names the source of truth it
+Synapse exposes **44 focused MCP tools** — a small, clean facade surface where multi-operation tools
+take an explicit `operation`, and every mutating action names the source of truth it
 reads back from. (One tool, the raw browser debugger, is break-glass–gated behind an
-explicit profile switch.) Here's what those 40 tools unlock.
+explicit profile switch.) Here's what those 44 tools unlock.
 
 ### 👁️ It can see — structured perception
 
@@ -631,18 +630,14 @@ window via `target operation=claim`, gated by `approval` — and your cursor nev
 Durable jobs (`shell operation=start/status`), screenshot + OCR perception, and the audit
 trail give you a *provable* record of what happened while you slept.
 
-**🎧 Debug-only audio prototype**
+**🎧 Perceive three channels at once**
 
-> *"In a lab profile with debug tools and audio enabled, join the meeting, transcribe the
-> system audio live, and while it runs, fill in the CRM form in the background window from
-> yesterday's notes. When someone says my name in the transcript, ping me."*
+> *"Join the meeting, transcribe the system audio live, and while it runs, fill in the CRM
+> form in the background window from yesterday's notes. When someone says my name in the
+> transcript, ping me."*
 
-Audio transcription is not on the default 40-tool production surface. The lower-level
-`audio_tail` and `audio_transcribe` tools are debug-surface tools, require
-`SYNAPSE_DEBUG_TOOLS=1` and `--enable-audio`, and Whisper transcription requires a
-verified local model side-loaded into the configured model path; Synapse does not download
-that model automatically. Background form-fill through `browser_form` / `act` and event
-subscriptions remain part of the production surface.
+WASAPI audio capture + Whisper transcription, background form-fill through `browser_form` /
+`act` value patterns, and event subscriptions — three sensory channels, one agent.
 
 **🖥️ A self-driving install**
 
@@ -666,57 +661,62 @@ reusable, human-approved automation.
 
 ## The full tool surface
 
-The default production surface is **facade-first**: 40 tools, each with a strict `operation`
-enum. Call `tools/list` on the running `synapse-mcp` server for the live registry. At a
-glance:
+Synapse has **44 MCP tools**, facade-first. Multi-operation tools take a strict
+`operation` enum; single-purpose tools omit it. `livefeed` is built behind the
+`livefeed` cargo feature (`cargo build -p synapse-mcp --features livefeed`); call
+`tools/list` on the running `synapse-mcp` server for the live registry.
 
-| Facade | Key operations |
-|---|---|
-| `health` | daemon + subsystem status |
-| `profile` | `status` · `set` |
-| `session` | `list` |
-| `subscribe` | `events` |
-| `observe` | `current` |
-| `find` | `elements` |
-| `read_text` | `text` |
-| `screenshot` | `capture` · `gif` |
-| `target` | `get` · `list` · `set` · `clear` · `claim` · `status` · `adopt` · `release` |
-| `act` | `invoke` · `foreground` |
-| `shell` | `run` · `start` · `status` · `cancel` |
-| `process` | `list` · `launch` · `history` |
-| `browser_tabs` | `list` · `select` · `new` · `close` |
-| `browser_nav` | `navigate` · `reload` · `back` · `forward` |
-| `browser_dom` | `content` · `locate` · `inspect` · `aria_snapshot` |
-| `browser_form` | `set_value` · `fill` |
-| `browser_wait` | `for_condition` |
-| `browser_capture` | `screenshot` · `downloads` |
-| `browser_storage` | `read` · `write` |
-| `browser_debugger` 🔒 | raw CDP: `evaluate` · `console_messages` · `network` · `route` · … (break-glass) |
-| `workspace` | `get` · `put` · `list` · `subscribe` · `exists` · `delete` |
-| `agent` | `spawn` · `send` · `inbox` · `wait` · `broadcast` · `steer` · `pause` · `resume` · `kill` · templates |
-| `task` | `create` · `get` · `update` · `claim` · `cancel` · `list` · `next` · `reconcile` · `dispatch_once` |
-| `approval` | `request` · `list` · `decide` · `gate` · `ask_operator` |
-| `escalation` | `config_get` · `config_set` · `list` · `ack` |
-| `timeline` | `get` · `search` · `stats` |
-| `episode` | `list` · `get` |
-| `routine` | `mine` · `list` · `inspect` · `update` · `feedback` · `label` · `automate` |
-| `assist` | `intent` · `detect` · `suggestion_list` · `suggestion_accept` |
-| `reality` | `baseline` · `delta` · `audit` |
-| `verification` | `inbox` · `poll` · `audit` · `bind` · `sources` |
-| `storage` | `inspect` · `summary` · `gc_once` |
-| `model` | `list` · `status` · `probe` · `register` · `update` · `remove` |
-| `cost` | `summarize` · `price_list` · `price_put` · `price_delete` |
-| `hygiene` | `scan_text` · `scan_storage` · `flags` · `report` |
-| `audit` | `command_query` · `lifecycle_events` · `profile_intelligence` · `export_bundle` |
-| `replay` | `record` · `demo_start` · `demo_stop` · `artifact_inspect` |
-| `privacy` | `pause` · `resume` · `exclusions` · `redact` · `purge` |
-| `setup` | `status` · `doctor` · `repair` |
-| `telemetry` | `status` |
+| # | Tool | What it does | Key operations |
+|---|---|---|---|
+| 1 | `health` | Daemon and subsystem status (bind, build, tool surface, bridges, storage) | — |
+| 2 | `profile` | Reads or switches this session's tool profile (normal / break_glass / browser_debugger) | `status` · `set` |
+| 3 | `session` | Lists MCP sessions; creates and drives private per-session Chromium seats | `list` · `seat_create` · `seat_act` · `seat_capture` · `seat_close` · … |
+| 4 | `subscribe` | Session-owned filtered SSE event subscriptions | `events` · `events_cancel` |
+| 5 | `user_activity` | Which window the human last used with a physical keyboard/mouse vs. the current foreground | — |
+| 6 | `observe` | Structured state of the target (or foreground) window: elements, focus, context | — |
+| 7 | `find` | Searches visible accessibility nodes and detected entities | — |
+| 8 | `read_text` | OCR of a region, element or target window (passive window capture) | — |
+| 9 | `screenshot` | Writes a verified PNG/JPEG screenshot or a bounded window GIF | `capture` · `gif` |
+| 10 | `livecapture` | Continuous capture of one native window with fresh JPEG frames on demand | `start` · `next` · `stop` · … |
+| 11 | `livefeed` | The agent's always-on camera on the whole monitor: what is on screen now, what changed, a filmstrip of a time span, full-res zoom | `start` · `stop` · `look` · `changes` · `watch` · `zoom` · `status` |
+| 12 | `videoanalyze` | Delivers timestamped frames of a local video or YouTube URL to the assistant | `inspect` · `analyze` |
+| 13 | `target` | Sets/reads the session's target window; claims windows for background control | `get` · `list` · `set` · `clear` · `claim` · `status` · `adopt` · `release` |
+| 14 | `act` | Performs one action on the target (click, type, press, scroll, drag…) in the background, or through the audited foreground escalation | `invoke` · `foreground` · `lease_acquire` · `lease_status` · `lease_release` · `route_memory_status` · `route_memory_clear` |
+| 15 | `shell` | Runs allowlisted commands, or durable background jobs with output files | `run` · `start` · `status` · `cancel` |
+| 16 | `process` | Lists OS processes; launches programs with an audited history | `list` · `launch` · `history` |
+| 17 | `browser_tabs` | Lists/selects/opens/closes tabs in an already-open Chromium browser | `list` · `select` · `new` · `close` |
+| 18 | `browser_nav` | Navigates an owned tab in the background | `navigate` · `reload` · `back` · `forward` |
+| 19 | `browser_dom` | Reads page HTML, locates/inspects elements, ARIA snapshot | `content` · `locate` · `inspect` · `aria_snapshot` |
+| 20 | `browser_form` | Sets one field or fills a form with dual readback | `set_value` · `fill` |
+| 21 | `browser_wait` | Waits for text, load state, URL, selector, function, request or response | `for_condition` |
+| 22 | `browser_capture` | Page/tab screenshots and download readbacks | `screenshot` · `downloads` |
+| 23 | `browser_storage` | Get/set/clear local/session storage; save/load storageState | `read` · `write` |
+| 24 | `browser_debugger` 🔒 | Raw CDP (evaluate, console, network, route…) — break-glass profile only | `evaluate` · `console_messages` · `network` · `route` · … |
+| 25 | `workspace` | Run-scoped shared blackboard for agents; durable hand-off and lessons ledger mirrored to a text file | `get` · `put` · `list` · `subscribe` · `exists` · `delete` · `ledger_put` · `ledger_list` |
+| 26 | `agent` | Spawns and controls agent processes; mailboxes, templates, stats | `spawn` · `send` · `inbox` · `wait` · `broadcast` · `steer` · `pause` · `resume` · `kill` · templates |
+| 27 | `task` | Durable agent task queue | `create` · `get` · `update` · `claim` · `cancel` · `list` · `next` · `reconcile` · `dispatch_once` |
+| 28 | `approval` | Durable human-approval queue and gates | `request` · `list` · `decide` · `gate` · `ask_operator` |
+| 29 | `escalation` | AFK escalation policy, list and acknowledgement | `config_get` · `config_set` · `list` · `ack` |
+| 30 | `timeline` | Reads/searches the recorded activity timeline | `get` · `search` · `stats` |
+| 31 | `episode` | Reads recorded work episodes | `list` · `get` |
+| 32 | `routine` | Mines your recurring routines; manages, labels and automates them | `mine` · `list` · `inspect` · `update` · `feedback` · `label` · `automate` |
+| 33 | `assist` | Current intent detection and proactive suggestions | `intent` · `detect` · `suggestion_list` · `suggestion_accept` |
+| 34 | `reality` | Delta-first reality: baseline, ordered deltas, drift audit | `baseline` · `delta` · `audit` |
+| 35 | `verification` | Verification inbox, polling, binding and sources | `inbox` · `poll` · `audit` · `bind` · `sources` |
+| 36 | `storage` | RocksDB column-family reports and maintenance GC | `inspect` · `summary` · `gc_once` |
+| 37 | `model` | Local model registry and endpoint probes | `list` · `status` · `probe` · `register` · `update` · `remove` |
+| 38 | `cost` | Token/cost rollups and price list | `summarize` · `price_list` · `price_put` · `price_delete` |
+| 39 | `hygiene` | Prompt-injection scanning of text and stored data | `scan_text` · `scan_storage` · `flags` · `report` |
+| 40 | `audit` | Command log, daemon lifecycle ledgers, profile intelligence, export | `command_query` · `lifecycle_events` · `profile_intelligence` · `export_bundle` |
+| 41 | `replay` | Records and inspects replay files; UIA demo recording | `record` · `demo_start` · `demo_stop` · `artifact_inspect` |
+| 42 | `privacy` | Pauses/resumes the timeline recorder, exclusions, redaction, purge | `pause` · `resume` · `exclusions` · `redact` · `purge` |
+| 43 | `setup` | Host setup status, doctor and (maintenance-gated) repair | `status` · `doctor` · `repair` |
+| 44 | `telemetry` | Profile, tool-surface and storage/ingress counters | `status` |
 
 Every mutating operation names the physical readback source of truth — a file path, RocksDB
 CF/key, process id, tab id, target id, event cursor, or profile row — so "it worked" is
 always backed by evidence. Full mapping and migration notes:
-[Synapse 40-Tool Surface](docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
+[Synapse 44-Tool Surface](docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
 
 ---
 
@@ -731,7 +731,7 @@ always backed by evidence. Full mapping and migration notes:
 | Action | Win32 `SendInput` (`enigo`), UIA control patterns, CDP input, verified readback |
 | Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, RocksDB mailboxes + workspace blackboard, approvals & escalation |
 | Learning | Routine mining, intent/assist, activity timeline & episodes, profile quality from audit |
-| Audio | Debug-gated WASAPI loopback; Whisper STT requires `--enable-audio` plus a side-loaded verified model |
+| Audio | WASAPI loopback + Whisper-tiny STT |
 | Storage | **RocksDB** (LZ4 + ZSTD), durable audit trail |
 | Models | ONNX Runtime (`ort`) for optional detection |
 

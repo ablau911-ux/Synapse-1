@@ -37,7 +37,8 @@
   pushd-mapped UNC drive).
 
 .PARAMETER SkipBuild
-  Do not build; require an already-installed synapse-mcp.exe at -ExePath.
+  Do not build; validate and install CargoTarget\release\synapse-mcp.exe.
+  Fails before daemon handoff when that release artifact is absent.
 
 .PARAMETER BuildTimeoutMinutes
   Maximum time to allow the release build to run. The build process tree is
@@ -98,11 +99,34 @@
 
 .PARAMETER Purge
   With -Remove, also delete the daemon DB, deployed profiles, and token.
+  Only explicit Synapse-owned paths are deleted (the token FILE, DbPath and
+  ProfilesDir when inside Synapse roots, and a named list of files in
+  %APPDATA%\synapse); anything else is refused. The exact list is printed first.
+
+.PARAMETER Force
+  With -Remove -Purge, delete without the interactive confirmation prompt.
 
 .PARAMETER ActiveIssue
   Optional current GitHub issue number/ref to preserve in Codex restart
   handoffs. Defaults to SYNAPSE_ACTIVE_ISSUE when set. Accepts 1441, #1441, or
   a ChrisRoyse/Synapse issue URL.
+
+.PARAMETER RefreshToolSurfaceOnly
+  Refresh the Codex tool-surface snapshot from the already-running daemon,
+  without building, restarting, or changing client configuration.
+
+.PARAMETER CodexStartSnapshotRetentionHours
+  Age limit for legacy Codex start snapshots (names from before #259 that carry no
+  owner PID) in %LOCALAPPDATA%\synapse\codex-start-snapshots. Setup persists it as the
+  Windows User variable SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS, which the
+  patched Codex launchers (and the WSL loader) read.
+
+.PARAMETER CodexStartSnapshotGraceMinutes
+  Minimum age before a launcher may prune another start's o<pid> snapshot whose
+  owner process a successful lookup shows is gone (covers PID reuse and races).
+  Persisted as the Windows User variable SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES.
+  Each launcher deletes its own snapshot when Codex exits; a snapshot whose owner
+  is alive, unknown, or not provably gone is never pruned.
 #>
 [CmdletBinding()]
 param(
@@ -121,40 +145,50 @@ param(
     [string]$TaskName    = 'SynapseMcpDaemon',
     [string]$MaintenanceLockPath = "$env:LOCALAPPDATA\synapse\setup-maintenance.lock.json",
     [ValidateRange(1, 1440)][int]$BuildTimeoutMinutes = 90,
+    [ValidateRange(1, 87600)][int]$CodexStartSnapshotRetentionHours = 168,
+    [ValidateRange(1, 1440)][int]$CodexStartSnapshotGraceMinutes = 10,
     [int]$PostExitParentPid = 0,
     [string]$PostExitContinuationReason = '',
     [string]$PostExitManifestPath = '',
+    [switch]$PostExitUseInstalledBinary,
+    [string]$PostExitInstalledSha256 = '',
     [switch]$ForceRestart,
     [switch]$SkipClientWiring,
+    [switch]$RefreshToolSurfaceOnly,
     [switch]$Remove,
-    [switch]$Purge
+    [switch]$Purge,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
+# Multi-browser bridge: browser rows (crates\synapse-browsers\browsers\*.json)
+# are the single source for browser ids, wire ids and paths. The legacy row is
+# the mandatory bridge; every other row is best-effort (not_installed = skip).
+. (Join-Path $PSScriptRoot 'synapse-browser-rows.ps1')
+# #251: live bridge identity readback shared with the bridge installer.
+. (Join-Path $PSScriptRoot 'synapse-bridge-live-identity.ps1')
+# Windowless scheduled-task actions (wscript.exe + run-hidden.vbs).
+. (Join-Path $PSScriptRoot 'synapse-hidden-runner.ps1')
+$SynapseLegacyBrowserId = 'chrome'
 $SynapseChromeBridgeMaintenancePauseMs = 720000
+# #140: /health has measured 0.3-0.9 s steady state and >4 s under deploy load.
+$SynapseChromeBridgeMaintenancePauseHealthTimeoutSec = 20
+# #140: a degraded /health (3 s daemon bound hit) is retried this many extra
+# times, then the pause is skipped with a warning instead of aborting setup.
+$SynapseChromeBridgeMaintenancePauseDegradedRetries = 5
+$SynapseChromeBridgeMaintenancePauseDegradedRetryDelaySec = 3
 $SynapseChromeBridgeMaintenanceCloseDrainMs = 7000
 $SynapseChromeBridgeReconnectAlarmCushionMs = 45000
 $SynapseChromeBridgeDefaultPostStartWaitMs = 30000
 $SynapseChromeBridgeMaintenancePauseGuardMs = 60000
 $SynapseChromeBridgeMaxPostStartWaitMs = $SynapseChromeBridgeMaintenancePauseMs + $SynapseChromeBridgeReconnectAlarmCushionMs + $SynapseChromeBridgeDefaultPostStartWaitMs
+$SynapseChromeBridgeUiReloadDeferredReason = 'existing_extension_ui_reload_no_eligible_chrome_window_deferred_to_daemon'
 $SynapseBindFinalDeadOwnerSettleSeconds = 15
 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
 $script:SynapseBindPostExitContinuationRequired = $false
 $script:SynapseBindPostExitContinuationDetail = $null
 $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitContinuationReason -eq 'dead_owner_bind_after_install')
 $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
-$script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
-$script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
-$script:SynapseBundledProfilesRollbackDirName = '.synapse-profile-reconcile-backups'
-$script:SynapseLegacyRetiredBundledProfiles = @(
-    [pscustomobject]@{
-        relative_path = 'everquest.live.toml'
-        sha256 = 'B921FB8298F5939AD40902360B4E478205827DE5113CD6F2D8ADD1DDA23254BD'
-        retired_by = '95f8e986051468bdd62ed82a6713b1a1167b2d94'
-        issue = '#1544/#1641'
-        reason = 'legacy bundled profile removed before setup had an ownership manifest'
-    }
-)
 function Write-SynapsePostExitManifestState {
     param(
         [Parameter(Mandatory=$true)][string]$State,
@@ -280,6 +314,26 @@ function Die($m)   {
     throw "[synapse-setup] FATAL: $m"
 }
 
+function Resolve-SynapseSetupFatalTrapPlan {
+    # #377: what the top-level trap does with a FATAL. Pure: no I/O.
+    param(
+        [string]$RepairManifestState = '',
+        [bool]$PostExitStartOnly = $false,
+        [string]$PostExitManifestState = '',
+        [int]$LastExitCode = 0
+    )
+    # A FATAL always ends the process with 1, whatever the last native command
+    # returned (`break` under pwsh -File exited with that code, often 0). A repair
+    # manifest already handed off stays handed off; a post-exit continuation records
+    # 'failed' unless Die already did.
+    return [pscustomobject]@{
+        ExitCode = 1
+        WriteRepairFailed = ($RepairManifestState -ne 'handoff_started')
+        WritePostExitFailed = ($PostExitStartOnly -and $PostExitManifestState -ne 'failed')
+        LockState = 'failed'
+    }
+}
+
 function Get-SynapseUnixTimeMilliseconds {
     return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 }
@@ -319,12 +373,20 @@ function Invoke-SynapseChromeBridgeVerifier {
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
         Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_MISSING path=$InstallerPath remediation=setup requires the repo script that verifies the direct localhost Chrome bridge and removes stale nativeMessaging registration"
     }
+    # Both callers run before the new daemon starts (preflight, and after the
+    # old daemon was drained), so the live identity check is deferred to
+    # Assert-SynapseBridgeLiveIdentityAfterSetup once the daemon is up (#251).
     $chromeBridgeArgs = @{
         SynapseNativeHostExe = $NativeHostExePath
+        DeferLiveVerification = $true
     }
     $readback = & $InstallerPath @chromeBridgeArgs
+    $runtimeVerification = $readback.runtime_verification
     if (-not $readback.ok) {
-        Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true"
+        if ($runtimeVerification.deferred -ne $true -or $null -eq $runtimeVerification.expected_identity) {
+            Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$InstallerPath reason=$($readback.reason) remediation=installer did not return ok=true and did not defer the live bridge identity check to setup's post-start verification"
+        }
+        Info "Chrome bridge live identity check deferred until the daemon is running reason=$($readback.reason)"
     }
     $autoInstall = $readback.synapse_chrome_auto_install
     if (-not $autoInstall) {
@@ -358,11 +420,7 @@ function Format-SynapseChromeBridgeProfileInstallState {
     $autoInstallAttempted = if ($autoInstall) { [string]$autoInstall.attempted } else { 'missing' }
     $autoInstallReason = if ($autoInstall) { [string]$autoInstall.reason } else { 'missing' }
     $extensionDir = if ($Readback.extension_dir) { [string]$Readback.extension_dir } else { 'missing' }
-    $cleanup = $Readback.stale_bridge_build_cleanup
-    $cleanupRemoved = if ($cleanup) { @($cleanup.removed_dirs).Count } else { 'missing' }
-    $cleanupPreserved = if ($cleanup) { @($cleanup.preserved_dirs).Count } else { 'missing' }
-    $cleanupFailed = if ($cleanup) { @($cleanup.failed_dirs).Count } else { 'missing' }
-    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5},auto_install_attempted:{6},auto_install_reason:{7},extension_dir:{8},stale_build_dirs_removed:{9},stale_build_dirs_preserved:{10},stale_build_dirs_failed:{11}" -f `
+    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5},auto_install_attempted:{6},auto_install_reason:{7},extension_dir:{8}" -f `
         $state.installed, `
         $state.profile_count, `
         $state.installed_profile_count, `
@@ -371,10 +429,7 @@ function Format-SynapseChromeBridgeProfileInstallState {
         $state.reason, `
         $autoInstallAttempted, `
         $autoInstallReason, `
-        $extensionDir, `
-        $cleanupRemoved, `
-        $cleanupPreserved, `
-        $cleanupFailed)
+        $extensionDir)
 }
 
 function Invoke-SynapseChromeBridgeUiRepair {
@@ -392,24 +447,45 @@ function Invoke-SynapseChromeBridgeUiRepair {
         -SynapseNativeHostExe $NativeHostExePath `
         -ReloadExistingExtensionViaUi `
         -AutoInstallTimeoutSeconds 45
-    if (-not $readback.ok) {
-        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true after the existing Chrome extension UI repair path"
-    }
     $autoInstall = $readback.synapse_chrome_auto_install
     if (-not $autoInstall) {
         Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_READBACK_MISSING path=$InstallerPath remediation=installer did not return synapse_chrome_auto_install readback for the UI repair path"
+    }
+    # A UI repair cannot be live-verified yet: the reloaded extension registers
+    # asynchronously, so the installer defers (ok=false, deferred=true) and the
+    # caller waits for registration before the post-start identity check; the
+    # #132 no-eligible-window reason is a deferral too, never a failure (#251).
+    $repairDeferred = [string]$autoInstall.reason -eq $SynapseChromeBridgeUiReloadDeferredReason -or
+        $readback.runtime_verification.deferred -eq $true
+    if (-not $readback.ok -and -not $repairDeferred) {
+        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_INSTALLER_FAILED path=$InstallerPath reason=$($readback.reason) remediation=installer neither returned ok=true nor deferred the live bridge identity check after the existing Chrome extension UI repair path"
     }
     $allowedReasons = @(
         'existing_ready_extension_ui_reload_invoked',
         'existing_ready_extension_nonstable_path_ui_reload_invoked',
         'installed_unpacked_extension_in_active_profile'
     )
-    if ($allowedReasons -notcontains [string]$autoInstall.reason) {
+    if ([string]$autoInstall.reason -eq $SynapseChromeBridgeUiReloadDeferredReason) {
+        # No eligible interactive Chrome window exists, so the live extension UI
+        # reload cannot run (#132): the installed extension row is unchanged and
+        # the daemon reconverges it in place via browser_debugger.reload_bridge
+        # once a bridge host registers. This is deferred, not failed.
+        $rejectedWindows = if ($null -ne $autoInstall.rejected_windows) { [string]$autoInstall.rejected_windows } else { '<none>' }
+        Info ("WARN: Chrome bridge UI repair deferred to daemon reason={0} bridge_self_reload_command={1} rejected_windows={2} remediation={3}" -f `
+            [string]$autoInstall.reason,
+            [string]$autoInstall.bridge_self_reload_command,
+            $rejectedWindows,
+            [string]$autoInstall.remediation)
+    }
+    elseif ($allowedReasons -notcontains [string]$autoInstall.reason) {
         Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_NOT_PERFORMED reason=$($autoInstall.reason) attempted=$($autoInstall.attempted) changed=$($autoInstall.changed) remediation=post-start absent-host repair must either invoke the existing extension Reload control or install the bundled unpacked bridge into the already-open active profile"
     }
     $profileInstallState = $readback.synapse_chrome_profile_install_state
     if (-not $profileInstallState -or $profileInstallState.active_profile_installed -ne $true) {
         Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_PROFILE_NOT_INSTALLED reason=$($autoInstall.reason) active_profile=$($profileInstallState.active_profile) remediation=post-start UI repair did not leave the active Chrome profile with the bundled Synapse bridge row installed"
+    }
+    if ([string]$autoInstall.reason -eq $SynapseChromeBridgeUiReloadDeferredReason) {
+        return $readback
     }
     $uiBefore = if ($autoInstall.ui_before) { ($autoInstall.ui_before | ConvertTo-Json -Depth 8 -Compress) } else { '<none>' }
     $uiAfter = if ($autoInstall.ui_after) { ($autoInstall.ui_after | ConvertTo-Json -Depth 8 -Compress) } else { '<none>' }
@@ -432,6 +508,7 @@ $script:SynapseMcpSessionDeleteTimeoutSec = 20
 $script:SynapseSetupMaintenanceLockStream = $null
 $script:SynapseSetupMaintenanceLockPath = $null
 $script:SynapseSetupMaintenanceLockReason = $null
+$script:SynapseSetupOwnedDirectories = @()
 
 function Get-ProcessLineage {
     param([int]$StartPid = $PID)
@@ -504,6 +581,60 @@ function Read-SynapseSetupMaintenanceLockOwner {
     }
 }
 
+# Cross-process guard shared with the stdio bridge (crates/synapse-mcp/src/connect.rs
+# SpawnGuard, same name). Setup holds it while acquiring the maintenance lock; the
+# bridge holds it across its lock check + daemon spawn, so they cannot interleave (#11).
+$script:SynapseSetupSpawnGuardName = 'Global\SynapseSetupMaintenanceSpawnGuard'
+
+function New-SynapseSetupSpawnGuardMutex {
+    # Let any authenticated user open it even when setup runs elevated.
+    try {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::AuthenticatedUserSid, $null)
+        $rule = New-Object System.Security.AccessControl.MutexAccessRule($sid, 'Synchronize, Modify', 'Allow')
+        $security = New-Object System.Security.AccessControl.MutexSecurity
+        $security.AddAccessRule($rule)
+        $created = $false
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            return [System.Threading.MutexAcl]::Create($false, $script:SynapseSetupSpawnGuardName, [ref]$created, $security)
+        }
+        return New-Object System.Threading.Mutex($false, $script:SynapseSetupSpawnGuardName, [ref]$created, $security)
+    } catch {
+        return New-Object System.Threading.Mutex($false, $script:SynapseSetupSpawnGuardName)
+    }
+}
+
+function Enter-SynapseSetupSpawnGuard {
+    param([int]$TimeoutMs = 30000)
+    $mutex = New-SynapseSetupSpawnGuardMutex
+    $got = $false
+    try {
+        $got = $mutex.WaitOne($TimeoutMs)
+    } catch [System.Threading.AbandonedMutexException] {
+        $got = $true
+    }
+    if (-not $got) {
+        $mutex.Dispose()
+        Die "SYNAPSE_SETUP_SPAWN_GUARD_TIMEOUT name=$script:SynapseSetupSpawnGuardName timeout_ms=$TimeoutMs remediation=a synapse-mcp bridge is stuck inside its daemon-spawn critical section; inspect synapse-mcp --mode connect processes"
+    }
+    return ,$mutex
+}
+
+function Exit-SynapseSetupSpawnGuard {
+    param($Mutex)
+    if ($null -eq $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } catch { }
+    $Mutex.Dispose()
+}
+
+function Get-SynapseProcessStartUnix {
+    param([Parameter(Mandatory=$true)][int]$ProcessId)
+    try {
+        return [DateTimeOffset]::new((Get-Process -Id $ProcessId -ErrorAction Stop).StartTime).ToUnixTimeSeconds()
+    } catch {
+        return $null
+    }
+}
+
 function Acquire-SynapseSetupMaintenanceLock {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
@@ -511,6 +642,10 @@ function Acquire-SynapseSetupMaintenanceLock {
     )
 
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    # Hold the spawn guard from before the lock file is opened until its "held"
+    # JSON is on disk, so a bridge's check+spawn can never straddle our acquire (#11).
+    $spawnGuard = Enter-SynapseSetupSpawnGuard
+    try {
     try {
         $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
     } catch [System.IO.IOException] {
@@ -530,6 +665,7 @@ function Acquire-SynapseSetupMaintenanceLock {
         state = 'held'
         reason = $Reason
         pid = $PID
+        pid_start_unix = (Get-SynapseProcessStartUnix -ProcessId $PID)
         parent_pid = $self.ParentProcessId
         process_name = $self.Name
         command_line = $self.CommandLine
@@ -544,6 +680,9 @@ function Acquire-SynapseSetupMaintenanceLock {
     $stream.SetLength(0)
     $stream.Write($bytes, 0, $bytes.Length)
     $stream.Flush($true)
+    } finally {
+        Exit-SynapseSetupSpawnGuard -Mutex $spawnGuard
+    }
     Info "Maintenance lock acquired reason=$Reason path=$Path pid=$PID"
 }
 
@@ -622,21 +761,67 @@ function Wait-SynapsePostExitParent {
 }
 
 trap {
+    # #377: a FATAL must end the process non-zero and record the failure. `break`
+    # under pwsh -File exited with the last native exit code (often 0).
     $errorText = $_ | Out-String
+    $oneLineError = ($errorText -replace '\s+', ' ').Trim()
+    $repairState = ''
     try {
-        $preserveHandoff = $false
         if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath) -and (Test-Path -LiteralPath $script:SynapseSetupRepairManifestPath -PathType Leaf)) {
-            $currentRepairManifest = Get-Content -Raw -LiteralPath $script:SynapseSetupRepairManifestPath | ConvertFrom-Json
-            $preserveHandoff = ([string]$currentRepairManifest.state -eq 'handoff_started')
-        }
-        if (-not $preserveHandoff) {
-            Write-SynapseSetupRepairManifestState -State 'failed' -Message (($errorText -replace '\s+', ' ').Trim()) -ExitCode 1 -Readback $null
+            $repairState = [string](Get-Content -Raw -LiteralPath $script:SynapseSetupRepairManifestPath | ConvertFrom-Json).state
         }
     } catch {
-        Info "WARN: could not write setup repair manifest failure state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
+        Info "WARN: could not read setup repair manifest state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
     }
-    Release-SynapseSetupMaintenanceLock -State failed -ErrorMessage $errorText
-    break
+    $postExitState = ''
+    if ($script:SynapsePostExitStartOnly) {
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($PostExitManifestPath) -and (Test-Path -LiteralPath $PostExitManifestPath -PathType Leaf)) {
+                $postExitState = [string](Get-Content -Raw -LiteralPath $PostExitManifestPath | ConvertFrom-Json).state
+            }
+        } catch {
+            Info "WARN: could not read post-exit manifest state path=$PostExitManifestPath error=$($_.Exception.Message)"
+        }
+    }
+    $fatalPlan = Resolve-SynapseSetupFatalTrapPlan `
+        -RepairManifestState $repairState `
+        -PostExitStartOnly ([bool]$script:SynapsePostExitStartOnly) `
+        -PostExitManifestState $postExitState `
+        -LastExitCode ([int]$global:LASTEXITCODE)
+    if ($fatalPlan.WriteRepairFailed) {
+        try {
+            Write-SynapseSetupRepairManifestState -State 'failed' -Message $oneLineError -ExitCode $fatalPlan.ExitCode -Readback $null
+        } catch {
+            Info "WARN: could not write setup repair manifest failure state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
+        }
+    }
+    if ($fatalPlan.WritePostExitFailed) {
+        try {
+            Write-SynapsePostExitManifestState -State 'failed' -Message $oneLineError -ExitCode $fatalPlan.ExitCode -Readback $null
+        } catch {
+            Info "WARN: could not write post-exit manifest failure state path=$PostExitManifestPath error=$($_.Exception.Message)"
+        }
+    }
+    try {
+        if (Get-Command Remove-SynapseSetupOwnedDirectories -ErrorAction SilentlyContinue) { Remove-SynapseSetupOwnedDirectories }
+    } catch {
+        Info "WARN: could not clean setup-owned run directories error=$($_.Exception.Message)"
+    }
+    Release-SynapseSetupMaintenanceLock -State $fatalPlan.LockState -ErrorMessage $errorText
+    [Console]::Error.WriteLine($errorText)
+    exit $fatalPlan.ExitCode
+}
+
+# #377: these checks call Die, so they run only once Die, the trap and the lock
+# helpers exist (earlier, a misuse failed with "The term 'Die' is not recognized").
+if ($PostExitUseInstalledBinary -and -not ($script:SynapsePostExitStartOnly -and $SkipBuild)) {
+    Die "SYNAPSE_POST_EXIT_USE_INSTALLED_BINARY_MISUSED remediation=-PostExitUseInstalledBinary is reserved for the dead_owner_bind_after_install continuation, which is launched with -PostExitParentPid and -SkipBuild and must validate the already-installed verified daemon bytes; remove the flag for a plain -SkipBuild run, which installs the CargoTarget release artifact"
+}
+if ($PostExitUseInstalledBinary -and [string]::IsNullOrWhiteSpace($PostExitInstalledSha256)) {
+    Die "SYNAPSE_POST_EXIT_INSTALLED_SHA_MISSING remediation=the continuation launcher must pass -PostExitInstalledSha256 with the sha256 the parent computed after installing, so the continuation proves the installed bytes were not replaced between parent verification and continuation preflight"
+}
+if ($script:SynapsePostExitStartOnly -and -not $PostExitUseInstalledBinary) {
+    Die "SYNAPSE_POST_EXIT_INSTALLED_BINARY_MODE_REQUIRED remediation=the dead_owner_bind_after_install continuation must be launched by Start-SynapsePostExitSetupContinuation with -PostExitUseInstalledBinary and -PostExitInstalledSha256, so it validates the bytes the parent installed and verified; a hand-written continuation must not silently validate an arbitrary CargoTarget artifact instead"
 }
 
 function Quote-WindowsCommandArgument {
@@ -779,6 +964,11 @@ namespace SynapseSetup
         private const uint EXIT_ASSIGN_FAILED = 125;
         private const uint EXIT_RESUME_FAILED = 126;
         private const uint INFINITE = 0xffffffff;
+        private const uint EXIT_JOB_CLEANUP = 130;
+        private const int JobObjectBasicProcessIdList = 3;
+        private const int JOB_PROCESS_ID_CAPACITY = 1024;
+        private const int JOB_DRAIN_TIMEOUT_MS = 15000;
+        private const int JOB_DRAIN_POLL_MS = 100;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct IO_COUNTERS
@@ -887,6 +1077,14 @@ namespace SynapseSetup
         private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(
+            IntPtr hJob,
+            int jobObjectInfoClass,
+            IntPtr lpJobObjectInfo,
+            uint cbJobObjectInfoLength,
+            out uint lpReturnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -916,6 +1114,9 @@ namespace SynapseSetup
             bool terminateJobCalled = false;
             bool terminateJobOk = false;
             string terminateJobError = "";
+            bool jobQueryOk = false;
+            uint[] jobActiveProcessIdsAfter = new uint[0];
+            int jobDrainWaitMs = 0;
             IntPtr job = IntPtr.Zero;
             IntPtr limitPointer = IntPtr.Zero;
             PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
@@ -1048,6 +1249,22 @@ namespace SynapseSetup
             }
             finally
             {
+                // #379: every exit path terminates the job and reads its own PID list
+                // back until it is empty (or the drain budget ends), so cleanup is
+                // proven from the job, not assumed from closing the handle.
+                if (job != IntPtr.Zero && assignedToJob)
+                {
+                    if (!terminateJobCalled)
+                    {
+                        terminateJobCalled = true;
+                        terminateJobOk = TerminateJobObject(job, EXIT_JOB_CLEANUP);
+                        if (!terminateJobOk)
+                        {
+                            terminateJobError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                        }
+                    }
+                    jobQueryOk = DrainJob(job, out jobActiveProcessIdsAfter, out jobDrainWaitMs);
+                }
                 diagnosticsJson = BuildDiagnosticsJson(
                     applicationName,
                     commandLine,
@@ -1067,7 +1284,10 @@ namespace SynapseSetup
                     terminateJobOk,
                     terminateJobError,
                     cleanupWait,
-                    failure);
+                    failure,
+                    jobQueryOk,
+                    jobActiveProcessIdsAfter,
+                    jobDrainWaitMs);
                 if (limitPointer != IntPtr.Zero)
                 {
                     Marshal.FreeHGlobal(limitPointer);
@@ -1146,7 +1366,10 @@ namespace SynapseSetup
             bool terminateJobOk,
             string terminateJobError,
             uint cleanupWait,
-            string failure)
+            string failure,
+            bool jobQueryOk,
+            uint[] jobActiveProcessIdsAfter,
+            int jobDrainWaitMs)
         {
             int signedExitCode = unchecked((int)exitCode);
             StringBuilder json = new StringBuilder();
@@ -1174,8 +1397,68 @@ namespace SynapseSetup
             json.Append(",\"cleanup_wait_result\":").Append(cleanupWait);
             json.Append(",\"cleanup_wait_kind\":\"").Append(JsonEscape(WaitKind(cleanupWait))).Append("\"");
             json.Append(",\"failure\":\"").Append(JsonEscape(failure)).Append("\"");
+            json.Append(",\"job_query_ok\":").Append(jobQueryOk ? "true" : "false");
+            json.Append(",\"job_active_process_ids_after\":[");
+            for (int i = 0; i < jobActiveProcessIdsAfter.Length; i++)
+            {
+                if (i > 0) json.Append(",");
+                json.Append(jobActiveProcessIdsAfter[i]);
+            }
+            json.Append("]");
+            json.Append(",\"job_drain_wait_ms\":").Append(jobDrainWaitMs);
             json.Append("}");
             return json.ToString();
+        }
+
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORD counts, then ULONG_PTR ids at offset 8.
+        private static bool TryReadJobProcessIds(IntPtr job, out uint[] processIds)
+        {
+            processIds = new uint[0];
+            int size = 8 + JOB_PROCESS_ID_CAPACITY * IntPtr.Size;
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                uint returned;
+                if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer, (uint)size, out returned))
+                {
+                    return false;
+                }
+                int count = Marshal.ReadInt32(buffer, 4);
+                if (count < 0 || count > JOB_PROCESS_ID_CAPACITY)
+                {
+                    return false;
+                }
+                processIds = new uint[count];
+                for (int i = 0; i < count; i++)
+                {
+                    processIds[i] = unchecked((uint)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64());
+                }
+                return true;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        // Polls the job's own PID list until it is empty or the drain budget ends.
+        // Returns false only when the job cannot be read back.
+        private static bool DrainJob(IntPtr job, out uint[] remaining, out int waitedMs)
+        {
+            waitedMs = 0;
+            while (true)
+            {
+                if (!TryReadJobProcessIds(job, out remaining))
+                {
+                    return false;
+                }
+                if (remaining.Length == 0 || waitedMs >= JOB_DRAIN_TIMEOUT_MS)
+                {
+                    return true;
+                }
+                System.Threading.Thread.Sleep(JOB_DRAIN_POLL_MS);
+                waitedMs += JOB_DRAIN_POLL_MS;
+            }
         }
     }
 }
@@ -1267,8 +1550,24 @@ function Invoke-SynapseProcessInKillOnCloseJob {
             live_build_tool_process_count_after = @($compilerProcessesAfter).Count
         }
     }
+    $cleanupVerdict = $null
+    if ($processJobDiagnostics -and $processJobDiagnostics.assigned_to_job -eq $true) {
+        # #379: zero job-owned processes must be proven from the job's own PID list;
+        # other agents' cargo/rustc are reported as unrelated and never touched.
+        $cleanupVerdict = Resolve-SynapseProcessJobCleanupVerdict `
+            -JobQueryOk ($processJobDiagnostics.job_query_ok -eq $true) `
+            -JobActivePidsAfter @($processJobDiagnostics.job_active_process_ids_after | ForEach-Object { [int64]$_ }) `
+            -BuildToolPidsAfter @($compilerProcessesAfter | ForEach-Object { [int64]$_.ProcessId })
+        $diagnosticObject.cleanup_result.job_query_ok = ($processJobDiagnostics.job_query_ok -eq $true)
+        $diagnosticObject.cleanup_result.job_clean = $cleanupVerdict.JobClean
+        $diagnosticObject.cleanup_result.job_leaked_process_ids_after = @($cleanupVerdict.JobLeakedPids)
+        $diagnosticObject.cleanup_result.unrelated_build_tool_process_ids_after = @($cleanupVerdict.UnrelatedBuildToolPids)
+    }
     if ($PSBoundParameters.ContainsKey('Diagnostics')) {
         $Diagnostics.Value = [pscustomobject]$diagnosticObject
+    }
+    if ($cleanupVerdict -and $cleanupVerdict.FailClosed) {
+        Die "$($cleanupVerdict.Code) command=$targetCommand job_query_ok=$($diagnosticObject.cleanup_result.job_query_ok) job_leaked_process_ids_after=$(@($cleanupVerdict.JobLeakedPids) -join ',') unrelated_build_tool_process_ids_after=$(@($cleanupVerdict.UnrelatedBuildToolPids) -join ',') remediation=setup's kill-on-close job still held processes (or could not be read back) after TerminateJobObject and a 15 s drain; inspect those exact PIDs, never kill other agents' cargo/rustc"
     }
     return $exitCode
 }
@@ -1277,6 +1576,37 @@ function Get-SynapseBuildToolProcessSnapshot {
     @(Get-CimInstance Win32_Process -Filter "Name='cargo.exe' OR Name='rustc.exe'" -ErrorAction SilentlyContinue |
         Sort-Object ProcessId |
         Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)
+}
+
+function Resolve-SynapseProcessJobCleanupVerdict {
+    # #379: did the setup build job end with zero job-owned processes? Pure: takes the
+    # job's own PID readback and the machine-wide cargo/rustc PIDs.
+    param(
+        [bool]$JobQueryOk = $false,
+        [AllowEmptyCollection()][int64[]]$JobActivePidsAfter = @(),
+        [AllowEmptyCollection()][int64[]]$BuildToolPidsAfter = @()
+    )
+    # Only the job's own PID list decides "leaked"; another agent's cargo/rustc on the
+    # same machine is reported as unrelated and never counted (or touched) as setup's.
+    if (-not $JobQueryOk) {
+        return [pscustomobject]@{
+            JobClean = $false
+            JobLeakedPids = @()
+            UnrelatedBuildToolPids = @($BuildToolPidsAfter | Sort-Object -Unique)
+            FailClosed = $true
+            Code = 'SYNAPSE_SETUP_PROCESS_JOB_READBACK_FAILED'
+        }
+    }
+    $leaked = @($JobActivePidsAfter | Sort-Object -Unique)
+    $unrelated = @($BuildToolPidsAfter | Where-Object { $leaked -notcontains $_ } | Sort-Object -Unique)
+    $clean = ($leaked.Count -eq 0)
+    return [pscustomobject]@{
+        JobClean = $clean
+        JobLeakedPids = $leaked
+        UnrelatedBuildToolPids = $unrelated
+        FailClosed = (-not $clean)
+        Code = $(if ($clean) { '' } else { 'SYNAPSE_SETUP_PROCESS_JOB_LEAKED' })
+    }
 }
 
 function Get-SynapseBuildLogSignal {
@@ -1405,6 +1735,55 @@ function Get-SynapseCargoVersionFailureKind {
     }
 }
 
+function Resolve-CodexLauncherPlan {
+    # Which codex.js the patched launchers call, and which launcher directories get
+    # patched. Pure: existence is passed in as the list of paths that exist.
+    param(
+        [string]$LauncherDir,
+        [string]$NpmGlobalDir,
+        [AllowEmptyCollection()][string[]]$ExistingPaths = @()
+    )
+    # The PATH-winning launcher is not always npm's own shim dir (a copied shim in
+    # %USERPROFILE%\.codex\bin has no node_modules), so the launcher-local package
+    # wins when present, else npm's global one; every dir holding a codex shim is
+    # patched once (Windows paths compare case-insensitively).
+    $package = 'node_modules\@openai\codex\bin\codex.js'
+    $codexJs = $null
+    $targets = @()
+    foreach ($dir in @($LauncherDir, $NpmGlobalDir)) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        $prefix = $dir.TrimEnd('\') + '\'
+        if ($null -eq $codexJs -and $ExistingPaths -contains ($prefix + $package)) {
+            $codexJs = $prefix + $package
+        }
+        $hasShim = @('codex.ps1', 'codex.cmd', 'codex') | Where-Object { $ExistingPaths -contains ($prefix + $_) }
+        if ($hasShim -and $targets -notcontains $dir) {
+            $targets += $dir
+        }
+    }
+    return [pscustomobject]@{ CodexJs = $codexJs; TargetDirs = $targets }
+}
+
+function Set-CodexLauncherEntrypoint {
+    # Launcher text with the real codex.js baked in by absolute path. Pure.
+    param(
+        [AllowEmptyString()][string]$Text = '',
+        [ValidateSet('ps1', 'cmd', 'sh')][string]$Kind,
+        [AllowEmptyString()][string]$CodexJsPath = ''
+    )
+    # The path goes inside double quotes in PowerShell, cmd and sh launchers, so
+    # characters those expand (", %, $, `) are refused rather than escaped.
+    if ([string]::IsNullOrWhiteSpace($CodexJsPath) -or $CodexJsPath -match '["%$`]') {
+        throw "SYNAPSE_CODEX_PACKAGE_PATH_UNSAFE path=$CodexJsPath remediation=install Codex under a path without double quotes, %, `$ or backticks"
+    }
+    $relative = if ($Kind -eq 'cmd') { '"%dp0%\node_modules\@openai\codex\bin\codex.js"' } else { '"$basedir/node_modules/@openai/codex/bin/codex.js"' }
+    $absolute = if ($Kind -eq 'sh') { '"' + ($CodexJsPath -replace '\\', '/') + '"' } else { '"' + $CodexJsPath + '"' }
+    if (-not $Text.Contains($relative)) {
+        throw "SYNAPSE_CODEX_LAUNCHER_TEMPLATE_DRIFT kind=$Kind remediation=the $Kind launcher template no longer calls $relative; update Set-CodexLauncherEntrypoint with the template"
+    }
+    return $Text.Replace($relative, $absolute)
+}
+
 function Install-CodexSynapseTokenLoader {
     param(
         [Parameter(Mandatory=$true)][string]$CodexCommandPath,
@@ -1415,33 +1794,27 @@ function Install-CodexSynapseTokenLoader {
     if (-not $launcherDir -or -not (Test-Path $launcherDir)) {
         Die "Cannot resolve Codex launcher directory from '$CodexCommandPath'."
     }
-    # The launcher that wins on PATH is not always npm's own shim directory
-    # (e.g. %USERPROFILE%\.codex\bin ahead of %APPDATA%\npm). npm shims find
-    # codex.js relative to themselves, so a copied shim breaks `codex` outright.
-    # Resolve the real package entry point and bake its absolute path in.
     $npmGlobalDir = Join-Path $env:APPDATA 'npm'
-    $codexJs = @(
-        (Join-Path $launcherDir 'node_modules\@openai\codex\bin\codex.js'),
-        (Join-Path $npmGlobalDir 'node_modules\@openai\codex\bin\codex.js')
-    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if (-not $codexJs) {
-        Die "SYNAPSE_CODEX_PACKAGE_MISSING launcher=$CodexCommandPath remediation=install Codex with 'npm install -g @openai/codex@latest' (or %USERPROFILE%\.codex\bin\codex-update.ps1), then rerun setup."
+    $existingPaths = @(foreach ($dir in @($launcherDir, $npmGlobalDir)) {
+        foreach ($leaf in @('codex.ps1', 'codex.cmd', 'codex', 'node_modules\@openai\codex\bin\codex.js')) {
+            $candidate = $dir.TrimEnd('\') + '\' + $leaf
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $candidate }
+        }
+    })
+    $plan = Resolve-CodexLauncherPlan -LauncherDir $launcherDir -NpmGlobalDir $npmGlobalDir -ExistingPaths $existingPaths
+    if (-not $plan.CodexJs) {
+        Die "SYNAPSE_CODEX_PACKAGE_MISSING launcher=$CodexCommandPath remediation=install Codex with 'npm install -g @openai/codex@latest', then rerun setup."
     }
-    $codexJs = (Resolve-Path -LiteralPath $codexJs).Path
-    $dirs = @($launcherDir, $npmGlobalDir) |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'codex.ps1') } |
-        ForEach-Object { (Resolve-Path -LiteralPath $_).Path } |
-        Select-Object -Unique
-    foreach ($dir in $dirs) {
-        Install-CodexSynapseTokenLoaderInDir -LauncherDir $dir -CodexJsPath $codexJs -TokenPath $TokenPath
+    foreach ($dir in $plan.TargetDirs) {
+        Install-CodexSynapseTokenLoaderInDir -LauncherDir $dir -CodexJsPath $plan.CodexJs -TokenPath $TokenPath
     }
 
     # Structural readback: the PATH-winning launcher must actually start Codex.
     $versionOut = & $CodexCommandPath --version 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or $versionOut -notmatch 'codex') {
-        Die "SYNAPSE_CODEX_LAUNCHER_BROKEN launcher=$CodexCommandPath codex_js=$codexJs exit=$LASTEXITCODE output=$($versionOut.Trim()) remediation=inspect the launcher; restore $CodexCommandPath.synapse-bak if needed."
+        Die "SYNAPSE_CODEX_LAUNCHER_BROKEN launcher=$CodexCommandPath codex_js=$($plan.CodexJs) exit=$LASTEXITCODE output=$($versionOut.Trim()) remediation=inspect the launcher; restore $CodexCommandPath.synapse-bak if needed"
     }
-    Info "Codex launcher verified: $CodexCommandPath -> $codexJs ($($versionOut.Trim()))"
+    Info "Codex launcher verified: $CodexCommandPath -> $($plan.CodexJs) ($($versionOut.Trim()))"
 }
 
 function Install-CodexSynapseTokenLoaderInDir {
@@ -1452,8 +1825,6 @@ function Install-CodexSynapseTokenLoaderInDir {
     )
 
     $npmDir = $LauncherDir
-    $codexJsWin = $CodexJsPath
-    $codexJsPosix = $CodexJsPath -replace '\\', '/'
 
     $ps1Path = Join-Path $npmDir 'codex.ps1'
     $cmdPath = Join-Path $npmDir 'codex.cmd'
@@ -1468,6 +1839,7 @@ $basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
 $synapseConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
 $synapseTokenPath = Join-Path $env:APPDATA 'synapse\token.txt'
 $synapseHasConfig = $false
+$synapseOwnSnapshot = $null
 if (Test-Path $synapseConfigPath) {
   try {
     $synapseHasConfig = ((Get-Content -Raw $synapseConfigPath) -match '(?m)^\[mcp_servers\.synapse\]')
@@ -1507,14 +1879,52 @@ if ($synapseHasConfig) {
     exit 1
   }
   $synapseStartSnapshotDir = Join-Path $env:LOCALAPPDATA 'synapse\codex-start-snapshots'
-  $synapseStartSnapshotPath = Join-Path $synapseStartSnapshotDir ("codex-tool-surface-{0}-{1}.json" -f $PID, [Guid]::NewGuid().ToString('N'))
+  # #259: o<owner PID>-<GUID>. The owner is this PowerShell process; it deletes the file when Codex exits.
+  $synapseStartSnapshotPath = Join-Path $synapseStartSnapshotDir ("codex-tool-surface-o{0}-{1}.json" -f $PID, [Guid]::NewGuid().ToString('N'))
   try {
     New-Item -ItemType Directory -Force -Path $synapseStartSnapshotDir | Out-Null
-    Copy-Item -LiteralPath $synapseToolSurfacePath -Destination $synapseStartSnapshotPath -Force
+    # #259: CreateNew never overwrites another start's snapshot.
+    $synapseStartSnapshotBytes = [System.IO.File]::ReadAllBytes($synapseToolSurfacePath)
+    $synapseStartSnapshotStream = [System.IO.File]::Open($synapseStartSnapshotPath, 'CreateNew', 'Write', 'Read')
+    try { $synapseStartSnapshotStream.Write($synapseStartSnapshotBytes, 0, $synapseStartSnapshotBytes.Length) } finally { $synapseStartSnapshotStream.Dispose() }
   } catch {
     Write-Error "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=$synapseStartSnapshotPath error=$($_.Exception.Message) remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex"
     exit 1
   }
+  $synapseOwnSnapshot = $synapseStartSnapshotPath
+  # #259: best-effort prune of snapshots other starts left behind (crash, killed window).
+  # Candidates are enumerated BEFORE liveness is read, so a start that appears meanwhile is
+  # never judged against an older process table. Same rule in the cmd and sh launchers:
+  #   o<pid>-<id>.json: delete only if the process lookup succeeded, <pid> is gone, and the
+  #     file is older than SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES.
+  #   legacy <n>-... names (no owner): delete only if older than SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS.
+  #   anything else, a failed lookup, or an unset limit: keep.
+  try {
+    $synapseKeepPath = [System.IO.Path]::GetFullPath($synapseStartSnapshotPath)
+    $synapseCandidates = @(Get-ChildItem -LiteralPath $synapseStartSnapshotDir -Filter 'codex-tool-surface-*.json' -File -ErrorAction Stop | Where-Object { $_.FullName -ne $synapseKeepPath })
+    $synapseLive = $null
+    try {
+      $synapseLive = @{}
+      foreach ($synapseProc in @(Get-CimInstance Win32_Process -Property ProcessId -ErrorAction Stop)) { $synapseLive[[long]$synapseProc.ProcessId] = $true }
+      if ($synapseLive.Count -eq 0) { $synapseLive = $null }
+    } catch { $synapseLive = $null }
+    $synapseGraceMinutes = 0
+    [void][int]::TryParse([string]$env:SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES, [ref]$synapseGraceMinutes)
+    $synapseRetentionHours = 0
+    [void][int]::TryParse([string]$env:SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS, [ref]$synapseRetentionHours)
+    $synapseNow = [DateTime]::UtcNow
+    foreach ($synapseOld in $synapseCandidates) {
+      $synapseAge = $synapseNow - $synapseOld.LastWriteTimeUtc
+      $synapseTail = $synapseOld.Name.Substring(19)
+      $synapseDrop = $false
+      if ($synapseTail -match '\Ao(\d{1,10})-[0-9a-f]+\.json\z') {
+        $synapseDrop = $null -ne $synapseLive -and $synapseGraceMinutes -gt 0 -and $synapseAge.TotalMinutes -gt $synapseGraceMinutes -and -not $synapseLive.ContainsKey([long]$Matches[1])
+      } elseif ($synapseTail -match '\A\d') {
+        $synapseDrop = $synapseRetentionHours -gt 0 -and $synapseAge.TotalHours -gt $synapseRetentionHours
+      }
+      if ($synapseDrop) { try { $synapseOld.Delete() } catch { } }
+    }
+  } catch { }
   $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START = $synapseToolSurfaceHash
   $env:SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START = [string]$synapseToolSurface.tool_count
   $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START = $synapseStartSnapshotPath
@@ -1522,7 +1932,9 @@ if ($synapseHasConfig) {
 Remove-Variable synapseConfigPath,synapseTokenPath,synapseHasConfig -ErrorAction SilentlyContinue
 Remove-Variable synapseTokenRaw,synapseToken -ErrorAction SilentlyContinue
 Remove-Variable synapseToolSurfacePath,synapseToolSurface,synapseToolSurfaceHash -ErrorAction SilentlyContinue
-Remove-Variable synapseStartSnapshotDir,synapseStartSnapshotPath -ErrorAction SilentlyContinue
+Remove-Variable synapseStartSnapshotDir,synapseStartSnapshotPath,synapseStartSnapshotBytes,synapseStartSnapshotStream -ErrorAction SilentlyContinue
+Remove-Variable synapseKeepPath,synapseCandidates,synapseLive,synapseProc,synapseGraceMinutes,synapseRetentionHours -ErrorAction SilentlyContinue
+Remove-Variable synapseNow,synapseOld,synapseAge,synapseTail,synapseDrop -ErrorAction SilentlyContinue
 # Synapse MCP token loader: end
 
 $exe=""
@@ -1532,26 +1944,31 @@ if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {
   $exe=".exe"
 }
 $ret=0
-if (Test-Path "$basedir/node$exe") {
-  # Support pipeline input
-  if ($MyInvocation.ExpectingInput) {
-    $input | & "$basedir/node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+try {
+  if (Test-Path "$basedir/node$exe") {
+    # Support pipeline input
+    if ($MyInvocation.ExpectingInput) {
+      $input | & "$basedir/node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+    } else {
+      & "$basedir/node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+    }
+    $ret=$LASTEXITCODE
   } else {
-    & "$basedir/node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+    # Support pipeline input
+    if ($MyInvocation.ExpectingInput) {
+      $input | & "node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+    } else {
+      & "node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
+    }
+    $ret=$LASTEXITCODE
   }
-  $ret=$LASTEXITCODE
-} else {
-  # Support pipeline input
-  if ($MyInvocation.ExpectingInput) {
-    $input | & "node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
-  } else {
-    & "node$exe"  "$basedir/node_modules/@openai/codex/bin/codex.js" $args
-  }
-  $ret=$LASTEXITCODE
+} finally {
+  # #259: this start owns its snapshot; remove it on every exit path (normal, error, Ctrl+C).
+  if ($synapseOwnSnapshot) { Remove-Item -LiteralPath $synapseOwnSnapshot -Force -ErrorAction SilentlyContinue }
 }
 exit $ret
 '@
-        $ps1 = $ps1.Replace('"$basedir/node_modules/@openai/codex/bin/codex.js"', "`"$codexJsWin`"")
+        $ps1 = Set-CodexLauncherEntrypoint -Text $ps1 -Kind 'ps1' -CodexJsPath $CodexJsPath
         Copy-Item $ps1Path "$ps1Path.synapse-bak" -Force
         Set-Content -Path $ps1Path -Value $ps1 -Encoding utf8
         Info "Installed Synapse token loader in Codex PowerShell launcher: $ps1Path"
@@ -1575,6 +1992,7 @@ SET "_synapse_cfg=%USERPROFILE%\.codex\config.toml"
 SET "_synapse_tok=%APPDATA%\synapse\token.txt"
 SET "_synapse_surface=%APPDATA%\synapse\codex-tool-surface.json"
 SET "_synapse_has_cfg="
+SET "_synapse_own_snapshot="
 IF EXIST "%_synapse_cfg%" (
   %SystemRoot%\System32\findstr.exe /R /C:"^\[mcp_servers\.synapse\]" "%_synapse_cfg%" >NUL 2>NUL
   IF NOT ERRORLEVEL 1 SET "_synapse_has_cfg=1"
@@ -1609,20 +2027,40 @@ IF DEFINED _synapse_has_cfg (
     EXIT /B 1
   )
   SET "_synapse_start_dir=%LOCALAPPDATA%\synapse\codex-start-snapshots"
-  SET "_synapse_start_surface=!_synapse_start_dir!\codex-tool-surface-!RANDOM!-!RANDOM!.json"
+  SET "_synapse_start_surface="
   IF NOT EXIST "!_synapse_start_dir!" MD "!_synapse_start_dir!" >NUL 2>NUL
   IF NOT EXIST "!_synapse_start_dir!" (
-    ECHO SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=!_synapse_start_surface! remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex 1>&2
+    ECHO SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=!_synapse_start_dir! remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex 1>&2
     EXIT /B 1
   )
-  COPY /Y "%_synapse_surface%" "!_synapse_start_surface!" >NUL
-  IF ERRORLEVEL 1 (
+  REM #259: name = o + wrapper cmd PID + GUID, written with CreateNew by a PS 5.1 helper that prints the path.
+  REM The wrapper deletes its own snapshot after Codex exits. The helper prunes only proven orphans:
+  REM files enumerated first, then o-PID owners proven gone by a successful lookup and older than
+  REM SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES; legacy names only past SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS.
+  SET "_synapse_start_ps=$ErrorActionPreference='Stop'; $dir=$env:_synapse_start_dir; $tag='u'"
+  SET "_synapse_start_ps=!_synapse_start_ps!; try { $self=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID); $for=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $self.ParentProcessId); if ($for.ParentProcessId) { $tag='o' + $for.ParentProcessId } } catch { $tag='u' }"
+  SET "_synapse_start_ps=!_synapse_start_ps!; $path=Join-Path $dir ('codex-tool-surface-{0}-{1}.json' -f $tag,[guid]::NewGuid().ToString('N')); $bytes=[IO.File]::ReadAllBytes($env:_synapse_surface)"
+  SET "_synapse_start_ps=!_synapse_start_ps!; $out=[IO.File]::Open($path,'CreateNew','Write','Read'); try { $out.Write($bytes,0,$bytes.Length) } finally { $out.Dispose() }"
+  SET "_synapse_start_ps=!_synapse_start_ps!; try { $keep=[IO.Path]::GetFullPath($path); $files=@(Get-ChildItem -LiteralPath $dir -Filter 'codex-tool-surface-*.json' -File | Where-Object { $_.FullName -ne $keep })"
+  SET "_synapse_start_ps=!_synapse_start_ps!; $live=$null; try { $live=@{}; foreach ($p in @(Get-CimInstance Win32_Process -Property ProcessId)) { $live[[long]$p.ProcessId]=$true }; if ($live.Count -eq 0) { $live=$null } } catch { $live=$null }"
+  SET "_synapse_start_ps=!_synapse_start_ps!; $grace=0; [void][int]::TryParse([string]$env:SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES,[ref]$grace); $hours=0; [void][int]::TryParse([string]$env:SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS,[ref]$hours); $now=[DateTime]::UtcNow"
+  SET "_synapse_start_ps=!_synapse_start_ps!; foreach ($f in $files) { $age=$now - $f.LastWriteTimeUtc; $tail=$f.Name.Substring(19); $drop=$false"
+  SET "_synapse_start_ps=!_synapse_start_ps!; if ($tail -match '\Ao(\d{1,10})-[0-9a-f]+\.json\z') { $drop=$null -ne $live -and $grace -gt 0 -and $age.TotalMinutes -gt $grace -and -not $live.ContainsKey([long]$Matches[1]) } elseif ($tail -match '\A\d') { $drop=$hours -gt 0 -and $age.TotalHours -gt $hours }"
+  SET "_synapse_start_ps=!_synapse_start_ps!; if ($drop) { try { $f.Delete() } catch { } } } } catch { }; $path"
+  FOR /F "usebackq delims=" %%P IN (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ([ScriptBlock]::Create($env:_synapse_start_ps))"`) DO SET "_synapse_start_surface=%%P"
+  SET "_synapse_start_ps="
+  IF NOT DEFINED _synapse_start_surface (
+    ECHO SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=!_synapse_start_dir! remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex 1>&2
+    EXIT /B 1
+  )
+  IF NOT EXIST "!_synapse_start_surface!" (
     ECHO SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=!_synapse_start_surface! remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex 1>&2
     EXIT /B 1
   )
   SET "SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START=!_synapse_surface_hash!"
   SET "SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START=!_synapse_surface_count!"
   SET "SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START=!_synapse_start_surface!"
+  SET "_synapse_own_snapshot=!_synapse_start_surface!"
 )
 SET "_synapse_cfg="
 SET "_synapse_tok="
@@ -1633,7 +2071,9 @@ SET "_synapse_surface_hash="
 SET "_synapse_surface_count="
 SET "_synapse_start_dir="
 SET "_synapse_start_surface="
+SET "_synapse_start_ps="
 REM Synapse MCP token loader: end
+REM #259: the CALLed child deletes this start's own snapshot after Codex exits and re-exits with Codex's code.
 
 IF EXIST "%dp0%\node.exe" (
   SET "_prog=%dp0%\node.exe"
@@ -1642,9 +2082,9 @@ IF EXIST "%dp0%\node.exe" (
   SET PATHEXT=%PATHEXT:;.JS;=;%
 )
 
-endLocal & SET "SYNAPSE_BEARER_TOKEN=%SYNAPSE_BEARER_TOKEN%" & SET "SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START%" & SET "SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START%" & SET "SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START%" & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+endLocal & SET "SYNAPSE_BEARER_TOKEN=%SYNAPSE_BEARER_TOKEN%" & SET "SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START%" & SET "SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START%" & SET "SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START=%SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START%" & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %* & CALL %COMSPEC% /d /c "(IF NOT "%_synapse_own_snapshot%"=="" DEL /F /Q "%_synapse_own_snapshot%" >NUL 2>NUL) & EXIT %%ERRORLEVEL%%"
 '@
-        $cmd = $cmd.Replace('"%dp0%\node_modules\@openai\codex\bin\codex.js"', "`"$codexJsWin`"")
+        $cmd = Set-CodexLauncherEntrypoint -Text $cmd -Kind 'cmd' -CodexJsPath $CodexJsPath
         Copy-Item $cmdPath "$cmdPath.synapse-bak" -Force
         Set-Content -Path $cmdPath -Value $cmd -Encoding ascii
         Info "Installed Synapse token loader in Codex CMD launcher: $cmdPath"
@@ -1694,17 +2134,53 @@ if [ -f "$synapse_cfg" ] && grep -Eq '^\[mcp_servers\.synapse\]' "$synapse_cfg";
         exit 1
     fi
     synapse_start_dir="$LOCALAPPDATA/synapse/codex-start-snapshots"
-    synapse_start_surface="$synapse_start_dir/codex-tool-surface-$$-$(date +%s).json"
-    if ! mkdir -p "$synapse_start_dir" || ! cp "$synapse_surface" "$synapse_start_surface"; then
+    # #259: o<this shell's Windows PID>-<random>. The shell stays alive while node runs (no exec)
+    # and its EXIT trap deletes the snapshot. No Windows PID -> "u" (owner unknown, never pruned).
+    synapse_owner_pid=$(cat "/proc/$$/winpid" 2>/dev/null)
+    case "$synapse_owner_pid" in
+        ''|*[!0-9]*) synapse_owner_tag="u" ;;
+        *) synapse_owner_tag="o$synapse_owner_pid" ;;
+    esac
+    synapse_start_nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$synapse_start_nonce" ] || synapse_start_nonce="$(date +%s)$$"
+    synapse_start_surface="$synapse_start_dir/codex-tool-surface-$synapse_owner_tag-$synapse_start_nonce.json"
+    if ! mkdir -p "$synapse_start_dir" || ! (set -C; cat "$synapse_surface" > "$synapse_start_surface") 2>/dev/null; then
         printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=$synapse_start_surface remediation=repair permissions on $synapse_start_dir before starting Codex" >&2
         exit 1
+    fi
+    synapse_own_snapshot="$synapse_start_surface"
+    trap 'rm -f -- "$synapse_own_snapshot"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # #259: best-effort prune, same rule as the cmd/ps1 launchers: enumerate first, then read
+    # liveness; o<pid> only when the lookup succeeded, <pid> is gone and the file is older than
+    # the grace period; legacy names only past the retention; everything else is kept.
+    if command -v powershell.exe > /dev/null 2>&1; then
+        _synapse_start_dir="$synapse_start_dir" _synapse_start_keep="$synapse_start_surface" powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+$keep = [IO.Path]::GetFullPath($env:_synapse_start_keep)
+$files = @(Get-ChildItem -LiteralPath $env:_synapse_start_dir -Filter "codex-tool-surface-*.json" -File -ErrorAction Stop | Where-Object { $_.FullName -ne $keep })
+$live = $null
+try { $live = @{}; foreach ($p in @(Get-CimInstance Win32_Process -Property ProcessId -ErrorAction Stop)) { $live[[long]$p.ProcessId] = $true }; if ($live.Count -eq 0) { $live = $null } } catch { $live = $null }
+$grace = 0; [void][int]::TryParse([string]$env:SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES, [ref]$grace)
+$hours = 0; [void][int]::TryParse([string]$env:SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS, [ref]$hours)
+$now = [DateTime]::UtcNow
+foreach ($f in $files) {
+  $age = $now - $f.LastWriteTimeUtc; $tail = $f.Name.Substring(19); $drop = $false
+  if ($tail -match "\Ao(\d{1,10})-[0-9a-f]+\.json\z") {
+    $drop = $null -ne $live -and $grace -gt 0 -and $age.TotalMinutes -gt $grace -and -not $live.ContainsKey([long]$Matches[1])
+  } elseif ($tail -match "\A\d") {
+    $drop = $hours -gt 0 -and $age.TotalHours -gt $hours
+  }
+  if ($drop) { try { $f.Delete() } catch { } }
+}' > /dev/null 2>&1 || true
     fi
     SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START="$synapse_surface_hash"
     SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START="$synapse_surface_count"
     SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="$synapse_start_surface"
     export SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
 fi
-unset synapse_cfg synapse_tok synapse_file_token synapse_surface synapse_surface_hash synapse_surface_count synapse_start_dir synapse_start_surface
+unset synapse_cfg synapse_tok synapse_file_token synapse_surface synapse_surface_hash synapse_surface_count synapse_start_dir synapse_start_surface synapse_owner_pid synapse_owner_tag synapse_start_nonce
 # Synapse MCP token loader: end
 
 case `uname` in
@@ -1715,13 +2191,15 @@ case `uname` in
     ;;
 esac
 
+# #259: run node as a child (not exec) so the EXIT trap can delete this start's snapshot.
 if [ -x "$basedir/node" ]; then
-  exec "$basedir/node"  "$basedir/node_modules/@openai/codex/bin/codex.js" "$@"
+  "$basedir/node"  "$basedir/node_modules/@openai/codex/bin/codex.js" "$@"
 else
-  exec node  "$basedir/node_modules/@openai/codex/bin/codex.js" "$@"
+  node  "$basedir/node_modules/@openai/codex/bin/codex.js" "$@"
 fi
+exit $?
 '@
-        $sh = $sh.Replace('"$basedir/node_modules/@openai/codex/bin/codex.js"', "`"$codexJsPosix`"")
+        $sh = Set-CodexLauncherEntrypoint -Text $sh -Kind 'sh' -CodexJsPath $CodexJsPath
         Copy-Item $shPath "$shPath.synapse-bak" -Force
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($shPath, ($sh -replace "`r?`n", "`n"), $utf8NoBom)
@@ -1747,11 +2225,20 @@ function Test-CodexSynapseHttpConfig {
     if ($null -eq $body) {
         return $false
     }
+    return (Test-CodexSynapseHttpConfigBody -Body $body -Bind $Bind)
+}
+
+function Test-CodexSynapseHttpConfigBody {
+    # Does a [mcp_servers.synapse] section body carry the required client policy? Pure.
+    param(
+        [AllowEmptyString()][string]$Body = '',
+        [Parameter(Mandatory=$true)][string]$Bind
+    )
     $bindUrlRegex = [regex]::Escape("http://$Bind/mcp")
-    return ($body -match "url\s*=\s*`"$bindUrlRegex`"" -and
-        $body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"' -and
-        $body -match '(?m)^\s*required\s*=\s*false\s*$' -and
-        $body -match '(?m)^\s*default_tools_approval_mode\s*=\s*"approve"\s*$')
+    return ($Body -match "url\s*=\s*`"$bindUrlRegex`"" -and
+        $Body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"' -and
+        $Body -match '(?m)^\s*required\s*=\s*false\s*$' -and
+        $Body -match '(?m)^\s*default_tools_approval_mode\s*=\s*"approve"\s*$')
 }
 
 function Test-CodexSynapseHttpTransportConfig {
@@ -1808,10 +2295,24 @@ function Set-CodexSynapseClientPolicy {
         $content = Get-Content -Raw $ConfigPath
     }
 
+    $content = Update-CodexSynapseSectionText -Content $content -Bind $Bind
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ConfigPath, $content, $utf8NoBom)
+}
+
+function Update-CodexSynapseSectionText {
+    # The [mcp_servers.synapse] section policy applied to config.toml text. Pure;
+    # every other section stays byte-identical.
+    param(
+        [AllowEmptyString()][string]$Content = '',
+        [Parameter(Mandatory=$true)][string]$Bind
+    )
+    # ($content below is this parameter: PowerShell names are case-insensitive.)
     $desiredLines = @(
         ('url = "http://{0}/mcp"' -f $Bind),
         'bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"',
-        # A daemon outage must remain an MCP error, not prevent Codex from opening.
+        # #2269: a daemon outage must stay an MCP error, never stop Codex from opening.
         'required = false',
         'startup_timeout_sec = 20',
         'default_tools_approval_mode = "approve"'
@@ -1853,9 +2354,7 @@ function Set-CodexSynapseClientPolicy {
         }
         $content += ((@('[mcp_servers.synapse]') + $desiredLines) -join "`r`n") + "`r`n"
     }
-
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($ConfigPath, $content, $utf8NoBom)
+    return $content
 }
 
 function Get-SynapseMcpProcessSnapshot {
@@ -1911,6 +2410,20 @@ function Get-SynapseMcpDeployTargetMatch {
 
     $rules = @()
     $bindArg = Get-SynapseCommandLineArgumentValue -CommandLine $Process.CommandLine -Name '--bind'
+    $dbArgForBridge = Get-SynapseCommandLineArgumentValue -CommandLine $Process.CommandLine -Name '--db'
+    $modeArg = Get-SynapseCommandLineArgumentValue -CommandLine $Process.CommandLine -Name '--mode'
+    if (-not [string]::IsNullOrWhiteSpace($modeArg) -and $modeArg.Trim() -ieq 'connect') {
+        # Issue #11: a `--mode connect` stdio bridge belongs to a live MCP client
+        # (Codex/Claude) that cannot respawn it. It is never a deploy stop target;
+        # it rides its HTTP reconnect loop across the daemon replacement.
+        return [pscustomobject]@{
+            IsMatch = $false
+            Rules = @('connect_bridge_preserved')
+            BindArg = if ($null -eq $bindArg) { '<missing>' } else { $bindArg }
+            DbArg = if ($null -eq $dbArgForBridge) { '<missing>' } else { $dbArgForBridge }
+            ExpectedDb = Normalize-SynapseSetupPathForCompare -Path $DbPath
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($bindArg) -and $bindArg.Trim() -ieq $Bind) {
         $rules += "bind=$Bind"
     }
@@ -2803,79 +3316,6 @@ function Get-SynapseObjectPropertyValue {
     return $null
 }
 
-function Format-SynapseHealthSubsystemStatuses {
-    param([AllowNull()]$Health)
-
-    $subsystems = Get-SynapseObjectPropertyValue -Object $Health -Names @('subsystems')
-    if ($null -eq $subsystems) {
-        return '<missing>'
-    }
-
-    $statuses = @()
-    foreach ($prop in @($subsystems.PSObject.Properties | Sort-Object Name)) {
-        $status = [string](Get-SynapseObjectPropertyValue -Object $prop.Value -Names @('status'))
-        if ([string]::IsNullOrWhiteSpace($status)) {
-            $status = '<missing>'
-        }
-        $statuses += ("{0}={1}" -f $prop.Name, $status)
-    }
-    if ($statuses.Count -eq 0) {
-        return '<none>'
-    }
-    return ($statuses -join ',')
-}
-
-function Test-SynapseHealthCriticalSubsystemsReady {
-    param([AllowNull()]$Health)
-
-    $subsystems = Get-SynapseObjectPropertyValue -Object $Health -Names @('subsystems')
-    if ($null -eq $subsystems) {
-        return [pscustomobject]@{
-            Ok = $false
-            Detail = 'health.subsystems missing'
-        }
-    }
-
-    $criticalNames = @(
-        'action',
-        'daemon_drain',
-        'daemon_lifecycle',
-        'facade_contract',
-        'http',
-        'perception',
-        'public_tool_registry',
-        'storage'
-    )
-    $missing = @()
-    $bad = @()
-    foreach ($name in $criticalNames) {
-        $node = Get-SynapseObjectPropertyValue -Object $subsystems -Names @($name)
-        if ($null -eq $node) {
-            $missing += $name
-            continue
-        }
-        $status = [string](Get-SynapseObjectPropertyValue -Object $node -Names @('status'))
-        if ($status -ne 'ok') {
-            if ([string]::IsNullOrWhiteSpace($status)) {
-                $status = '<missing>'
-            }
-            $bad += ("{0}={1}" -f $name, $status)
-        }
-    }
-
-    if ($missing.Count -gt 0 -or $bad.Count -gt 0) {
-        return [pscustomobject]@{
-            Ok = $false
-            Detail = ("missing={0} bad={1}" -f (Format-SynapseLimitedList -Items $missing), (Format-SynapseLimitedList -Items $bad))
-        }
-    }
-
-    return [pscustomobject]@{
-        Ok = $true
-        Detail = 'critical_subsystems_ok'
-    }
-}
-
 function Read-SynapseMcpSseJsonResponse {
     param(
         [Parameter(Mandatory=$true)][string]$Content,
@@ -3120,6 +3560,16 @@ function Invoke-SynapseSetupMcpTool {
     }
 }
 
+function Get-SynapseChromeBridgeHostWaitStep {
+    # #2271: next step of the post-start bridge host wait. Pure.
+    param([string]$Detail = '', [int64]$PauseRemainingMs = 0)
+    if ($Detail -notmatch 'no_active_chrome_bridge_host') { return 'stop_waiting' }
+    # Setup's own maintenance pause is no reason for foreground chrome://extensions
+    # UI repair: the worker re-registers when the pause ends, so keep waiting (the
+    # wait deadline already covers the remaining pause plus the alarm cushion).
+    return 'wait'
+}
+
 function Assert-SynapseChromeBridgeLiveAfterSetup {
     param(
         [Parameter(Mandatory=$true)][string]$Bind,
@@ -3132,7 +3582,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $chromeBridge = $Health.subsystems.chrome_bridge
     $status = [string]$chromeBridge.status
     $detail = [string]$chromeBridge.detail
-    $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+    $isClean = $status -eq 'ok' -and $detail -match '(?:^|\s)extension_stale=false(?:\s|$)' -and $detail -match '(?:^|\s)extension_capabilities=(?:[^\s,]+,)*pageScreenshot(?:,|\s|$)'
     if ($isClean) {
         Info "Chrome bridge OK after daemon start: stale=false capability=pageScreenshot"
         return $Health
@@ -3151,24 +3601,15 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $deadlineMs = [int64]$nowMs + [int64]$postStartWaitMs
     $attempt = 0
     while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadlineMs) {
-        if ($detail -notmatch 'no_active_chrome_bridge_host') {
-            break
-        }
-        $attempt += 1
         $currentMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
         $pauseRemainingMs = 0
         if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
             $pauseRemainingMs = [Math]::Max(0, [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$currentMs)
         }
-        if ($pauseRemainingMs -gt 0) {
-            # #2271: the bridge worker ends its maintenance pause itself once /health
-            # reports a different daemon pid (checked on its 30 s wake alarm), so keep
-            # waiting instead of jumping to foreground chrome://extensions UI repair.
-            Info ("Chrome bridge host absent after daemon start while maintenance reconnect pause remains active; waiting for the worker to observe the replaced daemon pid and end the pause. attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2}" -f `
-                $attempt,
-                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
-                $pauseRemainingMs)
+        if ((Get-SynapseChromeBridgeHostWaitStep -Detail $detail -PauseRemainingMs $pauseRemainingMs) -ne 'wait') {
+            break
         }
+        $attempt += 1
         $waitRemainingMs = [Math]::Max(0, [int64]$deadlineMs - [int64]$currentMs)
         Info ("Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2} wait_remaining_ms={3}" -f `
             $attempt,
@@ -3184,7 +3625,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         $chromeBridge = $currentHealth.subsystems.chrome_bridge
         $status = [string]$chromeBridge.status
         $detail = [string]$chromeBridge.detail
-        $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+        $isClean = $status -eq 'ok' -and $detail -match '(?:^|\s)extension_stale=false(?:\s|$)' -and $detail -match '(?:^|\s)extension_capabilities=(?:[^\s,]+,)*pageScreenshot(?:,|\s|$)'
         if ($isClean) {
             Info "Chrome bridge OK after daemon start wait: stale=false capability=pageScreenshot"
             return $currentHealth
@@ -3196,6 +3637,16 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
             -InstallerPath $ChromeBridgeInstallerPath `
             -NativeHostExePath $ChromeNativeHostExePath
         $repairReason = [string]$uiRepairReadback.synapse_chrome_auto_install.reason
+        if ($repairReason -eq $SynapseChromeBridgeUiReloadDeferredReason) {
+            # No eligible Chrome window can host the live extension reload and no
+            # bridge host can register without one, so neither waiting nor failing
+            # here can converge (#132): complete setup with the healthy daemon and
+            # surface the deferred repair through chrome_bridge health.
+            Info ("WARN: Chrome bridge host absent with no eligible Chrome window; setup completes with the deferred bridge repair. reason={0} bridge_self_reload_command=browser_debugger.reload_bridge status={1}" -f `
+                $repairReason,
+                $status)
+            return $currentHealth
+        }
         $uiDeadlineMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]45000
         $uiAttempt = 0
         do {
@@ -3209,7 +3660,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
             $chromeBridge = $currentHealth.subsystems.chrome_bridge
             $status = [string]$chromeBridge.status
             $detail = [string]$chromeBridge.detail
-            $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+            $isClean = $status -eq 'ok' -and $detail -match '(?:^|\s)extension_stale=false(?:\s|$)' -and $detail -match '(?:^|\s)extension_capabilities=(?:[^\s,]+,)*pageScreenshot(?:,|\s|$)'
             if ($isClean) {
                 Info "Chrome bridge OK after existing-Chrome UI repair: reason=$repairReason stale=false capability=pageScreenshot"
                 return $currentHealth
@@ -3252,11 +3703,65 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $afterBridge = $afterHealth.subsystems.chrome_bridge
     $afterStatus = [string]$afterBridge.status
     $afterDetail = [string]$afterBridge.detail
-    if ($afterStatus -ne 'ok' -or $afterDetail -notmatch 'extension_stale=false' -or $afterDetail -notmatch 'pageScreenshot') {
+    if ($afterStatus -ne 'ok' -or $afterDetail -notmatch '(?:^|\s)extension_stale=false(?:\s|$)' -or $afterDetail -notmatch '(?:^|\s)extension_capabilities=(?:[^\s,]+,)*pageScreenshot(?:,|\s|$)') {
         Die "SYNAPSE_CHROME_BRIDGE_STALE_AFTER_SETUP_RELOAD status=$afterStatus detail=$afterDetail remediation=setup requires the already-open Chrome profile to load the bundled bridge build; run scripts\\install-synapse-chrome-debugger.ps1 from the interactive desktop and keep normal bridge commands failed closed until health is clean"
     }
     Info "Chrome bridge OK after setup reload: stale=false capability=pageScreenshot"
     return $afterHealth
+}
+
+function Assert-SynapseBridgeLiveIdentityAfterSetup {
+    # #251: the installer runs deferred their live identity checks to here,
+    # after the new daemon is up and the bridge passed the short-health gate.
+    # One authenticated browser_debugger MCP session reads detailed health; the
+    # mandatory Chrome bridge fails closed, optional browsers are WARN-only.
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)]$Health,
+        $ChromeReadback,
+        [object[]]$OptionalBridges = @()
+    )
+
+    $checks = @()
+    if ([string]$Health.subsystems.chrome_bridge.detail -match 'no_active_chrome_bridge_host') {
+        # Only the #132 deferred UI repair completes setup without a host.
+        Info "WARN: SYNAPSE_CHROME_BRIDGE_LIVE_IDENTITY_DEFERRED reason=no_active_chrome_bridge_host remediation=no bridge host can register yet; the deferred repair is surfaced in chrome_bridge health and the identity is checkable once a host registers"
+    } else {
+        $expected = $ChromeReadback.runtime_verification.expected_identity
+        if ($null -eq $expected) {
+            Die "SYNAPSE_CHROME_BRIDGE_LIVE_IDENTITY_EXPECTATION_MISSING remediation=the bridge installer readback carries no expected identity; rerun setup so the installer deploys and reports the bridge build"
+        }
+        $checks += [pscustomobject]@{ browser = $SynapseLegacyBrowserId; expected = $expected; mandatory = $true }
+    }
+    foreach ($bridge in @($OptionalBridges | Where-Object { $null -ne $_.readback.runtime_verification.expected_identity })) {
+        $checks += [pscustomobject]@{ browser = [string]$bridge.browser; expected = $bridge.readback.runtime_verification.expected_identity; mandatory = $false }
+    }
+    if ($checks.Count -eq 0) { return }
+    $mandatory = @($checks | Where-Object { $_.mandatory }).Count -gt 0
+    try {
+        $detailedHealth = Read-SynapseChromeBridgeDetailedHealth -Bind $Bind -Token $Token
+    } catch {
+        $reason = Get-SynapseBridgeIdentityFailureReason -Message $_.Exception.Message
+        if ($mandatory) {
+            Die "SYNAPSE_CHROME_BRIDGE_LIVE_IDENTITY_FAILED bind=$Bind reason=$reason remediation=the running daemon did not return detailed bridge identity through an authenticated browser_debugger MCP session; repair the daemon MCP/profile path before accepting setup"
+        }
+        Info "WARN: SYNAPSE_BROWSER_BRIDGE_LIVE_IDENTITY_UNVERIFIED browsers=$((@($checks | ForEach-Object { $_.browser })) -join ',') reason=$reason"
+        return
+    }
+    foreach ($check in $checks) {
+        $outcome = Test-SynapseBridgeLiveIdentity -Health $detailedHealth -Expected $check.expected
+        if ($outcome.ok) {
+            Info "Bridge live identity verified browser=$($check.browser) contract=$($check.expected.contract) source=$($outcome.source)"
+            foreach ($warning in @($outcome.warnings)) {
+                Info "WARN: SYNAPSE_BRIDGE_LOADED_FROM_NONSTANDARD_FOLDER browser=$($check.browser) $warning remediation=the running code matches the deployed build; Load unpacked from the expected folder to keep future setup reloads on the stable path"
+            }
+        } elseif ($check.mandatory) {
+            Die "SYNAPSE_CHROME_BRIDGE_LIVE_IDENTITY_FAILED bind=$Bind browser=$($check.browser) reason=$($outcome.reason) remediation=the running bridge host does not report the deployed bridge identity; run scripts\install-synapse-chrome-debugger.ps1 from the interactive desktop, then browser_debugger.reload_bridge, and keep normal bridge commands failed closed until identity matches"
+        } else {
+            Info "WARN: SYNAPSE_BROWSER_BRIDGE_LIVE_IDENTITY_UNVERIFIED browser=$($check.browser) reason=$($outcome.reason) remediation=open $($check.browser) with the bridge loaded and rerun scripts\install-synapse-browser-bridge.ps1 -Browser $($check.browser); the mandatory $SynapseLegacyBrowserId bridge is unaffected"
+        }
+    }
 }
 
 function Read-SynapseDaemonToolSurface {
@@ -3403,523 +3908,237 @@ function Get-SynapseFileSha256 {
     }
 }
 
-function Get-SynapseFullPathForScopeCheck {
-    param([Parameter(Mandatory=$true)][string]$Path)
-    return [System.IO.Path]::GetFullPath($Path).TrimEnd(
-        [System.IO.Path]::DirectorySeparatorChar,
-        [System.IO.Path]::AltDirectorySeparatorChar)
-}
-
-function Assert-SynapseProfileRelativePathSafe {
+function Get-SynapseCheckoutCargoTarget {
+    # Key the persistent target by the source checkout so two checkouts never
+    # share one fingerprint database. Used by both the build and -SkipBuild.
     param(
-        [Parameter(Mandatory=$true)][string]$RelativePath,
-        [Parameter(Mandatory=$true)][string]$Context
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][string]$SourceDir
     )
 
-    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
-        Die "SYNAPSE_PROFILE_RELATIVE_PATH_EMPTY context=$Context remediation=bundled profile manifests must use non-empty relative paths"
-    }
-    if ($RelativePath -match '^[A-Za-z]:|^\\\\') {
-        Die "SYNAPSE_PROFILE_RELATIVE_PATH_ABSOLUTE context=$Context relative_path=$RelativePath remediation=bundled profile manifests must not contain absolute paths"
-    }
-    $normalized = $RelativePath.Replace('\', '/')
-    foreach ($segment in @($normalized.Split('/'))) {
-        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..') {
-            Die "SYNAPSE_PROFILE_RELATIVE_PATH_UNSAFE context=$Context relative_path=$RelativePath segment=$segment remediation=bundled profile manifests must not contain empty, current-directory, or parent-directory segments"
-        }
-    }
-    return $normalized
+    $resolvedSource = (Resolve-Path $SourceDir).Path.TrimEnd('\')
+    $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($resolvedSource.ToLowerInvariant())
+    $sourceHash = ([System.Security.Cryptography.SHA1]::Create().ComputeHash($sourceBytes) |
+        ForEach-Object { $_.ToString('x2') }) -join ''
+    $sourceLeaf = (Split-Path $resolvedSource -Leaf) -replace '[^A-Za-z0-9._-]', '_'
+    return (Join-Path $Root "$sourceLeaf-$($sourceHash.Substring(0,12))")
 }
 
-function Join-SynapseProfileRelativePath {
+function Get-SynapseRetryDelayMs {
     param(
-        [Parameter(Mandatory=$true)][string]$BaseDir,
-        [Parameter(Mandatory=$true)][string]$RelativePath,
-        [Parameter(Mandatory=$true)][string]$Context
+        [Parameter(Mandatory=$true)][int]$Attempt,
+        [Parameter(Mandatory=$true)][int]$BaseMs,
+        [Parameter(Mandatory=$true)][int]$MaxMs
     )
 
-    $normalized = Assert-SynapseProfileRelativePathSafe -RelativePath $RelativePath -Context $Context
-    $baseFull = Get-SynapseFullPathForScopeCheck -Path $BaseDir
-    $baseWithSep = $baseFull + [System.IO.Path]::DirectorySeparatorChar
-    $nativeRelative = $normalized.Replace('/', [string][System.IO.Path]::DirectorySeparatorChar)
-    $candidate = [System.IO.Path]::GetFullPath((Join-Path $baseFull $nativeRelative))
-    if (-not $candidate.StartsWith($baseWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Die "SYNAPSE_PROFILE_RELATIVE_PATH_SCOPE_ESCAPE context=$Context base=$baseFull relative_path=$RelativePath resolved=$candidate remediation=bundled profile reconciliation refuses paths that escape the profile directory"
-    }
-    return $candidate
+    $shift = [math]::Min([math]::Max($Attempt - 1, 0), 20)
+    return [int][math]::Min([double]$BaseMs * [math]::Pow(2, $shift), [double]$MaxMs)
 }
 
-function Get-SynapseProfileRelativePath {
+function Resolve-SynapseSkipBuildCandidatePath {
     param(
-        [Parameter(Mandatory=$true)][string]$BaseDir,
-        [Parameter(Mandatory=$true)][string]$Path,
-        [Parameter(Mandatory=$true)][string]$Context
+        [Parameter(Mandatory=$true)][string]$CargoTarget,
+        [AllowNull()][Nullable[datetime]]$MinimumWriteTimeUtc = $null
     )
 
-    $baseFull = Get-SynapseFullPathForScopeCheck -Path $BaseDir
-    $baseWithSep = $baseFull + [System.IO.Path]::DirectorySeparatorChar
-    $full = [System.IO.Path]::GetFullPath($Path)
-    if (-not $full.StartsWith($baseWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Die "SYNAPSE_PROFILE_PATH_SCOPE_ESCAPE context=$Context base=$baseFull path=$full remediation=bundled profile reconciliation refuses to classify files outside the profile root"
+    $candidate = Get-SynapseCargoReleaseArtifactPath -CargoTarget $CargoTarget
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$candidate cargo_target=$CargoTarget remediation=-SkipBuild requires CargoTarget\release\synapse-mcp.exe; build that release artifact or pass the Cargo target directory that contains it"
     }
-    return (Assert-SynapseProfileRelativePathSafe -RelativePath ($full.Substring($baseWithSep.Length).Replace('\', '/')) -Context $Context)
+    $written = (Get-Item -LiteralPath $candidate).LastWriteTimeUtc
+    if ($null -ne $MinimumWriteTimeUtc -and $written -lt $MinimumWriteTimeUtc) {
+        Die "SYNAPSE_SKIP_BUILD_ARTIFACT_STALE FATAL path=$candidate written_utc=$($written.ToString('o')) head_commit_utc=$(([datetime]$MinimumWriteTimeUtc).ToString('o')) remediation=the artifact is older than the source HEAD commit; run setup without -SkipBuild to rebuild the per-checkout target"
+    }
+    return (Resolve-Path -LiteralPath $candidate).Path
 }
 
-function Test-SynapseSetupProfileMetadataRelativePath {
-    param([Parameter(Mandatory=$true)][string]$RelativePath)
+function Get-SynapseSkipBuildHeadIdentity {
+    param([Parameter(Mandatory=$true)][string]$SourceDir)
 
-    $normalized = $RelativePath.Replace('\', '/')
-    return (
-        $normalized -ieq $script:SynapseBundledProfilesManifestFileName -or
-        $normalized.StartsWith("$($script:SynapseBundledProfilesQuarantineDirName)/", [System.StringComparison]::OrdinalIgnoreCase) -or
-        $normalized.StartsWith("$($script:SynapseBundledProfilesRollbackDirName)/", [System.StringComparison]::OrdinalIgnoreCase))
-}
-
-function New-SynapseCaseInsensitiveMap {
-    return (New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase))
-}
-
-function Read-SynapseProfileTomlId {
-    param(
-        [Parameter(Mandatory=$true)][string]$Path,
-        [Parameter(Mandatory=$true)][string]$RelativePath
-    )
-
-    $reader = $null
+    $revision = $null
+    $commitUnix = $null
+    $dirty = $true
     try {
-        $reader = [System.IO.File]::OpenText($Path)
-        while ($null -ne ($line = $reader.ReadLine())) {
-            if ($line -match '^\s*#') { continue }
-            if ($line -match '^\s*\[') { break }
-            if ($line -match '^\s*id\s*=\s*"([^"]+)"') {
-                return $Matches[1]
-            }
-        }
+        $revision = @(& git -C $SourceDir rev-parse --short=12 HEAD 2>$null) | Select-Object -First 1
+        $commitUnix = @(& git -C $SourceDir log -1 --format=%ct 2>$null) | Select-Object -First 1
+        & git -C $SourceDir diff --quiet HEAD -- 2>$null
+        $dirty = ($LASTEXITCODE -ne 0)
     } catch {
-        Die "SYNAPSE_PROFILE_ID_READ_FAILED path=$Path relative_path=$RelativePath error=$($_.Exception.Message) remediation=verify the bundled profile TOML is readable before setup can deploy it"
-    } finally {
-        if ($null -ne $reader) {
-            $reader.Dispose()
-        }
+        $revision = $null
     }
-    return ''
+    if ([string]$revision -notmatch '^[0-9a-f]{7,40}$' -or [string]$commitUnix -notmatch '^\d+$') {
+        Die "SYNAPSE_SKIP_BUILD_HEAD_UNREADABLE FATAL source=$SourceDir remediation=-SkipBuild must prove the candidate was built from the current HEAD, but git could not read HEAD from this source directory; fix the checkout or run setup without -SkipBuild"
+    }
+    return [pscustomobject]@{
+        Revision = [string]$revision
+        CommitTimeUtc = [DateTimeOffset]::FromUnixTimeSeconds([long]$commitUnix).UtcDateTime
+        Dirty = $dirty
+    }
 }
 
-function Get-SynapseBundledProfileSourceEntries {
-    param([Parameter(Mandatory=$true)][string]$SourceProfilesDir)
+function Read-SynapseSourceGit {
+    param([string]$SourceDir, [string[]]$GitArguments)
 
-    if (-not (Test-Path -LiteralPath $SourceProfilesDir -PathType Container)) {
-        Die "SYNAPSE_BUNDLED_PROFILES_SOURCE_MISSING path=$SourceProfilesDir remediation=provide the repository bundled profile directory before setup can reconcile installed profiles"
-    }
-
-    $entries = @()
-    foreach ($file in @(Get-ChildItem -LiteralPath $SourceProfilesDir -File -Recurse -ErrorAction Stop)) {
-        $relative = Get-SynapseProfileRelativePath -BaseDir $SourceProfilesDir -Path $file.FullName -Context 'source_bundled_profiles'
-        if (Test-SynapseSetupProfileMetadataRelativePath -RelativePath $relative) { continue }
-        $isTopLevelProfile = ($relative -notmatch '/' -and $relative.EndsWith('.toml', [System.StringComparison]::OrdinalIgnoreCase))
-        $entries += [pscustomobject]@{
-            relative_path = $relative
-            source_path = $file.FullName
-            sha256 = Get-SynapseFileSha256 -Path $file.FullName
-            length = [int64]$file.Length
-            last_write_time_utc = $file.LastWriteTimeUtc.ToString('o')
-            profile_file = [bool]$isTopLevelProfile
-        }
-    }
-
-    $entries = @($entries | Sort-Object relative_path)
-    if ($entries.Count -lt 1) {
-        Die "SYNAPSE_BUNDLED_PROFILES_SOURCE_EMPTY path=$SourceProfilesDir remediation=repository bundled profile source must contain at least one file"
-    }
-
-    $pathMap = New-SynapseCaseInsensitiveMap
-    foreach ($entry in $entries) {
-        if ($pathMap.ContainsKey($entry.relative_path)) {
-            Die "SYNAPSE_BUNDLED_PROFILES_DUPLICATE_RELATIVE_PATH path=$SourceProfilesDir relative_path=$($entry.relative_path) remediation=remove case-colliding bundled profile files before setup can deploy them"
-        }
-        $pathMap[$entry.relative_path] = $entry
-    }
-
-    $profileEntries = @($entries | Where-Object { $_.profile_file })
-    if ($profileEntries.Count -lt 1) {
-        Die "SYNAPSE_BUNDLED_PROFILES_SOURCE_NO_TOML path=$SourceProfilesDir remediation=profile-dependent tools need at least one top-level bundled .toml profile"
-    }
-
-    $ids = @()
-    foreach ($entry in $profileEntries) {
-        $id = Read-SynapseProfileTomlId -Path $entry.source_path -RelativePath $entry.relative_path
-        if ([string]::IsNullOrWhiteSpace($id)) {
-            Die "SYNAPSE_BUNDLED_PROFILE_ID_MISSING path=$($entry.source_path) relative_path=$($entry.relative_path) remediation=bundled profile TOML must declare a top-level id before any table"
-        }
-        $ids += [pscustomobject]@{ id = $id; relative_path = $entry.relative_path }
-    }
-    $duplicateIds = @($ids | Group-Object id | Where-Object { $_.Count -gt 1 })
-    if ($duplicateIds.Count -gt 0) {
-        $detail = (($duplicateIds | ForEach-Object {
-            "$($_.Name):$((@($_.Group | ForEach-Object { $_.relative_path }) -join ','))"
-        }) -join ';')
-        Die "SYNAPSE_BUNDLED_PROFILE_DUPLICATE_ID path=$SourceProfilesDir duplicates=$detail remediation=profile ids must be unique before setup can deploy a coherent bundled set"
-    }
-
-    return $entries
-}
-
-function Read-SynapseBundledProfilesManifest {
-    param([Parameter(Mandatory=$true)][string]$ManifestPath)
-
-    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-        return $null
-    }
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = 'git.exe'
+    $start.WorkingDirectory = $SourceDir
+    $start.Arguments = (($GitArguments | ForEach-Object { Quote-WindowsCommandArgument $_ }) -join ' ')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
     try {
-        $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_INVALID_JSON path=$ManifestPath error=$($_.Exception.Message) remediation=manifest exists but is unreadable; inspect it before setup can safely decide which deployed profiles it owns"
-    }
-
-    if ([int]$manifest.schema_version -ne 1) {
-        Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_UNSUPPORTED path=$ManifestPath schema_version=$($manifest.schema_version) remediation=setup only understands bundled profile manifest schema_version=1"
-    }
-    if ([string]$manifest.owner -ne 'synapse-setup:bundled-profiles') {
-        Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_OWNER_MISMATCH path=$ManifestPath owner=$($manifest.owner) remediation=setup refuses to use a manifest it did not create"
-    }
-
-    $seen = New-SynapseCaseInsensitiveMap
-    foreach ($file in @($manifest.files)) {
-        $relative = Assert-SynapseProfileRelativePathSafe -RelativePath ([string]$file.relative_path) -Context 'previous_bundled_profiles_manifest'
-        if ($seen.ContainsKey($relative)) {
-            Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_DUPLICATE_PATH path=$ManifestPath relative_path=$relative remediation=repair duplicate manifest entries before setup can safely prune retired bundled profiles"
-        }
-        if ([string]::IsNullOrWhiteSpace([string]$file.sha256) -or ([string]$file.sha256) -notmatch '^[0-9A-Fa-f]{64}$') {
-            Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_BAD_HASH path=$ManifestPath relative_path=$relative sha256=$($file.sha256) remediation=manifest file entries must carry valid SHA-256 hashes"
-        }
-        $seen[$relative] = $true
-    }
-
-    return $manifest
+        $null = $process.Start()
+        $output = $process.StandardOutput.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) { throw "git source read failed: $($GitArguments -join ' ')" }
+        return $output
+    } finally { $process.Dispose() }
 }
 
-function Convert-SynapseEntriesToMap {
-    param([Parameter(Mandatory=$true)]$Entries)
+function Get-SynapseBuildSourceFingerprint {
+    param([Parameter(Mandatory=$true)][string]$SourceDir)
 
-    $map = New-SynapseCaseInsensitiveMap
-    foreach ($entry in @($Entries)) {
-        $relative = Assert-SynapseProfileRelativePathSafe -RelativePath ([string]$entry.relative_path) -Context 'profile_entry_map'
-        $map[$relative] = $entry
-    }
-    return $map
-}
-
-function Copy-SynapseProfileFileWithHashReadback {
-    param(
-        [Parameter(Mandatory=$true)][string]$Source,
-        [Parameter(Mandatory=$true)][string]$Destination,
-        [Parameter(Mandatory=$true)][string]$ExpectedSha256,
-        [Parameter(Mandatory=$true)][string]$Context
-    )
-
-    $parent = Split-Path -Parent $Destination
-    if (-not [string]::IsNullOrWhiteSpace($parent)) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    }
-    Copy-Item -LiteralPath $Source -Destination $Destination -Force
-    $actual = Get-SynapseFileSha256 -Path $Destination
-    if ($actual -ne $ExpectedSha256) {
-        Die "SYNAPSE_PROFILE_COPY_HASH_MISMATCH context=$Context source=$Source destination=$Destination expected_sha256=$ExpectedSha256 actual_sha256=$actual remediation=copied profile bytes changed during copy; setup refuses to install an incoherent bundled profile set"
-    }
-}
-
-function New-SynapseBundledProfilesManifestObject {
-    param(
-        [Parameter(Mandatory=$true)][string]$SourceProfilesDir,
-        [Parameter(Mandatory=$true)][string]$ProfilesDir,
-        [Parameter(Mandatory=$true)]$Entries,
-        [Parameter(Mandatory=$true)]$Quarantined,
-        [Parameter(Mandatory=$true)]$PreservedCustomProfiles,
-        [Parameter(Mandatory=$true)]$PreservedLegacyRetiredHashMismatches
-    )
-
-    $fileRecords = @($Entries | ForEach-Object {
-        [ordered]@{
-            relative_path = [string]$_.relative_path
-            sha256 = [string]$_.sha256
-            length = [int64]$_.length
-            profile_file = [bool]$_.profile_file
-        }
-    })
-    $fingerprintInput = [ordered]@{
-        schema_version = 1
-        files = $fileRecords
-    }
-    $sourceManifestSha256 = Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $fingerprintInput)
-
-    return [ordered]@{
-        schema_version = 1
-        owner = 'synapse-setup:bundled-profiles'
-        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
-        source_profiles_dir = [System.IO.Path]::GetFullPath($SourceProfilesDir)
-        deployed_profiles_dir = [System.IO.Path]::GetFullPath($ProfilesDir)
-        source_manifest_sha256 = $sourceManifestSha256
-        bundled_file_count = $fileRecords.Count
-        bundled_profile_count = @($fileRecords | Where-Object { $_.profile_file }).Count
-        files = $fileRecords
-        quarantined_retired = @($Quarantined)
-        preserved_custom_profiles = @($PreservedCustomProfiles)
-        preserved_legacy_retired_hash_mismatches = @($PreservedLegacyRetiredHashMismatches)
-    }
-}
-
-function Install-SynapseBundledProfiles {
-    param(
-        [Parameter(Mandatory=$true)][string]$SourceProfilesDir,
-        [Parameter(Mandatory=$true)][string]$ProfilesDir,
-        [Parameter(Mandatory=$true)][string]$LogDir
-    )
-
-    New-Item -ItemType Directory -Force -Path $ProfilesDir | Out-Null
-    $manifestPath = Join-Path $ProfilesDir $script:SynapseBundledProfilesManifestFileName
-    $sourceEntries = @(Get-SynapseBundledProfileSourceEntries -SourceProfilesDir $SourceProfilesDir)
-    $sourceMap = Convert-SynapseEntriesToMap -Entries $sourceEntries
-    $previousManifest = Read-SynapseBundledProfilesManifest -ManifestPath $manifestPath
-    $previousMap = New-SynapseCaseInsensitiveMap
-    if ($previousManifest) {
-        $previousMap = Convert-SynapseEntriesToMap -Entries @($previousManifest.files)
-    }
-
-    $stageRoot = New-SynapseSetupRunDirectory -Root $LogDir -Purpose 'profile-stage'
-    foreach ($entry in $sourceEntries) {
-        $stagedPath = Join-SynapseProfileRelativePath -BaseDir $stageRoot -RelativePath $entry.relative_path -Context 'stage_bundled_profiles'
-        Copy-SynapseProfileFileWithHashReadback -Source $entry.source_path -Destination $stagedPath -ExpectedSha256 $entry.sha256 -Context 'stage_bundled_profiles'
-    }
-
-    $retireActions = @()
-    foreach ($previous in @($previousMap.Values)) {
-        $relative = [string]$previous.relative_path
-        if ($sourceMap.ContainsKey($relative)) { continue }
-        $target = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'retire_previous_bundled_profile'
-        if (Test-Path -LiteralPath $target -PathType Leaf) {
-            $retireActions += [pscustomobject]@{
-                relative_path = $relative
-                path = $target
-                prior_sha256 = ([string]$previous.sha256).ToUpperInvariant()
-                reason = 'previous_manifest_absent_from_source'
-                require_hash_match = $false
+    $head = (Read-SynapseSourceGit -SourceDir $SourceDir -GitArguments @('rev-parse', '--verify', 'HEAD')).Trim()
+    if ($head -notmatch '^[0-9a-f]{40,64}$') { throw 'Source HEAD is unreadable' }
+    $root = (Read-SynapseSourceGit -SourceDir $SourceDir -GitArguments @('rev-parse', '--show-toplevel')).TrimEnd("`r", "`n")
+    $changed = Read-SynapseSourceGit -SourceDir $root -GitArguments @('diff', '--no-ext-diff', '--name-only', '--no-renames', '-z', 'HEAD', '--')
+    $records = New-Object System.Collections.Generic.List[string]
+    $records.Add($head)
+    foreach ($name in @($changed.Split([char]0) | Where-Object { $_ } | Sort-Object -CaseSensitive)) {
+        $path = Join-Path $root $name
+        $encodedName = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($name))
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Modified source is a reparse point: $name"
             }
-        }
+            $records.Add("${encodedName}:$(Get-SynapseFileSha256 -Path $path)")
+        } elseif (Test-Path -LiteralPath $path) {
+            throw "Modified source is not a regular file: $name"
+        } else { $records.Add("${encodedName}:deleted") }
     }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($records -join "`n"))) |
+            ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally { $sha.Dispose() }
+}
 
-    foreach ($legacy in @($script:SynapseLegacyRetiredBundledProfiles)) {
-        $relative = Assert-SynapseProfileRelativePathSafe -RelativePath ([string]$legacy.relative_path) -Context 'legacy_retired_bundled_profile'
-        if ($sourceMap.ContainsKey($relative)) { continue }
-        if (@($retireActions | Where-Object { $_.relative_path -ieq $relative }).Count -gt 0) { continue }
-        $target = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'retire_legacy_bundled_profile'
-        if (Test-Path -LiteralPath $target -PathType Leaf) {
-            $retireActions += [pscustomobject]@{
-                relative_path = $relative
-                path = $target
-                prior_sha256 = ([string]$legacy.sha256).ToUpperInvariant()
-                reason = "legacy_retired_seed:$($legacy.issue)"
-                require_hash_match = $true
-            }
-        }
+function Write-SynapseBuildSourceFingerprint {
+    param([Parameter(Mandatory=$true)][string]$SourceDir, [Parameter(Mandatory=$true)][string]$CandidatePath,
+        [string]$ExpectedFingerprint)
+
+    $fingerprint = Get-SynapseBuildSourceFingerprint -SourceDir $SourceDir
+    if ($ExpectedFingerprint -and $fingerprint -ine $ExpectedFingerprint) {
+        Die "SYNAPSE_BUILD_SOURCE_CHANGED FATAL source=$SourceDir path=$CandidatePath remediation=source changed during the build; rebuild from a stable source tree before recording proof"
     }
+    [IO.File]::WriteAllText("$CandidatePath.source-fingerprint", $fingerprint, [Text.Encoding]::ASCII)
+}
 
-    $rollbackRoot = $null
-    $quarantineRoot = $null
-    $copiedNew = @()
-    $overwritten = @()
-    $quarantined = @()
-    $preservedLegacyMismatches = @()
+function Assert-SynapseSkipBuildSourceFingerprint {
+    param([Parameter(Mandatory=$true)][string]$SourceDir, [Parameter(Mandatory=$true)][string]$CandidatePath)
 
     try {
-        foreach ($entry in $sourceEntries) {
-            $relative = [string]$entry.relative_path
-            $stagedPath = Join-SynapseProfileRelativePath -BaseDir $stageRoot -RelativePath $relative -Context 'install_staged_bundled_profile'
-            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'install_bundled_profile'
-            $targetExists = Test-Path -LiteralPath $targetPath -PathType Leaf
-            if ($targetExists) {
-                $targetHash = Get-SynapseFileSha256 -Path $targetPath
-                if ($targetHash -eq $entry.sha256) {
-                    continue
-                }
-                if ([string]::IsNullOrWhiteSpace($rollbackRoot)) {
-                    $rollbackRoot = New-SynapseSetupRunDirectory -Root (Join-Path $ProfilesDir $script:SynapseBundledProfilesRollbackDirName) -Purpose 'profiles-rollback'
-                }
-                $backupPath = Join-SynapseProfileRelativePath -BaseDir $rollbackRoot -RelativePath $relative -Context 'backup_existing_profile'
-                Copy-SynapseProfileFileWithHashReadback -Source $targetPath -Destination $backupPath -ExpectedSha256 $targetHash -Context 'backup_existing_profile'
-                $overwritten += [pscustomobject]@{
-                    relative_path = $relative
-                    target_path = $targetPath
-                    backup_path = $backupPath
-                    original_sha256 = $targetHash
-                }
-            } else {
-                $copiedNew += [pscustomobject]@{
-                    relative_path = $relative
-                    target_path = $targetPath
-                }
-            }
-            Copy-SynapseProfileFileWithHashReadback -Source $stagedPath -Destination $targetPath -ExpectedSha256 $entry.sha256 -Context 'install_bundled_profile'
-        }
+        $proof = [IO.File]::ReadAllText("$CandidatePath.source-fingerprint")
+        if ($proof -notmatch '\A[0-9a-fA-F]{64}\z') { throw 'Missing or malformed source fingerprint' }
+        $current = Get-SynapseBuildSourceFingerprint -SourceDir $SourceDir
+        if ($proof -ine $current) { throw 'Source fingerprint no longer matches the build' }
+    } catch {
+        Die "SYNAPSE_SKIP_BUILD_SOURCE_UNVERIFIED FATAL path=$CandidatePath source=$SourceDir detail=$($_.Exception.Message) remediation=run setup without -SkipBuild to rebuild and record the current source fingerprint"
+    }
+}
 
-        foreach ($action in $retireActions) {
-            if (-not (Test-Path -LiteralPath $action.path -PathType Leaf)) { continue }
-            $currentHash = Get-SynapseFileSha256 -Path $action.path
-            if ($action.require_hash_match -and $currentHash -ne $action.prior_sha256) {
-                $preservedLegacyMismatches += [ordered]@{
-                    relative_path = $action.relative_path
-                    path = $action.path
-                    expected_sha256 = $action.prior_sha256
-                    actual_sha256 = $currentHash
-                    reason = 'legacy_retired_seed_hash_mismatch_preserved_as_custom'
-                }
-                continue
-            }
+function Assert-SynapseSkipBuildRevision {
+    # The daemon embeds its build revision (build.rs VERGEN_GIT_SHA, reported as
+    # health.build). That identity, not file mtime, proves the artifact matches HEAD.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$CandidateBuild,
+        [Parameter(Mandatory=$true)]$HeadIdentity,
+        [Parameter(Mandatory=$true)][string]$CandidatePath
+    )
 
-            if ([string]::IsNullOrWhiteSpace($quarantineRoot)) {
-                $quarantineRoot = New-SynapseSetupRunDirectory -Root (Join-Path $ProfilesDir $script:SynapseBundledProfilesQuarantineDirName) -Purpose 'retired'
-            }
-            $quarantinePath = Join-SynapseProfileRelativePath -BaseDir $quarantineRoot -RelativePath $action.relative_path -Context 'quarantine_retired_bundled_profile'
-            $quarantineParent = Split-Path -Parent $quarantinePath
-            if (-not [string]::IsNullOrWhiteSpace($quarantineParent)) {
-                New-Item -ItemType Directory -Force -Path $quarantineParent | Out-Null
-            }
-            Move-Item -LiteralPath $action.path -Destination $quarantinePath -Force
-            if (Test-Path -LiteralPath $action.path -PathType Leaf) {
-                Die "SYNAPSE_RETIRED_BUNDLED_PROFILE_QUARANTINE_FAILED path=$($action.path) quarantine=$quarantinePath remediation=setup moved a retired bundled profile but it remains active in the watched profile directory"
-            }
-            $quarantineHash = Get-SynapseFileSha256 -Path $quarantinePath
-            if ($quarantineHash -ne $currentHash) {
-                Die "SYNAPSE_RETIRED_BUNDLED_PROFILE_QUARANTINE_HASH_MISMATCH path=$($action.path) quarantine=$quarantinePath expected_sha256=$currentHash actual_sha256=$quarantineHash remediation=quarantined retired bundled profile bytes changed during move"
-            }
-            $quarantineRecord = [ordered]@{
-                relative_path = $action.relative_path
-                original_path = $action.path
-                quarantine_path = $quarantinePath
-                sha256 = $currentHash
-                reason = $action.reason
-            }
-            $quarantined += $quarantineRecord
-        }
+    $candidateRevision = ([string]$CandidateBuild) -replace '-dirty$', ''
+    $head = [string]$HeadIdentity.Revision
+    if ($candidateRevision -notmatch '^[0-9a-f]{7,40}$') {
+        Die "SYNAPSE_SKIP_BUILD_REVISION_UNKNOWN FATAL path=$CandidatePath candidate_build=$CandidateBuild head_revision=$head remediation=the candidate daemon does not report an embedded git revision (not a release build from a git checkout); run setup without -SkipBuild"
+    }
+    if (-not ($candidateRevision.StartsWith($head) -or $head.StartsWith($candidateRevision))) {
+        Die "SYNAPSE_SKIP_BUILD_REVISION_MISMATCH FATAL path=$CandidatePath candidate_build=$CandidateBuild head_revision=$head remediation=the artifact was built from a different revision than the current HEAD (for example another branch); run setup without -SkipBuild to rebuild the per-checkout target"
+    }
+    if (([string]$CandidateBuild) -match '-dirty$') {
+        Info "WARN: SkipBuild candidate build=$CandidateBuild was built from a dirty tree; revision matches HEAD=$head but uncommitted changes cannot be verified"
+    }
+    if ($HeadIdentity.Dirty) {
+        Info "WARN: SkipBuild source tree has uncommitted changes relative to HEAD=$head; candidate build=$CandidateBuild may not include them"
+    }
+}
 
-        $deployMismatches = @()
-        foreach ($entry in $sourceEntries) {
-            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $entry.relative_path -Context 'verify_installed_bundled_profile'
-            if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
-                $deployMismatches += "missing:$($entry.relative_path)"
-                continue
-            }
-            $targetHash = Get-SynapseFileSha256 -Path $targetPath
-            if ($targetHash -ne $entry.sha256) {
-                $deployMismatches += "hash_mismatch:$($entry.relative_path):expected=$($entry.sha256):actual=$targetHash"
-            }
-        }
-        if ($deployMismatches.Count -gt 0) {
-            Die "SYNAPSE_BUNDLED_PROFILES_DEPLOY_VERIFY_FAILED mismatches=$($deployMismatches -join ';') remediation=installed bundled profile set does not match the staged source manifest"
-        }
+function Get-SynapseCargoReleaseArtifactPath {
+    param([Parameter(Mandatory=$true)][string]$CargoTarget)
 
-        $staleOwnedStillActive = @()
-        foreach ($previous in @($previousMap.Values)) {
-            $relative = [string]$previous.relative_path
-            if ($sourceMap.ContainsKey($relative)) { continue }
-            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'verify_retired_previous_bundled_profile'
-            if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
-                $staleOwnedStillActive += $relative
-            }
+    $artifactRoot = [System.IO.Path]::GetFullPath($CargoTarget)
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_BUILD_TARGET)) {
+        if ($env:CARGO_BUILD_TARGET -notmatch '^[A-Za-z0-9_.-]+$') {
+            Die "SYNAPSE_CARGO_BUILD_TARGET_UNSUPPORTED value=$($env:CARGO_BUILD_TARGET) remediation=use a Cargo target triple name (for example x86_64-pc-windows-msvc), not a target JSON path, or unset CARGO_BUILD_TARGET"
         }
-        foreach ($legacy in @($script:SynapseLegacyRetiredBundledProfiles)) {
-            $relative = [string]$legacy.relative_path
-            if ($sourceMap.ContainsKey($relative)) { continue }
-            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'verify_retired_legacy_bundled_profile'
-            if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
-                $targetHash = Get-SynapseFileSha256 -Path $targetPath
-                if ($targetHash -eq ([string]$legacy.sha256).ToUpperInvariant()) {
-                    $staleOwnedStillActive += $relative
-                }
-            }
-        }
-        if ($staleOwnedStillActive.Count -gt 0) {
-            Die "SYNAPSE_RETIRED_BUNDLED_PROFILES_STILL_ACTIVE profiles=$($staleOwnedStillActive -join ',') remediation=retired setup-owned profile files must be absent from the watched top-level deployed profile directory"
-        }
+        $artifactRoot = Join-Path $artifactRoot $env:CARGO_BUILD_TARGET
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $artifactRoot 'release\synapse-mcp.exe'))
+}
 
-        $customProfiles = @()
-        foreach ($profile in @(Get-ChildItem -LiteralPath $ProfilesDir -Filter *.toml -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
-            $relative = Get-SynapseProfileRelativePath -BaseDir $ProfilesDir -Path $profile.FullName -Context 'classify_custom_profile'
-            if ($sourceMap.ContainsKey($relative)) { continue }
-            $customProfiles += [ordered]@{
-                relative_path = $relative
-                path = $profile.FullName
-                sha256 = Get-SynapseFileSha256 -Path $profile.FullName
-            }
-        }
+function Get-SynapseInstallDisposition {
+    param(
+        [Parameter(Mandatory=$true)][string]$CandidateHash,
+        [Parameter(Mandatory=$true)][string]$ExePath
+    )
 
-        $manifest = New-SynapseBundledProfilesManifestObject `
-            -SourceProfilesDir $SourceProfilesDir `
-            -ProfilesDir $ProfilesDir `
-            -Entries $sourceEntries `
-            -Quarantined $quarantined `
-            -PreservedCustomProfiles $customProfiles `
-            -PreservedLegacyRetiredHashMismatches $preservedLegacyMismatches
-        $manifestTempPath = Join-Path $ProfilesDir (".{0}.{1}.tmp" -f $script:SynapseBundledProfilesManifestFileName, [Guid]::NewGuid().ToString('N'))
-        Write-SynapseUtf8NoBomFile -Path $manifestTempPath -Text (($manifest | ConvertTo-Json -Depth 40) + "`n")
-        Move-Item -LiteralPath $manifestTempPath -Destination $manifestPath -Force
-        $manifestReadback = Read-SynapseBundledProfilesManifest -ManifestPath $manifestPath
-        if ([string]$manifestReadback.source_manifest_sha256 -ne [string]$manifest.source_manifest_sha256) {
-            Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_READBACK_MISMATCH path=$manifestPath expected_sha256=$($manifest.source_manifest_sha256) actual_sha256=$($manifestReadback.source_manifest_sha256) remediation=setup wrote the bundled profile ownership manifest but read back different content"
-        }
+    $installedHash = if (Test-Path -LiteralPath $ExePath -PathType Leaf) {
+        Get-SynapseFileSha256 -Path $ExePath
+    } else {
+        $null
+    }
+    return [pscustomobject]@{
+        InstalledHash = $installedHash
+        InstallRequired = ($null -eq $installedHash -or $installedHash -ne $CandidateHash)
+    }
+}
 
-        Info ("Bundled profile reconciliation complete source_files={0} bundled_profiles={1} custom_profiles={2} quarantined_retired={3} legacy_hash_mismatch_preserved={4} manifest={5} source_manifest_sha256={6}" -f `
-            $sourceEntries.Count,
-            @($sourceEntries | Where-Object { $_.profile_file }).Count,
-            $customProfiles.Count,
-            $quarantined.Count,
-            $preservedLegacyMismatches.Count,
-            $manifestPath,
-            $manifest.source_manifest_sha256)
-        return [pscustomobject]@{
-            ManifestPath = $manifestPath
-            SourceManifestSha256 = [string]$manifest.source_manifest_sha256
-            BundledFileCount = $sourceEntries.Count
-            BundledProfileCount = @($sourceEntries | Where-Object { $_.profile_file }).Count
-            CustomProfileCount = $customProfiles.Count
-            QuarantinedRetiredCount = $quarantined.Count
+function Restore-SynapseBinaryBackupAfterInstallFailure {
+    param(
+        [Parameter(Mandatory=$true)][string]$BackupPath,
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$ExpectedHash,
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$InstallError
+    )
+
+    # #129: a failed publication may already have put the verified old image back at
+    # $ExePath (connector bridges still map it, so it cannot be overwritten). Verify the
+    # bytes first; when they already match, the overwrite is redundant. Otherwise restore
+    # through rename (a mapped image can be retired aside) instead of an in-place copy.
+    $currentHash = $null
+    if (Test-Path -LiteralPath $ExePath -PathType Leaf) {
+        try { $currentHash = Get-SynapseFileSha256 -Path $ExePath } catch { $currentHash = $null }
+    }
+    try {
+        if ($currentHash -and $currentHash -eq $ExpectedHash) {
+            Info "SYNAPSE_BINARY_ROLLBACK_ALREADY_RESTORED path=$ExePath sha256=$currentHash reason=installed bytes already match the verified backup; overwrite skipped"
+        } else {
+            $null = Install-SynapseBinaryOverHeldImage -Source $BackupPath -Destination $ExePath
         }
     } catch {
-        $originalError = $_.Exception.Message
-        $rollbackErrors = @()
-        foreach ($newFile in @($copiedNew | Sort-Object relative_path -Descending)) {
-            try {
-                if (Test-Path -LiteralPath $newFile.target_path -PathType Leaf) {
-                    Remove-Item -LiteralPath $newFile.target_path -Force
-                }
-            } catch {
-                $rollbackErrors += "remove_new:$($newFile.relative_path):$($_.Exception.Message)"
-            }
-        }
-        foreach ($backup in @($overwritten | Sort-Object relative_path)) {
-            try {
-                Copy-SynapseProfileFileWithHashReadback -Source $backup.backup_path -Destination $backup.target_path -ExpectedSha256 $backup.original_sha256 -Context 'rollback_existing_profile'
-            } catch {
-                $rollbackErrors += "restore_overwritten:$($backup.relative_path):$($_.Exception.Message)"
-            }
-        }
-        foreach ($retired in @($quarantined | Sort-Object relative_path)) {
-            try {
-                if ((Test-Path -LiteralPath $retired.quarantine_path -PathType Leaf) -and -not (Test-Path -LiteralPath $retired.original_path -PathType Leaf)) {
-                    $parent = Split-Path -Parent $retired.original_path
-                    if (-not [string]::IsNullOrWhiteSpace($parent)) {
-                        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-                    }
-                    Move-Item -LiteralPath $retired.quarantine_path -Destination $retired.original_path -Force
-                }
-            } catch {
-                $rollbackErrors += "restore_quarantined:$($retired.relative_path):$($_.Exception.Message)"
-            }
-        }
-        if ($rollbackErrors.Count -gt 0) {
-            Die "SYNAPSE_BUNDLED_PROFILES_RECONCILE_FAILED_ROLLBACK_FAILED original_error=[$originalError] rollback_errors=$($rollbackErrors -join ';') remediation=profile deployment failed and automatic rollback did not fully restore the prior deployed bytes; inspect $ProfilesDir before restarting the daemon"
-        }
-        Die "SYNAPSE_BUNDLED_PROFILES_RECONCILE_FAILED error=[$originalError] rollback=completed remediation=setup restored prior deployed profile bytes; fix the named profile deployment error and rerun setup"
+        Die "SYNAPSE_BINARY_INSTALL_COPY_FAILED_ROLLBACK_COPY_FAILED path=$ExePath backup=$BackupPath install_error=$InstallError rollback_error=$($_.Exception.Message) remediation=restore the verified backup manually, then rerun setup"
     }
+    $restoredHash = Get-SynapseFileSha256 -Path $ExePath
+    if ($restoredHash -ne $ExpectedHash) {
+        Die "SYNAPSE_BINARY_INSTALL_COPY_FAILED_ROLLBACK_HASH_MISMATCH expected_sha256=$ExpectedHash actual_sha256=$restoredHash backup=$BackupPath install_error=$InstallError"
+    }
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Start-ScheduledTask -TaskName $TaskName
+    }
+    return $restoredHash
 }
 
 function New-SynapseSetupRunDirectory {
@@ -3935,6 +4154,246 @@ function New-SynapseSetupRunDirectory {
     return $path
 }
 
+# #16: run directories created by setup (staged binary copy, candidate DB) are removed
+# after use. Only an exact path strictly inside its owning root is ever deleted, never
+# through a reparse point, and cleanup failure never fails setup.
+function Test-SynapseTreeHasReparsePoint {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $pending = New-Object System.Collections.Generic.Queue[string]
+    $pending.Enqueue($Path)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)) {
+            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $true }
+            if ($child.PSIsContainer) { $pending.Enqueue($child.FullName) }
+        }
+    }
+    return $false
+}
+
+function Remove-SynapseSetupOwnedDirectory {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Root
+    )
+
+    try {
+        if (-not (Test-SynapsePathStrictlyInside -Path $Path -Root $Root)) {
+            Info "WARN: SYNAPSE_SETUP_CLEANUP_REFUSED reason=outside_owning_root path=$Path root=$Root"
+            return $false
+        }
+        $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+        $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+        if ((Split-Path -Parent $full) -ine $rootFull -or
+            (Split-Path -Leaf $full) -cnotmatch '^(daemon-binary|candidate)-\d{8}T\d{9}Z-\d+$') {
+            Info "WARN: SYNAPSE_SETUP_CLEANUP_REFUSED reason=not_owned_direct_child path=$full root=$rootFull"
+            return $false
+        }
+        if (-not (Test-Path -LiteralPath $full)) { return $true }
+        $reparse = [System.IO.FileAttributes]::ReparsePoint
+        if (-not (Test-Path -LiteralPath $Root -PathType Container) -or
+            ((Get-Item -LiteralPath $Root -Force).Attributes -band $reparse)) {
+            Info "WARN: SYNAPSE_SETUP_CLEANUP_REFUSED reason=root_missing_or_reparse_point path=$full root=$Root"
+            return $false
+        }
+        $item = Get-Item -LiteralPath $full -Force
+        $ancestorPath = $rootFull
+        while ($ancestorPath) {
+            if ((Get-Item -LiteralPath $ancestorPath -Force -ErrorAction Stop).Attributes -band $reparse) {
+                Info "WARN: SYNAPSE_SETUP_CLEANUP_REFUSED reason=reparse_ancestor path=$ancestorPath"
+                return $false
+            }
+            $ancestorPath = Split-Path -Parent $ancestorPath
+        }
+        if (-not $item.PSIsContainer -or ($item.Attributes -band $reparse) -or (Test-SynapseTreeHasReparsePoint -Path $full)) {
+            Info "WARN: SYNAPSE_SETUP_CLEANUP_REFUSED reason=reparse_point_or_not_a_directory path=$full"
+            return $false
+        }
+        $lastError = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+                break
+            } catch {
+                $lastError = $_.Exception.Message
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        if (Test-Path -LiteralPath $full) {
+            Info "WARN: SYNAPSE_SETUP_CLEANUP_INCOMPLETE path=$full error=$lastError remediation=remove the leftover setup run directory manually"
+            return $false
+        }
+        Info "Removed setup run directory path=$full"
+        return $true
+    } catch {
+        Info "WARN: SYNAPSE_SETUP_CLEANUP_FAILED path=$Path error=$($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-SynapseLegacySetupRunDirectories {
+    param([Parameter(Mandatory=$true)][string]$LogDir)
+
+    foreach ($name in @('setup-staging', 'setup-candidates')) {
+        $root = Join-Path $LogDir $name
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        try {
+            foreach ($child in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction Stop)) {
+                if ($child.Name -cmatch '^(daemon-binary|candidate)-\d{8}T\d{9}Z-\d+$' -and
+                    (Remove-SynapseSetupOwnedDirectory -Path $child.FullName -Root $root)) {
+                    $child.FullName
+                }
+            }
+        } catch {
+            Info "WARN: SYNAPSE_SETUP_CLEANUP_FAILED path=$root error=$($_.Exception.Message)"
+        }
+    }
+}
+
+function Register-SynapseSetupOwnedDirectory {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Root
+    )
+
+    $script:SynapseSetupOwnedDirectories = @($script:SynapseSetupOwnedDirectories) + @([pscustomobject]@{ Path = $Path; Root = $Root })
+}
+
+function Remove-SynapseSetupOwnedDirectories {
+    $remaining = @()
+    foreach ($entry in @($script:SynapseSetupOwnedDirectories)) {
+        if ($null -eq $entry) { continue }
+        if (-not (Remove-SynapseSetupOwnedDirectory -Path $entry.Path -Root $entry.Root)) { $remaining += $entry }
+    }
+    $script:SynapseSetupOwnedDirectories = $remaining
+}
+
+function Test-SynapseSharingViolation {
+    param([System.Exception]$Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        $win32Code = $current.HResult -band 0xFFFF
+        if ($win32Code -in @(32, 33)) {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
+function Copy-SynapseFileWithSharingRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [ValidateRange(1, 120000)][int]$TimeoutMs = 15000,
+        [ValidateRange(1, 5000)][int]$DelayMs = 200
+    )
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            if ($attempt -gt 1) {
+                Info "SYNAPSE_BINARY_COPY_RETRY_SUCCEEDED destination=$Destination attempts=$attempt elapsed_ms=$($timer.ElapsedMilliseconds)"
+            }
+            return
+        } catch {
+            if (-not (Test-SynapseSharingViolation -Exception $_.Exception) -or $timer.ElapsedMilliseconds -ge $TimeoutMs) {
+                throw
+            }
+            $sleepMs = Get-SynapseRetryDelayMs -Attempt $attempt -BaseMs $DelayMs -MaxMs 2000
+            Info "WARN: SYNAPSE_BINARY_COPY_SHARING_RETRY destination=$Destination attempt=$attempt elapsed_ms=$($timer.ElapsedMilliseconds) timeout_ms=$TimeoutMs next_delay_ms=$sleepMs"
+            Start-Sleep -Milliseconds $sleepMs
+        }
+    }
+}
+
+function Move-SynapseFileWithSharingRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [ValidateRange(1, 120000)][int]$TimeoutMs = 15000,
+        [ValidateRange(1, 5000)][int]$DelayMs = 200
+    )
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop
+            return
+        } catch {
+            if (-not (Test-SynapseSharingViolation -Exception $_.Exception) -or $timer.ElapsedMilliseconds -ge $TimeoutMs) { throw }
+            Start-Sleep -Milliseconds (Get-SynapseRetryDelayMs -Attempt $attempt -BaseMs $DelayMs -MaxMs 2000)
+        }
+    }
+}
+
+function Install-SynapseBinaryOverHeldImage {
+    # Connector-held images support rename. Prepare and hash the adjacent candidate
+    # before retiring the live image, then publish by same-directory rename.
+    param([Parameter(Mandatory = $true)][string]$Source, [Parameter(Mandatory = $true)][string]$Destination)
+    if (-not (Test-Path -LiteralPath $Source)) { throw "SYNAPSE_BINARY_INSTALL_SOURCE_MISSING source=$Source" }
+    $incomingPath = '{0}.incoming-{1}' -f $Destination, [guid]::NewGuid().ToString('N')
+    $sourceHash = Get-SynapseFileSha256 -Path $Source
+    $retiredPath = $null
+    try {
+        Copy-SynapseFileWithSharingRetry -Source $Source -Destination $incomingPath
+        if ((Get-SynapseFileSha256 -Path $incomingPath) -ne $sourceHash) {
+            throw "SYNAPSE_INSTALL_PREPARED_HASH_MISMATCH source=$Source incoming=$incomingPath expected_sha256=$sourceHash"
+        }
+        if (Test-Path -LiteralPath $Destination) {
+            $retiredPath = '{0}.retired-{1}' -f $Destination, [guid]::NewGuid().ToString('N')
+            Move-SynapseFileWithSharingRetry -Source $Destination -Destination $retiredPath
+        }
+        Move-SynapseFileWithSharingRetry -Source $incomingPath -Destination $Destination
+    } catch {
+        $installError = $_.Exception.Message
+        if ($retiredPath -and (Test-Path -LiteralPath $retiredPath) -and -not (Test-Path -LiteralPath $Destination)) {
+            Move-SynapseFileWithSharingRetry -Source $retiredPath -Destination $Destination
+        }
+        throw "SYNAPSE_BINARY_INSTALL_PUBLISH_FAILED destination=$Destination error=$installError"
+    } finally {
+        if (Test-Path -LiteralPath $incomingPath) { Remove-Item -LiteralPath $incomingPath -Force -ErrorAction SilentlyContinue }
+    }
+    if ($retiredPath) {
+        try {
+            Remove-Item -LiteralPath $retiredPath -Force -ErrorAction Stop
+            Info "SYNAPSE_BINARY_HELD_IMAGE_RETIRED destination=$Destination retired=<deleted> holders=none"
+            $retiredPath = $null
+        } catch {
+            Info "SYNAPSE_BINARY_HELD_IMAGE_RETIRED destination=$Destination retired=$retiredPath holders=live (connect bridges keep running from the retired image; removed by a later setup run)"
+        }
+    }
+    $leaf = Split-Path -Leaf $Destination
+    Get-ChildItem -LiteralPath (Split-Path -Parent $Destination) -Filter "$leaf.retired-*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ine $retiredPath } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    return [pscustomobject]@{ Destination = $Destination; RetiredPath = $retiredPath }
+}
+
+function Test-SynapseInstalledHealthIdentity {
+    param($Health, [string]$ExePath, [string]$DbPath)
+
+    if (-not $Health.ok) { return $false }
+    try {
+        $liveProcess = Get-Process -Id ([int]$Health.pid) -ErrorAction Stop
+        $run = Get-Content -LiteralPath (Join-Path $DbPath 'daemon-run-current.json') -Raw | ConvertFrom-Json
+        return (
+            [System.IO.Path]::GetFullPath($liveProcess.Path) -ieq [System.IO.Path]::GetFullPath($ExePath) -and
+            [int]$run.pid -eq [int]$Health.pid -and
+            $run.mode -eq 'http' -and
+            [int64]$run.started_at_unix_ms -gt 0 -and
+            $null -eq $run.ended_at_unix_ms -and
+            [System.IO.Path]::GetFullPath($run.db_path) -ieq [System.IO.Path]::GetFullPath($DbPath)
+        )
+    } catch { return $false }
+}
+
 function New-SynapseStagedDaemonBinary {
     param(
         [Parameter(Mandatory=$true)][string]$BuiltPath,
@@ -3943,6 +4402,7 @@ function New-SynapseStagedDaemonBinary {
 
     $stagingRoot = Join-Path $LogDir 'setup-staging'
     $stagingDir = New-SynapseSetupRunDirectory -Root $stagingRoot -Purpose 'daemon-binary'
+    Register-SynapseSetupOwnedDirectory -Path $stagingDir -Root $stagingRoot
     $builtHash = Get-SynapseFileSha256 -Path $BuiltPath
     $stagedPath = Join-Path $stagingDir "synapse-mcp-$builtHash.exe"
     Copy-Item -LiteralPath $BuiltPath -Destination $stagedPath -Force
@@ -3956,6 +4416,79 @@ function New-SynapseStagedDaemonBinary {
         Sha256 = $stagedHash
         SourcePath = $BuiltPath
     }
+}
+
+function Resolve-SynapseInstallSource {
+    param(
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$CargoTarget,
+        [Parameter(Mandatory=$true)][bool]$CargoTargetExplicit,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [string]$SourceDir, [string]$BuiltPath,
+        [switch]$SkipBuild, [switch]$PostExitUseInstalledBinary,
+        [string]$PostExitInstalledSha256
+    )
+
+    $headIdentity = $null
+    if ($SkipBuild -and $PostExitUseInstalledBinary) {
+        if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
+            Die "SYNAPSE_POST_EXIT_INSTALLED_BINARY_MISSING path=$ExePath remediation=continuation requires the already-installed verified daemon binary; rerun full setup to rebuild and reinstall"
+        }
+        $installSourcePath = $ExePath
+        $installSourceHash = Get-SynapseFileSha256 -Path $installSourcePath
+        if ($installSourceHash -ne $PostExitInstalledSha256) {
+            Die "SYNAPSE_POST_EXIT_INSTALLED_BINARY_REPLACED path=$ExePath expected_sha256=$PostExitInstalledSha256 actual_sha256=$installSourceHash remediation=the installed daemon bytes changed after the parent verified them; rerun full setup without -SkipBuild"
+        }
+        Info "Post-exit SkipBuild candidate binary path=$installSourcePath sha256=$installSourceHash"
+    } elseif ($SkipBuild) {
+        $skipSource = if ($SourceDir) { $SourceDir } else { Split-Path -Parent $PSScriptRoot }
+        if (-not $CargoTargetExplicit) {
+            $CargoTarget = Get-SynapseCheckoutCargoTarget -Root $CargoTarget -SourceDir $skipSource
+            Info "Per-checkout build target: $CargoTarget (source: $skipSource)"
+        }
+        $headIdentity = Get-SynapseSkipBuildHeadIdentity -SourceDir $skipSource
+        $installSourcePath = Resolve-SynapseSkipBuildCandidatePath -CargoTarget $CargoTarget -MinimumWriteTimeUtc $headIdentity.CommitTimeUtc
+        $installSourceHash = Get-SynapseFileSha256 -Path $installSourcePath
+        Info "SkipBuild candidate binary path=$installSourcePath cargo_target=$CargoTarget sha256=$installSourceHash"
+    } else {
+        $staged = New-SynapseStagedDaemonBinary -BuiltPath $BuiltPath -LogDir $LogDir
+        $installSourcePath = $staged.Path
+        $installSourceHash = $staged.Sha256
+    }
+    return [pscustomobject]@{ Path = $installSourcePath; Sha256 = $installSourceHash; CargoTarget = $CargoTarget; HeadIdentity = $headIdentity }
+}
+
+function Invoke-SynapseInstallHealthRollback {
+    param(
+        [Parameter(Mandatory=$true)][string]$BackupPath,
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$ExpectedHash,
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$FailureDetail,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [ValidateRange(1, 3600)][int]$HealthTimeoutSeconds = 600
+    )
+
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
+    Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -TimeoutSeconds 300
+    $hash = Restore-SynapseBinaryBackupAfterInstallFailure -BackupPath $BackupPath -ExePath $ExePath `
+        -ExpectedHash $ExpectedHash -TaskName $TaskName -InstallError $FailureDetail
+    $deadline = (Get-Date).AddSeconds($HealthTimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        try {
+            $health = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
+            if (Test-SynapseInstalledHealthIdentity -Health $health -ExePath $ExePath -DbPath $DbPath) {
+                return [pscustomobject]@{ Ok = $true; RollbackHash = $hash; Pid = [int]$health.pid }
+            }
+        } catch { }
+    }
+    return [pscustomobject]@{ Ok = $false; RollbackHash = $hash; Pid = $null }
 }
 
 function New-SynapseCandidateBind {
@@ -4030,72 +4563,49 @@ function Test-SynapseCandidateDaemon {
         Die "$($tokenRead.Code) stage=candidate_health $($tokenRead.Detail) remediation=setup must have a valid bearer token before candidate health can be proven"
     }
 
-    $candidateRoot = New-SynapseSetupRunDirectory -Root (Join-Path $LogDir 'setup-candidates') -Purpose 'candidate'
+    $candidatesRoot = Join-Path $LogDir 'setup-candidates'
+    $candidateRoot = New-SynapseSetupRunDirectory -Root $candidatesRoot -Purpose 'candidate'
+    Register-SynapseSetupOwnedDirectory -Path $candidateRoot -Root $candidatesRoot
     $candidateDb = Join-Path $candidateRoot 'db'
-    $candidateShellJobRoot = Join-Path $candidateRoot 'shell-jobs'
     New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
-    New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
-    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
+    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb profiles=$ProfilesDir"
 
     $candidate = $null
     $health = $null
-    $lastHealthError = $null
     $surface = $null
     try {
-        $previousShellJobRoot = Get-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
-        try {
-            $env:SYNAPSE_SHELL_JOB_ROOT = $candidateShellJobRoot
-            $candidate = Start-Process `
-                -FilePath $CandidateExePath `
-                -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--log-level','info') `
-                -WindowStyle Hidden `
-                -PassThru
-        } finally {
-            if ($previousShellJobRoot) {
-                $env:SYNAPSE_SHELL_JOB_ROOT = $previousShellJobRoot.Value
-            } else {
-                Remove-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
-            }
-        }
+        $candidate = Start-Process `
+            -FilePath $CandidateExePath `
+            -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--log-level','info') `
+            -WindowStyle Hidden `
+            -PassThru
         $deadline = (Get-Date).AddSeconds(25)
         do {
             Start-Sleep -Milliseconds 500
             $read = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token
-            if ($read.Ok) {
+            if ($read.Ok -and $read.Health.ok) {
                 $health = $read.Health
                 break
             }
-            $lastHealthError = $read.Error
         } while ((Get-Date) -lt $deadline)
 
         if ($null -eq $health) {
             $alive = [bool](Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)
             $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $candidateBind)
-            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} last_error={6} remediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
+            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} remediation=the newly built daemon was not healthy on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
                 $CandidateExePath,
                 $candidateHash,
                 $candidate.Id,
                 $alive,
                 $candidateBind,
-                (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
-                $lastHealthError)
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners))
         }
 
         $healthPid = [int]$health.pid
         if ($healthPid -ne [int]$candidate.Id) {
             Die "SYNAPSE_CANDIDATE_PID_MISMATCH expected_pid=$($candidate.Id) health_pid=$healthPid bind=$candidateBind remediation=health came from an unexpected process; refusing handoff"
-        }
-        if ($health.ok -ne $true) {
-            $subsystemStatuses = @()
-            if ($health.subsystems) {
-                foreach ($prop in @($health.subsystems.PSObject.Properties | Sort-Object Name)) {
-                    $subsystemStatuses += ("{0}={1}" -f $prop.Name, ([string]$prop.Value.status))
-                }
-            }
-            $statusText = if ($subsystemStatuses.Count -gt 0) { $subsystemStatuses -join ',' } else { '<none>' }
-            Info "WARN: candidate daemon /health returned ok=false during isolated preflight; continuing with pid/tool-surface validation subsystem_statuses=$statusText"
         }
         $surface = Read-SynapseDaemonToolSurface -Bind $candidateBind -Token $tokenRead.Token -Health $health
         if ($surface.tool_count -lt 1) {
@@ -4107,9 +4617,9 @@ function Test-SynapseCandidateDaemon {
             Pid = $healthPid
             Bind = $candidateBind
             DbPath = $candidateDb
-            ShellJobRoot = $candidateShellJobRoot
             ExePath = $CandidateExePath
             Sha256 = $candidateHash
+            Build = [string]$health.build
             ToolCount = $surface.tool_count
             ToolSurfaceSha256 = $surface.tool_surface_sha256
             ToolNames = $surface.tool_names
@@ -4127,6 +4637,33 @@ function Test-SynapseCandidateDaemon {
         } elseif ($candidateBind) {
             Wait-SynapseBindReleased -Reason 'candidate_health' -Bind $candidateBind -TimeoutSeconds 5
         }
+        # #16: the candidate DB is disposable; remove the exact run directory after the process exits.
+        $null = Remove-SynapseSetupOwnedDirectory -Path $candidateRoot -Root $candidatesRoot
+    }
+}
+
+function Assert-SynapseRefreshToolSurface {
+    # #65: the expected surface size comes from the daemon's own public tool registry
+    # (PUBLIC_TOOL_LIMIT authority, reported in health), never from a literal in this script.
+    param(
+        [Parameter(Mandatory=$true)]$Surface,
+        [Parameter(Mandatory=$true)]$Health,
+        [Parameter(Mandatory=$true)][string]$Bind
+    )
+
+    $registry = $null
+    if ($Health.subsystems -and $Health.subsystems.PSObject.Properties['public_tool_registry']) {
+        $registry = $Health.subsystems.public_tool_registry
+    }
+    $detail = if ($registry) { [string]$registry.detail } else { '' }
+    if ($detail -notmatch '\bpublic_tool_count=(?<public>\d+)\s+max_public_tool_count=(?<max>\d+)\b') {
+        Die "SYNAPSE_TOOL_SURFACE_REFRESH_AUTHORITY_MISSING bind=$Bind remediation=health.subsystems.public_tool_registry.detail did not report public_tool_count and max_public_tool_count; repair the daemon before refreshing"
+    }
+    $registryCount = [int]$Matches['public']
+    $registryMax = [int]$Matches['max']
+    $count = [int]$Surface.tool_count
+    if ($count -lt 1 -or $count -ne $registryCount -or $registryCount -gt $registryMax -or [int]$Surface.daemon_pid -ne [int]$Health.pid) {
+        Die "SYNAPSE_TOOL_SURFACE_REFRESH_MISMATCH bind=$Bind tools_list_count=$count registry_public_tool_count=$registryCount registry_max_public_tool_count=$registryMax surface_pid=$($Surface.daemon_pid) health_pid=$($Health.pid) remediation=repair daemon PID or tool surface so tools/list matches the public tool registry before refreshing"
     }
 }
 
@@ -4136,14 +4673,30 @@ function Write-SynapseCodexToolSurfaceSnapshot {
         [Parameter(Mandatory=$true)]$Surface
     )
 
+    if ([string]$Surface.tool_surface_setup_canonical_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$Surface.tool_surface_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        Die "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_HASH_INVALID path=$Path remediation=refresh from a live MCP tools/list and health tool; placeholder or non-digest hashes are forbidden"
+    }
+
+    $temporaryPath = $null
     try {
         $dir = Split-Path -Parent $Path
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         $json = $Surface | ConvertTo-Json -Depth 20
         $encoding = [System.Text.UTF8Encoding]::new($false)
-        [System.IO.File]::WriteAllText($Path, $json, $encoding)
+        $temporaryPath = Join-Path $dir ('.{0}.incoming-{1}' -f (Split-Path -Leaf $Path), [guid]::NewGuid().ToString('N'))
+        [System.IO.File]::WriteAllText($temporaryPath, $json, $encoding)
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Replace($temporaryPath, $Path, [System.Management.Automation.Language.NullString]::Value)
+        } else {
+            [System.IO.File]::Move($temporaryPath, $Path)
+        }
     } catch {
         Die "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_WRITE_FAILED path=$Path error=$($_.Exception.Message) remediation=repair permissions on the Synapse appdata directory before starting Codex"
+    } finally {
+        if ($temporaryPath -and (Test-Path -LiteralPath $temporaryPath)) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
     }
     Info "Codex tool-surface snapshot written path=$Path daemon_pid=$($Surface.daemon_pid) tool_count=$($Surface.tool_count) tool_surface_sha256=$($Surface.tool_surface_sha256)"
 }
@@ -4745,6 +5298,7 @@ function Start-SynapsePostExitSetupContinuation {
         [Parameter(Mandatory=$true)][string]$CodexToolSurfaceSnapshotPath,
         [Parameter(Mandatory=$true)][string]$TaskName,
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [Parameter(Mandatory=$true)][string]$InstalledBinarySha256,
         [string]$ActiveIssue,
         [object]$DeadOwnerDetail
     )
@@ -4803,7 +5357,10 @@ function Start-SynapsePostExitSetupContinuation {
         '-PostExitManifestPath',
         $manifestPath,
         '-ForceRestart',
-        '-SkipBuild'
+        '-SkipBuild',
+        '-PostExitUseInstalledBinary',
+        '-PostExitInstalledSha256',
+        $InstalledBinarySha256
     )
     if (-not [string]::IsNullOrWhiteSpace($ActiveIssue)) {
         $args += @('-ActiveIssue', $ActiveIssue)
@@ -4812,7 +5369,18 @@ function Start-SynapsePostExitSetupContinuation {
         $args += '-SkipClientWiring'
     }
     $continuationTaskName = "SynapsePostExitSetup-$runId"
-    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-WindowsCommandArgument -Value $wrapperPath)"
+    # Never hand Task Scheduler a console program directly: powershell.exe would flash
+    # a visible terminal before -WindowStyle Hidden applies. run-hidden.vbs starts it
+    # hidden from the windowless wscript.exe host and returns its exit code.
+    $hiddenRunnerPath = Join-Path $PSScriptRoot 'run-hidden.vbs'
+    if (-not (Test-Path -LiteralPath $hiddenRunnerPath -PathType Leaf)) {
+        Die "SYNAPSE_HIDDEN_RUNNER_MISSING path=$hiddenRunnerPath remediation=restore scripts\run-hidden.vbs from the Synapse checkout; the continuation task must never start powershell.exe with a visible console"
+    }
+    $hiddenAction = Format-SynapseHiddenRunnerAction `
+        -WscriptPath (Join-Path $env:SystemRoot 'System32\wscript.exe') `
+        -RunnerPath $hiddenRunnerPath `
+        -ArgumentList @($launcherPath, '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $wrapperPath)
+    $taskArgument = $hiddenAction.Argument
     $argLiteralLines = @($args | ForEach-Object { "    $(Quote-PowerShellSingleQuotedString -Value $_)" })
     $wrapperLines = @(
         '$ErrorActionPreference = ''Stop''',
@@ -4854,6 +5422,7 @@ function Start-SynapsePostExitSetupContinuation {
         parent_pid = $PID
         launch_mode = 'scheduled_task'
         task_name = $continuationTaskName
+        task_execute = $hiddenAction.Execute
         task_argument = $taskArgument
         launcher_path = $launcherPath
         wrapper_path = $wrapperPath
@@ -4873,16 +5442,7 @@ function Start-SynapsePostExitSetupContinuation {
         if (Get-ScheduledTask -TaskName $continuationTaskName -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $continuationTaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
-        # Never hand Task Scheduler a console program directly: powershell.exe would flash a
-        # visible terminal before -WindowStyle Hidden applies. run-hidden.vbs starts it hidden
-        # from the windowless wscript.exe host and returns its exit code as the task result.
-        $hiddenRunner = Join-Path $SourceDir 'scripts\run-hidden.vbs'
-        if (-not (Test-Path -LiteralPath $hiddenRunner -PathType Leaf)) {
-            throw "SYNAPSE_HIDDEN_RUNNER_MISSING path=$hiddenRunner"
-        }
-        $wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
-        $hiddenArgument = "//B //Nologo $(Quote-WindowsCommandArgument -Value $hiddenRunner) $(Quote-WindowsCommandArgument -Value $launcherPath) -WindowStyle Hidden $taskArgument"
-        $action = New-ScheduledTaskAction -Execute $wscriptExe -Argument $hiddenArgument -WorkingDirectory $SourceDir
+        $action = New-ScheduledTaskAction -Execute $hiddenAction.Execute -Argument $hiddenAction.Argument -WorkingDirectory $SourceDir
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
@@ -5410,25 +5970,55 @@ function Request-SynapseChromeBridgeMaintenancePause {
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$Token,
         [Parameter(Mandatory=$true)][string]$Reason,
-        [int]$PauseMs = $SynapseChromeBridgeMaintenancePauseMs
+        [int]$PauseMs = $SynapseChromeBridgeMaintenancePauseMs,
+        [int]$HealthTimeoutSec = $SynapseChromeBridgeMaintenancePauseHealthTimeoutSec
     )
 
-    try {
-        $health = Invoke-RestMethod `
-            -Method Get `
-            -Uri "http://$Bind/health" `
-            -Headers @{ Authorization = "Bearer $Token" } `
-            -UserAgent "synapse-setup/$Reason" `
-            -TimeoutSec 4
-    } catch {
-        return [pscustomobject]@{
-            Ok = $false
-            Skipped = $false
-            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_FAILED'
-            Response = $null
-            Error = $_.Exception.Message
-            Detail = $null
+    # #140: the daemon answers a degraded payload when /health exceeds its 3 s
+    # bound (old daemons omit chrome_bridge, new ones report it as unknown).
+    # That is a slow host, not a missing bridge: retry within the budget, then
+    # skip the pause with a warning instead of aborting the restart.
+    $degradedAttempts = 0
+    while ($true) {
+        try {
+            $health = Invoke-RestMethod `
+                -Method Get `
+                -Uri "http://$Bind/health" `
+                -Headers @{ Authorization = "Bearer $Token" } `
+                -UserAgent "synapse-setup/$Reason" `
+                -TimeoutSec $HealthTimeoutSec
+        } catch {
+            return [pscustomobject]@{
+                Ok = $false
+                Skipped = $false
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_FAILED'
+                Response = $null
+                Error = $_.Exception.Message
+                Detail = $null
+            }
         }
+
+        $healthSubsystem = $health.subsystems.health
+        $bridgeProbe = $health.subsystems.chrome_bridge
+        $healthDegraded = ($null -ne $healthSubsystem -and "$($healthSubsystem.status)" -eq 'degraded') -or
+            ($null -ne $bridgeProbe -and "$($bridgeProbe.status)" -eq 'unknown')
+        if (-not $healthDegraded) {
+            break
+        }
+        if ($degradedAttempts -ge $SynapseChromeBridgeMaintenancePauseDegradedRetries) {
+            $degradedDetail = "health degraded after $($degradedAttempts + 1) probes: $($healthSubsystem.detail) chrome_bridge=$($bridgeProbe.detail)"
+            Write-Warning "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_HEALTH_DEGRADED reason=$Reason bind=$Bind $degradedDetail; continuing without a bridge pause"
+            return [pscustomobject]@{
+                Ok = $true
+                Skipped = $true
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_HEALTH_DEGRADED'
+                Response = $health
+                Error = $null
+                Detail = $degradedDetail
+            }
+        }
+        $degradedAttempts++
+        Start-Sleep -Seconds $SynapseChromeBridgeMaintenancePauseDegradedRetryDelaySec
     }
 
     $chromeBridge = $health.subsystems.chrome_bridge
@@ -5445,7 +6035,7 @@ function Request-SynapseChromeBridgeMaintenancePause {
 
     $status = "$($chromeBridge.status)"
     $detail = "$($chromeBridge.detail)"
-    if ($detail -match 'no_active_chrome_bridge_host') {
+    if ($detail -match 'no_active_chrome_bridge_host' -or $status -in @('unavailable', 'disconnected', 'disabled')) {
         return [pscustomobject]@{
             Ok = $true
             Skipped = $true
@@ -6041,7 +6631,9 @@ function Assert-SynapseChromeNativeHostStopTarget {
             $current.ExecutablePath,
             $current.CommandLine)
     }
-    if ($current.CommandLine -notmatch 'chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/') {
+    $legacyBrowserRow = Get-SynapseBrowserRow -Browser $SynapseLegacyBrowserId
+    $legacyBridgeOrigin = "$($legacyBrowserRow.extension.origin_scheme)://$($legacyBrowserRow.extension.id)/"
+    if ($current.CommandLine -notmatch [regex]::Escape($legacyBridgeOrigin)) {
         Die ("SYNAPSE_CHROME_NATIVE_HOST_STOP_UNVERIFIED pid={0} name={1} command_line={2} remediation=command line does not prove the Synapse Chrome extension bridge target; refusing exact-PID stop" -f `
             $pidValue,
             $current.Name,
@@ -6092,13 +6684,169 @@ function Stop-SynapseChromeNativeHostProcesses {
 }
 
 # ---------------------------------------------------------------------------
+# Purge scope (#181): -Remove -Purge deletes only explicit Synapse-owned paths.
+# Nothing is ever derived from a caller-supplied path by taking its parent.
+# ---------------------------------------------------------------------------
+function Test-SynapsePathStrictlyInside {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($rootFull)) { return $false }
+    return $full.StartsWith($rootFull + $sep, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-SynapsePurgePlan {
+    param(
+        [Parameter(Mandatory)][string]$DbPath,
+        [Parameter(Mandatory)][string]$ProfilesDir,
+        [Parameter(Mandatory)][string]$TokenPath,
+        [Parameter(Mandatory)][string]$AppDataSynapseDir,
+        [Parameter(Mandatory)][string[]]$AllowedRoots,
+        [string[]]$AllowedExactDirs = @()
+    )
+    $refuse = {
+        param([string]$What, [string]$Path)
+        throw "SYNAPSE_PURGE_PATH_REFUSED what=$What path=$Path remediation=point it inside a Synapse root ($($AllowedRoots -join '; ')) or omit -Purge"
+    }
+    # Named Synapse-owned entries under %APPDATA%\synapse; everything else there is foreign.
+    $appDataFiles = @('token.txt', 'chrome-bridge-token.txt', 'chrome-bridge-deferred-repair.txt', 'codex-tool-surface.json')
+    $appDataDirs = @('chrome-debugger')
+    $targets = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @(@('DbPath', $DbPath), @('ProfilesDir', $ProfilesDir))) {
+        $full = [System.IO.Path]::GetFullPath($entry[1]).TrimEnd('\', '/')
+        $allowed = $false
+        foreach ($root in $AllowedRoots) { if (Test-SynapsePathStrictlyInside -Path $full -Root $root) { $allowed = $true } }
+        foreach ($exact in $AllowedExactDirs) {
+            if ($full -ieq [System.IO.Path]::GetFullPath($exact).TrimEnd('\', '/')) { $allowed = $true }
+        }
+        if (-not $allowed) { & $refuse $entry[0] $entry[1] }
+        if (Test-Path -LiteralPath $full -PathType Leaf) { & $refuse "$($entry[0])_is_a_file" $entry[1] }
+        if ((Test-Path -LiteralPath $full -PathType Container) -and
+            ((Get-Item -LiteralPath $full -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            & $refuse "$($entry[0])_is_a_reparse_point" $entry[1]
+        }
+        $targets.Add([pscustomobject]@{ Path = $full; Recurse = $true })
+    }
+    # The token is deleted as a single FILE; its parent directory is never touched.
+    if (Test-Path -LiteralPath $TokenPath -PathType Container) { & $refuse 'TokenPath_is_a_directory' $TokenPath }
+    $targets.Add([pscustomobject]@{ Path = [System.IO.Path]::GetFullPath($TokenPath); Recurse = $false })
+    foreach ($name in $appDataFiles) {
+        $targets.Add([pscustomobject]@{ Path = [System.IO.Path]::GetFullPath((Join-Path $AppDataSynapseDir $name)); Recurse = $false })
+    }
+    foreach ($name in $appDataDirs) {
+        $targets.Add([pscustomobject]@{ Path = [System.IO.Path]::GetFullPath((Join-Path $AppDataSynapseDir $name)); Recurse = $true })
+    }
+    # Preflight the complete plan, including ancestors and named appdata entries,
+    # before returning any deletion target. PowerShell 5.1 can recurse through junctions.
+    foreach ($target in $targets) {
+        $ancestorPath = $target.Path
+        while ($ancestorPath) {
+            if (Test-Path -LiteralPath $ancestorPath) {
+                $ancestor = Get-Item -LiteralPath $ancestorPath -Force -ErrorAction Stop
+                if ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    & $refuse 'reparse_path' $ancestorPath
+                }
+            }
+            $ancestorPath = Split-Path -Parent $ancestorPath
+        }
+        if (-not $target.Recurse -or -not (Test-Path -LiteralPath $target.Path -PathType Container)) { continue }
+        $pending = New-Object System.Collections.Generic.Queue[string]
+        $pending.Enqueue($target.Path)
+        while ($pending.Count -gt 0) {
+            $directory = $pending.Dequeue()
+            foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+                if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { & $refuse 'reparse_descendant' $child.FullName }
+                if ($child.PSIsContainer) { $pending.Enqueue($child.FullName) }
+            }
+        }
+    }
+    $seen = @{}
+    foreach ($t in $targets) {
+        $key = $t.Path.ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $t }
+    }
+}
+
+function Invoke-SynapsePurge {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)][string]$DbPath,
+        [Parameter(Mandatory)][string]$ProfilesDir,
+        [Parameter(Mandatory)][string]$TokenPath,
+        [Parameter(Mandatory)][string]$AppDataSynapseDir,
+        [Parameter(Mandatory)][string[]]$AllowedRoots,
+        [string[]]$AllowedExactDirs = @(),
+        [switch]$Force
+    )
+    $plan = @(Get-SynapsePurgePlan -DbPath $DbPath -ProfilesDir $ProfilesDir -TokenPath $TokenPath `
+            -AppDataSynapseDir $AppDataSynapseDir -AllowedRoots $AllowedRoots -AllowedExactDirs $AllowedExactDirs)
+    $existing = @($plan | Where-Object { Test-Path -LiteralPath $_.Path })
+    Info "Purge will delete exactly these $($existing.Count) existing Synapse-owned path(s):"
+    foreach ($t in $existing) { Info "  $(if ($t.Recurse) { '[dir] ' } else { '[file]' }) $($t.Path)" }
+    if ($existing.Count -eq 0) { return }
+    if (-not ($Force -or $PSCmdlet.ShouldProcess(($existing.Path -join '; '), 'Delete Synapse data (-Purge)'))) {
+        Info 'Purge skipped (not confirmed). Pass -Force to delete without a prompt.'
+        return
+    }
+    foreach ($t in $existing) {
+        if ($t.Recurse) { Remove-Item -LiteralPath $t.Path -Recurse -Force } else { Remove-Item -LiteralPath $t.Path -Force }
+        Info "Deleted $($t.Path)"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Uninstall path
 # ---------------------------------------------------------------------------
-$maintenanceReason = if ($Remove) { 'remove' } else { 'setup' }
+$maintenanceReason = if ($Remove) { 'remove' } elseif ($RefreshToolSurfaceOnly) { 'tool_surface_refresh' } else { 'setup' }
+if (-not $Remove -and -not $RefreshToolSurfaceOnly) {
+    # #15: pure input is validated before the maintenance lock, build, staging, or
+    # candidate preflight so a typo cannot waste a build or leave prepared files.
+    $null = Get-SynapseNormalizedIssueRef -Issue $ActiveIssue
+}
+if ($RefreshToolSurfaceOnly -and ($Remove -or $Purge -or $ForceRestart)) {
+    Die 'SYNAPSE_TOOL_SURFACE_REFRESH_FLAGS_INVALID remediation=refresh cannot be combined with remove, purge, or force restart'
+}
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
+if (-not $Remove -and -not $RefreshToolSurfaceOnly) {
+    $null = Remove-SynapseLegacySetupRunDirectories -LogDir $LogDir
+}
+
+if ($RefreshToolSurfaceOnly) {
+    if (-not (Test-Path -LiteralPath $TokenPath -PathType Leaf)) {
+        Die "SYNAPSE_TOOL_SURFACE_REFRESH_TOKEN_MISSING path=$TokenPath remediation=restore the existing daemon token before refreshing"
+    }
+    $refreshToken = (Get-Content -Raw -LiteralPath $TokenPath).Trim()
+    try {
+        $refreshHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $refreshToken" } -TimeoutSec 5
+    } catch {
+        Die "SYNAPSE_TOOL_SURFACE_REFRESH_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=start or repair the authenticated daemon before refreshing"
+    }
+    $refreshSurface = Read-SynapseDaemonToolSurface -Bind $Bind -Token $refreshToken -Health $refreshHealth
+    Assert-SynapseRefreshToolSurface -Surface $refreshSurface -Health $refreshHealth -Bind $Bind
+    Write-SynapseCodexToolSurfaceSnapshot -Path $CodexToolSurfaceSnapshotPath -Surface $refreshSurface
+    $writtenSurface = Get-Content -Raw -LiteralPath $CodexToolSurfaceSnapshotPath | ConvertFrom-Json
+    if ($writtenSurface.tool_surface_setup_canonical_sha256 -cne $refreshSurface.tool_surface_setup_canonical_sha256 -or
+        $writtenSurface.tool_surface_sha256 -cne $refreshSurface.tool_surface_sha256) {
+        Die "SYNAPSE_TOOL_SURFACE_REFRESH_READBACK_MISMATCH path=$CodexToolSurfaceSnapshotPath remediation=repair snapshot storage before using it"
+    }
+    Info "Tool-surface refresh verified daemon_pid=$($refreshSurface.daemon_pid) tool_count=$($refreshSurface.tool_count) canonical_sha256=$($refreshSurface.tool_surface_setup_canonical_sha256)"
+    Release-SynapseSetupMaintenanceLock -State released
+    return
+}
 
 if ($Remove) {
+    $SynapsePurgeArgs = @{
+        DbPath = $DbPath; ProfilesDir = $ProfilesDir; TokenPath = $TokenPath
+        AppDataSynapseDir = (Join-Path $env:APPDATA 'synapse')
+        AllowedRoots = @((Join-Path $env:LOCALAPPDATA 'synapse'), (Join-Path $env:APPDATA 'synapse'))
+        AllowedExactDirs = @((Join-Path $env:USERPROFILE '.cargo\bin\profiles'))
+    }
+    if ($Purge) {
+        # Validate every purge path BEFORE stopping anything (#181).
+        Get-SynapsePurgePlan @SynapsePurgeArgs | Out-Null
+    }
     Step "Removing scheduled task '$TaskName'"
     Assert-SynapseRestartAllowed -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -6108,9 +6856,7 @@ if ($Remove) {
     } else { Info "Task '$TaskName' not present." }
     Stop-SynapseMcpProcesses -Reason 'remove' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
     if ($Purge) {
-        foreach ($p in @($DbPath, $ProfilesDir, (Split-Path -Parent $TokenPath))) {
-            if (Test-Path $p) { Remove-Item -Recurse -Force $p; Info "Deleted $p" }
-        }
+        Invoke-SynapsePurge @SynapsePurgeArgs -Force:$Force
     }
     Info "Done (remove)."
     Release-SynapseSetupMaintenanceLock -State released
@@ -6120,6 +6866,66 @@ if ($Remove) {
 # ---------------------------------------------------------------------------
 # 1. Preflight
 # ---------------------------------------------------------------------------
+function Initialize-SynapseNativeBuildEnvironment {
+    param([string]$LibclangPath = $env:LIBCLANG_PATH)
+
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($LibclangPath)) {
+        $candidates += $LibclangPath
+    } else {
+        $vsRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\2022'
+        if (Test-Path -LiteralPath $vsRoot -PathType Container) {
+            $candidates += @(Get-ChildItem -LiteralPath $vsRoot -Directory -ErrorAction Stop |
+                ForEach-Object { Join-Path $_.FullName 'VC\Tools\Llvm\x64\bin' })
+        }
+        $candidates += (Join-Path $env:ProgramFiles 'LLVM\bin')
+        $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
+        if ($clang) { $candidates += (Split-Path -Parent $clang.Source) }
+    }
+
+    $dll = $null
+    foreach ($candidate in $candidates) {
+        $path = if ($candidate -match '(?i)\.dll$') { $candidate } else { Join-Path $candidate 'libclang.dll' }
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $dll = (Resolve-Path -LiteralPath $path).Path
+            break
+        }
+    }
+    if (-not $dll) {
+        Die "SYNAPSE_NATIVE_LIBCLANG_MISSING checked=$($candidates -join ',') remediation=install Visual Studio Build Tools with the C++ Clang tools for Windows, or set LIBCLANG_PATH to the directory containing libclang.dll; rerun setup"
+    }
+
+    $directory = Split-Path -Parent $dll
+    $env:LIBCLANG_PATH = $directory
+    if (-not @(($env:Path -split ';') | Where-Object {
+        $_.TrimEnd('\') -ieq $directory.TrimEnd('\')
+    }).Count) {
+        $env:Path = "$directory;$env:Path"
+    }
+    try {
+        if ('System.Runtime.InteropServices.NativeLibrary' -as [type]) {
+            $handle = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
+        } else {
+            if (-not ('SynapseNativeBuild.Loader' -as [type])) {
+                Add-Type -Namespace SynapseNativeBuild -Name Loader -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern System.IntPtr LoadLibraryEx(string path, System.IntPtr file, uint flags);
+'@ -ErrorAction Stop
+            }
+            # LOAD_WITH_ALTERED_SEARCH_PATH searches beside libclang for its dependencies.
+            $handle = [SynapseNativeBuild.Loader]::LoadLibraryEx($dll, [IntPtr]::Zero, 8)
+            if ($handle -eq [IntPtr]::Zero) {
+                throw [System.ComponentModel.Win32Exception]::new([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            }
+        }
+        if ($handle -eq [IntPtr]::Zero) { throw 'native loader returned a null handle' }
+    } catch {
+        Die "SYNAPSE_NATIVE_LIBCLANG_LOAD_FAILED dll=$dll detail=$($_.Exception.Message) remediation=repair the Visual Studio C++/LLVM installation and its native DLL dependencies, then rerun setup"
+    }
+    Info "Native build prerequisite loaded: $dll (LIBCLANG_PATH and child PATH configured)"
+    return $dll
+}
+
 Step "Preflight"
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 if (-not $SkipBuild) {
@@ -6133,6 +6939,7 @@ if (-not $SkipBuild) {
     if ($SourceDir -match '^\\\\' -or $SourceDir -match '^[Zz]:\\home\\') {
         Die "-SourceDir '$SourceDir' looks like a UNC / WSL-mapped path. Build from a real local copy: building over \\wsl.localhost bakes transient drive paths into the binary."
     }
+    $null = Initialize-SynapseNativeBuildEnvironment
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $cargoVersionLog = Join-Path $LogDir 'setup-cargo-version.log'
     $cargoVersionDiagnosticsPath = Join-Path $LogDir 'setup-cargo-version-diagnostics.json'
@@ -6211,6 +7018,7 @@ if (-not $SkipBuild) {
 # ---------------------------------------------------------------------------
 if (-not $SkipBuild) {
     Step "Building synapse-mcp (release) from $SourceDir"
+    $buildSourceFingerprint = Get-SynapseBuildSourceFingerprint -SourceDir $SourceDir
     if (-not $PSBoundParameters.ContainsKey('CargoTarget')) {
         # Key the persistent target by the source checkout so two checkouts
         # can never share (and poison) one fingerprint database. Cargo
@@ -6220,11 +7028,7 @@ if (-not $SkipBuild) {
         # differ (observed live 2026-06-12: a synapse-core compiled from a
         # sibling clone shadowed new modules and broke the deploy build).
         $resolvedSource = (Resolve-Path $SourceDir).Path.TrimEnd('\')
-        $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($resolvedSource.ToLowerInvariant())
-        $sourceHash = ([System.Security.Cryptography.SHA1]::Create().ComputeHash($sourceBytes) |
-            ForEach-Object { $_.ToString('x2') }) -join ''
-        $sourceLeaf = (Split-Path $resolvedSource -Leaf) -replace '[^A-Za-z0-9._-]', '_'
-        $CargoTarget = Join-Path $CargoTarget "$sourceLeaf-$($sourceHash.Substring(0,12))"
+        $CargoTarget = Get-SynapseCheckoutCargoTarget -Root $CargoTarget -SourceDir $SourceDir
         Info "Per-checkout build target: $CargoTarget (source: $resolvedSource)"
     }
     New-Item -ItemType Directory -Force -Path $CargoTarget, $LogDir | Out-Null
@@ -6244,7 +7048,7 @@ if (-not $SkipBuild) {
     $buildLog = Join-Path $LogDir 'setup-build.log'
     $buildDiagnosticsPath = Join-Path $LogDir 'setup-build-diagnostics.json'
     if (Test-Path -LiteralPath $buildDiagnosticsPath) { Remove-Item -LiteralPath $buildDiagnosticsPath -Force }
-    $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
+    $built = Get-SynapseCargoReleaseArtifactPath -CargoTarget $CargoTarget
     Info "Build process tree is job-owned; log: $buildLog"
     $buildInvocationDiagnostics = $null
     $buildExit = Invoke-SynapseProcessInKillOnCloseJob `
@@ -6307,6 +7111,7 @@ if (-not $SkipBuild) {
             $buildLogSignal.tail_80)
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
+    Write-SynapseBuildSourceFingerprint -SourceDir $SourceDir -CandidatePath $built -ExpectedFingerprint $buildSourceFingerprint
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
 }
 
@@ -6328,6 +7133,12 @@ if ($token.Length -lt 16) { Die "Token at $TokenPath is too short ($($token.Leng
 [Environment]::SetEnvironmentVariable('SYNAPSE_BEARER_TOKEN', $token, 'User')
 $env:SYNAPSE_BEARER_TOKEN = $token
 Info "Set Windows User SYNAPSE_BEARER_TOKEN from $TokenPath for native HTTP MCP clients that require env-based bearer auth."
+# #259: launcher-side limits for pruning Codex start snapshots other starts left behind.
+[Environment]::SetEnvironmentVariable('SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS', [string]$CodexStartSnapshotRetentionHours, 'User')
+$env:SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS = [string]$CodexStartSnapshotRetentionHours
+[Environment]::SetEnvironmentVariable('SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES', [string]$CodexStartSnapshotGraceMinutes, 'User')
+$env:SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES = [string]$CodexStartSnapshotGraceMinutes
+Info "Set Windows User SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS=$CodexStartSnapshotRetentionHours and SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES=$CodexStartSnapshotGraceMinutes for Codex launcher start-snapshot pruning."
 try {
     $signature = '[DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
     $type = Add-Type -MemberDefinition $signature -Name Win32SendMessageTimeout -Namespace SynapseEnv -PassThru -ErrorAction Stop
@@ -6361,22 +7172,24 @@ Info "Candidate profiles verified path=$candidateProfilesDir count=$candidatePro
 # 4. Stage and health-check the replacement before touching the live daemon
 # ---------------------------------------------------------------------------
 Step "Validating candidate daemon before handoff"
-$installSourcePath = $ExePath
-$installSourceHash = $null
-if ($SkipBuild) {
-    if (-not (Test-Path -LiteralPath $ExePath)) {
-        Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$ExePath remediation=-SkipBuild requires a real local synapse-mcp.exe at -ExePath before setup can touch the live daemon"
-    }
-    $installSourceHash = Get-SynapseFileSha256 -Path $ExePath
-    Info "SkipBuild candidate binary path=$ExePath sha256=$installSourceHash"
-} else {
-    $stagedBinary = New-SynapseStagedDaemonBinary -BuiltPath $built -LogDir $LogDir
-    $installSourcePath = $stagedBinary.Path
-    $installSourceHash = $stagedBinary.Sha256
-}
+$sourceArgs = @{ ExePath = $ExePath; CargoTarget = $CargoTarget; CargoTargetExplicit = $PSBoundParameters.ContainsKey('CargoTarget')
+    LogDir = $LogDir; SourceDir = $SourceDir; SkipBuild = $SkipBuild
+    PostExitUseInstalledBinary = $PostExitUseInstalledBinary; PostExitInstalledSha256 = $PostExitInstalledSha256 }
+if (-not $SkipBuild) { $sourceArgs.BuiltPath = $built }
+$installSource = Resolve-SynapseInstallSource @sourceArgs
+$installSourcePath = $installSource.Path
+$installSourceHash = $installSource.Sha256
+$CargoTarget = $installSource.CargoTarget
+$headIdentity = $installSource.HeadIdentity
 $candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
+}
+if ($SkipBuild -and -not $PostExitUseInstalledBinary) {
+    Assert-SynapseSkipBuildRevision -CandidateBuild $candidatePreflight.Build -HeadIdentity $headIdentity -CandidatePath $installSourcePath
+    $skipSource = if ($SourceDir) { $SourceDir } else { Split-Path -Parent $PSScriptRoot }
+    Assert-SynapseSkipBuildSourceFingerprint -SourceDir $skipSource -CandidatePath $installSourcePath
+    Info "SkipBuild candidate revision verified build=$($candidatePreflight.Build) head=$($headIdentity.Revision)"
 }
 Info "Candidate daemon accepted for handoff sha256=$installSourceHash tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256)"
 
@@ -6400,6 +7213,8 @@ Assert-CodexCandidateHandoffPreservesCurrentProcess `
 $chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
 if ($script:SynapsePostExitStartOnly) {
     Info "SYNAPSE_POST_EXIT_SKIP_CHROME_BRIDGE_PREFLIGHT reason=$PostExitContinuationReason bind=$Bind remediation=post-exit continuation must not reload or reconnect the Chrome bridge before the daemon bind is reusable; daemon /health after start remains the bridge Source-of-Truth readback."
+} elseif ($SkipClientWiring) {
+    Info "Skipped Chrome direct bridge preflight because -SkipClientWiring was set."
 } else {
     Step "Preflighting Chrome direct localhost bridge before daemon handoff"
     $chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
@@ -6415,32 +7230,110 @@ if ($script:SynapsePostExitStartOnly) {
         (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgePreflight))
 }
 
+function Invoke-SynapseOptionalBrowserBridges {
+    # Best-effort per declared non-legacy browser row: not installed -> skip
+    # with readback; installed -> run its family installer; a failure is a WARN
+    # with evidence, never a setup failure (the legacy row is the mandatory one).
+    param([string]$BrowsersDir)
+
+    $dispatcher = Join-Path $PSScriptRoot 'install-synapse-browser-bridge.ps1'
+    $results = @()
+    foreach ($row in @(Get-SynapseBrowserRows -BrowsersDir $BrowsersDir | Where-Object { [string]$_.id -ne $SynapseLegacyBrowserId })) {
+        try {
+            $resolved = & $dispatcher -Browser $row.id -BrowsersDir $BrowsersDir -ResolveOnly
+            if ($resolved.status -eq 'not_installed') {
+                Info "SYNAPSE_BROWSER_BRIDGE_SKIPPED browser=$($row.id) status=not_installed reason=$($resolved.reason) remediation=$($resolved.remediation)"
+                $results += [pscustomobject]@{ browser = [string]$row.id; status = 'not_installed' }
+                continue
+            }
+            # Chromium rows run before the new daemon starts, so their live
+            # identity check is deferred to Assert-SynapseBridgeLiveIdentityAfterSetup (#251).
+            $chromium = [string]$row.family -eq 'chromium'
+            $installerParameters = if ($chromium) { @{ DeferLiveVerification = $true } } else { @{} }
+            $readback = & $dispatcher -Browser $row.id -BrowsersDir $BrowsersDir -InstallerParameters $installerParameters
+            $liveCheck = if (-not $chromium) { 'not_applicable' }
+                elseif ($readback.ok -eq $true) { 'verified' }
+                elseif ($readback.runtime_verification.deferred -eq $true) { 'deferred_until_daemon_start' }
+                else { 'unverified' }
+            $status = if ($liveCheck -eq 'unverified') { 'unverified' } else { 'installed' }
+            $prefix = if ($status -eq 'unverified') { 'WARN: SYNAPSE_BROWSER_BRIDGE_INSTALLED_UNVERIFIED' } else { 'SYNAPSE_BROWSER_BRIDGE_INSTALLED' }
+            Info "$prefix browser=$($row.id) executable=$($resolved.plan.executable) health_key=$($row.health_key) ok=$($readback.ok) reason=$($readback.reason) live_check=$liveCheck"
+            $results += [pscustomobject]@{ browser = [string]$row.id; status = $status; reason = [string]$readback.reason; readback = $readback }
+        } catch {
+            Info "WARN: SYNAPSE_BROWSER_BRIDGE_OPTIONAL_INSTALL_FAILED browser=$($row.id) error=$($_.Exception.Message) remediation=run scripts\install-synapse-browser-bridge.ps1 -Browser $($row.id) from the interactive desktop; the mandatory $SynapseLegacyBrowserId bridge is unaffected"
+            $results += [pscustomobject]@{ browser = [string]$row.id; status = 'failed'; error = $_.Exception.Message }
+        }
+    }
+    return $results
+}
+
+if (-not $script:SynapsePostExitStartOnly -and -not $SkipClientWiring) {
+    Step "Installing optional browser bridges (best-effort; not installed = skip)"
+    $optionalBrowserBridges = @(Invoke-SynapseOptionalBrowserBridges)
+    Info ("Optional browser bridges: {0}" -f $(if ($optionalBrowserBridges.Count -eq 0) { '<none declared>' } else { ($optionalBrowserBridges | ForEach-Object { "$($_.browser)=$($_.status)" }) -join ',' }))
+}
+
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon, then install the proven binary
 # ---------------------------------------------------------------------------
-Step "Draining live daemon and installing verified binary -> $ExePath"
-Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-}
-Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
 $backupPath = $null
-$oldInstalledHash = $null
+$installDisposition = Get-SynapseInstallDisposition -CandidateHash $installSourceHash -ExePath $ExePath
+$oldInstalledHash = $installDisposition.InstalledHash
+$installRequired = $installDisposition.InstallRequired
+if ($installRequired) {
+    Step "Draining live daemon and installing verified binary -> $ExePath"
+    Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -AllowActiveClientDrain
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
+    Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
 if (Test-Path -LiteralPath $ExePath) {
-    $oldInstalledHash = Get-SynapseFileSha256 -Path $ExePath
     $backupPath = "$ExePath.bak"
-    Copy-Item -LiteralPath $ExePath -Destination $backupPath -Force
+    Copy-SynapseFileWithSharingRetry -Source $ExePath -Destination $backupPath
     $backupHash = Get-SynapseFileSha256 -Path $backupPath
     if ($backupHash -ne $oldInstalledHash) {
         Die "SYNAPSE_BINARY_BACKUP_HASH_MISMATCH installed=$ExePath backup=$backupPath installed_hash=$oldInstalledHash backup_hash=$backupHash remediation=backup bytes changed during copy; refusing to install candidate"
     }
     Info "Backed up old binary -> $backupPath sha256=$backupHash"
 }
-if (-not $SkipBuild) {
-    Copy-Item -LiteralPath $installSourcePath -Destination $ExePath -Force
+if ([System.IO.Path]::GetFullPath($installSourcePath) -ine [System.IO.Path]::GetFullPath($ExePath)) {
+    try {
+        $null = Install-SynapseBinaryOverHeldImage -Source $installSourcePath -Destination $ExePath
+    } catch {
+        $installCopyError = $_.Exception.Message
+        if (-not $backupPath -or -not (Test-Path -LiteralPath $backupPath) -or -not $oldInstalledHash) {
+            Die "SYNAPSE_BINARY_INSTALL_COPY_FAILED path=$ExePath error=$installCopyError backup=<none> remediation=the candidate was not installed and no prior binary was available; resolve the file lock and rerun setup"
+        }
+        $restoredHash = Restore-SynapseBinaryBackupAfterInstallFailure `
+            -BackupPath $backupPath `
+            -ExePath $ExePath `
+            -ExpectedHash $oldInstalledHash `
+            -TaskName $TaskName `
+            -InstallError $installCopyError
+        $restoreHealth = $null
+        $restoreDeadline = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $restoreDeadline) {
+            Start-Sleep -Seconds 1
+            try {
+                $candidateHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
+                if (Test-SynapseInstalledHealthIdentity -Health $candidateHealth -ExePath $ExePath -DbPath $DbPath) {
+                    $restoreHealth = $candidateHealth
+                    break
+                }
+            } catch { }
+        }
+        if ($restoreHealth) {
+            Die "SYNAPSE_BINARY_INSTALL_COPY_FAILED_ROLLED_BACK path=$ExePath rollback_sha256=$restoredHash rollback_pid=$($restoreHealth.pid) install_error=$installCopyError remediation=old daemon is serving again; inspect the transient lock before retrying setup"
+        }
+        Die "SYNAPSE_BINARY_INSTALL_COPY_FAILED_ROLLBACK_UNHEALTHY path=$ExePath rollback_sha256=$restoredHash install_error=$installCopyError remediation=the old binary was restored but its scheduled daemon did not become healthy; inspect launcher logs"
+    }
 } else {
-    Info "SkipBuild candidate already resides at install path=$ExePath"
+    Info "Candidate already resides at install path=$ExePath; copy skipped"
+}
+} else {
+    Step "Verified binary already installed -> $ExePath"
+    Info "SYNAPSE_BINARY_INSTALL_NOOP path=$ExePath sha256=$oldInstalledHash reason=installed bytes already match the preflight candidate; daemon drain, backup, and copy skipped"
 }
 if (-not (Test-Path -LiteralPath $ExePath)) {
     Die "SYNAPSE_INSTALL_BINARY_MISSING path=$ExePath remediation=setup could not find the installed daemon binary after the copy step"
@@ -6452,45 +7345,12 @@ if ($installedHash -ne $installSourceHash) {
 $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
-
-$installDir = Split-Path -Parent $ExePath
-$retiredSetupOwnedExecutables = @(
-    'synapse-fsv-toast-history.exe'
-)
-foreach ($retiredExeName in $retiredSetupOwnedExecutables) {
-    $retiredPath = Join-Path $installDir $retiredExeName
-    if (-not (Test-Path -LiteralPath $retiredPath)) { continue }
-
-    $resolvedRetiredPath = [System.IO.Path]::GetFullPath($retiredPath)
-    $resolvedInstallDir = [System.IO.Path]::GetFullPath($installDir).TrimEnd('\')
-    if ((Split-Path -Parent $resolvedRetiredPath).TrimEnd('\') -ine $resolvedInstallDir) {
-        Die "SYNAPSE_RETIRED_EXECUTABLE_SCOPE_MISMATCH path=$resolvedRetiredPath install_dir=$resolvedInstallDir remediation=setup only prunes retired executables inside the installed Synapse binary directory"
-    }
-
-    $retiredOwners = @(Get-CimInstance Win32_Process -Filter "Name='$retiredExeName'" -ErrorAction SilentlyContinue |
-        Where-Object {
-            try {
-                $candidatePath = [System.IO.Path]::GetFullPath([string]$_.ExecutablePath)
-                $candidatePath -ieq $resolvedRetiredPath
-            } catch {
-                $false
-            }
-        })
-    if ($retiredOwners.Count -gt 0) {
-        $ownerPids = ($retiredOwners | ForEach-Object { $_.ProcessId }) -join ','
-        Die "SYNAPSE_RETIRED_EXECUTABLE_STILL_RUNNING path=$resolvedRetiredPath pids=$ownerPids remediation=close the retired helper process before setup can prune its installed executable"
-    }
-
-    $retiredHash = Get-SynapseFileSha256 -Path $resolvedRetiredPath
-    Remove-Item -LiteralPath $resolvedRetiredPath -Force
-    if (Test-Path -LiteralPath $resolvedRetiredPath) {
-        Die "SYNAPSE_RETIRED_EXECUTABLE_PRUNE_FAILED path=$resolvedRetiredPath sha256=$retiredHash remediation=setup removed the retired helper but the file still exists; inspect file permissions/locks and retry"
-    }
-    Info "Pruned retired setup-owned executable path=$resolvedRetiredPath sha256=$retiredHash"
-}
+Remove-SynapseSetupOwnedDirectories
 
 if ($script:SynapsePostExitStartOnly) {
     Info "SYNAPSE_POST_EXIT_SKIP_CHROME_BRIDGE_VERIFY reason=$PostExitContinuationReason bind=$Bind remediation=post-exit continuation avoids creating bridge peers while the dead-owner bind is still draining; daemon /health after start verifies the active Chrome bridge."
+} elseif ($SkipClientWiring) {
+    Info "Skipped Chrome direct bridge verification because -SkipClientWiring was set."
 } else {
     Step "Verifying Chrome direct localhost bridge"
     $chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
@@ -6512,14 +7372,32 @@ if ($script:SynapsePostExitStartOnly) {
 # ---------------------------------------------------------------------------
 Step "Deploying bundled profiles -> $ProfilesDir"
 if ($srcProfiles -and (Test-Path $srcProfiles)) {
-    $profileDeploy = Install-SynapseBundledProfiles -SourceProfilesDir $srcProfiles -ProfilesDir $ProfilesDir -LogDir $LogDir
-    if ($profileDeploy.BundledProfileCount -lt 1) {
-        Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=reconciled bundled profiles but found 0 top-level .toml files in the setup-owned manifest"
-    }
-    Info "Deployed $($profileDeploy.BundledProfileCount) bundled profiles from manifest $($profileDeploy.ManifestPath)."
+    New-Item -ItemType Directory -Force -Path $ProfilesDir | Out-Null
+    Copy-Item "$srcProfiles\*" $ProfilesDir -Recurse -Force
+    $n = (Get-ChildItem $ProfilesDir -Filter *.toml -File).Count
+    if ($n -lt 1) { Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=copied profiles but found 0 .toml files in the deployed profile directory" }
+    Info "Deployed $n profiles."
 } elseif (-not (Test-Path $ProfilesDir)) {
     Die "SYNAPSE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=profile-dependent tools need bundled or deployed profiles before daemon start"
 } else { Info "Reusing existing profiles at $ProfilesDir." }
+
+# 6b. Deploy the browser rows next to the exe (synapse_browsers
+#     BrowserRegistry::bundled_dirs reads <exe dir>\browsers). Without them the
+#     daemon still serves the legacy chrome row compiled into the binary.
+$srcBrowserRows = if ($SourceDir) { Join-Path $SourceDir 'crates\synapse-browsers\browsers' } else { $null }
+$deployedBrowserRowsDir = Join-Path (Split-Path -Parent $ExePath) 'browsers'
+Step "Deploying browser rows -> $deployedBrowserRowsDir"
+if ($srcBrowserRows -and (Test-Path -LiteralPath $srcBrowserRows -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $deployedBrowserRowsDir | Out-Null
+    Copy-Item -Path (Join-Path $srcBrowserRows '*.json') -Destination $deployedBrowserRowsDir -Force
+    $deployedBrowserRows = @(Get-SynapseBrowserRows -BrowsersDir $deployedBrowserRowsDir)
+    if (-not ($deployedBrowserRows | Where-Object { [string]$_.id -eq $SynapseLegacyBrowserId })) {
+        Die "SYNAPSE_BROWSER_ROWS_LEGACY_MISSING dir=$deployedBrowserRowsDir legacy=$SynapseLegacyBrowserId remediation=the deployed browser rows must include the mandatory legacy row"
+    }
+    Info ("Deployed {0} browser rows: {1}" -f $deployedBrowserRows.Count, (($deployedBrowserRows | ForEach-Object { $_.id }) -join ','))
+} else {
+    Info "SYNAPSE_BROWSER_ROWS_SOURCE_ABSENT source=$srcBrowserRows deployed=$deployedBrowserRowsDir reason=no SourceDir browser rows; the daemon uses its compiled-in legacy row"
+}
 
 if ($script:SynapseBindPostExitContinuationRequired) {
     $continuation = Start-SynapsePostExitSetupContinuation `
@@ -6536,6 +7414,7 @@ if ($script:SynapseBindPostExitContinuationRequired) {
         -CodexToolSurfaceSnapshotPath $CodexToolSurfaceSnapshotPath `
         -TaskName $TaskName `
         -MaintenanceLockPath $MaintenanceLockPath `
+        -InstalledBinarySha256 $installedHash `
         -ActiveIssue $ActiveIssue `
         -DeadOwnerDetail $script:SynapseBindPostExitContinuationDetail
     Die ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_STARTED reason=install_binary bind={0} child_pid={1} manifest={2} stdout={3} stderr={4} remediation=the verified daemon bytes and profiles were installed, but Windows kept the dead-owner listener unavailable until this setup process exits. A hidden continuation has been launched and will wait for parent_pid={5}, reacquire the maintenance lock, start the daemon through the normal setup path, and write its own stdout/stderr/readbacks. Inspect the continuation manifest/logs and final process/socket SoT before accepting repair." -f `
@@ -6585,39 +7464,26 @@ Info "Task registered and started."
 Step "Verifying daemon health (http://$Bind/health)"
 $ok = $false
 $healthPid = $null
-$lastHealthError = $null
-$lastHealthSubsystemStatuses = '<none>'
-for ($i=0; $i -lt 15; $i++) {
+$healthDeadline = (Get-Date).AddMinutes(10)
+while ((Get-Date) -lt $healthDeadline) {
     Start-Sleep -Seconds 2
     try {
         $h = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
-        $lastHealthSubsystemStatuses = Format-SynapseHealthSubsystemStatuses -Health $h
-        $criticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $h
-        if ($criticalReady.Ok) {
-            Info ("Daemon OK: pid={0} version={1} db={2}" -f $h.pid, $h.version, $h.subsystems.storage.db_path)
-            if ($h.ok -ne $true) {
-                Info "WARN: daemon /health returned ok=false after install, but critical non-Chrome subsystems are ready; continuing to Chrome bridge repair/readback. subsystem_statuses=$lastHealthSubsystemStatuses"
-            }
+        if (Test-SynapseInstalledHealthIdentity -Health $h -ExePath $ExePath -DbPath $DbPath) {
+            Info ("Daemon OK: pid={0} version={1} db={2}" -f $h.pid, $h.version, $DbPath)
             $healthPid = [int]$h.pid
             $ok = $true; break
-        } else {
-            $lastHealthError = $criticalReady.Detail
-            Info "WARN: daemon /health responded but critical subsystems are not ready yet attempt=$($i + 1) detail=$($criticalReady.Detail) subsystem_statuses=$lastHealthSubsystemStatuses"
         }
-    } catch {
-        $lastHealthError = $_.Exception.Message
-    }
+    } catch { }
 }
 if (-not $ok) {
     $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} last_health_error={4} last_subsystem_statuses={5}`nlisteners:`n{6}`nprocesses:`n{7}`nremediation=inspect {8} and synapse.log.* under {9} for launch / STORAGE_* / bind errors" -f `
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3}`nlisteners:`n{4}`nprocesses:`n{5}`nremediation=inspect {6} and synapse.log.* under {7} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
         ($(if ($backupPath) { $backupPath } else { '<none>' })),
-        ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
-        $lastHealthSubsystemStatuses,
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
         $launcherLog,
@@ -6626,34 +7492,15 @@ if (-not $ok) {
     if ($backupPath -and (Test-Path -LiteralPath $backupPath) -and $oldInstalledHash) {
         Info "WARN: $failureDetail"
         Info "Attempting rollback to previous daemon binary backup=$backupPath sha256=$oldInstalledHash"
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        }
-        Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -TimeoutSeconds 300
-        Copy-Item -LiteralPath $backupPath -Destination $ExePath -Force
-        $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
-        if ($rollbackHash -ne $oldInstalledHash) {
-            Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_HASH_MISMATCH expected_sha256=$oldInstalledHash actual_sha256=$rollbackHash backup=$backupPath install_path=$ExePath original_failure=[$failureDetail]"
-        }
-        Start-ScheduledTask -TaskName $TaskName
-        $rollbackOk = $false
-        $rollbackHealth = $null
-        for ($j=0; $j -lt 15; $j++) {
-            Start-Sleep -Seconds 2
-            try {
-                $rh = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
-                if ($rh.ok) {
-                    $rollbackHealth = $rh
-                    $rollbackOk = $true
-                    break
-                }
-            } catch { }
-        }
-        if ($rollbackOk) {
+        $rollback = Invoke-SynapseInstallHealthRollback `
+            -BackupPath $backupPath -ExePath $ExePath -ExpectedHash $oldInstalledHash `
+            -TaskName $TaskName -FailureDetail $failureDetail -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -Token $token
+        $rollbackHash = $rollback.RollbackHash
+        if ($rollback.Ok) {
             Die ("SYNAPSE_INSTALL_HEALTH_FAILED_ROLLED_BACK candidate_sha256={0} rollback_sha256={1} rollback_pid={2} original_failure=[{3}] remediation=old daemon is serving again; inspect candidate startup logs before retrying" -f `
                 $installSourceHash,
                 $rollbackHash,
-                $rollbackHealth.pid,
+                $rollback.Pid,
                 $failureDetail)
         }
 
@@ -6671,12 +7518,45 @@ if (-not $ok) {
 
     Die $failureDetail
 }
-$h = Assert-SynapseChromeBridgeLiveAfterSetup `
-    -Bind $Bind `
-    -Token $token `
-    -Health $h `
-    -ChromeBridgeInstallerPath $chromeBridgeInstaller `
-    -ChromeNativeHostExePath $ChromeNativeHostExePath
+if ($PostExitUseInstalledBinary) {
+    # The running daemon image is write-locked by the OS, so hashing it now
+    # binds the bytes the continuation actually launched: a replacement
+    # between the preflight hash equality and the process start is caught
+    # here instead of being blessed by a health check that verifies
+    # pid/path/db but never the executable bytes. Runs immediately after
+    # health, before Chrome bridge / client wiring treat the daemon as
+    # accepted.
+    $postLaunchHash = Get-SynapseFileSha256 -Path $ExePath
+    if ($postLaunchHash -ne $PostExitInstalledSha256) {
+        Die "SYNAPSE_POST_EXIT_LAUNCHED_BINARY_REPLACED path=$ExePath expected_sha256=$PostExitInstalledSha256 actual_sha256=$postLaunchHash daemon_pid=$healthPid remediation=the daemon was started from bytes that differ from the parent-verified hash; stop the scheduled daemon and rerun full setup without -SkipBuild to reinstall a verified candidate"
+    }
+    Info "Post-exit launched binary re-verified path=$ExePath sha256=$postLaunchHash daemon_pid=$healthPid"
+}
+if ($SkipClientWiring) {
+    Info "Skipped Chrome bridge post-start assertion because -SkipClientWiring was set."
+} else {
+    $h = Assert-SynapseChromeBridgeLiveAfterSetup `
+        -Bind $Bind `
+        -Token $token `
+        -Health $h `
+        -ChromeBridgeInstallerPath $chromeBridgeInstaller `
+        -ChromeNativeHostExePath $ChromeNativeHostExePath
+    if ($null -eq $chromeBridgeReadback) {
+        # The post-exit continuation skipped the pre-start verifier; its
+        # deployment readback supplies the expected bridge identity.
+        Step "Reading Chrome direct localhost bridge deployment for live identity verification"
+        $chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
+            -InstallerPath $chromeBridgeInstaller `
+            -NativeHostExePath $ChromeNativeHostExePath
+    }
+    Step "Verifying live bridge identity through an authenticated browser_debugger MCP session"
+    Assert-SynapseBridgeLiveIdentityAfterSetup `
+        -Bind $Bind `
+        -Token $token `
+        -Health $h `
+        -ChromeReadback $chromeBridgeReadback `
+        -OptionalBridges @($optionalBrowserBridges)
+}
 $healthPid = [int]$h.pid
 $daemonLineage = Get-ProcessLineage -StartPid $healthPid
 $cmdAncestor = $daemonLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1
@@ -6731,7 +7611,7 @@ if (-not $SkipClientWiring) {
             Die "SYNAPSE_CODEX_MCP_CONFIG_INCOMPLETE path=$codexCfg remediation=repair [mcp_servers.synapse] so it contains url=http://$Bind/mcp, bearer_token_env_var=SYNAPSE_BEARER_TOKEN, required=false, and default_tools_approval_mode=approve."
         }
         Install-CodexSynapseTokenLoader -CodexCommandPath $codex.Source -TokenPath $TokenPath
-        Info "Codex (Windows) wired via Streamable HTTP transport with required=false and default_tools_approval_mode=approve; Synapse failures remain visible without blocking Codex startup."
+        Info "Codex (Windows) wired via Streamable HTTP transport with required=false, startup_timeout_sec=20 and default_tools_approval_mode=approve; a Synapse outage stays visible without blocking Codex startup."
     } elseif (Test-Path $codexCfg) {
         $c = Get-Content -Raw $codexCfg
         if ($c -match '(?m)^\[mcp_servers\.synapse\]' -and

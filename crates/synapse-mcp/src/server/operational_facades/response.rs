@@ -16,6 +16,7 @@ pub(super) fn storage_response(
         readback_source_of_truth: readback,
         inspect: None,
         summary: None,
+        put_probe_rows: None,
         gc_once: None,
     };
     fill(&mut response);

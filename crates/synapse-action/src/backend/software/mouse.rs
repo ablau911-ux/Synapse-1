@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, sync::Once, time::Instant};
+use std::{fmt::Write as _, sync::Once};
 
 use enigo::Enigo;
 use serde_json::json;
@@ -23,14 +23,14 @@ use windows::Win32::{
         },
         WindowsAndMessaging::{
             GetPhysicalCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetPhysicalCursorPos,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos, SetPhysicalCursorPos,
         },
     },
 };
 
 use super::{
     input::{mouse_input, send_input_batch},
-    utils::sleep_ms,
+    utils::{InputTimeline, sleep_ms},
 };
 use crate::backend::mouse_coordinates::{VirtualDesktop, normalize_absolute_mouse_point};
 use crate::{
@@ -140,15 +140,62 @@ pub(super) fn mouse_drag(
 ) -> Result<(), ActionError> {
     send_absolute_mouse_move(from, "drag origin absolute mouse move")?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
-    let drag_result = mouse_move_curve(from, to, curve, duration_ms)
-        .and_then(|()| verify_cursor_position(to, "drag target cursor readback"));
-    let release_result = mouse_button(button, ButtonAction::Up, 0, state);
-    match (drag_result, release_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(original), Err(release_error)) => Err(annotate_drag_cleanup_release_error(
+    // The button is down from here: this is the drag's one exit, and it
+    // always sends the button-up, whatever the move did (#309).
+    let moved = drag_move(from, to, curve, duration_ms);
+    let released = mouse_button(button, ButtonAction::Up, 0, state);
+    drag_outcome(moved, released)
+}
+
+/// Moves a held drag from `from` to `to`. With a duration the samples are
+/// spread over it on absolute deadlines from the drag start (#309); with none
+/// they go out as one batch. A release-all or the operator hotkey stops it.
+fn drag_move(
+    from: Point,
+    to: Point,
+    curve: &AimCurve,
+    duration_ms: u32,
+) -> Result<(), ActionError> {
+    let inputs = curve_mouse_inputs(from, to, curve, duration_ms)?;
+    if duration_ms == 0 {
+        return send_input_batch(&inputs, "drag curve absolute mouse move");
+    }
+    let timeline = InputTimeline::new();
+    for (index, input) in inputs.iter().enumerate() {
+        timeline.wait_for_offset(drag_sample_offset_ms(duration_ms, index, inputs.len()))?;
+        send_input_batch(
+            std::slice::from_ref(input),
+            "drag curve absolute mouse move",
+        )?;
+    }
+    Ok(())
+}
+
+/// When sample `index` of `count` drag moves is due, in ms from the drag
+/// start: evenly spread so the last one lands on `duration_ms`.
+fn drag_sample_offset_ms(duration_ms: u32, index: usize, count: usize) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let (index, count) = (index as u64, count as u64);
+    u64::from(duration_ms) * (index + 1).min(count) / count
+}
+
+/// The drag result after its button-up: a failed release wins (the button
+/// may still be held) and names the move error it followed; otherwise the
+/// move error; otherwise success.
+fn drag_outcome(
+    moved: Result<(), ActionError>,
+    released: Result<(), ActionError>,
+) -> Result<(), ActionError> {
+    match (moved, released) {
+        (Ok(()), released) => released,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(release_error)) => Err(annotate_cleanup_release_error(
+            "mouse_drag",
             release_error,
-            &original,
+            &error,
+            None,
         )),
     }
 }
@@ -207,7 +254,8 @@ pub(super) fn mouse_stroke(
                 extract_sample_index(error.detail()).or_else(|| plan.samples.len().checked_sub(1));
             let requested_path_point =
                 sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
-            let release_error = annotate_cleanup_release_error(release_error, &error, sample_index);
+            let release_error =
+                annotate_cleanup_release_error("mouse_stroke", release_error, &error, sample_index);
             log_stroke_cleanup_release_error(
                 &context,
                 sample_index,
@@ -300,47 +348,23 @@ fn mouse_move_curve(
     curve: &AimCurve,
     duration_ms: u32,
 ) -> Result<(), ActionError> {
-    if matches!(curve, AimCurve::Instant) {
-        return send_absolute_mouse_move(to, "curve instant absolute mouse move");
-    }
+    let inputs = curve_mouse_inputs(from, to, curve, duration_ms)?;
+    send_input_batch(&inputs, "drag curve absolute mouse move")
+}
+
+fn curve_mouse_inputs(
+    from: Point,
+    to: Point,
+    curve: &AimCurve,
+    duration_ms: u32,
+) -> Result<Vec<INPUT>, ActionError> {
     let samples = sample_curve(curve, from, to, duration_ms, None);
     let desktop = virtual_desktop()?;
-    let last_index = samples.len().saturating_sub(1);
-    if last_index == 0 {
-        return Ok(());
-    }
-    let start = Instant::now();
-    for (index, point) in samples.into_iter().enumerate().skip(1) {
-        let target_elapsed_ms = curve_sample_elapsed_ms(duration_ms, index, last_index);
-        let elapsed_ms = elapsed_millis_u32(start.elapsed());
-        let delay_ms = target_elapsed_ms.saturating_sub(elapsed_ms);
-        if sleep_ms(delay_ms) {
-            return Err(ActionError::SafetyOperatorHotkeyFired {
-                detail: format!(
-                    "operator release requested during mouse_move_curve at sample_index={index}"
-                ),
-            });
-        }
-        send_input_batch(
-            &[absolute_mouse_input_for_desktop(point, desktop)],
-            "curve absolute mouse move",
-        )?;
-    }
-    Ok(())
-}
-
-fn curve_sample_elapsed_ms(duration_ms: u32, sample_index: usize, last_index: usize) -> u32 {
-    if duration_ms == 0 || last_index == 0 {
-        return 0;
-    }
-    let numerator = u128::from(duration_ms) * sample_index as u128;
-    let denominator = last_index as u128;
-    let rounded = (numerator + denominator / 2) / denominator;
-    u32::try_from(rounded).unwrap_or(u32::MAX)
-}
-
-fn elapsed_millis_u32(duration: std::time::Duration) -> u32 {
-    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+    Ok(samples
+        .into_iter()
+        .skip(1)
+        .map(|point| absolute_mouse_input_for_desktop(point, desktop))
+        .collect())
 }
 
 #[allow(
@@ -579,6 +603,22 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
         );
     }
 
+    if set_cursor_pos(point, detail)? {
+        let cursor_pos_actual = read_physical_cursor_position(detail)?;
+        if cursor_readback_matches(point, cursor_pos_actual) {
+            return Ok(());
+        }
+        tracing::warn!(
+            code = "M2_SET_CURSOR_POS_MISMATCH",
+            requested_x = point.x,
+            requested_y = point.y,
+            actual_x = cursor_pos_actual.x,
+            actual_y = cursor_pos_actual.y,
+            detail,
+            "SetCursorPos succeeded but readback mismatched; trying remaining cursor move fallbacks"
+        );
+    }
+
     if let Some(compensation) = compensation
         && set_physical_cursor_pos(compensation.adjusted, detail)?
     {
@@ -637,33 +677,6 @@ fn stroke_error(error: &StrokeError) -> ActionError {
     ActionError::TargetInvalid {
         detail: format!("mouse_stroke planning failed: {error}"),
     }
-}
-
-fn verify_cursor_position(point: Point, detail: &'static str) -> Result<(), ActionError> {
-    let actual = read_physical_cursor_position(detail)?;
-    if cursor_readback_matches(point, actual) {
-        Ok(())
-    } else {
-        Err(ActionError::BackendUnavailable {
-            detail: format!(
-                "{detail} mismatch: requested={point:?} actual=({},{}) tolerance_px={CURSOR_READBACK_TOLERANCE_PX}",
-                actual.x, actual.y
-            ),
-        })
-    }
-}
-
-fn annotate_drag_cleanup_release_error(
-    release_error: ActionError,
-    original_error: &ActionError,
-) -> ActionError {
-    let detail = format!(
-        "mouse_drag button_cleanup_after_move_error: original_code={} original_detail={}; cleanup_detail={}",
-        original_error.code(),
-        original_error.detail(),
-        release_error.detail()
-    );
-    release_error.with_detail(detail)
 }
 
 #[derive(Clone, Debug)]
@@ -760,6 +773,7 @@ fn annotate_stroke_emit_error(
 }
 
 fn annotate_cleanup_release_error(
+    action: &'static str,
     release_error: ActionError,
     original_error: &ActionError,
     sample_index: Option<usize>,
@@ -768,7 +782,7 @@ fn annotate_cleanup_release_error(
         .map(|index| format!(" sample_index={index}"))
         .unwrap_or_default();
     let detail = format!(
-        "mouse_stroke button_cleanup_after_stream_error{index}: original_code={} original_detail={}; cleanup_detail={}",
+        "{action} button_cleanup_after_stream_error{index}: original_code={} original_detail={}; cleanup_detail={}",
         original_error.code(),
         original_error.detail(),
         release_error.detail()
@@ -870,7 +884,7 @@ fn extract_sample_index(detail: &str) -> Option<usize> {
 }
 
 fn set_physical_cursor_pos(point: Point, detail: &'static str) -> Result<bool, ActionError> {
-    super::delivery_guard::ensure_pointer(super::delivery_guard::PointerDelivery::Move, detail)?;
+    super::delivery_guard::ensure_cursor_move()?;
     Ok(match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
         Ok(()) => true,
         Err(error) if error.code() != windows::core::HRESULT(0) => {
@@ -891,6 +905,34 @@ fn set_physical_cursor_pos(point: Point, detail: &'static str) -> Result<bool, A
                 point_y = point.y,
                 detail,
                 "SetPhysicalCursorPos returned false without a Win32 error"
+            );
+            false
+        }
+    })
+}
+
+fn set_cursor_pos(point: Point, detail: &'static str) -> Result<bool, ActionError> {
+    super::delivery_guard::ensure_cursor_move()?;
+    Ok(match unsafe { SetCursorPos(point.x, point.y) } {
+        Ok(()) => true,
+        Err(error) if error.code() != windows::core::HRESULT(0) => {
+            tracing::warn!(
+                code = "M2_SET_CURSOR_POS_UNAVAILABLE",
+                point_x = point.x,
+                point_y = point.y,
+                detail,
+                error = %error,
+                "SetCursorPos failed; trying remaining cursor move fallbacks"
+            );
+            false
+        }
+        Err(_error) => {
+            tracing::warn!(
+                code = "M2_SET_CURSOR_POS_FALSE_NO_ERROR",
+                point_x = point.x,
+                point_y = point.y,
+                detail,
+                "SetCursorPos returned false without a Win32 error"
             );
             false
         }
@@ -1107,3 +1149,7 @@ fn activate_thread_dpi_awareness() {
     let _previous =
         unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
+
+#[cfg(test)]
+#[path = "mouse_drag_table.rs"]
+mod drag_table;

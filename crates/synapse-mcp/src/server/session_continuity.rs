@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeSet,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::ErrorData;
 use serde::{Deserialize, Serialize};
-use synapse_action::{LeaseOutcome, LeaseStatus, lease};
+use serde_json::json;
+use synapse_action::{LeaseStatus, lease};
 use synapse_core::error_codes;
 use synapse_storage::{Db, cf};
 
@@ -19,6 +20,18 @@ use super::{
 const SESSION_TARGET_PREFIX: &str = "mcp/session-target/v1/";
 const SESSION_LEASE_PREFIX: &str = "mcp/session-lease/v1/";
 const SESSION_CDP_TARGET_OWNER_PREFIX: &str = "mcp/session-cdp-target-owner/v1/";
+const LEASE_RECONCILIATION_REASON: &str = "daemon_restart_reconciliation";
+
+#[path = "session_lease_identity.rs"]
+mod lease_identity;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LeaseProcessGeneration {
+    process_id: u32,
+    started_at_unix_ms: u64,
+}
+
+static LEASE_PROCESS_GENERATION: OnceLock<LeaseProcessGeneration> = OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedSessionTarget {
@@ -36,6 +49,10 @@ struct PersistedSessionLease {
     renewed_at_unix_ms: u64,
     ttl_ms: u64,
     expires_at_unix_ms: u64,
+    #[serde(default)]
+    owner_process_id: u32,
+    #[serde(default)]
+    owner_process_started_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,20 +68,20 @@ pub(crate) struct PersistedCdpTargetOwner {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub(crate) struct ContinuityCleanupReadback {
-    pub target_row_existed_before: bool,
-    pub target_row_exists_after: bool,
-    pub target_row_deleted: bool,
-    pub lease_row_existed_before: bool,
-    pub lease_row_exists_after: bool,
-    pub lease_row_deleted: bool,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub(crate) struct LeaseContinuityCleanupReadback {
+pub(crate) struct TargetContinuityCleanupReadback {
     pub row_existed_before: bool,
     pub row_exists_after: bool,
     pub row_deleted: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct LeaseReleaseReconciliationReadback {
+    pub session_id: String,
+    pub row_existed_before: bool,
+    pub row_exists_after: bool,
+    pub row_deleted: bool,
+    pub release_event_written: bool,
+    pub reason_code: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -82,11 +99,6 @@ impl SynapseService {
         session_id: &str,
         target: &SessionTarget,
     ) -> Result<(), ErrorData> {
-        let hwnd = match target {
-            SessionTarget::Window { hwnd } => *hwnd,
-            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
-        };
-        crate::m1::validate_window_hwnd_shape("persist_session_target", hwnd)?;
         let row = PersistedSessionTarget {
             schema_version: 1,
             session_id: session_id.to_owned(),
@@ -192,14 +204,6 @@ impl SynapseService {
         owner_key: &str,
         owner: &CdpTargetOwner,
     ) -> Result<(), ErrorData> {
-        crate::m1::validate_window_hwnd_shape("persist_cdp_target_owner", owner.window_hwnd)?;
-        if let Some(capture_window_hwnd) = owner.capture_window_hwnd {
-            crate::m1::validate_hwnd_shape(
-                "persist_cdp_target_owner",
-                "capture_window_hwnd",
-                capture_window_hwnd,
-            )?;
-        }
         let owner_read = self.session_registry_read_for_persistence(&owner.session_id)?;
         let row = PersistedCdpTargetOwner {
             schema_version: 1,
@@ -324,6 +328,7 @@ impl SynapseService {
             ));
         }
         let now = unix_ms_now();
+        let generation = current_lease_process_generation();
         let row = PersistedSessionLease {
             schema_version: 1,
             session_id: session_id.to_owned(),
@@ -331,8 +336,10 @@ impl SynapseService {
             renewed_at_unix_ms: now.saturating_sub(status.renewed_at_ms_ago.unwrap_or_default()),
             ttl_ms,
             expires_at_unix_ms: now.saturating_add(expires_in_ms),
+            owner_process_id: generation.process_id,
+            owner_process_started_at_unix_ms: generation.started_at_unix_ms,
         };
-        let encoded = synapse_storage::encode_json(&row).map_err(|error| {
+        let encoded = lease_identity::encode_lease_row(&row, status).map_err(|error| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!("encode persisted session lease failed: {error}"),
@@ -349,6 +356,92 @@ impl SynapseService {
             "persisted active input lease intent to CF_SESSIONS"
         );
         Ok(())
+    }
+
+    /// Persists a newly acquired lease and its `LeaseAcquired` journal edge in
+    /// one RocksDB transition. A process crash can therefore leave neither an
+    /// unjournaled open row nor a journal edge without its matching row.
+    pub(super) fn persist_session_lease_with_acquisition_event(
+        &self,
+        session_id: &str,
+        status: &LeaseStatus,
+    ) -> Result<(), ErrorData> {
+        let ttl_ms = status.ttl_ms.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "cannot persist unheld input lease: missing ttl_ms",
+            )
+        })?;
+        let expires_in_ms = status.expires_in_ms.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "cannot persist unheld input lease: missing expires_in_ms",
+            )
+        })?;
+        if status.owner_session_id.as_deref() != Some(session_id) {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "cannot persist input lease for {session_id}: status owner is {:?}",
+                    status.owner_session_id
+                ),
+            ));
+        }
+        let now = unix_ms_now();
+        let generation = current_lease_process_generation();
+        let row = PersistedSessionLease {
+            schema_version: 1,
+            session_id: session_id.to_owned(),
+            stored_at_unix_ms: now,
+            renewed_at_unix_ms: now.saturating_sub(status.renewed_at_ms_ago.unwrap_or_default()),
+            ttl_ms,
+            expires_at_unix_ms: now.saturating_add(expires_in_ms),
+            owner_process_id: generation.process_id,
+            owner_process_started_at_unix_ms: generation.started_at_unix_ms,
+        };
+        let encoded = lease_identity::encode_lease_row(&row, status).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("encode persisted session lease failed: {error}"),
+            )
+        })?;
+        let mut event = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::LeaseAcquired,
+        );
+        event.session_id = Some(session_id.to_owned());
+        event.attributes.conversation_id = Some(session_id.to_owned());
+        event.payload = json!({
+            "ttl_ms": status.ttl_ms,
+            "lease_generation": status.generation,
+            "lease_process_id": generation.process_id,
+            "lease_process_started_at_unix_ms": generation.started_at_unix_ms,
+        });
+        let db = self.session_continuity_db()?;
+        super::agent_events::record_agent_events_with_session_mutations(
+            &db,
+            &[],
+            &[(session_lease_key(session_id), encoded)],
+            &[event],
+        )
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        tracing::info!(
+            code = "MCP_SESSION_LEASE_ACQUIRE_COMMITTED",
+            session_id,
+            ttl_ms,
+            expires_at_unix_ms = row.expires_at_unix_ms,
+            owner_process_id = generation.process_id,
+            "readback=CF_SESSIONS+CF_AGENT_EVENTS after=session_lease_acquire_committed"
+        );
+        Ok(())
+    }
+
+    /// Whether a persisted lifecycle row exists for `session_id`'s input lease.
+    /// An action-acquired lease has none (#205).
+    pub(super) fn session_lease_row_exists(&self, session_id: &str) -> Result<bool, ErrorData> {
+        let db = self.session_continuity_db()?;
+        cf_row_exists(&db, &session_lease_key(session_id))
+            .map_err(|error| mcp_error(error.code(), error.to_string()))
     }
 
     pub(super) fn persist_session_lease_handoff(
@@ -379,6 +472,7 @@ impl SynapseService {
             ));
         }
         let now = unix_ms_now();
+        let generation = current_lease_process_generation();
         let row = PersistedSessionLease {
             schema_version: 1,
             session_id: to_session_id.to_owned(),
@@ -386,8 +480,10 @@ impl SynapseService {
             renewed_at_unix_ms: now.saturating_sub(status.renewed_at_ms_ago.unwrap_or_default()),
             ttl_ms,
             expires_at_unix_ms: now.saturating_add(expires_in_ms),
+            owner_process_id: generation.process_id,
+            owner_process_started_at_unix_ms: generation.started_at_unix_ms,
         };
-        let encoded = synapse_storage::encode_json(&row).map_err(|error| {
+        let encoded = lease_identity::encode_lease_row(&row, status).map_err(|error| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!("encode persisted session lease handoff failed: {error}"),
@@ -456,27 +552,113 @@ impl SynapseService {
         Ok(readback)
     }
 
-    pub(super) fn delete_persisted_session_lease(&self, session_id: &str) -> Result<(), ErrorData> {
-        let db = self.session_continuity_db()?;
-        let key = session_lease_key(session_id);
-        let existed_before =
-            cf_row_exists(&db, &key).map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        delete_exact_session_row(&db, key.clone())?;
-        let exists_after =
-            cf_row_exists(&db, &key).map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if exists_after {
+    /// Commits a lease handoff's source-row removal, recipient-row creation,
+    /// and released/acquired journal pair atomically.
+    pub(super) fn persist_session_lease_handoff_with_events(
+        &self,
+        from_session_id: &str,
+        to_session_id: &str,
+        status: &LeaseStatus,
+    ) -> Result<LeaseHandoffContinuityReadback, ErrorData> {
+        let ttl_ms = status.ttl_ms.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "cannot persist handoff input lease: missing ttl_ms",
+            )
+        })?;
+        let expires_in_ms = status.expires_in_ms.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "cannot persist handoff input lease: missing expires_in_ms",
+            )
+        })?;
+        if status.owner_session_id.as_deref() != Some(to_session_id) {
             return Err(mcp_error(
-                error_codes::STORAGE_CORRUPTED,
-                format!("persisted session lease row still exists after delete for {session_id}"),
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "cannot persist input lease handoff to {to_session_id}: status owner is {:?}",
+                    status.owner_session_id
+                ),
             ));
         }
+        let now = unix_ms_now();
+        let generation = current_lease_process_generation();
+        let row = PersistedSessionLease {
+            schema_version: 1,
+            session_id: to_session_id.to_owned(),
+            stored_at_unix_ms: now,
+            renewed_at_unix_ms: now.saturating_sub(status.renewed_at_ms_ago.unwrap_or_default()),
+            ttl_ms,
+            expires_at_unix_ms: now.saturating_add(expires_in_ms),
+            owner_process_id: generation.process_id,
+            owner_process_started_at_unix_ms: generation.started_at_unix_ms,
+        };
+        let encoded = lease_identity::encode_lease_row(&row, status).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("encode persisted session lease handoff failed: {error}"),
+            )
+        })?;
+        let db = self.session_continuity_db()?;
+        let from_key = session_lease_key(from_session_id);
+        let to_key = session_lease_key(to_session_id);
+        let from_row_existed_before = cf_row_exists(&db, &from_key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if !from_row_existed_before {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "cannot hand off input lease from {from_session_id}: source CF_SESSIONS row is absent"
+                ),
+            ));
+        }
+        let ts_ns = super::agent_events::unix_time_ns_now();
+        let mut released =
+            synapse_core::AgentEventRecord::new(ts_ns, synapse_core::AgentEventKind::LeaseReleased);
+        released.session_id = Some(from_session_id.to_owned());
+        released.reason_code = Some("handoff".to_owned());
+        released.attributes.conversation_id = Some(from_session_id.to_owned());
+        released.payload = json!({
+            "to_session": to_session_id,
+            "lease_generation": lease_identity::read_generation(&db, from_session_id)
+                .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, error))?,
+        });
+        let mut acquired =
+            synapse_core::AgentEventRecord::new(ts_ns, synapse_core::AgentEventKind::LeaseAcquired);
+        acquired.session_id = Some(to_session_id.to_owned());
+        acquired.reason_code = Some("handoff".to_owned());
+        acquired.attributes.conversation_id = Some(to_session_id.to_owned());
+        acquired.payload = json!({
+            "from_session": from_session_id,
+            "lease_generation": status.generation,
+            "ttl_ms": status.ttl_ms,
+            "lease_process_id": generation.process_id,
+            "lease_process_started_at_unix_ms": generation.started_at_unix_ms,
+        });
+        super::agent_events::record_agent_events_with_session_mutations(
+            &db,
+            std::slice::from_ref(&from_key),
+            &[(to_key, encoded)],
+            &[released, acquired],
+        )
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let readback = LeaseHandoffContinuityReadback {
+            from_row_existed_before,
+            from_row_exists_after: false,
+            from_row_deleted: true,
+            to_row_exists_after: true,
+            to_row_session_id: Some(to_session_id.to_owned()),
+        };
         tracing::info!(
-            code = "MCP_SESSION_LEASE_DELETED",
-            session_id,
-            existed_before,
-            "deleted input lease intent from CF_SESSIONS"
+            code = "MCP_SESSION_LEASE_HANDOFF_COMMITTED",
+            from_session_id,
+            to_session_id,
+            readback = ?readback,
+            ttl_ms,
+            expires_at_unix_ms = row.expires_at_unix_ms,
+            "readback=CF_SESSIONS+CF_AGENT_EVENTS after=session_lease_handoff_committed"
         );
-        Ok(())
+        Ok(readback)
     }
 
     pub(super) fn restore_session_lease_if_needed(
@@ -486,88 +668,71 @@ impl SynapseService {
         let Some(persisted) = self.read_persisted_session_lease(session_id)? else {
             return Ok(());
         };
-        let now = unix_ms_now();
-        if persisted.expires_at_unix_ms <= now {
-            self.delete_persisted_session_lease(session_id)?;
-            tracing::warn!(
-                code = "MCP_SESSION_LEASE_EXPIRED_DELETE",
-                session_id,
-                expires_at_unix_ms = persisted.expires_at_unix_ms,
-                now_unix_ms = now,
-                "deleted expired persisted input lease intent"
-            );
-            return Ok(());
-        }
         let current = lease::status();
-        if current.held {
+        if persisted_lease_matches_physical_owner(&persisted, session_id, &current)
+            && lease_identity::identity_matches(
+                &*self.session_continuity_db()?,
+                session_id,
+                &current,
+                true,
+            )
+            .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, error))?
+        {
             tracing::info!(
-                code = "MCP_SESSION_LEASE_RESTORE_SKIPPED",
+                code = "MCP_SESSION_LEASE_PHYSICAL_OWNER_CONFIRMED",
                 session_id,
                 current_owner = ?current.owner_session_id,
-                "input lease already held; persisted intent was not restored"
+                "persisted input lease matches the current process's physical owner"
             );
             return Ok(());
         }
-        let remaining_ms = persisted.expires_at_unix_ms.saturating_sub(now);
-        if remaining_ms < synapse_action::MIN_LEASE_TTL_MS {
-            self.delete_persisted_session_lease(session_id)?;
-            tracing::warn!(
-                code = "MCP_SESSION_LEASE_TOO_CLOSE_TO_EXPIRY_DELETE",
-                session_id,
-                remaining_ms,
-                min_restore_ttl_ms = synapse_action::MIN_LEASE_TTL_MS,
-                "deleted persisted input lease intent that was too close to expiry to restore without extending it"
-            );
-            return Ok(());
+        let _readback = self.reconcile_persisted_session_lease(
+            session_id,
+            &persisted,
+            &current,
+            LEASE_RECONCILIATION_REASON,
+        )?;
+        Ok(())
+    }
+
+    /// Reconciles all persisted lease rows before the daemon exposes a tool
+    /// endpoint. A lease belongs to a process-local physical primitive, so an
+    /// unclean/cold restart must close prior-process rows rather than recreate
+    /// foreground authority from disk.
+    pub(crate) fn reconcile_persisted_session_leases_on_startup(&self) -> Result<(), ErrorData> {
+        let current = lease::status();
+        let persisted = self.read_all_persisted_session_leases()?;
+        let db = self.session_continuity_db()?;
+        let mut preserved = 0_u32;
+        let mut reconciled = 0_u32;
+        for (row, generation) in persisted {
+            if persisted_lease_matches_physical_owner(&row, &row.session_id, &current)
+                && lease_identity::generation_matches(generation.as_deref(), &current, true)
+            {
+                preserved = preserved.saturating_add(1);
+                continue;
+            }
+            let _readback = reconcile_persisted_session_lease_with_generation(
+                &db,
+                &row.session_id,
+                &row,
+                &current,
+                LEASE_RECONCILIATION_REASON,
+                generation.as_deref(),
+            )
+            .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, error))?;
+            reconciled = reconciled.saturating_add(1);
         }
-        match lease::try_acquire(session_id, lease::ttl_from_ms(remaining_ms)) {
-            LeaseOutcome::Acquired(status) | LeaseOutcome::Renewed(status) => {
-                if let Err(error) = self.persist_session_lease(session_id, &status) {
-                    let released = lease::release_if_owner(session_id);
-                    tracing::error!(
-                        code = error_codes::TOOL_INTERNAL_ERROR,
-                        session_id,
-                        released_after_persist_failure = released,
-                        error = ?error,
-                        "input lease restore failed durability write; released in-memory lease before returning error"
-                    );
-                    return Err(error);
-                }
-                tracing::info!(
-                    code = "MCP_SESSION_LEASE_RESTORED",
-                    session_id,
-                    restored_expires_in_ms = status.expires_in_ms,
-                    "restored input lease from CF_SESSIONS"
-                );
-                Ok(())
-            }
-            LeaseOutcome::Busy {
-                holder,
-                retry_after_ms,
-            } => {
-                tracing::warn!(
-                    code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,
-                    session_id,
-                    holder = ?holder.owner_session_id,
-                    retry_after_ms,
-                    "persisted input lease intent could not restore because the lease is contended"
-                );
-                Ok(())
-            }
-            LeaseOutcome::CleanupPending {
-                expired,
-                retry_after_ms,
-            } => {
-                tracing::warn!(
-                    code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,
-                    session_id,
-                    expired_owner = ?expired.owner_session_id,
-                    retry_after_ms,
-                    "persisted input lease intent could not restore because expired input cleanup is pending"
-                );
-                Ok(())
-            }
-        }
+        tracing::info!(
+            code = "MCP_SESSION_LEASE_STARTUP_RECONCILIATION",
+            persisted_row_count = preserved.saturating_add(reconciled),
+            preserved_row_count = preserved,
+            reconciled_row_count = reconciled,
+            physical_lease_held = current.held,
+            physical_lease_owner = ?current.owner_session_id,
+            "readback=CF_SESSIONS+CF_AGENT_EVENTS after=startup_lease_reconciliation"
+        );
+        Ok(())
     }
 
     pub(super) fn memory_session_target(
@@ -620,7 +785,6 @@ impl SynapseService {
                 ),
             ));
         }
-        validate_persisted_session_target_hwnd(session_id, &persisted.target)?;
         Ok(Some(persisted))
     }
 
@@ -655,6 +819,49 @@ impl SynapseService {
         Ok(Some(persisted))
     }
 
+    fn read_all_persisted_session_leases(
+        &self,
+    ) -> Result<Vec<(PersistedSessionLease, Option<String>)>, ErrorData> {
+        let db = self.session_continuity_db()?;
+        let rows = db
+            .scan_cf_prefix(cf::CF_SESSIONS, SESSION_LEASE_PREFIX.as_bytes())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let mut persisted = Vec::with_capacity(rows.len());
+        let warnings = skipped_rows::SkippedRowWarnings::startup_lease_rows();
+        let mut skips = skipped_rows::SweepSkips::default();
+        for (row_key, value) in rows {
+            let row = lease_identity::decode_lease_row(&value);
+            let valid = row.as_ref().is_ok_and(|(row, _generation)| {
+                row.schema_version == 1 && row_key == session_lease_key(&row.session_id)
+            });
+            if !valid {
+                if warnings.should_warn(&mut skips, &row_key) {
+                    tracing::warn!(code = "MCP_SESSION_LEASE_STARTUP_ROW_SKIPPED",
+                        key = ?row_key, "invalid lease row retained; continuing startup reconciliation");
+                }
+                continue;
+            }
+            if let Ok(row) = row {
+                persisted.push(row);
+            }
+        }
+        warnings.finish_sweep(skips);
+        persisted.sort_by(|left, right| left.0.session_id.cmp(&right.0.session_id));
+        Ok(persisted)
+    }
+
+    fn reconcile_persisted_session_lease(
+        &self,
+        session_id: &str,
+        persisted: &PersistedSessionLease,
+        physical: &LeaseStatus,
+        reason_code: &str,
+    ) -> Result<LeaseReleaseReconciliationReadback, ErrorData> {
+        let db = self.session_continuity_db()?;
+        reconcile_persisted_session_lease_from_db(&db, session_id, persisted, physical, reason_code)
+            .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, error))
+    }
+
     fn session_registry_read_for_persistence(
         &self,
         session_id: &str,
@@ -685,58 +892,12 @@ impl SynapseService {
     }
 }
 
-pub(crate) fn delete_persisted_session_continuity_rows(
-    m3_state: &SharedM3State,
-    session_id: &str,
-) -> Result<ContinuityCleanupReadback, String> {
-    let db = session_continuity_db_from_state(m3_state)?;
-    delete_persisted_session_continuity_rows_from_db(&db, session_id)
-}
-
 pub(crate) fn read_persisted_session_target_for_session(
     m3_state: &SharedM3State,
     session_id: &str,
 ) -> Result<Option<SessionTarget>, String> {
     let db = session_continuity_db_from_state(m3_state)?;
     read_persisted_session_target_from_db(&db, session_id).map(|row| row.map(|row| row.target))
-}
-
-pub(crate) fn delete_persisted_session_continuity_rows_from_db(
-    db: &Db,
-    session_id: &str,
-) -> Result<ContinuityCleanupReadback, String> {
-    let target_key = session_target_key(session_id);
-    let lease_key = session_lease_key(session_id);
-    let target_row_existed_before =
-        cf_row_exists(db, &target_key).map_err(|error| error.to_string())?;
-    let lease_row_existed_before =
-        cf_row_exists(db, &lease_key).map_err(|error| error.to_string())?;
-    db.delete_batch(cf::CF_SESSIONS, [target_key.clone(), lease_key.clone()])
-        .map_err(|error| error.to_string())?;
-    let target_row_exists_after =
-        cf_row_exists(db, &target_key).map_err(|error| error.to_string())?;
-    let lease_row_exists_after =
-        cf_row_exists(db, &lease_key).map_err(|error| error.to_string())?;
-    if target_row_exists_after || lease_row_exists_after {
-        return Err(format!(
-            "session continuity rows still exist after delete for {session_id}: target_after={target_row_exists_after} lease_after={lease_row_exists_after}"
-        ));
-    }
-    let readback = ContinuityCleanupReadback {
-        target_row_existed_before,
-        target_row_exists_after,
-        target_row_deleted: target_row_existed_before && !target_row_exists_after,
-        lease_row_existed_before,
-        lease_row_exists_after,
-        lease_row_deleted: lease_row_existed_before && !lease_row_exists_after,
-    };
-    tracing::info!(
-        code = "MCP_SESSION_CONTINUITY_DELETED",
-        session_id,
-        readback = ?readback,
-        "readback=CF_SESSIONS after=session_continuity_deleted"
-    );
-    Ok(readback)
 }
 
 fn read_persisted_session_target_from_db(
@@ -760,115 +921,298 @@ fn read_persisted_session_target_from_db(
             persisted.schema_version, persisted.session_id
         ));
     }
-    validate_persisted_session_target_hwnd(session_id, &persisted.target)
-        .map_err(|error| error.message.to_string())?;
     Ok(Some(persisted))
 }
 
-pub(crate) fn delete_persisted_session_lease_row(
+pub(crate) fn delete_persisted_session_target_row(
     m3_state: &SharedM3State,
     session_id: &str,
-) -> Result<LeaseContinuityCleanupReadback, String> {
+) -> Result<TargetContinuityCleanupReadback, String> {
     let db = session_continuity_db_from_state(m3_state)?;
-    delete_persisted_session_lease_row_from_db(&db, session_id)
+    delete_persisted_session_target_row_from_db(&db, session_id)
 }
 
-/// Exact durable-lease row snapshot used by cancellation-safe authority
-/// guards. Keeping the encoded bytes lets a guard restore the pre-call row
-/// without reconstructing or extending its expiry metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PersistedSessionLeaseRowSnapshot {
-    value: Option<Vec<u8>>,
-}
-
-impl PersistedSessionLeaseRowSnapshot {
-    pub(crate) const fn row_exists(&self) -> bool {
-        self.value.is_some()
-    }
-}
-
-pub(crate) fn snapshot_persisted_session_lease_row(
-    m3_state: &SharedM3State,
-    session_id: &str,
-) -> Result<PersistedSessionLeaseRowSnapshot, String> {
-    let db = session_continuity_db_from_state(m3_state)?;
-    snapshot_persisted_session_lease_row_from_db(&db, session_id)
-}
-
-fn snapshot_persisted_session_lease_row_from_db(
+pub(crate) fn delete_persisted_session_target_row_from_db(
     db: &Db,
     session_id: &str,
-) -> Result<PersistedSessionLeaseRowSnapshot, String> {
-    let key = session_lease_key(session_id);
-    let value = db
-        .scan_cf_prefix(cf::CF_SESSIONS, &key)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find_map(|(row_key, value)| (row_key == key).then_some(value));
-    Ok(PersistedSessionLeaseRowSnapshot { value })
-}
-
-/// Restore an exact pre-call durable-lease row and immediately read it back.
-/// This is synchronous by design so an async future's `Drop` path can revoke a
-/// partially acquired foreground lease even during cancellation or unwind.
-pub(crate) fn restore_persisted_session_lease_row(
-    m3_state: &SharedM3State,
-    session_id: &str,
-    before: &PersistedSessionLeaseRowSnapshot,
-) -> Result<PersistedSessionLeaseRowSnapshot, String> {
-    let db = session_continuity_db_from_state(m3_state)?;
-    let key = session_lease_key(session_id);
-    match before.value.as_ref() {
-        Some(value) => db
-            .put_batch_pressure_bypass(cf::CF_SESSIONS, [(key, value.clone())])
-            .map_err(|error| error.to_string())?,
-        None => db
-            .delete_batch(cf::CF_SESSIONS, [key])
-            .map_err(|error| error.to_string())?,
-    }
-    let after = snapshot_persisted_session_lease_row_from_db(&db, session_id)?;
-    if &after != before {
-        return Err(format!(
-            "persisted session lease row mismatch after authority-guard restore for {session_id}: expected_present={} actual_present={}",
-            before.value.is_some(),
-            after.value.is_some()
-        ));
-    }
-    tracing::info!(
-        code = "MCP_SESSION_LEASE_AUTHORITY_GUARD_RESTORED",
-        session_id,
-        row_present = after.value.is_some(),
-        "readback=CF_SESSIONS after=authority_guard_lease_row_restored"
-    );
-    Ok(after)
-}
-
-pub(crate) fn delete_persisted_session_lease_row_from_db(
-    db: &Db,
-    session_id: &str,
-) -> Result<LeaseContinuityCleanupReadback, String> {
-    let key = session_lease_key(session_id);
-    let row_existed_before = cf_row_exists(db, &key).map_err(|error| error.to_string())?;
+) -> Result<TargetContinuityCleanupReadback, String> {
+    let key = session_target_key(session_id);
+    let row_existed_before = cf_row_exists(&db, &key).map_err(|error| error.to_string())?;
     db.delete_batch(cf::CF_SESSIONS, [key.clone()])
         .map_err(|error| error.to_string())?;
+    let row_exists_after = cf_row_exists(&db, &key).map_err(|error| error.to_string())?;
+    if row_exists_after {
+        return Err(format!(
+            "session target continuity row still exists after delete for {session_id}"
+        ));
+    }
+    Ok(TargetContinuityCleanupReadback {
+        row_existed_before,
+        row_exists_after,
+        row_deleted: row_existed_before,
+    })
+}
+
+fn read_persisted_session_lease_from_db(
+    db: &Db,
+    session_id: &str,
+) -> Result<Option<PersistedSessionLease>, String> {
+    let key = session_lease_key(session_id);
+    let rows = db
+        .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        .map_err(|error| error.to_string())?;
+    let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
+        return Ok(None);
+    };
+    let persisted =
+        synapse_storage::decode_json::<PersistedSessionLease>(&value).map_err(|error| {
+            format!("decode persisted session lease failed for {session_id}: {error}")
+        })?;
+    if persisted.schema_version != 1 || persisted.session_id != session_id {
+        return Err(format!(
+            "persisted session lease row mismatch for {session_id}: schema_version={} row_session_id={}",
+            persisted.schema_version, persisted.session_id
+        ));
+    }
+    Ok(Some(persisted))
+}
+
+/// Closes an open persisted input-lease lifecycle row and writes its balancing
+/// `LeaseReleased` event in one durable transition. The row is the exactly-once
+/// marker: callers that arrive after a prior closer observe no row and emit no
+/// duplicate release event.
+pub(crate) fn reconcile_persisted_session_lease_row(
+    m3_state: &SharedM3State,
+    session_id: &str,
+    reason_code: &str,
+) -> Result<LeaseReleaseReconciliationReadback, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    let Some(persisted) = read_persisted_session_lease_from_db(&db, session_id)? else {
+        return Ok(LeaseReleaseReconciliationReadback {
+            session_id: session_id.to_owned(),
+            reason_code: reason_code.to_owned(),
+            ..LeaseReleaseReconciliationReadback::default()
+        });
+    };
+    let physical = lease::status();
+    reconcile_persisted_session_lease_from_db(&db, session_id, &persisted, &physical, reason_code)
+}
+
+/// Emergency reports can be replayed; never close another acquisition's row.
+pub(crate) fn reconcile_displaced_session_lease_row(
+    m3_state: &SharedM3State,
+    displaced: &LeaseStatus,
+    reason_code: &str,
+) -> Result<LeaseReleaseReconciliationReadback, String> {
+    let session_id = displaced.owner_session_id.as_deref().unwrap_or_default();
+    let db = session_continuity_db_from_state(m3_state)?;
+    if session_id.is_empty()
+        || !lease_identity::identity_matches(&db, session_id, displaced, false)?
+    {
+        return Ok(LeaseReleaseReconciliationReadback {
+            session_id: session_id.to_owned(),
+            reason_code: reason_code.to_owned(),
+            ..LeaseReleaseReconciliationReadback::default()
+        });
+    }
+    let Some(persisted) = read_persisted_session_lease_from_db(&db, session_id)? else {
+        return Ok(LeaseReleaseReconciliationReadback::default());
+    };
+    reconcile_persisted_session_lease_from_db(
+        &db,
+        session_id,
+        &persisted,
+        &lease::status(),
+        reason_code,
+    )
+}
+
+/// Closes every persisted input-lease row whose lease no longer physically
+/// exists in this process (expired, preempted, force-cleared, left by a prior
+/// process), journaling one `LeaseReleased` per row. The row is the
+/// exactly-once marker, so this is idempotent and is the retry path for any
+/// release whose journal write was skipped or failed (#93/#94/#95). Rows that
+/// match the live physical owner are left alone. Callers hold the lease
+/// transition gate so an in-flight acquire (physical lease, then row) is never
+/// closed under it. Undecodable rows are skipped and logged.
+pub(crate) fn reconcile_orphaned_session_lease_rows(
+    m3_state: &SharedM3State,
+    reason_code: &str,
+) -> Result<u32, String> {
+    reconcile_orphaned_session_lease_rows_with_warnings(
+        m3_state,
+        reason_code,
+        skipped_rows::SkippedRowWarnings::global(),
+    )
+}
+
+/// [`reconcile_orphaned_session_lease_rows`] with an explicit warn-once memory
+/// instead of the process-wide one (test seam: isolated #180 bookkeeping).
+fn reconcile_orphaned_session_lease_rows_with_warnings(
+    m3_state: &SharedM3State,
+    reason_code: &str,
+    skip_log: &skipped_rows::SkippedRowWarnings,
+) -> Result<u32, String> {
+    let physical = lease::status();
+    // While the operator holds the lease (panic hotkey K1 -> K2 window), the
+    // displaced owner's row belongs to K2, which journals the fixed
+    // `operator_hotkey_preempted` reason. Sweeping now would steal that reason
+    // (#94); K2 clears the operator lease and the next tick resumes.
+    if lease::emergency_cleanup_pending()
+        || (physical.held
+            && physical.owner_session_id.as_deref()
+                == Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID))
+    {
+        return Ok(0);
+    }
+    let db = session_continuity_db_from_state(m3_state)?;
+    let rows = db
+        .scan_cf_prefix(cf::CF_SESSIONS, SESSION_LEASE_PREFIX.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut closed = 0_u32;
+    let mut sweep_skips = skipped_rows::SweepSkips::default();
+    for (row_key, value) in rows {
+        let (persisted, generation) = match lease_identity::decode_lease_row(&value) {
+            Ok((row, generation))
+                if row.schema_version == 1 && row_key == session_lease_key(&row.session_id) =>
+            {
+                (row, generation)
+            }
+            Ok(_) | Err(_) => {
+                // #180: the sweep ticks every 250 ms; warn once per corrupt key.
+                if skip_log.should_warn(&mut sweep_skips, &row_key) {
+                    tracing::warn!(
+                        code = "MCP_SESSION_LEASE_ORPHAN_SWEEP_ROW_SKIPPED",
+                        key = %String::from_utf8_lossy(&row_key),
+                        "persisted session lease row is undecodable or mismatched; left for repair (reported once per key)"
+                    );
+                }
+                continue;
+            }
+        };
+        if persisted_lease_matches_physical_owner(&persisted, &persisted.session_id, &physical)
+            && lease_identity::generation_matches(generation.as_deref(), &physical, true)
+        {
+            continue;
+        }
+        let session_id = persisted.session_id.clone();
+        match reconcile_persisted_session_lease_with_generation(
+            &db,
+            &session_id,
+            &persisted,
+            &physical,
+            reason_code,
+            generation.as_deref(),
+        ) {
+            Ok(readback) if readback.release_event_written => closed = closed.saturating_add(1),
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                code = "MCP_SESSION_LEASE_ORPHAN_SWEEP_FAILED",
+                session_id = %session_id,
+                error = %error,
+                "orphaned session lease row could not be closed; the next sweep retries"
+            ),
+        }
+    }
+    skip_log.finish_sweep(sweep_skips);
+    Ok(closed)
+}
+
+fn reconcile_persisted_session_lease_from_db(
+    db: &Db,
+    session_id: &str,
+    persisted: &PersistedSessionLease,
+    physical: &LeaseStatus,
+    reason_code: &str,
+) -> Result<LeaseReleaseReconciliationReadback, String> {
+    let generation = lease_identity::read_generation(db, session_id)?;
+    reconcile_persisted_session_lease_with_generation(
+        db,
+        session_id,
+        persisted,
+        physical,
+        reason_code,
+        generation.as_deref(),
+    )
+}
+
+fn reconcile_persisted_session_lease_with_generation(
+    db: &Db,
+    session_id: &str,
+    persisted: &PersistedSessionLease,
+    physical: &LeaseStatus,
+    reason_code: &str,
+    generation: Option<&str>,
+) -> Result<LeaseReleaseReconciliationReadback, String> {
+    let key = session_lease_key(session_id);
+    let row_existed_before = cf_row_exists(db, &key).map_err(|error| error.to_string())?;
+    if !row_existed_before {
+        return Ok(LeaseReleaseReconciliationReadback {
+            session_id: session_id.to_owned(),
+            reason_code: reason_code.to_owned(),
+            ..LeaseReleaseReconciliationReadback::default()
+        });
+    }
+    let mut released = synapse_core::AgentEventRecord::new(
+        super::agent_events::unix_time_ns_now(),
+        synapse_core::AgentEventKind::LeaseReleased,
+    );
+    released.session_id = Some(session_id.to_owned());
+    released.reason_code = Some(reason_code.to_owned());
+    released.attributes.conversation_id = Some(session_id.to_owned());
+    released.payload = json!({
+        "lease_generation": generation,
+        "persisted_expires_at_unix_ms": persisted.expires_at_unix_ms,
+        "persisted_owner_process_id": persisted.owner_process_id,
+        "persisted_owner_process_started_at_unix_ms": persisted.owner_process_started_at_unix_ms,
+        "physical_lease_held": physical.held,
+        "physical_lease_owner_session_id": physical.owner_session_id,
+        "physical_lease_ttl_ms": physical.ttl_ms,
+    });
+    super::agent_events::record_agent_events_with_session_mutations(
+        db,
+        std::slice::from_ref(&key),
+        &[],
+        &[released],
+    )
+    .map_err(|error| error.to_string())?;
     let row_exists_after = cf_row_exists(db, &key).map_err(|error| error.to_string())?;
     if row_exists_after {
         return Err(format!(
-            "session lease continuity row still exists after delete for {session_id}"
+            "session lease continuity row still exists after reconciled release for {session_id}"
         ));
     }
-    let readback = LeaseContinuityCleanupReadback {
+    let readback = LeaseReleaseReconciliationReadback {
+        session_id: session_id.to_owned(),
         row_existed_before,
         row_exists_after,
-        row_deleted: row_existed_before && !row_exists_after,
+        row_deleted: true,
+        release_event_written: true,
+        reason_code: reason_code.to_owned(),
     };
-    tracing::info!(
-        code = "MCP_SESSION_LEASE_CONTINUITY_DELETED",
+    tracing::warn!(
+        code = "MCP_SESSION_LEASE_RECONCILED",
         session_id,
+        reason_code,
+        persisted_owner_process_id = persisted.owner_process_id,
+        physical_lease_held = physical.held,
+        physical_lease_owner = ?physical.owner_session_id,
         readback = ?readback,
-        "readback=CF_SESSIONS after=session_lease_continuity_deleted"
+        "readback=CF_SESSIONS+CF_AGENT_EVENTS after=session_lease_reconciled"
     );
     Ok(readback)
+}
+
+fn persisted_lease_matches_physical_owner(
+    persisted: &PersistedSessionLease,
+    session_id: &str,
+    physical: &LeaseStatus,
+) -> bool {
+    let generation = current_lease_process_generation();
+    physical.held
+        && physical.owner_session_id.as_deref() == Some(session_id)
+        && persisted.owner_process_id == generation.process_id
+        && persisted.owner_process_started_at_unix_ms == generation.started_at_unix_ms
 }
 
 fn validate_restored_target(session_id: &str, target: &SessionTarget) -> Result<(), ErrorData> {
@@ -970,27 +1314,53 @@ fn read_persisted_cdp_target_owners_for_session_from_db(
     db: &Db,
     session_id: &str,
 ) -> Result<Vec<(String, PersistedCdpTargetOwner)>, String> {
+    read_persisted_cdp_target_owners_for_session_with_warnings(
+        db,
+        session_id,
+        skipped_rows::SkippedRowWarnings::cdp_owner_rows(),
+    )
+}
+
+fn read_persisted_cdp_target_owners_for_session_with_warnings(
+    db: &Db,
+    session_id: &str,
+    skip_log: &skipped_rows::SkippedRowWarnings,
+) -> Result<Vec<(String, PersistedCdpTargetOwner)>, String> {
     let rows = db
         .scan_cf_prefix(cf::CF_SESSIONS, SESSION_CDP_TARGET_OWNER_PREFIX.as_bytes())
         .map_err(|error| error.to_string())?;
+    // #216: one bad row (another build's schema, a torn write) must not fail
+    // the scan for every unrelated session. Rows of other sessions are skipped
+    // before strict validation; a bad row is skipped, warned once, and left in
+    // place for repair.
+    let mut skips = skipped_rows::SweepSkips::default();
     let mut decoded = Vec::new();
     for (row_key, value) in rows {
-        let row = synapse_storage::decode_json::<PersistedCdpTargetOwner>(&value)
-            .map_err(|error| format!("decode persisted CDP target owner failed: {error}"))?;
-        validate_persisted_cdp_target_owner(&row.owner.cdp_target_id, &row)
-            .map_err(|error| error.message.to_string())?;
-        let expected_key = cdp_target_owner_row_key(&row.owner_key, &row.owner.cdp_target_id);
-        if row_key != expected_key {
-            return Err(format!(
-                "persisted CDP target owner row key mismatch: row_key={} owner_key={}",
-                String::from_utf8_lossy(&row_key),
-                row.owner_key
-            ));
+        let row = match synapse_storage::decode_json::<PersistedCdpTargetOwner>(&value) {
+            Ok(row) => row,
+            Err(error) => {
+                warn_skipped_cdp_owner_row(
+                    skip_log,
+                    &mut skips,
+                    &row_key,
+                    &format!("decode persisted CDP target owner failed: {error}"),
+                );
+                continue;
+            }
+        };
+        if row.owner_session_id != session_id {
+            continue;
         }
-        if row.owner_session_id == session_id {
-            decoded.push((row.owner_key.clone(), row));
+        if let Err(reason) = check_persisted_cdp_target_owner_row(&row_key, &row) {
+            warn_skipped_cdp_owner_row(skip_log, &mut skips, &row_key, &reason);
+            continue;
         }
+        decoded.push((row.owner_key.clone(), row));
     }
+    // A per-session scan sees only this session's rows strictly, so it must not
+    // prune the shared memory: that would forget another session's bad row and
+    // make the next full scan warn again (#216). The full session-id scan prunes.
+    drop(skips);
     decoded.sort_by(|left, right| {
         left.1
             .owner
@@ -1005,49 +1375,119 @@ fn read_persisted_session_target_session_ids_from_db(db: &Db) -> Result<BTreeSet
     let rows = db
         .scan_cf_prefix(cf::CF_SESSIONS, SESSION_TARGET_PREFIX.as_bytes())
         .map_err(|error| error.to_string())?;
+    // #216: a bad row is skipped and warned once, never an error for the scan.
+    let skip_log = skipped_rows::SkippedRowWarnings::session_target_rows();
+    let mut skips = skipped_rows::SweepSkips::default();
     let mut session_ids = BTreeSet::new();
     for (row_key, value) in rows {
-        let key_session_id = session_id_from_target_row_key(&row_key)?;
-        let row = synapse_storage::decode_json::<PersistedSessionTarget>(&value)
-            .map_err(|error| format!("decode persisted session target failed: {error}"))?;
-        if row.schema_version != 1 || row.session_id != key_session_id {
-            return Err(format!(
-                "persisted session target row mismatch: row_key={} schema_version={} row_session_id={}",
-                String::from_utf8_lossy(&row_key),
-                row.schema_version,
-                row.session_id
-            ));
+        let checked = session_id_from_target_row_key(&row_key).and_then(|key_session_id| {
+            let row = synapse_storage::decode_json::<PersistedSessionTarget>(&value)
+                .map_err(|error| format!("decode persisted session target failed: {error}"))?;
+            if row.schema_version != 1 || row.session_id != key_session_id {
+                return Err(format!(
+                    "persisted session target row mismatch: row_key={} schema_version={} row_session_id={}",
+                    String::from_utf8_lossy(&row_key),
+                    row.schema_version,
+                    row.session_id
+                ));
+            }
+            Ok(key_session_id)
+        });
+        match checked {
+            Ok(key_session_id) => {
+                session_ids.insert(key_session_id);
+            }
+            Err(reason) => {
+                if skip_log.should_warn(&mut skips, &row_key) {
+                    tracing::warn!(
+                        code = "MCP_SESSION_TARGET_ROW_SKIPPED",
+                        key = %String::from_utf8_lossy(&row_key),
+                        detail = %reason,
+                        "persisted session target row is undecodable or mismatched; left for repair (reported once per key)"
+                    );
+                }
+            }
         }
-        validate_persisted_session_target_hwnd(&key_session_id, &row.target)
-            .map_err(|error| error.message.to_string())?;
-        session_ids.insert(key_session_id);
     }
+    skip_log.finish_sweep(skips);
     Ok(session_ids)
 }
 
 fn read_persisted_cdp_target_owner_session_ids_from_db(
     db: &Db,
 ) -> Result<BTreeSet<String>, String> {
+    read_persisted_cdp_target_owner_session_ids_with_warnings(
+        db,
+        skipped_rows::SkippedRowWarnings::cdp_owner_rows(),
+    )
+}
+
+fn read_persisted_cdp_target_owner_session_ids_with_warnings(
+    db: &Db,
+    skip_log: &skipped_rows::SkippedRowWarnings,
+) -> Result<BTreeSet<String>, String> {
     let rows = db
         .scan_cf_prefix(cf::CF_SESSIONS, SESSION_CDP_TARGET_OWNER_PREFIX.as_bytes())
         .map_err(|error| error.to_string())?;
+    // #216: a bad row is skipped and warned once; it must not hide every
+    // other session from the stale-candidate scan on each 250 ms tick.
+    let mut skips = skipped_rows::SweepSkips::default();
     let mut session_ids = BTreeSet::new();
     for (row_key, value) in rows {
-        let row = synapse_storage::decode_json::<PersistedCdpTargetOwner>(&value)
-            .map_err(|error| format!("decode persisted CDP target owner failed: {error}"))?;
-        validate_persisted_cdp_target_owner(&row.owner.cdp_target_id, &row)
-            .map_err(|error| error.message.to_string())?;
-        let expected_key = cdp_target_owner_row_key(&row.owner_key, &row.owner.cdp_target_id);
-        if row_key != expected_key {
-            return Err(format!(
-                "persisted CDP target owner row key mismatch: row_key={} owner_key={}",
-                String::from_utf8_lossy(&row_key),
-                row.owner_key
-            ));
+        let row = match synapse_storage::decode_json::<PersistedCdpTargetOwner>(&value) {
+            Ok(row) => row,
+            Err(error) => {
+                warn_skipped_cdp_owner_row(
+                    skip_log,
+                    &mut skips,
+                    &row_key,
+                    &format!("decode persisted CDP target owner failed: {error}"),
+                );
+                continue;
+            }
+        };
+        if let Err(reason) = check_persisted_cdp_target_owner_row(&row_key, &row) {
+            warn_skipped_cdp_owner_row(skip_log, &mut skips, &row_key, &reason);
+            continue;
         }
         session_ids.insert(row.owner_session_id);
     }
+    skip_log.finish_sweep(skips);
     Ok(session_ids)
+}
+
+/// Strict validation of one decoded persisted CDP owner row against its key.
+fn check_persisted_cdp_target_owner_row(
+    row_key: &[u8],
+    row: &PersistedCdpTargetOwner,
+) -> Result<(), String> {
+    validate_persisted_cdp_target_owner(&row.owner.cdp_target_id, row)
+        .map_err(|error| error.message.to_string())?;
+    let expected_key = cdp_target_owner_row_key(&row.owner_key, &row.owner.cdp_target_id);
+    if row_key != expected_key {
+        return Err(format!(
+            "persisted CDP target owner row key mismatch: row_key={} owner_key={}",
+            String::from_utf8_lossy(row_key),
+            row.owner_key
+        ));
+    }
+    Ok(())
+}
+
+fn warn_skipped_cdp_owner_row(
+    skip_log: &skipped_rows::SkippedRowWarnings,
+    skips: &mut skipped_rows::SweepSkips,
+    row_key: &[u8],
+    reason: &str,
+) {
+    if skip_log.should_warn(skips, row_key) {
+        tracing::warn!(
+            code = "MCP_SESSION_CDP_OWNER_ROW_SKIPPED",
+            key = %String::from_utf8_lossy(row_key),
+            detail = %reason,
+            "persisted CDP target owner row is undecodable or mismatched; left for repair (reported once per key)"
+        );
+    }
 }
 
 fn session_id_from_target_row_key(row_key: &[u8]) -> Result<String, String> {
@@ -1097,25 +1537,6 @@ fn validate_persisted_cdp_target_owner(
             ),
         ));
     }
-    if !crate::m1::window_hwnd_shape_is_canonical(row.owner.window_hwnd) {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "persisted CDP target owner row has noncanonical window_hwnd={}; expected 1..=4294967295",
-                row.owner.window_hwnd
-            ),
-        ));
-    }
-    if let Some(capture_window_hwnd) = row.owner.capture_window_hwnd
-        && !crate::m1::window_hwnd_shape_is_canonical(capture_window_hwnd)
-    {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "persisted CDP target owner row has noncanonical capture_window_hwnd={capture_window_hwnd}; expected 1..=4294967295"
-            ),
-        ));
-    }
     if normalize_cdp_target_id(&row.owner.cdp_target_id)
         != normalize_cdp_target_id(requested_cdp_target_id)
     {
@@ -1128,35 +1549,6 @@ fn validate_persisted_cdp_target_owner(
         ));
     }
     Ok(())
-}
-
-fn validate_persisted_session_target_hwnd(
-    session_id: &str,
-    target: &SessionTarget,
-) -> Result<(), ErrorData> {
-    let (field, hwnd) = match target {
-        SessionTarget::Window { hwnd } => ("hwnd", *hwnd),
-        SessionTarget::Cdp { window_hwnd, .. } => ("window_hwnd", *window_hwnd),
-    };
-    if crate::m1::window_hwnd_shape_is_canonical(hwnd) {
-        return Ok(());
-    }
-    tracing::error!(
-        code = error_codes::STORAGE_CORRUPTED,
-        source_of_truth = "CF_SESSIONS persisted session target row",
-        session_id,
-        field,
-        actual_value = hwnd,
-        accepted_range = "1..=u32::MAX",
-        remediation = "delete or repair the corrupt session-target row, then bind a canonical target through the target facade",
-        "persisted session target contains a noncanonical HWND"
-    );
-    Err(mcp_error(
-        error_codes::STORAGE_CORRUPTED,
-        format!(
-            "persisted session target row for {session_id} has noncanonical {field}={hwnd}; expected 1..=4294967295"
-        ),
-    ))
 }
 
 fn cdp_target_owner_target_prefix(cdp_target_id: &str) -> Vec<u8> {
@@ -1204,3 +1596,47 @@ fn unix_ms_now() -> u64 {
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
 }
+
+fn current_lease_process_generation() -> LeaseProcessGeneration {
+    *LEASE_PROCESS_GENERATION.get_or_init(|| LeaseProcessGeneration {
+        process_id: std::process::id(),
+        started_at_unix_ms: unix_ms_now(),
+    })
+}
+
+#[path = "session_continuity_skipped_rows.rs"]
+mod skipped_rows;
+
+#[cfg(test)]
+#[path = "tests/session_lease_skip_warn_once_180.rs"]
+mod session_lease_skip_warn_once_180_tests;
+
+#[cfg(test)]
+#[path = "tests/session_lease_orphan_sweep.rs"]
+mod session_lease_orphan_sweep_tests;
+
+#[cfg(test)]
+#[path = "tests/session_lease_hotkey_sweep_94.rs"]
+mod session_lease_hotkey_sweep_94_tests;
+
+#[cfg(test)]
+#[path = "tests/session_lease_restart_reconcile_95.rs"]
+mod session_lease_restart_reconcile_95_tests;
+
+#[cfg(test)]
+#[path = "tests/session_cdp_owner_bad_row_216.rs"]
+mod session_cdp_owner_bad_row_216_tests;
+
+#[cfg(test)]
+#[path = "tests/journal_failure_retry_93.rs"]
+mod journal_failure_retry_93;
+#[cfg(test)]
+#[path = "tests/orphan_warning_events_180.rs"]
+mod orphan_warning_events_180;
+#[cfg(test)]
+#[path = "tests/startup_corrupt_leases_216.rs"]
+mod startup_corrupt_leases_216;
+
+#[cfg(test)]
+#[path = "tests/durable_lease_generation_95.rs"]
+mod durable_lease_generation_95;

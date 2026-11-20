@@ -12,6 +12,8 @@ pub enum ReflexError {
     KindInvalid { detail: String },
     #[error("reflex params invalid: {detail}")]
     ParamsInvalid { detail: String },
+    #[error("reflex storage failure ({code}): {detail}")]
+    Storage { code: &'static str, detail: String },
     #[error("reflex target invalid: {detail}")]
     TargetInvalid { detail: String },
     #[error("reflex filter invalid: {detail}")]
@@ -32,6 +34,12 @@ pub enum ReflexError {
     LifetimeExpired { reflex_id: ReflexId },
     #[error("reflex recursion limit reached: {reflex_id}")]
     RecursionLimit { reflex_id: ReflexId },
+    #[error("reflex OS input refused: {error}")]
+    InputTarget { error: synapse_action::ActionError },
+    /// A reflex/routine `TypeText` was refused or interrupted because its
+    /// target window was not the foreground (#188).
+    #[error("reflex foreground typing refused: {reflex_id}: {detail}")]
+    ForegroundLost { reflex_id: ReflexId, detail: String },
 }
 
 impl ReflexError {
@@ -43,6 +51,7 @@ impl ReflexError {
             Self::CapReached { .. } => error_codes::REFLEX_CAP_REACHED,
             Self::KindInvalid { .. } => error_codes::REFLEX_KIND_INVALID,
             Self::ParamsInvalid { .. } => error_codes::REFLEX_PARAMS_INVALID,
+            Self::Storage { code, .. } => code,
             Self::TargetInvalid { .. } => error_codes::REFLEX_TARGET_INVALID,
             Self::FilterInvalid { .. } => error_codes::REFLEX_FILTER_INVALID,
             Self::PriorityInvalid { .. } => error_codes::REFLEX_PRIORITY_INVALID,
@@ -53,6 +62,8 @@ impl ReflexError {
             Self::DisabledByOperator { .. } => error_codes::REFLEX_DISABLED_BY_OPERATOR,
             Self::LifetimeExpired { .. } => error_codes::REFLEX_LIFETIME_EXPIRED,
             Self::RecursionLimit { .. } => error_codes::REFLEX_RECURSION_LIMIT,
+            Self::InputTarget { error } => error.code(),
+            Self::ForegroundLost { .. } => error_codes::ACTION_FOREGROUND_LOST,
         }
     }
 }

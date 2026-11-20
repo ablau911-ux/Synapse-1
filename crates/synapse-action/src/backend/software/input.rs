@@ -1,5 +1,33 @@
 use std::mem;
 
+#[cfg(test)]
+type BatchSender = fn(&[INPUT], i32) -> u32;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BATCH_SENDER: std::cell::Cell<Option<BatchSender>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct TestBatchSender {
+    previous: Option<BatchSender>,
+}
+
+#[cfg(test)]
+pub(super) fn install_batch_sender(sender: BatchSender) -> TestBatchSender {
+    TestBatchSender {
+        previous: TEST_BATCH_SENDER.with(|slot| slot.replace(Some(sender))),
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestBatchSender {
+    fn drop(&mut self) {
+        TEST_BATCH_SENDER.with(|slot| slot.set(self.previous));
+    }
+}
+
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, MOUSE_EVENT_FLAGS,
     MOUSEINPUT, SendInput, VIRTUAL_KEY,
@@ -62,13 +90,23 @@ pub(super) fn send_input_batch(inputs: &[INPUT], detail: &'static str) -> Result
     if inputs.is_empty() {
         return Ok(());
     }
-    super::delivery_guard::ensure_send_input_batch(inputs, detail)?;
+    super::delivery_guard::ensure_send_input_batch(inputs)?;
     let cb_size =
         i32::try_from(mem::size_of::<INPUT>()).map_err(|_err| ActionError::BackendUnavailable {
             detail: "INPUT struct size does not fit SendInput cbSize".to_owned(),
         })?;
     // SAFETY: `inputs` points to initialized Windows `INPUT` values for the
     // duration of the call, and `cb_size` is exactly `size_of::<INPUT>()`.
+    #[cfg(test)]
+    let injected_sender = TEST_BATCH_SENDER.with(std::cell::Cell::get);
+    #[cfg(test)]
+    let sent = if let Some(sender) = injected_sender {
+        sender(inputs, cb_size)
+    } else {
+        // SAFETY: same initialized slice and exact INPUT size as the production call.
+        unsafe { SendInput(inputs, cb_size) }
+    };
+    #[cfg(not(test))]
     let sent = unsafe { SendInput(inputs, cb_size) };
     let expected = u32::try_from(inputs.len()).map_err(|_err| ActionError::BackendUnavailable {
         detail: "SendInput input count does not fit u32".to_owned(),

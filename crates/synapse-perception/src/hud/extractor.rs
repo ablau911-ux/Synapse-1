@@ -2,7 +2,9 @@ use std::time::Instant;
 
 use image::GrayImage;
 use regex::Regex;
-use synapse_core::{HudExtractor, HudFieldSpec, HudParser, HudReading, HudValue, Rect};
+use synapse_core::{
+    ConfidenceSource, HudExtractor, HudFieldSpec, HudParser, HudReading, HudValue, Rect,
+};
 
 use crate::{
     HudTemplate, OcrProvider, PerceptionError, PerceptionResult, TemplateCounterConfig,
@@ -115,7 +117,12 @@ fn extract_template_field(
         request.templates,
         candidate_config,
     ) {
-        Ok(reading) if reading.confidence >= f64::from(request.field.confidence_threshold) => {
+        Ok(reading)
+            if ConfidenceSource::Engine.meets_threshold(
+                confidence_to_f32(reading.confidence),
+                request.field.confidence_threshold,
+            ) =>
+        {
             let confidence = confidence_to_f32(reading.confidence);
             Ok(FieldExtraction {
                 field_name: request.field.name.clone(),
@@ -123,6 +130,7 @@ fn extract_template_field(
                     raw_text: reading.value.to_string(),
                     parsed: HudValue::Number(f64::from(reading.value)),
                     confidence,
+                    confidence_source: ConfidenceSource::Engine,
                     stale_ms: request.stale_ms,
                 },
                 source: ExtractionSource::TemplateMatch,
@@ -201,13 +209,24 @@ fn ocr_reading(
         Ok(text) => text,
         Err(_error) => return default_ocr_reading_for_no_text(request),
     };
-    let confidence = min_word_confidence(&regions);
-    if confidence < request.field.confidence_threshold {
+    let threshold = request.field.confidence_threshold;
+    if let Some(region) = regions.iter().find(|region| {
+        !region
+            .confidence_source
+            .meets_threshold(finite_unit_confidence(region.confidence), threshold)
+    }) {
         return Err(hud_error(format!(
-            "HUD OCR confidence {confidence:.3} below threshold {:.3} for field {:?}",
-            request.field.confidence_threshold, request.field.name
+            "HUD OCR confidence {:.3} did not meet threshold {threshold:.3} for field {:?}",
+            finite_unit_confidence(region.confidence),
+            request.field.name
         )));
     }
+    let confidence = min_word_confidence(&regions);
+    let confidence_source = regions
+        .iter()
+        .map(|region| region.confidence_source)
+        .reduce(ConfidenceSource::least_trusted)
+        .unwrap_or_default();
 
     let parsed = parse_hud_text(&request.field.parser, &text)?;
     let raw_text = match source {
@@ -219,6 +238,7 @@ fn ocr_reading(
             raw_text,
             parsed,
             confidence,
+            confidence_source,
             stale_ms: request.stale_ms,
         },
         ocr_text: text,
@@ -240,6 +260,7 @@ fn default_ocr_reading_for_no_text(
             raw_text: String::new(),
             parsed,
             confidence: 0.0,
+            confidence_source: ConfidenceSource::NotApplicable,
             stale_ms: request.stale_ms,
         },
         ocr_text: String::new(),
@@ -260,17 +281,29 @@ fn joined_text(regions: &[TextRegion]) -> PerceptionResult<String> {
     }
 }
 
+/// Lowest word score; an unscored word (no engine score) counts as `0.0`, never as an invented score.
 fn min_word_confidence(regions: &[TextRegion]) -> f32 {
     regions
         .iter()
         .map(|region| {
-            if region.confidence.is_finite() {
-                region.confidence.clamp(0.0, 1.0)
-            } else {
+            if matches!(
+                region.confidence_source,
+                ConfidenceSource::Unsupported | ConfidenceSource::NotApplicable
+            ) {
                 0.0
+            } else {
+                finite_unit_confidence(region.confidence)
             }
         })
         .fold(1.0_f32, f32::min)
+}
+
+const fn finite_unit_confidence(confidence: f32) -> f32 {
+    if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn parse_number(text: &str) -> PerceptionResult<f64> {

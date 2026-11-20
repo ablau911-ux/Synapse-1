@@ -5,6 +5,7 @@ pub mod click_timing;
 pub mod clipboard;
 pub mod curve;
 pub mod delivery_target;
+pub use delivery_target::InputDeliveryTarget;
 pub mod dynamics;
 pub mod emitter;
 pub mod error;
@@ -16,14 +17,17 @@ pub mod lease;
 pub mod path;
 pub mod rate_limit;
 pub mod recovery;
+mod release_ack;
 pub mod safety;
 pub mod stroke;
+#[cfg(test)]
+pub(crate) mod test_support_epoch;
 pub mod validation;
 pub mod velocity;
 
 pub use backend::{
     ActionBackend, BackendResolutionPolicy, ResolvedBackend,
-    recording::{RecordedInput, RecordingBackend},
+    recording::{MAX_RECORDED_EVENTS, RecordedInput, RecordingBackend, redacted_key_label},
     resolve_backend, resolve_backend_with_policy,
     unavailable::HardwareUnavailableBackend,
     vigem::VigemBackend,
@@ -38,7 +42,6 @@ pub use clipboard::{
     snapshot as snapshot_clipboard, with_restored_clipboard, write_text as write_clipboard_text,
 };
 pub use curve::sample_curve;
-pub use delivery_target::InputDeliveryTarget;
 pub use dynamics::{BIGRAMS, KeystrokeEvent, ModifierMask, sample_typing_schedule};
 pub use emitter::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot,
@@ -47,37 +50,25 @@ pub use emitter::{
 };
 pub use error::{ActionError, ActionResult};
 pub use handle::{
-    ACTION_QUEUE_CAPACITY, ActionComboScheduler, ActionEnqueueMeta, ActionHandle, ActionMessage,
-    RELEASE_ALL_HANDLE, SessionInputLeaseReleaseSummary, SessionInputSessionSnapshot,
-    SessionInputSnapshot, SessionKeyInput, SessionMouseButtonInput, SessionPadInput,
-    SessionReleaseSummary,
+    ACTION_QUEUE_CAPACITY, ActionComboScheduler, ActionHandle, ActionMessage, RELEASE_ALL_HANDLE,
+    SessionInputLeaseReleaseSummary, SessionInputSessionSnapshot, SessionInputSnapshot,
+    SessionKeyInput, SessionMouseButtonInput, SessionPadInput, SessionReleaseSummary,
 };
 pub use hotkey::{
-    OperatorHotkeyGuard, OperatorHotkeyShutdownReport, OperatorHotkeyStatus,
-    OperatorPanicSafetyCompletion, OperatorPanicSafetyFinalization, OperatorPanicSafetyReadback,
-    OperatorPanicSafetyToken, acknowledge_operator_panic_preemption,
-    complete_operator_panic_safety_generation, finish_operator_panic_safety_finalization,
-    install_operator_hotkey, operator_hotkey_status, operator_panic_epoch,
-    operator_panic_requested_since, operator_panic_safety_pending, operator_panic_safety_readback,
-    operator_release_epoch, operator_release_requested_since,
-    record_operator_panic_safety_incident, request_operator_panic_interrupt,
-    request_release_interrupt, set_operator_hotkey_status,
+    OperatorHotkeyGuard, OperatorHotkeyStatus, install_operator_hotkey, operator_hotkey_status,
+    operator_release_epoch, operator_release_requested_since, request_release_interrupt,
+    set_operator_hotkey_status,
 };
 pub use humanize::{HumanizeError, HumanizeResult, humanize_timed_path};
 pub use invoke::{
     CoordinateFallbackPlan, ElementClickOutcome, click_element_or_fallback, invoke_element,
 };
 pub use lease::{
-    DEFAULT_LEASE_TTL_MS, LeaseError, LeaseHandoff, LeaseOutcome, LeaseSafetySnapshot, LeaseStatus,
-    MAX_LEASE_TTL_MS, MIN_LEASE_TTL_MS, OPERATOR_LEASE_OWNER_SESSION_ID,
-    OPERATOR_PREEMPT_LEASE_TTL_MS,
+    DEFAULT_LEASE_TTL_MS, LeaseError, LeaseHandoff, LeaseOutcome, LeaseStatus, MAX_LEASE_TTL_MS,
+    MIN_LEASE_TTL_MS, OPERATOR_LEASE_OWNER_SESSION_ID, OPERATOR_PREEMPT_LEASE_TTL_MS,
     complete_expired_cleanup as complete_expired_input_lease_cleanup,
     expired_cleanup_snapshot as expired_input_lease_cleanup_snapshot,
-    force_clear as force_clear_input_lease,
-    force_clear_operator_panic_generation as force_clear_operator_panic_input_lease_generation,
-    force_preempt as force_preempt_input_lease,
-    force_preempt_operator_panic as force_preempt_input_lease_for_operator_panic,
-    operator_panic_lease_generation, safety_snapshot as input_lease_safety_snapshot,
+    force_clear as force_clear_input_lease, force_preempt as force_preempt_input_lease,
     ttl_from_ms as input_lease_ttl_from_ms,
 };
 pub use path::{
@@ -91,6 +82,7 @@ pub use recovery::{
     ActionCrashRecoveryReport, configure_crash_recovery_file,
     recover_stale_inputs_from_configured_path,
 };
+pub use release_ack::{ActionAck, ReleaseAllCompletion, ReleaseAllOutcome};
 pub use safety::install_panic_hook;
 pub use stroke::{
     STROKE_TICK_MS, StrokeError, StrokePlan, StrokeResult, plan_timed_stroke,

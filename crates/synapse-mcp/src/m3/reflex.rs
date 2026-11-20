@@ -5,6 +5,9 @@ mod history;
 mod list;
 mod register;
 
+#[cfg(test)]
+mod tests;
+
 pub use cancel::{
     ReflexCancelParams, ReflexCancelResponse, cancel_reflex, required_permissions_cancel,
 };
@@ -16,8 +19,9 @@ pub use history::{
     ReflexHistoryParams, ReflexHistoryResponse, history_reflexes, required_permissions_history,
 };
 pub use list::{ReflexListParams, ReflexListResponse, list_reflexes, required_permissions_list};
+pub(crate) use register::register_reflex_for_session;
 pub use register::{
-    ReflexRegisterParams, ReflexRegisterResponse, register_reflex, required_permissions_register,
+    ReflexRegisterParams, ReflexRegisterResponse, required_permissions_register,
     requires_a11y_event_bridge,
 };
 

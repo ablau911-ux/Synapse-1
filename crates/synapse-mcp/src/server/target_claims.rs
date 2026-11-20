@@ -14,23 +14,40 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::error_codes;
+use synapse_action::{
+    ActionError, InputDeliveryTarget, delivery_target::require_stored_input_target,
+};
+use synapse_core::{error_codes, types::StoredInputTarget};
 
 use super::{
     ErrorData, Json, Parameters, SessionTarget, SynapseService, TargetWire, mcp_error,
     session_registry::unix_time_ms_now, tool, tool_router,
 };
 
+#[path = "target_claim_adopt_proof.rs"]
+pub(super) mod adopt_proof;
+#[path = "tab_lock_idle.rs"]
+pub(super) mod tab_lock_idle;
+
+#[cfg(test)]
+#[path = "adoption_pause_support.rs"]
+mod adoption_pause_support;
+#[cfg(test)]
+use adoption_pause_support::{adoption_handoff_pause_for_test, pause_adoption_handoff_for_test};
+
 pub(crate) const DEFAULT_TARGET_CLAIM_TTL_MS: u64 = 120_000;
 const MIN_TARGET_CLAIM_TTL_MS: u64 = 1_000;
 const MAX_TARGET_CLAIM_TTL_MS: u64 = 600_000;
+/// Upper bound on live claims one session may hold at once (#207).
+pub(crate) const MAX_TARGET_CLAIMS_PER_SESSION: usize = 64;
 
 pub(crate) type SharedTargetClaims = Arc<Mutex<TargetClaimRegistry>>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct TargetClaimRegistry {
     claims: BTreeMap<String, TargetClaimEntry>,
     next_generation: u64,
+    adoption_reservations: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,11 +66,9 @@ pub(crate) struct TargetClaimEntry {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TargetClaimTargetParam {
     Window {
-        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
     },
     Cdp {
-        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
         cdp_target_id: String,
     },
@@ -163,6 +178,10 @@ pub struct TargetClaimStatusResponse {
     pub target_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_claim: Option<TargetClaimRead>,
+    /// Whether the status target's window still exists (#206). `None` when no
+    /// target was supplied or active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_live: Option<bool>,
     pub claims: Vec<TargetClaimRead>,
     pub source_of_truth: String,
 }
@@ -211,20 +230,11 @@ impl SynapseService {
             "tool.invocation kind=target_claim"
         );
         let session_id = require_claim_session_id(&request_context)?;
-        let _authority_gate = self
-            .lock_session_authority_for_tool("target_claim", &session_id)
-            .await?;
         validate_target_claim_ttl(params.0.ttl_ms)?;
         let target = self.resolve_target_claim_target(&session_id, params.0.target)?;
-        validate_claim_target(&target)?;
+        self.validate_registered_claim_target(&target)?;
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_before_registry_mutation",
-        )?;
-        let mut guard = self.lock_target_claims()?;
-        let prior_registry = guard.clone();
-        guard.prune_inactive(now, &live_sessions);
         let target_key = target_key(&target);
         let target_wire = target_wire(&target);
         let command_payload = json!({
@@ -232,11 +242,14 @@ impl SynapseService {
             "target": &target_wire,
             "ttl_ms": params.0.ttl_ms,
         });
+        // #207: snapshot under the lock, then run the WAL-synced audit writes
+        // with the claims mutex released.
+        let claims_before = snapshot_claims(&self.target_claims, now, &live_sessions)?;
         let command_before = json!({
             "source_of_truth": source_of_truth(),
-            "claims": guard.reads(now),
+            "claims": bounded_claims_view(&claims_before, &target_key),
         });
-        self.command_audit_intent(
+        self.claims_audit_intent(
             super::command_audit::CommandAuditInput::mcp(
                 "target_claim",
                 "target_claim",
@@ -252,21 +265,23 @@ impl SynapseService {
                 "target": &target_wire,
             })),
         )?;
-        let claim_result = guard.claim(&session_id, target, params.0.ttl_ms, now, &live_sessions);
-        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_after_registry_mutation",
-        ) {
-            *guard = prior_registry;
-            return Err(panic_error);
-        }
-        match claim_result {
+        let attempt = attempt_claim(
+            &self.target_claims,
+            &session_id,
+            target,
+            params.0.ttl_ms,
+            now,
+            &live_sessions,
+        )?;
+        let claims_after = bounded_claims_view(&attempt.claims_after, &target_key);
+        match attempt.result {
             Ok((entry, outcome)) => {
                 let response = TargetClaimResponse {
                     session_id: session_id.clone(),
                     outcome: outcome.to_owned(),
                     claim: entry.read(now),
                 };
-                self.command_audit_final(
+                self.claims_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "target_claim",
                         "target_claim",
@@ -277,7 +292,7 @@ impl SynapseService {
                         json!({
                             "source_of_truth": source_of_truth(),
                             "response": &response,
-                            "claims": guard.reads(now),
+                            "claims": claims_after,
                         }),
                         "ok",
                     )
@@ -296,9 +311,9 @@ impl SynapseService {
                 );
                 Ok(Json(response))
             }
-            Err(conflict) => {
-                let error = conflict_error("target_claim", &session_id, &conflict, "target_claim");
-                self.command_audit_final(
+            Err(refusal) => {
+                let error = refusal.error("target_claim", &session_id, "target_claim");
+                self.claims_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "target_claim",
                         "target_claim",
@@ -308,7 +323,7 @@ impl SynapseService {
                         command_before,
                         json!({
                             "source_of_truth": source_of_truth(),
-                            "claims": guard.reads(now),
+                            "claims": claims_after,
                         }),
                         "error",
                     )
@@ -326,7 +341,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Explicitly recover a target claim from an older live same-agent MCP session after client churn/compaction. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, and the old owner has no in-flight tool call. On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
+        description = "Explicitly recover a target claim from an older same-agent MCP session whose agent process is provably gone. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, the old owner has no in-flight tool call or input lease, and every process recorded for the owner is no longer running (a shared client name or idleness is never proof). On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
     )]
     pub async fn target_claim_adopt(
         &self,
@@ -339,11 +354,23 @@ impl SynapseService {
             "tool.invocation kind=target_claim_adopt"
         );
         let session_id = require_claim_session_id(&request_context)?;
+        self.target_claim_adopt_for_session(session_id, params.0)
+            .await
+    }
+
+    /// `target_claim_adopt` for an already-resolved requester MCP session id.
+    /// The tool entry point only resolves the session id from the request
+    /// context and delegates here (test seam: no `RequestContext` needed).
+    pub(crate) async fn target_claim_adopt_for_session(
+        &self,
+        session_id: String,
+        params: TargetClaimAdoptParams,
+    ) -> Result<Json<TargetClaimAdoptResponse>, ErrorData> {
         let TargetClaimAdoptParams {
             owner_session_id,
             target,
             ttl_ms,
-        } = params.0;
+        } = params;
         super::session_tools::validate_session_id(&owner_session_id)?;
         if owner_session_id == session_id {
             return Err(adopt_refused_error(
@@ -354,34 +381,15 @@ impl SynapseService {
                 None,
             ));
         }
-        // Adoption mutates both authority domains. Lexical multi-lock ordering
-        // prevents reverse-adoption deadlocks and keeps the owner stable through
-        // its lifecycle teardown and the requester's replacement claim.
-        let _authority_gates = self
-            .lock_session_authorities(&[session_id.as_str(), owner_session_id.as_str()])
-            .await?;
-        self.reject_terminated_session_tool_call("target_claim_adopt", &session_id)?;
-        self.reject_terminated_session_tool_call("target_claim_adopt", &owner_session_id)?;
         validate_target_claim_ttl(ttl_ms)?;
         let target = self.resolve_target_claim_target(&session_id, target)?;
-        validate_claim_target(&target)?;
+        self.validate_registered_claim_target(&target)?;
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_adopt_before_initial_registry_prune",
-        )?;
         let prior_entry = {
             let mut guard = self.lock_target_claims()?;
-            let prior_registry = guard.clone();
             guard.prune_inactive(now, &live_sessions);
-            let prior_entry = guard.get(&target_key(&target));
-            if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-                "target_claim_adopt_after_initial_registry_prune",
-            ) {
-                *guard = prior_registry;
-                return Err(panic_error);
-            }
-            prior_entry
+            guard.get(&target_key(&target))
         }
         .ok_or_else(|| target_claim_not_found_error("target_claim_adopt", &session_id, &target))?;
         if prior_entry.owner_session_id != owner_session_id {
@@ -394,8 +402,20 @@ impl SynapseService {
             ));
         }
         let prior_claim = prior_entry.read(now);
-        let (_requester, _owner, owner_in_flight_before) =
+        let (requester, owner, owner_in_flight_before) =
             self.ensure_same_agent_adoption_allowed(&session_id, &owner_session_id, now)?;
+        // #201: adoption terminates the owner's session, processes and tabs, so
+        // an idle-but-alive peer must be refused; require independent proof.
+        let owner_gone_proof = adopt_proof::prove_owner_gone(&owner, &crate::m4::process_exists)
+            .map_err(|reason| {
+                adopt_refused_error(
+                    &session_id,
+                    &owner_session_id,
+                    &reason,
+                    Some(&requester),
+                    Some(&owner),
+                )
+            })?;
         let command_payload = json!({
             "owner_session_id": &owner_session_id,
             "target_key": &prior_claim.target_key,
@@ -406,8 +426,9 @@ impl SynapseService {
             "source_of_truth": source_of_truth(),
             "prior_claim": &prior_claim,
             "owner_in_flight_before": owner_in_flight_before,
+            "owner_gone_proof": &owner_gone_proof,
         });
-        self.command_audit_intent(
+        self.claims_audit_intent(
             super::command_audit::CommandAuditInput::mcp(
                 "target_claim_adopt",
                 "target_claim_adopt",
@@ -424,17 +445,57 @@ impl SynapseService {
             })),
         )?;
 
+        // The intent audit write above took time: abort without tearing anything
+        // down if the claim moved since it was read (#201), or if the requester
+        // could not take the claim afterwards anyway (#207).
+        let reservation = AdoptionReservation::reserve(self, &prior_entry, &session_id, &target)?;
+        if let Err(reason) = reservation {
+            let error = adopt_refused_error(
+                &session_id,
+                &owner_session_id,
+                reason,
+                Some(&requester),
+                Some(&owner),
+            );
+            self.claims_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "target_claim_adopt",
+                    "target_claim_adopt",
+                    Some(session_id.clone()),
+                    Some(owner_session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({ "source_of_truth": source_of_truth() }),
+                    "error",
+                )
+                .with_target(json!({
+                    "target_key": &prior_claim.target_key,
+                    "target": &prior_claim.target,
+                }))
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
+            return Err(error);
+        }
+        let mut reservation = reservation.map_err(|reason| {
+            adopt_refused_error(
+                &session_id,
+                &owner_session_id,
+                reason,
+                Some(&requester),
+                Some(&owner),
+            )
+        })?;
+
         let lifecycle = self.session_lifecycle_state()?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_adopt_before_owner_teardown",
-        )?;
         let owner_teardown_report = match lifecycle
-            .teardown_session_authority_locked(&owner_session_id, "target_claim_adopt")
+            .teardown_session(&owner_session_id, "target_claim_adopt")
             .await
         {
             Ok(report) => report,
             Err(error) => {
-                self.command_audit_final(
+                self.claims_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "target_claim_adopt",
                         "target_claim_adopt",
@@ -444,7 +505,7 @@ impl SynapseService {
                         command_before,
                         json!({
                             "source_of_truth": source_of_truth(),
-                            "claims": self.lock_target_claims()?.reads(unix_time_ms_now()),
+                            "claims": self.claims_audit_view_now(&session_id, &prior_claim.target_key)?,
                         }),
                         "error",
                     )
@@ -459,46 +520,30 @@ impl SynapseService {
                 return Err(error);
             }
         };
-        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_adopt_after_owner_teardown",
-        ) {
-            synapse_action::record_operator_panic_safety_incident();
-            tracing::error!(
-                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-                session_id = %session_id,
-                owner_session_id = %owner_session_id,
-                target_key = %prior_claim.target_key,
-                "operator panic crossed target-claim adoption after owner teardown; old authority remains terminated and no replacement claim will be installed"
-            );
-            return Err(panic_error);
-        }
 
+        #[cfg(test)]
+        pause_adoption_handoff_for_test(self, &owner_session_id).await;
         let now_after = unix_time_ms_now();
         let live_sessions_after = self.live_target_claim_sessions(now_after, Some(&session_id))?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_adopt_before_replacement_claim",
+        let attempt = attempt_claim(
+            &self.target_claims,
+            &session_id,
+            target,
+            ttl_ms,
+            now_after,
+            &live_sessions_after,
         )?;
-        let mut guard = self.lock_target_claims()?;
-        let prior_registry = guard.clone();
-        guard.prune_inactive(now_after, &live_sessions_after);
-        let claim_result =
-            guard.claim(&session_id, target, ttl_ms, now_after, &live_sessions_after);
-        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_claim_adopt_after_replacement_claim",
-        ) {
-            *guard = prior_registry;
-            return Err(panic_error);
-        }
-        let (entry, _claim_outcome) = match claim_result {
+        let claims_after = bounded_claims_view(&attempt.claims_after, &prior_claim.target_key);
+        reservation.committed = attempt.result.is_ok();
+        let (entry, _claim_outcome) = match attempt.result {
             Ok(result) => result,
-            Err(conflict) => {
-                let error = conflict_error(
+            Err(refusal) => {
+                let error = refusal.error(
                     "target_claim_adopt",
                     &session_id,
-                    &conflict,
                     "adopt_after_owner_teardown",
                 );
-                self.command_audit_final(
+                self.claims_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "target_claim_adopt",
                         "target_claim_adopt",
@@ -509,7 +554,7 @@ impl SynapseService {
                         json!({
                             "source_of_truth": source_of_truth(),
                             "owner_teardown_report": &owner_teardown_report,
-                            "claims": guard.reads(now_after),
+                            "claims": claims_after,
                         }),
                         "error",
                     )
@@ -534,7 +579,7 @@ impl SynapseService {
             owner_teardown_report,
             source_of_truth: source_of_truth(),
         };
-        self.command_audit_final(
+        self.claims_audit_final(
             super::command_audit::CommandAuditInput::mcp(
                 "target_claim_adopt",
                 "target_claim_adopt",
@@ -545,7 +590,7 @@ impl SynapseService {
                 json!({
                     "source_of_truth": source_of_truth(),
                     "response": &response,
-                    "claims": guard.reads(now_after),
+                    "claims": claims_after,
                 }),
                 "ok",
             )
@@ -580,30 +625,22 @@ impl SynapseService {
             "tool.invocation kind=target_release"
         );
         let session_id = require_claim_session_id(&request_context)?;
-        let _authority_gate = self
-            .lock_session_authority_for_tool("target_release", &session_id)
-            .await?;
         let target = self.resolve_target_claim_target(&session_id, params.0.target)?;
         validate_claim_target_shape(&target)?;
         let target_key = target_key(&target);
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_release_before_registry_mutation",
-        )?;
-        let mut guard = self.lock_target_claims()?;
-        let prior_registry = guard.clone();
-        guard.prune_inactive(now, &live_sessions);
         let target_wire = target_wire(&target);
         let command_payload = json!({
             "target_key": &target_key,
             "target": &target_wire,
         });
+        let claims_before = snapshot_claims(&self.target_claims, now, &live_sessions)?;
         let command_before = json!({
             "source_of_truth": source_of_truth(),
-            "claims": guard.reads(now),
+            "claims": bounded_claims_view(&claims_before, &target_key),
         });
-        self.command_audit_intent(
+        self.claims_audit_intent(
             super::command_audit::CommandAuditInput::mcp(
                 "target_release",
                 "target_release",
@@ -619,14 +656,15 @@ impl SynapseService {
                 "target": &target_wire,
             })),
         )?;
-        let release_result = guard.release(&session_id, &target_key);
-        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
-            "target_release_after_registry_mutation",
-        ) {
-            *guard = prior_registry;
-            return Err(panic_error);
-        }
-        match release_result {
+        let attempt = attempt_release(
+            &self.target_claims,
+            &session_id,
+            &target_key,
+            now,
+            &live_sessions,
+        )?;
+        let claims_after = bounded_claims_view(&attempt.claims_after, &target_key);
+        match attempt.result {
             Ok(released) => {
                 let released_claim = released.as_ref().map(|entry| entry.read(now));
                 let response = TargetReleaseResponse {
@@ -637,7 +675,7 @@ impl SynapseService {
                     released_claim,
                     source_of_truth: source_of_truth(),
                 };
-                self.command_audit_final(
+                self.claims_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "target_release",
                         "target_release",
@@ -648,7 +686,7 @@ impl SynapseService {
                         json!({
                             "source_of_truth": source_of_truth(),
                             "response": &response,
-                            "claims": guard.reads(now),
+                            "claims": claims_after,
                         }),
                         "ok",
                     )
@@ -669,7 +707,7 @@ impl SynapseService {
             Err(conflict) => {
                 let error =
                     conflict_error("target_release", &session_id, &conflict, "target_release");
-                self.command_audit_final(
+                self.claims_audit_final(
                     super::command_audit::CommandAuditInput::mcp(
                         "target_release",
                         "target_release",
@@ -679,7 +717,7 @@ impl SynapseService {
                         command_before,
                         json!({
                             "source_of_truth": source_of_truth(),
-                            "claims": guard.reads(now),
+                            "claims": claims_after,
                         }),
                         "error",
                     )
@@ -710,16 +748,14 @@ impl SynapseService {
             "tool.invocation kind=target_claim_status"
         );
         let session_id = require_claim_session_id(&request_context)?;
-        let _authority_gate = self
-            .lock_session_authority_for_tool("target_claim_status", &session_id)
-            .await?;
         let target = match params.0.target {
             Some(target) => Some(target_param_to_session_target(target)?),
             None => self.session_target(Some(&session_id))?,
-        };
-        if let Some(target) = &target {
-            validate_claim_target(target)?;
         }
+        .map(canonical_claim_target);
+        // #206: a gone window must not hide its (stale) claim from the agent
+        // that needs to see and release it; report liveness instead of erroring.
+        let target_live = target.as_ref().map(status_target_liveness).transpose()?;
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
         let mut guard = self.lock_target_claims()?;
@@ -736,6 +772,7 @@ impl SynapseService {
             claim_count: claims.len(),
             target_key,
             target_claim,
+            target_live,
             claims,
             source_of_truth: source_of_truth(),
         }))
@@ -746,12 +783,39 @@ impl SynapseService {
     pub(crate) fn lock_target_claims(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, TargetClaimRegistry>, ErrorData> {
-        self.target_claims.lock().map_err(|_error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "target claim registry lock poisoned",
-            )
-        })
+        lock_claims(&self.target_claims)
+    }
+
+    /// Writes a target-claim intent audit row. The claims mutex must be free
+    /// during the WAL-synced write (#207); `audit_claims_lock_probe` observes it.
+    fn claims_audit_intent(
+        &self,
+        input: super::command_audit::CommandAuditInput,
+    ) -> Result<(), ErrorData> {
+        audit_claims_lock_probe::observe(&self.target_claims);
+        self.command_audit_intent(input)?;
+        Ok(())
+    }
+
+    /// Writes a target-claim final audit row; see [`Self::claims_audit_intent`].
+    fn claims_audit_final(
+        &self,
+        input: super::command_audit::CommandAuditInput,
+    ) -> Result<(), ErrorData> {
+        audit_claims_lock_probe::observe(&self.target_claims);
+        self.command_audit_final(input)?;
+        Ok(())
+    }
+
+    fn claims_audit_view_now(
+        &self,
+        session_id: &str,
+        target_key: &str,
+    ) -> Result<Value, ErrorData> {
+        let now = unix_time_ms_now();
+        let live_sessions = self.live_target_claim_sessions(now, Some(session_id))?;
+        let claims = snapshot_claims(&self.target_claims, now, &live_sessions)?;
+        Ok(bounded_claims_view(&claims, target_key))
     }
 
     pub(crate) fn target_claim_reads_by_owner(
@@ -785,9 +849,36 @@ impl SynapseService {
             claim_count: claims.len(),
             target_key: None,
             target_claim: None,
+            target_live: None,
             claims,
             source_of_truth: source_of_truth(),
         })
+    }
+
+    fn validate_registered_claim_target(&self, target: &SessionTarget) -> Result<(), ErrorData> {
+        validate_claim_target(target)?;
+        if let SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } = target
+        {
+            let owners = self.cdp_target_owners_ref().lock().map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "CDP owner registry lock poisoned",
+                )
+            })?;
+            if !owners.values().any(|owner| {
+                owner.cdp_target_id == *cdp_target_id
+                    && window_root_hwnd(owner.window_hwnd) == window_root_hwnd(*window_hwnd)
+            }) {
+                return Err(mcp_error(
+                    error_codes::TARGET_WINDOW_NOT_FOUND,
+                    "CDP claim target is not registered for this window",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn dashboard_target_claim_prune(
@@ -805,9 +896,8 @@ impl SynapseService {
         let command_before = json!({
             "source_of_truth": source_of_truth(),
             "claim_count": before_claims.len(),
-            "claims": &before_claims,
         });
-        self.command_audit_intent(
+        self.claims_audit_intent(
             super::command_audit::CommandAuditInput::mcp(
                 "target_claim_status",
                 "target_claim_prune",
@@ -839,6 +929,7 @@ impl SynapseService {
             claim_count: after_claims.len(),
             target_key: None,
             target_claim: None,
+            target_live: None,
             claims: after_claims,
             source_of_truth: source_of_truth(),
         };
@@ -850,7 +941,7 @@ impl SynapseService {
             after,
             source_of_truth: source_of_truth(),
         };
-        self.command_audit_final(
+        self.claims_audit_final(
             super::command_audit::CommandAuditInput::mcp(
                 "target_claim_status",
                 "target_claim_prune",
@@ -860,7 +951,9 @@ impl SynapseService {
                 command_before,
                 json!({
                     "source_of_truth": source_of_truth(),
-                    "response": &response,
+                    "before_count": response.before_count,
+                    "after_count": response.after_count,
+                    "pruned_count": response.pruned_count,
                 }),
                 "ok",
             )
@@ -897,6 +990,7 @@ impl SynapseService {
         session_id: &str,
         target: &SessionTarget,
     ) -> Result<(), ErrorData> {
+        super::agent_scope::ensure_access(session_id, target)?;
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(session_id))?;
         let mut guard = self.lock_target_claims()?;
@@ -926,7 +1020,7 @@ impl SynapseService {
         let mut guard = self.lock_target_claims()?;
         guard.prune_inactive(now, &live_sessions);
         let claim = guard
-            .get(&target_key(target))
+            .get(&target_key(&canonical_claim_target(target.clone())))
             .filter(|entry| entry.owner_session_id == session_id)
             .map(|entry| entry.read(now));
         Ok(claim)
@@ -937,15 +1031,16 @@ impl SynapseService {
         session_id: &str,
         target: Option<TargetClaimTargetParam>,
     ) -> Result<SessionTarget, ErrorData> {
-        match target {
-            Some(target) => target_param_to_session_target(target),
+        let target = match target {
+            Some(target) => target_param_to_session_target(target)?,
             None => self.session_target(Some(session_id))?.ok_or_else(|| {
                 mcp_error(
                     error_codes::TARGET_NOT_SET,
                     "target_claim requires an explicit target or this session's active target",
                 )
-            }),
-        }
+            })?,
+        };
+        Ok(canonical_claim_target(target))
     }
 
     fn live_target_claim_sessions(
@@ -1059,6 +1154,8 @@ impl SynapseService {
         let owner_in_flight =
             match crate::daemon_lifecycle::in_flight_tool_calls_for_session(owner_session_id) {
                 Ok(calls) => calls,
+                #[cfg(test)]
+                Err(error) if error.to_string().contains("ledger is not configured") => Vec::new(),
                 Err(error) => {
                     return Err(mcp_error(
                         error_codes::TOOL_INTERNAL_ERROR,
@@ -1085,6 +1182,119 @@ impl SynapseService {
         }
         Ok((requester, owner, owner_in_flight))
     }
+}
+
+/// Outcome of one claim attempt plus the post-attempt claim snapshot, both
+/// owned so the caller can write audit rows with the claims mutex released.
+struct ClaimAttempt {
+    result: Result<(TargetClaimEntry, &'static str), ClaimRefusal>,
+    claims_after: Vec<TargetClaimRead>,
+}
+
+/// Why a claim attempt was refused; every refusal is written through the
+/// caller's final audit row (#207).
+#[derive(Debug)]
+enum ClaimRefusal {
+    /// A live peer holds an overlapping claim.
+    Conflict(TargetClaimConflict),
+    /// The session already holds [`MAX_TARGET_CLAIMS_PER_SESSION`] claims.
+    LimitReached,
+}
+
+impl ClaimRefusal {
+    fn error(&self, tool: &'static str, session_id: &str, operation: &'static str) -> ErrorData {
+        match self {
+            Self::Conflict(conflict) => conflict_error(tool, session_id, conflict, operation),
+            Self::LimitReached => mcp_error(
+                error_codes::TARGET_CLAIM_LIMIT_REACHED,
+                format!(
+                    "{tool} refused: session {session_id:?} already holds {MAX_TARGET_CLAIMS_PER_SESSION} target claims; release one first"
+                ),
+            ),
+        }
+    }
+}
+
+struct ReleaseAttempt {
+    result: Result<Option<TargetClaimEntry>, TargetClaimConflict>,
+    claims_after: Vec<TargetClaimRead>,
+}
+
+fn lock_claims(
+    claims: &SharedTargetClaims,
+) -> Result<std::sync::MutexGuard<'_, TargetClaimRegistry>, ErrorData> {
+    claims.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "target claim registry lock poisoned",
+        )
+    })
+}
+
+/// Prune and copy out the claims; the guard is dropped before returning (#207).
+fn snapshot_claims(
+    claims: &SharedTargetClaims,
+    now_unix_ms: u64,
+    live_sessions: &BTreeSet<String>,
+) -> Result<Vec<TargetClaimRead>, ErrorData> {
+    let mut guard = lock_claims(claims)?;
+    guard.prune_inactive(now_unix_ms, live_sessions);
+    Ok(guard.reads(now_unix_ms))
+}
+
+/// Claim under the lock and return owned results; the guard is dropped before
+/// returning so audit I/O never runs while other sessions' action checks wait.
+fn attempt_claim(
+    claims: &SharedTargetClaims,
+    session_id: &str,
+    target: SessionTarget,
+    ttl_ms: u64,
+    now_unix_ms: u64,
+    live_sessions: &BTreeSet<String>,
+) -> Result<ClaimAttempt, ErrorData> {
+    let mut guard = lock_claims(claims)?;
+    guard.prune_inactive(now_unix_ms, live_sessions);
+    // #207: claims are bounded per session, so a client cannot grow the audit
+    // trail and every action's conflict scan without limit.
+    let result = if guard.has_claim_capacity(session_id, &target) {
+        guard
+            .claim(session_id, target, ttl_ms, now_unix_ms, live_sessions)
+            .map_err(ClaimRefusal::Conflict)
+    } else {
+        Err(ClaimRefusal::LimitReached)
+    };
+    let claims_after = guard.reads(now_unix_ms);
+    Ok(ClaimAttempt {
+        result,
+        claims_after,
+    })
+}
+
+fn attempt_release(
+    claims: &SharedTargetClaims,
+    session_id: &str,
+    target_key: &str,
+    now_unix_ms: u64,
+    live_sessions: &BTreeSet<String>,
+) -> Result<ReleaseAttempt, ErrorData> {
+    let mut guard = lock_claims(claims)?;
+    guard.prune_inactive(now_unix_ms, live_sessions);
+    let result = guard.release(session_id, target_key);
+    let claims_after = guard.reads(now_unix_ms);
+    Ok(ReleaseAttempt {
+        result,
+        claims_after,
+    })
+}
+
+/// Audit-row view of the claim registry: the total count plus the one claim for
+/// the target in question. Rows no longer embed every claim, so they do not
+/// grow with the number of claims (#207).
+fn bounded_claims_view(claims: &[TargetClaimRead], target_key: &str) -> Value {
+    json!({
+        "claim_count": claims.len(),
+        "target_claim": claims.iter().find(|claim| claim.target_key == target_key),
+    })
 }
 
 pub(crate) fn cleanup_claims_for_session(
@@ -1118,6 +1328,103 @@ pub(crate) fn cleanup_claims_for_session(
     }
 }
 
+/// Owns the target and one requester slot across destructive, awaited cleanup.
+struct AdoptionReservation {
+    claims: SharedTargetClaims,
+    prior: TargetClaimEntry,
+    generation: u64,
+    committed: bool,
+}
+
+impl AdoptionReservation {
+    fn reserve(
+        service: &SynapseService,
+        prior: &TargetClaimEntry,
+        session_id: &str,
+        target: &SessionTarget,
+    ) -> Result<Result<Self, &'static str>, ErrorData> {
+        let mut registry = service.lock_target_claims()?;
+        if let Err(reason) = registry.adopt_gate(prior, session_id, target) {
+            return Ok(Err(reason));
+        }
+        if registry.adoption_reservations.contains(&prior.target_key) {
+            return Ok(Err("target already reserved for adoption"));
+        }
+        let mut reserved = prior.clone();
+        session_id.clone_into(&mut reserved.owner_session_id);
+        reserved.generation = registry.allocate_generation();
+        registry
+            .claims
+            .insert(prior.target_key.clone(), reserved.clone());
+        registry
+            .adoption_reservations
+            .insert(prior.target_key.clone());
+        Ok(Ok(Self {
+            claims: Arc::clone(&service.target_claims),
+            prior: prior.clone(),
+            generation: reserved.generation,
+            committed: false,
+        }))
+    }
+}
+
+impl Drop for AdoptionReservation {
+    fn drop(&mut self) {
+        let mut registry = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry
+            .adoption_reservations
+            .remove(&self.prior.target_key);
+        if !self.committed
+            && registry
+                .claims
+                .get(&self.prior.target_key)
+                .is_some_and(|entry| entry.generation == self.generation)
+        {
+            registry
+                .claims
+                .insert(self.prior.target_key.clone(), self.prior.clone());
+        }
+    }
+}
+
+/// Checks the binding against the current exact window claim and OS foreground.
+pub(crate) fn resolve_stored_input_target(
+    claims: &SharedTargetClaims,
+    automation_id: &str,
+    target: Option<StoredInputTarget>,
+    owner: Option<&str>,
+) -> Result<InputDeliveryTarget, ActionError> {
+    let claimed_foreground = match (target, owner) {
+        (Some(target), Some(owner)) => {
+            let window = window_session_target(target.root_hwnd);
+            let key = target_key(&window);
+            let now = unix_time_ms_now();
+            let claimed = claims.lock().is_ok_and(|guard| {
+                !guard.adoption_reservations.contains(&key)
+                    && guard.claims.get(&key).is_some_and(|entry| {
+                        entry.owner_session_id == owner && entry.expires_at_unix_ms > now
+                    })
+            });
+            if claimed && super::agent_scope::ensure_access(owner, &window).is_ok() {
+                synapse_a11y::foreground_root_identity()
+                    .ok()
+                    .map(|identity| StoredInputTarget {
+                        root_hwnd: identity.root_hwnd,
+                        pid: identity.pid,
+                    })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    require_stored_input_target(automation_id, target, claimed_foreground)
+        .map(InputDeliveryTarget::from_stored)
+}
+
 impl TargetClaimRegistry {
     pub(crate) fn claim(
         &mut self,
@@ -1127,11 +1434,54 @@ impl TargetClaimRegistry {
         now_unix_ms: u64,
         live_sessions: &BTreeSet<String>,
     ) -> Result<(TargetClaimEntry, &'static str), TargetClaimConflict> {
-        let target_key = target_key(&target);
-        if let Some(existing) = self.claims.get(&target_key)
-            && existing.owner_session_id != session_id
-            && live_sessions.contains(&existing.owner_session_id)
+        self.claim_with_roots(
+            session_id,
+            target,
+            ttl_ms,
+            now_unix_ms,
+            live_sessions,
+            &window_root_hwnd,
+        )
+    }
+
+    /// Whether `session_id` may claim `target`: renewing a claim it already
+    /// holds always may; a new claim only below [`MAX_TARGET_CLAIMS_PER_SESSION`].
+    pub(crate) fn has_claim_capacity(&self, session_id: &str, target: &SessionTarget) -> bool {
+        let key = target_key(target);
+        if self
+            .claims
+            .get(&key)
+            .is_some_and(|entry| entry.owner_session_id == session_id)
         {
+            return true;
+        }
+        self.claims
+            .values()
+            .filter(|entry| entry.owner_session_id == session_id)
+            .count()
+            < MAX_TARGET_CLAIMS_PER_SESSION
+    }
+
+    /// [`Self::claim`] with an injectable top-level-root resolver so the
+    /// hierarchy rules (#202) are testable without real windows.
+    fn claim_with_roots(
+        &mut self,
+        session_id: &str,
+        target: SessionTarget,
+        ttl_ms: u64,
+        now_unix_ms: u64,
+        live_sessions: &BTreeSet<String>,
+        root_of: &dyn Fn(i64) -> i64,
+    ) -> Result<(TargetClaimEntry, &'static str), TargetClaimConflict> {
+        let target_key = target_key(&target);
+        if let Some(existing) = self.claims.values().find(|existing| {
+            (existing.owner_session_id != session_id
+                || (self.adoption_reservations.contains(&existing.target_key)
+                    && existing.target_key != target_key))
+                && (live_sessions.contains(&existing.owner_session_id)
+                    || self.adoption_reservations.contains(&existing.target_key))
+                && targets_overlap(&existing.target, &target, root_of)
+        }) {
             return Err(TargetClaimConflict {
                 entry: existing.clone(),
                 requester_session_id: session_id.to_owned(),
@@ -1177,7 +1527,9 @@ impl TargetClaimRegistry {
         let Some(existing) = self.claims.get(target_key).cloned() else {
             return Ok(None);
         };
-        if existing.owner_session_id != session_id {
+        if existing.owner_session_id != session_id
+            || self.adoption_reservations.contains(target_key)
+        {
             return Err(TargetClaimConflict {
                 entry: existing,
                 requester_session_id: session_id.to_owned(),
@@ -1191,7 +1543,10 @@ impl TargetClaimRegistry {
         let target_keys = self
             .claims
             .iter()
-            .filter_map(|(key, entry)| (entry.owner_session_id == session_id).then(|| key.clone()))
+            .filter_map(|(key, entry)| {
+                (entry.owner_session_id == session_id && !self.adoption_reservations.contains(key))
+                    .then(|| key.clone())
+            })
             .collect::<Vec<_>>();
         target_keys
             .into_iter()
@@ -1200,10 +1555,56 @@ impl TargetClaimRegistry {
     }
 
     fn conflict(&self, session_id: &str, target: &SessionTarget) -> Option<TargetClaimEntry> {
+        self.conflict_with_roots(session_id, target, &window_root_hwnd)
+    }
+
+    /// First claim held by another session whose target overlaps `target` in
+    /// the window hierarchy (#202). Exact-key matching alone let a window claim
+    /// be bypassed through a child control, or a tab claim through its window.
+    fn conflict_with_roots(
+        &self,
+        session_id: &str,
+        target: &SessionTarget,
+        root_of: &dyn Fn(i64) -> i64,
+    ) -> Option<TargetClaimEntry> {
         self.claims
-            .get(&target_key(target))
-            .filter(|entry| entry.owner_session_id != session_id)
+            .values()
+            .find(|entry| {
+                entry.owner_session_id != session_id
+                    && targets_overlap(&entry.target, target, root_of)
+            })
             .cloned()
+    }
+
+    /// Checks run under the claims lock right before an adoption tears the
+    /// owner down: the claim must not have moved (#201), and the requester must
+    /// be able to take it afterwards (#207).
+    fn adopt_gate(
+        &self,
+        prior: &TargetClaimEntry,
+        session_id: &str,
+        target: &SessionTarget,
+    ) -> Result<(), &'static str> {
+        if !self.claim_unmoved(prior) {
+            return Err(
+                "target claim changed after it was read; adoption aborted before owner teardown",
+            );
+        }
+        if !self.has_claim_capacity(session_id, target) {
+            return Err(
+                "requesting session already holds the maximum number of target claims; adoption aborted before owner teardown",
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the claim for `prior`'s target is still held by the same owner
+    /// at the same generation (#201).
+    fn claim_unmoved(&self, prior: &TargetClaimEntry) -> bool {
+        self.claims.get(&prior.target_key).is_some_and(|current| {
+            current.owner_session_id == prior.owner_session_id
+                && current.generation == prior.generation
+        })
     }
 
     fn get(&self, target_key: &str) -> Option<TargetClaimEntry> {
@@ -1219,8 +1620,9 @@ impl TargetClaimRegistry {
 
     fn prune_inactive(&mut self, now_unix_ms: u64, live_sessions: &BTreeSet<String>) {
         self.claims.retain(|_key, entry| {
-            entry.expires_at_unix_ms > now_unix_ms
-                && live_sessions.contains(&entry.owner_session_id)
+            self.adoption_reservations.contains(&entry.target_key)
+                || (entry.expires_at_unix_ms > now_unix_ms
+                    && live_sessions.contains(&entry.owner_session_id))
         });
     }
 
@@ -1244,6 +1646,73 @@ impl TargetClaimEntry {
             generation: self.generation,
             source_of_truth: source_of_truth(),
         }
+    }
+}
+
+/// Top-level (GA_ROOT) window of `hwnd`; a window that is gone keeps its own
+/// handle so stale claims stay addressable.
+fn window_root_hwnd(hwnd: i64) -> i64 {
+    synapse_a11y::top_level_root_hwnd(hwnd).unwrap_or(hwnd)
+}
+
+const fn claim_window_hwnd(target: &SessionTarget) -> i64 {
+    match target {
+        SessionTarget::Window { hwnd }
+        | SessionTarget::Cdp {
+            window_hwnd: hwnd, ..
+        } => *hwnd,
+    }
+}
+
+/// Claim identity is the top-level root window (and CDP tab id), so a child
+/// control HWND and its root claim the same thing (#202).
+pub(crate) fn canonical_claim_target(target: SessionTarget) -> SessionTarget {
+    canonical_claim_target_with(target, &window_root_hwnd)
+}
+
+fn canonical_claim_target_with(
+    target: SessionTarget,
+    root_of: &dyn Fn(i64) -> i64,
+) -> SessionTarget {
+    match target {
+        SessionTarget::Window { hwnd } => SessionTarget::Window {
+            hwnd: root_of(hwnd),
+        },
+        SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } => SessionTarget::Cdp {
+            window_hwnd: root_of(window_hwnd),
+            cdp_target_id,
+        },
+    }
+}
+
+/// Whether mutating `requested` can disturb what `claimed` protects. Targets
+/// in different top-level windows never overlap. Inside one window a window
+/// target overlaps everything (OS input and window-level verbs reach every
+/// tab), while two CDP targets overlap only on the same tab id.
+fn targets_overlap(
+    claimed: &SessionTarget,
+    requested: &SessionTarget,
+    root_of: &dyn Fn(i64) -> i64,
+) -> bool {
+    if root_of(claim_window_hwnd(claimed)) != root_of(claim_window_hwnd(requested)) {
+        return false;
+    }
+    match (claimed, requested) {
+        (
+            SessionTarget::Cdp {
+                cdp_target_id: claimed_id,
+                ..
+            },
+            SessionTarget::Cdp {
+                cdp_target_id: requested_id,
+                ..
+            },
+            // CDP TargetIDs are hex; element ids carry them uppercased (#202).
+        ) => claimed_id.eq_ignore_ascii_case(requested_id),
+        _ => true,
     }
 }
 
@@ -1274,7 +1743,7 @@ pub(crate) fn window_session_target(hwnd: i64) -> SessionTarget {
     SessionTarget::Window { hwnd }
 }
 
-fn current_foreground_session_target() -> Result<SessionTarget, ErrorData> {
+pub(super) fn current_foreground_session_target() -> Result<SessionTarget, ErrorData> {
     let foreground = synapse_a11y::current_foreground_context().map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
@@ -1327,16 +1796,38 @@ fn validate_claim_target(target: &SessionTarget) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Status-time target check (#206): shape-only validation plus a liveness
+/// readback. A closed window is a valid thing to ask about (its claim may still
+/// be held), so only a structurally invalid target is an error.
+fn status_target_liveness(target: &SessionTarget) -> Result<bool, ErrorData> {
+    validate_claim_target_shape(target)?;
+    let (SessionTarget::Window { hwnd }
+    | SessionTarget::Cdp {
+        window_hwnd: hwnd, ..
+    }) = target;
+    Ok(synapse_a11y::foreground_context(*hwnd).is_ok())
+}
+
 fn validate_claim_target_shape(target: &SessionTarget) -> Result<(), ErrorData> {
     match target {
         SessionTarget::Window { hwnd } => {
-            crate::m1::validate_window_hwnd_shape("target", *hwnd)?;
+            if *hwnd == 0 {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "target claim window_hwnd must be non-zero",
+                ));
+            }
         }
         SessionTarget::Cdp {
             window_hwnd,
             cdp_target_id,
         } => {
-            crate::m1::validate_window_hwnd_shape("target", *window_hwnd)?;
+            if *window_hwnd == 0 {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "target claim window_hwnd must be non-zero",
+                ));
+            }
             validate_cdp_target_id(cdp_target_id)?;
         }
     }
@@ -1415,7 +1906,7 @@ fn conflict_error(
             "claim": read,
             "read_only_observe_allowed": true,
             "mutation_allowed": false,
-            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt only for an older idle same-agent owner read from the Source of Truth",
+            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt only when the owner's agent process is provably gone",
         })),
     )
 }
@@ -1530,3 +2021,71 @@ const fn default_target_claim_ttl_ms() -> u64 {
 fn source_of_truth() -> String {
     "daemon target claim registry".to_owned()
 }
+
+/// Test seam (#207): records, for every target-claim audit write, whether the
+/// claims mutex was free at write time. Recording is opt-in per thread
+/// (`start`/`take`) and compiles to a no-op outside `cfg(test)`.
+pub(crate) mod audit_claims_lock_probe {
+    use super::SharedTargetClaims;
+
+    #[cfg(test)]
+    thread_local! {
+        static OBSERVATIONS: std::cell::RefCell<Option<Vec<bool>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called right before each audit row write with the claims registry.
+    pub(super) fn observe(claims: &SharedTargetClaims) {
+        #[cfg(test)]
+        OBSERVATIONS.with(|cell| {
+            if let Some(observations) = cell.borrow_mut().as_mut() {
+                observations.push(claims.try_lock().is_ok());
+            }
+        });
+        #[cfg(not(test))]
+        let _ = claims;
+    }
+
+    /// Starts recording on the current thread, clearing earlier observations.
+    #[cfg(test)]
+    pub(crate) fn start() {
+        OBSERVATIONS.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stops recording and returns one `true` (mutex free) / `false` (mutex
+    /// held) per audit write since `start`.
+    #[cfg(test)]
+    pub(crate) fn take() -> Vec<bool> {
+        OBSERVATIONS.with(|cell| cell.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/target_claims_status_gone_window_206.rs"]
+mod target_claims_status_gone_window_206;
+
+#[cfg(test)]
+#[path = "tests/target_claims_hierarchy_202.rs"]
+mod target_claims_hierarchy_202;
+
+#[cfg(test)]
+#[path = "tests/target_claims_lock_scope_207.rs"]
+mod target_claims_lock_scope_207;
+
+#[cfg(test)]
+#[path = "tests/target_claim_adopt_201.rs"]
+mod target_claim_adopt_201;
+
+#[cfg(test)]
+#[path = "tests/adoption_handoff_race_201.rs"]
+mod adoption_handoff_race_201;
+#[cfg(test)]
+#[path = "tests/claim_prune_rows_207.rs"]
+mod claim_prune_rows_207;
+#[cfg(test)]
+#[path = "tests/claim_status_handler_206.rs"]
+mod claim_status_handler_206;
+
+#[cfg(all(test, windows))]
+#[path = "tests/synthetic_cdp_claim_207.rs"]
+mod synthetic_cdp_claim_207;

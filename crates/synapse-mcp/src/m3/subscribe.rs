@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use synapse_core::{EventFilter, error_codes};
 
 use crate::{http::sse::SseState, m1::mcp_error};
@@ -11,6 +12,10 @@ use super::{
 };
 
 const DEFAULT_BUFFER_SIZE: u32 = 4096;
+const MIN_BUFFER_SIZE: u32 = 1;
+const MAX_BUFFER_SIZE: u32 = 4096;
+const SUBSCRIPTION_SOURCE_OF_TRUTH: &str =
+    "SseState subscription registry + MCP-session ownership map";
 
 const fn default_kinds() -> Vec<String> {
     Vec::new()
@@ -42,7 +47,37 @@ pub struct SubscribeParams {
     pub snapshot_first: bool,
     #[serde(default = "default_buffer_size")]
     #[schemars(default = "default_buffer_size")]
+    #[schemars(range(min = 1, max = 4096))]
+    /// Per-subscription live queue and SSE replay capacity (1..=4096, default
+    /// 4096). When full, each buffer drops its oldest event and reports loss.
     pub buffer_size: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscribeOperation {
+    Events,
+    EventsCancel,
+}
+
+impl SubscribeOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Events => "events",
+            Self::EventsCancel => "events_cancel",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubscribeFacadeParams {
+    pub operation: SubscribeOperation,
+    #[serde(default)]
+    pub events: Option<SubscribeParams>,
+    #[serde(default)]
+    pub events_cancel: Option<SubscribeCancelParams>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -74,6 +109,44 @@ pub enum SubscribeCancelReason {
 pub struct SubscribeCancelResponse {
     pub cancelled: bool,
     pub reason: SubscribeCancelReason,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubscribeFacadeResponse {
+    pub source_of_truth: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SubscribeCancelReason>,
+}
+
+impl From<SubscribeResponse> for SubscribeFacadeResponse {
+    fn from(response: SubscribeResponse) -> Self {
+        Self {
+            source_of_truth: SUBSCRIPTION_SOURCE_OF_TRUTH,
+            subscription_id: Some(response.subscription_id),
+            started_at: Some(response.started_at),
+            cancelled: None,
+            reason: None,
+        }
+    }
+}
+
+impl From<SubscribeCancelResponse> for SubscribeFacadeResponse {
+    fn from(response: SubscribeCancelResponse) -> Self {
+        Self {
+            source_of_truth: SUBSCRIPTION_SOURCE_OF_TRUTH,
+            subscription_id: None,
+            started_at: None,
+            cancelled: Some(response.cancelled),
+            reason: Some(response.reason),
+        }
+    }
 }
 
 #[must_use]
@@ -110,22 +183,23 @@ pub fn subscribe_to_events(
     params: &SubscribeParams,
     owner_session_id: Option<String>,
 ) -> Result<SubscribeResponse, ErrorData> {
-    if params.buffer_size != DEFAULT_BUFFER_SIZE {
+    if !(MIN_BUFFER_SIZE..=MAX_BUFFER_SIZE).contains(&params.buffer_size) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "subscribe buffer_size must be {DEFAULT_BUFFER_SIZE}; got {}",
+                "subscribe buffer_size must be between {MIN_BUFFER_SIZE} and {MAX_BUFFER_SIZE}; got {}",
                 params.buffer_size
             ),
         ));
     }
     let filter = params.filter.clone().unwrap_or(EventFilter::All);
     let subscription_id = sse_state
-        .subscribe(
+        .subscribe_with_capacity(
             filter,
             params.kinds.clone(),
             params.snapshot_first,
             owner_session_id,
+            NonZeroUsize::new(params.buffer_size as usize).unwrap_or(NonZeroUsize::MIN),
         )
         .map_err(|error| mcp_error(error.code(), error.message()))?;
     Ok(SubscribeResponse {
@@ -147,6 +221,27 @@ pub fn cancel_subscription(
     }
     sse_state
         .cancel(subscription_id)
+        .map_err(|error| mcp_error(error.code(), error.message(subscription_id)))?;
+    Ok(SubscribeCancelResponse {
+        cancelled: true,
+        reason: SubscribeCancelReason::Ok,
+    })
+}
+
+pub fn cancel_owned_subscription(
+    sse_state: &SseState,
+    params: &SubscribeCancelParams,
+    owner_session_id: &str,
+) -> Result<SubscribeCancelResponse, ErrorData> {
+    let subscription_id = params.subscription_id.trim();
+    if subscription_id.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "subscribe events_cancel subscription_id must not be empty",
+        ));
+    }
+    sse_state
+        .cancel_for_session(subscription_id, owner_session_id)
         .map_err(|error| mcp_error(error.code(), error.message(subscription_id)))?;
     Ok(SubscribeCancelResponse {
         cancelled: true,

@@ -4,6 +4,8 @@ use std::{
     process::ExitCode,
 };
 
+mod routing;
+
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use synapse_core::{AccessibleSubtree, ForegroundContext, Rect, error_codes};
@@ -43,6 +45,8 @@ pub(crate) struct HiddenDesktopCapture {
     pub bitmap: synapse_capture::CapturedBgraBitmap,
     pub capture_backend: &'static str,
     pub capture_region: Rect,
+    /// Clipped client-relative region for a client-region capture (#233).
+    pub client_region: Option<Rect>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +81,10 @@ enum WorkerPayload {
     Capture {
         context: ForegroundContext,
         region: Rect,
+        /// The clipped client-relative region when a client region was
+        /// requested (#233); `None` for window-relative captures.
+        #[serde(default)]
+        client_region: Option<Rect>,
         width: u32,
         height: u32,
         capture_backend: String,
@@ -138,7 +146,8 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
                 .ok_or_else(|| worker_param_error("missing_bgra_path"))?;
             let requested_region = args.region.as_deref().map(parse_rect).transpose()?;
             let context = worker_context(hwnd)?;
-            let region = worker_capture_region(hwnd, requested_region, args.client_region)?;
+            let (region, client_region) =
+                worker_capture_region(hwnd, requested_region, args.client_region)?;
             let captured = synapse_capture::window_region_to_bgra_bitmap_printwindow(hwnd, region)
                 .map_err(|error| worker_error(error.code(), error.to_string()))?;
             fs::write(bgra_path, &captured.bitmap.bytes).map_err(|error| {
@@ -150,6 +159,7 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
             Ok(WorkerPayload::Capture {
                 context,
                 region: captured.bitmap.region,
+                client_region,
                 width: captured.bitmap.width,
                 height: captured.bitmap.height,
                 capture_backend: captured.capture_backend.to_owned(),
@@ -176,16 +186,20 @@ fn worker_capture_region(
     hwnd: i64,
     region: Option<Rect>,
     client_region: bool,
-) -> Result<Rect, WorkerEnvelope> {
+) -> Result<(Rect, Option<Rect>), WorkerEnvelope> {
     let Some(region) = region else {
         return synapse_capture::window_capture_region(hwnd)
+            .map(|window| (window, None))
             .map_err(|error| worker_error(error.code(), error.to_string()));
     };
     if client_region {
-        return synapse_capture::client_region_to_window_region(hwnd, region)
+        // Report the clipped client rectangle too, so OCR readbacks describe
+        // the pixels actually captured (#233).
+        return synapse_capture::client_region_to_window_regions(hwnd, region)
+            .map(|resolved| (resolved.window, Some(resolved.client)))
             .map_err(|error| worker_error(error.code(), error.to_string()));
     }
-    Ok(region)
+    Ok((region, None))
 }
 
 #[cfg(windows)]
@@ -304,33 +318,17 @@ pub(crate) fn hidden_desktop_window_snapshot(
 #[cfg(windows)]
 pub(crate) fn hidden_desktop_window_hwnds(desktop_name: &str) -> Result<Vec<i64>, rmcp::ErrorData> {
     use windows::{
-        Win32::{
-            Foundation::{LPARAM, SetLastError, WIN32_ERROR},
-            System::StationsAndDesktops::{
-                CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READ_CONTROL,
-                DESKTOP_READOBJECTS, EnumDesktopWindows, OpenDesktopW,
-            },
+        Win32::System::StationsAndDesktops::{
+            CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READ_CONTROL,
+            DESKTOP_READOBJECTS, OpenDesktopW,
         },
-        core::{BOOL, PCWSTR},
+        core::PCWSTR,
     };
-
-    struct Search {
-        hwnds: Vec<i64>,
-    }
-
-    unsafe extern "system" fn enum_window(
-        hwnd: windows::Win32::Foundation::HWND,
-        lparam: LPARAM,
-    ) -> BOOL {
-        let search = unsafe { &mut *(lparam.0 as *mut Search) };
-        search
-            .hwnds
-            .push(synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize));
-        BOOL(1)
-    }
 
     let desktop_wide = wide_null(desktop_name);
     let access = DESKTOP_ENUMERATE.0 | DESKTOP_READOBJECTS.0 | DESKTOP_READ_CONTROL.0;
+    // SAFETY: `desktop_wide` is a live NUL-terminated UTF-16 buffer; the returned handle is owned
+    // here and closed below.
     let handle = unsafe {
         OpenDesktopW(
             PCWSTR(desktop_wide.as_ptr()),
@@ -346,17 +344,10 @@ pub(crate) fn hidden_desktop_window_hwnds(desktop_name: &str) -> Result<Vec<i64>
         )
     })?;
 
-    let mut search = Search { hwnds: Vec::new() };
-    unsafe {
-        SetLastError(WIN32_ERROR(0));
-    }
-    let enum_result = unsafe {
-        EnumDesktopWindows(
-            Some(handle),
-            Some(enum_window),
-            LPARAM((&raw mut search).cast::<core::ffi::c_void>() as isize),
-        )
-    };
+    // Shared with m4's hidden-desktop sweep: an empty desktop (EnumDesktopWindows
+    // returns FALSE with last error 0) is an empty list, not an unreadable one.
+    let enum_result = crate::m4::desktop_window_hwnds(handle);
+    // SAFETY: `handle` was opened above and is not used afterwards; this is its only close.
     let close_result = unsafe { CloseDesktop(handle) };
     if let Err(error) = close_result {
         return Err(crate::m1::mcp_error(
@@ -364,15 +355,12 @@ pub(crate) fn hidden_desktop_window_hwnds(desktop_name: &str) -> Result<Vec<i64>
             format!("hidden desktop HWND enumeration failed to close {desktop_name:?}: {error}"),
         ));
     }
-    if let Err(error) = enum_result {
-        return Err(crate::m1::mcp_error(
+    enum_result.map_err(|error| {
+        crate::m1::mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
-            format!("EnumDesktopWindows failed for hidden desktop {desktop_name:?}: {error}"),
-        ));
-    }
-    search.hwnds.sort_unstable();
-    search.hwnds.dedup();
-    Ok(search.hwnds)
+            format!("{error} (desktop {desktop_name:?})"),
+        )
+    })
 }
 
 #[cfg(not(windows))]
@@ -404,78 +392,76 @@ pub(crate) fn hidden_desktop_window_capture(
     region: Option<Rect>,
     client_region: bool,
 ) -> Result<HiddenDesktopCapture, rmcp::ErrorData> {
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let mut temp = WorkerTempPaths::new(true)?;
-    let result = (|| {
-        let payload = run_worker_with_paths(
-            desktop_name,
-            DesktopWorkerOp::Capture,
-            hwnd,
-            region,
-            client_region,
-            None,
-            &temp,
-        )?;
-        let WorkerPayload::Capture {
-            context,
+    let temp = WorkerTempPaths::new(true)?;
+    let payload = run_worker_with_paths(
+        desktop_name,
+        DesktopWorkerOp::Capture,
+        hwnd,
+        region,
+        client_region,
+        None,
+        &temp,
+    )?;
+    let WorkerPayload::Capture {
+        context,
+        region,
+        client_region,
+        width,
+        height,
+        capture_backend,
+        bgra_bytes,
+    } = payload
+    else {
+        return Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker returned unexpected capture payload: {payload:?}"),
+        ));
+    };
+    let bgra_path = temp.bgra_path.as_ref().ok_or_else(|| {
+        crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "desktop worker capture temp path was not allocated",
+        )
+    })?;
+    let bytes = fs::read(bgra_path).map_err(|error| {
+        crate::m1::mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "desktop worker BGRA readback failed for {}: {error}",
+                bgra_path.display()
+            ),
+        )
+    })?;
+    if bytes.len() as u64 != bgra_bytes {
+        return Err(crate::m1::mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "desktop worker BGRA length mismatch: metadata={bgra_bytes} actual={}",
+                bytes.len()
+            ),
+        ));
+    }
+    let capture_backend = match capture_backend.as_str() {
+        "printwindow" => "printwindow",
+        other => {
+            return Err(crate::m1::mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("desktop worker returned unsupported capture backend {other:?}"),
+            ));
+        }
+    };
+    Ok(HiddenDesktopCapture {
+        context,
+        bitmap: synapse_capture::CapturedBgraBitmap {
             region,
             width,
             height,
-            capture_backend,
-            bgra_bytes,
-        } = payload
-        else {
-            return Err(crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("desktop worker returned unexpected capture payload: {payload:?}"),
-            ));
-        };
-        let bgra_path = temp.bgra_path.as_ref().ok_or_else(|| {
-            crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "desktop worker capture temp path was not allocated",
-            )
-        })?;
-        let bytes = fs::read(bgra_path).map_err(|error| {
-            crate::m1::mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "desktop worker BGRA readback failed for {}: {error}",
-                    bgra_path.display()
-                ),
-            )
-        })?;
-        if bytes.len() as u64 != bgra_bytes {
-            return Err(crate::m1::mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "desktop worker BGRA length mismatch: metadata={bgra_bytes} actual={}",
-                    bytes.len()
-                ),
-            ));
-        }
-        let capture_backend = match capture_backend.as_str() {
-            "printwindow" => "printwindow",
-            other => {
-                return Err(crate::m1::mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!("desktop worker returned unsupported capture backend {other:?}"),
-                ));
-            }
-        };
-        Ok(HiddenDesktopCapture {
-            context,
-            bitmap: synapse_capture::CapturedBgraBitmap {
-                region,
-                width,
-                height,
-                bytes,
-            },
-            capture_backend,
-            capture_region: region,
-        })
-    })();
-    finish_worker_temp_cleanup(result, &mut temp)
+            bytes,
+        },
+        capture_backend,
+        capture_region: region,
+        client_region,
+    })
 }
 
 #[cfg(not(windows))]
@@ -500,10 +486,8 @@ fn run_worker(
     client_region: bool,
     depth: Option<u32>,
 ) -> Result<WorkerPayload, rmcp::ErrorData> {
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let mut temp = WorkerTempPaths::new(matches!(op, DesktopWorkerOp::Capture))?;
-    let result = run_worker_with_paths(desktop_name, op, hwnd, region, client_region, depth, &temp);
-    finish_worker_temp_cleanup(result, &mut temp)
+    let temp = WorkerTempPaths::new(matches!(op, DesktopWorkerOp::Capture))?;
+    run_worker_with_paths(desktop_name, op, hwnd, region, client_region, depth, &temp)
 }
 
 #[cfg(windows)]
@@ -516,11 +500,11 @@ fn run_worker_with_paths(
     depth: Option<u32>,
     temp: &WorkerTempPaths,
 ) -> Result<WorkerPayload, rmcp::ErrorData> {
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let process_verdict =
-        launch_worker_process(desktop_name, op, hwnd, region, client_region, depth, temp)?;
+    // #176: HWNDs are session-wide, so the worker would accept any live window. Only windows that
+    // belong to this hidden desktop may be routed to its worker.
+    routing::ensure_hwnd_on_desktop(desktop_name, hwnd, hidden_desktop_window_hwnds)?;
+    launch_worker_process(desktop_name, op, hwnd, region, client_region, depth, temp)?;
     let envelope: WorkerEnvelope = read_json(&temp.json_path)?;
-    validate_worker_exit_envelope(process_verdict, &envelope)?;
     if !envelope.ok {
         let code = envelope
             .error_code
@@ -543,1041 +527,6 @@ fn run_worker_with_paths(
 }
 
 #[cfg(windows)]
-const WORKER_TERMINATION_READBACK_TIMEOUT_MS: u32 = 5_000;
-
-#[cfg(windows)]
-const STILL_ACTIVE_EXIT_CODE: u32 = 259;
-
-#[cfg(windows)]
-struct WorkerProcessHandles {
-    process: Option<windows::Win32::Foundation::HANDLE>,
-    thread: Option<windows::Win32::Foundation::HANDLE>,
-    job: Option<windows::Win32::Foundation::HANDLE>,
-    job_assigned: bool,
-    terminal_verified: bool,
-    terminal_exit_code: Option<u32>,
-    child_created: bool,
-    retained_owner_id: Option<u64>,
-    pid: u32,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Fields are intentionally consumed through fail-closed diagnostic Debug output.
-pub(crate) struct DesktopWorkerRetainedOwner {
-    // Windows HANDLE is !Send in the bindings. Raw values are safe here
-    // because kernel handles are process-wide; the registry remains their
-    // exact logical owner and reconstructs them only for checked Win32 calls.
-    pub(crate) owner_id: u64,
-    pub(crate) pid: u32,
-    pub(crate) process_handle: Option<isize>,
-    pub(crate) thread_handle: Option<isize>,
-    pub(crate) job_handle: Option<isize>,
-    pub(crate) job_assigned: bool,
-    pub(crate) terminal_verified: bool,
-    pub(crate) terminal_exit_code: Option<u32>,
-    pub(crate) child_created: bool,
-    pub(crate) last_failure: String,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Append-only evidence is emitted in shutdown diagnostics and inspected in tests.
-pub(crate) struct DesktopWorkerRetainedOwnerEvidence {
-    pub(crate) sequence: u64,
-    pub(crate) event: &'static str,
-    pub(crate) owner: DesktopWorkerRetainedOwner,
-    pub(crate) detail: String,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Non-count fields preserve exact owner evidence for fatal shutdown reports.
-pub(crate) struct DesktopWorkerRetainedOwnerReport {
-    pub(crate) active_owner_count: usize,
-    pub(crate) reap_in_progress_count: usize,
-    pub(crate) active_owners: Vec<DesktopWorkerRetainedOwner>,
-    pub(crate) evidence: Vec<DesktopWorkerRetainedOwnerEvidence>,
-}
-
-#[cfg(windows)]
-fn retained_worker_process_handles() -> &'static std::sync::Mutex<Vec<DesktopWorkerRetainedOwner>> {
-    static RETAINED: std::sync::OnceLock<std::sync::Mutex<Vec<DesktopWorkerRetainedOwner>>> =
-        std::sync::OnceLock::new();
-    RETAINED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-#[cfg(windows)]
-fn lock_retained_worker_process_handles()
--> std::sync::MutexGuard<'static, Vec<DesktopWorkerRetainedOwner>> {
-    retained_worker_process_handles()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[cfg(windows)]
-fn retained_worker_reaps_in_progress() -> &'static std::sync::atomic::AtomicUsize {
-    static IN_PROGRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    &IN_PROGRESS
-}
-
-#[cfg(windows)]
-struct RetainedWorkerReapGuard;
-
-#[cfg(windows)]
-impl Drop for RetainedWorkerReapGuard {
-    fn drop(&mut self) {
-        retained_worker_reaps_in_progress().fetch_sub(1, std::sync::atomic::Ordering::Release);
-    }
-}
-
-#[cfg(windows)]
-fn take_retained_worker_owner_for_retry()
--> Option<(DesktopWorkerRetainedOwner, RetainedWorkerReapGuard)> {
-    // Increment while holding the same registry lock used by the shutdown
-    // readback. Thus an observer sees either the retained registry entry or
-    // the in-progress owner, never a false zero between those two states.
-    let mut owners = lock_retained_worker_process_handles();
-    let owner = owners.pop()?;
-    retained_worker_reaps_in_progress().fetch_add(1, std::sync::atomic::Ordering::Release);
-    Some((owner, RetainedWorkerReapGuard))
-}
-
-#[cfg(windows)]
-fn retained_worker_owner_evidence()
--> &'static std::sync::Mutex<Vec<DesktopWorkerRetainedOwnerEvidence>> {
-    static EVIDENCE: std::sync::OnceLock<
-        std::sync::Mutex<Vec<DesktopWorkerRetainedOwnerEvidence>>,
-    > = std::sync::OnceLock::new();
-    EVIDENCE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
-#[cfg(windows)]
-fn append_retained_worker_owner_evidence(
-    event: &'static str,
-    owner: DesktopWorkerRetainedOwner,
-    detail: String,
-) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_EVIDENCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    let sequence = NEXT_EVIDENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    retained_worker_owner_evidence()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(DesktopWorkerRetainedOwnerEvidence {
-            sequence,
-            event,
-            owner,
-            detail,
-        });
-}
-
-#[cfg(windows)]
-pub(crate) fn desktop_worker_retained_owner_report() -> DesktopWorkerRetainedOwnerReport {
-    let active_owners = lock_retained_worker_process_handles().clone();
-    let reap_in_progress_count =
-        retained_worker_reaps_in_progress().load(std::sync::atomic::Ordering::Acquire);
-    let evidence = retained_worker_owner_evidence()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    DesktopWorkerRetainedOwnerReport {
-        active_owner_count: active_owners.len().saturating_add(reap_in_progress_count),
-        reap_in_progress_count,
-        active_owners,
-        evidence,
-    }
-}
-
-#[cfg(not(windows))]
-pub(crate) fn desktop_worker_retained_owner_report() -> DesktopWorkerRetainedOwnerReport {
-    DesktopWorkerRetainedOwnerReport {
-        active_owner_count: 0,
-        reap_in_progress_count: 0,
-        active_owners: Vec::new(),
-        evidence: Vec::new(),
-    }
-}
-
-#[cfg(windows)]
-impl WorkerProcessHandles {
-    fn from_process_info(
-        process_info: windows::Win32::System::Threading::PROCESS_INFORMATION,
-        job: windows::Win32::Foundation::HANDLE,
-    ) -> Self {
-        Self {
-            process: (!process_info.hProcess.0.is_null()).then_some(process_info.hProcess),
-            thread: (!process_info.hThread.0.is_null()).then_some(process_info.hThread),
-            job: (!job.0.is_null()).then_some(job),
-            job_assigned: false,
-            terminal_verified: false,
-            terminal_exit_code: None,
-            child_created: true,
-            retained_owner_id: None,
-            pid: process_info.dwProcessId,
-        }
-    }
-
-    fn from_retained(retained: DesktopWorkerRetainedOwner) -> Self {
-        fn restore(raw: isize) -> windows::Win32::Foundation::HANDLE {
-            windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void)
-        }
-
-        Self {
-            process: retained.process_handle.map(restore),
-            thread: retained.thread_handle.map(restore),
-            job: retained.job_handle.map(restore),
-            job_assigned: retained.job_assigned,
-            terminal_verified: retained.terminal_verified,
-            terminal_exit_code: retained.terminal_exit_code,
-            child_created: retained.child_created,
-            retained_owner_id: Some(retained.owner_id),
-            pid: retained.pid,
-        }
-    }
-
-    fn from_standalone_job(job: windows::Win32::Foundation::HANDLE) -> Self {
-        Self {
-            process: None,
-            thread: None,
-            job: (!job.0.is_null()).then_some(job),
-            job_assigned: false,
-            terminal_verified: false,
-            terminal_exit_code: None,
-            child_created: false,
-            retained_owner_id: None,
-            pid: 0,
-        }
-    }
-
-    const fn has_handles(&self) -> bool {
-        self.process.is_some() || self.thread.is_some() || self.job.is_some()
-    }
-
-    fn mark_terminal(&mut self, exit_code: u32) {
-        self.terminal_verified = true;
-        self.terminal_exit_code = Some(exit_code);
-    }
-
-    fn retain_remaining(&mut self, stage: &'static str, last_failure: String) -> bool {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_RETAINED_OWNER_ID: AtomicU64 = AtomicU64::new(1);
-
-        if !self.has_handles() {
-            return false;
-        }
-        let event = if self.retained_owner_id.is_some() {
-            "retry_retained"
-        } else {
-            "retained"
-        };
-        let retained = DesktopWorkerRetainedOwner {
-            owner_id: self
-                .retained_owner_id
-                .unwrap_or_else(|| NEXT_RETAINED_OWNER_ID.fetch_add(1, Ordering::Relaxed)),
-            pid: self.pid,
-            process_handle: self.process.map(|handle| handle.0 as isize),
-            thread_handle: self.thread.map(|handle| handle.0 as isize),
-            job_handle: self.job.map(|handle| handle.0 as isize),
-            job_assigned: self.job_assigned,
-            terminal_verified: self.terminal_verified,
-            terminal_exit_code: self.terminal_exit_code,
-            child_created: self.child_created,
-            last_failure,
-        };
-        lock_retained_worker_process_handles().push(retained.clone());
-        append_retained_worker_owner_evidence(
-            event,
-            retained.clone(),
-            format!("exact desktop-worker kernel handles retained at {stage}"),
-        );
-        self.process = None;
-        self.thread = None;
-        self.job = None;
-        self.job_assigned = false;
-        self.retained_owner_id = None;
-        report_worker_process_lifecycle_failure(
-            "MCP_DESKTOP_WORKER_HANDLES_RETAINED",
-            self.pid,
-            stage,
-            &format!(
-                "retained exact desktop-worker kernel handles for later checked cleanup; process={:?}; thread={:?}; job={:?}; terminal_verified={}; terminal_exit_code={:?}",
-                retained.process_handle,
-                retained.thread_handle,
-                retained.job_handle,
-                retained.terminal_verified,
-                retained.terminal_exit_code
-            ),
-        );
-        true
-    }
-
-    fn process(&self) -> Result<windows::Win32::Foundation::HANDLE, String> {
-        self.process.ok_or_else(|| {
-            format!(
-                "desktop worker CreateProcessW returned no process handle for pid {}",
-                self.pid
-            )
-        })
-    }
-
-    fn thread(&self) -> Result<windows::Win32::Foundation::HANDLE, String> {
-        self.thread.ok_or_else(|| {
-            format!(
-                "desktop worker CreateProcessW returned no primary thread handle for pid {}",
-                self.pid
-            )
-        })
-    }
-
-    fn job(&self) -> Result<windows::Win32::Foundation::HANDLE, String> {
-        self.job.ok_or_else(|| {
-            format!(
-                "desktop worker has no kill-on-close job handle for pid {}",
-                self.pid
-            )
-        })
-    }
-
-    fn close_checked(&mut self) -> Vec<String> {
-        let mut failures = Vec::new();
-        // Callers may release process/thread ownership only after terminal
-        // state was independently verified. The finalizer below establishes
-        // that precondition before using this mechanical close helper.
-        self.close_one("job", &mut failures);
-        self.close_one("thread", &mut failures);
-        self.close_one("process", &mut failures);
-        failures
-    }
-
-    fn close_one(&mut self, kind: &'static str, failures: &mut Vec<String>) {
-        let pid = self.pid;
-        let slot = match kind {
-            "job" => &mut self.job,
-            "thread" => &mut self.thread,
-            _ => &mut self.process,
-        };
-        let Some(handle) = *slot else {
-            return;
-        };
-        if let Err(error) = unsafe { windows::Win32::Foundation::CloseHandle(handle) } {
-            let detail =
-                format!("CloseHandle({kind}) failed for desktop worker pid {pid}: {error}");
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_HANDLE_CLOSE_FAILED",
-                pid,
-                kind,
-                &detail,
-            );
-            failures.push(detail);
-            // CloseHandle failure is not evidence that kernel ownership was
-            // released. Keep the exact handle (and job-assignment fact) for
-            // the finalizer or retained-owner registry instead of silently
-            // discarding the only owner of a potentially live worker tree.
-            return;
-        }
-        *slot = None;
-        if kind == "job" {
-            self.job_assigned = false;
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WorkerProcessHandles {
-    fn drop(&mut self) {
-        if !self.has_handles() {
-            return;
-        }
-        // Panic/unwind follows the same bounded kill -> exact wait -> exit-code
-        // readback state machine as ordinary returns. If even that cannot
-        // establish safe release, the process-global registry becomes the
-        // durable owner of every remaining raw handle.
-        let report = finalize_worker_process_handles(self, "drop_unwind");
-        if !report.failures.is_empty() {
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_HANDLE_DROP_FAILED",
-                self.pid,
-                "drop",
-                &report.failures.join("; "),
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkerProcessVerdict {
-    pid: u32,
-    timed_out: bool,
-    exit_code: u32,
-}
-
-#[cfg(windows)]
-fn report_worker_process_lifecycle_failure(
-    code: &'static str,
-    pid: u32,
-    stage: &'static str,
-    detail: &str,
-) {
-    tracing::error!(
-        code,
-        pid,
-        stage,
-        detail,
-        "desktop worker process lifecycle operation failed"
-    );
-    use std::io::Write as _;
-    let stderr = std::io::stderr();
-    let mut stderr = stderr.lock();
-    let _ = writeln!(
-        stderr,
-        "synapse-mcp desktop worker lifecycle error: code={code} pid={pid} stage={stage} detail={detail}"
-    );
-}
-
-#[cfg(windows)]
-fn validate_worker_exit_envelope(
-    verdict: WorkerProcessVerdict,
-    envelope: &WorkerEnvelope,
-) -> Result<(), rmcp::ErrorData> {
-    if (verdict.exit_code == 0) == envelope.ok {
-        return Ok(());
-    }
-
-    let detail = format!(
-        "desktop worker pid {} returned contradictory terminal evidence: kernel exit_code={} requires envelope.ok={}, but JSON envelope.ok={}; refusing an untrustworthy worker result",
-        verdict.pid,
-        verdict.exit_code,
-        verdict.exit_code == 0,
-        envelope.ok
-    );
-    report_worker_process_lifecycle_failure(
-        "MCP_DESKTOP_WORKER_EXIT_ENVELOPE_MISMATCH",
-        verdict.pid,
-        "json_envelope_readback",
-        &detail,
-    );
-    Err(crate::m1::mcp_error(
-        error_codes::TOOL_INTERNAL_ERROR,
-        detail,
-    ))
-}
-
-#[cfg(windows)]
-fn close_or_retain_standalone_worker_job(
-    handle: windows::Win32::Foundation::HANDLE,
-    stage: &'static str,
-) -> Result<(), String> {
-    let mut handles = WorkerProcessHandles::from_standalone_job(handle);
-    let report = finalize_worker_process_handles(&mut handles, stage);
-    if report.failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "standalone desktop-worker job cleanup failed at {stage}: {}; exact_handle_retained={}",
-            report.failures.join("; "),
-            report.retained
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn create_worker_kill_on_close_job() -> Result<windows::Win32::Foundation::HANDLE, String> {
-    use windows::{
-        Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject,
-        },
-        core::PCWSTR,
-    };
-
-    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-        .map_err(|error| format!("CreateJobObjectW for desktop worker failed: {error}"))?;
-    let limit_size = match u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-    {
-        Ok(size) => size,
-        Err(error) => {
-            let close = close_or_retain_standalone_worker_job(job, "job_limit_size_conversion");
-            return Err(format!(
-                "desktop worker job limit size conversion failed: {error}; close_readback={close:?}"
-            ));
-        }
-    };
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if let Err(error) = unsafe {
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            limit_size,
-        )
-    } {
-        let close = close_or_retain_standalone_worker_job(job, "job_limit_configuration");
-        return Err(format!(
-            "SetInformationJobObject(KILL_ON_JOB_CLOSE) for desktop worker failed: {error}; close_readback={close:?}"
-        ));
-    }
-    let mut readback = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    let mut returned_bytes = 0_u32;
-    if let Err(error) = unsafe {
-        QueryInformationJobObject(
-            Some(job),
-            JobObjectExtendedLimitInformation,
-            (&raw mut readback).cast(),
-            limit_size,
-            Some(&raw mut returned_bytes),
-        )
-    } {
-        let close = close_or_retain_standalone_worker_job(job, "job_limit_query");
-        return Err(format!(
-            "QueryInformationJobObject(KILL_ON_JOB_CLOSE) readback for desktop worker failed: {error}; close_readback={close:?}"
-        ));
-    }
-    if returned_bytes != limit_size {
-        let close = close_or_retain_standalone_worker_job(job, "job_limit_query_size_readback");
-        return Err(format!(
-            "QueryInformationJobObject returned {returned_bytes} bytes for desktop worker kill-on-close limits; expected {limit_size}; limit_flags={:#x}; close_readback={close:?}",
-            readback.BasicLimitInformation.LimitFlags.0
-        ));
-    }
-    if !readback
-        .BasicLimitInformation
-        .LimitFlags
-        .contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-    {
-        let close = close_or_retain_standalone_worker_job(job, "job_limit_flag_readback");
-        return Err(format!(
-            "QueryInformationJobObject readback omitted KILL_ON_JOB_CLOSE for desktop worker; limit_flags={:#x}; close_readback={close:?}",
-            readback.BasicLimitInformation.LimitFlags.0
-        ));
-    }
-    tracing::info!(
-        code = "MCP_DESKTOP_WORKER_JOB_LIMIT_VERIFIED",
-        limit_flags = readback.BasicLimitInformation.LimitFlags.0,
-        returned_bytes,
-        "desktop worker kill-on-close job limit independently read back before child creation"
-    );
-    Ok(job)
-}
-
-#[cfg(windows)]
-fn assign_worker_job_and_resume(handles: &mut WorkerProcessHandles) -> Result<(), String> {
-    use windows::{
-        Win32::System::{
-            JobObjects::{AssignProcessToJobObject, IsProcessInJob},
-            Threading::ResumeThread,
-        },
-        core::BOOL,
-    };
-
-    let job = handles.job()?;
-    let process = handles.process()?;
-    let thread = handles.thread()?;
-    unsafe { AssignProcessToJobObject(job, process) }.map_err(|error| {
-        format!(
-            "AssignProcessToJobObject failed for suspended desktop worker pid {}: {error}",
-            handles.pid
-        )
-    })?;
-    // Assignment succeeded even if its independent readback fails. Preserve
-    // this fact so every later error path closes the kill-on-close owner.
-    handles.job_assigned = true;
-    let mut in_job = BOOL::default();
-    unsafe { IsProcessInJob(process, Some(job), &raw mut in_job) }.map_err(|error| {
-        format!(
-            "IsProcessInJob readback failed for suspended desktop worker pid {}: {error}",
-            handles.pid
-        )
-    })?;
-    if !in_job.as_bool() {
-        return Err(format!(
-            "IsProcessInJob readback was false after assigning suspended desktop worker pid {}",
-            handles.pid
-        ));
-    }
-    let previous_suspend_count = unsafe { ResumeThread(thread) };
-    if previous_suspend_count == u32::MAX {
-        return Err(format!(
-            "ResumeThread failed for job-owned desktop worker pid {}: {}",
-            handles.pid,
-            windows::core::Error::from_thread()
-        ));
-    }
-    if previous_suspend_count != 1 {
-        return Err(format!(
-            "ResumeThread returned unexpected prior suspend count {previous_suspend_count} for desktop worker pid {}; expected exactly 1",
-            handles.pid,
-        ));
-    }
-    tracing::info!(
-        code = "MCP_DESKTOP_WORKER_JOB_OWNERSHIP_VERIFIED",
-        pid = handles.pid,
-        previous_suspend_count,
-        "desktop worker was assigned to a kill-on-close job, independently read back, and resumed"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-fn read_worker_exit_code(
-    process: windows::Win32::Foundation::HANDLE,
-    pid: u32,
-    stage: &'static str,
-) -> Result<u32, String> {
-    let mut exit_code = 0_u32;
-    unsafe { windows::Win32::System::Threading::GetExitCodeProcess(process, &raw mut exit_code) }
-        .map_err(|error| {
-        format!("GetExitCodeProcess failed for desktop worker pid {pid} at {stage}: {error}")
-    })?;
-    Ok(exit_code)
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WorkerTerminalProbe {
-    Running,
-    Terminal(u32),
-}
-
-#[cfg(windows)]
-#[derive(Debug)]
-struct WorkerHandleFinalization {
-    terminal_exit_code: Option<u32>,
-    failures: Vec<String>,
-    retained: bool,
-    job_close_triggered: bool,
-}
-
-#[cfg(windows)]
-fn reconcile_provisional_terminate_process_failure(
-    failures: &mut Vec<String>,
-    provisional_failure: Option<String>,
-    exact_terminal_exit_code: Option<u32>,
-    pid: u32,
-    stage: &'static str,
-) {
-    let Some(provisional_failure) = provisional_failure else {
-        return;
-    };
-    if let Some(exit_code) = exact_terminal_exit_code {
-        // TerminateProcess is asynchronous with respect to the independent job
-        // termination trigger. Windows explicitly returns ERROR_ACCESS_DENIED
-        // when the exact process has already terminated. Preserve that raced
-        // syscall as diagnostic evidence, but let the subsequent wait on this
-        // same process handle plus non-STILL_ACTIVE exit-code readback decide
-        // the terminal verdict.
-        tracing::warn!(
-            code = "MCP_DESKTOP_WORKER_TERMINATE_PROCESS_RACE_RESOLVED",
-            pid,
-            stage,
-            exit_code,
-            provisional_failure,
-            source_of_truth =
-                "exact process HANDLE signaled + GetExitCodeProcess non-STILL_ACTIVE readback",
-            "desktop worker exact-process termination syscall raced with an independently verified terminal transition"
-        );
-    } else {
-        failures.push(provisional_failure);
-    }
-}
-
-#[cfg(windows)]
-fn probe_worker_terminal_state(
-    handles: &mut WorkerProcessHandles,
-    timeout_ms: u32,
-    stage: &'static str,
-) -> Result<WorkerTerminalProbe, String> {
-    use windows::Win32::{
-        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::WaitForSingleObject,
-    };
-
-    if handles.terminal_verified {
-        return handles
-            .terminal_exit_code
-            .map(WorkerTerminalProbe::Terminal)
-            .ok_or_else(|| {
-                format!(
-                    "desktop worker pid {} marked terminal without an exit-code readback at {stage}",
-                    handles.pid
-                )
-            });
-    }
-    let process = handles.process()?;
-    let wait = unsafe { WaitForSingleObject(process, timeout_ms) };
-    if wait == WAIT_TIMEOUT {
-        return Ok(WorkerTerminalProbe::Running);
-    }
-    if wait != WAIT_OBJECT_0 {
-        let last_error = (wait == WAIT_FAILED)
-            .then(windows::core::Error::from_thread)
-            .map_or_else(|| "not available".to_owned(), |error| error.to_string());
-        return Err(format!(
-            "desktop worker pid {} terminal probe at {stage} returned {wait:?}; timeout_ms={timeout_ms}; last_error={last_error}",
-            handles.pid
-        ));
-    }
-    let exit_code = read_worker_exit_code(process, handles.pid, stage)?;
-    if exit_code == STILL_ACTIVE_EXIT_CODE {
-        return Err(format!(
-            "desktop worker pid {} was signaled at {stage}, but GetExitCodeProcess returned STILL_ACTIVE ({STILL_ACTIVE_EXIT_CODE})",
-            handles.pid
-        ));
-    }
-    handles.mark_terminal(exit_code);
-    Ok(WorkerTerminalProbe::Terminal(exit_code))
-}
-
-#[cfg(windows)]
-fn finalize_worker_process_handles(
-    handles: &mut WorkerProcessHandles,
-    stage: &'static str,
-) -> WorkerHandleFinalization {
-    use windows::Win32::System::Threading::TerminateProcess;
-
-    let mut failures = Vec::new();
-    let mut job_close_triggered = false;
-    if !handles.child_created {
-        if handles.process.is_some() || handles.thread.is_some() || handles.job_assigned {
-            failures.push(format!(
-                "childless desktop-worker owner unexpectedly contained process/thread/job-assignment state at {stage}; process={}; thread={}; job_assigned={}",
-                handles.process.is_some(),
-                handles.thread.is_some(),
-                handles.job_assigned
-            ));
-        }
-        handles.close_one("job", &mut failures);
-        let retained = if handles.has_handles() {
-            let last_failure = if failures.is_empty() {
-                format!("childless desktop-worker job handle remained owned after {stage}")
-            } else {
-                failures.join("; ")
-            };
-            let retained = handles.retain_remaining(stage, last_failure);
-            failures.push(format!(
-                "childless desktop-worker exact job handle retained after {stage}"
-            ));
-            retained
-        } else {
-            false
-        };
-        return WorkerHandleFinalization {
-            terminal_exit_code: None,
-            failures,
-            retained,
-            job_close_triggered,
-        };
-    }
-    match probe_worker_terminal_state(handles, 0, "finalize_pre_close") {
-        Ok(WorkerTerminalProbe::Terminal(_)) => {}
-        Ok(WorkerTerminalProbe::Running) => {}
-        Err(error) => failures.push(error),
-    }
-
-    if !handles.terminal_verified {
-        let job_was_assigned = handles.job_assigned;
-        if handles.job.is_some() {
-            let failure_count = failures.len();
-            handles.close_one("job", &mut failures);
-            let job_close_succeeded = handles.job.is_none();
-            if job_was_assigned && job_close_succeeded {
-                job_close_triggered = true;
-                match probe_worker_terminal_state(
-                    handles,
-                    WORKER_TERMINATION_READBACK_TIMEOUT_MS,
-                    "post_kill_on_close_job_wait",
-                ) {
-                    Ok(WorkerTerminalProbe::Terminal(_)) => {}
-                    Ok(WorkerTerminalProbe::Running) => failures.push(format!(
-                        "desktop worker pid {} remained live for {} ms after the verified kill-on-close job handle was closed",
-                        handles.pid, WORKER_TERMINATION_READBACK_TIMEOUT_MS
-                    )),
-                    Err(error) => failures.push(error),
-                }
-            } else if job_was_assigned && failures.len() == failure_count {
-                failures.push(format!(
-                    "desktop worker pid {} lost its recorded job assignment without a checked job-close result",
-                    handles.pid
-                ));
-            }
-        }
-    }
-
-    if !handles.terminal_verified {
-        let mut provisional_terminate_process_failure = None;
-        match handles.process() {
-            Ok(process) => {
-                if let Err(error) = unsafe { TerminateProcess(process, 1) } {
-                    provisional_terminate_process_failure = Some(format!(
-                        "TerminateProcess exact-child finalizer failed for desktop worker pid {} at {stage}: {error}",
-                        handles.pid
-                    ));
-                }
-            }
-            Err(error) => failures.push(error),
-        }
-        let exact_terminal_exit_code = match probe_worker_terminal_state(
-            handles,
-            WORKER_TERMINATION_READBACK_TIMEOUT_MS,
-            "post_exact_process_termination_wait",
-        ) {
-            Ok(WorkerTerminalProbe::Terminal(exit_code)) => Some(exit_code),
-            Ok(WorkerTerminalProbe::Running) => {
-                failures.push(format!(
-                    "desktop worker pid {} remained live for {} ms after the exact-process termination fallback at {stage}",
-                    handles.pid, WORKER_TERMINATION_READBACK_TIMEOUT_MS
-                ));
-                None
-            }
-            Err(error) => {
-                failures.push(error);
-                None
-            }
-        };
-        reconcile_provisional_terminate_process_failure(
-            &mut failures,
-            provisional_terminate_process_failure,
-            exact_terminal_exit_code,
-            handles.pid,
-            stage,
-        );
-    }
-
-    if handles.terminal_verified {
-        failures.extend(handles.close_checked());
-    } else {
-        failures.push(format!(
-            "desktop worker pid {} has no verified signaled-state plus exit-code readback at {stage}; process/thread ownership will not be relinquished",
-            handles.pid
-        ));
-    }
-
-    let retained = if handles.has_handles() {
-        let process_retained = handles.process.is_some();
-        let thread_retained = handles.thread.is_some();
-        let job_retained = handles.job.is_some();
-        let last_failure = if failures.is_empty() {
-            format!(
-                "desktop worker pid {} still owned handles after checked finalization at {stage}",
-                handles.pid
-            )
-        } else {
-            failures.join("; ")
-        };
-        let retained = handles.retain_remaining(stage, last_failure);
-        failures.push(format!(
-            "desktop worker pid {} exact handles retained after {stage}: process={process_retained}; thread={thread_retained}; job={job_retained}",
-            handles.pid
-        ));
-        retained
-    } else {
-        false
-    };
-
-    WorkerHandleFinalization {
-        terminal_exit_code: handles.terminal_exit_code,
-        failures,
-        retained,
-        job_close_triggered,
-    }
-}
-
-#[cfg(windows)]
-fn retry_retained_worker_process_handles() -> Result<(), String> {
-    static RETRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _retry_guard = RETRY_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    loop {
-        let Some((retained, _reap_guard)) = take_retained_worker_owner_for_retry() else {
-            return Ok(());
-        };
-        let pid = retained.pid;
-        let retained_evidence = retained.clone();
-        let mut handles = WorkerProcessHandles::from_retained(retained);
-        let report = finalize_worker_process_handles(&mut handles, "retained_handle_retry");
-        if report.retained {
-            return Err(format!(
-                "desktop worker pid {pid} retained-handle retry still owns unresolved handles: {}",
-                report.failures.join("; ")
-            ));
-        }
-        let recovery_detail = if report.failures.is_empty() {
-            format!(
-                "retained desktop-worker owner {} was reaped with terminal_exit_code={:?}",
-                retained_evidence.owner_id, report.terminal_exit_code
-            )
-        } else {
-            format!(
-                "retained desktop-worker owner {} was reaped after checked recovery failures: {}",
-                retained_evidence.owner_id,
-                report.failures.join("; ")
-            )
-        };
-        append_retained_worker_owner_evidence("reaped", retained_evidence, recovery_detail.clone());
-        if !report.failures.is_empty() {
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_RETAINED_HANDLE_RETRY_RECOVERED",
-                pid,
-                "retained_handle_retry",
-                &recovery_detail,
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
-fn wait_for_worker_process(
-    handles: &mut WorkerProcessHandles,
-    timeout_ms: u32,
-) -> Result<WorkerProcessVerdict, String> {
-    use windows::Win32::{
-        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::WaitForSingleObject,
-    };
-
-    let process = handles.process()?;
-    let wait = unsafe { WaitForSingleObject(process, timeout_ms) };
-    if wait == WAIT_OBJECT_0 {
-        let exit_code = read_worker_exit_code(process, handles.pid, "natural_exit")?;
-        handles.mark_terminal(exit_code);
-        return Ok(WorkerProcessVerdict {
-            pid: handles.pid,
-            timed_out: false,
-            exit_code,
-        });
-    }
-    if wait != WAIT_TIMEOUT {
-        let last_error = (wait == WAIT_FAILED)
-            .then(windows::core::Error::from_thread)
-            .map_or_else(|| "not available".to_owned(), |error| error.to_string());
-        let primary = format!(
-            "WaitForSingleObject returned {wait:?} for desktop worker pid {}; last_error={last_error}",
-            handles.pid
-        );
-        let cleanup = terminate_worker_process_and_readback(handles, timeout_ms).map_or_else(
-            |cleanup_error| format!("cleanup_failed={cleanup_error}"),
-            |exit_code| format!("cleanup_verified_exit_code={exit_code}"),
-        );
-        return Err(format!("{primary}; {cleanup}"));
-    }
-
-    // Termination is asynchronous. A successful syscall is not the verdict:
-    // wait on the exact process handle, then read its kernel exit code through
-    // a separate operation before reporting the timeout to the caller.
-    let exit_code = terminate_worker_process_and_readback(handles, timeout_ms)?;
-    Ok(WorkerProcessVerdict {
-        pid: handles.pid,
-        timed_out: true,
-        exit_code,
-    })
-}
-
-#[cfg(windows)]
-fn terminate_worker_process_and_readback(
-    handles: &mut WorkerProcessHandles,
-    initial_timeout_ms: u32,
-) -> Result<u32, String> {
-    use windows::Win32::{
-        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::{
-            JobObjects::TerminateJobObject,
-            Threading::{TerminateProcess, WaitForSingleObject},
-        },
-    };
-
-    let process = handles.process()?;
-    let pid = handles.pid;
-    let mut failures = Vec::new();
-    if handles.job_assigned {
-        match handles.job() {
-            Ok(job) => {
-                if let Err(error) = unsafe { TerminateJobObject(job, 1) } {
-                    failures.push(format!(
-                        "TerminateJobObject failed after desktop worker pid {pid} did not stop within {initial_timeout_ms} ms: {error}"
-                    ));
-                    // Closing a configured kill-on-close job is an independent
-                    // kernel termination trigger. Attempt it even when the
-                    // explicit job termination fails.
-                    let mut close_failures = Vec::new();
-                    handles.close_one("job", &mut close_failures);
-                    failures.extend(close_failures);
-                }
-            }
-            Err(error) => failures.push(error),
-        }
-    }
-    // Job termination is asynchronous, and an assignment readback failure
-    // makes its membership untrustworthy. If the exact process is not already
-    // signaled, independently trigger exact-process termination as well.
-    let pre_fallback_wait = unsafe { WaitForSingleObject(process, 0) };
-    if pre_fallback_wait != WAIT_OBJECT_0 && pre_fallback_wait != WAIT_TIMEOUT {
-        let last_error = (pre_fallback_wait == WAIT_FAILED)
-            .then(windows::core::Error::from_thread)
-            .map_or_else(|| "not available".to_owned(), |error| error.to_string());
-        failures.push(format!(
-            "desktop worker pid {pid} exact-process pre-fallback wait returned {pre_fallback_wait:?}; last_error={last_error}"
-        ));
-    }
-    let provisional_terminate_process_failure = if pre_fallback_wait == WAIT_OBJECT_0 {
-        None
-    } else {
-        unsafe { TerminateProcess(process, 1) }
-            .err()
-            .map(|error| {
-                format!(
-                    "TerminateProcess exact-child fallback failed for desktop worker pid {pid} after {initial_timeout_ms} ms: {error}; pre_fallback_wait={pre_fallback_wait:?}"
-                )
-            })
-    };
-    let termination_wait =
-        unsafe { WaitForSingleObject(process, WORKER_TERMINATION_READBACK_TIMEOUT_MS) };
-    if termination_wait != WAIT_OBJECT_0 {
-        let last_error = (termination_wait == WAIT_FAILED)
-            .then(windows::core::Error::from_thread)
-            .map_or_else(|| "not available".to_owned(), |error| error.to_string());
-        failures.push(format!(
-            "desktop worker pid {pid} did not reach signaled state after job/process termination within {WORKER_TERMINATION_READBACK_TIMEOUT_MS} ms; wait={termination_wait:?}; last_error={last_error}"
-        ));
-    }
-    let mut exact_terminal_exit_code = None;
-    let exit_code = match read_worker_exit_code(process, pid, "post_termination_readback") {
-        Ok(exit_code) => {
-            if exit_code == STILL_ACTIVE_EXIT_CODE {
-                failures.push(format!(
-                    "desktop worker pid {pid} remained STILL_ACTIVE after termination wait; wait={termination_wait:?}"
-                ));
-            } else if termination_wait == WAIT_OBJECT_0 {
-                handles.mark_terminal(exit_code);
-                exact_terminal_exit_code = Some(exit_code);
-            }
-            Some(exit_code)
-        }
-        Err(error) => {
-            failures.push(error);
-            None
-        }
-    };
-    reconcile_provisional_terminate_process_failure(
-        &mut failures,
-        provisional_terminate_process_failure,
-        exact_terminal_exit_code,
-        pid,
-        "post_termination_readback",
-    );
-    if failures.is_empty() {
-        exit_code.ok_or_else(|| {
-            format!("desktop worker pid {pid} had no exit-code readback after termination")
-        })
-    } else {
-        Err(format!(
-            "desktop worker pid {pid} termination/readback failed: {}; exit_code_readback={exit_code:?}",
-            failures.join("; ")
-        ))
-    }
-}
-
-#[cfg(windows)]
 fn launch_worker_process(
     desktop_name: &str,
     op: DesktopWorkerOp,
@@ -1586,36 +535,20 @@ fn launch_worker_process(
     client_region: bool,
     depth: Option<u32>,
     temp: &WorkerTempPaths,
-) -> Result<WorkerProcessVerdict, rmcp::ErrorData> {
+) -> Result<(), rmcp::ErrorData> {
     use windows::{
-        Win32::System::Threading::{
-            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-            PROCESS_INFORMATION, STARTUPINFOW,
+        Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{
+                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
+                PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+            },
         },
         core::{PCWSTR, PWSTR},
     };
 
     const WORKER_TIMEOUT_MS: u32 = 10_000;
 
-    // Keep a final invariant check at the process-creation boundary. Callers
-    // validate earlier for stable classification before temp allocation, but
-    // this function must never be able to encode a noncanonical HWND into a
-    // child command line if a new caller bypasses those outer seams.
-    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    retry_retained_worker_process_handles().map_err(|error| {
-        report_worker_process_lifecycle_failure(
-            "MCP_DESKTOP_WORKER_RETAINED_HANDLE_RETRY_FAILED",
-            0,
-            "before_new_worker_spawn",
-            &error,
-        );
-        crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "desktop worker cannot spawn while prior exact child handles remain unresolved: {error}"
-            ),
-        )
-    })?;
     let exe = std::env::current_exe().map_err(|error| {
         crate::m1::mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
@@ -1663,165 +596,77 @@ fn launch_worker_process(
         lpDesktop: PWSTR(desktop_wide.as_ptr().cast_mut()),
         ..Default::default()
     };
-    let job = create_worker_kill_on_close_job().map_err(|error| {
-        report_worker_process_lifecycle_failure(
-            "MCP_DESKTOP_WORKER_JOB_CREATE_FAILED",
-            0,
-            "create_kill_on_close_job",
-            &error,
-        );
-        crate::m1::mcp_error(error_codes::TOOL_INTERNAL_ERROR, error)
-    })?;
     let mut process_info = PROCESS_INFORMATION::default();
-    let create_result = unsafe {
+    // #22: the worker inherits the daemon environment minus Synapse credentials.
+    let environment = crate::m4::child_environment::inherited_environment_block();
+    // SAFETY: `command_line_wide` is a live mutable NUL-terminated buffer (CreateProcessW may
+    // modify it); `startup_info.lpDesktop` points into the live `desktop_wide`; `environment` is a
+    // live double-NUL-terminated UTF-16 block matching CREATE_UNICODE_ENVIRONMENT; `process_info`
+    // is a live out-param; the remaining null arguments are optional.
+    unsafe {
         CreateProcessW(
             PCWSTR::null(),
             Some(PWSTR(command_line_wide.as_mut_ptr())),
             None,
             None,
             false,
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            None,
+            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            Some(environment.as_ptr().cast()),
             PCWSTR::null(),
             &raw const startup_info,
             &raw mut process_info,
         )
-    };
-    if let Err(error) = create_result {
-        let job_close =
-            close_or_retain_standalone_worker_job(job, "job_after_create_process_failure");
-        let detail = format!(
-            "desktop worker CreateProcessW failed for desktop {desktop_name:?}: {error}; job_close_readback={job_close:?}"
-        );
-        report_worker_process_lifecycle_failure(
-            "MCP_DESKTOP_WORKER_CREATE_PROCESS_FAILED",
-            0,
-            "create_suspended_process",
-            &detail,
-        );
-        return Err(crate::m1::mcp_error(
+    }
+    .map_err(|error| {
+        crate::m1::mcp_error(
             error_codes::ACTION_TARGET_INVALID,
-            detail,
-        ));
-    }
+            format!("desktop worker CreateProcessW failed for desktop {desktop_name:?}: {error}"),
+        )
+    })?;
 
-    let mut handles = WorkerProcessHandles::from_process_info(process_info, job);
-    if let Err(start_error) = assign_worker_job_and_resume(&mut handles) {
-        let termination_readback = terminate_worker_process_and_readback(&mut handles, 0);
-        let finalization =
-            finalize_worker_process_handles(&mut handles, "assign_verify_resume_failure");
-        let detail = format!(
-            "desktop worker pid {} could not establish verified kill-on-close ownership and resume: {start_error}; termination_readback={termination_readback:?}; final_terminal_exit_code={:?}; job_close_triggered={}; finalization_failures={:?}; exact_handles_retained={}",
-            handles.pid,
-            finalization.terminal_exit_code,
-            finalization.job_close_triggered,
-            finalization.failures,
-            finalization.retained
-        );
-        report_worker_process_lifecycle_failure(
-            "MCP_DESKTOP_WORKER_JOB_START_FAILED",
-            handles.pid,
-            "assign_verify_resume",
-            &detail,
-        );
-        return Err(crate::m1::mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            detail,
-        ));
-    }
-    tracing::info!(
-        code = "MCP_DESKTOP_WORKER_PROCESS_STARTED",
-        pid = handles.pid,
-        desktop_name,
-        operation = op.as_arg(),
-        hwnd,
-        "hidden-desktop worker process started"
-    );
-    let process_result = wait_for_worker_process(&mut handles, WORKER_TIMEOUT_MS);
-    let finalization = finalize_worker_process_handles(&mut handles, "launch_result_cleanup");
-    let verdict = match process_result {
-        Ok(verdict) if finalization.failures.is_empty() => verdict,
-        Ok(verdict) => {
-            let detail = format!(
-                "desktop worker pid {} reached terminal exit_code={} timed_out={}, but checked handle finalization failed: {}; final_terminal_exit_code={:?}; job_close_triggered={}; exact_handles_retained={}",
-                verdict.pid,
-                verdict.exit_code,
-                verdict.timed_out,
-                finalization.failures.join("; "),
-                finalization.terminal_exit_code,
-                finalization.job_close_triggered,
-                finalization.retained
-            );
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_HANDLE_CLEANUP_FAILED",
-                verdict.pid,
-                "close_after_wait",
-                &detail,
-            );
-            return Err(crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                detail,
-            ));
-        }
-        Err(error) => {
-            let detail = if finalization.failures.is_empty() {
-                error
-            } else {
-                format!(
-                    "{error}; checked_handle_finalization_failures={}; final_terminal_exit_code={:?}; job_close_triggered={}; exact_handles_retained={}",
-                    finalization.failures.join("; "),
-                    finalization.terminal_exit_code,
-                    finalization.job_close_triggered,
-                    finalization.retained
-                )
-            };
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_PROCESS_WAIT_FAILED",
-                handles.pid,
-                "wait_or_terminate",
-                &detail,
-            );
-            return Err(crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                detail,
-            ));
-        }
-    };
-    if verdict.timed_out {
-        tracing::error!(
-            code = "MCP_DESKTOP_WORKER_TIMEOUT_REAPED",
-            pid = verdict.pid,
-            timeout_ms = WORKER_TIMEOUT_MS,
-            exit_code = verdict.exit_code,
-            desktop_name,
-            "desktop worker timed out and the exact child was terminated, joined, and read back"
-        );
+    // SAFETY: `process_info.hProcess` is the valid process handle from the successful
+    // CreateProcessW above and has not been closed yet.
+    let wait = unsafe { WaitForSingleObject(process_info.hProcess, WORKER_TIMEOUT_MS) };
+    if wait == WAIT_TIMEOUT {
+        // SAFETY: `process_info.hProcess` is still open (closed only after this call, on this
+        // path).
+        let _ = unsafe { TerminateProcess(process_info.hProcess, 1) };
+        // SAFETY: `hThread` is the valid thread handle from CreateProcessW; this path closes it
+        // exactly once and returns.
+        let _ = unsafe { CloseHandle(process_info.hThread) };
+        // SAFETY: `hProcess` is still open and is closed exactly once on this path, which returns
+        // right after.
+        let _ = unsafe { CloseHandle(process_info.hProcess) };
         return Err(crate::m1::mcp_error(
             error_codes::A11Y_UIA_WORKER_TIMEOUT,
             format!(
-                "desktop worker pid {} timed out after {WORKER_TIMEOUT_MS} ms for desktop {desktop_name:?}; exact process termination was verified with exit_code={} and both Win32 handles were closed",
-                verdict.pid, verdict.exit_code
+                "desktop worker timed out after {WORKER_TIMEOUT_MS} ms for desktop {desktop_name:?}"
             ),
         ));
     }
-    tracing::info!(
-        code = "MCP_DESKTOP_WORKER_PROCESS_REAPED",
-        pid = verdict.pid,
-        exit_code = verdict.exit_code,
-        desktop_name,
-        operation = op.as_arg(),
-        "hidden-desktop worker reached kernel-signaled terminal state and both handles closed"
-    );
-    if verdict.exit_code != 0 && !temp.json_path.exists() {
+    let mut exit_code = 0_u32;
+    // SAFETY: `process_info.hProcess` is still open and `exit_code` is a live local out-param.
+    let _ = unsafe { GetExitCodeProcess(process_info.hProcess, &raw mut exit_code) };
+    // SAFETY: `hThread` is the valid thread handle from CreateProcessW; closed exactly once on this
+    // path.
+    let _ = unsafe { CloseHandle(process_info.hThread) };
+    // SAFETY: `hProcess` is closed exactly once on this path; it is not used afterwards.
+    let _ = unsafe { CloseHandle(process_info.hProcess) };
+    if wait != WAIT_OBJECT_0 {
+        return Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker wait failed for desktop {desktop_name:?}: wait={wait:?}"),
+        ));
+    }
+    if exit_code != 0 && !temp.json_path.exists() {
         return Err(crate::m1::mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(
-                "desktop worker pid {} exited {} without JSON readback for desktop {desktop_name:?}",
-                verdict.pid, verdict.exit_code
+                "desktop worker exited {exit_code} without JSON readback for desktop {desktop_name:?}"
             ),
         ));
     }
-    Ok(verdict)
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1880,7 +725,6 @@ fn wide_null(value: &str) -> Vec<u16> {
 struct WorkerTempPaths {
     json_path: PathBuf,
     bgra_path: Option<PathBuf>,
-    cleaned: bool,
 }
 
 #[cfg(windows)]
@@ -1900,91 +744,16 @@ impl WorkerTempPaths {
         Ok(Self {
             json_path: dir.join(format!("{id}.json")),
             bgra_path: include_bgra.then(|| dir.join(format!("{id}.bgra"))),
-            cleaned: false,
         })
-    }
-
-    fn cleanup_checked(&mut self) -> Result<(), rmcp::ErrorData> {
-        let mut failures = Vec::new();
-        for (kind, path) in std::iter::once(("json", &self.json_path))
-            .chain(self.bgra_path.as_ref().map(|path| ("bgra", path)))
-        {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    let detail = format!(
-                        "remove desktop worker {kind} temp file {}: {error}; kind={:?}; raw_os_error={:?}",
-                        path.display(),
-                        error.kind(),
-                        error.raw_os_error()
-                    );
-                    report_worker_process_lifecycle_failure(
-                        "MCP_DESKTOP_WORKER_TEMP_CLEANUP_FAILED",
-                        std::process::id(),
-                        kind,
-                        &detail,
-                    );
-                    failures.push(detail);
-                }
-            }
-        }
-        if failures.is_empty() {
-            self.cleaned = true;
-            Ok(())
-        } else {
-            Err(crate::m1::mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "desktop worker temporary artifact cleanup failed: {}",
-                    failures.join("; ")
-                ),
-            ))
-        }
     }
 }
 
 #[cfg(windows)]
 impl Drop for WorkerTempPaths {
     fn drop(&mut self) {
-        if self.cleaned {
-            return;
-        }
-        if let Err(error) = self.cleanup_checked() {
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_TEMP_DROP_FAILED",
-                std::process::id(),
-                "drop",
-                &format!("{error:?}"),
-            );
-        }
-    }
-}
-
-#[cfg(windows)]
-fn finish_worker_temp_cleanup<T>(
-    result: Result<T, rmcp::ErrorData>,
-    temp: &mut WorkerTempPaths,
-) -> Result<T, rmcp::ErrorData> {
-    let cleanup = temp.cleanup_checked();
-    match (result, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => {
-            let detail = format!(
-                "desktop worker operation and temporary artifact cleanup both failed; primary={primary:?}; cleanup={cleanup:?}"
-            );
-            report_worker_process_lifecycle_failure(
-                "MCP_DESKTOP_WORKER_OPERATION_AND_TEMP_CLEANUP_FAILED",
-                std::process::id(),
-                "finish",
-                &detail,
-            );
-            Err(crate::m1::mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                detail,
-            ))
+        let _ = fs::remove_file(&self.json_path);
+        if let Some(path) = self.bgra_path.as_ref() {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -2000,6 +769,7 @@ fn worker_code_static(code: &str) -> &'static str {
         }
         error_codes::CAPTURE_PRINTWINDOW_BLACK => error_codes::CAPTURE_PRINTWINDOW_BLACK,
         error_codes::CAPTURE_PRINTWINDOW_DISABLED => error_codes::CAPTURE_PRINTWINDOW_DISABLED,
+        error_codes::CAPTURE_WGC_FRAME_TIMEOUT => error_codes::CAPTURE_WGC_FRAME_TIMEOUT,
         error_codes::CAPTURE_TARGET_INVALID => error_codes::CAPTURE_TARGET_INVALID,
         error_codes::CAPTURE_TARGET_LOST => error_codes::CAPTURE_TARGET_LOST,
         error_codes::OBSERVE_INTERNAL => error_codes::OBSERVE_INTERNAL,
@@ -2011,3 +781,7 @@ fn worker_code_static(code: &str) -> &'static str {
         _ => error_codes::TOOL_INTERNAL_ERROR,
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "tests/desktop_worker_dispatch_176.rs"]
+mod desktop_worker_dispatch_176_tests;

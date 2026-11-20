@@ -1,0 +1,42 @@
+{
+  "id": "opera",
+  "label": "Opera",
+  "family": "chromium",
+  "process_names": ["opera.exe"],
+  "exe_path_markers": [
+    "\\Programs\\Opera\\",
+    "\\Program Files\\Opera\\",
+    "\\Program Files (x86)\\Opera\\"
+  ],
+  "exe_candidates": [
+    "%LOCALAPPDATA%\\Programs\\Opera\\opera.exe",
+    "%ProgramFiles%\\Opera\\opera.exe",
+    "%ProgramFiles(x86)%\\Opera\\opera.exe"
+  ],
+  "app_paths_name": null,
+  "user_data_root": "%APPDATA%\\Opera Software\\Opera Stable",
+  "profile_layout": "multi",
+  "window_title_suffixes": [" - Opera"],
+  "tab_target_prefix": "opera-tab:",
+  "endpoint_base": "synapse-bridge://opera",
+  "health_key": "opera_bridge",
+  "registration_token_file": "browser-bridge-token-opera.txt",
+  "extension": {
+    "id": "leoocgnkjnplbfdbklajepahofecgfbk",
+    "origin_scheme": "chrome-extension",
+    "extensions_page_url": "opera://extensions",
+    "manifest_dir": "synapse-chrome-debugger",
+    "deploy_subdir": "browser-extension\\opera"
+  },
+  "policy": null,
+  "native_messaging_cleanup_roots": [],
+  "protected_extension_ids": [],
+  "cdp_product_tokens": ["OPR", "Opera"],
+  "unsupported_capabilities": [],
+  "debugger_api_expected": true,
+  "install_ui": {
+    "developer_mode_names": ["Developer mode"],
+    "load_unpacked_names": ["Load unpacked"]
+  },
+  "winget_id": "Opera.Opera"
+}

@@ -1,6 +1,7 @@
 use super::notify_tools::{
     NotifyHumanParams, NotifyKind, SYNAPSE_TOAST_GROUP, ToastAction, ToastActionActivationType,
-    ToastActivationCallback, run_internal_toast_with_activation, toast_tag_for,
+    ToastActivationCallback, desktop_toasts_config_suppressed_reason,
+    run_internal_toast_with_activation, toast_tag_for,
 };
 use super::{
     ApprovalDecideParams, ApprovalDecideResponse, ApprovalListParams, ApprovalListResponse,
@@ -32,25 +33,25 @@ use super::{
     RoutineMineResponse, RoutineUpdateParams, RoutineUpdateResponse, StorageGcOnceParams,
     StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
     StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
-    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
-    SubscribeResponse, SynapseService, TimelineExclusionsParams, TimelineExclusionsResponse,
-    TimelinePauseParams, TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse,
-    TimelineResumeParams, TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
-    apply_storage_pressure_sample, cancel_file_jsonl_tail_watcher, cancel_reflex,
-    cancel_subscription, decide_approval, decide_profile_authoring_candidate,
-    disable_registry_profile, export_audit_bundle, export_profile_authoring_candidate,
-    export_registry, generate_profile_authoring_candidate, generate_routine_automation_candidate,
-    get_episode, history_reflexes, import_registry, inspect_profile_authoring_candidate,
-    inspect_routine, inspect_storage, install_file_jsonl_tail_watcher, install_registry_package,
-    list_approvals, list_episodes, list_local_models, list_profile_authoring_candidates,
-    list_profiles, list_reflexes, list_routines, mine_and_store_routines, pause_timeline,
-    prepare_activation_links, probe_local_model, purge_timeline, put_probe_rows,
-    query_audit_intelligence, query_flags, query_registry, record_replay, refresh_profile_quality,
-    register_local_model, register_reflex, remove_local_model, request_approval, resume_timeline,
-    rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
-    segment_episodes, start_demo_recording, stop_demo_recording, subscribe_to_events, tail_audio,
-    tool, tool_router, transcribe_audio, update_approval_toast_state, update_local_model,
-    update_routine, update_timeline_exclusions,
+    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse,
+    SubscribeFacadeParams, SubscribeFacadeResponse, SubscribeOperation, SynapseService,
+    TimelineExclusionsParams, TimelineExclusionsResponse, TimelinePauseParams,
+    TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse, TimelineResumeParams,
+    TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
+    cancel_file_jsonl_tail_watcher, cancel_owned_subscription, cancel_reflex, decide_approval,
+    decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
+    export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
+    generate_routine_automation_candidate, get_episode, history_reflexes, import_registry,
+    inspect_profile_authoring_candidate, inspect_routine, inspect_storage,
+    install_file_jsonl_tail_watcher, install_registry_package, list_approvals, list_episodes,
+    list_local_models, list_profile_authoring_candidates, list_profiles, list_reflexes,
+    list_routines, mine_and_store_routines, pause_timeline, prepare_activation_links,
+    probe_local_model, purge_timeline, put_probe_rows, query_audit_intelligence, query_flags,
+    query_registry, record_replay, refresh_profile_quality, register_local_model,
+    remove_local_model, request_approval, resume_timeline, rollback_registry_profile, scan_storage,
+    scan_text_tool, search_timeline, segment_episodes, start_demo_recording, stop_demo_recording,
+    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    update_approval_toast_state, update_local_model, update_routine, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 use serde_json::{Value, json};
@@ -131,33 +132,92 @@ fn approval_toast_activation_callback(
     })
 }
 
+fn invalid_subscribe_facade(message: impl Into<String>) -> ErrorData {
+    crate::m1::mcp_error(
+        synapse_core::error_codes::TOOL_PARAMS_INVALID,
+        message.into(),
+    )
+}
+
+pub(super) fn validate_subscribe_facade_params(
+    params: &SubscribeFacadeParams,
+) -> Result<(), ErrorData> {
+    let payload_count = usize::from(params.events.is_some())
+        .saturating_add(usize::from(params.events_cancel.is_some()));
+    if payload_count != 1 {
+        return Err(invalid_subscribe_facade(
+            "subscribe requires exactly one operation payload",
+        ));
+    }
+    match params.operation {
+        SubscribeOperation::Events if params.events.is_some() => Ok(()),
+        SubscribeOperation::EventsCancel if params.events_cancel.is_some() => Ok(()),
+        SubscribeOperation::Events => Err(invalid_subscribe_facade(
+            "operation=events accepts only the events payload",
+        )),
+        SubscribeOperation::EventsCancel => Err(invalid_subscribe_facade(
+            "operation=events_cancel accepts only the events_cancel payload",
+        )),
+    }
+}
+
 #[tool_router(router = m3_tool_router, vis = "pub(super)")]
 impl SynapseService {
-    #[tool(description = "Subscribe to filtered event notifications")]
+    #[tool(
+        description = "Session-owned event subscription facade. operation=events creates a filtered SSE subscription; operation=events_cancel cancels only a subscription owned by this MCP session. Exactly one matching operation payload is required."
+    )]
     pub async fn subscribe(
         &self,
-        params: Parameters<SubscribeParams>,
+        params: Parameters<SubscribeFacadeParams>,
         request_context: RequestContext<RoleServer>,
-    ) -> Result<Json<SubscribeResponse>, ErrorData> {
+    ) -> Result<Json<SubscribeFacadeResponse>, ErrorData> {
+        validate_subscribe_facade_params(&params.0)?;
+        let operation = params.0.operation;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "subscribe",
-            kinds_count = params.0.kinds.len(),
-            snapshot_first = params.0.snapshot_first,
-            buffer_size = params.0.buffer_size,
+            operation = operation.as_str(),
             "tool.invocation kind=subscribe"
         );
-        self.require_m3_permissions(
-            "subscribe",
-            &crate::m3::subscribe::required_permissions(&params.0),
-        )?;
-        if crate::m3::subscribe::requires_a11y_event_bridge(&params.0) {
-            self.ensure_a11y_event_bridge()?;
-        }
-        let owner_session_id =
-            super::context::mcp_session_id_from_request_context(&request_context)?;
+        let owner_session_id = super::context::mcp_session_id_from_request_context(&request_context)?
+            .ok_or_else(|| {
+                crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                    "subscribe requires a trusted MCP session owner; ownerless transports cannot create or cancel subscriptions",
+                )
+            })?;
         let sse_state = self.sse_state()?;
-        subscribe_to_events(&sse_state, &params.0, owner_session_id).map(Json)
+        match operation {
+            SubscribeOperation::Events => {
+                let spec = params.0.events.ok_or_else(|| {
+                    invalid_subscribe_facade("operation=events requires the events payload")
+                })?;
+                self.require_m3_permissions(
+                    "subscribe",
+                    &crate::m3::subscribe::required_permissions(&spec),
+                )?;
+                if crate::m3::subscribe::requires_a11y_event_bridge(&spec) {
+                    self.ensure_a11y_event_bridge()?;
+                }
+                subscribe_to_events(&sse_state, &spec, Some(owner_session_id))
+                    .map(SubscribeFacadeResponse::from)
+                    .map(Json)
+            }
+            SubscribeOperation::EventsCancel => {
+                let spec = params.0.events_cancel.ok_or_else(|| {
+                    invalid_subscribe_facade(
+                        "operation=events_cancel requires the events_cancel payload",
+                    )
+                })?;
+                self.require_m3_permissions(
+                    "subscribe",
+                    &crate::m3::subscribe::required_permissions_cancel(&spec),
+                )?;
+                cancel_owned_subscription(&sse_state, &spec, &owner_session_id)
+                    .map(SubscribeFacadeResponse::from)
+                    .map(Json)
+            }
+        }
     }
 
     #[tool(description = "Cancel an event subscription")]
@@ -175,14 +235,21 @@ impl SynapseService {
             "subscribe_cancel",
             &crate::m3::subscribe::required_permissions_cancel(&params.0),
         )?;
+        let owner = crate::http::current_mcp_session_id().ok_or_else(|| {
+            crate::m1::mcp_error(
+                synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                "subscribe_cancel requires a trusted MCP session owner",
+            )
+        })?;
         let sse_state = self.sse_state()?;
-        cancel_subscription(&sse_state, &params.0).map(Json)
+        cancel_owned_subscription(&sse_state, &params.0, &owner).map(Json)
     }
 
     #[tool(description = "Register a reflex")]
     pub async fn reflex_register(
         &self,
         params: Parameters<ReflexRegisterParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ReflexRegisterResponse>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -194,54 +261,23 @@ impl SynapseService {
         let params = params.0;
         let required = crate::m3::reflex::required_permissions_register(&params)?;
         self.require_m3_permissions("reflex_register", &required)?;
-        let preflight = match self.ensure_supported_use_allows_action("reflex_register") {
-            Ok(preflight) => preflight,
-            Err(error) => {
-                self.audit_action_denied("reflex_register", &error);
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.ensure_supported_use_allows_action("reflex_register") {
+            self.audit_action_denied("reflex_register", &error);
+            return Err(error);
+        }
         self.refresh_reflex_audit_context()?;
         if crate::m3::reflex::requires_a11y_event_bridge(&params) {
             self.ensure_a11y_event_bridge()?;
         }
         let runtime = self.reflex_runtime()?;
         self.install_reflex_action_gate(&runtime)?;
-        preflight.ensure_operator_panic_boundary("immediately_before_reflex_register")?;
-        let response = register_reflex(&runtime, params.clone())?;
-        if let Err(error) =
-            preflight.ensure_operator_panic_boundary("immediately_after_reflex_register")
-        {
-            let rollback = ReflexCancelParams {
-                reflex_id: response.reflex_id,
-            };
-            let _rollback_result = cancel_reflex(&runtime, &rollback);
-            return Err(error);
-        }
+        let owner = super::context::mcp_session_id_from_request_context(&request_context)?;
+        let response =
+            crate::m3::reflex::register_reflex_for_session(&runtime, params.clone(), owner)?;
         if let Some(request) = params.file_jsonl_tail_watcher_request(response.reflex_id.clone()) {
-            if let Err(error) =
-                preflight.ensure_operator_panic_boundary("before_reflex_file_watcher_install")
-            {
-                let rollback = ReflexCancelParams {
-                    reflex_id: response.reflex_id,
-                };
-                let _rollback_result = cancel_reflex(&runtime, &rollback);
-                return Err(error);
-            }
             let m3_state = self.m3_state_handle();
             let event_bus = self.sse_state()?.event_bus();
             if let Err(error) = install_file_jsonl_tail_watcher(&m3_state, request, event_bus) {
-                let rollback = ReflexCancelParams {
-                    reflex_id: response.reflex_id,
-                };
-                let _rollback_result = cancel_reflex(&runtime, &rollback);
-                return Err(error);
-            }
-            if let Err(error) =
-                preflight.ensure_operator_panic_boundary("after_reflex_file_watcher_install")
-            {
-                let _cancelled_watcher =
-                    cancel_file_jsonl_tail_watcher(&m3_state, &response.reflex_id);
                 let rollback = ReflexCancelParams {
                     reflex_id: response.reflex_id,
                 };
@@ -977,8 +1013,18 @@ impl SynapseService {
             }
         };
         if params.notify && !response.deduped {
-            let (delivery, toast_audit_row) =
-                match crate::approval_protocol::ensure_protocol_handler_registered() {
+            let (delivery, toast_audit_row) = {
+                let suppressed_reason = desktop_toasts_config_suppressed_reason();
+                let protocol_registration = if let Some(reason) = suppressed_reason {
+                    Err(reason.to_owned())
+                } else {
+                    crate::approval_protocol::ensure_protocol_handler_registered().map_err(
+                        |message| {
+                            format!("approval protocol handler registration failed: {message}")
+                        },
+                    )
+                };
+                match protocol_registration {
                     Ok(_protocol_readback) => {
                         let bind = self.m3_bind_addr()?;
                         match prepare_activation_links(&db, &response.item.approval_id, &bind) {
@@ -1031,11 +1077,12 @@ impl SynapseService {
                                     Ok(toast) => {
                                         let delivery = ApprovalToastDelivery {
                                             requested: true,
+                                            shown: Some(toast.shown),
                                             suppress_popup: response.item.toast.suppress_popup,
-                                            actionable_buttons: true,
+                                            actionable_buttons: toast.verified_in_history,
                                             activation_id: Some(links.activation_id),
                                             protocol_handler_registered: Some(true),
-                                            unavailable_reason: None,
+                                            unavailable_reason: toast.suppressed_reason,
                                             notify_tag: Some(toast.tag),
                                             notify_group: Some(toast.group),
                                             notification_setting: Some(toast.notification_setting),
@@ -1081,6 +1128,7 @@ impl SynapseService {
                                     Err(error) => {
                                         let delivery = ApprovalToastDelivery {
                                             requested: true,
+                                            shown: None,
                                             suppress_popup: response.item.toast.suppress_popup,
                                             actionable_buttons: false,
                                             activation_id: Some(links.activation_id),
@@ -1136,6 +1184,7 @@ impl SynapseService {
                             Err(error) => {
                                 let delivery = ApprovalToastDelivery {
                                     requested: true,
+                                    shown: None,
                                     suppress_popup: response.item.toast.suppress_popup,
                                     actionable_buttons: false,
                                     activation_id: None,
@@ -1187,16 +1236,17 @@ impl SynapseService {
                             }
                         }
                     }
-                    Err(message) => {
+                    Err(unavailable_reason) => {
                         let delivery = ApprovalToastDelivery {
                             requested: true,
+                            shown: suppressed_reason.map(|_| false),
                             suppress_popup: response.item.toast.suppress_popup,
                             actionable_buttons: false,
                             activation_id: None,
-                            protocol_handler_registered: Some(false),
-                            unavailable_reason: Some(format!(
-                                "approval protocol handler registration failed: {message}"
-                            )),
+                            protocol_handler_registered: suppressed_reason
+                                .is_none()
+                                .then_some(false),
+                            unavailable_reason: Some(unavailable_reason),
                             notify_tag: None,
                             notify_group: None,
                             notification_setting: None,
@@ -1238,7 +1288,8 @@ impl SynapseService {
                         response.item_row = item_row;
                         (delivery, Some(audit_row))
                     }
-                };
+                }
+            };
             tracing::info!(
                 code = "APPROVAL_TOAST_DELIVERY_RECORDED",
                 approval_id = %response.item.approval_id,
@@ -1985,12 +2036,12 @@ impl SynapseService {
             "episode_segment",
             &crate::m3::episodes::required_permissions(&params.0),
         )?;
-        let runtime = self.reflex_runtime()?;
-        segment_episodes(&runtime, &params.0).map(Json)
+        let db = self.m3_storage()?;
+        segment_episodes(&db, &params.0).map(Json)
     }
 
     #[tool(
-        description = "List derived episodes (CF_EPISODES) overlapping a time range, ordered chronologically with stable ids, durations, app/document identity, and interaction summaries; filters by app, actor, and minimum duration; pages via cursor. Run episode_segment first to materialize episodes"
+        description = "List derived episodes (CF_EPISODES) overlapping a time range, ordered chronologically with stable ids, durations, app/document identity, and interaction summaries; filters by app, actor, and minimum duration; pages via cursor. Episodes are cut from the timeline before each periodic routine mining run"
     )]
     pub async fn episode_list(
         &self,
@@ -2041,7 +2092,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Mine recurring routines from derived episodes (CF_EPISODES) into CF_ROUTINES: frequent episode-identity sequences with temporally regular schedules (circular time-of-day clustering, day-of-week classification) and honest Wilson-lower-bound confidence. Deterministic and re-runnable; each run replaces the routine store atomically. Run episode_segment first to materialize episodes"
+        description = "Mine recurring routines from derived episodes (CF_EPISODES) into CF_ROUTINES: frequent episode-identity sequences with temporally regular schedules (circular time-of-day clustering, day-of-week classification) and honest Wilson-lower-bound confidence. Deterministic and re-runnable; each run replaces the routine store atomically. Mines the episodes already stored; the periodic job cuts the timeline into episodes before each of its runs"
     )]
     pub async fn routine_mine(
         &self,
@@ -2179,7 +2230,9 @@ impl SynapseService {
             &crate::m3::storage::required_permissions_gc(&params.0),
         )?;
         let runtime = self.reflex_runtime()?;
-        run_storage_gc_once(&runtime, &params.0).map(Json)
+        crate::m3::storage_maintenance::run_storage_gc_once_blocking(runtime, params.0)
+            .await
+            .map(Json)
     }
 
     #[tool(description = "Apply one synthetic free-byte sample through storage pressure handling")]
@@ -2198,6 +2251,18 @@ impl SynapseService {
             &crate::m3::storage::required_permissions_pressure(&params.0),
         )?;
         let runtime = self.reflex_runtime()?;
-        apply_storage_pressure_sample(&runtime, &params.0).map(Json)
+        crate::m3::storage_maintenance::run_on_blocking_pool(move || {
+            crate::m3::storage::apply_storage_pressure_sample(&runtime, &params.0)
+        })
+        .await
+        .map(Json)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/raw_maintenance_60.rs"]
+mod raw_maintenance_60_tests;
+
+#[cfg(test)]
+#[path = "tests/legacy_subscribe_cancel_owner_137.rs"]
+mod legacy_subscribe_cancel_owner_137_tests;

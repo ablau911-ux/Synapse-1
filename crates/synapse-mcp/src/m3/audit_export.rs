@@ -15,8 +15,14 @@ use synapse_core::{ProfileId, SCHEMA_VERSION, error_codes};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, encode_json};
 
-use crate::m1::mcp_error;
+use crate::{
+    credential_redaction::{
+        CREDENTIAL_CLASS, classified_marker, credential_name, token_like_value,
+    },
+    m1::mcp_error,
+};
 
+use super::episodes::hex_encode;
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, required},
@@ -29,6 +35,7 @@ const DEFAULT_MAX_ROW_BYTES: u64 = 64 * 1024;
 const MAX_ROW_BYTES: u64 = 512 * 1024;
 const STRICT_POLICY: &str = "strict";
 const BUNDLE_KIND: &str = "audit_export_bundle";
+const UNKNOWN_FIELD: &str = "unknown_field";
 const RETAINED_FIELD_PATHS: &[&str] = &[
     "schema_version",
     "row_kind",
@@ -45,6 +52,17 @@ const RETAINED_FIELD_PATHS: &[&str] = &[
     "outcome",
     "error_code",
     "redacted",
+    "ts_ns",
+    "timestamp",
+    "timestamp_ns",
+    "time_ns",
+    "created_at",
+    "created_at_unix_ms",
+    "updated_at",
+    "started_at",
+    "ended_at",
+    "activated_at",
+    "launched_at",
     "audit_context/profile_id",
     "audit_context/profile_version",
     "audit_context/profile_schema_version",
@@ -61,7 +79,6 @@ const RETAINED_FIELD_PATHS: &[&str] = &[
     "human_os_foreground/process_name",
     "foreground_tier/required_foreground",
     "foreground_tier/backend_tier",
-    "foreground_tier/session_foreground_policy",
     "foreground_tier/policy_allows_foreground",
     "foreground_tier/foreground_policy_violation",
     "foreground_tier/allowed",
@@ -513,77 +530,56 @@ fn redact_value(value: Value, stats: &mut RedactionStats, path: &str) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .enumerate()
-                .map(|(index, item)| redact_value(item, stats, &format!("{path}/{index}")))
+                .map(|item| redact_value(item, stats, path))
                 .collect(),
         ),
-        Value::String(text) if path_like_string(&text) => {
-            redact_leaf(stats, "path_like_string");
-            json!("[redacted:path_like_string]")
-        }
-        other => other,
+        _ => redact_leaf(stats, UNKNOWN_FIELD),
     }
 }
 
 fn redact_object(object: Map<String, Value>, stats: &mut RedactionStats, path: &str) -> Value {
     let mut redacted = Map::new();
     for (key, value) in object {
+        if token_like_value(&key) {
+            redacted.insert(
+                classified_marker(CREDENTIAL_CLASS),
+                redact_leaf(stats, CREDENTIAL_CLASS),
+            );
+            continue;
+        }
         let child_path = if path.is_empty() {
             key.clone()
         } else {
             format!("{path}/{key}")
         };
-        if let Some(class) = sensitive_field_class(&key) {
-            redact_leaf(stats, class);
-            redacted.insert(key, json!(format!("[redacted:{class}]")));
-        } else if retained_field_path(&child_path) {
-            redacted.insert(key, redact_retained_value(value, stats));
-        } else if traversable_container_path(&child_path) {
-            redacted.insert(key, redact_value(value, stats, &child_path));
+        // A literal slash in a key must never impersonate a nested field.
+        let value = if key.contains('/') {
+            redact_leaf(stats, UNKNOWN_FIELD)
+        } else if RETAINED_FIELD_PATHS.contains(&child_path.as_str()) {
+            redact_retained_value(value, stats)
+        } else if let Some(class) = sensitive_field_class(&key) {
+            redact_leaf(stats, class)
+        } else if TRAVERSABLE_CONTAINER_PATHS.contains(&child_path.as_str()) {
+            redact_value(value, stats, &child_path)
         } else {
-            redact_leaf(stats, "unknown_field");
-            redacted.insert(key, json!("[redacted:unknown_field]"));
-        }
+            redact_leaf(stats, UNKNOWN_FIELD)
+        };
+        redacted.insert(key, value);
     }
     Value::Object(redacted)
 }
 
-fn retained_field_path(path: &str) -> bool {
-    RETAINED_FIELD_PATHS.contains(&path)
-}
-
-fn traversable_container_path(path: &str) -> bool {
-    TRAVERSABLE_CONTAINER_PATHS.contains(&path)
-}
-
 fn redact_retained_value(value: Value, stats: &mut RedactionStats) -> Value {
     match value {
-        Value::String(text) if path_like_string(&text) => {
-            redact_leaf(stats, "path_like_string");
-            json!("[redacted:path_like_string]")
-        }
-        Value::Object(_) | Value::Array(_) => {
-            redact_leaf(stats, "unknown_field");
-            json!("[redacted:unknown_field]")
-        }
+        Value::String(text) if path_like_string(&text) => redact_leaf(stats, "path_like_string"),
+        Value::String(text) if token_like_value(&text) => redact_leaf(stats, CREDENTIAL_CLASS),
+        Value::Object(_) | Value::Array(_) => redact_leaf(stats, UNKNOWN_FIELD),
         other => other,
     }
 }
 
 fn sensitive_field_class(key: &str) -> Option<&'static str> {
     let lower = key.to_ascii_lowercase();
-    if lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("passwd")
-        || lower.contains("api_key")
-        || lower.contains("apikey")
-        || lower.contains("cookie")
-        || lower.contains("credential")
-        || lower.contains("authorization")
-    {
-        return Some("credential");
-    }
     if matches!(
         lower.as_str(),
         "audit_id"
@@ -663,12 +659,13 @@ fn sensitive_field_class(key: &str) -> Option<&'static str> {
     {
         return Some("image");
     }
-    None
+    credential_name(key).then_some(CREDENTIAL_CLASS)
 }
 
-fn redact_leaf(stats: &mut RedactionStats, class: &'static str) {
+fn redact_leaf(stats: &mut RedactionStats, class: &'static str) -> Value {
     stats.fields_redacted += 1;
     *stats.redacted_by_class.entry(class.to_owned()).or_default() += 1;
+    Value::String(classified_marker(class))
 }
 
 fn path_like_string(value: &str) -> bool {
@@ -768,9 +765,8 @@ fn fail_closed_rules() -> Vec<String> {
         "redaction policy must be selected and match explicit consent",
         "external sharing remains false in local bundles",
         "matching rows larger than max_row_bytes abort the export before files are written",
-        "only retained_fields are exported in plaintext; every unknown field redacts as unknown_field",
-        "credential-like keys redact before retained-field checks",
-        "path-like string values redact even when a retained key is unexpectedly path-shaped",
+        "only allow-listed scalar fields may be exported in plaintext",
+        "credential-like fields and token-like values are redacted",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -785,20 +781,13 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+// Plain SHA-256 on purpose (#174): these are integrity hashes of the exported,
+// already-redacted bundle files; an external verifier must be able to recompute
+// them with `sha256sum`, which a per-install keyed digest would prevent.
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex_encode(&hasher.finalize()))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 const fn default_max_export_rows() -> u32 {

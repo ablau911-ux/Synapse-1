@@ -12,7 +12,7 @@
 //! The counters are derived on read by scanning the journal rows, never
 //! maintained as a second incrementally-updated copy. A counter *is* the
 //! folded sum of the rows it reports, so it reconciles with them exactly
-//! (the #903 manual FSV requirement) with no reconciliation job to run. The honesty
+//! (the #903 FSV requirement) with no reconciliation job to run. The honesty
 //! figure `scanned_rows` is returned so a caller can confirm the rollup was
 //! not truncated, and the scan errors loudly when its row budget is exhausted
 //! — a truncated stat is silently wrong, so it is refused, never returned.
@@ -131,6 +131,9 @@ pub struct AgentStatsResponse {
     pub scanned_rows: u64,
     /// Distinct agents (anchors) seen in the window.
     pub agents_total: u64,
+    /// Authoritative current lease ownership; `fleet.leases.held_open` is only
+    /// the journal-derived historical figure.
+    pub live_lease: LiveLeaseState,
     pub fleet: ScopeStats,
     /// Per-agent breakdown, present only when `group_by = "agent"`. Ordered by
     /// anchor.
@@ -230,9 +233,36 @@ pub struct ErrorStats {
 pub struct LeaseStats {
     pub acquired: u64,
     pub released: u64,
-    /// `acquired - released`, floored at 0 — leases still held when the window
-    /// ended (a contention signal).
+    /// `acquired - released` over the journaled events, floored at 0. This is a
+    /// historical contention signal, NOT current ownership: releases that bypass
+    /// the journal (teardown, expiry, emergency preempt, restart recovery) leave
+    /// it elevated. Read `AgentStatsResponse::live_lease` for the authoritative
+    /// current state.
     pub held_open: u64,
+}
+
+/// The authoritative current input-lease state at the time of the call, read
+/// from `synapse_action::lease` (not derived from the event journal).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LiveLeaseState {
+    pub held: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_in_ms: Option<u64>,
+    pub source_of_truth: &'static str,
+}
+
+impl LiveLeaseState {
+    pub(crate) fn from_status(status: &synapse_action::LeaseStatus) -> Self {
+        Self {
+            held: status.held,
+            owner_session_id: status.owner_session_id.clone(),
+            expires_in_ms: status.expires_in_ms,
+            source_of_truth: "synapse_action::lease (live in-memory owner)",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -328,6 +358,7 @@ impl SynapseService {
             until_ns: params.until_ns,
             scanned_rows,
             agents_total: anchors.len() as u64,
+            live_lease: LiveLeaseState::from_status(&synapse_action::lease::status()),
             fleet: fleet.finish(),
             per_agent: include_per_agent.then_some(per_agent),
         })
@@ -711,7 +742,7 @@ impl ScopeAccumulator {
 /// calls, not a histogram approximation. Uses the nearest-rank method: for a
 /// sorted ascending sample of `n` values and percentile `p`, the rank is
 /// `ceil(p/100 * n)` and the result is the value at that 1-based rank. The
-/// method is exact, deterministic, and hand-verifiable during manual FSV.
+/// method is exact, deterministic, and hand-verifiable for FSV.
 fn latency_stats(durations_ms: &[u64]) -> LatencyStats {
     if durations_ms.is_empty() {
         return LatencyStats {
@@ -815,3 +846,14 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next.push(0);
     next
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[path = "tests/agent_stats_live_lease.rs"]
+mod agent_stats_live_lease_tests;
+
+#[cfg(test)]
+#[path = "tests/agent_stats_handler_91.rs"]
+mod agent_stats_handler_91_tests;

@@ -320,7 +320,8 @@ mod tray {
 
     unsafe fn message_loop() {
         let mut msg = MSG::default();
-        while GetMessageW(&raw mut msg, None, 0, 0).as_bool() {
+        // GetMessageW returns -1 on error; as_bool() would treat that as true and spin forever.
+        while GetMessageW(&raw mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&raw const msg);
             DispatchMessageW(&raw const msg);
         }
@@ -602,6 +603,9 @@ mod tray {
             client
                 .post(format!("{base}{endpoint}"))
                 .bearer_auth(&app.token)
+                // #167: non-browser dashboard clients prove they are not a
+                // cross-site page with this header (no Origin is sent).
+                .header("X-Synapse-Dashboard", "1")
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body)
                 .send()

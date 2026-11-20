@@ -61,7 +61,7 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--kill-stray` | — | bool | `false` | In `--mode doctor`, kill stray `synapse-mcp` processes. |
 | `--enable-audio` | `SYNAPSE_ENABLE_AUDIO` | bool | `false` | Enable audio capture runtime. |
 | `--restrict-unknown-profile` | `SYNAPSE_RESTRICT_UNKNOWN_PROFILE` | bool | `false` | Fail closed on unprofiled foreground apps. Default off = unknown apps actionable. |
-| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | string (LIST) | read-only (`READ_EVENTS`, `READ_REFLEX`, `READ_PROFILE`, `READ_STORAGE`; plus `READ_AUDIO` only when audio is enabled) | Explicit M3 permission grant allowlist; write/input permissions require opt-in. |
+| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | string (LIST) | none | Restrict granted permission set. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | bool | `false` | Force reflex into degraded mode (testing/diagnostic). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | u64 (BYTES) | none | Inject a synthetic free-bytes value for disk-pressure logic. |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | NonZeroUsize | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | Cap on event-bus subscriptions. |
@@ -100,6 +100,8 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | `SYNAPSE_BEARER_TOKEN` | `m3.rs`, `http/auth.rs` (`TOKEN_ENV`), `chrome_debugger_bridge.rs`, `overlay/main.rs` | string | none | HTTP bearer token. Used only if `token.txt` is absent (see §4). |
 | `APPDATA` | `http/auth.rs`, `chrome_debugger_bridge.rs`, `bin/synapse-chrome-native-host.rs` | path | (Windows-provided) | Root for `synapse\token.txt` and other roaming files. |
 | `SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS` | `http/session.rs` | u64 (s) | `86400` (24 h) | MCP HTTP session idle timeout. |
+| `SYNAPSE_TERMINATED_SESSION_CAPACITY` | `server/terminated_sessions.rs` | usize (>0) | `4096` | Size of the FIFO ring remembering recently terminated session ids (oldest evicted first). |
+| `SYNAPSE_HTTP_MAX_SESSIONS` | `http/session_admission.rs` | usize (>0) | `1024` | Cap on live MCP HTTP sessions; `initialize` beyond it gets 503 `HTTP_SESSION_CAPACITY` (resource bound, not auth). |
 | `SYNAPSE_HTTP_SSE_MANUAL` | `http/sse.rs` (`MANUAL_ENV`) | bool (`1`/`true`) | unset (off) | Manual SSE test hook. |
 | `SYNAPSE_ALLOW_NON_LOOPBACK` | (also CLI) | bool | `false` | See §2. |
 | `SYNAPSE_TRAY_BASE_URL` | `overlay/main.rs` | string | `DEFAULT_BASE_URL` (overlay) | Base URL the tray/overlay talks to. |
@@ -190,8 +192,10 @@ Variables already listed as CLI `env` fallbacks in §2 are not repeated here. Th
 | `SYNAPSE_MCP_REQUIRE_OPERATOR_HOTKEY` | `safety.rs` | bool | off | Hard startup failure if hotkey cannot arm. |
 | `SYNAPSE_APPROVAL_GATE_TIMEOUT_MS` | `server/permission_gate.rs` | u64 (ms, `>=1000`) | `1500000` (25 min) | Approval-gate blocking timeout. |
 | `SYNAPSE_ENFORCE_SUPPORTED_USE` | `server/target_policy.rs` | bool (1/true/yes/y/on) | off | Restore legacy supported-use (game-profile) gating. |
-| `SYNAPSE_ALLOW_SHELL_ANY` | `m4.rs` | bool (falsey to restrict) | **on** (permissive) | Allow any shell command unless explicitly disabled. |
-| `SYNAPSE_ALLOW_LAUNCH_ANY` | `m4.rs` | bool (falsey to restrict) | **on** (permissive) | Allow any launch target unless explicitly disabled. |
+| `SYNAPSE_ALLOW_SHELL_ANY` | `m4.rs` | bool (falsey to restrict) | **on** if no `--allow-shell` patterns, else off | Allow any shell command unless disabled; configured patterns restrict unless this is explicitly truthy. |
+| `SYNAPSE_ALLOW_LAUNCH_ANY` | `m4.rs` | bool (falsey to restrict) | **on** if no `--allow-launch` patterns, else off | Allow any launch target unless disabled; configured patterns restrict unless this is explicitly truthy. |
+| `SYNAPSE_USER_ACTIVE_QUIET_MS` | `server/user_active_gate.rs` (`QUIET_WINDOW_ENV`) | u64 (ms) | `60000`; unparsable keeps the default; `0` disables the activity check; a locked workstation is still refused (`USER_WORKSTATION_LOCKED`) | #258 quiet window: actions that move the human's real foreground, cursor or keyboard (act operation=foreground, focus_window, SendInput tiers, act_combo, visible GUI launches) are refused with `USER_ACTIVE` while physical input is younger than this, and with `USER_ACTIVITY_UNKNOWN` while the input hook is not running. Read per call. |
+| `SYNAPSE_AGENT_SPAWN_ENABLED` | `server/agent_spawn_switch.rs` (`AgentSpawnSwitch::ENV`, read once in `main.rs`) | only `1` (spaces/line ends ignored) is on | **off** | D8 (#2419): agent spawn is opt-in. Off: every spawn route (agent spawn, task dispatch, respawn before its kill, dashboard spawn) is refused with `AGENT_SPAWN_DISABLED` and nothing is launched or killed; `health` action detail ends with `agent_spawn=on|off`. |
 | `SYNAPSE_AGENT_SPAWN_SHELL` | `server/m4_tools.rs` (`AGENT_SPAWN_SHELL_ENV_VAR`) | string | none | Override shell used for spawned agents. |
 | `SYNAPSE_MCP_SESSION_ID` | `m4.rs` (`SHELL_SESSION_ID_ENV`) | string | none | Reserved env key injected into shell child env. |
 
@@ -220,8 +224,11 @@ These are written by setup/launcher scripts, not read by the daemon Rust code:
 | `SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START` | Codex launcher | Daemon tools/list fingerprint at start. |
 | `SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START` | Codex launcher | Tool count at start. |
 | `SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START` | Codex launcher | Path to the start snapshot. |
+| `SYNAPSE_CODEX_START_SNAPSHOT_RETENTION_HOURS` | setup (`-CodexStartSnapshotRetentionHours`, default 168, User env) | Age after which launchers delete legacy start snapshots (pre-#259 names without an owner PID). Unset = never. |
+| `SYNAPSE_CODEX_START_SNAPSHOT_GRACE_MINUTES` | setup (`-CodexStartSnapshotGraceMinutes`, default 10, User env) | Launchers delete their own `codex-tool-surface-o<pid>-*.json` when Codex exits; another start prunes one only if a successful process lookup shows `<pid>` gone and the file is older than this. Unset = never. |
 | `SYNAPSE_TOOL_SURFACE_OUT` | `server/tool_profiles.rs` | Output path for the tool-surface dump. |
 | `SYNAPSE_DEBUG_TOOLS` | `server.rs` | Truthy enables debug tools in the surface. |
+| `SYNAPSE_ENABLE_EVERQUEST` | `server.rs` | Truthy enables EverQuest domain tools. |
 
 ### 3.11 Test / benchmark only (not production config)
 

@@ -15,7 +15,7 @@ use super::{
     types::{
         ReplayArtifactInspectParams, ReplayArtifactInspectResponse, ReplayArtifactLineSummary,
     },
-    util::{prefixed_sha256, string_field},
+    util::{keyed_sha256, prefixed_sha256, string_field},
     validation::validate_replay_artifact_params,
 };
 pub(super) fn inspect_replay_artifact(
@@ -131,7 +131,7 @@ fn summarize_replay_line(line_no: u64, bytes: &[u8], value: &Value) -> ReplayArt
     ReplayArtifactLineSummary {
         line_no,
         len_bytes: bytes.len() as u64,
-        sha256: prefixed_sha256(bytes),
+        sha256: keyed_sha256(bytes),
         target: string_field(value, "target"),
         record_type: record
             .and_then(|record| string_field(record, "type"))

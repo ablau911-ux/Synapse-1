@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_action::{
-    ActionBackend, ActionError, ActionHandle, ArcLengthPath, EmitState, PathError, RecordedInput,
+    ActionError, ActionHandle, ArcLengthPath, EmitState, PathError, RecordedInput,
     RecordingBackend, StrokeError, StrokePlan, plan_timed_stroke, screen_point_from_path_point,
 };
 use synapse_core::{
@@ -47,8 +47,6 @@ const STROKE_DETAIL_TARGET_UNRESOLVED: &str = "STROKE_TARGET_UNRESOLVED";
 const CDP_STROKE_MIN_DISPATCH_INTERVAL_MS: f64 = 8.0;
 #[cfg(windows)]
 const CDP_STROKE_MAX_DISPATCH_POINTS: usize = 256;
-#[cfg(windows)]
-const CDP_STROKE_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +159,35 @@ pub struct ActStrokePlan {
 }
 
 impl ActStrokePlan {
+    /// The CDP element a CDP aim stroke dispatches to (#202 claim check).
+    pub(crate) fn cdp_aim_element(&self) -> Option<&ElementId> {
+        self.cdp_aim.as_ref().map(|aim| &aim.element_id)
+    }
+
+    /// Every distinct screen pixel the planned stroke visits (#202 claim
+    /// check): a drag lands in whatever windows are under its path.
+    pub(crate) fn screen_points(&self) -> Vec<Point> {
+        let mut points: Vec<Point> = self
+            .plan
+            .iter()
+            .flat_map(|plan| plan.samples.iter())
+            .filter_map(|sample| {
+                let x = sample.point.x.round();
+                let y = sample.point.y.round();
+                (x.is_finite() && y.is_finite()).then(|| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    Point {
+                        x: x as i32,
+                        y: y as i32,
+                    }
+                })
+            })
+            .collect();
+        points.sort_unstable_by_key(|point| (point.x, point.y));
+        points.dedup();
+        points
+    }
+
     pub(crate) const fn requires_input_lease(&self) -> bool {
         !matches!(self.input_kind, ActStrokeInputKind::CdpElementAim)
     }
@@ -189,16 +216,15 @@ struct CdpAimTarget {
     backend_node_id: i64,
 }
 
-pub(crate) async fn act_stroke_with_handle_and_boundary(
+pub async fn act_stroke_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActStrokeParams,
     plan: ActStrokePlan,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActStrokeResponse, ErrorData> {
     let started = Instant::now();
     if let Some(cdp_aim) = &plan.cdp_aim {
-        return execute_cdp_aim(&params, cdp_aim, started, boundary).await;
+        return execute_cdp_aim(&params, cdp_aim, started).await;
     }
     let path = plan.path.clone().ok_or_else(|| {
         params_invalid_detail(
@@ -229,9 +255,9 @@ pub(crate) async fn act_stroke_with_handle_and_boundary(
         .collect();
 
     if let Some(recording) = recording {
-        execute_recording(&recording, &modifier_keys, &action, backend, boundary)?;
+        execute_recording(&recording, &modifier_keys, &action, backend)?;
     } else {
-        execute_with_modifiers(&handle, &modifier_keys, action, backend, boundary).await?;
+        execute_with_modifiers(&handle, &modifier_keys, action, backend).await?;
     }
 
     Ok(response(&params, &path, &stroke_plan, started, backend))
@@ -242,7 +268,6 @@ pub(crate) async fn act_stroke_cdp_target(
     cdp_target_id: &str,
     params: ActStrokeParams,
     plan: ActStrokePlan,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActStrokeResponse, ErrorData> {
     #[cfg(windows)]
     {
@@ -279,21 +304,15 @@ pub(crate) async fn act_stroke_cdp_target(
         })?;
         let points = cdp_dispatch_points_from_stroke_plan(&stroke_plan);
         let button = cdp_mouse_button(params.button)?;
-        boundary.ensure("immediately_before_cdp_mouse_stroke_target")?;
-        let dispatch = tokio::time::timeout(
-            CDP_STROKE_ROUTE_TIMEOUT,
-            synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button),
+        // #193: the time budget (planned duration + margin) and the release of a held
+        // page button on failure/timeout live in synapse-a11y, which owns the socket.
+        let dispatch = synapse_a11y::cdp_mouse_stroke_target(
+            endpoint,
+            cdp_target_id,
+            points,
+            button,
         )
         .await
-        .map_err(|_| {
-            mcp_error(
-                error_codes::A11Y_CDP_AXTREE_FAILED,
-                format!(
-                    "act_stroke CDP Input.dispatchMouseEvent route timed out after {} ms for target {cdp_target_id:?}",
-                    CDP_STROKE_ROUTE_TIMEOUT.as_millis()
-                ),
-            )
-        })?
         .map_err(|error| {
             mcp_error(
                 error.code(),
@@ -302,7 +321,6 @@ pub(crate) async fn act_stroke_cdp_target(
                 ),
             )
         })?;
-        boundary.ensure("after_cdp_mouse_stroke_target")?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_TARGET_DISPATCHED",
             cdp_target_id = %dispatch.target_id,
@@ -874,16 +892,9 @@ async fn execute_with_modifiers(
     modifier_keys: &[synapse_core::Key],
     stroke_action: Action,
     backend: Backend,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let mut pressed = Vec::with_capacity(modifier_keys.len());
     for key in modifier_keys {
-        if let Err(error) = boundary.ensure("immediately_before_stroke_modifier_key_down") {
-            let _release_result =
-                release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup")
-                    .await;
-            return Err(error);
-        }
         if let Err(error) = handle
             .execute(Action::KeyDown {
                 key: key.clone(),
@@ -899,15 +910,7 @@ async fn execute_with_modifiers(
         pressed.push(key.clone());
     }
 
-    if let Err(error) = boundary.ensure("immediately_before_foreground_stroke_dispatch") {
-        let _release_result =
-            release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup").await;
-        return Err(error);
-    }
     let stroke_result = handle.execute(stroke_action).await;
-    let boundary_error = boundary
-        .ensure("after_foreground_stroke_before_modifier_release")
-        .err();
     if stroke_result.is_ok() && !pressed.is_empty() {
         tokio::time::sleep(Duration::from_millis(MODIFIER_RELEASE_SETTLE_MS)).await;
     }
@@ -921,17 +924,6 @@ async fn execute_with_modifiers(
     if let Err(error) = stroke_result {
         return Err(action_error_to_mcp(&error));
     }
-    if let Some(error) = boundary_error {
-        if let Err(release_error) = &release_result {
-            tracing::error!(
-                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-                detail_code = "STROKE_MODIFIER_RELEASE_AFTER_OPERATOR_PANIC_FAILED",
-                detail = %release_error,
-                "operator panic superseded a stroke and best-effort modifier cleanup failed"
-            );
-        }
-        return Err(error);
-    }
     if let Err(error) = release_result {
         return Err(action_error_to_mcp(&error));
     }
@@ -942,7 +934,6 @@ async fn execute_cdp_aim(
     params: &ActStrokeParams,
     cdp_aim: &CdpAimTarget,
     started: Instant,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActStrokeResponse, ErrorData> {
     #[cfg(windows)]
     {
@@ -969,7 +960,6 @@ async fn execute_cdp_aim(
             .map(|context| context.window_title)
             .unwrap_or_default();
         let target_id_hint = synapse_a11y::cdp_target_from_element_id(&cdp_aim.element_id);
-        boundary.ensure("immediately_before_cdp_aim_node")?;
         let landed = synapse_a11y::cdp_aim_node(
             &endpoint,
             &title_hint,
@@ -978,7 +968,6 @@ async fn execute_cdp_aim(
         )
         .await
         .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-        boundary.ensure("after_cdp_aim_node")?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_AIM_MOVED",
             element_id = %cdp_aim.element_id,
@@ -1051,49 +1040,47 @@ fn execute_recording(
     modifier_keys: &[synapse_core::Key],
     stroke_action: &Action,
     backend: Backend,
-    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
-    let before_events = recording.events();
-    let before_event_count = before_events.len();
+    let mut new_events = Vec::new();
     let mut emit_state = EmitState::new();
     for key in modifier_keys {
-        boundary.ensure("immediately_before_recorded_stroke_modifier_key_down")?;
-        recording
-            .execute(
-                &Action::KeyDown {
-                    key: key.clone(),
-                    backend,
-                },
-                &mut emit_state,
-            )
-            .map_err(|error| action_error_to_mcp(&error))?;
+        new_events.extend(
+            recording
+                .execute_capturing(
+                    &Action::KeyDown {
+                        key: key.clone(),
+                        backend,
+                    },
+                    &mut emit_state,
+                )
+                .map_err(|error| action_error_to_mcp(&error))?,
+        );
     }
-    boundary.ensure("immediately_before_recorded_stroke_dispatch")?;
-    recording
-        .execute(stroke_action, &mut emit_state)
-        .map_err(|error| action_error_to_mcp(&error))?;
+    new_events.extend(
+        recording
+            .execute_capturing(stroke_action, &mut emit_state)
+            .map_err(|error| action_error_to_mcp(&error))?,
+    );
     for key in modifier_keys.iter().rev() {
-        recording
-            .execute(
-                &Action::KeyUp {
-                    key: key.clone(),
-                    backend,
-                },
-                &mut emit_state,
-            )
-            .map_err(|error| action_error_to_mcp(&error))?;
+        new_events.extend(
+            recording
+                .execute_capturing(
+                    &Action::KeyUp {
+                        key: key.clone(),
+                        backend,
+                    },
+                    &mut emit_state,
+                )
+                .map_err(|error| action_error_to_mcp(&error))?,
+        );
     }
-    let after_events = recording.events();
-    let new_events = &after_events[before_event_count..];
-    let event_sequence = event_sequence(new_events);
+    let event_sequence = event_sequence(&new_events);
     tracing::info!(
         code = "M2_ACT_STROKE_RECORDING_READBACK",
         kind = "act_stroke",
-        before_event_count,
-        after_event_count = after_events.len(),
+        recorded_event_total = recording.event_count(),
         new_event_count = new_events.len(),
         event_sequence,
-        ?new_events,
         "readback=recording_backend tool=act_stroke after_events_readback"
     );
     Ok(())
@@ -1248,8 +1235,12 @@ fn event_sequence(events: &[RecordedInput]) -> String {
 
 fn event_label(event: &RecordedInput) -> String {
     match event {
-        RecordedInput::KeyDown { key } => format!("key_down:{}", key_label(key)),
-        RecordedInput::KeyUp { key } => format!("key_up:{}", key_label(key)),
+        RecordedInput::KeyDown { key } => {
+            format!("key_down:{}", synapse_action::redacted_key_label(key))
+        }
+        RecordedInput::KeyUp { key } => {
+            format!("key_up:{}", synapse_action::redacted_key_label(key))
+        }
         RecordedInput::MouseButtonDown { button } => format!("down:{}", button_label(*button)),
         RecordedInput::MouseButtonUp { button } => format!("up:{}", button_label(*button)),
         RecordedInput::MouseStrokePoint { elapsed_ms, point } => {
@@ -1258,15 +1249,7 @@ fn event_label(event: &RecordedInput) -> String {
                 point.x, point.y
             )
         }
-        other => format!("{other:?}"),
-    }
-}
-
-fn key_label(key: &synapse_core::Key) -> String {
-    match &key.code {
-        synapse_core::KeyCode::Named { value } => value.clone(),
-        synapse_core::KeyCode::Symbol { value } => value.to_string(),
-        synapse_core::KeyCode::HidCode { value } => format!("hid:{value}"),
+        other => other.log_label(),
     }
 }
 
@@ -1466,6 +1449,8 @@ fn act_stroke_path_id(params: &ActStrokeParams, plan: &ActStrokePlan) -> String 
         )
         .into_bytes()
     });
+    // Plain SHA-256 on purpose (#174): derives a deterministic stroke id from the
+    // geometry/timing parameters (coordinates, not typed content).
     format!("stroke:{}", sha256_hex(payload))
 }
 

@@ -21,15 +21,12 @@ use super::{
 use crate::{
     ReflexError, ReflexResult,
     conflict::{ConflictCandidate, ConflictLoser, REFLEX_STARVED_KIND, resolve_conflicts},
+    enqueue_audit,
     kinds::{
         hold_lifetime::{HoldReleaseReason, emit_lifetime_expired},
         on_event::{OnEventTickGuard, publish_debounced, publish_fired},
     },
-    write_audit,
 };
-
-const REFLEX_TICK_JITTER_METRIC: &str = "reflex_tick_jitter_us";
-const REFLEX_STARVED_METRIC: &str = "reflex_starved_total";
 
 pub(super) fn tick(runtime: &mut RuntimeState, elapsed: Duration, degraded: bool) {
     let events = runtime.subscription.drain();
@@ -126,8 +123,11 @@ fn dispatch_triggered_reflexes(
                     super::mark_reflex_fired(runtime, trigger.reflex_index);
                 }
                 Err(error) => {
-                    *dispatch_blocked = true;
                     mark_dispatch_error(runtime, trigger.reflex_index, &error);
+                    if matches!(error, ReflexError::InputTarget { .. }) {
+                        continue;
+                    }
+                    *dispatch_blocked = true;
                     warn_dispatch_blocked(&trigger.reflex_id, &error);
                     break;
                 }
@@ -136,7 +136,7 @@ fn dispatch_triggered_reflexes(
                 if !guard.can_fire() {
                     guard.report_limit_once(
                         &runtime.event_bus,
-                        runtime.audit_db.as_deref(),
+                        runtime.audit_producer.as_ref(),
                         &trigger.reflex_id,
                         runtime.tick_index,
                         event,
@@ -151,7 +151,7 @@ fn dispatch_triggered_reflexes(
                         guard.record_fire();
                         publish_fired(
                             &runtime.event_bus,
-                            runtime.audit_db.as_deref(),
+                            runtime.audit_producer.as_ref(),
                             &trigger.reflex_id,
                             runtime.tick_index,
                             event,
@@ -161,8 +161,11 @@ fn dispatch_triggered_reflexes(
                         super::mark_reflex_fired(runtime, trigger.reflex_index);
                     }
                     Err(error) => {
-                        *dispatch_blocked = true;
                         mark_dispatch_error(runtime, trigger.reflex_index, &error);
+                        if matches!(error, ReflexError::InputTarget { .. }) {
+                            continue;
+                        }
+                        *dispatch_blocked = true;
                         warn_dispatch_blocked(&trigger.reflex_id, &error);
                         break;
                     }
@@ -267,7 +270,7 @@ fn publish_debounce_suppression(
     };
     publish_debounced(
         &runtime.event_bus,
-        runtime.audit_db.as_deref(),
+        runtime.audit_producer.as_ref(),
         &reflex.reflex_id,
         runtime.tick_index,
         &first_event,
@@ -330,14 +333,9 @@ fn record_starvation(
     for loser in losers {
         losing_slots.insert(loser.loser_slot);
         if runtime.starvation_states[loser.loser_slot].record_loss(elapsed) {
-            metrics::counter!(
-                REFLEX_STARVED_METRIC,
-                "reflex_id" => format!("slot:{}", loser.loser_slot)
-            )
-            .increment(1);
             publish_starved(
                 &runtime.event_bus,
-                runtime.audit_db.as_deref(),
+                runtime.audit_producer.as_ref(),
                 loser,
                 runtime.tick_index,
                 runtime.starvation_states[loser.loser_slot].contended_for(),
@@ -360,7 +358,7 @@ fn record_starvation(
 
 fn publish_starved(
     event_bus: &crate::EventBus,
-    audit_db: Option<&synapse_storage::Db>,
+    audit_db: Option<&crate::audit::AuditProducer>,
     loser: &ConflictLoser,
     tick_index: u64,
     starved_for: Duration,
@@ -406,7 +404,7 @@ fn publish_starved(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
+    if let Err(error) = enqueue_audit(db, &audit) {
         tracing::warn!(
             component = "reflex_conflict",
             reflex_id = %audit.reflex_id,
@@ -441,8 +439,6 @@ fn record_tick_sample(
     let elapsed_us = duration_us(elapsed);
     let target_us = duration_us(runtime.config.target_interval);
     let jitter_us = elapsed_us.abs_diff(target_us);
-    let jitter_metric = f64::from(u32::try_from(jitter_us).unwrap_or(u32::MAX));
-    metrics::histogram!(REFLEX_TICK_JITTER_METRIC).record(jitter_metric);
     let deadline_late = elapsed > runtime.config.late_after;
     let late = deadline_late || dispatch_blocked;
     if late {
@@ -519,7 +515,7 @@ fn write_tick_late_audit(
     reason: &str,
     degraded: bool,
 ) {
-    let Some(db) = runtime.audit_db.as_deref() else {
+    let Some(db) = runtime.audit_producer.as_ref() else {
         return;
     };
     let audit = StoredReflexAudit {
@@ -546,7 +542,7 @@ fn write_tick_late_audit(
         redacted: false,
         redactions: Vec::new(),
     };
-    if let Err(error) = write_audit(db, &audit) {
+    if let Err(error) = enqueue_audit(db, &audit) {
         tracing::warn!(
             component = "reflex_scheduler",
             audit_id = %audit.audit_id,
@@ -570,7 +566,7 @@ fn mark_dispatch_error(runtime: &RuntimeState, index: usize, error: &ReflexError
     if error.code() == error_codes::REFLEX_ACTION_PERMISSION_DENIED {
         super::mark_reflex_action_denied(runtime, index);
     } else {
-        super::mark_reflex_error(runtime, index, error.code());
+        super::mark_reflex_error(runtime, index, error);
     }
 }
 

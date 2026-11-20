@@ -260,7 +260,7 @@ pub struct TaskResponse {
 #[tool_router(router = agent_facade_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Facade for spawned-agent lifecycle, mailbox, stats, templates, and controls in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Every mutating operation delegates to the real lifecycle/mailbox/template/control implementation and returns its physical source-of-truth readback."
+        description = "Facade for spawned-agent lifecycle, mailbox, stats, templates, and controls in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Every mutating operation delegates to the real lifecycle/mailbox/template/control implementation and returns its physical source-of-truth readback."
     )]
     pub async fn agent(
         &self,
@@ -776,7 +776,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for durable agent task queue operations in the <=40 public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return the task row readback from the real task implementation."
+        description = "Facade for durable agent task queue operations in the <={PUBLIC_TOOL_LIMIT} public MCP surface. operation is a strict enum; exactly one matching operation spec is accepted. Mutating operations return the task row readback from the real task implementation."
     )]
     pub async fn task(
         &self,

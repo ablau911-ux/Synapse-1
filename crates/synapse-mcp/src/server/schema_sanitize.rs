@@ -52,6 +52,44 @@ use std::{borrow::Cow, sync::Arc};
 use rmcp::model::Tool;
 use serde_json::{Map, Value};
 
+/// Preserve tagged-union validation while exposing the object root required by
+/// strict MCP clients. Properties remain constrained by the original oneOf.
+pub(crate) fn tagged_object_input_schema<T: schemars::JsonSchema>() -> Arc<Map<String, Value>> {
+    let value = serde_json::to_value(schemars::schema_for!(T))
+        .unwrap_or_else(|error| panic!("tool schema serialization failed: {error}"));
+    let Value::Object(mut root) = value else {
+        panic!("tool schema must be an object");
+    };
+    let mut properties = Map::new();
+    let mut operations = Vec::new();
+    if let Some(Value::Array(variants)) = root.get("oneOf") {
+        for variant in variants {
+            if let Some(Value::Object(fields)) = variant.get("properties") {
+                for (name, schema) in fields {
+                    if name == "operation" {
+                        if let Some(value) = schema.get("const") {
+                            operations.push(value.clone());
+                        }
+                    } else {
+                        properties
+                            .entry(name.clone())
+                            .or_insert_with(|| schema.clone());
+                    }
+                }
+            }
+        }
+    }
+    properties.insert(
+        "operation".into(),
+        serde_json::json!({"type": "string", "enum": operations}),
+    );
+    root.insert("type".into(), Value::String("object".into()));
+    root.insert("additionalProperties".into(), Value::Bool(false));
+    root.insert("properties".into(), Value::Object(properties));
+    root.insert("required".into(), serde_json::json!(["operation"]));
+    Arc::new(root)
+}
+
 /// Keywords whose value is a *map* of subschemas. A boolean value of any member
 /// is the client-rejected case and is rewritten.
 const SCHEMA_MAP_KEYWORDS: &[&str] = &[
@@ -163,17 +201,40 @@ fn strip_nonstandard_format(map: &mut Map<String, Value>) {
 }
 
 /// Sanitizes every tool's input and output schema so no property/composition
-/// subschema is a bare boolean. Returns tools safe to send over `tools/list`.
+/// subschema is a bare boolean, and lists the optional `agent_id` field on the
+/// agent-scoped tools (#299). Returns tools safe to send over `tools/list`.
 #[must_use]
 pub fn sanitize_tools(tools: Vec<Tool>) -> Vec<Tool> {
-    tools.into_iter().map(sanitize_tool).collect()
+    let mut tools = tools.into_iter().map(sanitize_tool).collect::<Vec<_>>();
+    super::agent_scope::add_agent_id_parameter(&mut tools);
+    tools
+}
+
+/// Placeholder tool descriptions use for the public tool ceiling. It is expanded
+/// from `PUBLIC_TOOL_LIMIT` when tools are served, so descriptions cannot go stale
+/// when the public surface grows (#89).
+const PUBLIC_TOOL_LIMIT_PLACEHOLDER: &str = "{PUBLIC_TOOL_LIMIT}";
+
+fn expand_public_tool_limit(input: Cow<'_, str>) -> Cow<'_, str> {
+    if !input.contains(PUBLIC_TOOL_LIMIT_PLACEHOLDER) {
+        return input;
+    }
+    Cow::Owned(input.replace(
+        PUBLIC_TOOL_LIMIT_PLACEHOLDER,
+        &super::tool_profiles::PUBLIC_TOOL_LIMIT.to_string(),
+    ))
 }
 
 fn sanitize_tool(mut tool: Tool) -> Tool {
-    if let Some(description) = tool.description.as_ref() {
-        if let Cow::Owned(normalized) = normalize_metadata_text(description.as_ref()) {
-            tool.description = Some(Cow::Owned(normalized));
-        }
+    let rewritten =
+        tool.description.as_ref().and_then(|description| {
+            match expand_public_tool_limit(normalize_metadata_text(description.as_ref())) {
+                Cow::Owned(text) => Some(text),
+                Cow::Borrowed(_) => None,
+            }
+        });
+    if let Some(text) = rewritten {
+        tool.description = Some(Cow::Owned(text));
     }
     tool.input_schema = sanitize_schema_object(&tool.input_schema);
     if let Some(output) = &tool.output_schema {

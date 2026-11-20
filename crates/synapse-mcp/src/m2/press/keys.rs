@@ -7,7 +7,7 @@ use synapse_core::{Key, KeyCode, error_codes};
 use super::action_error_to_mcp;
 use crate::m1::mcp_error;
 
-const MODIFIER_ORDER: [&str; 4] = ["ctrl", "shift", "alt", "super"];
+pub(in crate::m2::press) const MODIFIER_ORDER: [&str; 4] = ["ctrl", "shift", "alt", "super"];
 
 pub(in crate::m2::press) fn normalized_keys(raw_keys: &[String]) -> Result<Vec<Key>, ErrorData> {
     if raw_keys.is_empty() {
@@ -24,7 +24,12 @@ pub(in crate::m2::press) fn normalized_keys(raw_keys: &[String]) -> Result<Vec<K
         if !seen.insert(name.clone()) {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                format!("act_press duplicate key '{name}'"),
+                // Never echo a text-producing key: errors land in the audit log.
+                if is_text_producing_key(&name) {
+                    "act_press duplicate text-producing key".to_owned()
+                } else {
+                    format!("act_press duplicate key '{name}'")
+                },
             ));
         }
         names.push(name);
@@ -45,7 +50,7 @@ pub(in crate::m2::press) fn normalized_keys(raw_keys: &[String]) -> Result<Vec<K
     Ok(ordered)
 }
 
-fn canonical_key_name(raw_key: &str) -> Result<String, ErrorData> {
+pub(crate) fn canonical_key_name(raw_key: &str) -> Result<String, ErrorData> {
     let lowered = raw_key.trim().to_ascii_lowercase();
     let key = match lowered.as_str() {
         "" => {
@@ -73,7 +78,12 @@ fn canonical_key_name(raw_key: &str) -> Result<String, ErrorData> {
         Ok(key.to_owned())
     } else {
         Err(action_error_to_mcp(&ActionError::UnsupportedKey {
-            detail: format!("act_press unsupported key '{raw_key}'"),
+            // The raw name is not echoed: errors land in the audit log, and a
+            // mistaken secret passed as a key name must not be persisted.
+            detail: format!(
+                "act_press unsupported key name ({} chars); use a single ASCII letter/digit or backtick, f1-f24, or a named key such as ctrl, shift, alt, super, enter, tab, esc, space, arrows, home/end, pageup/pagedown, insert, delete, backspace",
+                raw_key.chars().count()
+            ),
         }))
     }
 }
@@ -110,6 +120,12 @@ fn is_allowed_key_name(key: &str) -> bool {
             | "tab"
             | "up"
     )
+}
+
+/// Whether a canonical key name inserts text when pressed without a shortcut
+/// modifier: single printable characters and `space`.
+pub(crate) fn is_text_producing_key(name: &str) -> bool {
+    name == "space" || name.chars().count() == 1
 }
 
 pub(in crate::m2::press) fn key(value: &str) -> Key {

@@ -5,8 +5,17 @@ use uuid::Uuid;
 
 use crate::{
     REFLEX_CANCELLED_KIND, REFLEX_DISABLED_KIND, REFLEX_REGISTERED_KIND, ReflexError, ReflexResult,
-    ReflexRuntime, write_audit,
+    ReflexRuntime,
 };
+
+#[cfg(not(test))]
+use crate::write_audit;
+#[cfg(test)]
+use audit_storage_codes_275::write_audit;
+
+#[cfg(test)]
+#[path = "audit_storage_codes_275.rs"]
+mod audit_storage_codes_275;
 
 impl ReflexRuntime {
     pub(crate) fn write_registration_audit(&self, status: &ReflexStatus) -> ReflexResult<()> {
@@ -23,6 +32,7 @@ impl ReflexRuntime {
             details: json!({
                 "kind": REFLEX_REGISTERED_KIND,
                 "kind_summary": status.kind_summary,
+                "input_target": status.input_target,
                 "priority": status.priority,
                 "lifetime": status.lifetime,
                 "exclusive": status.exclusive,
@@ -30,12 +40,11 @@ impl ReflexRuntime {
             redacted: false,
             redactions: Vec::new(),
         };
-        write_audit(&self.db, &audit).map_err(|error| ReflexError::ParamsInvalid {
-            detail: format!("registration audit write failed: {error}"),
-        })?;
-        self.db.flush().map_err(|error| ReflexError::ParamsInvalid {
-            detail: format!("registration audit flush failed: {error}"),
-        })
+        write_audit(&self.db, &audit)
+            .map_err(|error| audit_storage_error(&error, "registration audit write"))?;
+        self.db
+            .flush()
+            .map_err(|error| audit_storage_error(&error, "registration audit flush"))
     }
 
     pub(crate) fn write_cancellation_audit(&self, status: &ReflexStatus) -> ReflexResult<()> {
@@ -59,12 +68,11 @@ impl ReflexRuntime {
             redacted: false,
             redactions: Vec::new(),
         };
-        write_audit(&self.db, &audit).map_err(|error| ReflexError::ParamsInvalid {
-            detail: format!("cancellation audit write failed: {error}"),
-        })?;
-        self.db.flush().map_err(|error| ReflexError::ParamsInvalid {
-            detail: format!("cancellation audit flush failed: {error}"),
-        })
+        write_audit(&self.db, &audit)
+            .map_err(|error| audit_storage_error(&error, "cancellation audit write"))?;
+        self.db
+            .flush()
+            .map_err(|error| audit_storage_error(&error, "cancellation audit flush"))
     }
 
     pub(crate) fn write_disabled_audits_with_reason(
@@ -97,13 +105,22 @@ impl ReflexRuntime {
                 redacted: false,
                 redactions: Vec::new(),
             };
-            write_audit(&self.db, &audit).map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("disabled audit write failed: {error}"),
-            })?;
+            write_audit(&self.db, &audit)
+                .map_err(|error| audit_storage_error(&error, "disabled audit write"))?;
         }
-        self.db.flush().map_err(|error| ReflexError::ParamsInvalid {
-            detail: format!("disabled audit flush failed: {error}"),
-        })
+        self.db
+            .flush()
+            .map_err(|error| audit_storage_error(&error, "disabled audit flush"))
+    }
+}
+
+pub(crate) fn audit_storage_error(
+    error: &synapse_storage::StorageError,
+    operation: &str,
+) -> ReflexError {
+    ReflexError::Storage {
+        code: error.code(),
+        detail: format!("{operation} failed: {error}"),
     }
 }
 

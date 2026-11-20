@@ -1,27 +1,29 @@
-# Synapse 40-Tool Surface Migration
+# Synapse 44-Tool Surface Migration
 
 Updated: 2026-06-30
 
 Parent issue: #1374
 Task issue: #1394
 
+Current authority amendment, 2026-10-16: `PUBLIC_TOOL_LIMIT` and `PUBLIC_TOOL_NAMES` in `crates/synapse-mcp/src/server/tool_profiles.rs` supersede the historical counts below; the current registry and normal-agent surface contain 44 tools (`livefeed` is built behind the `livefeed` cargo feature). The per-tool list is in README.md "The full tool surface". `NORMAL_ALLOWED_EXACT` aliases `PUBLIC_TOOL_NAMES`. The migration body and its original counts remain historical evidence.
+
 ## Current Surface
 
 The default production MCP surface is facade-first:
 
-- Public registry limit: 40 tools maximum.
+- Public registry limit: 44 tools maximum.
 - Public registry source of truth: `crates/synapse-mcp/src/server/tool_profiles.rs` `PUBLIC_TOOL_NAMES`.
 - Normal-agent visible source of truth: `NORMAL_ALLOWED_EXACT`.
 - Facade contract source of truth: `FACADE_TOOL_CONTRACTS`.
 - Live profile row source of truth: `CF_SESSIONS mcp/tool-profile/v1/<session_id>`.
 
-The current normal-agent profile exposes all 40 stable public facade names. Every scoped production HTTP profile advertises the same facade surface so strict/static MCP clients never need a schema refresh to gain a capability route. Profiles gate operation-level authority: debugger-backed `browser_debugger` operations require `profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why debugger authority is required>`, and real-foreground actions use the audited `act operation=foreground` route. Raw implementation tools remain hidden for scoped HTTP profiles. Trusted unscoped stdio intentionally retains the full raw admin surface, and `SYNAPSE_DEBUG_TOOLS=1` explicitly enables the diagnostic implementation surface.
+The public registry and the normal-agent profile list 44 tools. `browser_debugger` is listed, but each of its operations fails closed with TOOL_PROFILE_POLICY_DENIED until the session switches to `browser_debugger` with `profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why raw CDP is required>`.
 
 Default normal-agent tools:
 
-`health`, `profile`, `session`, `subscribe`, `observe`, `find`, `read_text`, `screenshot`, `target`, `act`, `shell`, `process`, `browser_tabs`, `browser_nav`, `browser_dom`, `browser_form`, `browser_wait`, `browser_capture`, `browser_storage`, `browser_debugger`, `workspace`, `agent`, `task`, `approval`, `escalation`, `timeline`, `episode`, `routine`, `assist`, `reality`, `verification`, `storage`, `model`, `cost`, `hygiene`, `audit`, `replay`, `privacy`, `setup`, `telemetry`.
+`health`, `profile`, `session`, `subscribe`, `observe`, `find`, `read_text`, `screenshot`, `target`, `act`, `shell`, `process`, `browser_tabs`, `browser_nav`, `browser_dom`, `browser_form`, `browser_wait`, `browser_capture`, `browser_storage`, `workspace`, `agent`, `task`, `approval`, `escalation`, `timeline`, `episode`, `routine`, `assist`, `reality`, `verification`, `storage`, `model`, `cost`, `hygiene`, `audit`, `replay`, `privacy`, `setup`, `telemetry`.
 
-Public facade with profile-gated operations:
+Public but profile-gated:
 
 `browser_debugger`.
 
@@ -45,7 +47,7 @@ Removed status means removed from the normal public surface. It does not always 
 | --- | --- |
 | `profile` | `status`, `set` |
 | `session` | `list` |
-| `subscribe` | `events` |
+| `subscribe` | `events`, `events_cancel` |
 | `observe` | `current` |
 | `find` | `elements` |
 | `read_text` | `text` |
@@ -95,6 +97,21 @@ tool: profile
 args: { "operation": "status" }
 ```
 
+Subscription lifecycle:
+
+```text
+tool: subscribe
+args: { "operation": "events", "events": { "kinds": ["workspace.put"], "snapshot_first": false, "buffer_size": 256 } }
+
+tool: subscribe
+args: { "operation": "events_cancel", "events_cancel": { "subscription_id": "<id returned by events>" } }
+```
+
+`events_cancel` only releases a subscription created by the same live MCP
+session. A client that is terminating an HTTP MCP session should also use the
+protocol session-termination request; that teardown reclaims any remaining
+subscriptions owned by that session.
+
 Targeted action:
 
 ```text
@@ -134,6 +151,8 @@ tool: workspace
 args: { "operation": "get", "get": { "key": "issue/1394/example" } }
 ```
 
+For `workspace operation=list`, continue successful pages with the returned opaque `next_cursor` and the same `run_id`/`prefix` until `complete=true`. A page can contain no live entries and still have `has_next=true` when it examined expired or corrupt rows; each page scans at most 1,000 raw rows or 16 MiB of encoded values plus lookahead. Cursors expire on daemon restart, and a live scan does not revisit keys inserted before its cursor. Do not synthesize or modify cursors.
+
 Shell job with durable status:
 
 ```text
@@ -158,7 +177,7 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `session_end` | Advanced maintenance/session lifecycle route | Removed from normal public surface. |
 | `profile_list`, `profile_authoring_generate`, `profile_authoring_inspect`, `profile_authoring_list` | Advanced profile-maintenance route | Removed from normal public surface. |
 | `subscribe` | `subscribe operation=events` | Kept as public facade. |
-| `subscribe_cancel` | Client/session subscription lifecycle | Removed from normal public surface. |
+| `subscribe_cancel` | `subscribe operation=events_cancel` | Condensed into the session-owned public subscription facade. |
 | `observe` | `observe operation=current` | Kept as public facade. |
 | `observe_delta` | `reality operation=delta` | Condensed into reality facade. |
 | `find` | `find operation=elements` | Kept as public facade. |
@@ -169,7 +188,7 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `set_capture_target`, `set_perception_mode` | `target operation=set` plus per-call `observe`/`screenshot` parameters | Removed as normal public global mutators. |
 | `target_claim`, `target_claim_status`, `target_claim_adopt`, `target_release` | `target operation=claim/status/adopt/release` | Condensed. |
 | `target_act` | `act operation=invoke` | Condensed through action facade. |
-| `act_foreground` | `act operation=foreground` | Condensed; explicit reason required; the whole keyed authority transaction remains supervised through exact profile/lease cleanup and final audit after caller cancellation, and the dedicated physical operator-panic epoch supersedes stored agent lease snapshots. |
+| `act_foreground` | `act operation=foreground` | Condensed; explicit reason required. |
 | `control_lease_acquire`, `control_lease_handoff`, `control_lease_release`, `control_lease_status` | `act operation=foreground`, `target operation=claim/status/release`, or explicit `break_glass` profile | Removed from normal public surface as standalone lease tools. |
 | `act_run_shell`, `act_run_shell_start`, `act_run_shell_status`, `act_run_shell_cancel` | `shell operation=run/start/status/cancel` | Condensed. |
 | `act_launch` | `process operation=launch` | Condensed. |
@@ -223,8 +242,12 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 
 Old tool missing from mapping: treat as documentation failure and update this file before closing a migration issue.
 
-Removed tool still public in `normal_agent`: treat as profile regression. Fix `NORMAL_ALLOWED_EXACT` or the profile router before claiming the 40-tool surface is live.
+Removed tool still public in `normal_agent`: treat as profile regression. Fix `NORMAL_ALLOWED_EXACT` or the profile router before claiming the 44-tool surface is live.
 
 Doc example uses hidden route from `normal_agent`: treat as a documentation regression. Examples must use current facade tools only.
 
 Public count above 40: treat as release blocker for #1374. The source of truth is production-client `tools/list`, not a local constant alone.
+
+## `reality operation=delta`: `rebase_required` is expected behavior (ref #156)
+
+`delta` re-selects the profile on every poll. If the foreground window switches to a different profile mid-watch (for example Alt+Tab), the response is `rebase_required=true` with `reason="profile_changed: head profile <A> but observed <B>"`, empty `deltas`, and the head cursor. Every `reason` is a stable token, optionally followed by `": <detail>"`, so **match reasons by token prefix**, never by exact string (e.g. `reason == token || reason.starts_with(token + ": ")`). Other `rebase_required` reasons: `stale_epoch` (`"stale_epoch: requested <epoch>, current <epoch>"`: the requested `since_epoch` is not the current head epoch of the resolved profile and belongs to no other profile's head; empty `deltas`, the head cursor, `baseline_required=false`), `delta_overflow` (`"delta_overflow: N changes exceed …"`), `delta_snapshot_budget_exceeded` (`"delta_snapshot_budget_exceeded: …"`), and `missing_baseline` (emitted as the bare token `"missing_baseline"` with no detail when no baseline head exists for the resolved profile and any requested `since_epoch` belongs to no other profile; the response also sets `baseline_required=true`, has empty `deltas` and no cursor). Match `missing_baseline` as a **prefix**: when the stored head row exists but cannot be decoded (e.g. written by an older build), the reason is `"missing_baseline: stored head row is undecodable; call reality baseline to rebuild it"` (ref #234), with the same `baseline_required=true` handling. Clients must treat it as a signal to call `reality operation=baseline` (or switch back), not as a failure. Regression coverage: `crates/synapse-mcp/src/server/tests/reality_profile_switch_156.rs` (`must_fail_delta_without_profile_id_after_switch_reports_profile_changed`, `must_fail_delta_with_new_profile_id_after_switch_reports_profile_changed`, `must_pass_delta_for_unknown_epoch_on_new_profile_still_reports_missing_baseline`) and `crates/synapse-mcp/src/server/tests/reality_undecodable_head_234.rs`.

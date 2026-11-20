@@ -148,6 +148,7 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | `CAPTURE_GRAPHICS_API_UNSUPPORTED` | Capture graphics API unsupported. |
 | `CAPTURE_PRINTWINDOW_DISABLED` | PrintWindow capture path disabled. |
 | `CAPTURE_PRINTWINDOW_BLACK` | PrintWindow returned a black frame. |
+| `CAPTURE_WGC_FRAME_TIMEOUT` | No WGC frame arrived for the window before the timeout (for example minimized). |
 | `CAPTURE_TARGET_LOST` | Capture target window lost. |
 | `CAPTURE_NO_DIRTY_REGIONS` | No dirty regions to capture. |
 | `A11Y_NOT_AVAILABLE` | Accessibility backend unavailable. |
@@ -301,17 +302,20 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | --- | --- |
 | `STORAGE_OPEN_FAILED` | Storage open failed. |
 | `STORAGE_WRITE_FAILED` | Storage write failed. |
+| `STORAGE_WRITE_SHED` | Disk-pressure policy refused the write; no rows in the refused batch were persisted. |
 | `STORAGE_READ_FAILED` | Storage read failed. |
 | `STORAGE_CORRUPTED` | Storage corrupted. |
 | `STORAGE_SCHEMA_MISMATCH` | Storage schema mismatch. |
 | `STORAGE_DISK_PRESSURE_LEVEL_1` … `_4` | Disk pressure escalation levels 1–4. |
 | `STORAGE_CF_HARD_CAP_REACHED` | Column-family hard cap reached. |
 
-#### Episodes / templates / tasks
+#### Episodes / routines / suggestions / templates / tasks
 
 | Code | Meaning |
 | --- | --- |
 | `EPISODE_NOT_FOUND` | Episode not found (#846/#847). |
+| `ROUTINE_NOT_FOUND` | Routine lookups completed successfully in both routine stores, but the requested routine is absent (#98). |
+| `SUGGESTION_NOT_FOUND` | Suggestion lookup completed successfully in `CF_KV`, but the requested suggestion is absent (#97). |
 | `AGENT_TEMPLATE_NOT_FOUND` | Agent spawn template not found (#909). |
 | `AGENT_TASK_NOT_FOUND` | Agent task not found (#910). |
 | `AGENT_TASK_INVALID_TRANSITION` | Invalid agent-task state transition. |
@@ -438,20 +442,12 @@ Dependencies: `metrics`, `metrics-exporter-prometheus`, `opentelemetry`, `opente
 
 Metrics use the `metrics` crate facade (re-exports `counter`, `gauge`, `histogram`, `describe_*`, `Unit`). `init_tracing` calls `register_m3_metrics()`, which describes each metric once (`Once`-guarded) and logs registration. **Export is via Prometheus** — the `metrics-exporter-prometheus` dependency is declared on this crate (the recorder/exporter is installed elsewhere in the daemon); `metrics-exporter-prometheus` and `opentelemetry-otlp` are both present as dependencies, but only the Prometheus exporter backs the registered metrics here.
 
-Cardinality budget: `CARDINALITY_LIMIT = 1_000`; each `MetricSpec` carries a `max_label_combinations` that must stay below that limit (tested). `MetricKind` = `Counter | Gauge | Histogram`. The registry `M3_METRICS` holds exactly 19 specs (12 counters, 5 gauges, 2 histograms).
+Cardinality budget: `CARDINALITY_LIMIT = 1_000`; each `MetricSpec` carries a `max_label_combinations` that must stay below that limit (tested). `MetricKind` = `Counter | Gauge | Histogram`. The registry `M3_METRICS` holds exactly 11 specs (7 counters, 3 gauges, 1 histogram). Eight metrics that were registered but never emitted anywhere (`events_published_total`, `reflex_fires_total`, `reflex_tick_jitter_us`, `reflex_recursion_clamps_total`, `reflex_starved_total`, `storage_disk_pressure_level`, `storage_cf_bytes`, `storage_write_batch_flushes_total`) were removed (#60) so dashboards cannot treat them as live; current disk-pressure level and per-CF sizes are read through `storage operation=summary`/`inspect`.
 
 | Metric name | Kind | Unit | Labels | Max combos | Measures |
 | --- | --- | --- | --- | --- | --- |
-| `events_dropped_for_subscriber` | Counter | Count | `subscription_id` | 64 | Events dropped by a bounded per-subscriber queue. |
-| `events_published_total` | Counter | Count | `source`, `kind` | 832 | Events published onto the M3 event bus. |
-| `reflex_fires_total` | Counter | Count | `kind`, `reflex_id` | 64 | Reflex fire outcomes accepted by the scheduler. |
-| `reflex_tick_jitter_us` | Histogram | Microseconds | — | 1 | Reflex scheduler tick jitter (µs). |
-| `reflex_recursion_clamps_total` | Counter | Count | — | 1 | Times the on-event recursion guard clamped firing. |
-| `reflex_starved_total` | Counter | Count | `reflex_id` | 32 | Reflexes marked starved by conflict resolution. |
+| `events_dropped_for_subscriber` | Counter | Count | `subscriber_slot` (hash bucket 0..63 of the subscription id) | 64 | Events dropped by a bounded per-subscriber queue. |
 | `cache_evictions_total` | Counter | Count | `cf`, `reason` | 64 | Rows evicted from caches / CF retention. |
-| `storage_disk_pressure_level` | Gauge | Count | — | 1 | Current storage disk pressure level (0..4). |
-| `storage_cf_bytes` | Gauge | Bytes | `cf` | 16 | Estimated live bytes per storage column family. |
-| `storage_write_batch_flushes_total` | Counter | Count | `trigger` | 8 | Storage write-batch flushes by trigger. |
 | `profiles_active` | Gauge | Count | `profile_id` | 128 | Active-profile marker (1 active / 0 inactive). |
 | `profile_reloads_total` | Counter | Count | `profile_id`, `outcome` | 256 | Profile reload attempts by profile and outcome. |
 | `audio_loopback_underruns_total` | Counter | Count | — | 1 | Audio loopback underruns while reading the ring. |

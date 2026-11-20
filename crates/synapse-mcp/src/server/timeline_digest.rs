@@ -13,7 +13,7 @@
 //! `episode_list` returns — read through the identical
 //! [`crate::m3::episodes::list_episodes`] scan, never a parallel cache. The
 //! digest therefore reconciles with `CF_EPISODES` by construction (the #850
-//! manual FSV requirement):
+//! FSV requirement):
 //!
 //! - `active_ms` == Σ episode `duration_ms`
 //! - `active_ms` == Σ(`by_app[*].active_ms`) + `by_app_other.active_ms`
@@ -54,7 +54,7 @@ use synapse_storage::{cf, decode_json};
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
 use crate::m3::episodes::{
     EpisodeListParams, EpisodeView, MAX_LIST_LIMIT, hex_encode, key_after, list_episodes,
-    local_day_start, next_local_day_start,
+    local_day_start, next_local_day_start, now_ts_ns,
 };
 use crate::m3::permissions::{Permission, RequiredPermissions, required};
 
@@ -119,7 +119,7 @@ pub struct GroupUsage {
     pub keystroke_count: u64,
     pub click_count: u64,
     /// Share of `active_ms` in parts-per-thousand (0..=1000); integer so the
-    /// row stays exactly comparable and carries no float rounding into manual FSV.
+    /// row stays exactly comparable and carries no float rounding into FSV.
     pub active_share_permille: u32,
 }
 
@@ -283,11 +283,6 @@ fn resolve_window(params: &TimelineDigestParams) -> Result<PeriodWindow, ErrorDa
         period_end_ns,
         day_starts,
     })
-}
-
-fn now_ts_ns() -> u64 {
-    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    u64::try_from(nanos).unwrap_or(0)
 }
 
 /// Pages [`list_episodes`] across the whole period and returns the episodes

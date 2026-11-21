@@ -54,7 +54,8 @@ const MAX_FRAME_OUTPUT_PIXELS: u64 = 3_840 * 2_160;
 
 /// Side of the change-test blocks, in native clip pixels.
 const BLOCK: usize = 8;
-/// Luma difference that counts a pixel as changed (above encoder noise).
+/// Largest R, G or B difference that counts a pixel as changed (above
+/// encoder noise).
 const PIXEL_DELTA: u8 = 32;
 /// Changed pixels that mark an 8x8 block as changed. A one-line text edit
 /// changes whole glyph strokes (dozens of high-contrast pixels per block).
@@ -74,7 +75,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 const VIEWS_DIR: &str = "views";
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 1;
+const ANALYSIS_VERSION: u32 = 2;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -264,6 +265,25 @@ impl ClipFolder {
         self.t_of(self.frames.len() as u64)
     }
 
+    /// Size and modified time of the files the overview is computed from; a
+    /// cached overview is reused only while this is unchanged.
+    fn fingerprint(&self) -> String {
+        [VIDEO_FILE, FRAMES_FILE, CLIP_JSON_FILE]
+            .iter()
+            .map(|name| {
+                let metadata = std::fs::metadata(self.folder.join(name)).ok();
+                let modified = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |since| since.as_nanos());
+                let size = metadata.map_or(0, |metadata| metadata.len());
+                format!("{name}:{size}:{modified}")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
     fn open_decoder(&self) -> Result<ClipDecoder, ErrorData> {
         ClipDecoder::open(&self.folder.join(VIDEO_FILE))
             .map_err(|error| internal(format!("could not open {VIDEO_FILE}: {error}")))
@@ -281,14 +301,11 @@ impl ClipFolder {
 // Change test
 // ---------------------------------------------------------------------------
 
-/// BT.601 luma of a BGRA frame, one byte per pixel.
-fn luma(bgra: &[u8]) -> Vec<u8> {
+/// R, G, B of a BGRA frame, three bytes per pixel: the change test compares
+/// colour, so a hue change with equal luma still counts.
+fn rgb(bgra: &[u8]) -> Vec<u8> {
     bgra.chunks_exact(4)
-        .map(|px| {
-            let value =
-                (29 * u32::from(px[0]) + 150 * u32::from(px[1]) + 77 * u32::from(px[2])) >> 8;
-            u8::try_from(value).unwrap_or(u8::MAX)
-        })
+        .flat_map(|px| [px[2], px[1], px[0]])
         .collect()
 }
 
@@ -319,15 +336,24 @@ impl BlockMap {
     fn between(before: &[u8], after: &[u8], width: usize, height: usize) -> Self {
         let mut map = Self::empty(width, height);
         let mut counts = vec![0_u32; map.cols * map.rows];
+        let row_bytes = width * 3;
         for y in 0..height {
-            let row = y * width;
+            let row = y * row_bytes;
             let block_row = (y / BLOCK) * map.cols;
-            let (Some(a), Some(b)) = (before.get(row..row + width), after.get(row..row + width))
-            else {
+            let (Some(a), Some(b)) = (
+                before.get(row..row + row_bytes),
+                after.get(row..row + row_bytes),
+            ) else {
                 break;
             };
-            for (x, (pa, pb)) in a.iter().zip(b).enumerate() {
-                if pa.abs_diff(*pb) > PIXEL_DELTA {
+            for (x, (pa, pb)) in a.chunks_exact(3).zip(b.chunks_exact(3)).enumerate() {
+                let delta = pa
+                    .iter()
+                    .zip(pb)
+                    .map(|(ca, cb)| ca.abs_diff(*cb))
+                    .max()
+                    .unwrap_or(0);
+                if delta > PIXEL_DELTA {
                     counts[block_row + x / BLOCK] += 1;
                 }
             }
@@ -432,6 +458,9 @@ struct Pick {
 #[derive(Serialize, Deserialize)]
 struct Analysis {
     version: u32,
+    /// `ClipFolder::fingerprint` of the files this was computed from.
+    #[serde(default)]
+    inputs: String,
     timeline: Vec<ClipTimelineEntry>,
     picks: Vec<Pick>,
     notes: Vec<String>,
@@ -460,7 +489,7 @@ impl<'a> Analyzer<'a> {
             clip,
             width: first.width as usize,
             height: first.height as usize,
-            shown: luma(&first.bgra),
+            shown: rgb(&first.bgra),
             open: None,
             done: Vec::new(),
             decoded: 1,
@@ -488,7 +517,7 @@ impl<'a> Analyzer<'a> {
         if number == 0 || !self.clip.is_new(number) || frame.width as usize != self.width {
             return;
         }
-        let current = luma(&frame.bgra);
+        let current = rgb(&frame.bgra);
         let blocks = BlockMap::between(&self.shown, &current, self.width, self.height);
         if blocks.count == 0 {
             self.new_without_change += 1;
@@ -604,7 +633,7 @@ impl<'a> Analyzer<'a> {
                 self.done.len(),
                 self.new_without_change
             ),
-            "change test: 8x8 blocks at native resolution, luma; settled after 200 ms, short-lived = back within 500 ms".to_owned(),
+            "change test: 8x8 blocks at native resolution, largest R/G/B difference; settled after 200 ms, short-lived = back within 500 ms".to_owned(),
             "no cursor mask: clip format v1 does not record the cursor position, so cursor moves count as changes".to_owned(),
         ];
         if self.decoded < clip.frames.len() as u64 {
@@ -623,6 +652,7 @@ impl<'a> Analyzer<'a> {
         }
         Analysis {
             version: ANALYSIS_VERSION,
+            inputs: String::new(),
             timeline,
             picks,
             notes,
@@ -868,10 +898,11 @@ impl ClipView {
 
     fn frame(&mut self, params: &ClipViewParams) -> Result<(), ErrorData> {
         let t_ms = params.t_ms.unwrap_or(0);
-        let last_t = self.clip.t_of(self.clip.last_frame());
-        if t_ms > last_t {
+        // The final frame stays on screen until the clip's end.
+        let duration = self.clip.duration_ms();
+        if t_ms >= duration {
             return Err(params_invalid(format!(
-                "t_ms {t_ms} is after the last frame ({last_t} ms)"
+                "t_ms {t_ms} is at or after the clip end ({duration} ms)"
             )));
         }
         let number = self.clip.frame_at_ms(t_ms);
@@ -951,7 +982,7 @@ impl ClipView {
             ));
         }
         let (width, height) = (before.width as usize, before.height as usize);
-        let blocks = BlockMap::between(&luma(&before.bgra), &luma(&after.bgra), width, height);
+        let blocks = BlockMap::between(&rgb(&before.bgra), &rgb(&after.bgra), width, height);
         let mut regions = blocks.regions();
         let _ = writeln!(
             self.text,
@@ -1003,30 +1034,33 @@ impl ClipView {
     /// `start_ms`..=`end_ms`, checked against the clip.
     fn range(&self, params: &ClipViewParams) -> Result<(u64, u64), ErrorData> {
         let (start, end) = (params.start_ms.unwrap_or(0), params.end_ms.unwrap_or(0));
-        let last_t = self.clip.t_of(self.clip.last_frame());
+        // The final frame stays on screen until the clip's end.
+        let duration = self.clip.duration_ms();
         if start >= end {
             return Err(params_invalid(format!(
                 "start_ms {start} must be before end_ms {end}"
             )));
         }
-        if start > last_t {
+        if start >= duration {
             return Err(params_invalid(format!(
-                "start_ms {start} is after the last frame ({last_t} ms)"
+                "start_ms {start} is at or after the clip end ({duration} ms)"
             )));
         }
-        Ok((start, end.min(last_t)))
+        Ok((start, end.min(duration - 1)))
     }
 
     fn analysis(&self) -> Result<Analysis, ErrorData> {
         let cache = self.clip.views_dir()?.join(ANALYSIS_FILE);
+        let inputs = self.clip.fingerprint();
         if let Some(analysis) = std::fs::read(&cache)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Analysis>(&bytes).ok())
-            .filter(|analysis| analysis.version == ANALYSIS_VERSION)
+            .filter(|analysis| analysis.version == ANALYSIS_VERSION && analysis.inputs == inputs)
         {
             return Ok(analysis);
         }
-        let analysis = Analyzer::run(&self.clip)?;
+        let mut analysis = Analyzer::run(&self.clip)?;
+        analysis.inputs = inputs;
         if let Ok(bytes) = serde_json::to_vec_pretty(&analysis) {
             let _ = std::fs::write(&cache, bytes);
         }

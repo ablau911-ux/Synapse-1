@@ -62,6 +62,8 @@ pub(super) struct ClipEncoder {
     fps: u32,
     frames_written: u64,
     readback: EncoderReadback,
+    /// `true` once `Finalize` ran; otherwise drop finalizes (error exits).
+    finalized: bool,
     _runtime: MediaFoundationRuntime,
 }
 
@@ -100,6 +102,7 @@ impl ClipEncoder {
                 rate_control_value,
                 keyframe_interval_frames: fps * KEYFRAME_INTERVAL_SECONDS,
             },
+            finalized: false,
             _runtime: runtime,
         })
     }
@@ -144,9 +147,28 @@ impl ClipEncoder {
     }
 
     /// Flushes the encoder and closes the file.
-    pub(super) fn finish(self) -> Result<EncoderReadback, String> {
+    pub(super) fn finish(mut self) -> Result<EncoderReadback, String> {
+        self.finalized = true;
         unsafe { self.writer.Finalize() }.map_err(hr("IMFSinkWriter::Finalize"))?;
-        Ok(self.readback)
+        Ok(self.readback.clone())
+    }
+}
+
+impl Drop for ClipEncoder {
+    /// Error exits after `BeginWriting` still finalize the writer; the
+    /// caller's original error is kept, so this result is only logged.
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        if let Err(error) = unsafe { self.writer.Finalize() } {
+            tracing::debug!(
+                code = "CLIP_ENCODER_FINALIZE_ON_DROP_FAILED",
+                error = %error,
+                "finalize after an earlier clip error failed"
+            );
+        }
     }
 }
 
@@ -202,7 +224,7 @@ fn open_writer(
                 .SetInputMediaType(stream, &input, &plain_params)
                 .map_err(hr("IMFSinkWriter::SetInputMediaType"))?;
         }
-        let (mode, value) = confirm_rate_control(&writer, stream);
+        let (mode, value) = confirm_rate_control(&writer, stream)?;
         writer
             .BeginWriting()
             .map_err(hr("IMFSinkWriter::BeginWriting"))?;
@@ -275,11 +297,17 @@ fn encoder_params(keyframe_interval: u32, quality: bool) -> Result<IMFAttributes
 }
 
 /// Sets quality mode on the live encoder; the encoder's answer is the
-/// readback. On refusal it switches to the 6 Mbps constant-bitrate fallback.
-fn confirm_rate_control(writer: &IMFSinkWriter, stream: u32) -> (&'static str, u32) {
-    let Some(codec) = codec_api(writer, stream) else {
-        return ("cbr_bitrate", FALLBACK_BITRATE_BPS);
-    };
+/// readback. On refusal it switches to the 6 Mbps constant-bitrate fallback,
+/// checks both setters and reports the mode and bitrate the encoder reads
+/// back. A fallback that cannot be set or confirmed is an error.
+fn confirm_rate_control(
+    writer: &IMFSinkWriter,
+    stream: u32,
+) -> Result<(&'static str, u32), String> {
+    let codec = codec_api(writer, stream).ok_or_else(|| {
+        "the encoder exposes no ICodecAPI: rate control cannot be set or read back".to_owned()
+    })?;
+    let cbr = eAVEncCommonRateControlMode_CBR.0.cast_unsigned();
     unsafe {
         let quality_accepted = codec
             .SetValue(
@@ -294,20 +322,39 @@ fn confirm_rate_control(writer: &IMFSinkWriter, stream: u32) -> (&'static str, u
                 )
                 .is_ok();
         if quality_accepted {
-            return ("quality", H264_QUALITY_LEVEL);
+            return Ok(("quality", H264_QUALITY_LEVEL));
         }
-        // The output type already carries MF_MT_AVG_BITRATE; these make the
-        // fallback explicit on encoders that honour ICodecAPI.
-        let _ = codec.SetValue(
-            &CODECAPI_AVEncCommonRateControlMode,
-            &variant_u32(eAVEncCommonRateControlMode_CBR.0.cast_unsigned()),
-        );
-        let _ = codec.SetValue(
-            &CODECAPI_AVEncCommonMeanBitRate,
-            &variant_u32(FALLBACK_BITRATE_BPS),
-        );
+        codec
+            .SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(cbr))
+            .map_err(hr("set CODECAPI_AVEncCommonRateControlMode (CBR fallback)"))?;
+        codec
+            .SetValue(
+                &CODECAPI_AVEncCommonMeanBitRate,
+                &variant_u32(FALLBACK_BITRATE_BPS),
+            )
+            .map_err(hr("set CODECAPI_AVEncCommonMeanBitRate (CBR fallback)"))?;
+        let mode = codec
+            .GetValue(&CODECAPI_AVEncCommonRateControlMode)
+            .map_err(hr("read back CODECAPI_AVEncCommonRateControlMode"))?;
+        let bitrate = codec
+            .GetValue(&CODECAPI_AVEncCommonMeanBitRate)
+            .map_err(hr("read back CODECAPI_AVEncCommonMeanBitRate"))?;
+        match (variant_as_u32(&mode), variant_as_u32(&bitrate)) {
+            (Some(mode), Some(bitrate)) if mode == cbr => Ok(("cbr_bitrate", bitrate)),
+            (mode, _) => Err(format!(
+                "the CBR fallback did not take effect: the encoder reads back rate control mode {mode:?}"
+            )),
+        }
     }
-    ("cbr_bitrate", FALLBACK_BITRATE_BPS)
+}
+
+/// The value of a `VT_UI4` VARIANT.
+fn variant_as_u32(variant: &VARIANT) -> Option<u32> {
+    // SAFETY: the union member is read only when the tag says it is a UI4.
+    unsafe {
+        let inner = &*variant.Anonymous.Anonymous;
+        (inner.vt == VT_UI4).then(|| inner.Anonymous.ulVal)
+    }
 }
 
 fn codec_api(writer: &IMFSinkWriter, stream: u32) -> Option<ICodecAPI> {

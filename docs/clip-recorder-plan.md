@@ -1,6 +1,8 @@
 # Clip recorder: building plan
 
-Status 2026-11-21 16:40 IST. Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex.
+Status 2026-11-21 16:19 IST. Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex.
+
+Since 2026-11-21 18:05 IST the owner's requirements and the equation in `docs/clip-recorder-equation.md` supersede this plan where they differ (rate, length, size, resize, encoder, keyframe interval).
 
 ## Goal
 

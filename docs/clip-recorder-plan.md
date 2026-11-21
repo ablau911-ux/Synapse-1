@@ -1,105 +1,132 @@
-# Clip recorder: building plan
+# Clip recorder: building plan (version 2)
 
-Status 2026-11-21 16:19 IST. Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex.
+Status 2026-11-21 19:45 IST. Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex, read-only.
 
-Since 2026-11-21 18:05 IST the owner's requirements and the equation in `docs/clip-recorder-equation.md` supersede this plan where they differ (rate, length, size, resize, encoder, keyframe interval).
+This is step 3 of the owner's work order: the equation in `docs/clip-recorder-equation.md` turned into an order of operations, each with its desired real-world result. Step 4 is the code, in which every tunable is a named constant that stands for one symbol of the equation.
 
-## Goal
+Version 1 of this plan (commit ad0047d1) was built as commits 7709f70c, 7e4cf3eb and be2447f8. Version 2 changes that code where the equation requires it (equation document, section 5).
 
-Agents can see clips of bugs while an app is in active use. Two parts:
+## Fixed by the owner
 
-1. **Recorder**: records a short video clip of one window or one monitor.
-2. **Viewer**: lets an agent look at a clip as a text timeline plus a few chosen still frames.
+- Flashes from 0.050 s on screen are in the clip. 60 Hz is the reference screen.
+- Never above 20 fps and never above 5 % of the processor time, on any machine. A weaker machine takes longer; nothing else gives way.
+- Every machine from a Core i3 2.2 GHz with two cores, 4 GB memory and Intel graphics.
+- 60 s by default, longer on demand. At least 480 lines. The size follows the window. Quality before bytes.
+- Viewers are the existing agents, which see still images. No automated tests (upstream policy #1699).
 
-## Sources fused
+## The process
 
-| # | Source | What it contributed |
+The work is split in two because of the 5 % rule: what cannot wait runs in the Synapse service while the screen is recorded, and what can wait runs in a worker that Windows itself limits.
+
+### A. Live part, in the Synapse service
+
+| # | Operation | Desired result | Equation |
+|---|---|---|---|
+| A1 | Read the machine: thread count, hardware H.264 encoder present, free disk | No constant of one PC in the code | R10 |
+| A2 | Check the privacy pause and the disk; refuse to start when paused or the disk is critical | Nothing is recorded that must not be | existing rule |
+| A3 | Read the window size, compute σ and the recorded size | Recorded size = window size, whole-number duplication up to at least 480 lines | G |
+| A4 | Observe the window through its own capture stream at 60 frames per second, cursor on | Every screen refresh up to 60 Hz is seen | C (1) |
+| A5 | For each instant s_k (every 50 ms) choose the last observed frame captured at or before s_k | A late recorder cannot miss a flash | C (2) |
+| A6 | If the chosen frame is the one already recorded: write only its line in `frames.jsonl` | A repeated frame costs nothing | B |
+| A7 | If it is new: read it back and put it in the waiting folder as one raw frame file, then write its line | The only pixel work in the service is one copy | a_rt |
+| A8 | Count observed frames lost and the largest observation gap; measure the processor time of the live threads | The clip can state whether C and B held | conditions |
+| A9 | On a window resize, on every 60 s, or on stop: close the segment and start the next one at the current size | The size keeps following the window; a long clip can be opened in parts | G, T |
+| A10 | Stop at the requested length, on a stop call, when the window closes, when privacy pauses, or when the disk budget is reached | Length is 60 s by default and can be extended while recording | T |
+
+### B. Worker, the same program started in worker mode
+
+Windows runs the worker inside a job object with a hard processor limit, at below-normal priority and without a window. The limit holds on any machine without the worker measuring anything.
+
+| # | Operation | Desired result | Equation |
+|---|---|---|---|
+| B1 | Take the waiting frames in order, delete each after use | The waiting folder stays small on a capable machine | t_ready |
+| B2 | Duplicate pixels by σ, convert the colours | Recorded size as computed in A3 | G |
+| B3 | Encode with H.264 through Media Foundation: the hardware encoder when A1 found one that accepts the size, the Windows software encoder otherwise | The cheapest encoder the machine has | E |
+| B4 | Give every encoded frame its instant s_k as time stamp; frames that repeat are not encoded, the picture simply stays | Bytes follow changes, not time | r |
+| B5 | Force a keyframe on the first new frame after τ since the last keyframe | Fewest bytes within the seek and crash limits | τ |
+| B6 | Quality mode at level q; if refused, bitrate = β · width · height · f, read back | Same quality on every machine | Q |
+| B7 | When a segment's frames are done: finish its video file; when all are done: write `clip.json` with the conditions and mark the clip ready | The clip says what it guarantees | conditions |
+
+### C. Calls an agent makes (operations of the `screenshot` tool)
+
+| Operation | Does | Returns |
 |---|---|---|
-| S1 | Research document `reports/Bug clip video - full research results.md` (14 sections, academic and technical sources) | Architecture, encoder choice, clip folder format, frame selection, viewer tools, defaults |
-| S2 | Measurements on this PC, 2026-11-21 (`clipbench`, H.264 only) | Real numbers: sizes, CPU, colour accuracy, 20 fps feasibility |
-| S3 | Code inspection of the current tree (capture crate, GIF recorder, screenshot facade) | What to reuse, what not to copy |
-| S4 | Review of the 51 upstream documents (README, CONTRIBUTING, systemdocs 01-18, ADRs, capability matrix) | Project rules, tool-surface limits, privacy and storage rules |
+| `record` | Starts a recording (window or monitor, length 60 s unless given) and returns at once | clip id, folder |
+| `record_status` | Reads the state | recording, encoding or ready; seconds recorded; frames waiting; conditions so far |
+| `record_stop` | Ends the recording now | as `record_status` |
+| `record_extend` | Adds time to a running recording | new end time |
+| `clip_overview`, `clip_frames`, `clip_frame`, `clip_diff` | The viewer, on a ready clip or on its finished segments | text timeline and labelled PNG images |
 
-## Owner decisions (fixed)
+### D. Viewer changes
 
-- Target: one window or one monitor. Maximum clip length 2 minutes. 20 fps default, 30 fps maximum.
-- Small files; MP4 was only an example, the encoding is chosen on evidence.
-- Windows' yellow capture border is accepted for now.
-- Viewers are the existing AI agents only (no local model, no Gemini).
-- Recording on request first. Rolling buffer and triggers come later.
-- Simple, maintainable by one person; reuse existing code; no ffmpeg, no child processes.
-- No automated tests (upstream policy #1699).
+| # | Operation | Desired result | Equation |
+|---|---|---|---|
+| D1 | Read clips made of several segments with frames at uneven times | Long and resized clips can be viewed | T, G |
+| D2 | Shrink overview images by averaging all source pixels, never below 75 % of the recorded size | Text stays readable for the fewest tokens | σ_v |
+| D3 | Enlarge close-ups by whole-number duplication ×2 | Small text becomes readable without blur | σ_v |
+| D4 | Refuse with a clear error while the part asked for is not ready, saying how many frames wait | No half-finished clip is shown as complete | t_ready |
 
-## Key facts that drive the design
+## Clip folder
 
-| Fact | Source | Consequence |
+    clip.json                 written when the clip is ready
+    frames.jsonl              one line per instant: frame, time, new or repeated, keyframe, segment
+    segment-0001.mp4 ...      one video file per segment
+    waiting/                  raw frames not yet encoded (empty when ready)
+    views/                    images the viewer exported
+
+`clip.json` gains a `conditions` block. For each of C, G, Q, B and T: the measured value, the limit, and whether it held; for a failed condition, the instants where it failed.
+
+## Parameter map (step 4: every constant is one symbol)
+
+| Symbol | Constant | File | Value | Source of the value |
+|---|---|---|---|---|
+| f | `RECORD_FPS` | `server/capture_clip.rs` | 20 | base rule |
+| observation rate | `OBSERVE_INTERVAL_MS` | `server/capture_clip.rs` | 16 | 60 Hz reference |
+| d_min | `MIN_FLASH_MS` | `server/capture_clip.rs` | 50 | requirement; equals 1000 / f |
+| t_def | `DEFAULT_DURATION_MS` | `server/capture_clip.rs` | 60,000 | requirement |
+| segment length | `SEGMENT_MS` | `server/capture_clip.rs` | 60,000 | one default clip |
+| h_min | `MIN_LINES` | `server/capture_clip.rs` | 480 | requirement |
+| U_max | `CPU_LIMIT_PERCENT` | `server/clip_worker.rs` | 5 | base rule |
+| worker share of U_max | `WORKER_CPU_PERCENT` | `server/clip_worker.rs` | 4 | 5 minus 1 for the live part (computed live need: at most 0.5 %) |
+| disk budget D | `CLIP_DISK_RESERVE_BYTES` | `server/capture_clip.rs` | stop when free disk falls below 2 GB | keeps the machine usable; to confirm with the owner |
+| q | `H264_QUALITY_LEVEL` | `server/clip_encoder.rs` | 70 until q_min is measured | built value |
+| β | `FALLBACK_BITS_PER_PIXEL_FRAME` | `server/clip_encoder.rs` | 0.10 | measured need 0.09 at level 70 |
+| τ | `KEYFRAME_INTERVAL_MS` | `server/clip_encoder.rs` | 5,000 | measured saving 40 to 79 %; crash loss at most 5 s |
+| σ_v lower bound | `OVERVIEW_MIN_SCALE` | `server/clip_viewer.rs` | 0.75 | h_leg / h_text = 9 / 12, assumed |
+| close-up factor | `CLOSEUP_SCALE` | `server/clip_viewer.rs` | 2 | whole-number duplication |
+| N | `MAX_IMAGES_PER_CALL` | `server/clip_viewer.rs` | 8 | built value |
+
+`MAX_FPS`, `MAX_DURATION_MS`, `FALLBACK_BITRATE_BPS` and `KEYFRAME_INTERVAL_SECONDS` are removed.
+
+## Known limit that stays
+
+On the weakest machine with the software encoder, a 1920 × 1080 window that changes on every recorded frame produces raw waiting frames at 166 MB per second. A disk that cannot write that fast loses frames. The recorder does not hide it: the lost frames are counted and condition C is reported as not held for those instants.
+
+## Not in this build
+
+Other codecs than H.264; colour conversion on the graphics chip; a rolling buffer that keeps only the last minutes; triggers; clicks and key presses in the clip; clip retention; removing the yellow border.
+
+## Work packages
+
+Each package is built by one agent from this plan with a time and tool-call limit, passes `cargo fmt --all` and `cargo clippy -p synapse-mcp --all-targets -- -D warnings`, is committed and pushed as `claude`, and is then reviewed by Codex read-only. Findings are fixed before the next package starts.
+
+| # | Package | Contains |
 |---|---|---|
-| Windows.Graphics.Capture is the only API that records a window behind other windows | S1 §5.1 | Use WGC through the existing `synapse-capture` stream |
-| WGC delivers frames only when content changes; its own rate control is imprecise | S1 §5.2, S2 | The recorder owns a constant-rate ticker and repeats the last frame; repeats cost almost nothing in H.264 |
-| A fully static window is a still picture, not a clip | S2 (Finance Manager runs: 1 new frame in 600) | Flag new vs repeated per frame so the viewer skips repeats |
-| Media Foundation H.264 is built into Windows; hardware use must be requested and verified | S1 §5.3 | Own MF Sink Writer encoder; record which encoder was really used |
-| The ready-made `windows-capture` encoder: bitrate only, no keyframe control, colour tint | S1 §5.3, S2 (colour error up to 21/255 vs 1-3) | Do not use it |
-| Quality-based encoding is far smaller than fixed bitrate for UI content | S2 (x264 quality 23/28: 10 / 7.2 MB/min on changing text; fixed 6 Mbps: 43.5 MB/min) | Quality rate-control mode, bitrate only as fallback |
-| 20 fps was held in every run, finalize under 200 ms | S2 | 20 fps default is safe |
-| Normal MP4 is unreadable after a crash | S1 §5.3 | Fragmented MP4 |
-| Agents and MCP results cannot carry video | S1 §8.1 | Viewer returns chosen PNG frames plus a text timeline |
-| Scene-cut detection misses UI changes (0.05-0.2 % of the frame) | S1 §8.2 | Block-level (8x8) change test for frame choice |
-| The public tool list is full at 40 | S4 | New operations on the existing `screenshot` tool, not a new tool |
-| The GIF recorder blocks a tokio worker for the whole capture | S4 (bug in `capture_gif.rs`) | Recorder runs on its own thread |
-| The shared M1 capture controller feeds `observe` | S3, S4 | Recorder uses its own `CaptureHandle`; never switches the shared one |
-| `SYNAPSE_CAPTURE_FORCE_DXGI` makes window capture impossible | S4 | Pin the WGC backend |
-| Capture channel holds 2 frames, drops the oldest | S4 | Drain continuously; report dropped frames |
-| Privacy pause and app exclusions gate every recorder | S4 (`TimelineControl::suppress_reason`) | Recorder refuses or stops when paused or excluded |
-| Raw media belongs on disk, not in RocksDB; no file retention exists yet | S4 | Clip folders under `%LOCALAPPDATA%\synapse\clips\`; retention is later work |
-| No tool returns images today; Claude Code caps a tool result near 25,000 tokens | S4, S1 §8.4 | Viewer pages at most 8 images per call, PNG, file path with each |
-
-## Part 1: Recorder (`screenshot operation=record`)
-
-**Parameters**: `window_hwnd` or `monitor_index` (else the session window target, resolved like `screenshot capture`); `duration_ms` 100..=120000; `fps` 1..=30, default 20; `folder` optional (default `%LOCALAPPDATA%\synapse\clips\<clip_id>`, must not exist).
-
-**Pipeline** (one dedicated thread):
-
-1. Check privacy (`suppress_reason`) and disk pressure (refuse at levels 3/4).
-2. Start an own `spawn_capture_loop` handle: target window or monitor, backend pinned to WGC, `min_update_interval_ms = 1000/fps`, `dirty_region_only = false`, cursor on.
-3. Ticker at 1000/fps ms: take the newest frame (drain the channel), convert with `captured_frame_region_to_bgra_bitmap`, encode; when nothing new arrived repeat the last frame and mark it repeated.
-4. Encoder: own Media Foundation Sink Writer, H.264, NV12 or RGB32 input, keyframe every 1 s, quality rate-control mode (fallback 6 Mbps), hardware transforms requested and the actual encoder recorded, fragmented MP4 (fallback normal MP4, recorded).
-5. Size fixed at clip start (even dimensions); a resized window is scaled with letterboxing. A minimized window: keep repeating, mark the interval. Never restore or focus a window.
-6. Every tick re-check privacy; stop early with the reason recorded.
-7. Write into a temp folder, rename into place at the end; remove the temp folder on error; always stop the capture handle.
-
-**Clip folder**: `clip.mp4`; `frames.jsonl` (frame number, time ms, new or repeated, keyframe); `clip.json` (schema version, clip id, Synapse version, monotonic start plus wall-clock anchor, target details, encode details incl. encoder actually used and hardware flag, health: frames new / repeated / dropped by the capture channel / achieved fps / minimized intervals / resizes / early-stop reason).
-
-**Response**: folder and file paths, `clip.mp4` size and SHA-256, duration, size, frame counts, encoder, hardware flag, container.
-
-**Errors**: `CAPTURE_TARGET_INVALID`, `CAPTURE_TARGET_LOST` (window closed), `CAPTURE_GRAPHICS_API_UNSUPPORTED`, `CAPTURE_THREAD_FAILED`; each with operation, source of truth, target id and remediation. All-black frames (hidden desktop) are an error, never a silent PrintWindow fallback.
-
-**Wiring**: `ScreenshotOperation` / `ScreenshotParams` (`m1.rs`), params and response structs next to the GIF ones, facade match and per-operation validator (`server/m1_tools/mod.rs`), `FACADE_TOOL_CONTRACTS` entry with the readback (path + size + SHA-256), same profile and permission as `gif`, tool description, README and `docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md` operation tables.
-
-**Files**: `server/capture_clip.rs` (recorder), `server/clip_encoder.rs` (Media Foundation encoder; one type owns it).
-
-## Part 2: Viewer (operations on `screenshot`)
-
-Built after the recorder, on the clip folder format above.
-
-| Operation | Returns |
-|---|---|
-| `clip_overview` | Text timeline (changes, repeats skipped, gaps stated), then up to 8 labelled key frames per call with paging |
-| `clip_frames` | Frames in a time range: at most 8 images, at most 15 fps |
-| `clip_frame` | One frame at native pixels, optional crop (at least 200 px short side) and 1-2x scale |
-| `clip_diff` | Changed regions between two times as text, plus one before/after crop |
-
-**Decoding**: Media Foundation Source Reader (built into Windows), RGB32 output, sample timestamps; `frames.jsonl` gives new/repeated flags without decoding.
-
-**Frame choice** (S1 §8.2): block-level 8x8 change test with a small mask around the cursor; settled after 200 ms without change; changes that revert within 500 ms flagged as short-lived; pick last-before and first-settled-after each change, the start of each short-lived change, one frame every 10 s as a floor, first and last frames.
-
-**Every image**: PNG; label `Image k (t=mm:ss.mmm, frame n, reason)` in the text and drawn on the exported copy (the clip stays clean); file path returned with each image.
-
-**Not in this part**: `clip_find`, `clip_transients`, events (clicks, keys, logs) joined into the clip, local captions.
-
-## Later (not in this build)
-
-Rolling buffer with triggers (hotkey, agent call, error signals); events in the clip folder; clip retention by count, age and total size; yellow border removal (packaged identity); optional local vision captions.
+| 1 | Live part | A1 to A10, the four `record*` operations, `frames.jsonl`, the waiting folder, conditions C, G, T |
+| 2 | Worker | Worker mode of the program, the job object limit, B1 to B7, `clip.json` with all conditions |
+| 3 | Viewer | D1 to D4 |
+| 4 | Proof and constants | The measurement session below; README and tool-surface tables |
 
 ## Proof
 
-Per item: `cargo fmt --all` and `cargo clippy -p synapse-mcp --all-targets -- -D warnings`. After deploy: one real recording of a window and one viewer call through the MCP client, with the clip folder read back. Codex (gpt-6.1-sol, high) reviews each part.
+After package 3, one session on the development PC with the new build deployed: a still window and a window with changing text and flashes of 50 ms, recorded for 30 s each. It must show, from `clip.json` and the files:
+
+1. Every 50 ms flash is in the clip, and the largest observation gap is at most 16.7 ms.
+2. The measured processor share is at most 5 %, and the worker's share at most 4 %.
+3. A still window produces no encoder work after the first frame.
+4. Recorded size equals the window size; a window below 480 lines is duplicated.
+5. The decoded text is readable at level 70, and at which lower level it stops being readable (q_min).
+6. The bytes per minute against the equation's figures, which gives K and P for the built encoder.
+7. The viewer opens the clip, including a resized one with two segments.
+
+The weakest machine itself cannot be proven here. Its figures remain the computed ones until one run on a real Core i3.

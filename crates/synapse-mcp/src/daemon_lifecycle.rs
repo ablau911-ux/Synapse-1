@@ -912,20 +912,20 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
                 event.route_id.clone(),
                 event.profile.clone(),
             );
-            let error_code = event
-                .error
-                .as_ref()
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    event
-                        .error
-                        .as_ref()
-                        .and_then(|error| error.get("detail_code"))
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                });
+            // Tool errors are recorded as {message, data:{code, ...}}; read the
+            // canonical code from `data` as well as the top level (#153,
+            // upstream #2165).
+            let error_code = event.error.as_ref().and_then(|error| {
+                [error, error.get("data").unwrap_or(&Value::Null)]
+                    .into_iter()
+                    .find_map(|level| {
+                        level
+                            .get("code")
+                            .and_then(Value::as_str)
+                            .or_else(|| level.get("detail_code").and_then(Value::as_str))
+                    })
+                    .map(ToOwned::to_owned)
+            });
             let entry = aggregates.entry(key).or_insert_with(|| ToolUsageAggregate {
                 tool: event.tool.clone(),
                 operation: event.operation.clone(),

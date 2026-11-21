@@ -31,30 +31,9 @@ impl From<AuditCommandQueryParams> for CommandAuditQueryParams {
 pub(super) fn summarize_command_query(
     response: CommandAuditQueryResponse,
 ) -> Result<AuditCommandQueryResponse, ErrorData> {
-    if response.partial || response.next_start_key_hex.is_some() {
-        return Err(ErrorData::new(
-            ErrorCode(-32099),
-            "audit operation=command_query reached a partial CF_ACTION_LOG page".to_owned(),
-            Some(json!({
-                "code": error_codes::STORAGE_READ_FAILED,
-                "tool": AUDIT_TOOL,
-                "operation": "command_query",
-                "source_id": response.cf_name,
-                "source_of_truth": AUDIT_SOT,
-                "page_complete": false,
-                "scanned_rows": response.scanned_rows,
-                "limit": response.limit,
-                "scan_limit": response.scan_limit,
-                "has_next_page": response.next_start_key_hex.is_some(),
-                // Surface the continuation cursor so a partial page is pageable from the
-                // public surface (#1515). This is a resume key, NOT a row-count proof, so it
-                // does not weaken the fail-closed "partial pages carry no success counts"
-                // contract enforced below (matched_rows/returned_count stay absent).
-                "next_start_key_hex": response.next_start_key_hex,
-                "remediation": "scope the read with start_ts_ns (it seeks CF_ACTION_LOG by ascending timestamp, so recent-activity queries complete in one page), or page forward by passing this next_start_key_hex back as start_key_hex until page_complete is true; a partial page intentionally omits matched/returned row counts",
-            })),
-        ));
-    }
+    // A forward page that stopped at `limit` (or at scan_limit) is a normal
+    // page: return its rows with complete=false and the resume cursor. Failing
+    // it instead hid every non-final page's rows (#201, upstream #1515/#1487).
     if response.corrupt_row_count > 0 {
         return Err(ErrorData::new(
             ErrorCode(-32099),
@@ -85,6 +64,7 @@ pub(super) fn summarize_command_query(
         has_older: response.has_older,
         oldest_returned_ts_ns: response.oldest_returned_ts_ns,
         start_key_hex: response.start_key_hex,
+        next_start_key_hex: response.next_start_key_hex,
         rows: response
             .rows
             .into_iter()

@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::m2::action_error_to_mcp;
 use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -822,10 +823,6 @@ fn at_label(at: Option<Point>) -> String {
         || "none".to_owned(),
         |point| format!("screen({},{})", point.x, point.y),
     )
-}
-
-fn action_error_to_mcp(error: &ActionError) -> ErrorData {
-    crate::m2::action_error_to_mcp(error)
 }
 
 #[cfg(windows)]

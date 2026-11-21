@@ -113,12 +113,14 @@ fn emit_key(enigo: &mut Enigo, key: &Key, direction: Direction) -> Result<(), Ac
         };
         enigo
             .raw(u16::from(*value), direction)
-            .map_err(enigo_error("emit raw scancode"))
+            .map_err(enigo_error("emit raw scancode"))?;
     } else {
         enigo
             .key(enigo_key(key)?, direction)
-            .map_err(enigo_error("emit key"))
+            .map_err(enigo_error("emit key"))?;
     }
+    super::delivery_guard::mark_batch_delivered();
+    Ok(())
 }
 
 fn validate_key(key: &Key) -> Result<(), ActionError> {

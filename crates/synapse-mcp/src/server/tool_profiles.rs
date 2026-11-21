@@ -1755,7 +1755,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "RocksDB CF row counts + audit retention report rows",
                 Some("CF row-count and GC report readback after pass"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before running GC",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
         ],
     ),
@@ -1798,7 +1798,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV local model registry row",
                 Some("registry row readback after forced structured probe"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before registering endpoints",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
             op(
                 "update",
@@ -1807,7 +1807,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV local model registry row",
                 Some("forced structured tool-call probe row readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before mutating endpoints",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
             op(
                 "remove",
@@ -1816,7 +1816,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV local model registry row + secret row",
                 Some("removed-row readback plus exact after-row absence check"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before removing endpoints",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
         ],
     ),
@@ -1850,7 +1850,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV cost/price/v1 row",
                 Some("exact CF_KV price row readback after write"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before mutating prices",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
             op(
                 "price_delete",
@@ -1859,7 +1859,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV cost/price/v1 row",
                 Some("exact CF_KV row absence/existed readback after delete"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before deleting prices",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
         ],
     ),
@@ -1884,7 +1884,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_OBSERVATIONS/CF_TIMELINE source rows",
                 Some("CF_KV hygiene flag rows linked to exact source keys"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile before batch-scanning storage",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
             op(
                 "flags",
@@ -2092,7 +2092,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "host setup files + external setup script process/socket state",
                 Some("post-repair daemon process/socket/token/config readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "switch to an explicit maintenance profile and run repair from an external process",
+                MAINTENANCE_PROFILE_REMEDIATION,
             ),
         ],
     ),
@@ -2207,6 +2207,11 @@ const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
     "release_all",
 ];
 
+/// Remediation for operations gated on `break_glass` / `full_capability`
+/// (`require_maintenance_profile`). There is no "maintenance" profile, so the
+/// text names the real, executable steps.
+pub(crate) const MAINTENANCE_PROFILE_REMEDIATION: &str = "requires profile=break_glass (or full_capability): call act operation=lease_acquire, then profile operation=set profile=break_glass confirm_break_glass=true reason=<why>, retry this operation, then restore profile=normal_agent and release the lease";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolProfileKind {
@@ -2241,6 +2246,13 @@ impl ToolProfileKind {
     /// only the serialized real-foreground tier needs break-glass/full-capability
     /// proof (#999/#1219).
     pub(crate) const fn allows_foreground_tier(self) -> bool {
+        matches!(self, Self::BreakGlass | Self::FullCapability)
+    }
+
+    /// Whether this profile may run maintenance mutations (storage GC, model
+    /// registry, cost price table, privacy controls). See
+    /// `MAINTENANCE_PROFILE_REMEDIATION` for how a caller obtains one.
+    pub(crate) const fn allows_maintenance_mutation(self) -> bool {
         matches!(self, Self::BreakGlass | Self::FullCapability)
     }
 
@@ -4070,10 +4082,7 @@ fn foreground_route_readiness(
         // Unscoped stdio admin runs without a session lease concept.
         None => true,
     };
-    let profile_allows_foreground = matches!(
-        profile,
-        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
-    );
+    let profile_allows_foreground = profile.allows_foreground_tier();
     let mut remaining_steps = Vec::new();
     if !holds_foreground_lease {
         remaining_steps.push(

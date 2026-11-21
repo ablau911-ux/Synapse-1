@@ -1381,6 +1381,9 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
         data["requesting_session_id"] = json!(requesting_session_id);
         data["retry_after_ms"] = json!(retry_after_ms);
     }
+    if matches!(error, ActionError::ForegroundLost { .. }) {
+        data["refused_before_delivery"] = json!(error.refused_before_any_delivery());
+    }
     ErrorData::new(ErrorCode(-32099), error.to_string(), Some(data))
 }
 

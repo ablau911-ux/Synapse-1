@@ -3263,12 +3263,11 @@ impl SynapseService {
                 backend: Backend::Auto,
             },
         ];
-        for action in actions {
+        for (action_index, action) in actions.into_iter().enumerate() {
             boundary.ensure("immediately_before_act_type_foreground_fallback_click")?;
-            handle
-                .execute(action)
-                .await
-                .map_err(|error| act_type_foreground_fallback_click_error(target, point, &error))?;
+            handle.execute(action).await.map_err(|error| {
+                act_type_foreground_fallback_click_error(target, point, &error, action_index == 0)
+            })?;
         }
         tracing::info!(
             code = "M2_ACT_TYPE_CHROMIUM_FOREGROUND_FALLBACK_CLICKED",
@@ -6241,6 +6240,7 @@ fn set_field_text_foreground_error(
             "reason": reason,
             "detail": detail,
             "target": target,
+            "refused_before_delivery": reason == "target_window_not_foreground",
             "backend_tier_used": crate::m2::TIER_FOREGROUND_KEYS,
             "required_foreground": true,
         })),
@@ -6348,6 +6348,7 @@ fn act_type_foreground_fallback_target_not_foreground_error(
             "code": error_codes::ACTION_FOREGROUND_LOST,
             "tool": "act_type",
             "reason": "into_element_foreground_fallback_target_not_foreground",
+            "refused_before_delivery": true,
             "foreground_expected": expected,
             "target": target,
             "required_foreground": true,
@@ -6380,6 +6381,7 @@ fn act_type_foreground_fallback_click_error(
     target: &ActTypeForegroundFallbackTarget,
     point: Point,
     error: &ActionError,
+    before_any_action: bool,
 ) -> ErrorData {
     let mapped = crate::m2::action_error_to_mcp(error);
     ErrorData::new(
@@ -6397,6 +6399,7 @@ fn act_type_foreground_fallback_click_error(
                 .unwrap_or(error_codes::ACTION_BACKEND_UNAVAILABLE),
             "tool": "act_type",
             "reason": "chromium_foreground_fallback_click_failed",
+            "refused_before_delivery": before_any_action && error.refused_before_any_delivery(),
             "point": point,
             "target": target,
             "cause": mapped.data,

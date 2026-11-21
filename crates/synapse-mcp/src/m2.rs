@@ -1229,6 +1229,18 @@ pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
                 "retry_after_ms": retry_after_ms,
             })),
         ),
+        ActionError::ForegroundLost {
+            detail,
+            before_any_delivery,
+        } => ErrorData::new(
+            ErrorCode(-32099),
+            error.to_string(),
+            Some(json!({
+                "code": error.code(),
+                "detail": detail,
+                "refused_before_delivery": before_any_delivery,
+            })),
+        ),
         _ => crate::m1::mcp_error(error.code(), error.to_string()),
     }
 }

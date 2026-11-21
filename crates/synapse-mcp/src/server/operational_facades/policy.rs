@@ -1,6 +1,6 @@
 use rmcp::{RoleServer, service::RequestContext};
 
-use crate::server::{ErrorData, SynapseService, tool_profiles::ToolProfileKind};
+use crate::server::{ErrorData, SynapseService, tool_profiles::MAINTENANCE_PROFILE_REMEDIATION};
 
 use super::errors::facade_policy_error;
 pub(super) fn session_or_stdio(
@@ -22,10 +22,7 @@ pub(super) fn require_maintenance_profile(
 ) -> Result<(), ErrorData> {
     let session_id = crate::server::context::mcp_session_id_from_request_context(request_context)?;
     let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
-    if matches!(
-        snapshot.profile,
-        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
-    ) {
+    if snapshot.profile.allows_maintenance_mutation() {
         return Ok(());
     }
     Err(facade_policy_error(
@@ -34,6 +31,6 @@ pub(super) fn require_maintenance_profile(
         source_id,
         snapshot.profile,
         source_of_truth,
-        "switch to an explicit maintenance profile with operator intent before running this mutating operation; normal_agent may use the read-only operation first",
+        MAINTENANCE_PROFILE_REMEDIATION,
     ))
 }

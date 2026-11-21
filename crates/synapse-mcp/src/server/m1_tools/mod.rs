@@ -13194,26 +13194,13 @@ fn browser_wait_facade_delegate_error(
     error: ErrorData,
     remediation: &'static str,
 ) -> ErrorData {
-    let cause_code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
-    let cause = error.data.clone().unwrap_or(Value::Null);
-    ErrorData::new(
-        error.code,
-        error.message.to_string(),
-        Some(json!({
-            "code": cause_code,
-            "operation": operation.as_str(),
-            "source_of_truth": BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH,
-            "source_id": source_id.into(),
-            "readback_source_of_truth": BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH,
-            "remediation": remediation,
-            "cause": cause,
-        })),
+    crate::server::delegate_errors::operation_delegate_error(
+        operation.as_str(),
+        BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH,
+        Some(BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH),
+        source_id,
+        error,
+        remediation,
     )
 }
 
@@ -15529,26 +15516,13 @@ fn browser_nav_delegate_error(
     error: ErrorData,
     remediation: &'static str,
 ) -> ErrorData {
-    let cause_code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
-    let cause_data = error.data.clone().unwrap_or(Value::Null);
-    ErrorData::new(
-        error.code,
-        error.message.to_string(),
-        Some(json!({
-            "code": cause_code,
-            "operation": operation.as_str(),
-            "source_of_truth": BROWSER_NAV_SOURCE_OF_TRUTH,
-            "source_id": source_id.into(),
-            "readback_source_of_truth": BROWSER_NAV_READBACK_SOURCE_OF_TRUTH,
-            "remediation": remediation,
-            "cause": cause_data,
-        })),
+    crate::server::delegate_errors::operation_delegate_error(
+        operation.as_str(),
+        BROWSER_NAV_SOURCE_OF_TRUTH,
+        Some(BROWSER_NAV_READBACK_SOURCE_OF_TRUTH),
+        source_id,
+        error,
+        remediation,
     )
 }
 

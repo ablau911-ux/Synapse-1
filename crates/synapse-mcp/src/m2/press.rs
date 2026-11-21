@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
+use crate::m2::action_error_to_mcp;
 use rmcp::ErrorData;
 use synapse_action::{ActionError, ActionHandle, RecordingBackend};
 use synapse_core::{Action, Backend, Key, KeyCode, Profile, error_codes};
@@ -431,10 +432,6 @@ fn press_action(keys: Vec<synapse_core::Key>, hold_ms: u32, backend: Backend) ->
         hold_ms,
         backend,
     }
-}
-
-fn action_error_to_mcp(error: &ActionError) -> ErrorData {
-    crate::m2::action_error_to_mcp(error)
 }
 
 const fn backend_used_name(backend: Backend) -> &'static str {

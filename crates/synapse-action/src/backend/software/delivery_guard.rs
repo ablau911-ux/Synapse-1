@@ -51,6 +51,9 @@ struct DeliveryScope {
     /// Foreground root under which the notification state was last read as
     /// non-protecting; reused while the foreground root is unchanged.
     unprotected_foreground_root: Option<i64>,
+    /// Set once input of this action was handed to the OS; a later refusal
+    /// is then not "nothing delivered".
+    delivered_any: bool,
 }
 
 thread_local! {
@@ -75,9 +78,27 @@ pub(super) fn enter_scope(target: Option<InputDeliveryTarget>) -> DeliveryScopeG
         scope.borrow_mut().replace(DeliveryScope {
             target,
             unprotected_foreground_root: None,
+            delivered_any: false,
         })
     });
     DeliveryScopeGuard { previous }
+}
+
+pub(super) fn mark_batch_delivered() {
+    SCOPE.with(|scope| {
+        if let Some(scope) = scope.borrow_mut().as_mut() {
+            scope.delivered_any = true;
+        }
+    });
+}
+
+fn nothing_delivered_yet() -> bool {
+    SCOPE.with(|scope| {
+        scope
+            .borrow()
+            .as_ref()
+            .is_none_or(|scope| !scope.delivered_any)
+    })
 }
 
 fn current_target() -> Option<InputDeliveryTarget> {
@@ -117,10 +138,10 @@ pub(super) fn ensure_pointer(kind: PointerDelivery, detail: &str) -> Result<(), 
             if kind == PointerDelivery::Press {
                 ensure_cursor_over_target(&target, detail)?;
             }
-            Ok(())
         }
-        None => ensure_human_not_in_protected_foreground(detail),
+        None => ensure_human_not_in_protected_foreground(detail)?,
     }
+    Ok(())
 }
 
 /// Classifies a raw `SendInput` batch and runs the matching check. Batches
@@ -172,6 +193,7 @@ fn ensure_foreground_is_target(
         Ok(foreground) => foreground,
         Err(error) => {
             return Err(ActionError::ForegroundLost {
+                before_any_delivery: nothing_delivered_yet(),
                 detail: format!(
                     "code={} {detail}: foreground could not be read immediately before delivery (target root_hwnd={:#x} pid={} source={}): {error}",
                     error_codes::ACTION_FOREGROUND_LOST,
@@ -201,6 +223,7 @@ fn ensure_cursor_over_target(
     // SAFETY: `point` is a valid out pointer for the duration of the call.
     if let Err(error) = unsafe { GetCursorPos(&raw mut point) } {
         return Err(ActionError::ForegroundLost {
+            before_any_delivery: nothing_delivered_yet(),
             detail: format!(
                 "code={} {detail}: cursor position could not be read before pointer press: {error}",
                 error_codes::ACTION_FOREGROUND_LOST
@@ -209,6 +232,7 @@ fn ensure_cursor_over_target(
     }
     let under = synapse_a11y::window_root_identity_at_point(point.x, point.y).map_err(|error| {
         ActionError::ForegroundLost {
+            before_any_delivery: nothing_delivered_yet(),
             detail: format!(
                 "code={} {detail}: window under cursor ({},{}) could not be read before pointer press: {error}",
                 error_codes::ACTION_FOREGROUND_LOST,
@@ -234,6 +258,7 @@ fn ensure_cursor_over_target(
         "refused pointer press: the window under the cursor is not the target"
     );
     Err(ActionError::ForegroundLost {
+        before_any_delivery: nothing_delivered_yet(),
         detail: format!(
             "code={} {detail}: window under cursor ({},{}) is root_hwnd={:#x} pid={}, not the intended target root_hwnd={:#x} pid={} source={}",
             error_codes::ACTION_FOREGROUND_LOST,
@@ -291,12 +316,18 @@ fn foreground_mismatch_error(
         "refused OS input: foreground is not the intended target"
     );
     ActionError::ForegroundLost {
+        before_any_delivery: nothing_delivered_yet(),
         detail: format!(
-            "code={} {detail}: foreground root_hwnd={foreground_root_hwnd:#x} pid={foreground_pid} (notification_state={state_text}) is not the intended target root_hwnd={:#x} pid={} source={} immediately before delivery; no input was delivered",
+            "code={} {detail}: foreground root_hwnd={foreground_root_hwnd:#x} pid={foreground_pid} (notification_state={state_text}) is not the intended target root_hwnd={:#x} pid={} source={} immediately before delivery; {}",
             error_codes::ACTION_FOREGROUND_LOST,
             target.root_hwnd,
             target.pid,
-            target.source
+            target.source,
+            if nothing_delivered_yet() {
+                "no input was delivered"
+            } else {
+                "earlier input of this action was already delivered; this batch was not"
+            }
         ),
     }
 }

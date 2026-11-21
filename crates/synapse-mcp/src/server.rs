@@ -245,6 +245,7 @@ mod browser_network;
 mod browser_storage;
 mod capture_gif;
 mod data_cleaning;
+mod delegate_errors;
 pub(crate) mod drain;
 pub(crate) mod escalation;
 mod handler;

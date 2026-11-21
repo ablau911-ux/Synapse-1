@@ -78,7 +78,7 @@ use synapse_storage::{
 
 use super::{
     ErrorData, Json, Parameters, SynapseService, agent_events::unix_time_ns_now, mcp_error, tool,
-    tool_profiles::ToolProfileKind, tool_router,
+    tool_router,
 };
 
 /// `CF_KV` key prefix for operator price rows. Versioned so a future codec can
@@ -1423,10 +1423,7 @@ fn require_cost_maintenance_profile(
 ) -> Result<(), ErrorData> {
     let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
     let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
-    if matches!(
-        snapshot.profile,
-        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
-    ) {
+    if snapshot.profile.allows_maintenance_mutation() {
         return Ok(());
     }
     Err(ErrorData::new(
@@ -1442,7 +1439,7 @@ fn require_cost_maintenance_profile(
             "source_id": source_id,
             "profile": snapshot.profile.as_str(),
             "source_of_truth": COST_SOURCE_OF_TRUTH,
-            "remediation": "switch to an explicit maintenance profile with operator intent before mutating the cost price table; normal_agent may use summarize or price_list first",
+            "remediation": super::tool_profiles::MAINTENANCE_PROFILE_REMEDIATION,
         })),
     ))
 }
@@ -1488,37 +1485,14 @@ fn cost_delegate_error(
     error: ErrorData,
     remediation: &'static str,
 ) -> ErrorData {
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "{COST_TOOL} operation={operation} failed for {source_id}: {}",
-            error.message
-        ),
-        Some(json!({
-            "code": error_code_from(&error),
-            "tool": COST_TOOL,
-            "operation": operation,
-            "source_id": source_id,
-            "source_of_truth": COST_SOURCE_OF_TRUTH,
-            "remediation": remediation,
-            "cause": {
-                "message": error.message.to_string(),
-                "data": error.data,
-            },
-        })),
+    super::delegate_errors::wrapped_delegate_error(
+        COST_TOOL,
+        operation,
+        source_id,
+        COST_SOURCE_OF_TRUTH,
+        error,
+        remediation,
     )
-}
-
-fn error_code_from(error: &ErrorData) -> String {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(|code| code.as_str())
-        .map_or_else(
-            || error_codes::TOOL_INTERNAL_ERROR.to_owned(),
-            str::to_owned,
-        )
 }
 
 /// Loads the full operator price table from `CF_KV`, keyed by normalized model

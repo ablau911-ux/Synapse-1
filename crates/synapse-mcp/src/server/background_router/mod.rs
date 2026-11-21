@@ -9957,6 +9957,20 @@ fn target_act_result_has_visual_pixel_verification(value: &Value) -> bool {
 }
 
 fn target_act_error_status(error: &ErrorData) -> &'static str {
+    // A foreground refusal raised before any input batch was delivered is a
+    // refusal, not a verify-needed outcome. Post-action readbacks raise the
+    // same code after input *was* delivered and keep verify_needed (#234,
+    // upstream #1830).
+    if target_act_error_code(error) == Some(error_codes::ACTION_FOREGROUND_LOST)
+        && error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("refused_before_delivery"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return TARGET_ACT_STATUS_REFUSED;
+    }
     match target_act_error_code(error) {
         Some(
             error_codes::ACTION_NO_OBSERVED_DELTA

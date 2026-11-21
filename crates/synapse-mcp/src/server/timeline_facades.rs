@@ -1,6 +1,5 @@
-use super::{
-    ErrorData, Json, Parameters, SynapseService, tool, tool_profiles::ToolProfileKind, tool_router,
-};
+use super::delegate_errors::delegate_error;
+use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 
 use crate::m3::{
     episodes::{EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse},
@@ -16,7 +15,7 @@ use crate::m3::{
 };
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use synapse_core::error_codes;
 
 const TIMELINE_TOOL: &str = "timeline";
@@ -582,10 +581,7 @@ impl SynapseService {
     ) -> Result<(), ErrorData> {
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         let snapshot = self.tool_profile_snapshot(session_id.as_deref())?;
-        if matches!(
-            snapshot.profile,
-            ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
-        ) {
+        if snapshot.profile.allows_maintenance_mutation() {
             return Ok(());
         }
         Err(ErrorData::new(
@@ -766,37 +762,6 @@ fn privacy_delegate_error(
         source_id,
         error,
         remediation,
-    )
-}
-
-fn delegate_error(
-    tool: &'static str,
-    operation: &'static str,
-    source_of_truth: &'static str,
-    source_id: impl Into<String>,
-    error: ErrorData,
-    remediation: &'static str,
-) -> ErrorData {
-    let cause_code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
-    let cause_data = error.data.clone().unwrap_or(Value::Null);
-    ErrorData::new(
-        error.code,
-        error.message.to_string(),
-        Some(json!({
-            "code": cause_code,
-            "tool": tool,
-            "operation": operation,
-            "source_of_truth": source_of_truth,
-            "source_id": source_id.into(),
-            "remediation": remediation,
-            "cause": cause_data,
-        })),
     )
 }
 

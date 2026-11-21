@@ -119,6 +119,11 @@ pub fn authorization_error(tool: &str, missing: Permission) -> ErrorData {
             "code": error_codes::SAFETY_PERMISSION_DENIED,
             "tool": tool,
             "missing_permission": missing.as_str(),
+            // #276: say how to obtain the grant. M3 grants come only from
+            // startup config here (the runtime overlay is reality-only).
+            "remediation": format!(
+                "start the daemon with SYNAPSE_MCP_ALLOWED_PERMISSIONS (env) or --allowed-permissions (CLI) listing {missing}"
+            ),
         })),
     )
 }

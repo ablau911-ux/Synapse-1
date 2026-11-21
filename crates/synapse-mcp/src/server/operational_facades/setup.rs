@@ -635,8 +635,9 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
         source_dir: source_dir.display().to_string(),
         setup_script_file: file_readback(setup_script),
         setup_repair_command_args,
-        setup_repair_mcp_tool: "setup operation=repair repair.reason=<reason> profile=maintenance"
-            .to_owned(),
+        setup_repair_mcp_tool:
+            "setup operation=repair repair.reason=<reason> (requires profile=break_glass)"
+                .to_owned(),
         token_file,
         daemon_run_file,
         shared_daemon_run_file,

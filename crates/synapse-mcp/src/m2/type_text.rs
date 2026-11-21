@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
+use crate::m2::action_error_to_mcp;
 use rmcp::ErrorData;
 use rmcp::model::ErrorCode;
 use rmcp::schemars::JsonSchema;
@@ -1122,10 +1123,6 @@ fn recorded_ikis(events: &[RecordedInput]) -> Vec<u32> {
             _ => None,
         })
         .collect()
-}
-
-fn action_error_to_mcp(error: &ActionError) -> ErrorData {
-    crate::m2::action_error_to_mcp(error)
 }
 
 fn a11y_error_to_mcp(error: synapse_a11y::A11yError) -> ErrorData {

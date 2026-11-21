@@ -872,7 +872,10 @@ fn extract_sample_index(detail: &str) -> Option<usize> {
 fn set_physical_cursor_pos(point: Point, detail: &'static str) -> Result<bool, ActionError> {
     super::delivery_guard::ensure_pointer(super::delivery_guard::PointerDelivery::Move, detail)?;
     Ok(match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
-        Ok(()) => true,
+        Ok(()) => {
+            super::delivery_guard::mark_batch_delivered();
+            true
+        }
         Err(error) if error.code() != windows::core::HRESULT(0) => {
             tracing::warn!(
                 code = "M2_SET_PHYSICAL_CURSOR_POS_UNAVAILABLE",

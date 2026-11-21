@@ -101,7 +101,7 @@ impl SynapseService {
                     .profile_intelligence
                     .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
                 self.require_m3_permissions(
-                    AUDIT_TOOL,
+                    "audit_profile_intelligence",
                     &crate::m3::profile_registry::required_permissions_audit(&spec),
                 )?;
                 let reflex_runtime = self.reflex_runtime().map_err(|error| {
@@ -139,7 +139,7 @@ impl SynapseService {
                     .export_bundle
                     .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
                 self.require_m3_permissions(
-                    AUDIT_TOOL,
+                    "audit_export_bundle",
                     &crate::m3::audit_export::required_permissions_bundle(&spec),
                 )?;
                 let reflex_runtime = self.reflex_runtime().map_err(|error| {

@@ -70,6 +70,9 @@ pub(super) fn send_input_batch(inputs: &[INPUT], detail: &'static str) -> Result
     // SAFETY: `inputs` points to initialized Windows `INPUT` values for the
     // duration of the call, and `cb_size` is exactly `size_of::<INPUT>()`.
     let sent = unsafe { SendInput(inputs, cb_size) };
+    if sent > 0 {
+        super::delivery_guard::mark_batch_delivered();
+    }
     let expected = u32::try_from(inputs.len()).map_err(|_err| ActionError::BackendUnavailable {
         detail: "SendInput input count does not fit u32".to_owned(),
     })?;

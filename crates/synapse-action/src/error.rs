@@ -40,7 +40,12 @@ pub enum ActionError {
         detail: String,
     },
     #[error("action foreground lost: {detail}")]
-    ForegroundLost { detail: String },
+    ForegroundLost {
+        detail: String,
+        /// True when the refusal happened before any input batch of this
+        /// action was delivered, so there is nothing to verify (#234, upstream #1830).
+        before_any_delivery: bool,
+    },
     #[error("action input target required: {detail}")]
     InputTargetRequired { detail: String },
     #[error("human fullscreen foreground protected: {detail}")]
@@ -108,7 +113,7 @@ impl ActionError {
             | Self::ElementNotResolved { detail }
             | Self::ElementPatternUnsupported { detail, .. }
             | Self::TransientElementExpired { detail, .. }
-            | Self::ForegroundLost { detail }
+            | Self::ForegroundLost { detail, .. }
             | Self::InputTargetRequired { detail }
             | Self::HumanFullscreenForeground { detail }
             | Self::UnsupportedKey { detail }
@@ -155,7 +160,13 @@ impl ActionError {
             Self::TransientElementExpired { element_id, .. } => {
                 Self::TransientElementExpired { element_id, detail }
             }
-            Self::ForegroundLost { .. } => Self::ForegroundLost { detail },
+            Self::ForegroundLost {
+                before_any_delivery,
+                ..
+            } => Self::ForegroundLost {
+                detail,
+                before_any_delivery,
+            },
             Self::InputTargetRequired { .. } => Self::InputTargetRequired { detail },
             Self::HumanFullscreenForeground { .. } => Self::HumanFullscreenForeground { detail },
             Self::UnsupportedKey { .. } => Self::UnsupportedKey { detail },
@@ -165,6 +176,19 @@ impl ActionError {
             Self::SafetyReleaseAllFired { .. } => Self::SafetyReleaseAllFired { detail },
             Self::SafetyOperatorHotkeyFired { .. } => Self::SafetyOperatorHotkeyFired { detail },
         }
+    }
+
+    /// True for a foreground refusal raised before any input batch of the
+    /// action was delivered.
+    #[must_use]
+    pub const fn refused_before_any_delivery(&self) -> bool {
+        matches!(
+            self,
+            Self::ForegroundLost {
+                before_any_delivery: true,
+                ..
+            }
+        )
     }
 
     #[must_use]

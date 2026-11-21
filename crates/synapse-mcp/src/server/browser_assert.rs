@@ -1094,13 +1094,7 @@ fn browser_dom_delegate_error(
     remediation: &'static str,
 ) -> ErrorData {
     let source_id = source_id.into();
-    let cause_code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
-        .to_owned();
+    let cause_code = crate::server::delegate_errors::delegate_code(&error);
     let cause = error.data.clone().unwrap_or(Value::Null);
     if let Some(scheme) =
         restricted_chrome_scripting_scheme(&cause_code, error.message.as_ref(), &cause)
@@ -1126,18 +1120,13 @@ fn browser_dom_delegate_error(
             })),
         );
     }
-    ErrorData::new(
-        error.code,
-        error.message.to_string(),
-        Some(json!({
-            "code": cause_code,
-            "operation": operation.as_str(),
-            "source_of_truth": DOM_SOURCE_OF_TRUTH,
-            "source_id": source_id,
-            "readback_source_of_truth": DOM_READBACK_SOURCE_OF_TRUTH,
-            "remediation": remediation,
-            "cause": cause,
-        })),
+    crate::server::delegate_errors::operation_delegate_error(
+        operation.as_str(),
+        DOM_SOURCE_OF_TRUTH,
+        Some(DOM_READBACK_SOURCE_OF_TRUTH),
+        source_id,
+        error,
+        remediation,
     )
 }
 

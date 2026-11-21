@@ -58,6 +58,8 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const STEER_KIND: &str = "steer";
 
 static NEXT_MAILBOX_SEQ: AtomicU64 = AtomicU64::new(1);
+/// Serializes inbox and receipt drains from scan through delete.
+static MAILBOX_DRAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -724,6 +726,13 @@ impl SynapseService {
         validate_inbox_params(params.max_messages)?;
         validate_kind_filter(&params.kinds)?;
         validate_session_id(session_id)?;
+        // Hold one lock from scan to delete for drains, so concurrent drains
+        // cannot both return (and "delete") the same rows (#177, upstream #1769).
+        let _drain_guard = params.drain.then(|| {
+            MAILBOX_DRAIN_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let db = self.mailbox_db()?;
         let mut scan = scan_inbox(&db, session_id, now_unix_ms)?;
         if !scan.expired_keys.is_empty() {
@@ -1373,6 +1382,11 @@ impl SynapseService {
             )));
         }
         validate_session_id(session_id)?;
+        let _drain_guard = params.drain.then(|| {
+            MAILBOX_DRAIN_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let db = self.mailbox_db()?;
         let (mut receipts, expired_keys, scanned_rows) =
             scan_receipts(&db, session_id, now_unix_ms)?;

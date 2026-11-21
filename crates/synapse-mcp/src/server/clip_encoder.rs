@@ -409,17 +409,18 @@ fn frame_time_hns(frame: u64, fps: u32) -> i64 {
         / i64::from(fps.max(1))
 }
 
-fn hr(step: &'static str) -> impl Fn(windows::core::Error) -> String {
+pub(super) fn hr(step: &'static str) -> impl Fn(windows::core::Error) -> String {
     move |error| format!("{step} failed: {error}")
 }
 
 /// COM (MTA) + Media Foundation for the current thread, released on drop.
-struct MediaFoundationRuntime {
+/// Shared with the clip decoder.
+pub(super) struct MediaFoundationRuntime {
     com_initialized: bool,
 }
 
 impl MediaFoundationRuntime {
-    fn start() -> Result<Self, String> {
+    pub(super) fn start() -> Result<Self, String> {
         // S_OK and S_FALSE both need a matching CoUninitialize; a thread that
         // is already STA (RPC_E_CHANGED_MODE) keeps its apartment.
         let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();

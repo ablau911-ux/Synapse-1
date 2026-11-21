@@ -50,10 +50,10 @@ pub(super) const DEFAULT_FPS: u32 = 20;
 pub(super) const MAX_FPS: u32 = 30;
 /// How long to wait for the first frame, which fixes the clip size.
 const FIRST_FRAME_TIMEOUT_MS: u64 = 3_000;
-const CLIP_SCHEMA_VERSION: u32 = 1;
-const VIDEO_FILE: &str = "clip.mp4";
-const FRAMES_FILE: &str = "frames.jsonl";
-const CLIP_JSON_FILE: &str = "clip.json";
+pub(super) const CLIP_SCHEMA_VERSION: u32 = 1;
+pub(super) const VIDEO_FILE: &str = "clip.mp4";
+pub(super) const FRAMES_FILE: &str = "frames.jsonl";
+pub(super) const CLIP_JSON_FILE: &str = "clip.json";
 const CLIP_SOURCE_OF_TRUTH: &str =
     "clip folder files (clip.mp4, frames.jsonl, clip.json) + target metadata";
 
@@ -863,17 +863,17 @@ fn thread_failed(detail: String) -> ErrorData {
     )
 }
 
-/// One line of `frames.jsonl`.
-#[derive(Serialize)]
-struct FrameLine {
-    frame: u64,
+/// One line of `frames.jsonl` (written here, read by the clip viewer).
+#[derive(Serialize, serde::Deserialize)]
+pub(super) struct FrameLine {
+    pub(super) frame: u64,
     /// Milliseconds from frame 0 on the constant-rate timeline.
-    t_ms: u64,
+    pub(super) t_ms: u64,
     /// `true` when Windows delivered a new frame for this tick, `false` when
     /// the previous frame was repeated.
-    new: bool,
+    pub(super) new: bool,
     /// Keyframe by the encoder's configured keyframe interval.
-    key: bool,
+    pub(super) key: bool,
 }
 
 /// `clip.json`.

@@ -380,11 +380,17 @@ pub enum ScreenshotOperation {
     Capture,
     Gif,
     Record,
+    ClipOverview,
+    ClipFrames,
+    ClipFrame,
+    ClipDiff,
 }
 
 /// Public perception artifact facade. `capture` writes a still image through
 /// the same path as `capture_screenshot`; `gif` records a bounded window GIF;
-/// `record` records an H.264 clip folder (see `CaptureClipParams`).
+/// `record` records an H.264 clip folder (see `CaptureClipParams`); the
+/// `clip_*` operations read a recorded clip folder back as a text timeline
+/// plus labelled PNG frames (see `ClipViewParams`).
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenshotParams {
@@ -420,14 +426,31 @@ pub struct ScreenshotParams {
     /// Monitor to record instead of a window. Valid only with `operation=record`.
     #[serde(default)]
     pub monitor_index: Option<u32>,
-    /// Clip frame rate (1..=30, default 20). Valid only with `operation=record`.
+    /// Clip frame rate (1..=30, default 20) with `operation=record`; sampling
+    /// rate (1..=15) with `operation=clip_frames`.
     #[serde(default)]
     pub fps: Option<u32>,
-    /// Absolute path of the clip folder to create; it must not exist yet.
-    /// Default `%LOCALAPPDATA%\synapse\clips\<clip_id>`. Valid only with
-    /// `operation=record`.
+    /// `record`: absolute path of the clip folder to create; it must not exist
+    /// yet (default `%LOCALAPPDATA%\synapse\clips\<clip_id>`). `clip_*`:
+    /// absolute path of an existing recorded clip folder (required).
     #[serde(default)]
     pub folder: Option<String>,
+    /// Range start (`clip_frames`) or the "before" time (`clip_diff`), in ms
+    /// from frame 0.
+    #[serde(default)]
+    pub start_ms: Option<u64>,
+    /// Range end (`clip_frames`, inclusive) or the "after" time (`clip_diff`).
+    #[serde(default)]
+    pub end_ms: Option<u64>,
+    /// Frame time for `clip_frame`, in ms from frame 0.
+    #[serde(default)]
+    pub t_ms: Option<u64>,
+    /// 1-based page of key frames for `clip_overview` (default 1).
+    #[serde(default)]
+    pub page: Option<u32>,
+    /// Pixel scale 1.0..=2.0 for `clip_frame` (default 1.0, native pixels).
+    #[serde(default)]
+    pub scale: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -441,6 +464,109 @@ pub struct ScreenshotResponse {
     pub gif: Option<CaptureGifResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<CaptureClipResponse>,
+    /// Result of `clip_overview`, `clip_frames`, `clip_frame` or `clip_diff`.
+    /// The PNG images themselves travel as image content next to this JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_view: Option<ClipViewResponse>,
+}
+
+/// Bounds of the `clip_*` parameters, shared by the facade validator and the
+/// clip viewer.
+pub mod clip_view_limits {
+    /// Highest sampling rate of `clip_frames`.
+    pub const MAX_FRAMES_FPS: u32 = 15;
+    /// Smallest short side of a `clip_frame` crop, in clip pixels.
+    pub const MIN_CROP_SHORT_SIDE: u32 = 200;
+    /// `clip_frame` scale range.
+    pub const MIN_SCALE: f64 = 1.0;
+    pub const MAX_SCALE: f64 = 2.0;
+    /// Bounds of the `max_long_edge` budget for overview and range images.
+    pub const MIN_LONG_EDGE: u32 = 200;
+    pub const MAX_LONG_EDGE: u32 = 1_920;
+}
+
+/// A `clip_*` request after facade validation.
+#[derive(Clone, Debug)]
+pub struct ClipViewParams {
+    pub operation: ScreenshotOperation,
+    /// Existing clip folder (absolute).
+    pub folder: String,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub t_ms: Option<u64>,
+    pub page: Option<u32>,
+    pub fps: Option<u32>,
+    /// Crop for `clip_frame`, in clip pixels.
+    pub region: Option<Rect>,
+    pub scale: Option<f64>,
+    /// Long-edge budget for `clip_overview` / `clip_frames` images.
+    pub max_long_edge: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ClipViewResponse {
+    pub clip_id: String,
+    pub folder: String,
+    pub duration_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub frames_total: u64,
+    pub frames_new: u64,
+    /// `clip_overview`: changes, static stretches and gaps in time order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline: Vec<ClipTimelineEntry>,
+    /// The images returned with this call, in content order.
+    pub images: Vec<ClipViewImage>,
+    /// `clip_diff`: changed regions (merged 8x8 blocks) in clip pixels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<ClipChangedRegion>,
+    /// `clip_overview` paging (1-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page: Option<u32>,
+    /// Limits, skipped repeats and analysis caveats.
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ClipTimelineEntry {
+    /// `change`, `short_lived`, `static` or `minimized`.
+    pub kind: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    /// Changed 8x8 blocks over the whole change (0 for `static`/`minimized`).
+    pub changed_blocks: u64,
+    /// Bounding box of the changed blocks, in clip pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<Rect>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ClipViewImage {
+    /// `k` in the label `Image k (...)`: the key-frame number across all
+    /// pages for `clip_overview`, counted within the call otherwise.
+    pub index: u32,
+    pub t_ms: u64,
+    pub frame: u64,
+    pub reason: String,
+    pub label: String,
+    /// Labelled PNG copy written under `<clip folder>\views\`.
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ClipChangedRegion {
+    pub rect: Rect,
+    pub changed_blocks: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

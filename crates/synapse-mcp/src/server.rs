@@ -246,7 +246,11 @@ mod browser_storage;
 mod capture_clip;
 mod capture_gif;
 #[cfg(windows)]
+mod clip_decoder;
+#[cfg(windows)]
 mod clip_encoder;
+#[cfg(windows)]
+mod clip_viewer;
 mod data_cleaning;
 mod delegate_errors;
 pub(crate) mod drain;

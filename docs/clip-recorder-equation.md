@@ -1,6 +1,6 @@
 # Clip recorder: requirements and equation
 
-Status: draft for the owner's approval, 2026-11-21 18:45 IST (third version: the owner's base rules of 20 fps, 5 % and 60 Hz). Branch `feature/clip-capture`.
+Status: approved by the owner 2026-11-21; section 6 (the run for the weakest machine) added 19:20 IST. Branch `feature/clip-capture`.
 
 This document covers steps 1 and 2 of the owner's work order. Steps 3 and 4 follow after approval.
 
@@ -203,6 +203,73 @@ The processor costs on the minimum machine cannot be measured on this PC. They n
 8. Keyframe interval is fixed at 1 s without a calculation.
 9. Processor load is neither measured nor limited, and no work is deferred. A repeated frame is not converted again, but it is still handed to the encoder on every tick.
 10. A clip does not report whether its conditions held.
+
+## 6. The equation run for the weakest machine (2026-11-21 19:20 IST)
+
+Weakest machine (owner): Core i3 2.2 GHz, two cores (four threads), 4 GB memory, Intel graphics. Taken as the Core i3-2330M class.
+
+### Inputs
+
+Measured on the development PC (Core i7-13620H), single thread, then multiplied by the speed ratio 3.68 (PassMark single-thread rating 3546 against 964). Nothing was measured on a real Core i3.
+
+| Cost | Development PC | Weakest machine | Per 1920 × 1080 frame there |
+|---|---|---|---|
+| c_read, read a frame back | 0.13 ns per pixel | 0.5 | 1 ms |
+| c_conv, convert colours (the code as built) | 1.65 | 6.1 | 13 ms |
+| compare 8 × 8 blocks (viewer) | 1.75 | 6.4 | 13 ms |
+| c_enc, Windows software H.264 encoder | 7.0 (measured 4.8 to 7.4) | 25.7 | 53 ms |
+| c_enc, Intel Quick Sync, processor part | 2.0 (measured 1.2 to 2.3) | 7.4 | 15 ms |
+
+- Encoder costs: the Media Foundation encoders run through ffmpeg (`h264_mf`, quality 70) on two recorded screen clips, processor time minus the decode-only run.
+- The software encoder spends as much on a repeated frame as on a new one (8.2 ms against 8.0 ms per frame at 1252 × 890).
+- Budget on the weakest machine: 0.05 × 4 threads = 0.2 thread-seconds per second.
+- Activity: "typical" is the measured changing-text window, 3.8 new frames per second; "worst" is a window that changes on every recorded frame, 20 per second.
+- Not included: c_obs, the cost of observing a frame without reading it (not measured).
+
+### Result: processor share and time until a 60-second clip is ready
+
+`t_ready = max(t_clip, A_def / (0.05 · n − a_rt))`. "Share if done live" is what the work would take without deferring; above 5 % the work is deferred and the clip is ready later.
+
+| Encoder path | Window | Typical: share if live | Typical: ready after | Worst: share if live | Worst: ready after |
+|---|---|---|---|---|---|
+| Software encoder | 854 × 480 | 1.3 % | 60 s | 6.6 % | 80 s |
+| Software encoder | 1280 × 720 | 2.8 % | 60 s | 14.9 % | 184 s |
+| Software encoder | 1920 × 1080 | 6.4 % | 77 s | 33.5 % | 439 s |
+| Quick Sync, conversion on the processor | 854 × 480 | 0.5 % | 60 s | 2.8 % | 60 s |
+| Quick Sync, conversion on the processor | 1280 × 720 | 1.2 % | 60 s | 6.4 % | 78 s |
+| Quick Sync, conversion on the processor | 1920 × 1080 | 2.8 % | 60 s | 14.4 % | 185 s |
+| Quick Sync, conversion on the graphics chip | 854 × 480 | 0.3 % | 60 s | 1.6 % | 60 s |
+| Quick Sync, conversion on the graphics chip | 1280 × 720 | 0.7 % | 60 s | 3.6 % | 60 s |
+| Quick Sync, conversion on the graphics chip | 1920 × 1080 | 1.6 % | 60 s | 8.1 % | 102 s |
+
+### What the numbers decide
+
+1. The 5 % rule holds on the weakest machine in every case; what changes is when the clip is ready. In typical use the clip is ready when the recording ends, except a 1920 × 1080 window with the software encoder (17 s later).
+2. Repeated frames must never reach the encoder. Handed over on every tick, as the code does today, the software encoder alone would take 5 % of the processor at 854 × 480, 12 % at 1280 × 720 and 27 % at 1920 × 1080, with nothing changing on screen.
+3. Reading frames back is cheap (at most 2 % of one thread); the work is in the conversion and the encoder. The hardware encoder cuts it by about 2.4 times, conversion on the graphics chip by a further 1.8 times.
+4. The worst case with the software encoder at 1920 × 1080 leaves 1,036 frames waiting at the end of a 60-second clip. Kept raw that is 8.6 GB, written at 166 MB per second, which an ordinary hard disk cannot do. Frames that wait need a cheaper form than raw, or that case must be reported as not met. Step 3 has to settle this.
+5. Memory: the frame buffers at 1920 × 1080 are 36 MB, 0.9 % of 4 GB. The encoder's own memory is not measured.
+
+### Bytes with the Windows software encoder at quality 70
+
+Measured: changing small text at 1252 × 890: 15.0 MB per minute with a keyframe every second, 9.0 with one every 5 seconds. Still window at 1502 × 1038: 2.5 and 0.5 MB per minute. Quick Sync at the same setting: 10.3 and 3.7 MB per minute (keyframe every second).
+
+Scaled by pixel count:
+
+| Window | Small changing text, keyframe 1 s / 5 s | Still window, keyframe 1 s / 5 s |
+|---|---|---|
+| 854 × 480 | 5.5 / 3.3 MB per minute | 0.7 / 0.1 |
+| 1280 × 720 | 12.4 / 7.4 | 1.5 / 0.3 |
+| 1920 × 1080 | 27.9 / 16.7 | 3.3 / 0.7 |
+
+A keyframe every 5 seconds saves 40 % on changing text and 79 % on a still window. Quality 70 gives larger files than the x264 runs (7.2 to 10 MB per minute at 1252 × 890); the lowest readable quality q_min is still not measured, so these are upper figures.
+
+### Limits of this run
+
+- The weakest-machine figures are the development PC's figures times one benchmark ratio. Memory speed, the old graphics chip and its driver are not in that ratio.
+- Whether Quick Sync is available on a 2011 Intel graphics chip under a current Windows driver is not verified.
+- The encoder costs include ffmpeg's own frame handling and a start-up share; the built recorder will differ somewhat.
+- Scripts: `scripts/clip-equation/` (`bench.rs`, `measure_encoder.ps1`, `run_equation.py`).
 
 ## Corrections
 

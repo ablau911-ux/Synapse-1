@@ -379,10 +379,12 @@ pub enum ScreenshotOperation {
     #[default]
     Capture,
     Gif,
+    Record,
 }
 
 /// Public perception artifact facade. `capture` writes a still image through
-/// the same path as `capture_screenshot`; `gif` records a bounded window GIF.
+/// the same path as `capture_screenshot`; `gif` records a bounded window GIF;
+/// `record` records an H.264 clip folder (see `CaptureClipParams`).
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenshotParams {
@@ -390,11 +392,13 @@ pub struct ScreenshotParams {
     #[serde(default)]
     pub operation: ScreenshotOperation,
     /// Output `.png`, `.jpg`, `.jpeg`, or `.gif` file path. Must be absolute.
+    /// Required for `capture` and `gif`; `record` takes `folder` instead.
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub region: Option<Rect>,
     /// Explicit per-call window override (HWND). Takes precedence over the
-    /// session's active target.
+    /// session's active target. With `operation=record`: the window to record.
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
@@ -406,12 +410,24 @@ pub struct ScreenshotParams {
     /// Still-image long-edge budget, or GIF frame long-edge budget.
     #[serde(default)]
     pub max_long_edge: Option<u32>,
-    /// GIF recording duration. Valid only with `operation=gif`.
+    /// GIF or clip recording duration. Valid only with `operation=gif`
+    /// (bounded by the GIF recorder) or `operation=record` (100..=120000).
     #[serde(default)]
     pub duration_ms: Option<u64>,
     /// GIF frame interval. Valid only with `operation=gif`.
     #[serde(default)]
     pub interval_ms: Option<u64>,
+    /// Monitor to record instead of a window. Valid only with `operation=record`.
+    #[serde(default)]
+    pub monitor_index: Option<u32>,
+    /// Clip frame rate (1..=30, default 20). Valid only with `operation=record`.
+    #[serde(default)]
+    pub fps: Option<u32>,
+    /// Absolute path of the clip folder to create; it must not exist yet.
+    /// Default `%LOCALAPPDATA%\synapse\clips\<clip_id>`. Valid only with
+    /// `operation=record`.
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -423,6 +439,8 @@ pub struct ScreenshotResponse {
     pub capture: Option<CaptureScreenshotResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gif: Option<CaptureGifResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<CaptureClipResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -464,6 +482,51 @@ pub struct CaptureGifResponse {
     pub bytes_written: u64,
     pub capture_backend: String,
     pub window_hwnd: i64,
+}
+
+/// `screenshot operation=record` request after facade validation: one window
+/// or one monitor, recorded into a clip folder (`clip.mp4`, `frames.jsonl`,
+/// `clip.json`). With neither target, the session's bound window is recorded.
+#[derive(Clone, Debug)]
+pub struct CaptureClipParams {
+    pub window_hwnd: Option<i64>,
+    pub monitor_index: Option<u32>,
+    /// Clip length in milliseconds (100..=120000).
+    pub duration_ms: u64,
+    /// Constant frame rate (1..=30, default 20).
+    pub fps: Option<u32>,
+    /// Absolute clip folder path that does not exist yet.
+    pub folder: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureClipResponse {
+    pub clip_id: String,
+    pub folder: String,
+    pub video_path: String,
+    pub frames_path: String,
+    pub clip_json_path: String,
+    /// Size of `clip.mp4` in bytes.
+    pub bytes: u64,
+    /// SHA-256 (lowercase hex) of `clip.mp4`.
+    pub sha256: String,
+    /// Encoded duration (frames / fps).
+    pub duration_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub frames_total: u64,
+    pub frames_new: u64,
+    pub frames_repeated: u64,
+    /// Friendly name of the H.264 encoder Media Foundation actually used.
+    pub encoder: String,
+    pub hardware: bool,
+    /// `fragmented_mp4`, or `mp4` when fragmented MP4 was refused.
+    pub container: String,
+    /// Why recording ended: `completed`, `target_lost` (window closed),
+    /// `privacy_paused` or `privacy_excluded_app`. Frames up to then are kept.
+    pub stopped_reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

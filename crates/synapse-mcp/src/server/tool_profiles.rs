@@ -388,6 +388,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::CAPTURE_TARGET_INVALID,
                 "bind the target and retry after the capture backend reports healthy",
             ),
+            op(
+                "record",
+                false,
+                true,
+                "clip folder files (clip.mp4, frames.jsonl, clip.json) + target metadata",
+                Some("clip.mp4 path + size + SHA-256 read back from the written file"),
+                error_codes::CAPTURE_TARGET_INVALID,
+                "bind the target and retry after the capture backend reports healthy",
+            ),
         ],
     ),
     facade_contract(

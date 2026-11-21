@@ -50,14 +50,14 @@ use crate::{
         BrowserWaitForResponse, BrowserWaitForSelectorParams, BrowserWaitForSelectorResponse,
         BrowserWaitForSelectorState, BrowserWaitForState, BrowserWaitForUrlMatchKind,
         BrowserWaitForUrlParams, BrowserWaitForUrlResponse, BrowserWaitParams, BrowserWaitResponse,
-        CaptureGifParams, CaptureGifResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
-        CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse,
-        CdpActiveElementInfo, CdpBridgeHostReadback, CdpBridgeReloadAckReadback,
-        CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse,
-        CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
-        CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
-        CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, ConsoleMessage,
-        ElementInspection, FindParams, FindResponse, HiddenDesktopPipFrameParams,
+        CaptureClipParams, CaptureClipResponse, CaptureGifParams, CaptureGifResponse,
+        CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
+        CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
+        CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse,
+        CdpCloseTabParams, CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction,
+        CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse,
+        CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse,
+        ConsoleMessage, ElementInspection, FindParams, FindResponse, HiddenDesktopPipFrameParams,
         HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, M1State, ObserveParams,
         ReadTextParams, ScreenshotOperation, ScreenshotParams, ScreenshotResponse,
         SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
@@ -243,7 +243,10 @@ mod browser_files;
 mod browser_frames;
 mod browser_network;
 mod browser_storage;
+mod capture_clip;
 mod capture_gif;
+#[cfg(windows)]
+mod clip_encoder;
 mod data_cleaning;
 mod delegate_errors;
 pub(crate) mod drain;

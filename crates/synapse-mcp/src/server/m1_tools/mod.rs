@@ -20,23 +20,23 @@ use super::{
     BrowserWaitForResponse, BrowserWaitForSelectorParams, BrowserWaitForSelectorResponse,
     BrowserWaitForSelectorState, BrowserWaitForState, BrowserWaitForUrlMatchKind,
     BrowserWaitForUrlParams, BrowserWaitForUrlResponse, BrowserWaitParams, BrowserWaitResponse,
-    CaptureGifParams, CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
-    CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
-    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
-    CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
-    CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
-    CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
-    ElementInspection, ErrorData, FindParams, FindResponse, Health, HealthParams,
-    HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json,
-    ObserveParams, Parameters, ReadTextParams, ScreenshotOperation, ScreenshotParams,
-    ScreenshotResponse, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
-    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
-    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
-    WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
-    populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
-    populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
-    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
-    tool_router,
+    CaptureClipParams, CaptureGifParams, CaptureScreenshotFormat, CaptureScreenshotParams,
+    CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo,
+    CdpBridgeHostReadback, CdpBridgeReloadAckReadback, CdpBridgeReloadParams,
+    CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse, CdpLargestContentfulPaintInfo,
+    CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams,
+    CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
+    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
+    FindParams, FindResponse, Health, HealthParams, HiddenDesktopPipFrameParams,
+    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
+    ReadTextParams, ScreenshotOperation, ScreenshotParams, ScreenshotResponse, SessionTarget,
+    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
+    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
+    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
+    mcp_error, observe_include, observe_input, populate_audio_summary, populate_clipboard_summary,
+    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
+    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
+    set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
@@ -805,7 +805,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public perception artifact facade. operation=capture writes a PNG/JPEG screenshot through the same verified artifact path as capture_screenshot. operation=gif records a bounded target-window GIF through the same artifact path as capture_gif. Both operations require an absolute output path, reject operation-irrelevant parameters, and return the physical artifact readback (path, bytes, dimensions, backend, and hash for still images)."
+        description = "Public perception artifact facade. operation=capture writes a PNG/JPEG screenshot through the same verified artifact path as capture_screenshot. operation=gif records a bounded target-window GIF through the same artifact path as capture_gif. Both operations require an absolute output path, reject operation-irrelevant parameters, and return the physical artifact readback (path, bytes, dimensions, backend, and hash for still images). operation=record records one window (window_hwnd, default the session's bound window) or one monitor (monitor_index) for duration_ms (100..=120000) at a constant fps (1..=30, default 20) into a new clip folder (folder: absolute, must not exist; default %LOCALAPPDATA%\\synapse\\clips\\<clip_id>): clip.mp4 (H.264, fragmented MP4, cursor shown), frames.jsonl (per frame: frame, t_ms, new or repeated, keyframe) and clip.json (clock, target, encoder actually used and whether hardware, health), and returns the folder and file paths plus clip.mp4 size and SHA-256. It refuses while the timeline recorder is paused, for an excluded app, or at disk-pressure level 3/4, and stops early (keeping the frames so far) on pause, exclusion or a closed window. It never restores or focuses the window; path, region, overwrite, max_pixels, max_long_edge and interval_ms are rejected."
     )]
     pub async fn screenshot(
         &self,
@@ -841,6 +841,7 @@ impl SynapseService {
                     source_of_truth: SCREENSHOT_SOURCE_OF_TRUTH.to_owned(),
                     capture: Some(capture),
                     gif: None,
+                    record: None,
                 }))
             }
             ScreenshotOperation::Gif => {
@@ -864,6 +865,18 @@ impl SynapseService {
                     source_of_truth: SCREENSHOT_SOURCE_OF_TRUTH.to_owned(),
                     capture: None,
                     gif: Some(gif),
+                    record: None,
+                }))
+            }
+            ScreenshotOperation::Record => {
+                let record = validate_screenshot_record_facade_params(params)?;
+                let record = self.capture_clip(record, &request_context).await?;
+                Ok(Json(ScreenshotResponse {
+                    operation: ScreenshotOperation::Record,
+                    source_of_truth: SCREENSHOT_SOURCE_OF_TRUTH.to_owned(),
+                    capture: None,
+                    gif: None,
+                    record: Some(record),
                 }))
             }
         }
@@ -4807,7 +4820,7 @@ impl SynapseService {
         })
     }
 
-    fn request_session_target(
+    pub(super) fn request_session_target(
         &self,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<Option<SessionTarget>, ErrorData> {
@@ -11833,7 +11846,7 @@ impl SynapseService {
     }
 }
 
-fn perception_window_hwnd(
+pub(super) fn perception_window_hwnd(
     tool: &str,
     target: &Option<SessionTarget>,
     explicit_hwnd: Option<i64>,
@@ -16872,10 +16885,133 @@ fn screenshot_operation_name(operation: ScreenshotOperation) -> &'static str {
     match operation {
         ScreenshotOperation::Capture => "capture",
         ScreenshotOperation::Gif => "gif",
+        ScreenshotOperation::Record => "record",
     }
 }
 
+/// `capture` and `gif` write one file at `path` and take no clip fields.
+fn validate_screenshot_file_facade_params(params: &ScreenshotParams) -> Result<(), ErrorData> {
+    let name = screenshot_operation_name(params.operation);
+    let clip_fields = [
+        ("monitor_index", params.monitor_index.is_some()),
+        ("fps", params.fps.is_some()),
+        ("folder", params.folder.is_some()),
+    ];
+    if let Some((field, _)) = clip_fields.iter().find(|(_, present)| *present) {
+        return Err(screenshot_facade_error(
+            params.operation,
+            format!(
+                "screenshot operation={name} rejects {field}; it is only valid with operation=record"
+            ),
+            "remove the field or call screenshot with operation=record",
+            field,
+        ));
+    }
+    if params.path.is_empty() {
+        return Err(screenshot_facade_error(
+            params.operation,
+            format!("screenshot operation={name} requires path"),
+            "pass an absolute output path",
+            "path",
+        ));
+    }
+    Ok(())
+}
+
+/// `record` takes `window_hwnd` or `monitor_index`, `duration_ms`, `fps` and
+/// `folder`; returns them bounds-checked.
+fn validate_screenshot_record_facade_params(
+    params: ScreenshotParams,
+) -> Result<CaptureClipParams, ErrorData> {
+    let invalid = |message: String, remediation: &'static str, field: &'static str| {
+        screenshot_facade_error(ScreenshotOperation::Record, message, remediation, field)
+    };
+    let rejected = [
+        ("path", !params.path.is_empty()),
+        ("region", params.region.is_some()),
+        ("overwrite", params.overwrite),
+        ("max_pixels", params.max_pixels.is_some()),
+        ("max_long_edge", params.max_long_edge.is_some()),
+        ("interval_ms", params.interval_ms.is_some()),
+    ];
+    if let Some((field, _)) = rejected.iter().find(|(_, present)| *present) {
+        return Err(invalid(
+            format!("screenshot operation=record rejects {field}"),
+            "pass only window_hwnd or monitor_index, duration_ms, fps and folder",
+            field,
+        ));
+    }
+    if params.window_hwnd.is_some() && params.monitor_index.is_some() {
+        return Err(invalid(
+            "screenshot operation=record takes window_hwnd or monitor_index, not both".to_owned(),
+            "pass one target, or neither to record the session's bound window",
+            "monitor_index",
+        ));
+    }
+    let Some(duration_ms) = params.duration_ms else {
+        return Err(invalid(
+            "screenshot operation=record requires duration_ms".to_owned(),
+            "pass duration_ms between 100 and 120000",
+            "duration_ms",
+        ));
+    };
+    let record = CaptureClipParams {
+        window_hwnd: params.window_hwnd,
+        monitor_index: params.monitor_index,
+        duration_ms,
+        fps: params.fps,
+        folder: params.folder,
+    };
+    let durations = super::capture_clip::MIN_DURATION_MS..=super::capture_clip::MAX_DURATION_MS;
+    if !durations.contains(&record.duration_ms) {
+        return Err(invalid(
+            format!(
+                "screenshot operation=record duration_ms must be {}..={}; got {}",
+                durations.start(),
+                durations.end(),
+                record.duration_ms
+            ),
+            "pass duration_ms between 100 and 120000",
+            "duration_ms",
+        ));
+    }
+    let fps_range = 1..=super::capture_clip::MAX_FPS;
+    if let Some(fps) = record.fps
+        && !fps_range.contains(&fps)
+    {
+        return Err(invalid(
+            format!(
+                "screenshot operation=record fps must be 1..={}; got {fps}",
+                fps_range.end()
+            ),
+            "pass fps between 1 and 30, or omit it for the default 20",
+            "fps",
+        ));
+    }
+    let Some(folder) = record.folder.as_deref().map(Path::new) else {
+        return Ok(record);
+    };
+    if !folder.is_absolute() || folder.parent().is_none() {
+        return Err(invalid(
+            format!(
+                "screenshot operation=record folder must be an absolute folder path: {folder:?}"
+            ),
+            "pass an absolute path for the new clip folder",
+            "folder",
+        ));
+    }
+    if folder.exists() {
+        return Err(invalid(
+            format!("screenshot operation=record folder already exists: {folder:?}"),
+            "pass a folder path that does not exist yet",
+            "folder",
+        ));
+    }
+    Ok(record)
+}
+
 fn validate_screenshot_capture_facade_params(params: &ScreenshotParams) -> Result<(), ErrorData> {
+    validate_screenshot_file_facade_params(params)?;
     if params.duration_ms.is_some() {
         return Err(screenshot_facade_error(
             ScreenshotOperation::Capture,
@@ -16896,6 +17032,7 @@ fn validate_screenshot_capture_facade_params(params: &ScreenshotParams) -> Resul
 }
 
 fn validate_screenshot_gif_facade_params(params: &ScreenshotParams) -> Result<(), ErrorData> {
+    validate_screenshot_file_facade_params(params)?;
     if params.region.is_some() {
         return Err(screenshot_facade_error(
             ScreenshotOperation::Gif,

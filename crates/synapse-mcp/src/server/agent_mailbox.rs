@@ -723,8 +723,8 @@ impl SynapseService {
         session_id: &str,
         now_unix_ms: u64,
     ) -> Result<AgentInboxResponse, ErrorData> {
-        validate_inbox_params(params.max_messages)?;
-        validate_kind_filter(&params.kinds)?;
+        validate_inbox_params(params.max_messages, "agent_inbox")?;
+        validate_kind_filter(&params.kinds, "agent_inbox")?;
         validate_session_id(session_id)?;
         // Hold one lock from scan to delete for drains, so concurrent drains
         // cannot both return (and "delete") the same rows (#177, upstream #1769).
@@ -1023,11 +1023,11 @@ impl SynapseService {
     ) -> Result<AgentSendBroadcastResponse, ErrorData> {
         validate_session_id(from_session)?;
         validate_broadcast_target(&params.to)?;
-        validate_kind(&params.kind)?;
-        validate_ttl_ms(params.ttl_ms)?;
-        validate_payload_size(&params.payload)?;
+        validate_kind(&params.kind, "agent_send_broadcast")?;
+        validate_ttl_ms(params.ttl_ms, "agent_send_broadcast")?;
+        validate_payload_size(&params.payload, "agent_send_broadcast")?;
         if let Some(artifact_handle) = &params.artifact_handle {
-            validate_artifact_handle(artifact_handle)?;
+            validate_artifact_handle(artifact_handle, "agent_send_broadcast")?;
         }
 
         let mut outcomes = Vec::new();
@@ -1593,82 +1593,84 @@ fn dashboard_json_readback(value: impl Serialize) -> Result<Value, ErrorData> {
 
 fn validate_send_params(params: &AgentSendParams) -> Result<(), ErrorData> {
     validate_session_id(&params.to_session)?;
-    validate_kind(&params.kind)?;
-    validate_ttl_ms(params.ttl_ms)?;
-    validate_payload_size(&params.payload)?;
+    validate_kind(&params.kind, "agent_send")?;
+    validate_ttl_ms(params.ttl_ms, "agent_send")?;
+    validate_payload_size(&params.payload, "agent_send")?;
     if let Some(artifact_handle) = &params.artifact_handle {
-        validate_artifact_handle(artifact_handle)?;
+        validate_artifact_handle(artifact_handle, "agent_send")?;
     }
     Ok(())
 }
 
-fn validate_kind(kind: &str) -> Result<(), ErrorData> {
+/// `op` names the called operation in errors (agent_send, agent_send_broadcast,
+/// agent_inbox, agent_wait share these checks).
+fn validate_kind(kind: &str, op: &str) -> Result<(), ErrorData> {
     let trimmed = kind.trim();
     if trimmed.is_empty() {
-        return Err(params_error("agent_send kind must not be empty"));
+        return Err(params_error(format!("{op} kind must not be empty")));
     }
     if trimmed.chars().count() > MAX_KIND_CHARS {
         return Err(params_error(format!(
-            "agent_send kind must be at most {MAX_KIND_CHARS} Unicode scalar values"
+            "{op} kind must be at most {MAX_KIND_CHARS} Unicode scalar values"
         )));
     }
     if !trimmed.chars().all(|ch| !ch.is_control()) {
-        return Err(params_error(
-            "agent_send kind must not contain control characters",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_ttl_ms(ttl_ms: u64) -> Result<(), ErrorData> {
-    if ttl_ms == 0 || ttl_ms > MAX_MESSAGE_TTL_MS {
         return Err(params_error(format!(
-            "agent_send ttl_ms must be between 1 and {MAX_MESSAGE_TTL_MS}"
+            "{op} kind must not contain control characters"
         )));
     }
     Ok(())
 }
 
-fn validate_payload_size(payload: &Value) -> Result<(), ErrorData> {
+fn validate_ttl_ms(ttl_ms: u64, op: &str) -> Result<(), ErrorData> {
+    if ttl_ms == 0 || ttl_ms > MAX_MESSAGE_TTL_MS {
+        return Err(params_error(format!(
+            "{op} ttl_ms must be between 1 and {MAX_MESSAGE_TTL_MS}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_payload_size(payload: &Value, op: &str) -> Result<(), ErrorData> {
     let encoded = synapse_storage::encode_json(payload).map_err(|error| {
         mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("agent_send payload must be JSON-encodable: {error}"),
+            format!("{op} payload must be JSON-encodable: {error}"),
         )
     })?;
     if encoded.len() > MAX_PAYLOAD_BYTES {
         return Err(params_error(format!(
-            "agent_send payload must encode to <= {MAX_PAYLOAD_BYTES} bytes; got {}",
+            "{op} payload must encode to <= {MAX_PAYLOAD_BYTES} bytes; got {}",
             encoded.len()
         )));
     }
     Ok(())
 }
 
-fn validate_artifact_handle(value: &str) -> Result<(), ErrorData> {
+fn validate_artifact_handle(value: &str, op: &str) -> Result<(), ErrorData> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(params_error(
-            "agent_send artifact_handle must not be empty when provided",
-        ));
+        return Err(params_error(format!(
+            "{op} artifact_handle must not be empty when provided"
+        )));
     }
     if trimmed.chars().count() > MAX_ARTIFACT_HANDLE_CHARS {
         return Err(params_error(format!(
-            "agent_send artifact_handle must be at most {MAX_ARTIFACT_HANDLE_CHARS} Unicode scalar values"
+            "{op} artifact_handle must be at most {MAX_ARTIFACT_HANDLE_CHARS} Unicode scalar values"
         )));
     }
     if !trimmed.chars().all(|ch| !ch.is_control()) {
-        return Err(params_error(
-            "agent_send artifact_handle must not contain control characters",
-        ));
+        return Err(params_error(format!(
+            "{op} artifact_handle must not contain control characters"
+        )));
     }
     Ok(())
 }
 
-fn validate_inbox_params(max_messages: usize) -> Result<(), ErrorData> {
+fn validate_inbox_params(max_messages: usize, op: &str) -> Result<(), ErrorData> {
     if max_messages == 0 || max_messages > MAX_MESSAGES_PER_READ {
         return Err(params_error(format!(
-            "agent_inbox max_messages must be between 1 and {MAX_MESSAGES_PER_READ}"
+            "{op} max_messages must be between 1 and {MAX_MESSAGES_PER_READ}"
         )));
     }
     Ok(())
@@ -1680,19 +1682,19 @@ fn validate_wait_params(params: &AgentWaitParams) -> Result<(), ErrorData> {
             "agent_wait timeout_ms must be <= {MAX_WAIT_TIMEOUT_MS}"
         )));
     }
-    validate_kind_filter(&params.kinds)?;
-    validate_inbox_params(params.max_messages)
+    validate_kind_filter(&params.kinds, "agent_wait")?;
+    validate_inbox_params(params.max_messages, "agent_wait")
 }
 
-fn validate_kind_filter(kinds: &[String]) -> Result<(), ErrorData> {
+fn validate_kind_filter(kinds: &[String], op: &str) -> Result<(), ErrorData> {
     if kinds.len() > MAX_KIND_FILTER_ENTRIES {
         return Err(params_error(format!(
-            "kinds filter must have at most {MAX_KIND_FILTER_ENTRIES} entries; got {}",
+            "{op} kinds filter must have at most {MAX_KIND_FILTER_ENTRIES} entries; got {}",
             kinds.len()
         )));
     }
     for kind in kinds {
-        validate_kind(kind)?;
+        validate_kind(kind, op)?;
     }
     Ok(())
 }

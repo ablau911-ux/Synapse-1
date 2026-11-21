@@ -19,7 +19,7 @@ impl SynapseService {
         tool: &'static str,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let session_id = action_session_id_from_request_context(request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         self.write_action_audit_row(tool, "started", None, &json!({}), session_id.as_deref())
     }
 
@@ -37,7 +37,7 @@ impl SynapseService {
         details: &Value,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let session_id = action_session_id_from_request_context(request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         self.write_action_audit_row(tool, "started", None, details, session_id.as_deref())
     }
 
@@ -125,7 +125,8 @@ impl SynapseService {
         details: &Value,
         request_context: &RequestContext<RoleServer>,
     ) {
-        let session_id = match action_session_id_from_request_context(request_context) {
+        let session_id = match super::context::mcp_session_id_from_request_context(request_context)
+        {
             Ok(session_id) => session_id,
             Err(session_error) => {
                 tracing::warn!(
@@ -193,7 +194,7 @@ impl SynapseService {
         result: &Result<T, ErrorData>,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let session_id = action_session_id_from_request_context(request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         match session_id.as_deref() {
             Some(session_id) => self.audit_action_result_for_session(tool, result, session_id),
             None => self.audit_action_result(tool, result),
@@ -255,7 +256,7 @@ impl SynapseService {
         details: &Value,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let session_id = action_session_id_from_request_context(request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         self.write_action_audit_row(tool, "ok", None, details, session_id.as_deref())
     }
 
@@ -266,7 +267,7 @@ impl SynapseService {
         details: &Value,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let session_id = action_session_id_from_request_context(request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         self.write_action_audit_row(
             tool,
             "error",
@@ -685,12 +686,6 @@ fn collect_action_audit_detail_redactions(value: &Value, redactions: &mut Vec<St
         }
         _ => {}
     }
-}
-
-fn action_session_id_from_request_context(
-    request_context: &RequestContext<RoleServer>,
-) -> Result<Option<String>, ErrorData> {
-    super::context::mcp_session_id_from_request_context(request_context)
 }
 
 struct ActionAuditProfileRef {

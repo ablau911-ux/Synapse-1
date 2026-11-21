@@ -4296,6 +4296,7 @@ function formatNsWindow(startNs: number, endNs: number): string {
 function costOutcome(value: unknown): { label: string; microUsd?: number } {
   const outcome = asRecord(value);
   const status = rawText(outcome.status);
+  if (status === "no_usage") return { label: "no terminal usage" };
   if (status === "priced") {
     const microUsd = numberOrZero(asRecord(outcome.cost).total_micro_usd);
     return { label: formatMicroUsd(microUsd), microUsd };

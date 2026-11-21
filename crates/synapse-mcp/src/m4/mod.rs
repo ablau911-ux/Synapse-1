@@ -15882,9 +15882,17 @@ async fn monitor_shell_job(
             terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
                 .to_owned();
         let timeout_ms = status.timeout_ms.unwrap_or_default();
+        // A real exit code means the process exited on its own after outrunning
+        // the cap, before any termination: never claim it was terminated.
+        let outcome = match status.exit_code {
+            Some(code) => format!(
+                "the process ran past it and exited on its own with exit code {code}; it was not terminated"
+            ),
+            None => "the process tree was terminated".to_owned(),
+        };
         status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
         status.error_message = Some(format!(
-            "durable job timeout_ms cap expired after {timeout_ms} ms; the process tree was terminated. \
+            "durable job timeout_ms cap expired after {timeout_ms} ms; {outcome}. \
              Durable jobs are unbounded by default — omit durable_timeout_ms (or raise it) to let the job \
              run until it exits or is cancelled with act_run_shell_cancel."
         ));
@@ -18145,6 +18153,7 @@ async fn run_allowlisted_shell_with_boundary(
     let stderr = join_capped_stream(stderr_task, "stderr").await?;
     let (error_code, error_message) = shell_budget_error(
         timed_out,
+        exit_code,
         params.timeout_ms,
         requested_execution_mode,
         inline_await_limit_ms,
@@ -18179,6 +18188,7 @@ async fn run_allowlisted_shell_with_boundary(
 
 fn shell_budget_error(
     timed_out: bool,
+    exit_code: Option<i32>,
     timeout_ms: u64,
     execution_mode: ActRunShellExecutionMode,
     inline_await_limit_ms: u64,
@@ -18204,10 +18214,19 @@ fn shell_budget_error(
              client-call budget"
         ),
     };
+    // A real exit code means the process exited on its own after outrunning the
+    // budget, before any termination: never claim it was terminated. The
+    // timeout path keeps exit_code None whenever it did terminate the tree.
+    let outcome = match exit_code {
+        Some(code) => format!(
+            "the process ran past it and exited on its own with exit code {code}; it was not terminated"
+        ),
+        None => "the process tree was terminated".to_owned(),
+    };
     (
         Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned()),
         Some(format!(
-            "caller timeout_ms budget expired after {timeout_ms} ms; the process tree was terminated. \
+            "caller timeout_ms budget expired after {timeout_ms} ms; {outcome}. \
              Inline MCP calls are guarded by a {DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS} ms client-call budget so long-running commands keep \
              a durable status handle instead of disappearing behind a client timeout. To allow more \
              time: {remediation}."

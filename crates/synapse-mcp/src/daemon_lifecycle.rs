@@ -126,6 +126,10 @@ pub struct ToolUsageTelemetry {
     pub rows_scanned: usize,
     pub segment_count: usize,
     pub aggregates: Vec<ToolUsageAggregate>,
+    /// Distinct routes seen in the scanned rows, before the aggregate cap.
+    pub aggregates_total: usize,
+    /// True when `aggregates` was cut to the cap and low-count routes are missing.
+    pub aggregates_truncated: bool,
     pub read_error: Option<String>,
 }
 
@@ -853,6 +857,8 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
             rows_scanned: 0,
             segment_count: 0,
             aggregates: Vec::new(),
+            aggregates_total: 0,
+            aggregates_truncated: false,
             read_error: Some("daemon lifecycle ledger not configured".to_owned()),
         };
     };
@@ -866,12 +872,15 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
                 rows_scanned: 0,
                 segment_count: 0,
                 aggregates: Vec::new(),
+                aggregates_total: 0,
+                aggregates_truncated: false,
                 read_error: Some(format!("{error:#}")),
             };
         }
     };
     let mut rows_scanned = 0_usize;
     let mut aggregates: BTreeMap<ToolUsageKey, ToolUsageAggregate> = BTreeMap::new();
+    let mut read_error = None;
     for path in ledger_paths.iter().rev() {
         if rows_scanned >= max_rows {
             break;
@@ -884,14 +893,10 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
         let lines = match lines {
             Ok(lines) => lines,
             Err(error) => {
-                return ToolUsageTelemetry {
-                    source_of_truth: active.display().to_string(),
-                    max_rows,
-                    rows_scanned,
-                    segment_count: ledger_paths.len(),
-                    aggregates: aggregates.into_values().collect(),
-                    read_error: Some(format!("read {}: {error}", path.display())),
-                };
+                // A failed segment keeps the partial aggregates, sorted and
+                // capped exactly like a complete read.
+                read_error = Some(format!("read {}: {error}", path.display()));
+                break;
             }
         };
         for line in lines.into_iter().rev() {
@@ -960,14 +965,17 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
             .then(left.tool.cmp(&right.tool))
             .then(left.operation.cmp(&right.operation))
     });
+    let aggregates_total = values.len();
     values.truncate(max_aggregates);
     ToolUsageTelemetry {
         source_of_truth: active.display().to_string(),
         max_rows,
         rows_scanned,
         segment_count: ledger_paths.len(),
+        aggregates_truncated: aggregates_total > values.len(),
         aggregates: values,
-        read_error: None,
+        aggregates_total,
+        read_error,
     }
 }
 

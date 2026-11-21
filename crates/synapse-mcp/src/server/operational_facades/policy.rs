@@ -12,7 +12,7 @@ pub(super) fn session_or_stdio(
     )
 }
 
-pub(super) fn require_maintenance_profile(
+pub(in crate::server) fn require_maintenance_profile(
     service: &SynapseService,
     request_context: &RequestContext<RoleServer>,
     tool: &'static str,

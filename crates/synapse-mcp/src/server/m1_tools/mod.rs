@@ -1738,14 +1738,12 @@ impl SynapseService {
             params.region.is_some(),
             original_error,
         )?;
-        let bitmap_sha256 = sha256_hex(&captured.bitmap.bytes);
         write_screenshot_bitmap(
             params,
             output_path,
             format,
             captured.bitmap,
             captured.capture_backend,
-            bitmap_sha256,
             Some(captured.context),
             None,
         )
@@ -1831,7 +1829,6 @@ impl SynapseService {
                 &captured.image_data_url,
                 params.region,
             )?;
-            let bitmap_sha256 = sha256_hex(&bitmap.bytes);
             tracing::info!(
                 code = "CDP_TARGET_SCREENSHOT_CAPTURED",
                 session_id = %session_id,
@@ -1855,7 +1852,6 @@ impl SynapseService {
                 format,
                 bitmap,
                 "chrome_debugger_page_capture_screenshot_bgra",
-                bitmap_sha256,
                 None,
                 None,
             );
@@ -1872,7 +1868,6 @@ impl SynapseService {
                     )
                 })?;
         let captured = cdp_page_bitmap_to_captured_bgra(page_bitmap, params.region)?;
-        let bitmap_sha256 = sha256_hex(&captured.bytes);
         tracing::info!(
             code = "CDP_TARGET_SCREENSHOT_CAPTURED",
             session_id = %session_id,
@@ -1888,7 +1883,6 @@ impl SynapseService {
             format,
             captured,
             "raw_cdp_page_capture_screenshot_bgra",
-            bitmap_sha256,
             target_context,
             None,
         )
@@ -17018,14 +17012,12 @@ fn capture_screen_screenshot_to_file(
             format!("capture_screenshot failed for region {region:?}: {error}"),
         )
     })?;
-    let bitmap_sha256 = sha256_hex(&captured.bytes);
     write_screenshot_bitmap(
         params,
         output_path,
         format,
         captured,
         "gdi_screen_region_bgra",
-        bitmap_sha256,
         foreground,
         None,
     )
@@ -17058,14 +17050,12 @@ fn capture_target_window_screenshot_to_file(
             retry_backoff_ms: captured.capture_retry_backoff_ms,
         });
     let captured = captured.bitmap;
-    let bitmap_sha256 = sha256_hex(&captured.bytes);
     write_screenshot_bitmap(
         params,
         output_path,
         format,
         captured,
         capture_backend,
-        bitmap_sha256,
         foreground,
         capture_retry_evidence,
     )
@@ -17743,7 +17733,6 @@ fn browser_screenshot_write_response(
     };
     let bitmap =
         stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
-    let bitmap_sha256 = sha256_hex(&bitmap.bytes);
     let write_params = CaptureScreenshotParams {
         path: params.path.clone(),
         region: Some(bitmap.region),
@@ -17759,7 +17748,6 @@ fn browser_screenshot_write_response(
         validation.format,
         bitmap,
         capture_backend,
-        bitmap_sha256,
         None,
         params.quality,
         None,
@@ -18167,7 +18155,6 @@ fn write_screenshot_bitmap(
     format: CaptureScreenshotFormat,
     captured: synapse_capture::CapturedBgraBitmap,
     capture_backend: &str,
-    bitmap_sha256: String,
     foreground: Option<ForegroundContext>,
     capture_retry_evidence: Option<CaptureRetryEvidence>,
 ) -> Result<CaptureScreenshotResponse, ErrorData> {
@@ -18177,7 +18164,6 @@ fn write_screenshot_bitmap(
         format,
         captured,
         capture_backend,
-        bitmap_sha256,
         foreground,
         None,
         capture_retry_evidence,
@@ -18190,7 +18176,6 @@ fn write_screenshot_bitmap_with_quality(
     format: CaptureScreenshotFormat,
     captured: synapse_capture::CapturedBgraBitmap,
     capture_backend: &str,
-    _bitmap_sha256: String,
     foreground: Option<ForegroundContext>,
     jpeg_quality: Option<u8>,
     capture_retry_evidence: Option<CaptureRetryEvidence>,

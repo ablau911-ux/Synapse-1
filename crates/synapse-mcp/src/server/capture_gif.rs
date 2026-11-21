@@ -114,10 +114,14 @@ impl SynapseService {
                     last_error = Some(error.to_string());
                 }
             }
-            // Pace to interval_ms, accounting for capture time.
+            // Pace to interval_ms, accounting for capture time, but never sleep
+            // past duration_ms: an interval longer than the duration must not
+            // stretch the call beyond the requested recording length.
             let spent = frame_started.elapsed();
+            let until_deadline =
+                Duration::from_millis(duration_ms).saturating_sub(started.elapsed());
             if let Some(remaining) = Duration::from_millis(interval_ms).checked_sub(spent) {
-                tokio::time::sleep(remaining).await;
+                tokio::time::sleep(remaining.min(until_deadline)).await;
             }
         }
 

@@ -109,7 +109,24 @@ pub(super) fn inspect_replay_artifact(
                     format!("JSON decode failed: {error}"),
                 )
             })?;
-            lines.push(summarize_replay_line(line_no, line, &value));
+            let summary = summarize_replay_line(line_no, line, &value);
+            // A replay record is a JSON object written by replay record (a
+            // `target`-tagged line, or a raw event/observation with `seq` and
+            // `at`) or by demo recording (a record `type`). Anything else is
+            // not a replay record and must not pass as one.
+            let raw_event_or_observation = value.get("seq").is_some() && value.get("at").is_some();
+            if !value.is_object()
+                || (summary.target.is_none()
+                    && summary.record_type.is_none()
+                    && !raw_event_or_observation)
+            {
+                return Err(replay_artifact_corrupt_error(
+                    &path,
+                    line_no,
+                    "not a replay record: expected a JSON object with a string `target`, a record `type`, or `seq` and `at`",
+                ));
+            }
+            lines.push(summary);
         }
     }
     Ok(ReplayArtifactInspectResponse {

@@ -2830,7 +2830,9 @@ fn summarize_bucket(
             continue;
         }
         summary.matching_rows += 1;
-        if let Some(status) = string_field(&row, "status") {
+        // command_audit rows carry their result in `outcome`, not `status`.
+        if let Some(status) = string_field(&row, "status").or_else(|| string_field(&row, "outcome"))
+        {
             increment(&mut summary.by_status, status);
         }
         if let Some(kind) = string_field(&row, kind_field)
@@ -3165,7 +3167,10 @@ fn summarize_report_audit(
             continue;
         }
         report.matching_rows += 1;
-        if let Some(status) = string_field(&decoded, "status") {
+        // command_audit rows carry their result in `outcome`, not `status`.
+        if let Some(status) =
+            string_field(&decoded, "status").or_else(|| string_field(&decoded, "outcome"))
+        {
             increment(&mut report.by_status, status);
         }
         if let Some(tool) = string_field(&decoded, "tool") {
@@ -3184,7 +3189,8 @@ fn summarize_report_audit(
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 tool: string_field(&decoded, "tool"),
-                status: string_field(&decoded, "status"),
+                status: string_field(&decoded, "status")
+                    .or_else(|| string_field(&decoded, "outcome")),
                 error_code: string_field(&decoded, "error_code"),
             });
         }

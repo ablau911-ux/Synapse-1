@@ -3932,8 +3932,8 @@ fn validate_profile_set_policy(
         return Err(ErrorData::new(
             ErrorCode(-32099),
             format!(
-                "explicit profile={profile_label} requires this MCP session to own the foreground input lease; current owner={:?}",
-                lease_proof.owner_session_id
+                "explicit profile={profile_label} requires this MCP session to own the foreground input lease; current owner={}",
+                lease_proof.owner_session_id.as_deref().unwrap_or("none")
             ),
             Some(json!({
                 "code": error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
@@ -3974,8 +3974,8 @@ fn validate_reality_write_grant_gate(
         return Err(ErrorData::new(
             ErrorCode(-32099),
             format!(
-                "profile operation=grant_reality_write requires this MCP session to own the foreground input lease; current owner={:?}",
-                lease_proof.owner_session_id
+                "profile operation=grant_reality_write requires this MCP session to own the foreground input lease; current owner={}",
+                lease_proof.owner_session_id.as_deref().unwrap_or("none")
             ),
             Some(json!({
                 "code": error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,

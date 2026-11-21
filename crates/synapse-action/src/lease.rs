@@ -148,7 +148,10 @@ pub struct LeaseHandoff {
 /// Error returned by [`renew`]/[`release`] when the caller is not the holder.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LeaseError {
-    #[error("input lease not held by session {session_id:?}; current holder {holder:?}")]
+    #[error(
+        "input lease not held by session {session_id}; current holder {}",
+        .holder.as_deref().unwrap_or("none")
+    )]
     NotHeld {
         session_id: String,
         holder: Option<String>,

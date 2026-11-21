@@ -331,9 +331,9 @@ pub struct CostBreakdown {
     pub total_micro_usd: u64,
 }
 
-/// Outcome of pricing one model's usage: either a computed cost, or an honest
-/// "unpriced" marker carrying the model id so the operator knows exactly which
-/// row to add to the price table.
+/// Outcome of pricing usage: a computed cost, an "unpriced" marker carrying the
+/// model id whose price row is missing, or `no_usage` for a spawn without
+/// terminal usage.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CostOutcome {
@@ -341,4 +341,7 @@ pub enum CostOutcome {
     Priced { cost: CostBreakdown },
     /// No price row exists for `model_id`; cost is deliberately unknown.
     Unpriced { model_id: String },
+    /// The spawn has no terminal usage yet, so nothing was priced; never
+    /// reported as a priced $0.
+    NoUsage,
 }

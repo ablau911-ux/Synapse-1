@@ -1201,7 +1201,7 @@ impl SynapseService {
             self,
             "act_press",
             &request_context,
-            lease_ttl_for_hold_ms(params.hold_ms),
+            crate::m2::foreground_input_lease_ttl_for_hold_ms(params.hold_ms),
         ) {
             Ok(guard) => guard,
             Err(error) => {
@@ -1349,7 +1349,7 @@ impl SynapseService {
             self,
             "act_keymap",
             &request_context,
-            lease_ttl_for_hold_ms(params.hold_ms),
+            crate::m2::foreground_input_lease_ttl_for_hold_ms(params.hold_ms),
         ) {
             Ok(guard) => guard,
             Err(error) => {
@@ -2046,18 +2046,12 @@ impl SynapseService {
     }
 }
 
-fn foreground_lease_session_id(
-    request_context: &RequestContext<RoleServer>,
-) -> Result<Option<String>, ErrorData> {
-    super::context::mcp_session_id_from_request_context(request_context)
-}
-
 impl SynapseService {
     fn foreground_click_policy_for_request(
         &self,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<ForegroundClickPolicy, ErrorData> {
-        let session_id = foreground_lease_session_id(request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         let Some(session_id_ref) = session_id.as_deref() else {
             return Ok(ForegroundClickPolicy::allowed(None));
         };
@@ -2481,16 +2475,12 @@ fn acquire_tool_foreground_input_lease_with_ttl(
     // the stable "stdio" owner (the same idiom the m3 layer uses) gives the
     // lease registry a real owner instead of refusing every foreground tier
     // over stdio.
-    let session_id =
-        foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
+    let session_id = super::context::mcp_session_id_from_request_context(request_context)?
+        .unwrap_or_else(|| "stdio".to_owned());
     if let Some(hidden_desktop) = service.session_hidden_desktop_readback(&session_id)? {
         return Err(hidden_desktop_foreground_refusal(tool, &hidden_desktop));
     }
     crate::m2::acquire_foreground_input_lease_with_ttl(tool, Some(&session_id), ttl_ms)
-}
-
-fn lease_ttl_for_hold_ms(hold_ms: u32) -> u64 {
-    crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

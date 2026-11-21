@@ -179,10 +179,6 @@ fn cursor_kv_key(spawn_id: &str) -> Vec<u8> {
     format!("{CURSOR_KV_PREFIX}{spawn_id}").into_bytes()
 }
 
-fn unix_time_ns_now() -> u64 {
-    super::agent_events::unix_time_ns_now()
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha256::new();
@@ -321,7 +317,7 @@ fn stick_cursor_error(db: &Db, cursor: &mut TranscriptCursor, detail: String) ->
         "transcript ingestion hit a sticky error; spawn is parked until the cursor is cleared"
     );
     cursor.error = Some(detail.clone());
-    cursor.updated_ts_ns = unix_time_ns_now();
+    cursor.updated_ts_ns = super::agent_events::unix_time_ns_now();
     if let Err(store_error) = store_cursor(db, cursor) {
         tracing::error!(
             code = "TRANSCRIPT_INGEST_ERROR",
@@ -393,7 +389,7 @@ pub(crate) fn ingest_spawn_dir_once(
                         source_complete: false,
                         completed_reason: None,
                         error: None,
-                        updated_ts_ns: unix_time_ns_now(),
+                        updated_ts_ns: super::agent_events::unix_time_ns_now(),
                     };
                     return Err(stick_cursor_error(db, &mut cursor, detail));
                 }
@@ -416,7 +412,7 @@ pub(crate) fn ingest_spawn_dir_once(
                 source_complete: false,
                 completed_reason: None,
                 error: None,
-                updated_ts_ns: unix_time_ns_now(),
+                updated_ts_ns: super::agent_events::unix_time_ns_now(),
             }
         }
     };
@@ -589,7 +585,7 @@ pub(crate) fn ingest_spawn_dir_once(
     cursor.offset_bytes += consumed_bytes as u64;
     cursor.parsed_rows += new_parsed;
     cursor.invalid_rows += new_invalid;
-    cursor.updated_ts_ns = unix_time_ns_now();
+    cursor.updated_ts_ns = super::agent_events::unix_time_ns_now();
     LINES_PARSED_TOTAL.fetch_add(new_parsed, Ordering::Relaxed);
     LINES_INVALID_TOTAL.fetch_add(new_invalid, Ordering::Relaxed);
 
@@ -926,7 +922,7 @@ fn parse_line(
     cursor: &mut TranscriptCursor,
 ) -> AgentTranscriptRecord {
     let mut record = AgentTranscriptRecord::new(
-        unix_time_ns_now(),
+        super::agent_events::unix_time_ns_now(),
         cursor.spawn_id.clone(),
         line_no,
         cursor.source,

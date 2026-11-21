@@ -146,7 +146,7 @@ pub fn replay_path_error(path: &Path, root: &Path) -> ErrorData {
     ErrorData::new(
         ErrorCode(-32099),
         format!(
-            "replay_record path {} must stay under {}",
+            "replay path {} must stay under {}",
             path.display(),
             root.display()
         ),
@@ -208,7 +208,7 @@ pub fn normalize_replay_path(
     if raw_path.is_empty() {
         return Err(crate::m1::mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "replay_record path must not be empty when provided",
+            "replay path must not be empty when provided",
         ));
     }
 

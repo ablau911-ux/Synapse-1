@@ -13,10 +13,6 @@ mod state;
 
 use client::VigemBackendInner;
 
-#[cfg(windows)]
-#[allow(unused_imports)]
-pub(crate) use state::{apply_pad_button, apply_pad_report, apply_pad_stick, apply_pad_trigger};
-
 /// Driver-backed `ViGEm` gamepad backend.
 ///
 /// On Windows this lazily connects to `ViGEmBus` and plugs an X360 or DS4

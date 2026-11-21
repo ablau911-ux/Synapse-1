@@ -318,8 +318,8 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
-                    "cannot persist input lease for {session_id}: status owner is {:?}",
-                    status.owner_session_id
+                    "cannot persist input lease for {session_id}: status owner is {}",
+                    status.owner_session_id.as_deref().unwrap_or("none")
                 ),
             ));
         }
@@ -373,8 +373,8 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
-                    "cannot persist input lease handoff to {to_session_id}: status owner is {:?}",
-                    status.owner_session_id
+                    "cannot persist input lease handoff to {to_session_id}: status owner is {}",
+                    status.owner_session_id.as_deref().unwrap_or("none")
                 ),
             ));
         }
@@ -433,7 +433,8 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::STORAGE_CORRUPTED,
                 format!(
-                    "persisted session lease handoff readback mismatch from={from_session_id} to={to_session_id}: from_after={from_row_exists_after} to_after={to_row_exists_after} to_row_session_id={to_row_session_id:?}"
+                    "persisted session lease handoff readback mismatch from={from_session_id} to={to_session_id}: from_after={from_row_exists_after} to_after={to_row_exists_after} to_row_session_id={}",
+                    to_row_session_id.as_deref().unwrap_or("none")
                 ),
             ));
         }

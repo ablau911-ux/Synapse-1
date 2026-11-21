@@ -199,17 +199,14 @@ pub(crate) struct ToastAction {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum ToastActionActivationType {
     Foreground,
-    Protocol,
 }
 
 impl ToastActionActivationType {
     const fn as_xml_value(self) -> &'static str {
         match self {
             Self::Foreground => "foreground",
-            Self::Protocol => "protocol",
         }
     }
 }

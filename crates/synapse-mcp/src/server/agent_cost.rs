@@ -333,7 +333,8 @@ pub struct AgentSpawnCost {
     /// Canonical disjoint token usage billed for this spawn.
     pub usage: BillableUsage,
     pub total_tokens: u64,
-    /// Locally-computed cost (or `unpriced` with the model id surfaced).
+    /// Locally-computed cost, `unpriced` with the model id surfaced, or
+    /// `no_usage` when terminal usage is absent.
     pub cost: CostOutcome,
     /// Cost the CLI reported for itself (Claude `total_cost_usd`), micro-USD.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -686,11 +687,13 @@ impl SynapseService {
                 }))
             }
             CostOperation::PricePut => {
-                require_cost_maintenance_profile(
+                super::operational_facades::policy::require_maintenance_profile(
                     self,
                     &request_context,
+                    COST_TOOL,
                     operation.as_str(),
                     "CF_KV cost/price/v1",
+                    COST_SOURCE_OF_TRUTH,
                 )?;
                 let price_put = params
                     .0
@@ -720,11 +723,13 @@ impl SynapseService {
                 }))
             }
             CostOperation::PriceDelete => {
-                require_cost_maintenance_profile(
+                super::operational_facades::policy::require_maintenance_profile(
                     self,
                     &request_context,
+                    COST_TOOL,
                     operation.as_str(),
                     "CF_KV cost/price/v1",
+                    COST_SOURCE_OF_TRUTH,
                 )?;
                 let price_delete = params
                     .0
@@ -1121,9 +1126,7 @@ impl SynapseService {
                     status: "no_terminal_usage".to_owned(),
                     usage: BillableUsage::default(),
                     total_tokens: 0,
-                    cost: CostOutcome::Priced {
-                        cost: CostBreakdown::default(),
-                    },
+                    cost: CostOutcome::NoUsage,
                     source_reported_micro_usd: None,
                     reconciliation_delta_micro_usd: None,
                     authoritative_line_no: None,
@@ -1413,35 +1416,6 @@ fn validate_cost_params(params: &CostParams) -> Result<CostOperation, ErrorData>
     } else {
         Err(cost_missing_spec(operation.as_str()))
     }
-}
-
-fn require_cost_maintenance_profile(
-    service: &SynapseService,
-    request_context: &RequestContext<RoleServer>,
-    operation: &'static str,
-    source_id: &str,
-) -> Result<(), ErrorData> {
-    let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
-    let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
-    if snapshot.profile.allows_maintenance_mutation() {
-        return Ok(());
-    }
-    Err(ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "{COST_TOOL} operation={operation} is not allowed for profile {}",
-            snapshot.profile.as_str()
-        ),
-        Some(json!({
-            "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
-            "tool": COST_TOOL,
-            "operation": operation,
-            "source_id": source_id,
-            "profile": snapshot.profile.as_str(),
-            "source_of_truth": COST_SOURCE_OF_TRUTH,
-            "remediation": super::tool_profiles::MAINTENANCE_PROFILE_REMEDIATION,
-        })),
-    ))
 }
 
 fn cost_missing_spec(operation: &str) -> ErrorData {

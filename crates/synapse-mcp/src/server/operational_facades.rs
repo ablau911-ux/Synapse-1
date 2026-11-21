@@ -1,7 +1,7 @@
 mod errors;
 mod hygiene;
 mod model;
-mod policy;
+pub(super) mod policy;
 mod response;
 mod routing;
 mod setup;

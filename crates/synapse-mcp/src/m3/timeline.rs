@@ -149,7 +149,17 @@ pub fn search_timeline(
     runtime: &Arc<Mutex<ReflexRuntime>>,
     params: &TimelineSearchParams,
 ) -> Result<TimelineSearchResponse, ErrorData> {
-    let filters = validate(params)?;
+    search_timeline_as(runtime, params, "timeline_search")
+}
+
+/// `op` names the called operation in validation errors (timeline_get reuses
+/// this search, and its errors must not say timeline_search).
+fn search_timeline_as(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &TimelineSearchParams,
+    op: &str,
+) -> Result<TimelineSearchResponse, ErrorData> {
+    let filters = validate(params, op)?;
     let runtime = lock_runtime(runtime)?;
 
     let mut matches = Vec::new();
@@ -306,7 +316,7 @@ pub fn get_timeline(
         limit: params.limit,
         cursor: params.cursor.clone(),
     };
-    let response = search_timeline(runtime, &search_params)?;
+    let response = search_timeline_as(runtime, &search_params, "timeline_get")?;
     Ok(TimelineGetResponse {
         rows: response.matches,
         scanned_rows: response.scanned_rows,
@@ -642,7 +652,7 @@ pub fn purge_timeline(
         limit: None,
         cursor: params.cursor.clone(),
     };
-    let mut filters = validate(&search_equivalent)?;
+    let mut filters = validate(&search_equivalent, "timeline_purge")?;
     // Purge has no match cap: everything matched inside the scan budget is
     // deleted; the budget plus cursor bound one call's work.
     filters.limit = usize::MAX;
@@ -1002,18 +1012,18 @@ fn now_ts_ns() -> u64 {
     u64::try_from(nanos).unwrap_or(0)
 }
 
-fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
+fn validate(params: &TimelineSearchParams, op: &str) -> Result<Filters, ErrorData> {
     let start_ts_ns = params.start_ts_ns.unwrap_or(0);
     let end_ts_ns = params.end_ts_ns.unwrap_or(u64::MAX);
     if start_ts_ns > end_ts_ns {
         return Err(invalid(format!(
-            "timeline_search start_ts_ns {start_ts_ns} must be <= end_ts_ns {end_ts_ns}"
+            "{op} start_ts_ns {start_ts_ns} must be <= end_ts_ns {end_ts_ns}"
         )));
     }
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
     if limit == 0 || limit > MAX_LIMIT {
         return Err(invalid(format!(
-            "timeline_search limit must be between 1 and {MAX_LIMIT}; got {limit}"
+            "{op} limit must be between 1 and {MAX_LIMIT}; got {limit}"
         )));
     }
     let apps_lower = params
@@ -1024,7 +1034,7 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
         .map(|app| {
             let trimmed = app.trim();
             if trimmed.is_empty() {
-                Err(invalid("timeline_search apps entries must not be empty"))
+                Err(invalid(format!("{op} apps entries must not be empty")))
             } else {
                 Ok(trimmed.to_lowercase())
             }
@@ -1036,11 +1046,11 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
         .map(|text| {
             let trimmed = text.trim();
             if trimmed.is_empty() {
-                return Err(invalid("timeline_search text must not be empty"));
+                return Err(invalid(format!("{op} text must not be empty")));
             }
             if trimmed.len() > MAX_TEXT_FILTER_BYTES {
                 return Err(invalid(format!(
-                    "timeline_search text must be <= {MAX_TEXT_FILTER_BYTES} bytes"
+                    "{op} text must be <= {MAX_TEXT_FILTER_BYTES} bytes"
                 )));
             }
             Ok(trimmed.to_lowercase())
@@ -1051,7 +1061,7 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|kind| parse_kind(kind))
+        .map(|kind| parse_kind(kind, op))
         .collect::<Result<Vec<_>, _>>()?;
     let actor = params
         .actor
@@ -1060,14 +1070,16 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
             "human" => Ok(ActorFilter::Human),
             "agent" => Ok(ActorFilter::Agent),
             other => Err(invalid(format!(
-                "timeline_search actor must be \"human\" or \"agent\"; got {other:?}"
+                "{op} actor must be \"human\" or \"agent\"; got {other:?}"
             ))),
         })
         .transpose()?;
     let start_key = match params.cursor.as_deref() {
         Some(cursor) => {
             let decoded = hex_decode(cursor).ok_or_else(|| {
-                invalid("timeline_search cursor is not a valid hex key from a prior response")
+                invalid(format!(
+                    "{op} cursor is not a valid hex key from a prior response"
+                ))
             })?;
             key_after(&decoded)
         }
@@ -1085,10 +1097,10 @@ fn validate(params: &TimelineSearchParams) -> Result<Filters, ErrorData> {
     })
 }
 
-fn parse_kind(raw: &str) -> Result<TimelineKind, ErrorData> {
+fn parse_kind(raw: &str, op: &str) -> Result<TimelineKind, ErrorData> {
     serde_json::from_value::<TimelineKind>(Value::String(raw.trim().to_owned())).map_err(|_error| {
         invalid(format!(
-            "timeline_search kinds entry {raw:?} is not a known timeline kind"
+            "{op} kinds entry {raw:?} is not a known timeline kind"
         ))
     })
 }

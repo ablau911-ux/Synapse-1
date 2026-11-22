@@ -260,7 +260,6 @@ impl StopReason {
 #[serde(rename_all = "snake_case")]
 pub(super) enum LossCause {
     SlotOverflow,
-    PrivacyDiscard,
     Disk,
     LoadShedding,
     ServiceRestart,
@@ -342,7 +341,11 @@ pub(super) struct ClipGeometry {
     pub(super) recorded_height: u32,
 }
 
-/// Session settings Windows granted (O1).
+/// Session settings Windows granted (O1). It has the fields of
+/// `synapse_capture::ObserverSettings` but stays its own stored type: that
+/// type exists only on Windows while `clip.json` is read on every platform,
+/// and the names stored in `clip.json` must not change with the capture
+/// crate. The recorder copies the grant once, when frame zero is written.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub(super) struct ObserverGrant {
     pub(super) cursor_in_picture: bool,

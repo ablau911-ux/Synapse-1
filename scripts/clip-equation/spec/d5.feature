@@ -23,8 +23,9 @@ Feature: The viewer reports each scheduled UI event once, with its type, region 
 
   Scenario: every scheduled event reported
     Given the proof clip, the page's schedule with its presentation times and regions, and the spinners running from page load
-    Then each row takes exactly one event of its kind, in its region, starting within one instant of t (typing takes all of its keys), and no event is left over
-    # Equation: one-to-one: kind = expect, bbox meets region, |start_ms - t| <= frame_ms; missed = duplicate = unexpected = 0 | Known: 0, 0, 0
+    Then each row takes exactly one event of its kind, in its region, starting within one instant of t, and no event is left over
+    And typing is matched key by key: every key presentation is covered by exactly one change, every change covers at least one key and starts within one instant of its first key, and the keys of one change form a chain allowed by D5 step 4 (each next key on the same line, at most REGION_GAP_BLOCKS = 24 columns aside, shown within SETTLE_MS after the previous one)
+    # Equation: one-to-one: kind = expect, bbox meets region, |start_ms - t| <= frame_ms; missed = duplicate = key problems = unexpected = 0 | Known: 0, 0, 0, 0
 
   Scenario: still period gives no event
     Given the proof clip
@@ -69,14 +70,14 @@ Feature: The viewer reports each scheduled UI event once, with its type, region 
     # Equation: pick.frame = N, min(end_frame + K_s, last) <= N <= last | Known: every settled change
 
   Scenario: #293-4a quiet one instant less than SETTLE_MS before the clip end is not settled
-    Given the boundary_below clip, ending 150 ms after the last change was shown
-    Then that change is quiet 150 ms before the clip end and is reported as still changing when the clip ended
-    # Equation: end_ms(clip) - end_ms(change) = SETTLE_MS - frame_ms, outcome = unsettled | Known: 150, unsettled
+    Given the boundary_below clip, its page run's timing and the recorder's clip.json and frames.jsonl
+    Then the page and the recorder alone give 150 ms of quiet after the last change, and the viewer reports that change as still changing when the clip ended
+    # Equation: quiet = stop(frames.jsonl) - ceil((page_start - s_0 + shown_ms) / frame_ms) * frame_ms = SETTLE_MS - frame_ms; outcome = unsettled | Known: 150, unsettled
 
   Scenario: #293-4b quiet exactly SETTLE_MS before the clip end is settled
-    Given the boundary_at clip, ending exactly 200 ms after the last change was shown
-    Then that change is quiet 200 ms before the clip end and is reported as settled
-    # Equation: end_ms(clip) - end_ms(change) = SETTLE_MS, outcome = settled | Known: 200, settled
+    Given the boundary_at clip, its page run's timing and the recorder's clip.json and frames.jsonl
+    Then the page and the recorder alone give exactly 200 ms of quiet after the last change, and the viewer reports that change as settled
+    # Equation: quiet = stop(frames.jsonl) - ceil((page_start - s_0 + shown_ms) / frame_ms) * frame_ms = SETTLE_MS; outcome = settled | Known: 200, settled
 
   Scenario: #293-5 only the animated stretch is exempt from FLASH
     Given the grey square's alternation and its 50 ms dark flash 400 ms after the alternation ends

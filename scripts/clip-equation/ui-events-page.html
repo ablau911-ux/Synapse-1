@@ -10,7 +10,9 @@
   The actual timing is exposed as window.actualTiming, one entry per schedule row, in ms from the
   schedule start: set_ms = the animation frame that made the change, shown_ms = the next animation
   frame (the change is on screen by then), rect = the region's box in CSS px of the viewport when
-  the change was made; for a flash also hide_ms and hidden_ms. A flash stays
+  the change was made; for a flash also hide_ms and hidden_ms; for typing also keys, one entry
+  per key presentation { n, set_ms, shown_ms, rect } (rect = character n and the caret after it).
+  window.scheduleStart is the run's schedule start (unix ms), for the boundary clips' timing. A flash stays
   on screen FLASH_MS from its shown_ms, so a late frame never shortens or hides it (issue #293).
   window.scheduleBoxFits is true when the printed schedule is shown whole, inside every viewport
   edge, and no card covers it; it is measured again on every resize.
@@ -167,6 +169,18 @@
     }, CARET_HALF_PERIOD_MS);
   }
 
+  // What key n changed: the box of character n (where the caret stood) and of the caret after it.
+  function keyRect(n) {
+    const range = document.createRange();
+    range.setStart($('typed').firstChild, n - 1);
+    range.setEnd($('typed').firstChild, n);
+    const a = range.getBoundingClientRect();
+    const b = $('caret').getBoundingClientRect();
+    const left = Math.min(a.left, b.left);
+    const top = Math.min(a.top, b.top);
+    return { x: left, y: top, w: Math.max(a.right, b.right) - left, h: Math.max(a.bottom, b.bottom) - top };
+  }
+
   function setGrey(value) {
     $('alt').style.background = 'rgb(' + value + ', ' + value + ', ' + value + ')';
   }
@@ -186,11 +200,15 @@
       const running = t < row.until_ms - row.t_ms;
       setGrey(running ? (Math.floor(t / ALT_STEP_MS) % 2 ? ALT_HIGH : ALT_LOW) : ALT_GREY);
     } },
-    typing: { tick: t => {
+    typing: { tick: (t, row, actual, now) => {
       const n = Math.min(TYPE_TEXT.length, Math.floor(t / TYPE_MS_PER_CHAR) + 1);
       if ($('typed').textContent.length !== n) {
         $('typed').textContent = TYPE_TEXT.slice(0, n);
         blinkCaret(); // solid while typing, blinks from the last key on
+        // Each key is one presentation: its own times and the box of what it changed.
+        const key = { n, set_ms: now, rect: keyRect(n) };
+        (actual.keys ??= []).push(key);
+        awaitingPaint.push([key, 'shown_ms']);
       }
     } },
     darkflash: { once: () => { $('altflash').style.display = 'block'; }, flash: 'altflash' },
@@ -221,7 +239,7 @@
         mark(actual, 'set_ms', 'shown_ms', t);
         actual.rect = rectOf(row.region);
       }
-      if (step.tick) step.tick(t - row.t_ms, row);
+      if (step.tick) step.tick(t - row.t_ms, row, actual, t);
       if (step.flash && actual.shown_ms !== undefined && actual.hide_ms === undefined && t - actual.shown_ms >= FLASH_MS) {
         $(step.flash).style.display = 'none';
         mark(actual, 'hide_ms', 'hidden_ms', t);

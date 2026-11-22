@@ -11,8 +11,8 @@
 //     "still":          { "timeline": [...], "fps": 20, "frame_ms": 50, "end_ms": 20000, "keyframes_ms": [...] },
 //     "spinner":        { "timeline": [...], "fps": 20, "frame_ms": 50 },
 //     "flash":          { "timeline": [...], "fps": 20, "frame_ms": 50, "shown_ms": [1000, 2000, ...] },
-//     "boundary_below": { "timeline": [...], "fps": 20, "frame_ms": 50, "end_ms": ..., "schedule_start_ms": ...,
-//                         "viewport": {...}, "actual": [...] },
+//     "boundary_below": { "timeline": [...], "fps": 20, "frame_ms": 50, "folder": "<clip folder>",
+//                         "page_start": <that run's window.scheduleStart>, "viewport": {...}, "actual": [...] },
 //     "boundary_at":    { same fields }
 //   }
 //   timeline and picks are the viewer's overview_analysis.json fields (ClipTimelineEntry: kind,
@@ -21,8 +21,11 @@
 //   end, (last frame + 1) * frame_ms. schedule_start_ms is the clip time of the page's schedule
 //   start. viewport maps the page's CSS px to recorded px: x_rec = x + x_css * scale. shown_ms of
 //   the flash clip lists the clip time at which each flash was presented. A boundary clip is its own
-//   page run: it carries that run's window.actualTiming as "actual"; it ends 150 ms (below) or
-//   exactly 200 ms (at) after its "last change" row was shown.
+//   page run: it carries that run's window.actualTiming as "actual" and window.scheduleStart as
+//   "page_start"; it should end 150 ms (below) or exactly 200 ms (at) after its "last change" row
+//   was shown. Its quiet time is computed from the page timing and the recorder's clip.json
+//   (clock.wall_clock_unix_ms_at_s0, fps) and frames.jsonl (the stop), never from the detector.
+//   Typing is matched key by key: actualTiming's typing entry lists every key presentation.
 // schedule.json, read from the proof run's page after the run:
 //   { "start": <unix ms>, "schedule": window.schedule, "actual": window.actualTiming,
 //     "always": window.always, "box_fits": window.scheduleBoxFits }
@@ -41,6 +44,7 @@ const EVENT_KINDS = new Set(['change', 'short_lived', 'animating']);
 const SETTLE_MS = 200;
 const SHORT_LIVED_MS = 500;
 const BLOCK_PX = 8;
+const REGION_GAP_COLUMNS = 24; // clip_viewer.rs REGION_GAP_BLOCKS.0
 const FLASH_MS = 50;
 const SETTLED_PICK = 'settled frame after change';
 const CONFIRMED = /settled at .*confirmed at frame (\d+)/;
@@ -90,22 +94,60 @@ class ViewedClip {
     return this.events.filter((e) => e.kind === kind).length;
   }
 
-  /** `true` when the event's box meets `rect` (recorded px), one block of slack. */
-  static meets(event, rect) {
+  /** `true` when the event's box meets `rect` (recorded px), with `slack` px (one block). */
+  static meets(event, rect, slack = BLOCK_PX) {
     const b = event.bbox;
     if (!b || !rect) return false;
-    return b.x < rect.x + rect.w + BLOCK_PX && rect.x < b.x + b.w + BLOCK_PX
-      && b.y < rect.y + rect.h + BLOCK_PX && rect.y < b.y + b.h + BLOCK_PX;
+    return b.x < rect.x + rect.w + slack && rect.x < b.x + b.w + slack
+      && b.y < rect.y + rect.h + slack && rect.y < b.y + b.h + slack;
+  }
+}
+
+/**
+ * D5 step 4 for typed keys: which key presentations may form one event. Block changes join when
+ * their intervals overlap and they lie within REGION_GAP_BLOCKS of each other. A key's blocks stay
+ * active until SETTLE_MS after it, so key b may join the event of the key a before it when b is the
+ * next key, on the same line (the boxes overlap vertically), at most REGION_GAP_BLOCKS columns
+ * (24 blocks of 8 recorded px) to the side, and shown within SETTLE_MS after a.
+ */
+class TypingRule {
+  static mayJoin(a, b) {
+    const sameLine = a.rect.y < b.rect.y + b.rect.h && b.rect.y < a.rect.y + a.rect.h;
+    const gap = Math.max(0, b.rect.x - (a.rect.x + a.rect.w), a.rect.x - (b.rect.x + b.rect.w));
+    return b.n === a.n + 1 && sameLine && gap <= REGION_GAP_COLUMNS * BLOCK_PX && b.t - a.t <= SETTLE_MS;
+  }
+}
+
+/** A boundary clip's stop and schedule start, from the recorder's clip.json and frames.jsonl. */
+class RecorderClock {
+  constructor(clip) {
+    const folder = clip.require('folder');
+    const meta = readJson(path.join(folder, 'clip.json'));
+    const framesFile = path.join(folder, 'frames.jsonl');
+    const lines = fs.existsSync(framesFile)
+      ? fs.readFileSync(framesFile, 'utf8').split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l))
+      : [];
+    if (!meta || lines.length === 0) throw new Error(`no input: clip.json or frames.jsonl in ${folder}`);
+    if (meta.fps !== clip.raw.fps) throw new Error(`${clip.name}: clip.json fps ${meta.fps} differs from ${clip.raw.fps}`);
+    const s0 = meta.clock?.wall_clock_unix_ms_at_s0;
+    if (!finite(s0)) throw new Error(`no input: clip.json clock.wall_clock_unix_ms_at_s0 in ${folder}`);
+    const last = lines.at(-1);
+    if (!finite(last.t_ms)) throw new Error(`frames.jsonl of ${folder} has no t_ms on its last line`);
+    // The last instant is shown until the stop, one instant later.
+    this.stopMs = last.t_ms + clip.frameMs;
+    this.recordedMs = meta.recorded_ms;
+    // Clip time of the page run's schedule start: its unix start minus the clip's s_0.
+    this.scheduleStartMs = clip.require('page_start') - s0;
   }
 }
 
 /** The schedule as one page run presented it, on one clip's timeline. */
 class RunTiming {
-  constructor(clip, page, actual) {
+  constructor(clip, page, actual, startMs = clip.require('schedule_start_ms')) {
     this.clip = clip;
     this.page = page;
     this.actual = actual;
-    this.startMs = clip.require('schedule_start_ms');
+    this.startMs = startMs;
     this.viewport = clip.require('viewport');
     if (!finite(this.startMs)) throw new Error(`${clip.name}.schedule_start_ms is not a number`);
   }
@@ -179,21 +221,19 @@ class ScheduleMatch {
       const found = clip.events.filter((e) => !used.has(e) && e.kind === row.expect && ViewedClip.meets(e, rect) && e.start_ms <= SHORT_LIVED_MS);
       this.judge(row, found, take);
     }
+    this.keyProblems = [];
     for (const row of timing.page.schedule.filter((r) => r.expect !== 'none')) {
       const nominal = timing.startMs + row.t_ms;
       if (nominal < 0 || nominal > clip.endMs) continue;
-      const t = timing.start(row);
-      const rect = timing.region(row);
-      const inTime = row.many
-        ? (e) => e.start_ms >= t - clip.frameMs && e.start_ms <= timing.until(row) + SETTLE_MS + clip.frameMs
-        : (e) => Math.abs(e.start_ms - t) <= clip.frameMs;
-      const found = clip.events.filter((e) => !used.has(e) && e.kind === row.expect && ViewedClip.meets(e, rect) && inTime(e));
-      if (!row.many) {
-        this.judge(row, found, take);
+      if (row.many) {
+        this.typing(timing, row, used, take);
         continue;
       }
-      if (!found.some((e) => Math.abs(e.start_ms - t) <= clip.frameMs)) this.missed.push(row.id);
-      take(row.id, found);
+      const t = timing.start(row);
+      const rect = timing.region(row);
+      const found = clip.events.filter((e) => !used.has(e) && e.kind === row.expect && ViewedClip.meets(e, rect)
+        && Math.abs(e.start_ms - t) <= clip.frameMs);
+      this.judge(row, found, take);
     }
     this.unexpected = clip.events.filter((e) => !used.has(e));
     this.used = used;
@@ -206,17 +246,58 @@ class ScheduleMatch {
     take(row.id, found);
   }
 
+  /**
+   * A row of many presentations (typing): every key presentation is covered by exactly one event,
+   * every event covers at least one key and starts within one instant of its first key, and the
+   * keys of one event form a chain that TypingRule allows. An event covers a key when its box
+   * meets the key's box and the key was shown within its interval (one instant of slack).
+   */
+  typing(timing, row, used, take) {
+    const clip = timing.clip;
+    const keys = timing.actualOf(row).keys;
+    if (!Array.isArray(keys) || keys.length === 0) throw new Error(`no key presentations for row "${row.id}"`);
+    const presented = keys.map((k) => {
+      if (!finite(k.shown_ms) || !finite(k.set_ms) || k.shown_ms < k.set_ms || !k.rect) {
+        throw new Error(`no presentation time or box for key ${k.n} of row "${row.id}"`);
+      }
+      return { n: k.n, t: timing.startMs + k.shown_ms, rect: timing.toRecorded(k.rect) };
+    });
+    const region = timing.region(row);
+    const from = presented[0].t - clip.frameMs;
+    const to = presented.at(-1).t + SETTLE_MS + clip.frameMs;
+    const events = clip.events.filter((e) => !used.has(e) && e.kind === row.expect && ViewedClip.meets(e, region)
+      && e.start_ms >= from && e.start_ms <= to);
+    const covers = (e, p) => ViewedClip.meets(e, p.rect, 0) && p.t >= e.start_ms - clip.frameMs && p.t <= e.end_ms + clip.frameMs;
+    for (const p of presented) {
+      const count = events.filter((e) => covers(e, p)).length;
+      if (count !== 1) this.keyProblems.push(`key ${p.n} covered by ${count} events`);
+    }
+    for (const e of events) {
+      const mine = presented.filter((p) => covers(e, p));
+      if (mine.length === 0) {
+        this.keyProblems.push(`${e.kind}@${e.start_ms} covers no key`);
+        continue;
+      }
+      if (Math.abs(e.start_ms - mine[0].t) > clip.frameMs) {
+        this.keyProblems.push(`${e.kind}@${e.start_ms} starts ${Math.round(e.start_ms - mine[0].t)} ms from key ${mine[0].n}`);
+      }
+      const broken = mine.findIndex((p, i) => i > 0 && !TypingRule.mayJoin(mine[i - 1], p));
+      if (broken > 0) this.keyProblems.push(`${e.kind}@${e.start_ms} joins keys ${mine[broken - 1].n} and ${mine[broken].n} against D5 step 4`);
+    }
+    take(row.id, events);
+  }
+
   /** `true` when row `id` took exactly one event. */
   single(id) {
     return (this.byRow.get(id) ?? []).length === 1;
   }
 
   get summary() {
-    return `missed: ${this.missed.join(', ') || '-'}; duplicate: ${this.duplicates.join('; ') || '-'}; unexpected: ${list(this.unexpected)}`;
+    return `missed: ${this.missed.join(', ') || '-'}; duplicate: ${this.duplicates.join('; ') || '-'}; keys: ${this.keyProblems.join('; ') || '-'}; unexpected: ${list(this.unexpected)}`;
   }
 
   get clean() {
-    return this.missed.length === 0 && this.duplicates.length === 0 && this.unexpected.length === 0;
+    return this.missed.length === 0 && this.duplicates.length === 0 && this.keyProblems.length === 0 && this.unexpected.length === 0;
   }
 }
 
@@ -261,14 +342,26 @@ class D5Inputs {
   }
 }
 
-/** #293-4: the boundary row's change, `quietMs` before the clip end, has `outcome`. */
+/**
+ * #293-4: the quiet time before the clip end comes from the page and the recorder alone: the clip
+ * time at which the page presented the last change (its run's unix start minus the clip's s_0,
+ * plus shown_ms), rounded up to the first instant that can show it, against the stop from
+ * frames.jsonl. The stimulus must give `quietMs`; then the detector's change near that instant
+ * must have `outcome`.
+ */
 function boundaryCheck(inputs, name, quietMs, outcome) {
-  const timing = inputs.boundary(name);
-  const found = timing.near(timing.row(ROW.boundary), 'change');
-  if (found.length !== 1) return { value: `1 change, quiet ${quietMs} ms`, measured: `${found.length} changes: ${list(found)}`, pass: false };
-  const quiet = timing.clip.endMs - found[0].end_ms;
-  const ok = quiet === quietMs && outcome.test(found[0].text ?? '');
-  return { value: `quiet ${quietMs} ms, ${outcome.source}`, measured: `quiet ${quiet} ms, "${found[0].text}"`, pass: ok };
+  const clip = inputs.clip(name);
+  const clock = new RecorderClock(clip);
+  const timing = new RunTiming(clip, inputs.schedule, clip.require('actual'), clock.scheduleStartMs);
+  const row = timing.row(ROW.boundary);
+  const shown = timing.start(row);
+  const firstInstantMs = Math.ceil(shown / clip.frameMs) * clip.frameMs;
+  const quiet = clock.stopMs - firstInstantMs;
+  const found = timing.near(row, 'change');
+  const detector = found.map((e) => `${e.start_ms}-${e.end_ms} "${e.text}"`).join('; ') || 'no change';
+  const measured = `page and recorder: shown ${shown.toFixed(1)} ms, first instant ${firstInstantMs}, stop ${clock.stopMs} (clip.json recorded_ms ${clock.recordedMs}), quiet ${quiet} ms; detector: ${detector}`;
+  const pass = quiet === quietMs && found.length === 1 && outcome.test(found[0].text ?? '');
+  return { value: `quiet ${quietMs} ms, ${outcome.source}`, measured, pass };
 }
 
 /** The checks by scenario title. */

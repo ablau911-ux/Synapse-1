@@ -1183,7 +1183,7 @@ pub fn run() -> Result<()> {
         corpus_spent.time(|| corpus.frame(0, &mut bgr))?;
         capture.fill(&bgr);
     }
-    let sampler = MemorySampler::start();
+    // No memory sampler runs during the way's work (M2, M3): RAM is the OS peak, as in way D.
     let (m0_ws, _) = memory_now();
     let ram = RamMeter::start();
 
@@ -1231,21 +1231,21 @@ pub fn run() -> Result<()> {
     // Memory samplers that ran during the measured work (M2, M3: none, as in way D).
     let samplers_in_work = crate::exp_meter::samplers_running();
     let ram_read = ram.read();
-    let (peak_ws, peak_sampled) = sampler.take_peaks();
     let os_ws = os_peak_working_set();
     let way_spent = convert.plus(comp).plus(write).plus(train);
     let (rect_src, rects_max) = (encoder.rect_src, encoder.rects_max);
     drop(encoder);
     let bytes_out = clip_bytes.total();
     let bytes_disk = ClipFiles::bytes_on_disk(&clip)?;
-    // M3: the compress peak is the OS peak of private bytes (the sampler's figure is kept beside it).
+    // M3: the compress peak is the OS peak of private bytes; no sampler runs during the work.
     let peak_private = ram_read.peak;
 
     // Decode and compare every pixel with the corpus.
     let mut dec = Spent::default();
     let mut corpus_dec = Spent::default();
     let mut read = Spent::default();
-    sampler.take_peaks();
+    // The decoder's peak needs a sampler (the OS peak never falls); way D's decode is sampled the same way.
+    let sampler = MemorySampler::start();
     let mut decoder = dec.time(|| WayDecoder::new(&way, w, h, &dict))?;
     let mut payload = Vec::with_capacity(b_max);
     let tail = clip.join("f-end.bin");
@@ -1282,7 +1282,7 @@ pub fn run() -> Result<()> {
     println!(
         "{{\"folder\":\"{folder_name}\",{},\"rep\":{rep},\"w\":{w},\"h\":{h},\"n_new\":{},\"d_wait\":{},\"frames\":{},\"bytes_out\":{bytes_out},\"bytes_disk\":{bytes_disk},\"bytes_per_frame\":{},{},\
 \"input\":\"bgra\",{},{},{},{},{},{},\"comp_cpu_per_frame_ns\":{},\"way_cpu_per_frame_ns\":{},\"comp_wall_total_ns\":{wall_comp_total},\"dict_bytes\":{},{},\
-{},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"peak_private_sampled\":{peak_sampled},\"samplers_in_work\":{samplers_in_work},\"b_max\":{b_max},\"peak_ws\":{peak_ws},\"os_peak_ws\":{os_ws},\
+{},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"samplers_in_work\":{samplers_in_work},\"b_max\":{b_max},\"os_peak_ws\":{os_ws},\
 \"m_cctx_est\":{},\"cctx_sizeof\":{cctx_sizeof},\"bc\":{bc},\"m_dctx_est\":{},\"dctx_sizeof\":{dctx_sizeof},\"bd\":{bd},\"ldm_read\":{ldm_read},\"rect_src_bytes\":{rect_src},\"rect_listed_bytes\":{rect_listed},\"rects_max\":{rects_max},\
 {},{},{},\"dec_cpu_per_frame_ns\":{},\"dec_peak_private\":{dec_peak_private},\"dec_peak_ws\":{dec_peak_ws},\
 \"frames_decoded\":{decoded},\"diff_sum\":{diff_sum},\"diff_frames\":{diff_frames},\"n_dec_worst\":{n_dec_worst},\"t_ready_ns\":{t_ready_ns}}}",

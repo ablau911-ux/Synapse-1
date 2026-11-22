@@ -103,12 +103,13 @@ const FLASH_TOLERANCE: i32 = 60;
 
 pub fn run() -> Result<()> {
     let args = Args::from_env();
-    let _runtime = MediaFoundationRuntime::start()?;
+    let phase = args.text_or("phase", "").to_owned();
+    // The worker starts Media Foundation inside its measured work (H3).
+    let _runtime = if phase == "worker" { None } else { Some(MediaFoundationRuntime::start()?) };
     if args.text_or("mode", "run") == "meter" {
         return meter_self_check(&args);
     }
     // M3: the live part and the worker are two processes, as in the product (E2).
-    let phase = args.text_or("phase", "").to_owned();
     let mut out = Json::default();
     out.text("phase", &phase);
     let outcome = match phase.as_str() {
@@ -283,6 +284,7 @@ fn run_live(args: &Args, out: &mut Json) -> Result<()> {
     out.float("cycle_rate", cycle_rate);
     folder.put(out);
     out.num("live_pid", std::process::id());
+    request.put(out);
     crate::exp_settings::install(request.settings(false));
     std::fs::create_dir_all(scratch.join(clip_folder::WAITING_DIR)).map_err(|e| format!("scratch: {e}"))?;
 
@@ -317,7 +319,45 @@ fn run_live(args: &Args, out: &mut Json) -> Result<()> {
     out.num("live_cycles", live.cycles);
     out.raw(reading.json("live_"));
     out.num("m_live", reading.ram);
+    // The encoder's activation check runs in this process after its RAM reading: it touches
+    // neither the live part's figures nor the worker process before its M_0 (H3).
+    check_activation(&request, &folder, out)?;
     out.text("status", "ok");
+    Ok(())
+}
+
+/// D1: the named encoder is found by name and vendor in the Media Foundation
+/// enumeration and activated from its enumeration object, then shut down.
+/// DW4 has no Sink Writer path: whether it takes system-memory NV12 is confirmed.
+fn check_activation(request: &Request, folder: &Folder, out: &mut Json) -> Result<()> {
+    let activate = find_encoder(&request.name, &request.vendor, request.hardware)?;
+    let activation = unsafe { activate.ActivateObject::<IMFTransform>() };
+    let transform = match activation {
+        Ok(transform) => {
+            out.num("activated", 1);
+            out.text("hresult", "0x00000000");
+            transform
+        }
+        Err(error) => {
+            out.num("activated", 0);
+            out.text("hresult", &format!("{:#010x}", error.code().0));
+            out.text("status", "not_activated");
+            return Err(format!("activation failed: {error}"));
+        }
+    };
+    if request.vendor == "VEN_1414" {
+        let (w, h) = recorded_size(folder);
+        let confirm = confirm_system_nv12(&transform, w, h);
+        let _ = unsafe { activate.ShutdownObject() };
+        out.text("dw4_system_nv12", &confirm.clone().unwrap_or_else(|e| format!("no: {e}")));
+        out.text("status", "no_product_path");
+        return Err(format!(
+            "DW4 activates; system-memory NV12: {}; the product's Sink Writer cannot select it",
+            confirm.unwrap_or_else(|e| format!("no ({e})"))
+        ));
+    }
+    drop(transform);
+    let _ = unsafe { activate.ShutdownObject() };
     Ok(())
 }
 
@@ -412,39 +452,6 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     folder.put(out);
     out.num("worker_pid", std::process::id());
     request.put(out);
-
-    // 1. Activation from the enumeration object.
-    let activate = find_encoder(&request.name, &request.vendor, request.hardware)?;
-    let activation = unsafe { activate.ActivateObject::<IMFTransform>() };
-    match &activation {
-        Ok(_) => {
-            out.num("activated", 1);
-            out.text("hresult", "0x00000000");
-        }
-        Err(error) => {
-            out.num("activated", 0);
-            out.text("hresult", &format!("{:#010x}", error.code().0));
-            out.text("status", "not_activated");
-            return Err(format!("activation failed: {error}"));
-        }
-    }
-    let transform = activation.map_err(|e| e.to_string())?;
-    if request.vendor == "VEN_1414" {
-        // DW4: no Sink Writer path; confirm whether it takes system-memory NV12.
-        let (w, h) = recorded_size(&folder);
-        let confirm = confirm_system_nv12(&transform, w, h);
-        let _ = unsafe { activate.ShutdownObject() };
-        out.text("dw4_system_nv12", &confirm.clone().unwrap_or_else(|e| format!("no: {e}")));
-        out.text("status", "no_product_path");
-        return Err(format!(
-            "DW4 activates; system-memory NV12: {}; the product's Sink Writer cannot select it",
-            confirm.unwrap_or_else(|e| format!("no ({e})"))
-        ));
-    }
-    drop(transform);
-    let _ = unsafe { activate.ShutdownObject() };
-    let manager = if request.hardware { Some(device_manager(&request.vendor)?) } else { None };
-    crate::exp_settings::set_d3d_manager(manager);
     crate::exp_settings::install(request.settings(request.hardware));
 
     // 2. The worker's measured work, from M_0 to ready.
@@ -461,6 +468,11 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     let mp4 = clip_dir.join("clip.mp4");
     let ram = RamMeter::start();
     let mut worker = Spent::default();
+    // H3: every setup the worker needs is part of its measured work: Media Foundation and,
+    // for a hardware encoder, the D3D11 device and its DXGI device manager.
+    let _runtime = worker.time(MediaFoundationRuntime::start)?;
+    let manager = worker.time(|| if request.hardware { device_manager(&request.vendor).map(Some) } else { Ok(None) })?;
+    crate::exp_settings::set_d3d_manager(manager);
     let mut files = worker.time(|| ClipFiles::create(&clip_dir, folder.width as usize, folder.height as usize))?;
     let encoded = worker.time(|| clip_encoder::probe_encode_once(&mp4, &input, request.hardware))?;
     worker.time(|| -> Result<()> {
@@ -562,6 +574,9 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
         format!("setting_refused:{name}")
     } else if quality.mapping_failed(folder.new_frames.len()) {
         "frame_map".to_owned()
+    } else if quality.ocr_failed {
+        // H4: R could not be read; n/a is kept for OCR that read no source text.
+        "ocr_error".to_owned()
     } else {
         "ok".to_owned()
     };
@@ -911,6 +926,8 @@ struct Quality {
     pixels: u64,
     r: Option<f64>,
     r_note: String,
+    /// H4: OCR raised an error, so R is unknown (not n/a).
+    ocr_failed: bool,
     r_regions: usize,
     r_source_chars: usize,
     flashes: Option<u64>,
@@ -954,6 +971,7 @@ impl Quality {
         out.float("psnr_global", if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY });
         match self.r {
             Some(r) => out.float("r", r),
+            None if self.ocr_failed => out.text("r", "error"),
             None => out.text("r", "n/a"),
         }
         out.text("r_note", &self.r_note);
@@ -1059,11 +1077,15 @@ fn measure_quality(
                 quality.r_source_chars = chars;
                 quality.r_note = note;
             }
-            Err(error) => quality.r_note = format!("OCR failed: {error}"),
+            Err(error) => {
+                quality.ocr_failed = true;
+                quality.r_note = format!("OCR failed: {error}");
+            }
         }
         quality.t_ocr = wall.elapsed().as_nanos();
     } else if text {
-        quality.r_note = "no text regions given (corpus.json text_regions)".to_owned();
+        quality.ocr_failed = true;
+        quality.r_note = "OCR failed: no text regions given (corpus.json text_regions)".to_owned();
     } else {
         quality.r_note = "not a text scenario".to_owned();
     }

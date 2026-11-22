@@ -73,8 +73,10 @@ const CLOSEUP_SCALE: u32 = 2;
 /// Side of the change-test blocks, in recorded clip pixels.
 const BLOCK: usize = 8;
 /// Largest R, G or B difference that counts a pixel as changed (above
-/// encoder noise).
-const PIXEL_DELTA: u8 = 32;
+/// encoder noise). Measured 2026-11-22 on a 1584 x 992 clip of text (H.264,
+/// quality 70, GOP 20): at keyframes, static text blocks had up to 7 pixels
+/// above 32 and 6 above 48, but at most 1 above 64; blank areas had none.
+const PIXEL_DELTA: u8 = 64;
 /// Changed pixels that mark an 8x8 block as changed. A one-line text edit
 /// changes whole glyph strokes (dozens of high-contrast pixels per block).
 const MIN_CHANGED_PIXELS: u32 = 3;
@@ -82,6 +84,20 @@ const MIN_CHANGED_PIXELS: u32 = 3;
 const SETTLE_MS: u64 = 200;
 /// A change that returns to the previous picture within this is short-lived.
 const SHORT_LIVED_MS: u64 = 500;
+/// A block animates while it changed in at least this share of the frames
+/// of the last `SHORT_LIVED_MS` (D5).
+const ANIMATING_CHANGE_SHARE: f64 = 0.5;
+/// Animating blocks form one animation across at most this many empty
+/// blocks (columns, rows; 8-neighbour connectivity plus the gap).
+const ANIMATION_GAP_BLOCKS: (usize, usize) = (1, 1);
+/// A changed region within this many empty blocks of an animation is a
+/// slower part of it (a digit that changes less often), not a change.
+const ANIMATION_ABSORB_GAP_BLOCKS: (usize, usize) = (2, 2);
+/// Changed blocks form one region across at most this many empty blocks:
+/// wide along a row, so the changed words of one text line (a log line, a
+/// status bar) are one change, and two blocks between rows (the line gap of
+/// a text block).
+const REGION_GAP_BLOCKS: (usize, usize) = (24, 2);
 /// The box masked around the logged cursor, in window pixels (D5).
 const CURSOR_MASK_PX: u32 = 48;
 /// A caret is a change at most this wide (window pixels) that toggles about
@@ -98,7 +114,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 7;
+const ANALYSIS_VERSION: u32 = 10;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -446,18 +462,37 @@ impl BlockMap {
         self.count = self.changed.iter().filter(|flag| **flag).count() as u64;
     }
 
-    fn union(&self, other: &Self) -> Self {
-        let mut union = self.clone();
-        union.merge(other);
-        union
+    fn set(&mut self, index: usize) {
+        if let Some(flag) = self.changed.get_mut(index)
+            && !*flag
+        {
+            *flag = true;
+            self.count += 1;
+        }
     }
 
-    /// `true` when a block is changed in both maps (same picture size).
-    fn overlaps(&self, other: &Self) -> bool {
+    /// The changed blocks, as indices.
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
         self.changed
             .iter()
-            .zip(&other.changed)
-            .any(|(here, there)| *here && *there)
+            .enumerate()
+            .filter_map(|(index, flag)| flag.then_some(index))
+    }
+
+    /// `true` when one of `blocks` is a changed block here or lies within
+    /// `gap` empty blocks of one: (columns, rows), 8-neighbour connectivity
+    /// plus the gap.
+    fn touches(&self, blocks: &[usize], gap: (usize, usize)) -> bool {
+        let (reach_cols, reach_rows) = (gap.0 + 1, gap.1 + 1);
+        let cols = self.cols.max(1);
+        blocks.iter().any(|&index| {
+            let (col, row) = (index % cols, index / cols);
+            (row.saturating_sub(reach_rows)..=(row + reach_rows).min(self.rows.saturating_sub(1)))
+                .any(|near_row| {
+                    (col.saturating_sub(reach_cols)..=(col + reach_cols).min(cols - 1))
+                        .any(|near_col| self.changed[near_row * cols + near_col])
+                })
+        })
     }
 
     fn percent(&self) -> f64 {
@@ -485,6 +520,13 @@ impl BlockMap {
 
     /// Connected groups of changed blocks (8-neighbour), as block indices.
     fn block_groups(&self) -> Vec<Vec<usize>> {
+        self.block_groups_within((0, 0))
+    }
+
+    /// Connected groups of changed blocks (8-neighbour, with up to `gap`
+    /// empty blocks between members: columns, rows), as block indices.
+    fn block_groups_within(&self, gap: (usize, usize)) -> Vec<Vec<usize>> {
+        let (reach_cols, reach_rows) = (gap.0 + 1, gap.1 + 1);
         let mut seen = vec![false; self.changed.len()];
         let mut groups = Vec::new();
         for start in 0..self.changed.len() {
@@ -497,8 +539,12 @@ impl BlockMap {
             while let Some(index) = stack.pop() {
                 group.push(index);
                 let (col, row) = (index % self.cols, index / self.cols);
-                for next_row in row.saturating_sub(1)..=(row + 1).min(self.rows - 1) {
-                    for next_col in col.saturating_sub(1)..=(col + 1).min(self.cols - 1) {
+                for next_row in
+                    row.saturating_sub(reach_rows)..=(row + reach_rows).min(self.rows - 1)
+                {
+                    for next_col in
+                        col.saturating_sub(reach_cols)..=(col + reach_cols).min(self.cols - 1)
+                    {
                         let next = next_row * self.cols + next_col;
                         if self.changed[next] && !seen[next] {
                             seen[next] = true;
@@ -535,13 +581,15 @@ impl BlockMap {
 // Overview analysis
 // ---------------------------------------------------------------------------
 
-/// One change: consecutive changed frames until the picture settles.
+/// One changed region (D5): a connected group of changed blocks, tracked on
+/// its own from its first change until it settles.
 struct Episode {
     start_frame: u64,
     last_change_frame: u64,
     blocks: BlockMap,
-    /// RGB before the change (kept only while a revert can still follow).
-    before: Vec<u8>,
+    /// RGB of each block before its first change in this region (kept only
+    /// while a return can still follow).
+    baseline: std::collections::HashMap<usize, Vec<u8>>,
     short_lived: bool,
     reverted: bool,
     settled: bool,
@@ -549,37 +597,64 @@ struct Episode {
     generation: u64,
 }
 
-/// What one block went through (D5): its picture before a change still open,
-/// its current run of changes, and when it last looked like a caret.
+impl Episode {
+    /// Joins a region that touches this one; the earlier baseline of a block
+    /// wins.
+    fn join(mut self, mut other: Self) -> Self {
+        if other.start_frame < self.start_frame {
+            std::mem::swap(&mut self, &mut other);
+        }
+        self.last_change_frame = self.last_change_frame.max(other.last_change_frame);
+        self.blocks.merge(&other.blocks);
+        for (index, pixels) in other.baseline {
+            self.baseline.entry(index).or_insert(pixels);
+        }
+        self
+    }
+
+    /// `true` when every given block shows its baseline again.
+    fn back_to_baseline(&self, blocks: &[usize], shown: &[u8]) -> bool {
+        let (width, height, cols) = (self.blocks.width, self.blocks.height, self.blocks.cols);
+        blocks.iter().all(|index| {
+            self.baseline.get(index).is_some_and(|before| {
+                block_equal(before, &block_pixels(shown, width, height, cols, *index))
+            })
+        })
+    }
+}
+
+/// What one block went through (D5): its changes within the last
+/// `SHORT_LIVED_MS`, and when it last looked like a caret.
 #[derive(Clone, Default)]
 struct BlockState {
-    baseline: Option<(Vec<u8>, u64)>,
-    run_start: u64,
-    last_change: Option<u64>,
+    recent: std::collections::VecDeque<u64>,
     animating: bool,
     last_caret: Option<u64>,
 }
 
-/// A region that returned to its previous picture within `SHORT_LIVED_MS`.
-struct Transient {
-    start: u64,
-    end: u64,
-    blocks: Vec<usize>,
-    /// The picture size the block indices refer to (a resize changes it).
-    size: (usize, usize),
-    /// The resize generation of the change (see `Analyzer`).
-    generation: u64,
-}
-
-/// A region that kept changing for longer than `SHORT_LIVED_MS`.
+/// A connected group of animating blocks, reported as one interval (D5).
 struct Animation {
     start: u64,
     end: u64,
-    blocks: Vec<usize>,
-    /// The picture size the block indices refer to (a resize changes it).
-    size: (usize, usize),
+    /// The last instant one of its blocks was animating.
+    seen: u64,
+    /// Its animating blocks: the only blocks that decide a merge.
+    core: BlockMap,
+    /// `core` plus the changed blocks next to it that change less often.
+    area: BlockMap,
     /// The resize generation of the run (see `Analyzer`).
     generation: u64,
+}
+
+impl Animation {
+    fn join(mut self, other: Self) -> Self {
+        self.start = self.start.min(other.start);
+        self.end = self.end.max(other.end);
+        self.seen = self.seen.max(other.seen);
+        self.core.merge(&other.core);
+        self.area.merge(&other.area);
+        self
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -608,9 +683,8 @@ struct Analyzer<'a> {
     height: usize,
     shown: Vec<u8>,
     states: Vec<BlockState>,
-    open: Option<Episode>,
+    open: Vec<Episode>,
     done: Vec<Episode>,
-    transients: Vec<Transient>,
     animations: Vec<Animation>,
     resizes: Vec<(u64, usize, usize)>,
     /// Goes up on every size change; changes are compared and merged only
@@ -632,9 +706,8 @@ impl<'a> Analyzer<'a> {
             height: 0,
             shown: Vec::new(),
             states: Vec::new(),
-            open: None,
+            open: Vec::new(),
             done: Vec::new(),
-            transients: Vec::new(),
             animations: Vec::new(),
             resizes: Vec::new(),
             generation: 0,
@@ -653,12 +726,7 @@ impl<'a> Analyzer<'a> {
                 analyzer.step(instant, &frame);
             }
         }
-        if let Some(episode) = analyzer.open.take() {
-            analyzer.close(episode, false);
-        }
-        let end = clip.last_frame();
-        analyzer.end_animations(end, true);
-        analyzer.absorb_into_animations();
+        analyzer.close_open(false);
         Ok(analyzer.finish())
     }
 
@@ -675,10 +743,7 @@ impl<'a> Analyzer<'a> {
         if (width, height) != (self.width, self.height) || captured != self.captured {
             self.captured = captured;
             if self.width != 0 {
-                if let Some(episode) = self.open.take() {
-                    self.close(episode, true);
-                }
-                self.end_animations(instant, true);
+                self.close_open(true);
                 self.resizes.push((instant, width, height));
             }
             self.width = width;
@@ -691,62 +756,183 @@ impl<'a> Analyzer<'a> {
             return;
         }
         let t_ms = self.clip.t_of(instant);
-        let settled = self.open.as_ref().is_some_and(|episode| {
-            t_ms.saturating_sub(self.clip.t_of(episode.last_change_frame)) >= SETTLE_MS
-        });
-        if settled && let Some(episode) = self.open.take() {
-            self.close(episode, true);
-        }
-        self.end_animations(instant, false);
+        self.close_settled(t_ms);
         if !self.clip.is_new(instant) {
             return;
         }
         let mut blocks = BlockMap::between(&self.shown, &current, width, height);
         self.mask_cursor(&mut blocks, instant);
         self.mask_caret(&mut blocks, &current, instant);
-        self.track_blocks(&blocks, &current, instant);
-        let mut episode_blocks = blocks.clone();
-        for (index, state) in self.states.iter().enumerate() {
-            if state.animating {
-                episode_blocks.unset(index);
+        self.previous = instant;
+        if blocks.count == 0 {
+            self.new_without_change += 1;
+        }
+        let before = std::mem::replace(&mut self.shown, current);
+        // D5 step 1: which blocks animate now.
+        let core = self.track_activity(&blocks, t_ms, instant);
+        // Step 2: animating blocks leave the change set and form animations;
+        // changed blocks next to an animation are its slower parts.
+        let mut remaining = blocks;
+        for index in 0..core.changed.len() {
+            if core.changed[index] {
+                remaining.unset(index);
             }
         }
-        // D5: changed blocks connected to an animating block belong to that
-        // animating region (its digits that change less often), not to a
-        // change of their own.
-        let animating: std::collections::HashSet<usize> = (0..self.states.len())
-            .filter(|&index| self.states[index].animating)
-            .collect();
-        if !animating.is_empty() {
-            for group in episode_blocks.block_groups() {
-                if touches(&group, &animating, episode_blocks.cols) {
-                    for index in group {
-                        episode_blocks.unset(index);
-                    }
+        self.track_animations(&core, instant);
+        for group in remaining.block_groups_within(ANIMATION_ABSORB_GAP_BLOCKS) {
+            let generation = self.generation;
+            if let Some(animation) = self.animations.iter_mut().find(|animation| {
+                animation.generation == generation
+                    && animation.seen == instant
+                    && animation.core.touches(&group, ANIMATION_ABSORB_GAP_BLOCKS)
+            }) {
+                for &index in &group {
+                    animation.area.set(index);
+                    remaining.unset(index);
                 }
             }
         }
-        self.previous = instant;
-        if episode_blocks.count == 0 {
-            if blocks.count == 0 {
-                self.new_without_change += 1;
-            }
-            self.shown = current;
-            return;
+        // Step 3: every other connected region is tracked on its own.
+        for group in remaining.block_groups_within(REGION_GAP_BLOCKS) {
+            self.track_region(&group, &before, instant);
         }
-        let before = std::mem::replace(&mut self.shown, current);
-        let episode = self.open.get_or_insert_with(|| Episode {
+    }
+
+    /// D5: a block animates while it changed in at least
+    /// `ANIMATING_CHANGE_SHARE` of the frames of the last `SHORT_LIVED_MS`.
+    /// Returns the animating blocks.
+    fn track_activity(&mut self, blocks: &BlockMap, t_ms: u64, instant: u64) -> BlockMap {
+        let window_frames = (SHORT_LIVED_MS * self.clip.fps() / 1_000).max(1);
+        let needed = (window_frames as f64 * ANIMATING_CHANGE_SHARE).ceil() as usize;
+        let mut core = BlockMap::empty(self.width, self.height);
+        for (index, state) in self.states.iter_mut().enumerate() {
+            while state
+                .recent
+                .front()
+                .is_some_and(|&at| self.clip.t_of(at) + SHORT_LIVED_MS <= t_ms)
+            {
+                state.recent.pop_front();
+            }
+            if blocks.changed[index] {
+                state.recent.push_back(instant);
+            }
+            state.animating = state.recent.len() >= needed;
+            if state.animating {
+                core.set(index);
+            }
+        }
+        core
+    }
+
+    /// D5: each connected group of animating blocks (one block of gap
+    /// allowed) joins the open animations its blocks touch, or starts one.
+    fn track_animations(&mut self, core: &BlockMap, instant: u64) {
+        let t_ms = self.clip.t_of(instant);
+        for group in core.block_groups_within(ANIMATION_GAP_BLOCKS) {
+            let start = group
+                .iter()
+                .filter_map(|&index| self.states[index].recent.front().copied())
+                .min()
+                .unwrap_or(instant);
+            let end = group
+                .iter()
+                .filter_map(|&index| self.states[index].recent.back().copied())
+                .max()
+                .unwrap_or(instant);
+            let mut joined: Option<Animation> = None;
+            let mut at = self.animations.len();
+            while at > 0 {
+                at -= 1;
+                let animation = &self.animations[at];
+                let open = t_ms.saturating_sub(self.clip.t_of(animation.seen)) <= SETTLE_MS;
+                if animation.generation == self.generation
+                    && open
+                    && animation.core.touches(&group, ANIMATION_GAP_BLOCKS)
+                {
+                    let animation = self.animations.remove(at);
+                    joined = Some(match joined {
+                        Some(joined) => joined.join(animation),
+                        None => animation,
+                    });
+                }
+            }
+            let mut animation = joined.unwrap_or_else(|| Animation {
+                start,
+                end,
+                seen: instant,
+                core: BlockMap::empty(self.width, self.height),
+                area: BlockMap::empty(self.width, self.height),
+                generation: self.generation,
+            });
+            animation.start = animation.start.min(start);
+            animation.end = animation.end.max(end);
+            animation.seen = instant;
+            for &index in &group {
+                animation.core.set(index);
+                animation.area.set(index);
+            }
+            self.animations.push(animation);
+        }
+    }
+
+    /// D5 step 3: a changed region joins the open regions its blocks touch
+    /// (one block of gap allowed), or starts one. Each new block keeps its
+    /// picture from before the change.
+    fn track_region(&mut self, group: &[usize], before: &[u8], instant: u64) {
+        let mut joined: Option<Episode> = None;
+        let mut at = self.open.len();
+        while at > 0 {
+            at -= 1;
+            if self.open[at].blocks.touches(group, REGION_GAP_BLOCKS) {
+                let region = self.open.remove(at);
+                joined = Some(match joined {
+                    Some(joined) => joined.join(region),
+                    None => region,
+                });
+            }
+        }
+        let mut region = joined.unwrap_or_else(|| Episode {
             start_frame: instant,
             last_change_frame: instant,
-            blocks: BlockMap::empty(width, height),
-            before,
+            blocks: BlockMap::empty(self.width, self.height),
+            baseline: std::collections::HashMap::new(),
             short_lived: false,
             reverted: false,
             settled: false,
             generation: self.generation,
         });
-        episode.last_change_frame = instant;
-        episode.blocks.merge(&episode_blocks);
+        let (width, height, cols) = (self.width, self.height, region.blocks.cols);
+        for &index in group {
+            region.blocks.set(index);
+            region
+                .baseline
+                .entry(index)
+                .or_insert_with(|| block_pixels(before, width, height, cols, index));
+        }
+        region.last_change_frame = instant;
+        self.open.push(region);
+    }
+
+    /// Closes the open regions that had no change for `SETTLE_MS`.
+    fn close_settled(&mut self, t_ms: u64) {
+        let mut at = self.open.len();
+        while at > 0 {
+            at -= 1;
+            let quiet = t_ms.saturating_sub(self.clip.t_of(self.open[at].last_change_frame));
+            if quiet >= SETTLE_MS {
+                let region = self.open.remove(at);
+                self.close(region, true);
+            }
+        }
+    }
+
+    /// Closes every open region (a resize, or the end of the clip).
+    fn close_open(&mut self, settled: bool) {
+        let mut open = std::mem::take(&mut self.open);
+        open.sort_by_key(|region| region.start_frame);
+        for region in open {
+            self.close(region, settled);
+        }
     }
 
     /// D5: the blocks under the logged cursor (now and at the last instant)
@@ -802,223 +988,77 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// D5: per block, a return to the picture before its change within
-    /// `SHORT_LIVED_MS` is a short-lived change of that block; changes that
-    /// go on for longer than `SHORT_LIVED_MS` without a `SETTLE_MS` pause
-    /// make the block animating.
-    fn track_blocks(&mut self, blocks: &BlockMap, current: &[u8], instant: u64) {
-        let t_ms = self.clip.t_of(instant);
-        let (width, height, cols) = (self.width, self.height, blocks.cols);
-        let mut returned: Vec<(u64, usize)> = Vec::new();
-        for index in 0..self.states.len() {
-            let clip = self.clip;
-            let state = &mut self.states[index];
-            if state
-                .baseline
-                .as_ref()
-                .is_some_and(|(_, at)| t_ms.saturating_sub(clip.t_of(*at)) > SHORT_LIVED_MS)
-            {
-                state.baseline = None;
-            }
-            if !blocks.changed[index] {
-                continue;
-            }
-            let quiet = state
-                .last_change
-                .is_none_or(|last| t_ms.saturating_sub(clip.t_of(last)) > SETTLE_MS);
-            if quiet {
-                state.run_start = instant;
-            }
-            state.last_change = Some(instant);
-            if t_ms.saturating_sub(clip.t_of(state.run_start)) > SHORT_LIVED_MS {
-                state.animating = true;
-            }
-            let now = block_pixels(current, width, height, cols, index);
-            match state.baseline.take() {
-                Some((before, at)) if !state.animating && block_equal(&before, &now) => {
-                    returned.push((at, index));
-                }
-                Some(baseline) => state.baseline = Some(baseline),
-                None => {
-                    state.baseline = Some((
-                        block_pixels(&self.shown, width, height, cols, index),
-                        instant,
-                    ));
-                }
-            }
-        }
-        returned.sort_unstable();
-        for (start, index) in returned {
-            match self.transients.last_mut() {
-                Some(last) if last.start == start && last.end == instant => last.blocks.push(index),
-                _ => self.transients.push(Transient {
-                    start,
-                    end: instant,
-                    blocks: vec![index],
-                    size: (width, height),
-                    generation: self.generation,
-                }),
-            }
-        }
-    }
-
-    /// Ends the animating runs that paused for `SETTLE_MS` (or all at the end)
-    /// and keeps each as one interval.
-    fn end_animations(&mut self, instant: u64, all: bool) {
-        let t_ms = self.clip.t_of(instant);
-        let mut ended: Vec<(u64, u64, usize)> = Vec::new();
-        for (index, state) in self.states.iter_mut().enumerate() {
-            let Some(last) = state.last_change else {
-                continue;
-            };
-            if state.animating && (all || t_ms.saturating_sub(self.clip.t_of(last)) > SETTLE_MS) {
-                ended.push((state.run_start, last, index));
-                state.animating = false;
-            }
-        }
-        // The block indices refer to the current picture size; animations of
-        // an earlier resize generation are never merged with them. A block
-        // joins an animation of the same time that it touches, so separate
-        // animating regions (a counter, a clock) stay separate intervals.
-        let (size, generation) = ((self.width, self.height), self.generation);
-        let cols = self.width.div_ceil(BLOCK);
-        for (start, end, index) in ended {
-            match self.animations.iter_mut().find(|animation| {
-                animation.generation == generation
-                    && animation.start <= end
-                    && start <= animation.end
-                    && blocks_touch(&[index], &animation.blocks, cols)
-            }) {
-                Some(animation) => {
-                    animation.start = animation.start.min(start);
-                    animation.end = animation.end.max(end);
-                    if !animation.blocks.contains(&index) {
-                        animation.blocks.push(index);
-                    }
-                }
-                None => self.animations.push(Animation {
-                    start,
-                    end,
-                    blocks: vec![index],
-                    size,
-                    generation,
-                }),
-            }
-        }
-    }
-
-    /// D5: the animations of one region become one interval, and a
-    /// short-lived change that touches an animation during its interval is
-    /// part of it (never reported or picked on its own). Repeats until
-    /// nothing more joins, so a region grows over its parts that change less
-    /// often.
-    fn absorb_into_animations(&mut self) {
-        let overlap = |a: (u64, u64), b: (u64, u64)| a.0 <= b.1 && b.0 <= a.1;
-        loop {
-            let mut joined = false;
-            let mut index = 0;
-            while index < self.animations.len() {
-                let mut other = index + 1;
-                while other < self.animations.len() {
-                    let (here, there) = (&self.animations[index], &self.animations[other]);
-                    let joins = here.generation == there.generation
-                        && overlap((here.start, here.end), (there.start, there.end))
-                        && blocks_touch(&there.blocks, &here.blocks, here.size.0.div_ceil(BLOCK));
-                    if joins {
-                        let there = self.animations.swap_remove(other);
-                        let here = &mut self.animations[index];
-                        here.start = here.start.min(there.start);
-                        here.end = here.end.max(there.end);
-                        for block in there.blocks {
-                            if !here.blocks.contains(&block) {
-                                here.blocks.push(block);
-                            }
-                        }
-                        joined = true;
-                    } else {
-                        other += 1;
-                    }
-                }
-                index += 1;
-            }
-            let mut kept = Vec::with_capacity(self.transients.len());
-            for transient in std::mem::take(&mut self.transients) {
-                let animation = self.animations.iter_mut().find(|animation| {
-                    animation.generation == transient.generation
-                        && overlap(
-                            (animation.start, animation.end),
-                            (transient.start, transient.end),
-                        )
-                        && blocks_touch(
-                            &transient.blocks,
-                            &animation.blocks,
-                            animation.size.0.div_ceil(BLOCK),
-                        )
-                });
-                match animation {
-                    Some(animation) => {
-                        animation.start = animation.start.min(transient.start);
-                        animation.end = animation.end.max(transient.end);
-                        for block in transient.blocks {
-                            if !animation.blocks.contains(&block) {
-                                animation.blocks.push(block);
-                            }
-                        }
-                        joined = true;
-                    }
-                    None => kept.push(transient),
-                }
-            }
-            self.transients = kept;
-            if !joined {
-                break;
-            }
-        }
-    }
-
-    /// Ends a change; marks it short-lived when the picture is back to the
-    /// one before it within `SHORT_LIVED_MS`, also when the return came as a
-    /// separate change right after.
-    fn close(&mut self, mut episode: Episode, settled: bool) {
-        let (width, height) = (self.width, self.height);
+    /// Ends a changed region; marks it short-lived when its blocks show their
+    /// picture from before it again within `SHORT_LIVED_MS`, also when the
+    /// return came as a separate region right after.
+    fn close(&mut self, mut region: Episode, settled: bool) {
         let span = |clip: &ViewedClip, start: u64, end: u64| clip.t_of(end) - clip.t_of(start);
-        episode.settled = settled;
-        // A change is compared only within its own blocks: an animating
-        // region elsewhere (excluded from the change) never hides a return.
-        if !BlockMap::between(&episode.before, &self.shown, width, height).overlaps(&episode.blocks)
-        {
-            episode.reverted = true;
-            episode.short_lived =
-                span(self.clip, episode.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS;
+        region.settled = settled;
+        let blocks: Vec<usize> = region.blocks.indices().collect();
+        // A region next to an animation that was animating by its end is
+        // that animation's start-up (its blocks change before they count as
+        // animating): part of the animation, not a change.
+        let (generation, started) = (region.generation, region.start_frame);
+        if let Some(animation) = self.animations.iter_mut().find(|animation| {
+            animation.generation == generation
+                && animation.seen >= started
+                && animation.core.touches(&blocks, ANIMATION_ABSORB_GAP_BLOCKS)
+        }) {
+            animation.start = animation.start.min(region.start_frame);
+            for &index in &blocks {
+                animation.area.set(index);
+            }
+            return;
+        }
+        if region.back_to_baseline(&blocks, &self.shown) {
+            region.reverted = true;
+            region.short_lived =
+                span(self.clip, region.start_frame, region.last_change_frame) <= SHORT_LIVED_MS;
         }
         // A resize ends comparison continuity: a change before it is never
         // compared with, or merged into, a picture of another size.
-        if !episode.reverted
-            && let Some(previous) = self.done.last_mut()
-            && !previous.reverted
-            && previous.generation == episode.generation
-            && span(self.clip, previous.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS
-            && !BlockMap::between(&previous.before, &self.shown, width, height)
-                .overlaps(&previous.blocks.union(&episode.blocks))
+        if !region.reverted
+            && let Some(previous) = self.done.iter_mut().rev().find(|previous| {
+                !previous.reverted
+                    && !previous.baseline.is_empty()
+                    && previous.generation == region.generation
+                    && previous.blocks.touches(&blocks, REGION_GAP_BLOCKS)
+            })
+            && span(self.clip, previous.start_frame, region.last_change_frame) <= SHORT_LIVED_MS
         {
-            previous.reverted = true;
-            previous.short_lived = true;
-            previous.settled = settled;
-            previous.last_change_frame = episode.last_change_frame;
-            previous.blocks.merge(&episode.blocks);
-            previous.before = Vec::new();
-            return;
+            let previous_blocks: Vec<usize> = previous.blocks.indices().collect();
+            let own: Vec<usize> = blocks
+                .iter()
+                .copied()
+                .filter(|index| !previous.baseline.contains_key(index))
+                .collect();
+            if previous.back_to_baseline(&previous_blocks, &self.shown)
+                && region.back_to_baseline(&own, &self.shown)
+            {
+                previous.reverted = true;
+                previous.short_lived = true;
+                previous.settled = settled;
+                previous.last_change_frame = region.last_change_frame;
+                previous.blocks.merge(&region.blocks);
+                previous.baseline.clear();
+                return;
+            }
         }
-        if let Some(previous) = self.done.last_mut() {
-            previous.before = Vec::new();
+        // Baselines are kept only while a return can still follow.
+        let now = self.clip.t_of(region.last_change_frame);
+        for previous in &mut self.done {
+            if now.saturating_sub(self.clip.t_of(previous.start_frame)) > SHORT_LIVED_MS {
+                previous.baseline.clear();
+            }
         }
-        if episode.reverted {
-            episode.before = Vec::new();
+        if region.reverted {
+            region.baseline.clear();
         }
-        self.done.push(episode);
+        self.done.push(region);
     }
 
-    fn finish(self) -> Analysis {
+    fn finish(mut self) -> Analysis {
+        self.done.sort_by_key(|region| region.start_frame);
         let clip = self.clip;
         let first = clip
             .clip
@@ -1034,7 +1074,7 @@ impl<'a> Analyzer<'a> {
             if clip.t_of(start).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
                 timeline.push(static_entry(clip, quiet_from, start.saturating_sub(1)));
             }
-            quiet_from = end;
+            quiet_from = quiet_from.max(end);
             picks.push(pick(
                 clip,
                 start.saturating_sub(1),
@@ -1051,40 +1091,15 @@ impl<'a> Analyzer<'a> {
         if clip.t_of(last).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
             timeline.push(static_entry(clip, quiet_from, last));
         }
-        let sized_bbox = |blocks: &[usize], (width, height): (usize, usize)| {
-            blocks_bbox(blocks, width.div_ceil(BLOCK), width, height)
-        };
-        let covered = |start: u64| {
-            self.done
-                .iter()
-                .any(|episode| episode.short_lived && episode.start_frame == start)
-        };
-        for transient in self
-            .transients
-            .iter()
-            .filter(|transient| !covered(transient.start))
-        {
-            let bbox = sized_bbox(&transient.blocks, transient.size);
-            picks.push(pick(clip, transient.start, "short-lived region change"));
-            timeline.push(region_entry(
-                clip,
-                "short_lived",
-                transient.start,
-                transient.end,
-                transient.blocks.len(),
-                bbox,
-                "short-lived region change, back to its previous picture",
-            ));
-        }
         for animation in &self.animations {
-            let bbox = sized_bbox(&animation.blocks, animation.size);
+            let bbox = animation.area.bbox();
             picks.push(pick(clip, animation.start, "animating region"));
             timeline.push(region_entry(
                 clip,
                 "animating",
                 animation.start,
                 animation.end,
-                animation.blocks.len(),
+                usize::try_from(animation.area.count).unwrap_or(usize::MAX),
                 bbox,
                 "region kept changing (animation); one frame shown",
             ));
@@ -1110,8 +1125,8 @@ impl<'a> Analyzer<'a> {
         let mut notes = vec![
             format!(
                 "{} changes, {} short-lived region changes and {} animating regions found; {repeated} repeated frames skipped by frames.jsonl flags; {} new frames showed no visible change",
-                self.done.len(),
-                self.transients.len(),
+                self.done.iter().filter(|region| !region.short_lived).count(),
+                self.done.iter().filter(|region| region.short_lived).count(),
                 self.animations.len(),
                 self.new_without_change
             ),
@@ -1224,24 +1239,6 @@ fn region_entry(
             fmt_time(end_ms)
         ),
     }
-}
-
-/// `true` when a block of `blocks` is one of `others` or one of their eight
-/// neighbours (the connectivity of `BlockMap::block_groups`).
-fn blocks_touch(blocks: &[usize], others: &[usize], cols: usize) -> bool {
-    let others: std::collections::HashSet<usize> = others.iter().copied().collect();
-    touches(blocks, &others, cols)
-}
-
-fn touches(blocks: &[usize], others: &std::collections::HashSet<usize>, cols: usize) -> bool {
-    let cols = cols.max(1);
-    blocks.iter().any(|&index| {
-        let (col, row) = (index % cols, index / cols);
-        (row.saturating_sub(1)..=row + 1).any(|near_row| {
-            (col.saturating_sub(1)..=(col + 1).min(cols - 1))
-                .any(|near_col| others.contains(&(near_row * cols + near_col)))
-        })
-    })
 }
 
 /// The bounding box of a set of blocks, in recorded pixels.

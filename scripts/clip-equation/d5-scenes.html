@@ -1,0 +1,90 @@
+<!doctype html>
+<!--
+  Clip viewer D5 side clips (docs/clip-recorder-plan.md, "D5 as an equation", item 7; checked by
+  scripts/clip-equation/spec/d5.feature, recorded by live-test/d5-proof.mjs). One scene per run:
+    ?scene=still    static text, nothing moves: the still clip must give no event.
+    ?scene=spinner  one ordinary 32 px border-arc spinner, 1 turn per second (the lone spinner of
+                    ui-events-page.html) and nothing else: exactly one animation.
+    ?scene=flash    a 50 ms flash in a small box once per second, its phase stepping by 5 ms
+                    through one 50 ms recorded instant, and nothing else: one FLASH per flash.
+    ?start=<unix ms>  the flash schedule start (wall clock); without it, 3 s after the page loads.
+  window.scheduleStart is that start. window.flashTiming lists every flash, in ms from the start:
+  { n, set_ms, shown_ms, hide_ms, hidden_ms }, timed like ui-events-page.html: set_ms = the
+  animation frame that showed the box, shown_ms = the next animation frame (on screen by then).
+  The box is hidden FLASH_MS after shown_ms, so a late frame never shortens a flash.
+  flash-page.html cannot serve as the D5 flash clip: its counter, clock and log change on every
+  instant, and it does not expose when each flash was presented.
+  Open the file directly in a browser; it needs no server and takes no input.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clip D5 scenes</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { background: #f4f4f8; color: #222; font: 16px/1.5 "Segoe UI", Arial, sans-serif; }
+  .scene { display: none; }
+  .card { position: absolute; background: #ffffff; border: 1px solid #c8c8d0; border-radius: 6px; }
+  #note { left: 40px; top: 40px; width: 420px; height: 90px; padding: 12px 16px; box-sizing: border-box; }
+  #lonecard { left: 200px; top: 200px; width: 100px; height: 100px; }
+  .spinner { position: absolute; width: 32px; height: 32px; box-sizing: border-box; border-radius: 50%;
+             border: 4px solid #e2e2e2; border-top-color: #2f6fd0; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #spinnerA { left: 34px; top: 34px; }
+  #flashcard { left: 200px; top: 200px; width: 128px; height: 108px; }
+  #flashbox { position: absolute; left: 24px; top: 24px; width: 80px; height: 60px; background: #ff2050; display: none; }
+</style>
+</head>
+<body>
+<div class="scene" id="still"><div class="card" id="note">Clip D5 still scene: nothing on this page changes.</div></div>
+<div class="scene" id="spinner"><div class="card" id="lonecard"><div class="spinner" id="spinnerA"></div></div></div>
+<div class="scene" id="flash"><div class="card" id="flashcard"><div id="flashbox"></div></div></div>
+<script>
+  const FLASH_MS = 50;           // d_min: one recorded instant
+  const FLASH_PERIOD_MS = 1000;  // one flash per second
+  const FIRST_FLASH_MS = 500;
+  const PHASE_STEP_MS = 5;       // the flash phase sweeps one recorded instant
+  const INSTANT_MS = 50;
+  const AUTO_START_MS = 3000;
+
+  const params = new URLSearchParams(location.search);
+  const scene = document.getElementById(params.get('scene') || 'still') || document.getElementById('still');
+  scene.style.display = 'block';
+
+  const param = Number(params.get('start'));
+  const start = Number.isFinite(param) && param > 0 ? param : Date.now() + AUTO_START_MS;
+  window.scheduleStart = start;
+  const flashTiming = [];
+  window.flashTiming = flashTiming;
+
+  if (scene.id === 'flash') {
+    const box = document.getElementById('flashbox');
+    const due = (n) => FIRST_FLASH_MS + n * FLASH_PERIOD_MS + (n * PHASE_STEP_MS) % INSTANT_MS;
+    let current = null;   // the flash on screen
+    let lastN = -1;       // the last flash period shown, so a late page skips a period, never doubles
+    let awaitingPaint = [];
+    const frame = (timestamp) => {
+      const t = performance.timeOrigin + timestamp - start;
+      for (const [entry, field] of awaitingPaint) entry[field] = t;
+      awaitingPaint = [];
+      if (current && current.shown_ms !== undefined && t - current.shown_ms >= FLASH_MS) {
+        box.style.display = 'none';
+        current.hide_ms = t;
+        awaitingPaint.push([current, 'hidden_ms']);
+        current = null;
+      }
+      const n = Math.floor((t - FIRST_FLASH_MS) / FLASH_PERIOD_MS);
+      if (!current && n > lastN && t >= due(n)) {
+        box.style.display = 'block';
+        current = { n, set_ms: t };
+        flashTiming.push(current);
+        awaitingPaint.push([current, 'shown_ms']);
+        lastN = n;
+      }
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+</script>
+</body>
+</html>

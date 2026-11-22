@@ -124,6 +124,31 @@ const num = (v) => (v === undefined || v === '' ? NaN : Number(v));
 const okRows = (rows) => rows.filter((r) => r.status === 'ok');
 const misses = (bad) => (bad.length ? `; misses: ${bad.slice(0, 5).join('; ')}${bad.length > 5 ? ` (+${bad.length - 5})` : ''}` : '');
 const pct = (measured, prior) => `${(((measured - prior) / prior) * 100).toFixed(1)} %`;
+const betaOk = (rate, beta) => num(beta) > 0 && (rate !== 'quality' || num(beta) === FALLBACK_BETA);
+
+/**
+ * The measurement rules of one way D run (plan M1 to M4, M6), each true when the run keeps it. One owner:
+ * the rows of this check and the fit's eligibility (fit/fit.mjs, #295 round 3 H6) both call these.
+ */
+export const D_ROW_RULES = {
+  /** M2: live and worker are two processes and the way's CPU is both phases. */
+  two_processes: (r) => Boolean(r.live_pid && r.worker_pid && r.live_pid !== r.worker_pid && num(r.way_cpu_ns) === num(r.a_rt_ns) + num(r.a_w_ns)),
+  /** M1, M3: input B,G,R,A; each phase's peak above its M_0 (taken after the input is prepared). */
+  ram_base: (r) => r.input === 'bgra' && num(r.live_os_peak_private) > num(r.live_os_peak_at_m0) && num(r.worker_os_peak_private) > num(r.worker_os_peak_at_m0),
+  /** M3: RAM is the OS peak of both phases. */
+  ram_os_both: (r) => num(r.live_ram_os) > 0 && num(r.worker_ram_os) > 0 && num(r.ram_os) === num(r.live_ram_os) + num(r.worker_ram_os)
+    && num(r.m_live) === num(r.live_ram_os) && num(r.m_worker) === num(r.worker_ram_os),
+  /** M4: bytes on disk = MP4 + frames.jsonl (one line per instant) + clip.json. */
+  retained_bytes: (r, root) => {
+    const sum = num(r.frame_bytes) + num(r.index_bytes) + num(r.clip_json_bytes);
+    return num(r.bytes_disk) === sum && num(r.bytes_on_disk) === sum && num(r.frame_bytes) === num(r.bytes) && num(r.clip_json_bytes) > 0
+      && num(r.index_lines) === CorpusFolder.nInst(root, r.folder);
+  },
+  /** M5: beta > 0; quality mode keeps the product's fallback. */
+  beta_positive: (r) => betaOk(r.rate_req ?? r.rate, r.beta_req ?? r.beta),
+  /** M6: every decoded frame mapped to a corpus new frame by time. */
+  frames_mapped: (r, root) => num(r.frames_mapped) === CorpusFolder.nNew(root, r.folder) && num(r.frames_missing) === 0 && num(r.frames_extra) === 0 && num(r.frames_mistimed) === 0,
+};
 
 /** The probe's meter self-check on one corpus frame, run once. */
 function meterSelfCheck(root) {
@@ -180,30 +205,25 @@ function checks(rows, root) {
     },
     'D: live and worker are two processes': needRows(() => {
       const runs = okRows(rows);
-      const bad = runs.filter((r) => !(r.live_pid && r.worker_pid && r.live_pid !== r.worker_pid && num(r.way_cpu_ns) === num(r.a_rt_ns) + num(r.a_w_ns)))
+      const bad = runs.filter((r) => !D_ROW_RULES.two_processes(r, root))
         .map((r) => `${label(r)}: pid ${r.live_pid ?? '-'}/${r.worker_pid ?? '-'}, way_cpu ${r.way_cpu_ns ?? '-'} vs ${num(r.a_rt_ns) + num(r.a_w_ns)}`);
       return { value: 'two pids; a_rt + a_w', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
     }),
     'D: RAM base excludes corpus buffers': needRows(() => {
       const runs = okRows(rows);
-      const bad = runs.filter((r) => !(r.input === 'bgra' && num(r.live_os_peak_private) > num(r.live_os_peak_at_m0) && num(r.worker_os_peak_private) > num(r.worker_os_peak_at_m0)))
+      const bad = runs.filter((r) => !D_ROW_RULES.ram_base(r, root))
         .map((r) => `${label(r)}: input ${r.input ?? '-'}, live peak ${r.live_os_peak_private ?? '-'} vs ${r.live_os_peak_at_m0 ?? '-'}, worker peak ${r.worker_os_peak_private ?? '-'} vs ${r.worker_os_peak_at_m0 ?? '-'}`);
       return { value: 'bgra; peak > peak at M_0', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
     }),
     'D: RAM is the OS peak of both phases': needRows(() => {
       const runs = okRows(rows);
-      const bad = runs.filter((r) => !(num(r.live_ram_os) > 0 && num(r.worker_ram_os) > 0 && num(r.ram_os) === num(r.live_ram_os) + num(r.worker_ram_os)
-        && num(r.m_live) === num(r.live_ram_os) && num(r.m_worker) === num(r.worker_ram_os)))
+      const bad = runs.filter((r) => !D_ROW_RULES.ram_os_both(r, root))
         .map((r) => `${label(r)}: ram_os ${r.ram_os ?? '-'} = ${r.live_ram_os ?? '-'} + ${r.worker_ram_os ?? '-'}?`);
       return { value: 'live + worker', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
     }),
     'D: bytes include frames.jsonl and clip.json': needRows(() => {
       const runs = okRows(rows);
-      const bad = runs.filter((r) => {
-        const sum = num(r.frame_bytes) + num(r.index_bytes) + num(r.clip_json_bytes);
-        return !(num(r.bytes_disk) === sum && num(r.bytes_on_disk) === sum && num(r.frame_bytes) === num(r.bytes) && num(r.clip_json_bytes) > 0
-          && num(r.index_lines) === CorpusFolder.nInst(root, r.folder));
-      }).map((r) => `${label(r)}: disk ${r.bytes_disk ?? '-'} on disk ${r.bytes_on_disk ?? '-'} = ${r.frame_bytes ?? '-'} + ${r.index_bytes ?? '-'} + ${r.clip_json_bytes ?? '-'}, lines ${r.index_lines ?? '-'}/${CorpusFolder.nInst(root, r.folder)}`);
+      const bad = runs.filter((r) => !D_ROW_RULES.retained_bytes(r, root)).map((r) => `${label(r)}: disk ${r.bytes_disk ?? '-'} on disk ${r.bytes_on_disk ?? '-'} = ${r.frame_bytes ?? '-'} + ${r.index_bytes ?? '-'} + ${r.clip_json_bytes ?? '-'}, lines ${r.index_lines ?? '-'}/${CorpusFolder.nInst(root, r.folder)}`);
       return { value: 'MP4 + frames.jsonl + clip.json', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
     }),
     'D: a refused setting is recorded as refused': needRows(() => {
@@ -223,13 +243,13 @@ function checks(rows, root) {
     'D: beta never 0': needRows(() => {
       const list = readRunList();
       const all = [...rows.map((r) => ({ where: label(r), rate: r.rate_req ?? r.rate, beta: r.beta_req ?? r.beta })), ...(list?.runs ?? []).map((r) => ({ where: `plan ${r.folder} ${r.encoder} q${r.q}`, rate: r.rate, beta: r.beta }))];
-      const bad = all.filter((r) => !(num(r.beta) > 0 && (r.rate !== 'quality' || num(r.beta) === FALLBACK_BETA))).map((r) => `${r.where}: ${r.rate} beta ${r.beta}`);
+      const bad = all.filter((r) => !betaOk(r.rate, r.beta)).map((r) => `${r.where}: ${r.rate} beta ${r.beta}`);
       return { value: `> 0; quality ${FALLBACK_BETA}`, measured: `${all.length - bad.length}/${all.length} runs and plan rows${list ? '' : ' (no run list)'}${misses(bad)}`, pass: list !== null && bad.length === 0 };
     }),
     'D: every decoded frame mapped by time': needRows(() => {
       const runs = rows.filter((r) => r.status === 'ok' || r.status === 'frame_map');
       const bad = runs.filter((r) => {
-        const clean = num(r.frames_mapped) === CorpusFolder.nNew(root, r.folder) && num(r.frames_missing) === 0 && num(r.frames_extra) === 0 && num(r.frames_mistimed) === 0;
+        const clean = D_ROW_RULES.frames_mapped(r, root);
         return r.status === 'ok' ? !clean : clean;
       }).map((r) => `${label(r)}: ${r.status}, mapped ${r.frames_mapped ?? '-'}/${CorpusFolder.nNew(root, r.folder)}, missing ${r.frames_missing ?? '-'}, extra ${r.frames_extra ?? '-'}, mistimed ${r.frames_mistimed ?? '-'}`);
       const mapFails = runs.filter((r) => r.status === 'frame_map').length;

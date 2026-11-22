@@ -26,6 +26,14 @@ const LOCK_SUFFIX: &str = ".lock";
 const RECORDER_LOCK_FILE: &str = "recorder.lock";
 const TEMP_SUFFIX: &str = ".tmp";
 const PART_SUFFIX: &str = ".part";
+/// A rename of `clip.json` or of a segment `.part` file is tried this many
+/// times in all while another program holds the file for a moment.
+const RENAME_ATTEMPTS: u32 = 5;
+/// The sleep between two rename attempts.
+const RENAME_RETRY_SLEEP_MS: u64 = 100;
+/// Windows errors of a file another program holds for a moment: access
+/// denied (5), sharing violation (32), lock violation (33).
+const BRIEF_HOLD_OS_ERRORS: [i32; 3] = [5, 32, 33];
 /// Extension of a waiting frame: B, G, R rows compressed with zstd (A8).
 const WAITING_FRAME_EXTENSION: &str = "zst";
 /// zstd level of the waiting frames (package 0b full comparison, `ca46079d`).
@@ -730,8 +738,31 @@ pub(super) fn write_atomically(path: &Path, value: &impl Serialize) -> Result<()
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
     drop(file);
-    std::fs::rename(&temp, path)
+    rename_retrying(&temp, path)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
+}
+
+/// Renames `from` to `to`, replacing `to`. When another program holds one of
+/// the files for a moment (antivirus, indexer: `BRIEF_HOLD_OS_ERRORS`), the
+/// rename is tried again, up to `RENAME_ATTEMPTS` times in all and
+/// `RENAME_RETRY_SLEEP_MS` apart; any other error fails at once.
+pub(super) fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(error)
+                if attempt < RENAME_ATTEMPTS
+                    && cfg!(windows)
+                    && error
+                        .raw_os_error()
+                        .is_some_and(|code| BRIEF_HOLD_OS_ERRORS.contains(&code)) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(RENAME_RETRY_SLEEP_MS));
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 /// The recorder's exclusive `recorder.lock` in the clip folder, held for the

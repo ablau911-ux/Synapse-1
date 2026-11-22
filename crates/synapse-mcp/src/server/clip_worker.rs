@@ -380,7 +380,7 @@ impl ClipWorker {
             .map_err(|error| format!("could not flush {}: {error}", part.display()))?;
         let file_name = super::clip_folder::segment_file_name(index);
         let finished = self.folder.join(&file_name);
-        std::fs::rename(&part, &finished)
+        super::clip_folder::rename_retrying(&part, &finished)
             .map_err(|error| format!("could not rename {}: {error}", part.display()))?;
         let (bytes, sha256) = super::clip_folder::file_size_and_sha256(&finished)
             .map_err(|error| format!("could not hash {}: {error}", finished.display()))?;

@@ -254,7 +254,7 @@ Consequence: a fade of any length is detected once its total contrast passes the
 - While a block animates, its anchor is frozen and it makes no event.
 - When it stops, it is compared with its anchor like any settling block. So a checkmark that replaces a spinner is a CHANGED event.
 - As built (`ea3e8514`): that change starts at the block's last motion, not at the start of the animation, so "checkmark replaces spinner" starts within one instant of the replacement.
-- As built (`ea3e8514`): a block that animated and ends back at its anchor makes no FLASH or REVERTED event; the animation event already covers that interval. Without this, a playhead would give a short-lived change in every block it crosses.
+- Owner decision (2026-11-22 21:07, issue #293): a block that animated and ends back at its anchor makes no FLASH or REVERTED event for that animated stretch; the animation event already covers it. Only that stretch is exempt: a later return in the same block is classified as usual. Without this, a playhead would give a short-lived change in every block it crosses.
 - Connected animating blocks form one animation interval.
 - There is no absorption: a block that is not animating is never swallowed by a neighbour.
 

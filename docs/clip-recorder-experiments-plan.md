@@ -10,6 +10,29 @@ End result wanted: **a small video file, of high quality, whose creation uses as
 
 Fixed by the owner earlier, and not experiment factors: f = 20 fps; flashes of 50 ms or more are in the clip; at most 10 % processor (E10); at least 480 lines; lossless waiting frames (E11); no cursor in the picture (E9); quality before bytes.
 
+## Method (owner, 2026-11-22 21:08): the target, every way to it, keep what reaches it, save the best equation
+
+"I want to get to x + y. Find me all the ways to get there and log every way. Try all the ways you found and keep those that produce the outcome x + y. Save the equation that does it better than the others."
+
+1. **Target (x + y).** A way reaches the target when all of these hold on the corpus:
+
+       O = [R = 1] ∧ [flashes found = flashes scheduled] ∧ [N_lost = 0] ∧ [U_weak ≤ 0.10] ∧ [lines ≥ 480]
+
+2. **All the ways.** Every way to turn the captured frames into a stored clip that an agent can view is listed in `docs/clip-recorder-ways.md`, the ways register. A way is any architecture, coder, encoder, setting, or combination of them. Each row records:
+   - the way and its source;
+   - its equations for bytes, CPU and RAM;
+   - whether it can run on this PC, and if not, why;
+   - its result on the corpus;
+   - kept or dropped, and the reason.
+
+   A way that cannot run is still logged.
+3. **Try all, keep those with O = true.** Every runnable way runs on the same corpus (steps 2 and 3). A way with O = false is dropped, and its row names the clause that failed.
+4. **The best way.** Among the kept ways, the cost equation is
+
+       J = bytes / bytes* + CPU / CPU* + RAM / RAM*
+
+   where bytes*, CPU* and RAM* are the smallest values among the kept ways, per minute of clip, and RAM is the peak. The way with the least J is the best. Its fitted equations (bytes, CPU, RAM, quality) are saved in the results file and then in the building plan. The Pareto front is shown beside it, so the owner sees every trade-off and decides.
+
 ## How "absolute and predictable" is reached
 
 1. **Fixed input.** Each content scenario is captured once into a corpus of lossless frames with their instants. Every configuration encodes the **same** frames, so a difference in a result comes only from the configuration.
@@ -159,7 +182,7 @@ Symbols as in section "Equations"; t = 20 s, f = 20 fps; w × h = recorded size 
 
 1. **Hard constraints:** R = 1 and every flash present (quality); U ≤ 10 % on the weakest-machine estimate; no lost instants.
 2. Among the configurations that pass: the **Pareto front** of bytes per minute, CPU time per minute and peak RAM.
-3. **Recommendation:** the front point with the least CPU plus RAM whose bytes are within 10 % of the smallest passing file. The owner sees the whole front and decides. The product changes only after that decision.
+3. **Recommendation:** the kept way with the least J (section "Method"). The owner sees the whole front and decides. The product changes only after that decision.
 
 ## Correcting the building plan from the results
 

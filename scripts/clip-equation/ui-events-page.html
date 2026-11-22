@@ -1,0 +1,146 @@
+<!doctype html>
+<!--
+  Clip viewer D5 proof page (docs/clip-recorder-plan.md, "D5 as an equation", item 7).
+  Plays a fixed schedule of ordinary UI events, by time from the schedule start:
+    ?start=<unix ms>  the schedule start (wall clock); without it, 3 s after the page loads.
+  The schedule is printed on the page (static text) and exposed as window.schedule:
+  [{ t_ms, name, expect, until_ms? }], expect = the timeline kind the viewer must report.
+  Always running, from page load to past the clip end:
+    - a lone spinner (an ordinary 32 px border-arc spinner, 1 turn per second), far from all else;
+    - spinner B beside a label, until a checkmark replaces it.
+  Nothing flashes the whole window: every change is local and small.
+  Open the file directly in a browser; it needs no server and takes no input.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clip D5 events page</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { background: #f4f4f8; color: #222; font: 16px/1.5 "Segoe UI", Arial, sans-serif; }
+  .card { position: absolute; background: #ffffff; border: 1px solid #c8c8d0; border-radius: 6px; }
+  #schedule { position: absolute; left: 16px; top: 16px; width: 430px; height: 400px; background: #fffbe6;
+              border: 1px solid #d8cf9c; border-radius: 6px; padding: 8px 12px; box-sizing: border-box;
+              font: 13px/1.45 Consolas, monospace; white-space: pre; overflow: hidden; }
+  #list { left: 480px; top: 16px; width: 260px; height: 160px; padding: 6px 0; box-sizing: border-box; }
+  #list div { height: 28px; line-height: 28px; padding: 0 14px; }
+  #list div.selected { background: #cce8ff; }
+  #fillcard { left: 780px; top: 16px; width: 200px; height: 160px; }
+  #fill { position: absolute; left: 30px; top: 30px; width: 140px; height: 100px; background: #ffffff; }
+  #fill.on { background: #d0d0d0; }
+  #dialog { position: absolute; left: 480px; top: 220px; width: 300px; height: 130px; background: #ffffff;
+            border: 2px solid #555; border-radius: 8px; padding: 10px 16px; box-sizing: border-box;
+            opacity: 0; transition: opacity 300ms linear; }
+  #dialog.on { opacity: 1; }
+  #dialog b { display: block; font-size: 18px; }
+  #dialog span { display: inline-block; margin: 14px 12px 0 0; padding: 2px 14px; border: 1px solid #333; border-radius: 4px; }
+  #savecard { left: 820px; top: 220px; width: 330px; height: 72px; }
+  .spinner { position: absolute; width: 32px; height: 32px; box-sizing: border-box; border-radius: 50%;
+             border: 4px solid #e2e2e2; border-top-color: #2f6fd0; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #spinnerB { left: 20px; top: 20px; }
+  #check { position: absolute; left: 18px; top: 14px; font: bold 30px/1 "Segoe UI Symbol", Arial, sans-serif; color: #1b8a2e; display: none; }
+  #saveLabel { position: absolute; left: 76px; top: 22px; }
+  #flashcard { left: 480px; top: 400px; width: 420px; height: 110px; }
+  #flash { position: absolute; left: 24px; top: 24px; width: 80px; height: 60px; background: #ff2050; display: none; }
+  #status { position: absolute; left: 140px; top: 40px; }
+  #trackcard { left: 16px; top: 560px; width: 860px; height: 72px; }
+  #track { position: absolute; left: 30px; top: 16px; width: 800px; height: 40px; background: #e8e8e8; }
+  #playhead { position: absolute; left: 0; top: 0; width: 2px; height: 40px; background: #c00000; }
+  #typecard { left: 16px; top: 680px; width: 520px; height: 64px; }
+  #field { position: absolute; left: 16px; top: 14px; width: 486px; height: 34px; border: 1px solid #888;
+           box-sizing: border-box; padding: 4px 8px; font: 16px/24px Consolas, monospace; white-space: pre; }
+  #caret { display: inline-block; width: 2px; height: 18px; background: #000; vertical-align: -3px; visibility: hidden; }
+  #lonecard { left: 1080px; top: 640px; width: 100px; height: 100px; }
+  #spinnerA { left: 34px; top: 34px; }
+</style>
+</head>
+<body>
+<div id="schedule"></div>
+<div class="card" id="list"><div>Inbox</div><div>Drafts</div><div id="item3">Sent items</div><div>Archive</div><div>Trash</div></div>
+<div class="card" id="fillcard"><div id="fill"></div></div>
+<div id="dialog"><b>Delete this file?</b>It cannot be restored.<br><span>Cancel</span><span>Delete</span></div>
+<div class="card" id="savecard"><div class="spinner" id="spinnerB"></div><div id="check">&#x2714;</div><div id="saveLabel">Saving 1 of 3 files</div></div>
+<div class="card" id="flashcard"><div id="flash"></div><div id="status">Status: idle</div></div>
+<div class="card" id="trackcard"><div id="track"><div id="playhead"></div></div></div>
+<div class="card" id="typecard"><div id="field"><span id="typed"></span><span id="caret"></span></div></div>
+<div class="card" id="lonecard"><div class="spinner" id="spinnerA"></div></div>
+<script>
+  const FLASH_MS = 50;              // d_min: one recorded instant
+  const PLAYHEAD_PX_PER_S = 20;     // one pixel per recorded instant at 20 fps
+  const TYPE_TEXT = 'clip viewer equation';
+  const TYPE_MS_PER_CHAR = 120;
+  const CARET_HALF_PERIOD_MS = 530; // the Windows default caret blink
+  const AUTO_START_MS = 3000;
+
+  // t_ms from the schedule start; expect = the timeline kind the viewer must report.
+  const schedule = [
+    { t_ms: 2000, name: 'list selection #cce8ff on white', expect: 'change' },
+    { t_ms: 4000, name: 'grey fill #d0d0d0 on white', expect: 'change' },
+    { t_ms: 6000, name: 'dialog fades in over 300 ms', expect: 'change' },
+    { t_ms: 8000, name: 'label changes beside running spinner B', expect: 'change' },
+    { t_ms: 10000, name: 'checkmark replaces spinner B', expect: 'change' },
+    { t_ms: 12000, name: '50 ms flash', expect: 'short_lived' },
+    { t_ms: 12000, name: 'status label changes beside the flash', expect: 'change' },
+    { t_ms: 14000, name: 'playhead (2 px) starts moving, 20 px/s', expect: 'animating' },
+    { t_ms: 16000, name: 'typing starts, 20 characters, 120 ms each', expect: 'change' },
+    { t_ms: 19000, until_ms: 29000, name: 'still period: nothing new (caret blinks)', expect: 'none' },
+  ];
+  window.schedule = schedule;
+
+  const param = Number(new URLSearchParams(location.search).get('start'));
+  const start = Number.isFinite(param) && param > 0 ? param : Date.now() + AUTO_START_MS;
+  window.scheduleStart = start;
+
+  const $ = id => document.getElementById(id);
+  $('schedule').textContent =
+    'Clip D5 proof page: schedule (ms from start)\n' +
+    'start (unix ms): ' + start + '\n\n' +
+    schedule.map(e => (('      ' + e.t_ms).slice(-6)) + (e.until_ms ? '-' + e.until_ms : '') +
+      '  ' + e.name + '\n        expect: ' + e.expect).join('\n') +
+    '\n\nalways: lone spinner (bottom right),\n        spinner B until 10000';
+
+  const actions = {
+    2000: () => $('item3').classList.add('selected'),
+    4000: () => $('fill').classList.add('on'),
+    6000: () => $('dialog').classList.add('on'),
+    8000: () => { $('saveLabel').textContent = 'Saving 2 of 3 files'; },
+    10000: () => { $('spinnerB').style.display = 'none'; $('check').style.display = 'block'; },
+    12000: () => { $('flash').style.display = 'block'; $('status').textContent = 'Status: synced'; },
+  };
+  const done = new Set();
+  let flashOffAt = null;
+  let caretTimer = null;
+
+  function blinkCaret() {
+    clearInterval(caretTimer);
+    $('caret').style.visibility = 'visible';
+    caretTimer = setInterval(() => {
+      const c = $('caret').style;
+      c.visibility = c.visibility === 'hidden' ? 'visible' : 'hidden';
+    }, CARET_HALF_PERIOD_MS);
+  }
+
+  function frame() {
+    const t = Date.now() - start;
+    for (const [at, act] of Object.entries(actions)) {
+      if (t >= Number(at) && !done.has(at)) { done.add(at); act(); if (Number(at) === 12000) flashOffAt = Number(at) + FLASH_MS; }
+    }
+    if (flashOffAt !== null && t >= flashOffAt) { $('flash').style.display = 'none'; flashOffAt = null; }
+    if (t >= 14000) {
+      const x = Math.min(798, Math.floor((t - 14000) * PLAYHEAD_PX_PER_S / 1000));
+      $('playhead').style.left = x + 'px';
+    }
+    if (t >= 16000) {
+      const n = Math.min(TYPE_TEXT.length, Math.floor((t - 16000) / TYPE_MS_PER_CHAR) + 1);
+      if ($('typed').textContent.length !== n) {
+        $('typed').textContent = TYPE_TEXT.slice(0, n);
+        blinkCaret(); // solid while typing, blinks from the last key on
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

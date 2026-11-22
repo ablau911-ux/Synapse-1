@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_BOTTOM, IsWindowVisible,
-    PostMessageW, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos, WM_CLOSE,
+    PostMessageW, SWP_NOACTIVATE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos, WM_CLOSE,
 };
 use windows::core::BOOL;
 
@@ -100,7 +100,14 @@ impl ChromeWindow {
                     )
                 }
                 .map_err(crate::win("SetWindowPos"))?;
-                let foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
+                let mut foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
+                if foreground_after == hwnd && foreground_before != 0 {
+                    // Chrome activates its new window; hand the foreground
+                    // back to the owner's window that had it (no input sent).
+                    // SAFETY: a foreground request for an existing window handle.
+                    let _ = unsafe { SetForegroundWindow(HWND(foreground_before as *mut _)) };
+                    foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
+                }
                 if foreground_after == hwnd || foreground_after != foreground_before {
                     println!("chrome_window note=foreground changed (before {foreground_before:#x}, after {foreground_after:#x}, probe window {hwnd:#x})");
                 }

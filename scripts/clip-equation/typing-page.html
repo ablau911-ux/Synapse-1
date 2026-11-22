@@ -50,11 +50,14 @@
     box.scrollTop = box.scrollHeight;
   }
 
+  // Only a step that changes the text or the caret touches the page, so a
+  // step without a change makes no new frame.
+  const key = (k) => Math.floor(k * CHARS_PER_S * INSTANT_MS / 1000) + ':' + Math.floor(k / BLINK_STEPS) % 2;
   let shown = -1;
   function frame(now) {
     if (startPerf === null) startPerf = now;
     const k = Math.max(0, Math.floor((now - startPerf) / INSTANT_MS));
-    if (k !== shown) { draw(k); shown = k; }
+    if (k !== shown) { if (key(k) !== key(shown)) draw(k); shown = k; }
     requestAnimationFrame(frame);
   }
   draw(0);

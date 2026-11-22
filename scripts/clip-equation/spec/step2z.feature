@@ -34,6 +34,24 @@ Feature: Way Z, every zstd way compresses the corpus losslessly with known bytes
     # reproduce the corpus writer's call (Node zlib.zstdCompressSync) and are printed as
     # evidence of the cause when the row misses; they never make it pass.
 
+  Scenario: baseline, corpus writer's call
+    Given way ZW1, L = -3, with the corpus writer's call: ZSTD_compressStream2, output drained 16 KB at a time (drain=16384, as Node zlib.zstdCompressSync)
+    Then bytes = D_wait of the folder, to the byte
+    # The one-shot row above stays strict; its difference is reported as caused by the call.
+
+  Scenario: RAM, nbWorkers > 0
+    Given zstd's estimates cover one thread only
+    Then M_comp = M_0 + ZSTD_sizeof_CCtx + B_c · px · 3 is within ±10 % of the measured peak private bytes
+
+  Scenario: RAM, one stream
+    Given W_eff = min(2^W, px · 3) when K_z = 1 (zstd knows the frame size at the first call), else 2^W
+    Then M_comp = M_0 + M_cctx − 2^W + W_eff + B_c · px · 3 is within ±10 % of the measured peak private bytes
+
+  Scenario: CPU from the cycle counter
+    Given rate = cycles per second of `clip-probe exp-rate` (QueryThreadCycleTime over QueryPerformanceCounter, 3 spins of 300 ms, the largest kept)
+    Then C = process cycles (QueryProcessCycleTime, user plus kernel, every thread) / rate · 10^9
+    And for one thread C <= 1.02 · the wall time of the same calls
+
   Scenario: determinism
     Given one configuration run 3 times (repeat 1, 2 and 3)
     Then bytes of run 1 = run 2 = run 3

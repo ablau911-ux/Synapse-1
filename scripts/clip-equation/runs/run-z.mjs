@@ -77,8 +77,8 @@ const MEASURED_COLUMNS = [
   'dec_cpu_ns', 'dec_gpt_ns', 'dec_wall_ns', 'dec_cpu_per_frame_ns', 'dec_peak_private', 'dec_peak_ws', 'read_cpu_ns', 'corpus_dec_cpu_ns',
   'frames_decoded', 'diff_sum', 'diff_frames', 'n_dec_worst', 't_ready_ns', 'run_wall_ms',
 ];
-const KNOWN_COLUMNS = ['known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
-const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_baseline', 'pass_ram', 'pass_roundTrip', 'pass_seek', 'pass_ramDec', 'pass_ready', 'error'];
+const KNOWN_COLUMNS = ['rate', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
+const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_baseline', 'pass_baselineWriter', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_ramDec', 'pass_ready', 'error'];
 const COLUMNS = [...OPTION_COLUMNS, ...MEASURED_COLUMNS, ...KNOWN_COLUMNS, ...PASS_COLUMNS];
 
 const folders = () => SCENARIOS.flatMap((s) => SIZES.map((z) => `${s}-${z}`));
@@ -110,6 +110,139 @@ export function pilotPlan(folder) {
     runs.push({ folder, level: -3, frames_cap: m.way === 'ZW16' ? 40 : '', ...m, rep: 1 });
   }
   return runs;
+}
+
+// Run list v2 (manager, 2026-11-22 about 21:37): the coverage floor, then larger sizes by cost.
+const FLOOR_SIZE = '640x360';
+const LARGER_SIZES = ['506x333', '1280x720', '1920x1080'];
+const BUDGET_S = 12 * 3600;
+const HOLD_OUT_SHARE = 0.2;
+const HOLD_OUT_SEED = 20261122;
+const PILOT_PX = 1920 * 1080;
+const RUNLIST = path.join(RESULTS, 'z-runlist.json');
+
+/** Every runnable way and option level swept over every level; ZW0 and the corpus writer's call once. */
+function wayConfigs() {
+  const once = GRID_B.filter((b) => b.way === 'ZW0' || b.drain);
+  const swept = [...GRID_A_MODES, ...GRID_B.filter((b) => !once.includes(b))];
+  return { swept, once };
+}
+
+/** Least squares y = t0 + a · x. */
+function line(points) {
+  const n = points.length;
+  const mx = points.reduce((s, p) => s + p[0], 0) / n;
+  const my = points.reduce((s, p) => s + p[1], 0) / n;
+  const a = points.reduce((s, p) => s + (p[0] - mx) * (p[1] - my), 0) / points.reduce((s, p) => s + (p[0] - mx) ** 2, 0);
+  return { t0: my - a * mx, a };
+}
+
+/**
+ * Equation 6 with the pilot's measured terms, per run:
+ *   t_run = t_0 + N_new · (px / px_pilot) · (a + c(L, m)),   c(L, m) = c_ZW1(L) · c_m(-3) / c_ZW1(-3)
+ * i.e. T = Σ_runs (t_0 + N_new · px · 3 / v(L, m)) · repeats with v(L, m) = px_pilot · 3 / (a + c(L, m)).
+ * t_0 = start cost of one subprocess; a = per-frame cost outside compressing (corpus decode, write,
+ * decode and compare); c = compress wall time per frame. t_0 and a from a line fit over the ZW1 pilot
+ * rows (5 to 400 frames): run wall − frames · c = t_0 + frames · a.
+ */
+export function costModel(pilotCsv) {
+  const [head, ...lines] = fs.readFileSync(pilotCsv, 'utf8').split(/\r?\n/).filter((l) => l.trim());
+  const cols = head.split(',');
+  const rows = lines.map((l) => Object.fromEntries(l.split(',').map((v, i) => [cols[i], v]))).filter((r) => !r.error);
+  const perFrame = (r) => Number(r.comp_wall_ns) / 1e9 / Number(r.frames);
+  const zw1 = rows.filter((r) => r.way === 'ZW1' && r.drain === '0' && r.rep === '1');
+  const { t0, a } = line(zw1.map((r) => [Number(r.frames), Number(r.run_wall_ms) / 1000 - Number(r.frames) * perFrame(r)]));
+  const cLevel = new Map(zw1.map((r) => [Number(r.level), perFrame(r)]));
+  const base = cLevel.get(-3);
+  const atBase = rows.filter((r) => Number(r.level) === -3 && r.rep === '1');
+  const ratio = (config) => {
+    const row = atBase.find((r) => r.way === config.way && Object.entries(config)
+      .filter(([k]) => !['folder', 'level', 'rep', 'frames_cap', 'way'].includes(k))
+      .every(([k, v]) => String(r[k]) === String(v)));
+    return row ? perFrame(row) / base : null;
+  };
+  const missing = new Set();
+  const cost = (config, level, nNew, px) => {
+    const k = ratio(config) ?? (missing.add(config.way), 1);
+    const c = config.way === 'ZW0' ? k * base : (cLevel.get(level) ?? base) * k;
+    return t0 + nNew * (px / PILOT_PX) * (a + c);
+  };
+  return { t0, a, cLevel, cost, missing };
+}
+
+/** A seeded generator (mulberry32), so the held-out cells are the same on every build of the list. */
+function seeded(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** results/z-runlist.json: cells (way, options, level, size; 6 contents × 3 repeats each), cheapest first. */
+export function buildRunList(budgetS = BUDGET_S) {
+  const model = costModel(path.join(RESULTS, 'z-pilot.csv'));
+  const { swept, once } = wayConfigs();
+  const cellCost = (config, level, size) => {
+    const [w, h] = size.split('x').map(Number);
+    return SCENARIOS.reduce((s, sc) => s + model.cost(config, level, CorpusFolder.of(CORPUS, `${sc}-${size}`).nNew, w * h), 0) * REPEATS;
+  };
+  const make = (config, level, size) => ({ ...config, level, size, cost_s: cellCost(config, level, size) });
+  const floor = [...swept.flatMap((c) => LEVELS.map((l) => make(c, l, FLOOR_SIZE))), ...once.map((c) => make(c, -3, FLOOR_SIZE))];
+  for (const cell of floor) cell.status = 'run';
+  const floorS = floor.reduce((s, c) => s + c.cost_s, 0);
+  const larger = [...swept.flatMap((c) => LEVELS.flatMap((l) => LARGER_SIZES.map((z) => make(c, l, z)))), ...once.flatMap((c) => LARGER_SIZES.map((z) => make(c, -3, z)))]
+    .sort((x, y) => x.cost_s - y.cost_s);
+  let total = floorS;
+  for (const cell of larger) {
+    if (total + cell.cost_s <= budgetS) {
+      cell.status = 'run';
+      total += cell.cost_s;
+    } else {
+      cell.status = 'predicted';
+    }
+  }
+  // Hold-out: 20 % of the cells that run at more than one size, drawn from the larger sizes (the floor stays in the fit).
+  const groupKey = (c) => JSON.stringify({ ...c, size: undefined, cost_s: undefined, status: undefined });
+  const sizesRun = new Map();
+  for (const c of [...floor, ...larger].filter((x) => x.status === 'run')) sizesRun.set(groupKey(c), (sizesRun.get(groupKey(c)) ?? 0) + 1);
+  const multi = [...floor, ...larger].filter((c) => c.status === 'run' && sizesRun.get(groupKey(c)) > 1);
+  const pool = multi.filter((c) => c.size !== FLOOR_SIZE);
+  const random = seeded(HOLD_OUT_SEED);
+  const shuffled = pool.map((c) => [random(), c]).sort((x, y) => x[0] - y[0]).map(([, c]) => c);
+  for (const c of shuffled.slice(0, Math.round(HOLD_OUT_SHARE * multi.length))) c.status = 'held-out';
+  const cells = [...floor, ...larger].sort((x, y) => x.cost_s - y.cost_s).map((c, i) => ({ id: i + 1, ...c, cost_s: Math.round(c.cost_s * 10) / 10 }));
+  const count = (s) => cells.filter((c) => c.status === s).length;
+  const list = {
+    created: new Date().toISOString(),
+    rule: 'coverage floor: every runnable way and option level x every Z1 level x 6 contents at 640x360; then the larger sizes cell by cell, cheapest predicted cell first, while T_total <= 12 h; cells left out are predicted by the size equations (eq. 1 eta, eq. 3 px-linear kappa_c); 20 % of the cells that run at more than one size are held out (seeded, drawn from the larger sizes)',
+    equation: 'T = sum over runs of (t_0 + N_new * (px / px_pilot) * (a + c(L, m))) * repeats; c(L, m) = c_ZW1(L) * c_m(-3) / c_ZW1(-3); equation 6 with v(L, m) = px_pilot * 3 / (a + c(L, m)) plus t_0 per subprocess',
+    coefficients: { t_0_s: model.t0, a_s_per_frame: model.a, px_pilot: PILOT_PX, c_ZW1_s_per_frame: Object.fromEntries(model.cLevel), pilot: 'results/z-pilot.csv' },
+    repeats: REPEATS,
+    contents: SCENARIOS,
+    hold_out: { share: HOLD_OUT_SHARE, seed: HOLD_OUT_SEED, generator: 'mulberry32' },
+    budget_h: budgetS / 3600,
+    T_floor_h: floorS / 3600,
+    T_total_h: total / 3600,
+    counts: { cells: cells.length, run: count('run'), held_out: count('held-out'), predicted: count('predicted'), runs: (count('run') + count('held-out')) * SCENARIOS.length * REPEATS },
+    ways_without_pilot_row: [...model.missing],
+    not_run: NOT_RUN,
+    cells,
+  };
+  fs.writeFileSync(RUNLIST, `${JSON.stringify(list, null, 1)}\n`);
+  return list;
+}
+
+/** The runs of the list, cheapest cell first: every content, repeats 1 to 3. */
+function listRuns() {
+  const list = JSON.parse(fs.readFileSync(RUNLIST, 'utf8'));
+  return list.cells.filter((c) => c.status !== 'predicted').flatMap((c) => SCENARIOS.flatMap((sc) => Array.from({ length: REPEATS }, (_, i) => {
+    const { id, size, status, cost_s: _cost, ...config } = c;
+    return { ...config, folder: `${sc}-${size}`, rep: i + 1, cell: id, held_out: status === 'held-out' ? 1 : 0 };
+  })));
 }
 
 class Csv {
@@ -184,7 +317,7 @@ async function runAll(runs, csvFile, limit = Infinity) {
   console.log(`run-z: cycle rate ${rate} per second`);
   for (const [i, run] of todo.entries()) {
     const { json, error, wallMs } = await runProbe(probeArgs(run, rate));
-    const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, error };
+    const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, rate, error };
     for (const key of ['layout', 'mode', 'tile', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain']) row[key] = json?.[key] ?? run[key] ?? '';
     if (json) {
       const folder = CorpusFolder.of(CORPUS, run.folder);
@@ -313,8 +446,11 @@ async function main() {
   if (flag === '--plan') {
     const plan = fullPlan();
     console.log(`full run: ${plan.length} runs (${plan.length / REPEATS} configurations × ${REPEATS} repeats); not run: ${Object.keys(NOT_RUN).join(', ')}`);
+  } else if (flag === '--runlist') {
+    const list = buildRunList(arg ? Number(arg) * 3600 : BUDGET_S);
+    console.log(`z-runlist.json: T_total ${list.T_total_h.toFixed(2)} h (floor ${list.T_floor_h.toFixed(2)} h); cells ${JSON.stringify(list.counts)}; t_0 ${list.coefficients.t_0_s.toFixed(3)} s, a ${(list.coefficients.a_s_per_frame * 1e3).toFixed(2)} ms/frame; no pilot row: ${list.ways_without_pilot_row.join(', ') || 'none'}`);
   } else if (flag === '--full') {
-    await runAll(fullPlan(), path.join(RESULTS, 'z-runs.csv'), Number(process.argv[4] ?? Infinity));
+    await runAll(listRuns(), path.join(RESULTS, 'z-runs.csv'), Number(process.argv[4] ?? Infinity));
   } else if (flag === '--pilot') {
     await runAll(pilotPlan(arg ?? 'scroll-1920x1080'), path.join(RESULTS, 'z-pilot.csv'));
   } else if (flag === '--estimate') {

@@ -65,16 +65,46 @@ export function rowChecks(r, folder) {
   add('bytes', `Σ out ${r.bytes_out}`, `on disk ${r.bytes_disk}`, num(r.bytes_out) === num(r.bytes_disk) && num(r.bytes_disk) > 0);
   if (r.way === 'ZW1' && num(r.level) === -3 && num(r.workers) === 0 && r.layout === 'bgr' && nKnown === folder.nNew) {
     if (num(r.drain || 0) === 0) {
-      // The product's call (one-shot ZSTD_compress2, as zstd::bulk::compress): the row itself.
+      // The product's call (one-shot ZSTD_compress2, as zstd::bulk::compress): strict, never loosened.
       add('baseline', folder.dWait, num(r.bytes_disk), num(r.bytes_disk) === folder.dWait);
+      if (num(r.bytes_disk) !== folder.dWait) {
+        out.push({ scenario: 'baseline', note: `known difference caused by the call: one-shot ZSTD_compress2 vs the corpus writer's 16 KB output drain (buffered mode, other block splits), ${num(r.bytes_disk) - folder.dWait} B` });
+      }
     } else {
-      // The corpus writer's call reproduced (ZSTD_compressStream2, output drained `drain` bytes
-      // at a time, as Node zlib.zstdCompressSync): evidence for the cause of a miss, never a pass.
-      out.push({ scenario: 'baseline', note: `evidence, drain=${r.drain} (corpus writer's call) ${r.folder} rep ${r.rep}: D_wait ${folder.dWait}, bytes ${r.bytes_disk}, ${num(r.bytes_disk) === folder.dWait ? 'equal' : 'differ'}` });
+      // Second known result: the corpus writer's call (ZSTD_compressStream2, output drained 16 KB
+      // at a time, as Node zlib.zstdCompressSync) gives D_wait to the byte.
+      add('baselineWriter', folder.dWait, num(r.bytes_disk), num(r.bytes_disk) === folder.dWait);
     }
   }
-  const mComp = num(r.m0_private) + num(r.m_cctx_est) + num(r.bc) * px * 3;
-  add('ram', Math.round(mComp), num(r.peak_private), within(mComp, num(r.peak_private), RAM_TOLERANCE));
+  const workers = num(r.workers) > 0;
+  const stream = r.mode === 'stream';
+  if (!workers && !stream) {
+    const mComp = num(r.m0_private) + num(r.m_cctx_est) + num(r.bc) * px * 3;
+    add('ram', Math.round(mComp), num(r.peak_private), within(mComp, num(r.peak_private), RAM_TOLERANCE));
+  }
+  if (workers) {
+    // zstd's estimates cover one thread only: M_cctx = ZSTD_sizeof_CCtx, read after the last frame.
+    const m = num(r.m0_private) + num(r.cctx_sizeof) + num(r.bc) * px * 3;
+    add('ramWorkers', Math.round(m), num(r.peak_private), within(m, num(r.peak_private), RAM_TOLERANCE));
+  }
+  if (stream) {
+    // The stream estimate counts a window of 2^W. With K_z = 1 each zstd frame ends in its first call,
+    // so zstd knows the frame size and the window is W_eff = min(2^W, px · 3) (ZSTD_resetCCtx_internal:
+    // windowSize = MIN(1 << windowLog, pledgedSrcSize)); with K_z > 1 the size is unknown: W_eff = 2^W.
+    const window = 2 ** num(r.wlog);
+    const wEff = num(r.kz) === 1 ? Math.min(window, px * 3) : window;
+    const m = num(r.m0_private) + num(r.m_cctx_est) - window + wEff + num(r.bc) * px * 3;
+    add('ramStream', `${Math.round(m)} (W_eff ${wEff})`, num(r.peak_private), within(m, num(r.peak_private), RAM_TOLERANCE));
+  }
+  const rate = num(r.rate);
+  if (rate > 0) {
+    // CPU = process cycles (QueryProcessCycleTime, user plus kernel, every thread) / rate · 10^9; one
+    // thread's CPU cannot exceed the wall time of the same calls (2 % for the 50 ms memory sampler).
+    const ns = (num(r.comp_cycles) / rate) * 1e9;
+    const single = !workers;
+    const ok = Math.abs(ns - num(r.comp_cpu_ns)) <= 1 + 1e-9 * ns && (!single || num(r.comp_cpu_ns) <= 1.02 * num(r.comp_wall_ns));
+    add('cpuCycles', `${Math.round(ns)} ns${single ? ` <= 1.02 · wall ${r.comp_wall_ns}` : ''}`, num(r.comp_cpu_ns), ok);
+  }
   add('roundTrip', 0, num(r.diff_sum), num(r.diff_sum) === 0 && num(r.frames_decoded) === nKnown);
   const kz = r.kz === 'all' ? folder.nNew : num(r.kz);
   const independent = isIndependent(r);
@@ -129,8 +159,12 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     frames: new Scenario('frames compressed', 'N_comp = N_new of the folder'),
     bytes: new Scenario('bytes', 'bytes = Σ output sizes = Σ clip file sizes on disk'),
     baseline: new Scenario('baseline equals the corpus', 'ZW1, L = -3, interleaved, independent: bytes = D_wait'),
+    baselineWriter: new Scenario('baseline, corpus writer\'s call', 'ZW1, L = -3, 16 KB output drain: bytes = D_wait'),
     determinism: new Scenario('determinism', 'bytes(run 1) = bytes(run 2) = bytes(run 3)'),
-    ram: new Scenario('RAM while compressing', 'M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes'),
+    ram: new Scenario('RAM while compressing', 'M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes (one thread, frames)'),
+    ramWorkers: new Scenario('RAM, nbWorkers > 0', 'M_comp = M_0 + ZSTD_sizeof_CCtx + B_c · px · 3 within ±10 %'),
+    ramStream: new Scenario('RAM, one stream', 'M_comp = M_0 + M_cctx − 2^W + W_eff + B_c · px · 3 within ±10 %; W_eff = min(2^W, px · 3) when K_z = 1, else 2^W'),
+    cpuCycles: new Scenario('CPU from the cycle counter', 'C = cycles / rate · 10^9 (rate from clip-probe exp-rate); one thread: C <= 1.02 · wall'),
     cpu: new Scenario('CPU', 'C_comp = N_new · (c_0 + px · κ_c), held-out rows within ±10 %'),
     runtime: new Scenario('run time', 'full-run wall time within ±20 % of T (equation 6)'),
     roundTrip: new Scenario('round trip', 'Σ |decoded − corpus| = 0'),

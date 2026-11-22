@@ -99,12 +99,15 @@ FAIL  baseline equals the corpus: ZW1, L = -3, interleaved, independent: bytes =
         miss: scroll-1920x1080 ZW1 L=-3 whole/bgr rep 1: known 49677690, measured 49650183
         miss: scroll-1920x1080 ZW1 L=-3 whole/bgr rep 2: known 49677690, measured 49650183
         miss: scroll-1920x1080 ZW1 L=-3 whole/bgr rep 3: known 49677690, measured 49650183
-        evidence, drain=16384 (corpus writer's call) scroll-1920x1080 rep 1: D_wait 49677690, bytes 49677690, equal
+        known difference caused by the call: one-shot ZSTD_compress2 vs the corpus writer's 16 KB output drain (buffered mode, other block splits), -27507 B
+        known difference caused by the call: one-shot ZSTD_compress2 vs the corpus writer's 16 KB output drain (buffered mode, other block splits), -27507 B
+        known difference caused by the call: one-shot ZSTD_compress2 vs the corpus writer's 16 KB output drain (buffered mode, other block splits), -27507 B
+PASS  baseline, corpus writer's call: ZW1, L = -3, 16 KB output drain: bytes = D_wait  (1 rows pass, 0 miss)
 PASS  determinism: bytes(run 1) = bytes(run 2) = bytes(run 3)  (1 rows pass, 0 miss)
-FAIL  RAM while compressing: M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes  (72 rows pass, 3 miss)
-        miss: scroll-1920x1080 ZW13 L=-3 stream/bgr rep 1: known 31851033, measured 21463040
-        miss: scroll-1920x1080 ZW17 L=-3 whole/bgr rep 1: known 14802968, measured 25694208
-        miss: scroll-1920x1080 ZW17 L=-3 whole/bgr rep 1: known 14811160, measured 30498816
+PASS  RAM while compressing: M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes (one thread, frames)  (65 rows pass, 0 miss)
+PASS  RAM, nbWorkers > 0: M_comp = M_0 + ZSTD_sizeof_CCtx + B_c · px · 3 within ±10 %  (2 rows pass, 0 miss)
+PASS  RAM, one stream: M_comp = M_0 + M_cctx − 2^W + W_eff + B_c · px · 3 within ±10 %; W_eff = min(2^W, px · 3) when K_z = 1, else 2^W  (8 rows pass, 0 miss)
+PASS  CPU from the cycle counter: C = cycles / rate · 10^9 (rate from clip-probe exp-rate); one thread: C <= 1.02 · wall  (75 rows pass, 0 miss)
 PENDING  CPU: C_comp = N_new · (c_0 + px · κ_c), held-out rows within ±10 %  (0 rows pass, 0 miss)
         needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only
 PENDING  run time: full-run wall time within ±20 % of T (equation 6)  (0 rows pass, 0 miss)
@@ -114,7 +117,7 @@ PASS  seek cost: N_dec(worst) = 1 independent; <= K_z otherwise  (75 rows pass, 
 FAIL  decoder RAM: M_dec = M_0 + M_dctx + B_d · px · 3 + b_max within ±10 % of decode peak private bytes  (74 rows pass, 1 miss)
         miss: scroll-1920x1080 ZW13 L=-3 stream/bgr rep 1: known 31654686, measured 14618624
 PASS  time until ready: t_ready = t_close <= 50 ms  (75 rows pass, 0 miss)
-step2z: 6 pass, 3 fail, 2 pending
+step2z: 11 pass, 2 fail, 2 pending
 ```
 
 Exit code 1.

@@ -5,10 +5,13 @@
     ?scene=still    static text, nothing moves: the still clip must give no event.
     ?scene=spinner  one ordinary 32 px border-arc spinner, 1 turn per second (the lone spinner of
                     ui-events-page.html) and nothing else: exactly one animation.
-    ?scene=flash    a 50 ms flash in a small box once per second, its phase stepping by 5 ms
-                    through one 50 ms recorded instant, and nothing else: one FLASH per flash.
+    ?scene=flash    FLASH_COUNT flashes of 50 ms in a small box, one per second, their phase
+                    stepping by 5 ms through one 50 ms recorded instant, then nothing: one FLASH
+                    per flash. A clip that records past window.flashEndMs plus a settling tail
+                    holds every flash whole.
     ?start=<unix ms>  the flash schedule start (wall clock); without it, 3 s after the page loads.
-  window.scheduleStart is that start. window.flashTiming lists every flash, in ms from the start:
+  window.scheduleStart is that start; window.flashCount = FLASH_COUNT; window.flashEndMs = the
+  nominal end of the last flash, in ms from the start. window.flashTiming lists every flash shown:
   { n, set_ms, shown_ms, hide_ms, hidden_ms }, timed like ui-events-page.html: set_ms = the
   animation frame that showed the box, shown_ms = the next animation frame (on screen by then).
   The box is hidden FLASH_MS after shown_ms, so a late frame never shortens a flash.
@@ -43,6 +46,7 @@
   const FLASH_MS = 50;           // d_min: one recorded instant
   const FLASH_PERIOD_MS = 1000;  // one flash per second
   const FIRST_FLASH_MS = 500;
+  const FLASH_COUNT = 15;
   const PHASE_STEP_MS = 5;       // the flash phase sweeps one recorded instant
   const INSTANT_MS = 50;
   const AUTO_START_MS = 3000;
@@ -56,10 +60,12 @@
   window.scheduleStart = start;
   const flashTiming = [];
   window.flashTiming = flashTiming;
+  const due = (n) => FIRST_FLASH_MS + n * FLASH_PERIOD_MS + (n * PHASE_STEP_MS) % INSTANT_MS;
+  window.flashCount = FLASH_COUNT;
+  window.flashEndMs = due(FLASH_COUNT - 1) + FLASH_MS;
 
   if (scene.id === 'flash') {
     const box = document.getElementById('flashbox');
-    const due = (n) => FIRST_FLASH_MS + n * FLASH_PERIOD_MS + (n * PHASE_STEP_MS) % INSTANT_MS;
     let current = null;   // the flash on screen
     let lastN = -1;       // the last flash period shown, so a late page skips a period, never doubles
     let awaitingPaint = [];
@@ -74,7 +80,7 @@
         current = null;
       }
       const n = Math.floor((t - FIRST_FLASH_MS) / FLASH_PERIOD_MS);
-      if (!current && n > lastN && t >= due(n)) {
+      if (!current && flashTiming.length < FLASH_COUNT && n > lastN && t >= due(n)) {
         box.style.display = 'block';
         current = { n, set_ms: t };
         flashTiming.push(current);

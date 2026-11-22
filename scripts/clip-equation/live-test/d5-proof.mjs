@@ -11,7 +11,8 @@
 // the scratch dir. Each clip gets its own Chrome --app window and profile: launched minimized
 // without activation, shown without activation, given two animation frames to paint, put behind
 // all other windows, recorded, read over the DevTools protocol, and closed in the same step
-// (owner rule: a test window is open only for the seconds of its recording). Then clip_overview
+// (owner rule: a test window is open only for the seconds of its recording; one that cannot be
+// closed, verified by its processes being gone, stops the whole round). Then clip_overview
 // runs and its views/overview_analysis.json gives timeline and picks.
 //
 // Writes into the scratch dir: viewer-output.json and schedule.json (the d5.mjs header, exactly),
@@ -42,7 +43,8 @@ const CONFIG = {
   window: { x: 40, y: 40, width: 1240, height: 840 },
   leadMs: 8000,        // schedule start after the launch: time to load, place and start record
   tailMs: 1500,        // the proof clip runs on after the page's last row
-  sceneMs: 20000,      // still, spinner and flash clips
+  sceneMs: 20000,      // still and spinner clips
+  flashSlackMs: 1000,  // recorded on top of the flash clip's settling tail (FLASH_TAIL_MS)
   boundaryMs: 35000,   // boundary runs: the page is reloaded with a start set from the clip's s_0
   parkedMs: 3600000,   // a boundary page's start until that reload: nothing plays before it
   reloadMs: 2000,      // the reloaded boundary page should have at least this long before its start
@@ -55,6 +57,10 @@ const CONFIG = {
 };
 // clip_viewer.rs SETTLE_MS (D5 item 2): the boundary runs end SETTLE_MS - frame_ms and SETTLE_MS on.
 const SETTLE_MS = 200;
+// clip_viewer.rs SHORT_LIVED_MS (D5 item 3). After the last flash the flash clip records at least
+// this quiet tail, so every flash is decided before the stop.
+const SHORT_LIVED_MS = 500;
+const FLASH_TAIL_MS = SHORT_LIVED_MS + SETTLE_MS;
 const BOUNDARY_ROW = 'boundary';
 const SW_SHOWMINNOACTIVE = 7;
 const UI_PAGE = 'ui-events-page.html';
@@ -63,11 +69,11 @@ const FRAMES = 'new Promise((r) => requestAnimationFrame(() => requestAnimationF
 const READ_UI_PAGE = `({ start: window.scheduleStart, schedule: window.schedule, actual: window.actualTiming,
   always: window.always, box_fits: window.scheduleBoxFits, inner: [innerWidth, innerHeight],
   dpr: devicePixelRatio, page_pixel_ratio: window.pagePixelRatio })`;
-const READ_SCENE = '({ start: window.scheduleStart, flashes: window.flashTiming })';
+const READ_SCENE = '({ start: window.scheduleStart, flashes: window.flashTiming, flash_count: window.flashCount, flash_end_ms: window.flashEndMs })';
 
 /**
- * The clips of the d5.mjs header. run: proof (schedule from the launch), scene (fixed length) or
- * boundary (start set from s_0). entry: the clip's fields in viewer-output.json, from c = { base
+ * The clips of the d5.mjs header. run: proof (schedule from the launch), scene (fixed length),
+ * flash (until a settling tail after the last flash) or boundary (start set from s_0). entry: the clip's fields in viewer-output.json, from c = { base
  * (timeline, fps, frame_ms), analysis, files (ClipFiles), page (what the page gave), startMs (the
  * page's start on the clip timeline) }.
  */
@@ -75,15 +81,15 @@ const CLIPS = {
   proof: {
     page: UI_PAGE, run: 'proof', read: READ_UI_PAGE,
     entry: (c) => ({ ...c.base, picks: c.analysis.picks, end_ms: c.files.endMs, keyframes_ms: c.files.keyframesMs,
-      schedule_start_ms: c.startMs, viewport: viewport(c.files.geometry, c.page) }),
+      schedule_start_ms: c.startMs, viewport: viewport(c.files.geometry, c.page), folder: c.files.folder }),
   },
   still: {
     page: SCENES, scene: 'still', run: 'scene', read: READ_SCENE,
-    entry: (c) => ({ ...c.base, end_ms: c.files.endMs, keyframes_ms: c.files.keyframesMs }),
+    entry: (c) => ({ ...c.base, end_ms: c.files.endMs, keyframes_ms: c.files.keyframesMs, folder: c.files.folder }),
   },
   spinner: { page: SCENES, scene: 'spinner', run: 'scene', read: READ_SCENE, entry: (c) => c.base },
   flash: {
-    page: SCENES, scene: 'flash', run: 'scene', read: READ_SCENE,
+    page: SCENES, scene: 'flash', run: 'flash', read: READ_SCENE,
     entry: (c) => ({ ...c.base, shown_ms: flashesInClip(c) }),
   },
   boundary_below: { page: UI_PAGE, run: 'boundary', read: READ_UI_PAGE, quietMs: (frameMs) => SETTLE_MS - frameMs, entry: boundaryEntry },
@@ -107,12 +113,17 @@ function viewport(geometry, page) {
   return { x: side * geometry.scale, y: top * geometry.scale, scale: page.dpr * geometry.scale };
 }
 
-/** Clip times of the flashes shown and hidden, with SETTLE_MS after, inside the clip. */
+/**
+ * Clip times of every flash the scene showed. Each must lie whole inside the clip with
+ * FLASH_TAIL_MS after it, or the run is wrong (never filtered: a flash in the frames is an event).
+ */
 function flashesInClip(c) {
-  return (c.page.flashes ?? [])
-    .filter((f) => Number.isFinite(f.set_ms) && Number.isFinite(f.hidden_ms)
-      && c.startMs + f.set_ms >= 0 && c.startMs + f.hidden_ms + SETTLE_MS <= c.files.endMs)
-    .map((f) => c.startMs + f.shown_ms);
+  const flashes = c.page.flashes ?? [];
+  if (flashes.length !== c.page.flash_count) throw new Error(`flash scene showed ${flashes.length} of ${c.page.flash_count} flashes`);
+  const outside = flashes.filter((f) => !(Number.isFinite(f.set_ms) && Number.isFinite(f.hidden_ms)
+    && c.startMs + f.set_ms >= 0 && c.startMs + f.hidden_ms + FLASH_TAIL_MS <= c.files.endMs));
+  if (outside.length) throw new Error(`flashes ${outside.map((f) => f.n).join(', ')} are not inside the clip with ${FLASH_TAIL_MS} ms after them`);
+  return flashes.map((f) => c.startMs + f.shown_ms);
 }
 
 /** Polls `probe` until it gives a truthy value (an error counts as not yet); throws after `ms`. */
@@ -175,9 +186,25 @@ class Cdp {
   close() { try { this.ws.close(); } catch { } }
 }
 
+/** A test window that could not be closed: the round stops (owner rule, never a window left open). */
+class CleanupError extends Error {}
+
+/** `true` while process `pid` exists. */
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
 /** One Chrome --app window with its own profile, driven over DevTools. */
 class TestWindow {
-  /** Launches the window minimized without activating it and connects to its page. */
+  /**
+   * Launches the window minimized without activating it, keeps its browser PID (the process of
+   * that profile without --type=, found right after the launch) and connects to its page.
+   */
   static async open(url, profileDir) {
     const chrome = CONFIG.chromeCandidates.find((p) => p && fs.existsSync(p));
     if (!chrome) throw new Error('Chrome not found: set CHROME_PATH');
@@ -186,24 +213,27 @@ class TestWindow {
     const args = [`--app=${url}`, `--user-data-dir=${profileDir}`, '--remote-debugging-port=0',
       `--window-position=${x},${y}`, `--window-size=${width},${height}`, ...CONFIG.chromeFlags];
     const line = [chrome, ...args].map((a) => `"${a}"`).join(' ').replace(/'/g, "''");
-    execFileSync('powershell', ['-NoProfile', '-Command', `(New-Object -ComObject WScript.Shell).Run('${line}', ${SW_SHOWMINNOACTIVE}, $false) | Out-Null`]);
     const win = new TestWindow(profileDir);
     try {
+      execFileSync('powershell', ['-NoProfile', '-Command', `(New-Object -ComObject WScript.Shell).Run('${line}', ${SW_SHOWMINNOACTIVE}, $false) | Out-Null`]);
+      win.pid = (await until(() => TestWindow.processes(profileDir).find((p) => p.browser), 'the Chrome browser process')).pid;
       await win.connect();
     } catch (error) {
-      win.close();
+      await win.close();
       throw error;
     }
     return win;
   }
 
-  /** The browser process of `profileDir` and its main window handle (0 until it has one). */
-  static browserProcess(profileDir) {
+  /** The chrome.exe processes of `profileDir`: pid, browser (no --type=), main window (0 if none). */
+  static processes(profileDir) {
     const out = execFileSync('powershell', ['-NoProfile', '-Command',
-      `Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${profileDir.replace(/'/g, "''")}') -and -not $_.CommandLine.Contains('--type=') } | Select-Object -First 1 | ForEach-Object { '{0} {1}' -f $_.ProcessId, (Get-Process -Id $_.ProcessId).MainWindowHandle }`],
+      `Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${profileDir.replace(/'/g, "''")}') } | ForEach-Object { $b = -not $_.CommandLine.Contains('--type='); $h = if ($b) { (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue).MainWindowHandle } else { 0 }; '{0} {1} {2}' -f $_.ProcessId, [int]$b, $h }`],
     { encoding: 'utf8' }).trim();
-    const [pid, hwnd] = out.split(/\s+/).map(Number);
-    return pid ? { pid, hwnd: hwnd || 0 } : null;
+    return out.split(/\r?\n/).filter((l) => l.trim()).map((l) => {
+      const [pid, browser, hwnd] = l.trim().split(/\s+/).map(Number);
+      return { pid, browser: browser === 1, hwnd: hwnd || 0 };
+    });
   }
 
   constructor(profileDir) {
@@ -218,12 +248,7 @@ class TestWindow {
       return targets.find((t) => t.type === 'page' && t.url.startsWith('file:'));
     }, 'the page target');
     this.cdp = await Cdp.connect(target.webSocketDebuggerUrl);
-    const browser = await until(() => {
-      const found = TestWindow.browserProcess(this.profileDir);
-      if (found) this.pid = found.pid;
-      return found?.hwnd ? found : null;
-    }, 'the Chrome window');
-    this.hwnd = browser.hwnd;
+    this.hwnd = (await until(() => TestWindow.processes(this.profileDir).find((p) => p.pid === this.pid && p.hwnd), 'the Chrome window')).hwnd;
   }
 
   read(expression) { return this.cdp.evaluate(expression); }
@@ -243,10 +268,24 @@ class TestWindow {
 
   navigate(url) { return this.cdp.send('Page.navigate', { url }); }
 
-  close() {
+  /**
+   * Ends the launch PID's process tree and every process of the profile, then verifies that none
+   * is left; throws CleanupError otherwise.
+   */
+  async close() {
     this.cdp?.close();
-    const pid = this.pid ?? TestWindow.browserProcess(this.profileDir)?.pid;
-    if (pid) try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { }
+    let left = [];
+    try {
+      left = TestWindow.processes(this.profileDir).map((p) => p.pid);
+    } catch { /* the check below asks again */ }
+    for (const pid of new Set([this.pid, ...left].filter(Boolean))) {
+      try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); } catch { /* already gone */ }
+    }
+    try {
+      await until(() => !(this.pid && alive(this.pid)) && TestWindow.processes(this.profileDir).length === 0, 'Chrome to exit');
+    } catch (error) {
+      throw new CleanupError(`test window not closed (browser pid ${this.pid ?? 'unknown'}, profile ${this.profileDir}): ${error.message}`);
+    }
   }
 }
 
@@ -312,7 +351,7 @@ class Recorder {
 
   /** clip_overview of `folder`, then its views/overview_analysis.json. */
   async overview(folder) {
-    const ov = await this.srv.call({ operation: 'clip_overview', folder: slash(folder) });
+    const ov = await this.srv.call({ operation: 'clip_overview', folder: slash(folder) }, CONFIG.readyMs);
     if (ov.error || ov.isError) throw new Error(`clip_overview failed: ${ov.texts.join(' ').slice(0, 600) || JSON.stringify(ov.error)}`);
     const file = path.join(folder, 'views', 'overview_analysis.json');
     const analysis = readJson(file);
@@ -349,6 +388,10 @@ class D5Proof {
           delete this.viewer[name];
           this.runs[name] = { error: String(error?.stack ?? error) };
           console.log(`${name}: FAILED ${error?.message ?? error}`);
+          if (error instanceof CleanupError) {
+            writeJson(this.files.runs, this.runs);
+            throw error;
+          }
         }
         writeJson(this.files.viewer, this.viewer);
         writeJson(this.files.runs, this.runs);
@@ -375,15 +418,14 @@ class D5Proof {
     fs.mkdirSync(path.dirname(folder), { recursive: true });
     const start = stamp + (spec.run === 'boundary' ? CONFIG.parkedMs : CONFIG.leadMs);
     const win = await TestWindow.open(this.pageUrl(spec, start), path.join(this.scratch, 'chrome', `${name}-${stamp}`));
-    let rec;
-    let page;
-    try {
+    const outcome = await (async () => {
       await win.ready(spec.page === UI_PAGE ? 'window.actualTiming' : 'window.flashTiming');
       await win.placeBehind();
-      ({ rec, page } = await this.record(win, spec, start, folder));
-    } finally {
-      win.close();
-    }
+      return this.record(win, spec, start, folder);
+    })().then((value) => ({ value }), (error) => ({ error }));
+    await win.close(); // CleanupError stops the round
+    if (outcome.error) throw outcome.error;
+    const { rec, page } = outcome.value;
     await this.recorder.waitReady(rec.clip_id);
     const { file, analysis } = await this.recorder.overview(rec.folder);
     const files = new ClipFiles(rec.folder);
@@ -402,6 +444,9 @@ class D5Proof {
     if (spec.run === 'proof') {
       const lastMs = Math.max(...schedule.map((r) => r.until_ms ?? r.t_ms));
       durationMs = Math.ceil((start - Date.now() + lastMs + CONFIG.tailMs) / 1000) * 1000;
+    } else if (spec.run === 'flash') {
+      const endMs = await win.read('window.flashEndMs');
+      durationMs = Math.ceil((start - Date.now() + endMs + FLASH_TAIL_MS + CONFIG.flashSlackMs) / 1000) * 1000;
     } else if (spec.run === 'boundary') {
       durationMs = CONFIG.boundaryMs;
     }
@@ -438,4 +483,9 @@ if (unknown.length) {
   process.exit(2);
 }
 fs.mkdirSync(scratch, { recursive: true });
-process.exit(await new D5Proof(path.resolve(exe), path.resolve(scratch), only).run());
+try {
+  process.exit(await new D5Proof(path.resolve(exe), path.resolve(scratch), only).run());
+} catch (error) {
+  console.error(`d5-proof stopped, check not run: ${error?.message ?? error}`);
+  process.exit(1);
+}

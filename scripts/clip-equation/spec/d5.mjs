@@ -7,8 +7,9 @@
 //   {
 //     "proof":          { "timeline": [...], "picks": [...], "fps": 20, "frame_ms": 50, "end_ms": 34000,
 //                         "keyframes_ms": [0, 1000, ...], "schedule_start_ms": 2950,
-//                         "viewport": { "x": 8, "y": 120, "scale": 1 } },
-//     "still":          { "timeline": [...], "fps": 20, "frame_ms": 50, "end_ms": 20000, "keyframes_ms": [...] },
+//                         "viewport": { "x": 8, "y": 120, "scale": 1 }, "folder": "<clip folder>" },
+//     "still":          { "timeline": [...], "fps": 20, "frame_ms": 50, "end_ms": 20000, "keyframes_ms": [...],
+//                         "folder": "<clip folder>" },
 //     "spinner":        { "timeline": [...], "fps": 20, "frame_ms": 50 },
 //     "flash":          { "timeline": [...], "fps": 20, "frame_ms": 50, "shown_ms": [1000, 2000, ...] },
 //     "boundary_below": { "timeline": [...], "fps": 20, "frame_ms": 50, "folder": "<clip folder>",
@@ -26,6 +27,10 @@
 //   was shown. Its quiet time is computed from the page timing and the recorder's clip.json
 //   (clock.wall_clock_unix_ms_at_s0, fps) and frames.jsonl (the stop), never from the detector.
 //   Typing is matched key by key: actualTiming's typing entry lists every key presentation.
+//   keyframes_ms of the proof and still clips must equal every keyframe instant (times frame_ms)
+//   of the segments in their folder's clip.json; one after the first instant is required only
+//   when the clip has more encoded frames (frames.jsonl lines with "new") than GOP_FRAMES, so a
+//   still clip (one encoded frame) is exempt.
 // schedule.json, read from the proof run's page after the run:
 //   { "start": <unix ms>, "schedule": window.schedule, "actual": window.actualTiming,
 //     "always": window.always, "box_fits": window.scheduleBoxFits }
@@ -46,6 +51,8 @@ const SHORT_LIVED_MS = 500;
 const BLOCK_PX = 8;
 const REGION_GAP_COLUMNS = 24; // clip_viewer.rs REGION_GAP_BLOCKS.0
 const FLASH_MS = 50;
+// clip_encoder.rs KEYFRAME_INTERVAL_MS (τ); GOP_FRAMES = τ · f / 1000 encoded frames.
+const KEYFRAME_INTERVAL_MS = 1000;
 const SETTLED_PICK = 'settled frame after change';
 const CONFIRMED = /settled at .*confirmed at frame (\d+)/;
 // Schedule rows by id (ui-events-page.html).
@@ -118,24 +125,43 @@ class TypingRule {
   }
 }
 
+/** The recorder's files in a clip's folder: clip.json and frames.jsonl. */
+class RecorderFiles {
+  constructor(clip) {
+    const folder = clip.require('folder');
+    this.folder = folder;
+    this.meta = readJson(path.join(folder, 'clip.json'));
+    const framesFile = path.join(folder, 'frames.jsonl');
+    this.lines = fs.existsSync(framesFile)
+      ? fs.readFileSync(framesFile, 'utf8').split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l))
+      : [];
+    if (!this.meta || this.lines.length === 0) throw new Error(`no input: clip.json or frames.jsonl in ${folder}`);
+    if (this.meta.fps !== clip.raw.fps) throw new Error(`${clip.name}: clip.json fps ${this.meta.fps} differs from ${clip.raw.fps}`);
+  }
+
+  /** Every keyframe instant of the segments, in clip ms, ascending. */
+  keyframesMs(frameMs) {
+    const instants = new Set((this.meta.segments ?? []).flatMap((s) => s.keyframe_instants ?? []));
+    return [...instants].sort((a, b) => a - b).map((k) => k * frameMs);
+  }
+
+  /** The frames the encoder received: instants with a new frame (repeats are not encoded). */
+  get encodedFrames() {
+    return this.lines.filter((l) => l.new === true).length;
+  }
+}
+
 /** A boundary clip's stop and schedule start, from the recorder's clip.json and frames.jsonl. */
 class RecorderClock {
   constructor(clip) {
-    const folder = clip.require('folder');
-    const meta = readJson(path.join(folder, 'clip.json'));
-    const framesFile = path.join(folder, 'frames.jsonl');
-    const lines = fs.existsSync(framesFile)
-      ? fs.readFileSync(framesFile, 'utf8').split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l))
-      : [];
-    if (!meta || lines.length === 0) throw new Error(`no input: clip.json or frames.jsonl in ${folder}`);
-    if (meta.fps !== clip.raw.fps) throw new Error(`${clip.name}: clip.json fps ${meta.fps} differs from ${clip.raw.fps}`);
-    const s0 = meta.clock?.wall_clock_unix_ms_at_s0;
-    if (!finite(s0)) throw new Error(`no input: clip.json clock.wall_clock_unix_ms_at_s0 in ${folder}`);
-    const last = lines.at(-1);
-    if (!finite(last.t_ms)) throw new Error(`frames.jsonl of ${folder} has no t_ms on its last line`);
+    const files = new RecorderFiles(clip);
+    const s0 = files.meta.clock?.wall_clock_unix_ms_at_s0;
+    if (!finite(s0)) throw new Error(`no input: clip.json clock.wall_clock_unix_ms_at_s0 in ${files.folder}`);
+    const last = files.lines.at(-1);
+    if (!finite(last.t_ms)) throw new Error(`frames.jsonl of ${files.folder} has no t_ms on its last line`);
     // The last instant is shown until the stop, one instant later.
     this.stopMs = last.t_ms + clip.frameMs;
-    this.recordedMs = meta.recorded_ms;
+    this.recordedMs = files.meta.recorded_ms;
     // Clip time of the page run's schedule start: its unix start minus the clip's s_0.
     this.scheduleStartMs = clip.require('page_start') - s0;
   }
@@ -410,7 +436,16 @@ function checks(inputs) {
       const still = inputs.clip('still');
       const atKeyframe = (clip, exempt) => {
         const keys = clip.require('keyframes_ms');
-        if (!Array.isArray(keys) || !keys.some((k) => k > clip.frameMs)) throw new Error(`${clip.name}: no keyframe after the first instant, so nothing is tested`);
+        const files = new RecorderFiles(clip);
+        const recorded = files.keyframesMs(clip.frameMs);
+        if (!Array.isArray(keys) || keys.length !== recorded.length || keys.some((k, i) => k !== recorded[i])) {
+          throw new Error(`${clip.name}: keyframes_ms ${JSON.stringify(keys)} differs from the segments' keyframe instants ${JSON.stringify(recorded)}`);
+        }
+        // GOP: a keyframe every GOP_FRAMES encoded frames, so only a clip with more has a later one.
+        const gopFrames = KEYFRAME_INTERVAL_MS * clip.raw.fps / 1000;
+        if (files.encodedFrames > gopFrames && !keys.some((k) => k > clip.frameMs)) {
+          throw new Error(`${clip.name}: ${files.encodedFrames} encoded frames > GOP ${gopFrames}, yet no keyframe after the first instant`);
+        }
         if (keys.some((k) => !finite(k) || k < 0 || k > clip.endMs)) throw new Error(`${clip.name}: a keyframe lies outside the clip`);
         return clip.events.filter((e) => e.start_ms > clip.frameMs && !exempt.has(e)
           && keys.some((k) => Math.abs(e.start_ms - k) <= clip.frameMs));

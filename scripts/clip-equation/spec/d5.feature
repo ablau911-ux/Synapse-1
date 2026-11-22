@@ -9,8 +9,9 @@
 #                       boundary_at (page runs ending 150 ms and exactly 200 ms after the "last
 #                       change" row). Each holds the viewer's overview_analysis.json timeline (and
 #                       picks), fps and frame_ms (= 1000 / fps), and as needed end_ms, keyframes_ms,
-#                       schedule_start_ms, viewport (CSS px to recorded px), shown_ms (flash clip)
-#                       and actual (a boundary run's window.actualTiming).
+#                       schedule_start_ms, viewport (CSS px to recorded px), shown_ms (flash clip),
+#                       actual (a boundary run's window.actualTiming) and folder (the clip folder:
+#                       boundary clips, and the proof and still clips for their keyframes).
 #   schedule.json       the proof run's window.schedule, window.actualTiming, window.always and
 #                       window.scheduleBoxFits.
 # Symbols: one instant = frame_ms (50 ms at 20 fps); K_s = SETTLE_MS / frame_ms = 4;
@@ -43,9 +44,10 @@ Feature: The viewer reports each scheduled UI event once, with its type, region 
     # Equation: count(animating) = 1, count(change) + count(short_lived) = 0 | Known: 1, 0
 
   Scenario: keyframe instants give no event
-    Given the proof and still clips with the keyframe instants of their segments, at least one after the first instant
+    Given the proof and still clips with keyframes_ms equal to every keyframe instant of the segments in their clip.json
+    And at least one keyframe after the first instant when the clip has more encoded frames than GOP_FRAMES = tau * f = 20 (a still clip, one encoded frame, is exempt)
     Then no event starts within one instant of a keyframe, except a proof event matched to its scheduled row
-    # Equation: count(events at a keyframe instant and not matched to a row) = 0 | Known: 0
+    # Equation: keyframes_ms = sorted(segments.keyframe_instants) * frame_ms; encoded > GOP_FRAMES => some keyframe > frame_ms; count(events at a keyframe instant and not matched to a row) = 0 | Known: 0
 
   Scenario: flash clip gives one FLASH per flash
     Given the flash clip and the clip time of each presented flash

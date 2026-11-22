@@ -31,10 +31,16 @@ Node 22 or later and Chrome (`CHROME_PATH` or its default install folder); no np
   `SYNAPSE_SHELL_JOB_ROOT=<scratch>/shell-jobs`.
 - Each clip gets a Chrome `--app` window with its own profile and DevTools port: launched minimized
   without activation, shown without activation, given two animation frames to paint, put behind
-  all other windows, recorded, read over DevTools and closed in the same step.
+  all other windows, recorded, read over DevTools and closed in the same step. Its browser PID is
+  found right after the launch; closing ends that process tree and every process of the profile
+  and verifies none is left. A window that cannot be closed stops the whole round.
 - `proof`, `boundary_below`, `boundary_at`: `../ui-events-page.html`. `still`, `spinner`, `flash`:
   `../d5-scenes.html?scene=...` (`flash-page.html` cannot give the flash clip: its counter, clock
-  and log change on every instant, and it does not expose when each flash was presented).
+  and log change on every instant, and it does not expose when each flash was presented). The
+  flash scene shows a fixed number of flashes; the clip records past the last one by
+  `SHORT_LIVED_MS + SETTLE_MS` plus slack, and every flash shown must lie inside it.
+- Every MCP call has a deadline; when the instance exits or its stdin breaks, pending calls fail
+  at once, so the window cleanup always runs.
 - A boundary page is loaded with its start an hour away; once `record` has started, it is reloaded
   with `?start=` set from the clip's s_0 so that the clip stops 150 ms or 200 ms after the first
   instant that shows the last change.

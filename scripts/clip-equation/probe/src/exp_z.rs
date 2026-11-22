@@ -24,48 +24,11 @@ use std::path::{Path, PathBuf};
 use zstd::zstd_safe::zstd_sys as sys;
 
 use crate::Result;
-use crate::clock;
-use crate::exp_meter::{Args, MemorySampler, memory_now, os_peak_working_set, process_cpu_ns, wall_ns};
+use crate::exp_cpu::Spent;
+use crate::exp_meter::{Args, MemorySampler, memory_now, os_peak_working_set, wall_ns};
 
 /// Dictionary training uses the first 20 new frames (plan factor Z4).
 const DICT_TRAIN_FRAMES: usize = 20;
-
-/// One counter set: process CPU (ns, `GetProcessTimes`), process cycles and wall time (ns).
-#[derive(Default, Clone, Copy)]
-struct Spent {
-    cpu_ns: u64,
-    cycles: u64,
-    wall_ns: u64,
-}
-
-impl Spent {
-    /// Runs `work` and adds what it cost.
-    fn time<T>(&mut self, work: impl FnOnce() -> T) -> T {
-        let (cpu, cycles, wall) = (process_cpu_ns(), clock::process_cycles(), wall_ns());
-        let value = work();
-        self.cpu_ns += process_cpu_ns().saturating_sub(cpu);
-        self.cycles += clock::process_cycles().saturating_sub(cycles);
-        self.wall_ns += wall_ns().saturating_sub(wall);
-        value
-    }
-
-    /// Process CPU in ns from the cycle counter: `GetProcessTimes` advances in
-    /// clock ticks (15.6 ms), far coarser than one frame, so per-frame sums use
-    /// `QueryProcessCycleTime` (user plus kernel cycles of every thread) at `rate`.
-    fn cpu_from_cycles(&self, rate: f64) -> u64 {
-        (self.cycles as f64 / rate * 1e9) as u64
-    }
-
-    fn json(&self, prefix: &str, rate: f64) -> String {
-        format!(
-            "\"{prefix}_cpu_ns\":{},\"{prefix}_gpt_ns\":{},\"{prefix}_cycles\":{},\"{prefix}_wall_ns\":{}",
-            self.cpu_from_cycles(rate),
-            self.cpu_ns,
-            self.cycles,
-            self.wall_ns
-        )
-    }
-}
 
 fn zstd_check(code: usize, step: &str) -> Result<usize> {
     // SAFETY: pure functions on an error code.

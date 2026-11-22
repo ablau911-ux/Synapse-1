@@ -8,8 +8,9 @@
 //!    Media Foundation enumeration and activated from its enumeration object.
 //! 2. Live part: every new frame goes through the copied product
 //!    `WaitingFrameWriter` (B, G, R, zstd −3) into `scratch/waiting/`. CPU is the
-//!    sum of `GetProcessTimes` deltas around those calls (a_rt), RAM the peak
-//!    private bytes above the baseline (M_live).
+//!    process cycle counter summed around those calls (a_rt, `exp_cpu`, the
+//!    same reading as way Z; the `GetProcessTimes` sum is kept as
+//!    `a_rt_gpt_ns`), RAM the peak private bytes above the baseline (M_live).
 //! 3. Worker: the copied product `encode_once` (via `probe_encode_once`) reads
 //!    the waiting frames back, scales by σ, converts with `Nv12Canvas::draw` and
 //!    encodes on the Sink Writer with the run's settings and the frames'
@@ -80,7 +81,8 @@ use windows::core::{HSTRING, Interface};
 use self::clip_encoder::{MediaFoundationRuntime, SegmentInput, SegmentSample};
 use crate::Result;
 use crate::encoder::attribute_string;
-use crate::exp_meter::{Args, MemorySampler, memory_now, process_cpu_ns};
+use crate::exp_cpu::Spent;
+use crate::exp_meter::{Args, MemorySampler, memory_now};
 use crate::exp_settings::{Codec, EncodeSettings};
 
 const INSTANT_MS: u64 = 50;
@@ -173,6 +175,9 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     let hint = args.flag("hint", true);
     let beta: f64 = args.number("beta", 0.10)?;
     let scratch = PathBuf::from(args.text("scratch")?);
+    // Cycles per second (`clip-probe exp-rate`), shared with way Z (`exp_cpu`).
+    let cycle_rate = args.rate()?;
+    out.float("cycle_rate", cycle_rate);
     out.text("folder", &folder.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     out.text("scenario", &folder.scenario);
     out.text("encoder", &way);
@@ -242,15 +247,13 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     let live_base = memory_now().1;
     sampler.take_peaks();
     let live_wall = Instant::now();
-    let (mut a_rt, mut waiting_bytes) = (0_u64, 0_u64);
+    let (mut live, mut waiting_bytes) = (Spent::default(), 0_u64);
     for &(instant, frame) in &folder.new_frames {
         let bgr = folder.frame_bgr(frame)?;
         for (pixel, source) in bgra.chunks_exact_mut(4).zip(bgr.chunks_exact(3)) {
             pixel[..3].copy_from_slice(source);
         }
-        let cpu = process_cpu_ns();
-        waiting_bytes += writer.write(&scratch, instant, &bgra)?;
-        a_rt += process_cpu_ns() - cpu;
+        waiting_bytes += live.time(|| writer.write(&scratch, instant, &bgra))?;
     }
     let t_live = live_wall.elapsed().as_nanos();
     let m_live = sampler.take_peaks().1.saturating_sub(live_base);
@@ -258,7 +261,8 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     drop(bgra);
     out.num("waiting_bytes", waiting_bytes);
     out.num("t_live_ns", t_live);
-    out.num("a_rt_ns", a_rt);
+    out.num("a_rt_ns", live.cpu_from_cycles(cycle_rate));
+    out.num("a_rt_gpt_ns", live.cpu_ns);
     out.num("m_live", m_live);
 
     // 3. Worker: the copied product encoder on the waiting frames.
@@ -274,9 +278,10 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     let clip = scratch.join("clip.mp4");
     let worker_base = memory_now().1;
     sampler.take_peaks();
-    let (cpu, wall) = (process_cpu_ns(), Instant::now());
-    let encoded = clip_encoder::probe_encode_once(&clip, &input, hardware)?;
-    let (a_w, t_worker) = (process_cpu_ns() - cpu, wall.elapsed().as_nanos());
+    let mut worker = Spent::default();
+    let encoded = worker.time(|| clip_encoder::probe_encode_once(&clip, &input, hardware))?;
+    let (a_w, t_worker) = (worker.cpu_from_cycles(cycle_rate), worker.wall_ns);
+    out.num("a_w_gpt_ns", worker.cpu_ns);
     let m_worker = sampler.take_peaks().1.saturating_sub(worker_base);
     out.num("out_w", encoded.width);
     out.num("out_h", encoded.height);
@@ -292,7 +297,11 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     out.text("rate_read", &quality.mode);
     out.num("rate_value", quality.value);
     out.num("keyframes_segment", encoded.keyframe_instants.len());
-    let used_matches = encoded.encoder.contains(&name) || (!vendor.is_empty() && encoded.encoder.contains(&vendor));
+    // With hardware transforms off the Sink Writer can load only a software
+    // encoder, and the software H.264 MFT reports no friendly name.
+    let used_matches = encoded.encoder.contains(&name)
+        || (!vendor.is_empty() && encoded.encoder.contains(&vendor))
+        || (!hardware && !encoded.hardware);
     out.num("encoder_matches", u32::from(used_matches));
 
     // 4. Read back from the file.
@@ -306,7 +315,7 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     out.num("max_gop", back.max_gop);
 
     // 5 and 6. Decode, quality, R and flashes.
-    let quality = measure_quality(&folder, &input, &clip, &sampler)?;
+    let quality = measure_quality(&folder, &input, &clip, &sampler, cycle_rate)?;
     quality.put(out);
     out.text("status", if used_matches { "ok" } else { "wrong_encoder" });
     Ok(())
@@ -618,8 +627,9 @@ impl Bits<'_> {
 #[derive(Default)]
 struct Quality {
     decoded: u64,
-    t_decode: u128,
-    a_dec: u64,
+    /// The decoder's `next_frame` calls; CPU from the cycle counter at `rate`.
+    dec: Spent,
+    rate: f64,
     m_decode: u64,
     t_quality: u128,
     t_ocr: u128,
@@ -636,8 +646,9 @@ impl Quality {
     fn put(&self, out: &mut Json) {
         out.num("decoded_frames", self.decoded);
         out.num("time_mismatch", self.time_mismatch);
-        out.num("t_decode_ns", self.t_decode);
-        out.num("a_dec_ns", self.a_dec);
+        out.num("t_decode_ns", self.dec.wall_ns);
+        out.num("a_dec_ns", self.dec.cpu_from_cycles(self.rate));
+        out.num("a_dec_gpt_ns", self.dec.cpu_ns);
         out.num("m_decode", self.m_decode);
         out.num("t_quality_ns", self.t_quality);
         out.num("t_ocr_ns", self.t_ocr);
@@ -663,8 +674,8 @@ impl Quality {
 }
 
 /// Decodes the clip with the copied product decoder and measures every frame.
-fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: &MemorySampler) -> Result<Quality> {
-    let mut quality = Quality::default();
+fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: &MemorySampler, rate: f64) -> Result<Quality> {
+    let mut quality = Quality { rate, ..Quality::default() };
     let text = TEXT_SCENARIOS.contains(&folder.scenario.as_str());
     let n = folder.new_frames.len();
     let ocr_orders: Vec<usize> = if text { (0..OCR_FRAMES.min(n)).map(|i| i * n / OCR_FRAMES.min(n)).collect() } else { Vec::new() };
@@ -675,10 +686,7 @@ fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: 
     sampler.take_peaks();
     let mut decoder = clip_decoder::ClipDecoder::open(clip)?;
     loop {
-        let (cpu, wall) = (process_cpu_ns(), Instant::now());
-        let frame = decoder.next_frame()?;
-        quality.a_dec += process_cpu_ns() - cpu;
-        quality.t_decode += wall.elapsed().as_nanos();
+        let frame = quality.dec.time(|| decoder.next_frame())?;
         let Some(frame) = frame else { break };
         quality.decoded += 1;
         let wall = Instant::now();

@@ -27,6 +27,7 @@ mod delivery;
 mod disk;
 mod encoder;
 mod exp_corpus;
+mod exp_cpu;
 mod exp_d;
 #[allow(dead_code)]
 mod exp_settings;

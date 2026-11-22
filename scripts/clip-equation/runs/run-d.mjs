@@ -34,8 +34,8 @@ const COLUMNS = ['grid', 'folder', 'scenario', 'width', 'height', 'sigma', 'out_
   'q', 'tau_f', 'hint', 'rate', 'beta', 'repeat', 'status', 'error', 'activated', 'hresult', 'dw4_system_nv12',
   'encoder_used', 'encoder_matches', 'n_new', 'frames', 'keyframes', 'keyframes_segment', 'b_frames', 'b_frames_read',
   'gop_read', 'max_gop', 'hint_accepted', 'rate_read', 'rate_value', 'bytes', 'clip_hash', 'bytes_identical',
-  'waiting_bytes', 't_live_ns', 'a_rt_ns', 'm_live', 't_worker_ns', 'a_w_ns', 'm_worker', 'decoded_frames',
-  'time_mismatch', 't_decode_ns', 'a_dec_ns', 'm_decode', 't_quality_ns', 't_ocr_ns', 'ssim_mean', 'ssim_min',
+  'waiting_bytes', 't_live_ns', 'a_rt_ns', 'a_rt_gpt_ns', 'm_live', 't_worker_ns', 'a_w_ns', 'a_w_gpt_ns', 'm_worker',
+  'decoded_frames', 'time_mismatch', 't_decode_ns', 'a_dec_ns', 'a_dec_gpt_ns', 'm_decode', 'cycle_rate', 't_quality_ns', 't_ocr_ns', 'ssim_mean', 'ssim_min',
   'psnr_mean', 'psnr_min', 'psnr_global', 'identical_frames', 'r', 'r_note', 'flashes', 'wall_ms',
   'known_frames', 'known_keyframes', 'known_b', 'known_flashes', 'pass_frames', 'pass_keyframes', 'pass_b'];
 
@@ -98,12 +98,22 @@ function readCsv(csv) {
 
 const clean = (v) => (v === undefined || v === null ? '' : String(v).replace(/[,\r\n]/g, ';'));
 
+/** Cycles per second of the process cycle counter, measured once per runner (`clip-probe exp-rate`). */
+let cycleRate;
+function rateArg() {
+  if (cycleRate === undefined) {
+    const res = spawnSync(PROBE, ['exp-rate'], { encoding: 'utf8', windowsHide: true });
+    cycleRate = Number(/rate=(\d+)/.exec(res.stdout || '')?.[1] ?? 0);
+  }
+  return `rate=${cycleRate}`;
+}
+
 function runOne(run, cfg) {
   const scratch = path.join(SCRATCH, `${process.pid}-${Date.now()}`);
   const flash = CORPUS.flash;
   const argv = ['exp-d', `folder=${path.join(CORPUS.root, run.folder)}`, `encoder=${run.enc.way}`, `name=${run.enc.name}`,
     `vendor=${run.enc.vendor}`, `hw=${run.enc.hw}`, `q=${run.q}`, `gop=${run.tau}`, `hint=${run.hint}`, `rate=${run.rate}`,
-    `beta=${run.beta}`, `scratch=${scratch}`, `repeat=${run.repeat}`, `window_width=${cfg.width}`,
+    `beta=${run.beta}`, `scratch=${scratch}`, `repeat=${run.repeat}`, rateArg(), `window_width=${cfg.width}`,
     `flash=${flash.bgr.join(':')}:${flash.box_left_fraction}:${flash.box_top}:${flash.box_width}:${flash.box_height}:${flash.min_pixels}`];
   const start = Date.now();
   const res = spawnSync(PROBE, argv, { encoding: 'utf8', windowsHide: true, maxBuffer: 1 << 24 });

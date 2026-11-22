@@ -12,6 +12,7 @@
 // One CSV row per run with every option, the measured values, the known values and
 // pass or fail. Rows already in the CSV are skipped, so a stopped run resumes.
 // Bytes come from run 1; bytes_identical records whether a repeat gave the same file.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -51,7 +52,7 @@ const COLUMNS = ['grid', 'folder', 'scenario', 'width', 'height', 'sigma', 'out_
   'decoded_frames', 'frames_mapped', 'frames_missing', 'frames_extra', 'frames_mistimed', 'time_offsets', 'mp4_time_offsets',
   't_decode_ns', 'a_dec_ns', 'a_dec_gpt_ns', 'm_decode', 'cycle_rate', 't_quality_ns', 't_ocr_ns',
   'ssim_mean', 'ssim_min', 'psnr_mean', 'psnr_min', 'mse_y', 'psnr_global', 'identical_frames', 'r', 'r_regions', 'r_source_chars', 'r_note', 'flashes', 'wall_ms',
-  'known_frames', 'known_keyframes', 'known_b', 'known_flashes', 'pass_frames', 'pass_keyframes', 'pass_b'];
+  'known_frames', 'known_keyframes', 'known_b', 'known_flashes', 'pass_frames', 'pass_keyframes', 'pass_b', 'list_id'];
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => (a.includes('=') ? a.split(/=(.*)/s).slice(0, 2) : [a, '1'])));
 
@@ -118,15 +119,51 @@ export const plannedKey = (run) => { const r = resolveRun(run); return D_KEY.map
 /** The key of a saved row: the settings it requested, so a row recorded under refused settings is still found. */
 export const rowKey = (row) => D_KEY.map((k) => String(REQUESTED[k] && row[REQUESTED[k]] !== undefined && row[REQUESTED[k]] !== '' ? row[REQUESTED[k]] : row[k])).join('|');
 
-/** results/d-runlist.json: the full D plan (grid A-D and the D part of grid B), one resolved run per line. */
-export function writeRunList(repeats = 3) {
-  const runs = [...plan('A', repeats), ...plan('B', repeats)].map(resolveRun);
+/** The identity of a D run list: a hash of its key, repeats and runs (M9; a resume never mixes lists). */
+export function runListIdentity(list) {
+  const runs = (list.runs ?? []).map((r) => D_KEY.map((k) => String(r[k])).join('|')).join('\n');
+  return crypto.createHash('sha256').update(`${(list.key ?? []).join('|')}\n${list.repeats}\n${runs}`).digest('hex').slice(0, 16);
+}
+
+/** The full D plan (grid A-D and the D part of grid B), every key resolved, no key twice. */
+function planList(repeats) {
+  const runs = [...plan('A', repeats), ...plan('B', repeats)].map(resolveRun).map((r) => Object.fromEntries(D_KEY.map((k) => [k, r[k]])));
   const keys = runs.map((r) => D_KEY.map((k) => String(r[k])).join('|'));
   if (new Set(keys).size !== keys.length) throw new Error('the D run plan has a run key twice');
-  const head = { about: 'Way D full run plan (docs/clip-recorder-experiments-plan.md, "Run design"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).', key: D_KEY, repeats, counts: { runs: runs.length, A: plan('A', repeats).length, B: plan('B', repeats).length } };
-  const body = runs.map((r) => `  ${JSON.stringify(Object.fromEntries(D_KEY.map((k) => [k, r[k]])))}`).join(',\n');
+  return { key: D_KEY, repeats, runs };
+}
+
+/** The identity of the plan as run-d.mjs defines it now. */
+export const planIdentity = (repeats = 3) => runListIdentity(planList(repeats));
+
+/** results/d-runlist.json: the full D plan, one resolved run per line, with its identity. */
+export function writeRunList(repeats = 3) {
+  const list = planList(repeats);
+  const listId = runListIdentity(list);
+  const head = { about: 'Way D full run plan (docs/clip-recorder-experiments-plan.md, "Run design"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).', key: D_KEY, repeats, list_id: listId, counts: { runs: list.runs.length, A: plan('A', repeats).length, B: plan('B', repeats).length } };
+  const body = list.runs.map((r) => `  ${JSON.stringify(r)}`).join(',\n');
   fs.writeFileSync(RUNLIST, `${JSON.stringify(head).slice(0, -1)},"runs":[\n${body}\n]}\n`);
-  return { runs: runs.length, unique: new Set(keys).size };
+  return { runs: list.runs.length, unique: list.runs.length, list_id: listId };
+}
+
+/**
+ * Before a full run: the run list must be the plan run-d.mjs defines now. A different or missing list
+ * is rewritten when the CSV has no rows yet, and refused when it has rows, so a resume never mixes lists.
+ * Returns the list id every row records.
+ */
+function preflightRunList(repeats, doneRows) {
+  const planId = planIdentity(repeats);
+  const file = fs.existsSync(RUNLIST) ? JSON.parse(fs.readFileSync(RUNLIST, 'utf8')) : null;
+  const fileId = file ? runListIdentity(file) : null;
+  if (file && file.list_id === fileId && fileId === planId) {
+    const other = doneRows.filter((r) => r.list_id !== planId);
+    if (other.length) throw new Error(`${other.length} rows of the CSV come from another run list (${other[0].list_id || 'none'}), not ${planId}: start a new CSV`);
+    return planId;
+  }
+  if (doneRows.length) throw new Error(`d-runlist.json (${file?.list_id ?? 'missing'}) is not the plan now (${planId}) and the CSV already has rows: refusing to mix run lists`);
+  writeRunList(repeats);
+  console.log(`d-runlist.json rewritten: ${planId}`);
+  return planId;
 }
 
 function readCsv(csv) {
@@ -215,10 +252,12 @@ function row(run, cfg, out, first) {
 function runGrid(grid) {
   try { os.setPriority(0, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* keeps normal priority */ }
   const repeats = grid === 'pilot' ? 1 : Number(args.repeats ?? 3);
-  if (grid !== 'pilot') writeRunList(repeats);
   const csv = path.resolve(args.csv ?? path.join(BASE, 'results', grid === 'pilot' ? 'd-pilot.csv' : 'd-runs.csv'));
   if (!fs.existsSync(csv)) fs.writeFileSync(csv, `${COLUMNS.join(',')}\n`);
+  const header = fs.readFileSync(csv, 'utf8').split(/\r?\n/)[0];
+  if (header !== COLUMNS.join(',')) throw new Error(`${path.basename(csv)} has other columns than this runner writes: start a new CSV`);
   const done = readCsv(csv);
+  const listId = grid === 'pilot' ? '' : preflightRunList(repeats, done);
   const doneKeys = new Set();
   for (const r of done) {
     if (doneKeys.has(rowKey(r))) throw new Error(`${path.basename(csv)} has the run key ${rowKey(r)} twice`);
@@ -226,7 +265,8 @@ function runGrid(grid) {
   }
   const firsts = new Map(done.filter((r) => r.repeat === '1').map((r) => [rowKey(r), r]));
   const cfgs = Object.fromEntries(folders().map((f) => [f.name, f]));
-  const runs = plan(grid, repeats);
+  // folder= and q= narrow a pilot to a small proof run; the full grids always run whole.
+  const runs = plan(grid, repeats).filter((r) => grid !== 'pilot' || ((!args.folder || r.folder === args.folder) && (!args.q || String(r.q) === String(args.q))));
   console.log(`exp-d ${grid}: ${runs.length} runs, ${runs.filter((r) => doneKeys.has(plannedKey(r))).length} already in ${csv}`);
   let count = 0;
   for (const run of runs) {
@@ -236,7 +276,7 @@ function runGrid(grid) {
     const out = runOne(run, cfg);
     const firstKey = plannedKey({ ...run, repeat: 1 });
     const first = run.repeat > 1 ? firsts.get(firstKey) : null;
-    const merged = row(run, cfg, out, first);
+    const merged = { ...row(run, cfg, out, first), list_id: listId };
     fs.appendFileSync(csv, `${COLUMNS.map((c) => clean(merged[c])).join(',')}\n`);
     doneKeys.add(key);
     if (run.repeat === 1) firsts.set(firstKey, out);

@@ -9,6 +9,7 @@
 //
 // Repeats: bytes are deterministic, so they come from run 1; CPU and RAM from runs 1 to 3.
 // A row already in the CSV (same options and repeat) is skipped.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -78,12 +79,12 @@ const MEASURED_COLUMNS = [
   'way_cpu_ns', 'way_cycles', 'way_wall_ns', 'way_cpu_per_frame_ns', 'convert_cpu_ns', 'convert_cycles',
   'comp_cpu_ns', 'comp_gpt_ns', 'comp_cycles', 'comp_wall_ns', 'comp_cpu_per_frame_ns', 'comp_wall_total_ns',
   'write_cpu_ns', 'write_cycles', 'write_wall_ns', 'corpus_cpu_ns', 'corpus_wall_ns', 'train_cpu_ns', 'train_cycles', 'train_wall_ns',
-  'm0_private', 'm0_ws', 'os_peak_at_m0', 'ram_os', 'peak_private', 'peak_private_sampled', 'b_max', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'dctx_sizeof', 'bd',
+  'm0_private', 'm0_ws', 'os_peak_at_m0', 'ram_os', 'peak_private', 'samplers_in_work', 'b_max', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'dctx_sizeof', 'bd',
   'ldm_read', 'rect_src_bytes', 'rect_listed_bytes', 'rects_max',
   'dec_cpu_ns', 'dec_gpt_ns', 'dec_wall_ns', 'dec_cpu_per_frame_ns', 'dec_peak_private', 'dec_peak_ws', 'read_cpu_ns', 'corpus_dec_cpu_ns',
   'frames_decoded', 'diff_sum', 'diff_frames', 'n_dec_worst', 't_ready_ns', 'run_wall_ms',
 ];
-const KNOWN_COLUMNS = ['rate', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
+const KNOWN_COLUMNS = ['rate', 'list_id', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
 const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_bytesAll', 'pass_baseline', 'pass_inputFormat', 'pass_cpuTotal', 'pass_dictCpu', 'pass_ramOs', 'pass_ldm', 'pass_rectList', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_ramShared', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_dctx', 'pass_ready', 'error'];
 const COLUMNS = [...OPTION_COLUMNS, ...MEASURED_COLUMNS, ...KNOWN_COLUMNS, ...PASS_COLUMNS];
 
@@ -234,7 +235,7 @@ function seeded(seed) {
 }
 
 /** results/z-runlist.json: cells (way, options, level, size; 6 contents × 3 repeats each), cheapest first. */
-export function buildRunList(budgetHours = null) {
+export function buildRunList(budgetHours = null, { write = true } = {}) {
   const model = costModel(path.join(RESULTS, 'z-pilot.csv'));
   const { swept, once } = wayConfigs();
   const cellCost = (config, level, size) => {
@@ -284,8 +285,49 @@ export function buildRunList(budgetHours = null) {
     not_run: NOT_RUN,
     cells,
   };
-  fs.writeFileSync(RUNLIST, `${JSON.stringify(list, null, 1)}\n`);
+  list.list_id = runListIdentity(list);
+  if (write) fs.writeFileSync(RUNLIST, `${JSON.stringify(list, null, 1)}\n`);
   return list;
+}
+
+/** The identity of a run list: a hash of everything in it except when it was made and the id itself (M9). */
+export function runListIdentity(list) {
+  const { created: _created, list_id: _id, ...plan } = list;
+  return crypto.createHash('sha256').update(JSON.stringify(plan)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Before --full (M9, M3 of the re-review): the list on disk must be the list run-z.mjs builds now, with
+ * the same budget, factor set and hold-out seed. Returns the differences and the id of the list built now;
+ * with write, a different list is rewritten when no full-run row exists yet, and refused when rows exist.
+ */
+export function preflightRunList({ write = false, doneRows = [] } = {}) {
+  const fresh = buildRunList(null, { write: false });
+  const file = fs.existsSync(RUNLIST) ? JSON.parse(fs.readFileSync(RUNLIST, 'utf8')) : null;
+  const config = (c) => JSON.stringify({ ...c, id: undefined, cost_s: undefined, status: undefined });
+  const mismatches = [];
+  if (!file) mismatches.push('no list');
+  else {
+    if (Math.abs((file.budget_h ?? NaN) - fresh.budget_h) > 1e-9) mismatches.push(`budget ${file.budget_h} h, now ${fresh.budget_h} h`);
+    if (JSON.stringify(file.hold_out) !== JSON.stringify(fresh.hold_out)) mismatches.push(`hold-out ${JSON.stringify(file.hold_out)}, now ${JSON.stringify(fresh.hold_out)}`);
+    const a = new Set(file.cells.map(config));
+    const b = new Set(fresh.cells.map(config));
+    const gone = [...a].filter((k) => !b.has(k)).length;
+    const added = [...b].filter((k) => !a.has(k)).length;
+    if (gone || added) mismatches.push(`factor set: ${gone} cells not in the plan now, ${added} new`);
+    if (file.list_id !== runListIdentity(file)) mismatches.push(`list_id ${file.list_id ?? 'none'} is not the hash of the list`);
+    else if (file.list_id !== fresh.list_id) mismatches.push(`list ${file.list_id}, plan now ${fresh.list_id}`);
+  }
+  if (write && mismatches.length) {
+    if (doneRows.length) throw new Error(`z-runlist.json is not the plan now (${mismatches.join('; ')}) and z-runs.csv has rows: refusing to mix run lists`);
+    fs.writeFileSync(RUNLIST, `${JSON.stringify(fresh, null, 1)}\n`);
+    console.log(`z-runlist.json rewritten (${mismatches.join('; ')}): ${fresh.list_id}`);
+  }
+  if (write) {
+    const other = doneRows.filter((r) => r.list_id !== fresh.list_id);
+    if (other.length) throw new Error(`${other.length} rows of z-runs.csv come from another run list (${other[0].list_id || 'none'}): start a new CSV`);
+  }
+  return { planId: fresh.list_id, fileId: file?.list_id ?? null, mismatches };
 }
 
 /** The runs of the list, cheapest cell first: every content, repeats 1 to 3. */
@@ -364,7 +406,16 @@ function cycleRate() {
   return Number(/rate=(\d+)/.exec(text)?.[1] ?? 0);
 }
 
-async function runAll(runs, csvFile, limit = Infinity) {
+/** The rows of a runner CSV (none when it does not exist). */
+function readRows(file) {
+  if (!fs.existsSync(file)) return [];
+  const [head, ...lines] = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.trim());
+  const cols = head.split(',');
+  if (head !== COLUMNS.join(',')) throw new Error(`${path.basename(file)} has other columns than this runner writes: start a new CSV`);
+  return lines.map((l) => Object.fromEntries(l.split(',').map((v, i) => [cols[i], v])));
+}
+
+async function runAll(runs, csvFile, limit = Infinity, listId = '') {
   const csv = new Csv(csvFile);
   const keys = runs.map(plannedKey);
   if (new Set(keys).size !== keys.length) throw new Error('the plan has a run key twice');
@@ -376,7 +427,7 @@ async function runAll(runs, csvFile, limit = Infinity) {
   console.log(`run-z: cycle rate ${rate} per second`);
   for (const [i, run] of todo.entries()) {
     const { json, error, wallMs } = await runProbe(probeArgs(run, rate));
-    const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, rate, error };
+    const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, rate, error, list_id: listId };
     const planned = resolveRun(run);
     for (const key of ['layout', 'mode', 'tile', 'gap', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain']) row[key] = json?.[key] ?? planned[key];
     row.frames_cap = planned.frames_cap;
@@ -512,7 +563,9 @@ async function main() {
     const list = buildRunList(arg ? Number(arg) : null);
     console.log(`z-runlist.json: T_total ${list.T_total_h.toFixed(2)} h (floor ${list.T_floor_h.toFixed(2)} h); cells ${JSON.stringify(list.counts)}; t_0 ${list.coefficients.t_0_s.toFixed(3)} s, a ${(list.coefficients.a_s_per_frame * 1e3).toFixed(2)} ms/frame; no pilot row: ${list.ways_without_pilot_row.join(', ') || 'none'}`);
   } else if (flag === '--full') {
-    await runAll(listRuns(), path.join(RESULTS, 'z-runs.csv'), Number(process.argv[4] ?? Infinity));
+    const csvFile = path.join(RESULTS, 'z-runs.csv');
+    const { planId } = preflightRunList({ write: true, doneRows: readRows(csvFile) });
+    await runAll(listRuns(), csvFile, Number(process.argv[4] ?? Infinity), planId);
   } else if (flag === '--pilot') {
     await runAll(pilotPlan(arg ?? 'scroll-1920x1080'), process.argv[4] ? path.resolve(process.argv[4]) : path.join(RESULTS, 'z-pilot.csv'));
   } else if (flag === '--estimate') {

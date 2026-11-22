@@ -363,10 +363,11 @@ impl ClipWorker {
             .folder
             .join(super::clip_folder::segment_part_name(index));
         let seed = self.seed(lines, range, &samples);
+        let scale = super::capture_clip::scale_for_height(range.canvas.1);
         let input = super::clip_encoder::SegmentInput {
             canvas_width: range.canvas.0,
             canvas_height: range.canvas.1,
-            scale: super::capture_clip::scale_for_height(range.canvas.1),
+            scale,
             fps: clip.fps,
             samples: &samples,
             seed: seed.as_ref(),
@@ -397,6 +398,7 @@ impl ClipWorker {
             height: encoded.height,
             padded: range.padded,
             bound_held: encoded.bound_held,
+            scale: Some(scale),
             keyframe_instants: encoded.keyframe_instants,
             encoder: encoded.encoder,
             hardware: encoded.hardware,

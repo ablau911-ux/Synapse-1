@@ -278,6 +278,20 @@ impl ViewedClip {
         self.clip.geometry.scale.max(1)
     }
 
+    /// σ of a segment: the one the worker stored, or the clip's σ in clips
+    /// from before it was stored per segment.
+    fn segment_scale(&self, segment: &SegmentCheckpoint) -> u32 {
+        segment
+            .scale
+            .map_or_else(|| self.scale(), |scale| scale.max(1))
+    }
+
+    /// σ at instant k: that of its segment (the clip's σ outside one).
+    fn scale_at(&self, frame: u64) -> u32 {
+        self.segment_of(frame)
+            .map_or_else(|| self.scale(), |segment| self.segment_scale(segment))
+    }
+
     /// D4: the part asked for is not committed yet.
     fn waiting_error(&self, t_ms: u64) -> ErrorData {
         let waiting = std::fs::read_dir(self.folder.join(WAITING_DIR))
@@ -349,8 +363,13 @@ impl ViewedClip {
     /// `OVERVIEW_MIN_SCALE` of the window size, at most `VIEW_MAX_LONG_EDGE`.
     /// The second value is `true` when the ceiling cuts below the floor.
     fn view_long_edge(&self, requested: Option<u32>) -> (u32, bool) {
-        let (width, height) = self.largest_recorded();
-        let window_long = width.max(height) / self.scale();
+        let window_long = self
+            .clip
+            .segments
+            .iter()
+            .map(|segment| segment.width.max(segment.height) / self.segment_scale(segment))
+            .max()
+            .unwrap_or(0);
         let floor = (f64::from(window_long) * OVERVIEW_MIN_SCALE).ceil() as u32;
         let wanted = requested.unwrap_or(VIEW_MAX_LONG_EDGE).max(floor);
         (wanted.min(VIEW_MAX_LONG_EDGE), floor > VIEW_MAX_LONG_EDGE)
@@ -373,7 +392,7 @@ impl ViewedClip {
             return None;
         }
         let [x, y] = self.line(frame)?.cursor?;
-        let scale = i64::from(self.scale());
+        let scale = i64::from(self.scale_at(frame));
         Some((i64::from(x) * scale, i64::from(y) * scale))
     }
 }

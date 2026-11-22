@@ -384,6 +384,10 @@ pub(super) struct SegmentCheckpoint {
     /// below σ · window size (B3).
     #[serde(default = "bound_held_default")]
     pub(super) bound_held: bool,
+    /// σ of this segment (A3), written by the clip worker at commit; `None`
+    /// in clips from before it was stored, which use the clip's σ.
+    #[serde(default)]
+    pub(super) scale: Option<u32>,
     pub(super) keyframe_instants: Vec<u64>,
     pub(super) encoder: String,
     pub(super) hardware: bool,

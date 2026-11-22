@@ -549,8 +549,13 @@ export function fitDBytes(configs) {
     if (!sep) pending.push({ part: mine.length ? `b_E (${e})` : `K/P (${e})`, reason: mine.length ? `GOP swept at q ${[...qs].join(', ')} only: K and P apart there; other q at tau_f != ${baseTau} pending` : `no GOP sweep for ${e}: only tau_f ${baseTau} is predicted, K folded into P` });
     models[e] = { fold, sep };
     // M5 (round 3): the published model is the one predict() uses.
-    coefficients.model[e] = sep ? 'P and K apart: P = p_E,c * px * exp(a_E * q), K = k_E,c * px * exp(b_E * q)'
-      : `P with K folded in at tau_f ${baseTau} (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)`;
+    // The formula predict() uses for this encoder, with only coefficients that exist (round 5).
+    const sweptQs = [...qs].sort((x, y) => x - y);
+    coefficients.model[e] = sep
+      ? 'P and K apart: bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); P = p_E,c * px * exp(a_E * q), K = k_E,c * px * exp(b_E * q)'
+      : `folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f ${baseTau}${sweptQs.length
+        ? `; at the folder and q of a GOP sweep (q ${sweptQs.join(', ')}), first: bytes_D = (n_new - n_key) * P_split + n_key * K_split (P_K_split, measured); another tau_f at q ${sweptQs.join(', ')} in another folder: bytes_D(tau_f) = bytes_D(tau_f ${baseTau}) * ((n_new - n_key) + n_key * r_q) / ((n_new - n_key0) + n_key0 * r_q), n_key = ceil(n_new / tau_f), n_key0 = ceil(n_new / ${baseTau}), r_q = K_over_P_at_q`
+        : `; no other tau_f (no GOP sweep)`}`;
   }
   const predict = (c) => {
     const m = models[c.way];
@@ -582,7 +587,7 @@ export function fitDBytes(configs) {
   }
   fitN = res.length;
   // Round 4: the published equation is the formula of the model that predicts, per encoder.
-  const equation = `bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); ${Object.entries(coefficients.model).map(([e, m]) => `${e}: ${m}`).join('; ') || 'no encoder fitted'}`;
+  const equation = Object.entries(coefficients.model).map(([e, m]) => `${e}: ${m}`).join(' | ') || 'no encoder fitted';
   return { coefficients, res, pending, predict, fit_n: fitN, equation };
 }
 

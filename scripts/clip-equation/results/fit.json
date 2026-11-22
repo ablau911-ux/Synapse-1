@@ -1,5 +1,5 @@
 {
- "created": "2026-11-22T21:43:55.357Z",
+ "created": "2026-11-22T21:47:38.778Z",
  "label": "PILOT, not final",
  "coverage": null,
  "failures": {
@@ -8512,8 +8512,8 @@
   },
   "d_bytes": {
    "model": {
-    "DW2": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)",
-    "DW1": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)"
+    "DW2": "folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f 20; no other tau_f (no GOP sweep)",
+    "DW1": "folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f 20; no other tau_f (no GOP sweep)"
    },
    "a_E": {},
    "b_E": {},
@@ -37525,12 +37525,12 @@
   },
   "eq7_d_bytes": {
    "title": "D bytes",
-   "equation": "bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); DW2: P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q); DW1: P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)",
+   "equation": "DW2: folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f 20; no other tau_f (no GOP sweep) | DW1: folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f 20; no other tau_f (no GOP sweep)",
    "fit_n": 9,
    "coefficients": {
     "model": {
-     "DW2": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)",
-     "DW1": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)"
+     "DW2": "folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f 20; no other tau_f (no GOP sweep)",
+     "DW1": "folded: bytes_D = n_new * px * p_folded_E,c * exp(a_folded_E * q) at tau_f 20; no other tau_f (no GOP sweep)"
     },
     "a_E": {},
     "b_E": {},

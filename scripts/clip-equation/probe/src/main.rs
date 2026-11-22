@@ -11,10 +11,14 @@
 //!   clip-probe threading   M6  blocking Map against "do not wait" Map with retry
 //!   clip-probe lateness    M7  selection lateness, idle and under processor load
 //!   clip-probe encoder     M8  Media Foundation H.264 settings set and read back
+//!   clip-probe compress    M10 to M14 (package 0b) compression of the waiting frames
 //!
-//! Windows are only ever the probe's own; see `probe_window.rs`.
+//! Windows are only ever the probe's own; see `probe_window.rs` and, for
+//! package 0b, `chrome_window.rs`.
 
+mod chrome_window;
 mod clock;
+mod compress;
 mod delivery;
 mod disk;
 mod encoder;
@@ -23,6 +27,7 @@ mod hash_frames;
 mod info;
 mod load;
 mod newframes;
+mod nv12_copy;
 mod observe;
 mod observer;
 mod probe_window;
@@ -32,6 +37,7 @@ mod slot_copy;
 mod slots;
 mod stats;
 mod threading;
+mod waiting_codec;
 
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -60,8 +66,9 @@ fn main() {
         "threading" => threading::run_threading(),
         "lateness" => threading::run_lateness(),
         "encoder" => encoder::run(),
+        "compress" => compress::run(),
         _ => Err(format!(
-            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness or encoder"
+            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder or compress"
         )),
     };
     if let Err(error) = outcome {

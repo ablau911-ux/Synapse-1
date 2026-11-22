@@ -1,0 +1,36 @@
+<!doctype html>
+<!--
+  Clip recorder package 0b, scenario "typing" (docs/clip-recorder-plan.md, M10).
+  Types text into its own text box by itself, CHARS_PER_S characters per second
+  (as M4's typing phase), so the probe needs no input. Open the file directly.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>clip0b typing</title>
+<style>
+  body { margin: 0; padding: 16px; background: #f6f7fb; font: 16px/1.5 "Segoe UI", sans-serif; color: #23232b; }
+  textarea { box-sizing: border-box; width: 100%; height: calc(100vh - 32px); padding: 14px; border: 1px solid #d5d8e3;
+             border-radius: 10px; background: #fff; font: 15px/1.55 Consolas, monospace; color: #1f2430; resize: none; outline: none; }
+</style>
+</head>
+<body>
+<textarea id="box" spellcheck="false"></textarea>
+<script>
+  const CHARS_PER_S = 8;
+  const TEXT = 'fn main() {\n    let frames = capture(window);\n    for frame in frames {\n' +
+    '        if frame.is_new() { waiting.write(frame.compress()); }\n    }\n}\n' +
+    'The live part stores each new frame; the worker encodes it later.\n';
+  const box = document.getElementById('box');
+  box.value = '// clip recorder notes\n';
+  box.focus();
+  let at = 0;
+  setInterval(() => {
+    box.value += TEXT[at % TEXT.length];
+    at += 1;
+    box.selectionStart = box.selectionEnd = box.value.length;
+    box.scrollTop = box.scrollHeight;
+  }, 1000 / CHARS_PER_S);
+</script>
+</body>
+</html>

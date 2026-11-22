@@ -12,6 +12,9 @@ description = "Package 0 measurement probes for the clip recorder (docs/clip-rec
 # Same versions as the Synapse workspace (Cargo.lock: windows-capture 2.0.0, windows 0.62.2).
 windows-capture = "=2.0.0"
 parking_lot = "0.12.5"
+# Package 0b (plan section 0b, M11): the two compression finalists for the waiting frames.
+lz4_flex = "0.14.2"
+zstd = "0.14.4"
 
 [dependencies.windows]
 version = "=0.62.2"

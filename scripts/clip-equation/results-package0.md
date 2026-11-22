@@ -565,3 +565,302 @@ sw-hint: frames=100 keys=0,20,40,60,80 types={"I":5,"P":95}
 hw-nohint: frames=100 keys=0,20,40,60,80 types={"I":5,"P":95}
 hw-hint: frames=100 keys=0,20,40,60,80 types={"I":5,"P":95}
 ```
+
+## Package 0b: compression of the waiting frames (M10 to M14)
+
+Measured 2026-11-22 09:50 to 09:57 (system clock, JST) on the same development PC with `clip-probe compress` (release build, `lz4_flex` 0.14.2 with its default safe features, `zstd` 0.14.4 over zstd-sys 2.0.16 / zstd 1.5.7). Plan: `docs/clip-recorder-plan.md` section 0b; research: `docs/clip-recorder-waiting-compression-research.md`. No product code was changed.
+
+How it was measured:
+
+- **M10 frames.** Each scenario is a Chrome `--app` window the probe opens itself (throw-away profile in `%TEMP%`, topmost without activation, closed and its profile deleted afterwards); each page drives itself with JavaScript, the probe sends no input to any window. Capture as in the product plan: windows-capture 2.0.0, requested interval 11 ms, cursor left out (E9). Every delivered frame is read back; per 50 ms instant the last frame at or before it is kept, and it counts as new when its time stamp is new (A7). 21 s per scenario. Frames stayed in memory only and were dropped after each scenario. Pages: `flash-page.html` (unchanged, with and without `?anim=1`), `scroll-page.html` (text scrolling 300 px/s on every refresh), `typing-page.html` (8 characters per second into its own text box), `video-page.html` (canvas animation standing in for a video: moving gradients and soft shapes plus per-pixel grain that changes every frame), `still-page.html`; the two small windows (506 x 333) carry the σ = 2 and σ = 3 checks.
+- **M11 methods** (`probe/src/waiting_codec.rs`): (a) raw; (b) `lz4_flex` block on the whole frame; (c) changed tiles + `lz4_flex`; (d) changed tiles + zstd level -1 and 1; tiles 32, 64, 128; alpha kept and dropped (dropped: B, G, R stored, the decoder writes 255). One file = 16-byte header + (tile coders) one bit per tile + one compressed block of the changed tiles' rows. Keyframe (every tile) every `WAITING_KEYFRAME_FRAMES` = 16 frames and on a size change. One thread; processor time from the thread cycle counter; ns per pixel over all source pixels of all frames (keyframes included). The encoder gets the previous source frame from the caller (the live part would swap two read-back buffers) and reuses its output buffer.
+- **M12 write** (`write_cost` in `probe/src/compress.rs`): every compressed file of the method, one at a time: create `<n>.tmp`, write through the file cache, rename; thread processor µs per file. At most 500 MB per method (raw: 138 to 184 frames of the 720p scenarios), files deleted after each method; free space stayed above 1.3 TB, at most 0.5 GB on disk at any time.
+- **M13 exactness:** every decoded frame compared with its source (alpha kept: all four bytes; dropped: B, G, R). For alpha dropped, the NV12 picture of the decoded frame and of the source were hashed (SipHash) after `Nv12Canvas::draw` at each σ of the scenario. `RecordedSize`, `even_up`, `even_down`, `Nv12Canvas` and `clamp_u8` are copied **verbatim** from `crates/synapse-mcp/src/server/clip_encoder.rs` into `probe/src/nv12_copy.rs`; only a three-field stand-in for `SegmentInput` was added.
+- **M14 live share:** a_rt = f_o · c_obs + n_new · (w · h · (c_read + c_comp) + write per file), at 1920 x 1080 and n_new = 20 per second (M4 worst). c_obs 0.373 ms, c_read 0.349 ns/px (package 0); c_comp is the scenario's measured ns/px (720p and 506 x 333 windows; per-pixel cost assumed equal at 1080p, an **estimate**); write per file from the least-squares fit over all 176 M12 points: **308.6 µs + 0.277 µs per KB** (a raw 1080p BGRA file: 1.257 ns/px, against M5's 1.507 at paced 20 per second). Development PC: 16 threads, f_o 72. Weakest machine (**estimate**): costs x 3.68, 4 threads, f_o 60. Limit: `CPU_LIMIT_PERCENT` = 10 (E10).
+
+### M10: the scenarios
+
+| Scenario | Window (frame) | Delivered per s | New frames per s | New frames | σ checked |
+|---|---|---|---|---|---|
+| flash | 1266 x 713 | 72.0 | 20.00 | 420 | 1 |
+| flash-anim | 1266 x 713 | 72.0 | 20.04 | 421 | 1 |
+| scroll | 1266 x 713 | 72.0 | 20.04 | 421 | 1 |
+| typing | 1266 x 713 | 8.0 | 8.00 | 168 | 1 |
+| video (canvas) | 1266 x 713 | 72.0 | 20.00 | 420 | 1 |
+| still | 1266 x 713 | 0.1 | 0.10 | 2 | 1 |
+| typing-small | 506 x 333 | 8.0 | 8.05 | 169 | 1, 2, 3 |
+| scroll-small | 506 x 333 | 72.0 | 20.00 | 420 | 1, 2, 3 |
+
+The flash page's counter changes on every refresh, so it gives a new frame at every instant (20 per second), like the M3 counter window. A covered Chrome window rendered only 3.8 frames per second in a first try; topmost (as the package 0 probe window) it rendered at the display rate.
+
+### M11 and M12: best tile per method, alpha dropped (all tile sizes and alpha kept in the raw output below)
+
+Bytes per frame at the scenario's window size; ratio against raw BGRA; c and d = compress and decompress ns per pixel (development PC, one thread); write = thread µs per file (create, write, rename).
+
+| Scenario | (a) raw | (b) lz4 whole | (c) tiles+lz4 | (d) tiles+zstd -1 | (d) tiles+zstd 1 |
+|---|---|---|---|---|---|
+| flash | 2,707,990 B, 1.3x, c 0.40, d 0.45, write 1066 | 45,501 B, 79x, c 0.65, d 0.67, write 337 | t32: 7,917 B, 456x, c 0.36, d 0.10, write 304 | t32: 4,724 B, 764x, c 0.35, d 0.10, write 306 | t32: 4,378 B, 825x, c 0.35, d 0.11, write 274 |
+| flash-anim | 2,707,990, 1.3x, 0.40, 0.47, 1079 | 45,537, 79x, 0.64, 0.67, 356 | t32: 8,007, 451x, 0.34, 0.11, 322 | t32: 4,741, 762x, 0.36, 0.11, 258 | t32: 4,392, 822x, 0.39, 0.11, 281 |
+| scroll | 2,707,990, 1.3x, 0.41, 0.46, 1054 | 139,936, 26x, 1.09, 0.78, 348 | t32: 136,867, 26x, 1.31, 0.78, 360 | t128: 75,436, 48x, 1.68, 1.19, 298 | t128: 68,955, 52x, 1.84, 1.12, 335 |
+| typing | 2,707,990, 1.3x, 0.39, 0.45, 1064 | 19,860, 182x, 0.55, 0.65, 300 | t64: 1,932, 1869x, 0.51, 0.14, 311 | t32: 827, 4369x, 0.32, 0.06, 285 | t32: 781, 4623x, 0.31, 0.06, 334 |
+| video (canvas) | 2,707,990, 1.3x, 0.40, 0.46, 1033 | 2,442,322, 1.5x, 1.50, 0.71, 973 | t32: 2,467,934, 1.5x, 1.94, 0.71, 982 | t32: 2,416,723, 1.5x, 2.54, 0.80, 952 | t128: 2,034,043, 1.8x, 3.63, 2.77, 896 |
+| still (2 frames, keyframes only) | 2,707,990, 1.3x, 0.59, 0.61, 1043 | 39,327, 92x, 1.22, 1.20, 335 | t128: 19,732, 183x, 1.26, 1.04, 305 | t64: 9,371, 385x, 1.32, 1.02, 357 | t64: 8,778, 411x, 1.33, 1.07, 314 |
+| typing-small | 505,510, 1.3x, 0.40, 0.48, 447 | 10,981, 61x, 0.64, 0.83, 286 | t32: 1,121, 601x, 0.38, 0.14, 300 | t32: 691, 976x, 0.36, 0.10, 306 | t32: 655, 1029x, 0.40, 0.11, 265 |
+| scroll-small | 505,510, 1.3x, 0.43, 0.47, 423 | 36,347, 19x, 1.22, 0.86, 305 | t32: 34,056, 20x, 1.79, 0.96, 300 | t32: 19,660, 34x, 2.18, 1.40, 317 | t32: 18,031, 37x, 2.06, 1.32, 311 |
+
+Tile size: averaged over the scenarios without video, 32 px gives the fewest bytes for every tile coder and both alpha choices (alpha dropped: tiles+lz4 0.0634 / 0.0646 / 0.0674 bytes per pixel at 32 / 64 / 128; zstd -1 0.0364 / 0.0368 / 0.0382; zstd 1 0.0334 / 0.0338 / 0.0352); larger tiles win only on video, by 1 to 5 %. Alpha dropped gives 8 to 25 % fewer bytes than alpha kept in every scenario at about the same cost (the whole-frame coders pay 0.15 to 0.25 ns/px for the repack; on video, lz4 with alpha kept costs 3.30 ns/px against 1.50 dropped).
+
+Writes: a file costs about 0.3 ms of processor time however small it is (create + rename dominate below about 100 KB); a raw 720p file costs 1.0 to 1.3 ms.
+
+### M13: exactness
+
+All 176 method x scenario runs: every decoded frame equal to its source in B, G, R (alpha kept: all four bytes), 0 mismatches. NV12 from the copied `Nv12Canvas::draw`, decoded against source, alpha dropped: equal in every frame for σ = 1 (all scenarios), σ = 2 and σ = 3 (typing-small 169 of 169, scroll-small 420 of 420, at every method and tile size). Alpha kept needs no NV12 check: the decoded bytes are identical to the source. Result: **pass for every method, both alpha choices, σ = 1, 2, 3.**
+
+### M14: live share at 1920 x 1080, 20 new frames per second (tile 32, alpha dropped unless named)
+
+| Content at 20 per second | (a) raw, alpha kept | (a) raw | (b) lz4 whole | (c) tiles+lz4 | (d) zstd -1 | (d) zstd 1 |
+|---|---|---|---|---|---|---|
+| flash (counter + flash) | 0.65 / 9.10 % | 0.62 / 8.65 % | 0.47 / 6.47 % | 0.39 / 5.35 % | 0.39 / 5.29 % | 0.39 / 5.31 % |
+| flash-anim | 0.65 / 9.09 % | 0.62 / 8.64 % | 0.47 / 6.44 % | 0.39 / 5.27 % | 0.39 / 5.35 % | 0.40 / 5.46 % |
+| scroll | 0.65 / 9.12 % | 0.62 / 8.68 % | 0.59 / 8.27 % | 0.65 / 9.13 % | 0.74 / **10.47 %** | 0.73 / **10.26 %** |
+| typing content at 20 per second | 0.65 / 9.11 % | 0.61 / 8.62 % | 0.44 / 6.08 % | 0.37 / 5.11 % | 0.38 / 5.17 % | 0.38 / 5.14 % |
+| video (canvas) | 0.64 / 9.08 % | 0.62 / 8.64 % | 0.88 / **12.53 %** | 1.00 / **14.25 %** | 1.15 / **16.50 %** | 1.45 / **20.99 %** |
+| typing-small | 0.64 / 9.05 % | 0.62 / 8.66 % | 0.47 / 6.46 % | 0.40 / 5.40 % | 0.39 / 5.34 % | 0.40 / 5.50 % |
+| scroll-small | 0.64 / 9.02 % | 0.62 / 8.77 % | 0.63 / 8.85 % | 0.77 / **10.98 %** | 0.87 / **12.38 %** | 0.84 / **11.92 %** |
+
+Each cell: development PC / weakest machine (estimate); bold = above `CPU_LIMIT_PERCENT` = 10. Typing at its real 8 per second costs less; the table uses 20 per second for every content, as the choice rule asks. The raw rows reproduce package 0's 9.14 % (M9) within the write model's difference.
+
+### The choice by the plan's rule
+
+Rule: the method with the fewest bytes whose compression keeps the live share within `CPU_LIMIT_PERCENT` on the weakest-machine estimate at the M4 worst rate.
+
+- With every measured content at 20 per second, the worst case is the video stand-in: photo-like noise does not compress (1.5x to 1.8x), so every compressor adds 1.1 to 3.6 ns/px of work and saves almost no write. Weakest machine: (b) 12.53 %, (c) 14.25 %, (d) 16.50 % and 20.99 %, all above 10 %. Only raw stays within: 8.64 % with alpha dropped, 9.08 % with alpha kept. **By the rule as written: (a) raw with alpha dropped** (3 bytes per pixel, 25 % fewer than today's raw, lossless by M13, 8.6 % on the weakest machine). No tile size applies.
+- If the owner excludes video-like content from the worst case: only (b) lz4 whole frame, alpha dropped, stays within 10 % in every other scenario (worst scroll-small 8.85 %, scroll 8.27 %); (c) fails on scroll-small (10.98 %), (d) on scroll (10.26 to 10.47 %) and scroll-small. Bytes for (b): 19 to 182 times fewer than raw on screen content.
+- On text-like content (flash, typing) the tile coders are far ahead: tiles + zstd 1, tile 32, alpha dropped stores 0.8 to 4.4 KB per frame at 720p (raw 3.6 MB) at 5.1 to 5.5 % on the weakest machine against raw's 8.6 %; tiles + zstd -1 is within 10 % of its bytes at slightly lower cost on scroll.
+
+Not decided here (owner, plan version 4.2): whether the worst case includes video-like content. A per-frame fallback (store the frame raw when the previous frame of that window compressed worse than a set ratio) would keep scroll and text at the tile coders' bytes and video at raw cost; it was **not measured**.
+
+### Not measured in package 0b
+
+- A real video player (the stand-in is a canvas animation; real video is often less noisy and may compress somewhat better).
+- 1920 x 1080 windows: the largest window was 1266 x 713 (a full-screen window would cover the owner's screen); per-pixel costs were carried over to 1080p (estimate).
+- The file cache's lazy-writer time (as M5), the `unsafe` speed features of `lz4_flex`, and anything on the weakest machine itself (every weakest-machine figure is x 3.68).
+
+### Raw output of `clip-probe compress`
+
+```
+M10 scenario=flash size=1266x713 seconds=21.0 delivered_per_s=72.0 new_frames=420 new_per_s=20.00 raw_bytes_per_frame=3610632 sigmas=[1]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 3610648 | 1.0 | 0.239 | 0.235 | 1282 (138) | 420/420 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 51520 | 70.1 | 0.390 | 0.272 | 339 (420) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 8652 | 417.3 | 0.293 | 0.080 | 295 (420) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 9076 | 397.8 | 0.625 | 0.102 | 352 (420) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 10886 | 331.7 | 0.488 | 0.105 | 307 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 5078 | 711.0 | 0.328 | 0.071 | 303 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 5505 | 655.9 | 0.496 | 0.080 | 307 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 6694 | 539.4 | 0.526 | 0.097 | 292 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 4882 | 739.5 | 0.314 | 0.078 | 263 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 5243 | 688.7 | 0.503 | 0.083 | 300 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 6433 | 561.3 | 0.533 | 0.096 | 292 (420) | 420/420 | all 4 bytes equal |
+| (a) raw alpha dropped | 2707990 | 1.3 | 0.397 | 0.449 | 1066 (184) | 420/420 | σ1 420/420 |
+| (b) lz4 whole alpha dropped | 45501 | 79.4 | 0.645 | 0.673 | 337 (420) | 420/420 | σ1 420/420 |
+| (c) tiles+lz4 tile 32 alpha dropped | 7917 | 456.1 | 0.361 | 0.104 | 304 (420) | 420/420 | σ1 420/420 |
+| (c) tiles+lz4 tile 64 alpha dropped | 8236 | 438.4 | 0.468 | 0.113 | 337 (420) | 420/420 | σ1 420/420 |
+| (c) tiles+lz4 tile 128 alpha dropped | 9615 | 375.5 | 0.470 | 0.143 | 287 (420) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 4724 | 764.3 | 0.348 | 0.104 | 306 (420) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 5096 | 708.6 | 0.484 | 0.116 | 286 (420) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 6134 | 588.6 | 0.485 | 0.147 | 336 (420) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 4378 | 824.8 | 0.354 | 0.105 | 274 (420) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 4718 | 765.3 | 0.490 | 0.115 | 273 (420) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 5744 | 628.6 | 0.564 | 0.141 | 288 (420) | 420/420 | σ1 420/420 |
+M10 scenario=flash-anim size=1266x713 seconds=21.0 delivered_per_s=72.0 new_frames=421 new_per_s=20.04 raw_bytes_per_frame=3610632 sigmas=[1]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 3610648 | 1.0 | 0.237 | 0.231 | 1279 (138) | 421/421 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 51594 | 70.0 | 0.403 | 0.273 | 312 (421) | 421/421 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 8686 | 415.7 | 0.316 | 0.084 | 325 (421) | 421/421 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 9323 | 387.3 | 0.515 | 0.092 | 327 (421) | 421/421 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 11213 | 322.0 | 0.489 | 0.110 | 302 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 5103 | 707.5 | 0.326 | 0.077 | 296 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 5566 | 648.7 | 0.498 | 0.089 | 281 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 6731 | 536.4 | 0.507 | 0.105 | 314 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 4905 | 736.1 | 0.324 | 0.080 | 307 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 5310 | 680.0 | 0.498 | 0.090 | 310 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 6431 | 561.5 | 0.522 | 0.114 | 324 (421) | 421/421 | all 4 bytes equal |
+| (a) raw alpha dropped | 2707990 | 1.3 | 0.396 | 0.470 | 1079 (184) | 421/421 | σ1 421/421 |
+| (b) lz4 whole alpha dropped | 45537 | 79.3 | 0.637 | 0.672 | 356 (421) | 421/421 | σ1 421/421 |
+| (c) tiles+lz4 tile 32 alpha dropped | 8007 | 450.9 | 0.342 | 0.109 | 322 (421) | 421/421 | σ1 421/421 |
+| (c) tiles+lz4 tile 64 alpha dropped | 8435 | 428.0 | 0.471 | 0.127 | 291 (421) | 421/421 | σ1 421/421 |
+| (c) tiles+lz4 tile 128 alpha dropped | 9863 | 366.1 | 0.484 | 0.158 | 295 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 4741 | 761.5 | 0.362 | 0.112 | 258 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 5154 | 700.5 | 0.488 | 0.131 | 271 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 6127 | 589.3 | 0.555 | 0.166 | 262 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 4392 | 822.0 | 0.391 | 0.111 | 281 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 4793 | 753.3 | 0.482 | 0.132 | 291 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 5752 | 627.7 | 0.509 | 0.178 | 300 (421) | 421/421 | σ1 421/421 |
+M10 scenario=scroll size=1266x713 seconds=21.0 delivered_per_s=72.0 new_frames=421 new_per_s=20.04 raw_bytes_per_frame=3610632 sigmas=[1]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 3610648 | 1.0 | 0.244 | 0.237 | 1299 (138) | 421/421 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 150267 | 24.0 | 0.817 | 0.432 | 365 (421) | 421/421 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 146097 | 24.7 | 1.018 | 0.702 | 342 (421) | 421/421 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 146193 | 24.7 | 1.056 | 0.718 | 389 (421) | 421/421 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 147388 | 24.5 | 1.065 | 0.663 | 365 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 85724 | 42.1 | 1.423 | 0.902 | 352 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 85179 | 42.4 | 1.474 | 0.922 | 291 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 84242 | 42.9 | 1.470 | 0.915 | 350 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 83545 | 43.2 | 1.460 | 0.930 | 339 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 83390 | 43.3 | 1.528 | 0.945 | 305 (421) | 421/421 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 82697 | 43.7 | 1.543 | 0.951 | 315 (421) | 421/421 | all 4 bytes equal |
+| (a) raw alpha dropped | 2707990 | 1.3 | 0.407 | 0.459 | 1054 (184) | 421/421 | σ1 421/421 |
+| (b) lz4 whole alpha dropped | 139936 | 25.8 | 1.086 | 0.784 | 348 (421) | 421/421 | σ1 421/421 |
+| (c) tiles+lz4 tile 32 alpha dropped | 136867 | 26.4 | 1.313 | 0.782 | 360 (421) | 421/421 | σ1 421/421 |
+| (c) tiles+lz4 tile 64 alpha dropped | 137050 | 26.3 | 1.288 | 0.816 | 304 (421) | 421/421 | σ1 421/421 |
+| (c) tiles+lz4 tile 128 alpha dropped | 137665 | 26.2 | 1.332 | 0.807 | 354 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 77724 | 46.5 | 1.683 | 1.141 | 310 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 76849 | 47.0 | 1.666 | 1.204 | 341 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 75436 | 47.9 | 1.676 | 1.190 | 298 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 71166 | 50.7 | 1.631 | 1.057 | 333 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 70226 | 51.4 | 1.618 | 1.138 | 333 (421) | 421/421 | σ1 421/421 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 68955 | 52.4 | 1.837 | 1.115 | 335 (421) | 421/421 | σ1 421/421 |
+M10 scenario=typing size=1266x713 seconds=21.0 delivered_per_s=8.0 new_frames=168 new_per_s=8.00 raw_bytes_per_frame=3610632 sigmas=[1]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 3610648 | 1.0 | 0.241 | 0.233 | 1313 (138) | 168/168 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 24206 | 149.2 | 0.269 | 0.282 | 335 (168) | 168/168 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 2301 | 1569.3 | 0.274 | 0.153 | 330 (168) | 168/168 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 2305 | 1566.6 | 0.472 | 0.158 | 306 (168) | 168/168 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 2930 | 1232.5 | 0.461 | 0.158 | 286 (168) | 168/168 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 908 | 3975.8 | 0.297 | 0.048 | 296 (168) | 168/168 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 947 | 3813.3 | 0.481 | 0.043 | 313 (168) | 168/168 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 1312 | 2752.1 | 0.482 | 0.054 | 303 (168) | 168/168 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 863 | 4185.8 | 0.287 | 0.049 | 289 (168) | 168/168 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 892 | 4048.3 | 0.510 | 0.048 | 321 (168) | 168/168 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 1226 | 2944.1 | 0.466 | 0.054 | 355 (168) | 168/168 | all 4 bytes equal |
+| (a) raw alpha dropped | 2707990 | 1.3 | 0.389 | 0.453 | 1064 (168) | 168/168 | σ1 168/168 |
+| (b) lz4 whole alpha dropped | 19860 | 181.8 | 0.550 | 0.649 | 300 (168) | 168/168 | σ1 168/168 |
+| (c) tiles+lz4 tile 32 alpha dropped | 1956 | 1846.0 | 0.300 | 0.140 | 297 (168) | 168/168 | σ1 168/168 |
+| (c) tiles+lz4 tile 64 alpha dropped | 1932 | 1868.8 | 0.513 | 0.141 | 311 (168) | 168/168 | σ1 168/168 |
+| (c) tiles+lz4 tile 128 alpha dropped | 2535 | 1424.5 | 0.413 | 0.148 | 338 (168) | 168/168 | σ1 168/168 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 827 | 4368.5 | 0.317 | 0.062 | 285 (168) | 168/168 | σ1 168/168 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 859 | 4201.1 | 0.467 | 0.065 | 314 (168) | 168/168 | σ1 168/168 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 1171 | 3082.9 | 0.460 | 0.079 | 337 (168) | 168/168 | σ1 168/168 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 781 | 4623.1 | 0.309 | 0.064 | 334 (168) | 168/168 | σ1 168/168 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 801 | 4510.4 | 0.460 | 0.069 | 283 (168) | 168/168 | σ1 168/168 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 1098 | 3288.6 | 0.430 | 0.079 | 297 (168) | 168/168 | σ1 168/168 |
+M10 scenario=video size=1266x713 seconds=21.0 delivered_per_s=72.0 new_frames=420 new_per_s=20.00 raw_bytes_per_frame=3610632 sigmas=[1]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 3610648 | 1.0 | 0.234 | 0.235 | 1300 (138) | 420/420 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 3104759 | 1.2 | 3.298 | 0.604 | 1257 (148) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 2798798 | 1.3 | 6.134 | 1.126 | 1107 (172) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 2826666 | 1.3 | 6.449 | 1.206 | 1080 (175) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 2862321 | 1.3 | 6.432 | 1.216 | 1119 (171) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 2897919 | 1.2 | 5.877 | 1.420 | 1136 (162) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 2845791 | 1.3 | 6.544 | 1.536 | 1075 (169) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 2870701 | 1.3 | 6.962 | 1.625 | 1148 (168) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 2350729 | 1.5 | 7.094 | 3.029 | 985 (203) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 2251566 | 1.6 | 7.532 | 3.117 | 946 (216) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 2224074 | 1.6 | 7.923 | 3.113 | 920 (222) | 420/420 | all 4 bytes equal |
+| (a) raw alpha dropped | 2707990 | 1.3 | 0.396 | 0.461 | 1033 (184) | 420/420 | σ1 420/420 |
+| (b) lz4 whole alpha dropped | 2442322 | 1.5 | 1.496 | 0.713 | 973 (199) | 420/420 | σ1 420/420 |
+| (c) tiles+lz4 tile 32 alpha dropped | 2467934 | 1.5 | 1.939 | 0.711 | 982 (199) | 420/420 | σ1 420/420 |
+| (c) tiles+lz4 tile 64 alpha dropped | 2472293 | 1.5 | 1.887 | 0.718 | 1006 (199) | 420/420 | σ1 420/420 |
+| (c) tiles+lz4 tile 128 alpha dropped | 2487786 | 1.5 | 2.228 | 0.755 | 997 (199) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 2416723 | 1.5 | 2.544 | 0.800 | 952 (202) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 2419188 | 1.5 | 2.528 | 0.816 | 997 (202) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 2434143 | 1.5 | 2.709 | 0.828 | 992 (202) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 2153029 | 1.7 | 3.804 | 2.673 | 913 (224) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 2068894 | 1.7 | 3.630 | 2.756 | 881 (236) | 420/420 | σ1 420/420 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 2034043 | 1.8 | 3.634 | 2.769 | 896 (242) | 420/420 | σ1 420/420 |
+M10 scenario=still size=1266x713 seconds=21.0 delivered_per_s=0.1 new_frames=2 new_per_s=0.10 raw_bytes_per_frame=3610632 sigmas=[1]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 3610648 | 1.0 | 0.338 | 0.410 | 1217 (2) | 2/2 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 45302 | 79.7 | 0.846 | 0.528 | 337 (2) | 2/2 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 24922 | 144.9 | 1.388 | 1.433 | 309 (2) | 2/2 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 23659 | 152.6 | 1.669 | 1.097 | 319 (2) | 2/2 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 22957 | 157.3 | 1.621 | 1.244 | 328 (2) | 2/2 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 11548 | 312.7 | 1.157 | 0.999 | 307 (2) | 2/2 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 10450 | 345.5 | 1.232 | 1.074 | 302 (2) | 2/2 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 11128 | 324.5 | 1.184 | 0.984 | 307 (2) | 2/2 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 11092 | 325.5 | 1.135 | 1.205 | 336 (2) | 2/2 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 10030 | 360.0 | 1.281 | 1.193 | 324 (2) | 2/2 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 10726 | 336.6 | 1.240 | 1.033 | 368 (2) | 2/2 | all 4 bytes equal |
+| (a) raw alpha dropped | 2707990 | 1.3 | 0.587 | 0.610 | 1043 (2) | 2/2 | σ1 2/2 |
+| (b) lz4 whole alpha dropped | 39327 | 91.8 | 1.220 | 1.196 | 335 (2) | 2/2 | σ1 2/2 |
+| (c) tiles+lz4 tile 32 alpha dropped | 22098 | 163.4 | 1.419 | 1.120 | 315 (2) | 2/2 | σ1 2/2 |
+| (c) tiles+lz4 tile 64 alpha dropped | 20902 | 172.7 | 1.362 | 1.143 | 304 (2) | 2/2 | σ1 2/2 |
+| (c) tiles+lz4 tile 128 alpha dropped | 19732 | 183.0 | 1.257 | 1.042 | 305 (2) | 2/2 | σ1 2/2 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 10420 | 346.5 | 1.164 | 1.073 | 312 (2) | 2/2 | σ1 2/2 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 9371 | 385.3 | 1.319 | 1.024 | 357 (2) | 2/2 | σ1 2/2 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 9732 | 371.0 | 1.080 | 1.036 | 359 (2) | 2/2 | σ1 2/2 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 9666 | 373.6 | 1.397 | 1.054 | 319 (2) | 2/2 | σ1 2/2 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 8778 | 411.3 | 1.325 | 1.068 | 314 (2) | 2/2 | σ1 2/2 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 9036 | 399.6 | 1.399 | 1.031 | 356 (2) | 2/2 | σ1 2/2 |
+M10 scenario=typing-small size=506x333 seconds=21.0 delivered_per_s=8.0 new_frames=169 new_per_s=8.05 raw_bytes_per_frame=673992 sigmas=[1, 2, 3]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 674008 | 1.0 | 0.226 | 0.196 | 535 (169) | 169/169 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 12281 | 54.9 | 0.409 | 0.413 | 312 (169) | 169/169 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 1244 | 541.6 | 0.270 | 0.121 | 265 (169) | 169/169 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 1569 | 429.6 | 0.410 | 0.158 | 306 (169) | 169/169 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 2402 | 280.6 | 0.389 | 0.235 | 315 (169) | 169/169 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 781 | 862.5 | 0.337 | 0.061 | 288 (169) | 169/169 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 942 | 715.2 | 0.373 | 0.086 | 345 (169) | 169/169 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 1406 | 479.5 | 0.500 | 0.129 | 322 (169) | 169/169 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 729 | 924.9 | 0.360 | 0.071 | 277 (169) | 169/169 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 880 | 765.6 | 0.395 | 0.087 | 316 (169) | 169/169 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 1327 | 508.0 | 0.471 | 0.140 | 347 (169) | 169/169 | all 4 bytes equal |
+| (a) raw alpha dropped | 505510 | 1.3 | 0.401 | 0.477 | 447 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (b) lz4 whole alpha dropped | 10981 | 61.4 | 0.638 | 0.825 | 286 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (c) tiles+lz4 tile 32 alpha dropped | 1121 | 601.0 | 0.377 | 0.144 | 300 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (c) tiles+lz4 tile 64 alpha dropped | 1365 | 493.9 | 0.381 | 0.169 | 338 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (c) tiles+lz4 tile 128 alpha dropped | 2167 | 311.0 | 0.442 | 0.267 | 318 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 691 | 975.5 | 0.361 | 0.097 | 306 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 829 | 812.8 | 0.398 | 0.123 | 328 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 1256 | 536.8 | 0.537 | 0.198 | 326 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 655 | 1029.4 | 0.403 | 0.106 | 265 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 766 | 880.1 | 0.484 | 0.140 | 287 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 1186 | 568.3 | 0.545 | 0.214 | 295 (169) | 169/169 | σ1 169/169, σ2 169/169, σ3 169/169 |
+M10 scenario=scroll-small size=506x333 seconds=21.0 delivered_per_s=72.0 new_frames=420 new_per_s=20.00 raw_bytes_per_frame=673992 sigmas=[1, 2, 3]
+| method | bytes/frame | ratio | compress ns/px | decompress ns/px | write µs/frame (files) | B,G,R exact | NV12 exact (σ) |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | 674008 | 1.0 | 0.218 | 0.191 | 546 (420) | 420/420 | all 4 bytes equal |
+| (b) lz4 whole alpha kept | 38645 | 17.4 | 1.038 | 0.452 | 318 (420) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 32 alpha kept | 36266 | 18.6 | 1.221 | 0.813 | 325 (420) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 64 alpha kept | 37144 | 18.1 | 1.339 | 0.750 | 296 (420) | 420/420 | all 4 bytes equal |
+| (c) tiles+lz4 tile 128 alpha kept | 38703 | 17.4 | 1.273 | 0.702 | 322 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 32 alpha kept | 21515 | 31.3 | 1.784 | 1.100 | 329 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 64 alpha kept | 22093 | 30.5 | 1.807 | 1.103 | 298 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd -1 tile 128 alpha kept | 23048 | 29.2 | 1.914 | 1.090 | 300 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 32 alpha kept | 20914 | 32.2 | 1.805 | 1.157 | 283 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 64 alpha kept | 21585 | 31.2 | 1.883 | 1.163 | 404 (420) | 420/420 | all 4 bytes equal |
+| (d) tiles+zstd 1 tile 128 alpha kept | 22607 | 29.8 | 2.124 | 1.173 | 325 (420) | 420/420 | all 4 bytes equal |
+| (a) raw alpha dropped | 505510 | 1.3 | 0.429 | 0.472 | 423 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (b) lz4 whole alpha dropped | 36347 | 18.5 | 1.222 | 0.863 | 305 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (c) tiles+lz4 tile 32 alpha dropped | 34056 | 19.8 | 1.785 | 0.964 | 300 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (c) tiles+lz4 tile 64 alpha dropped | 34840 | 19.3 | 1.619 | 0.943 | 340 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (c) tiles+lz4 tile 128 alpha dropped | 36203 | 18.6 | 1.532 | 0.926 | 329 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 19660 | 34.3 | 2.175 | 1.399 | 317 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (d) tiles+zstd -1 tile 64 alpha dropped | 19983 | 33.7 | 2.092 | 1.408 | 311 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (d) tiles+zstd -1 tile 128 alpha dropped | 20757 | 32.5 | 1.978 | 1.364 | 305 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (d) tiles+zstd 1 tile 32 alpha dropped | 18031 | 37.4 | 2.057 | 1.321 | 311 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (d) tiles+zstd 1 tile 64 alpha dropped | 18404 | 36.6 | 1.995 | 1.355 | 311 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 19161 | 35.2 | 1.975 | 1.300 | 344 (420) | 420/420 | σ1 420/420, σ2 420/420, σ3 420/420 |
+M12 write model: 308.6 µs per file + 0.2772 µs per KB (1.257 ns per raw-1080p pixel for a raw BGRA frame)
+M14 at 1920 x 1080, 20 new frames per second, worst scenario per figure (frames ≥ 20)
+| method | best tile | bytes/px worst / mean | compress ns/px worst | write µs/frame at 1080p | live share dev PC | live share weakest (estimate) | within 10 % |
+|---|---|---|---|---|---|---|---|
+| (a) raw alpha kept | - | 4.0001 / 4.0000 | 0.244 | 2608 | 0.65 % | 9.11 % | yes |
+| (b) lz4 whole alpha kept | - | 3.4396 / 0.5785 | 3.298 | 2285 | 1.40 % | 20.17 % | no |
+| (c) tiles+lz4 tile 32 alpha kept | 32 | 3.1006 / 0.5010 | 6.134 | 2091 | 2.11 % | 30.63 % | no |
+| (d) tiles+zstd -1 tile 64 alpha kept | 64 | 3.1527 / 0.4853 | 6.544 | 2120 | 2.22 % | 32.25 % | no |
+| (d) tiles+zstd 1 tile 128 alpha kept | 128 | 2.4639 / 0.3876 | 7.923 | 1725 | 2.53 % | 36.78 % | no |
+| (a) raw alpha dropped | - | 3.0001 / 3.0000 | 0.429 | 2033 | 0.62 % | 8.76 % | yes |
+| (b) lz4 whole alpha dropped | - | 2.7057 / 0.4664 | 1.496 | 1864 | 0.88 % | 12.52 % | no |
+| (c) tiles+lz4 tile 32 alpha dropped | 32 | 2.7341 / 0.4449 | 1.939 | 1880 | 1.00 % | 14.24 % | no |
+| (d) tiles+zstd -1 tile 32 alpha dropped | 32 | 2.6773 / 0.4137 | 2.544 | 1847 | 1.15 % | 16.49 % | no |
+| (d) tiles+zstd 1 tile 128 alpha dropped | 128 | 2.2534 / 0.3521 | 3.634 | 1604 | 1.40 % | 20.20 % | no |
+```

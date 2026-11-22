@@ -2,10 +2,13 @@
 // (docs/clip-recorder-experiments-plan.md, "Run design": grid A-D and the D part of grid B).
 //
 //   node run-d.mjs grid=A|B|all [repeats=3] [csv=...]      the full grids (resumable)
-//   node run-d.mjs grid=pilot [csv=results/d-pilot.csv]      typing and scroll at 1920 x 1080, q 30, 70, 100, 1 repeat
+//   node run-d.mjs grid=pilot [csv=results/d-pilot.csv]      typing and scroll at 1920 x 1080 and typing at 640 x 360, q 30, 70, 100, 1 repeat
 //   node run-d.mjs estimate [csv=results/d-pilot.csv]        T_D of the full grids from the pilot (equation 6 for way D)
+//   node run-d.mjs runlist [repeats=3]                       results/d-runlist.json, the full plan with resolved keys (M9)
 //
-// One probe process per run, at BelowNormal priority (inherited from this process).
+// Two probe processes per run, as in the product (M3): `exp-d phase=live`, then `exp-d phase=worker`,
+// at BelowNormal priority (inherited from this process). Rows are found by their requested settings
+// and record the settings the encoder read back (M5); a run key is never appended twice (M9).
 // One CSV row per run with every option, the measured values, the known values and
 // pass or fail. Rows already in the CSV are skipped, so a stopped run resumes.
 // Bytes come from run 1; bytes_identical records whether a repeat gave the same file.
@@ -26,17 +29,28 @@ const SCRATCH = path.join(os.tmpdir(), 'clip-exp-d');
 const WAY_BY_VENDOR = { VEN_8086: 'DW1', '': 'DW2', VEN_10DE: 'DW3', VEN_1414: 'DW4' };
 const GRID_A = { q: [30, 40, 50, 60, 70, 80, 90, 100], tau: 20, hint: 1, rate: 'quality' };
 const GRID_B = { way: 'DW1', q: 70, tau: [40, 100, 200], beta: [0.05, 0.10, 0.20] };
-const PILOT = { folders: ['typing-1920x1080', 'scroll-1920x1080'], q: [30, 70, 100] };
+const PILOT = { folders: ['typing-1920x1080', 'scroll-1920x1080', 'typing-640x360'], q: [30, 70, 100] };
 const OCR_FRAMES = 10;
 const TEXT_SCENARIOS = new Set(['typing', 'scroll', 'ui']);
+// The product's bitrate fallback (clip_encoder.rs FALLBACK_BITS_PER_PIXEL_FRAME): quality mode keeps it, never 0 (M5).
+export const FALLBACK_BETA = 0.10;
+// The D run key (fit/fit-config.json d_key_columns, plus the repeat) and the requested column of each setting (M5, M9).
+export const D_KEY = ['folder', 'encoder', 'q', 'tau_f', 'hint', 'rate', 'beta', 'repeat'];
+const REQUESTED = { q: 'q_req', tau_f: 'tau_f_req', hint: 'hint_req', rate: 'rate_req', beta: 'beta_req' };
+export const RUNLIST = path.join(BASE, 'results', 'd-runlist.json');
 
 const COLUMNS = ['grid', 'folder', 'scenario', 'width', 'height', 'sigma', 'out_w', 'out_h', 'encoder', 'encoder_name',
-  'q', 'tau_f', 'hint', 'rate', 'beta', 'repeat', 'status', 'error', 'activated', 'hresult', 'dw4_system_nv12',
-  'encoder_used', 'encoder_matches', 'n_new', 'frames', 'keyframes', 'keyframes_segment', 'b_frames', 'b_frames_read',
-  'gop_read', 'max_gop', 'hint_accepted', 'rate_read', 'rate_value', 'bytes', 'clip_hash', 'bytes_identical',
-  'waiting_bytes', 't_live_ns', 'a_rt_ns', 'a_rt_gpt_ns', 'm_live', 't_worker_ns', 'a_w_ns', 'a_w_gpt_ns', 'm_worker',
-  'decoded_frames', 'time_mismatch', 't_decode_ns', 'a_dec_ns', 'a_dec_gpt_ns', 'm_decode', 'cycle_rate', 't_quality_ns', 't_ocr_ns', 'ssim_mean', 'ssim_min',
-  'psnr_mean', 'psnr_min', 'psnr_global', 'identical_frames', 'r', 'r_note', 'flashes', 'wall_ms',
+  'q', 'tau_f', 'hint', 'rate', 'beta', 'repeat', 'status', 'error',
+  'q_req', 'tau_f_req', 'hint_req', 'rate_req', 'beta_req', 'q_read', 'tau_f_read', 'hint_read', 'rate_read', 'beta_read', 'rate_value', 'bitrate_req', 'bitrate_read',
+  'activated', 'hresult', 'dw4_system_nv12', 'encoder_used', 'encoder_matches', 'hardware_used',
+  'n_new', 'frames', 'keyframes', 'keyframes_segment', 'key_orders', 'b_frames', 'b_frames_read', 'max_gop',
+  'bytes', 'frame_bytes', 'index_bytes', 'clip_json_bytes', 'index_lines', 'files', 'bytes_disk', 'bytes_on_disk', 'clip_hash', 'bytes_identical', 'waiting_bytes',
+  'input', 'live_pid', 'worker_pid', 'way_cpu_ns', 'way_cycles', 't_live_ns', 'a_rt_ns', 'a_rt_gpt_ns', 'live_cycles', 't_worker_ns', 'a_w_ns', 'a_w_gpt_ns', 'worker_cycles',
+  'ram_os', 'm_live', 'm_worker', 'live_m0_private', 'live_os_peak_at_m0', 'live_os_peak_private', 'live_ram_os',
+  'worker_m0_private', 'worker_os_peak_at_m0', 'worker_os_peak_private', 'worker_ram_os',
+  'decoded_frames', 'frames_mapped', 'frames_missing', 'frames_extra', 'frames_mistimed', 'time_offsets', 'mp4_time_offsets',
+  't_decode_ns', 'a_dec_ns', 'a_dec_gpt_ns', 'm_decode', 'cycle_rate', 't_quality_ns', 't_ocr_ns',
+  'ssim_mean', 'ssim_min', 'psnr_mean', 'psnr_min', 'mse_y', 'psnr_global', 'identical_frames', 'r', 'r_regions', 'r_source_chars', 'r_note', 'flashes', 'wall_ms',
   'known_frames', 'known_keyframes', 'known_b', 'known_flashes', 'pass_frames', 'pass_keyframes', 'pass_b'];
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => (a.includes('=') ? a.split(/=(.*)/s).slice(0, 2) : [a, '1'])));
@@ -70,24 +84,50 @@ function plan(grid, repeats) {
   const all = folders();
   const encs = encoders();
   const add = (g, f, e, o) => { for (let r = 1; r <= repeats; r += 1) runs.push({ grid: g, folder: f.name, enc: e, repeat: r, ...o }); };
+  const quality = { rate: 'quality', beta: FALLBACK_BETA };
   if (grid === 'pilot') {
-    for (const f of all.filter((x) => PILOT.folders.includes(x.name))) for (const e of encs) for (const q of PILOT.q) add('pilot', f, e, { q, tau: 20, hint: 1, rate: 'quality', beta: 0 });
+    for (const f of all.filter((x) => PILOT.folders.includes(x.name))) for (const e of encs) for (const q of PILOT.q) add('pilot', f, e, { q, tau: 20, hint: 1, ...quality });
   }
   if (grid === 'A' || grid === 'all') {
-    for (const f of all) for (const e of encs) for (const q of GRID_A.q) add('A', f, e, { q, tau: GRID_A.tau, hint: GRID_A.hint, rate: GRID_A.rate, beta: 0 });
+    for (const f of all) for (const e of encs) for (const q of GRID_A.q) add('A', f, e, { q, tau: GRID_A.tau, hint: GRID_A.hint, ...quality });
   }
   if (grid === 'B' || grid === 'all') {
     const e = encs.find((x) => x.way === GRID_B.way);
     for (const f of all) {
-      for (const tau of GRID_B.tau) add('B-tau', f, e, { q: GRID_B.q, tau, hint: 1, rate: 'quality', beta: 0 });
-      add('B-hint', f, e, { q: GRID_B.q, tau: 20, hint: 0, rate: 'quality', beta: 0 });
+      for (const tau of GRID_B.tau) add('B-tau', f, e, { q: GRID_B.q, tau, hint: 1, ...quality });
+      add('B-hint', f, e, { q: GRID_B.q, tau: 20, hint: 0, ...quality });
       for (const beta of GRID_B.beta) add('B-beta', f, e, { q: 0, tau: 20, hint: 1, rate: 'bitrate', beta });
     }
   }
+  const keys = runs.map(plannedKey);
+  if (new Set(keys).size !== keys.length) throw new Error(`the ${grid} plan has a run key twice`);
   return runs;
 }
 
-const keyOf = (r) => [r.grid, r.folder, r.encoder ?? r.enc.way, r.q, r.tau_f ?? r.tau, r.hint, r.rate, r.beta, r.repeat].join('|');
+/** A planned run with every key resolved as the probe resolves it (M9): q is 0 in bitrate mode, quality mode keeps beta 0.10. */
+export function resolveRun(run) {
+  const rate = run.rate ?? 'quality';
+  return {
+    folder: run.folder, encoder: run.encoder ?? run.enc.way, q: rate === 'quality' ? Number(run.q) : 0, tau_f: Number(run.tau_f ?? run.tau ?? 20),
+    hint: Number(run.hint ?? 1), rate, beta: rate === 'quality' ? FALLBACK_BETA : Number(run.beta), repeat: Number(run.repeat),
+  };
+}
+
+/** The key a planned run is looked up by, resolved at planning, lookup and append the same way. */
+export const plannedKey = (run) => { const r = resolveRun(run); return D_KEY.map((k) => String(r[k])).join('|'); };
+/** The key of a saved row: the settings it requested, so a row recorded under refused settings is still found. */
+export const rowKey = (row) => D_KEY.map((k) => String(REQUESTED[k] && row[REQUESTED[k]] !== undefined && row[REQUESTED[k]] !== '' ? row[REQUESTED[k]] : row[k])).join('|');
+
+/** results/d-runlist.json: the full D plan (grid A-D and the D part of grid B), one resolved run per line. */
+export function writeRunList(repeats = 3) {
+  const runs = [...plan('A', repeats), ...plan('B', repeats)].map(resolveRun);
+  const keys = runs.map((r) => D_KEY.map((k) => String(r[k])).join('|'));
+  if (new Set(keys).size !== keys.length) throw new Error('the D run plan has a run key twice');
+  const head = { about: 'Way D full run plan (docs/clip-recorder-experiments-plan.md, "Run design"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).', key: D_KEY, repeats, counts: { runs: runs.length, A: plan('A', repeats).length, B: plan('B', repeats).length } };
+  const body = runs.map((r) => `  ${JSON.stringify(Object.fromEntries(D_KEY.map((k) => [k, r[k]])))}`).join(',\n');
+  fs.writeFileSync(RUNLIST, `${JSON.stringify(head).slice(0, -1)},"runs":[\n${body}\n]}\n`);
+  return { runs: runs.length, unique: new Set(keys).size };
+}
 
 function readCsv(csv) {
   if (!fs.existsSync(csv)) return [];
@@ -108,61 +148,100 @@ function rateArg() {
   return `rate=${cycleRate}`;
 }
 
+/** One probe process; its JSON line, or an error record. */
+function probe(argv) {
+  const res = spawnSync(PROBE, argv, { encoding: 'utf8', windowsHide: true, maxBuffer: 1 << 24 });
+  const line = (res.stdout || '').split(/\r?\n/).find((l) => l.startsWith('{'));
+  try { return line ? JSON.parse(line) : { status: 'error', error: `no JSON, exit ${res.status}: ${(res.stderr || '').trim().slice(0, 300)}` }; }
+  catch (e) { return { status: 'error', error: `bad JSON: ${e.message}` }; }
+}
+
+/** The scenario's fixed text regions (corpus.json text_regions, M7) as the probe's `regions=` argument. */
+function regionsArg(scenario) {
+  return (CORPUS.text_regions?.[scenario] ?? [])
+    .map((g) => [g.left, g.top, g.right, g.bottom, g.max_width ?? 0, g.max_height ?? 0, g.max_width_fraction ?? 0].join(':')).join(';');
+}
+
+/**
+ * One run = two processes, as in the product (M3, E2): `phase=live` writes the waiting folder,
+ * then `phase=worker` encodes from it. The way's CPU and RAM are the sums of both (M2, M3).
+ */
 function runOne(run, cfg) {
   const scratch = path.join(SCRATCH, `${process.pid}-${Date.now()}`);
   const flash = CORPUS.flash;
-  const argv = ['exp-d', `folder=${path.join(CORPUS.root, run.folder)}`, `encoder=${run.enc.way}`, `name=${run.enc.name}`,
-    `vendor=${run.enc.vendor}`, `hw=${run.enc.hw}`, `q=${run.q}`, `gop=${run.tau}`, `hint=${run.hint}`, `ratemode=${run.rate}`,
-    `beta=${run.beta}`, `scratch=${scratch}`, `repeat=${run.repeat}`, rateArg(), `window_width=${cfg.width}`,
-    `flash=${flash.bgr.join(':')}:${flash.box_left_fraction}:${flash.box_top}:${flash.box_width}:${flash.box_height}:${flash.min_pixels}`];
+  const r = resolveRun(run);
+  const common = [`folder=${path.join(CORPUS.root, run.folder)}`, `encoder=${r.encoder}`, `name=${run.enc.name}`,
+    `vendor=${run.enc.vendor}`, `hw=${run.enc.hw}`, `q=${r.q}`, `gop=${r.tau_f}`, `hint=${r.hint}`, `ratemode=${r.rate}`,
+    `beta=${r.beta}`, `scratch=${scratch}`, `repeat=${r.repeat}`, rateArg(), `window_width=${cfg.width}`,
+    `flash=${flash.bgr.join(':')}:${flash.box_left_fraction}:${flash.box_top}:${flash.box_width}:${flash.box_height}:${flash.min_pixels}`,
+    `regions=${regionsArg(cfg.scenario)}`];
   const start = Date.now();
-  const res = spawnSync(PROBE, argv, { encoding: 'utf8', windowsHide: true, maxBuffer: 1 << 24 });
+  const live = probe(['exp-d', 'phase=live', ...common]);
+  let out = { ...live, error: live.error ? `live: ${live.error}` : undefined };
+  if (live.status === 'ok') {
+    const worker = probe(['exp-d', 'phase=worker', ...common]);
+    out = { ...live, ...worker };
+    if (worker.a_w_ns !== undefined) {
+      out.way_cpu_ns = Number(live.a_rt_ns) + Number(worker.a_w_ns);
+      out.way_cycles = Number(live.live_cycles) + Number(worker.worker_cycles);
+      out.ram_os = Number(live.live_ram_os) + Number(worker.worker_ram_os);
+    }
+  }
   const wall = Date.now() - start;
-  const line = (res.stdout || '').split(/\r?\n/).find((l) => l.startsWith('{'));
-  let out;
-  try { out = line ? JSON.parse(line) : { status: 'error', error: `no JSON, exit ${res.status}: ${(res.stderr || '').trim().slice(0, 300)}` }; }
-  catch (e) { out = { status: 'error', error: `bad JSON: ${e.message}` }; }
   fs.rmSync(scratch, { recursive: true, force: true });
   return { ...out, wall_ms: wall };
 }
 
+/** The CSV row of a run: requested settings from the plan, actual settings as the probe read them back (M5). */
 function row(run, cfg, out, first) {
   const n = nNew(run.folder);
+  const r = resolveRun(run);
   const ok = out.status === 'ok';
-  const known = { known_frames: n, known_keyframes: ok ? Math.ceil(Number(out.frames) / run.tau) : '', known_b: 0, known_flashes: cfg.scenario === 'flash' ? CORPUS.t_s * CORPUS.flash.per_second : '' };
-  const r = {
-    ...out, grid: run.grid, folder: run.folder, scenario: cfg.scenario, encoder: run.enc.way, encoder_name: run.enc.name,
-    q: run.q, tau_f: run.tau, hint: run.hint, rate: run.rate, beta: run.beta, repeat: run.repeat, ...known,
+  const known = { known_frames: n, known_keyframes: ok ? Math.ceil(Number(out.frames) / Number(out.tau_f)) : '', known_b: 0, known_flashes: cfg.scenario === 'flash' ? CORPUS.t_s * CORPUS.flash.per_second : '' };
+  const requested = Object.fromEntries(Object.entries(REQUESTED).map(([k, col]) => [col, out[col] ?? r[k]]));
+  const actual = Object.fromEntries(Object.keys(REQUESTED).map((k) => [k, out[k] ?? r[k]]));
+  const merged = {
+    ...out, ...requested, ...actual, grid: run.grid, folder: run.folder, scenario: cfg.scenario, encoder: r.encoder, encoder_name: run.enc.name,
+    repeat: r.repeat, ...known,
     bytes_identical: first ? (first.clip_hash === out.clip_hash ? 1 : 0) : (ok ? 1 : ''),
     pass_frames: ok ? (Number(out.frames) === n ? 1 : 0) : '',
     pass_keyframes: ok ? (Number(out.keyframes) === known.known_keyframes ? 1 : 0) : '',
     pass_b: ok ? (Number(out.b_frames) === 0 ? 1 : 0) : '',
   };
-  return COLUMNS.map((c) => clean(r[c])).join(',');
+  if (rowKey(merged) !== plannedKey(run)) throw new Error(`the probe resolved ${plannedKey(run)} as ${rowKey(merged)}: fix resolveRun in run-d.mjs`);
+  return merged;
 }
 
 function runGrid(grid) {
   try { os.setPriority(0, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* keeps normal priority */ }
   const repeats = grid === 'pilot' ? 1 : Number(args.repeats ?? 3);
+  if (grid !== 'pilot') writeRunList(repeats);
   const csv = path.resolve(args.csv ?? path.join(BASE, 'results', grid === 'pilot' ? 'd-pilot.csv' : 'd-runs.csv'));
   if (!fs.existsSync(csv)) fs.writeFileSync(csv, `${COLUMNS.join(',')}\n`);
   const done = readCsv(csv);
-  const doneKeys = new Set(done.map(keyOf));
-  const firsts = new Map(done.filter((r) => r.repeat === '1').map((r) => [keyOf({ ...r, repeat: 1 }), r]));
+  const doneKeys = new Set();
+  for (const r of done) {
+    if (doneKeys.has(rowKey(r))) throw new Error(`${path.basename(csv)} has the run key ${rowKey(r)} twice`);
+    doneKeys.add(rowKey(r));
+  }
+  const firsts = new Map(done.filter((r) => r.repeat === '1').map((r) => [rowKey(r), r]));
   const cfgs = Object.fromEntries(folders().map((f) => [f.name, f]));
   const runs = plan(grid, repeats);
-  console.log(`exp-d ${grid}: ${runs.length} runs, ${runs.filter((r) => doneKeys.has(keyOf(r))).length} already in ${csv}`);
+  console.log(`exp-d ${grid}: ${runs.length} runs, ${runs.filter((r) => doneKeys.has(plannedKey(r))).length} already in ${csv}`);
   let count = 0;
   for (const run of runs) {
-    if (doneKeys.has(keyOf(run))) continue;
+    const key = plannedKey(run);
+    if (doneKeys.has(key)) continue;
     const cfg = cfgs[run.folder];
     const out = runOne(run, cfg);
-    const firstKey = keyOf({ ...run, repeat: 1 });
+    const firstKey = plannedKey({ ...run, repeat: 1 });
     const first = run.repeat > 1 ? firsts.get(firstKey) : null;
-    fs.appendFileSync(csv, `${row(run, cfg, out, first)}\n`);
+    const merged = row(run, cfg, out, first);
+    fs.appendFileSync(csv, `${COLUMNS.map((c) => clean(merged[c])).join(',')}\n`);
+    doneKeys.add(key);
     if (run.repeat === 1) firsts.set(firstKey, out);
     count += 1;
-    console.log(`${count} ${run.folder} ${run.enc.way} q${run.q} tau${run.tau} hint${run.hint} ${run.rate} ${run.beta} r${run.repeat}: ${out.status} ${out.bytes ?? ''} B ${out.wall_ms} ms${out.error ? ` (${out.error.slice(0, 120)})` : ''}`);
+    console.log(`${count} ${run.folder} ${run.enc.way} q${run.q} tau${run.tau} hint${run.hint} ${run.rate} ${run.beta} r${run.repeat}: ${out.status} ${out.bytes ?? ''} B ${out.wall_ms} ms${out.error ? ` (${String(out.error).slice(0, 120)})` : ''}`);
   }
 }
 
@@ -219,5 +298,8 @@ function estimate() {
   }, null, 1));
 }
 
-if (args.estimate) estimate();
-else runGrid(args.grid ?? 'pilot');
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (args.estimate) estimate();
+  else if (args.runlist) console.log(`d-runlist.json: ${JSON.stringify(writeRunList(Number(args.repeats ?? 3)))}`);
+  else runGrid(args.grid ?? 'pilot');
+}

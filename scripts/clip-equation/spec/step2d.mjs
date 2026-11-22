@@ -182,10 +182,13 @@ function checks(rows, root) {
     'D: a refused setting is recorded as refused': needRows(() => {
       const runs = rows.filter((r) => r.activated === '1' && r.status !== 'no_product_path');
       const bad = runs.filter((r) => {
-        const pairs = [['rate', r.rate_req, r.rate_read], ['q', r.q_req, r.q_read], ['tau_f', r.tau_f_req, r.tau_f_read], ['hint', r.hint_req, r.hint_read]];
+        const pairs = [['rate', r.rate_req, r.rate_read], ['q', r.q_req, r.q_read], ['tau_f', r.tau_f_req, r.tau_f_read], ['hint', r.hint_req, r.hint_read], ['beta', r.bitrate_req, r.bitrate_read]];
         if (pairs.some(([, req, read]) => req === undefined || read === undefined || req === '' || read === '')) return true;
-        const refused = pairs.find(([name, req, read]) => (name === 'q' && r.rate_read !== 'quality' ? false : String(req) !== String(read)));
-        const keysActual = String(r.q) === String(r.rate_read === 'quality' ? r.q_read : 0) && String(r.tau_f) === String(r.tau_f_read) && String(r.hint) === String(r.hint_read) && r.rate === r.rate_read;
+        // q is compared only when quality mode holds; the bitrate (beta) only in bitrate mode as requested.
+        const compared = (name) => (name === 'q' ? r.rate_read === 'quality' : name === 'beta' ? r.rate_req === 'bitrate' && r.rate_read === 'bitrate' : true);
+        const refused = pairs.find(([name, req, read]) => compared(name) && String(req) !== String(read));
+        const keysActual = String(r.q) === String(r.rate_read === 'quality' ? r.q_read : 0) && String(r.tau_f) === String(r.tau_f_read) && String(r.hint) === String(r.hint_read)
+          && r.rate === r.rate_read && String(r.beta) === String(r.beta_read);
         return refused ? !(r.status === `setting_refused:${refused[0]}` && keysActual) : (r.status.startsWith('setting_refused') || !keysActual);
       }).map((r) => `${label(r)}: ${r.status}; req ${r.rate_req}/${r.q_req}/${r.tau_f_req}/${r.hint_req} read ${r.rate_read}/${r.q_read}/${r.tau_f_read}/${r.hint_read}`);
       return { value: 'refused iff read-back differs', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };

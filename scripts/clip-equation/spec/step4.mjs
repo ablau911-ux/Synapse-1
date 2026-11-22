@@ -15,7 +15,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRuns } from './step2d.mjs';
 import { PENDING, relErr, runFeature } from './feature.mjs';
-import { D_BYTES_TRUTH, RAM_TRUTH, dBytesConfigs, ramFixture, sizeFixture, targetFixture, zBytesPerFrame } from './step4.fixtures.mjs';
+import { D_BYTES_TRUTH, D_META, RAM_TRUTH, Z_TRUTH, dBytesCase, gapFixture, ramFixture, requestedFixture, sizeFixture, targetFixture, validityFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -23,7 +23,9 @@ const FEATURE = path.join(HERE, 'step4.feature');
 export const CONFIG = JSON.parse(fs.readFileSync(path.join(BASE, 'fit', 'fit-config.json'), 'utf8'));
 const FIT_MODULE = path.join(BASE, 'fit', 'fit.mjs');
 
-export const keyOf = (kind, row) => `${kind}|${CONFIG[kind === 'Z' ? 'z_key_columns' : 'd_key_columns'].map((c) => row[c] ?? '').join('|')}`;
+/** Z key columns: the configured list plus every option column the runner wrote before `rep` (H1). */
+const zKeyColumns = (row) => { const c = Object.keys(row); const i = c.indexOf('rep'); return [...new Set([...CONFIG.z_key_columns, ...(i > 0 ? c.slice(0, i) : [])])]; };
+export const keyOf = (kind, row) => `${kind}|${(kind === 'Z' ? zKeyColumns(row) : CONFIG.d_key_columns).map((c) => row[c] ?? '').join('|')}`;
 const finite = (v) => typeof v === 'number' && Number.isFinite(v);
 const sizeOf = (folder) => folder.slice(folder.indexOf('-') + 1);
 const contentOf = (folder) => folder.slice(0, folder.indexOf('-'));
@@ -60,9 +62,18 @@ function mulberry32(seed) {
 export function completeD(rows) {
   const groups = new Map();
   for (const r of rows) groups.set(keyOf('D', r), [...(groups.get(keyOf('D', r)) ?? []), r]);
+  const req = (r) => `D|${CONFIG.d_key_columns.map((c) => (r[`${c}_req`] !== undefined && r[`${c}_req`] !== '' ? r[`${c}_req`] : r[c] ?? '')).join('|')}`;
+  const byReq = new Map();
+  for (const r of rows) byReq.set(req(r), [...(byReq.get(req(r)) ?? []), r]);
+  const valid = (r) => CONFIG.checks.ok_statuses.includes(r.status || 'ok') && CONFIG.checks.validity_pass.D.every((c) => r[c] !== '0');
+  const reqComplete = (k) => {
+    const rs = byReq.get(k) ?? [];
+    const reps = new Set(rs.map((r) => Number(r.repeat)));
+    return rs.every((r) => valid(r) && keyOf('D', r) === k) && [...Array(Math.max(...reps)).keys()].every((i) => reps.has(i + 1));
+  };
   const text = new Set(CONFIG.text_scenarios);
   const isNa = (r) => String(r.r ?? '').trim().toLowerCase() === 'n/a';
-  return new Set([...groups].filter(([, rs]) => rs.every((r) => r.status === 'ok')
+  return new Set([...groups].filter(([, rs]) => rs.every((r) => valid(r) && reqComplete(req(r)))
     && (!text.has(rs[0].scenario) || rs.every(isNa) || rs.every((r) => r.r !== '' && Number.isFinite(Number(r.r))))).map(([k]) => k));
 }
 
@@ -190,19 +201,67 @@ function findingChecks(F, inputs) {
       if (!n || n.runs_failed !== 4 || n.configs_blocked !== 3) bad.push(`failure counts ${JSON.stringify(n)}`);
       return { value: 'typing, scroll, ui at q 70 dropped and out of the fit; 4 failed runs, 3 blocked', measured: bad.length ? bad.join('; ') : 'as known', pass: bad.length === 0 };
     }),
-    '#10 FULL only when the unique keys match both run plans': need(() => {
+    '#10 M1 FULL only when the resolved keys match both run plans, without duplicates': need(() => {
       const { zRows, runlist } = sizeFixture();
       const dRows = targetFixture();
-      const dRunlist = { runs: dRows.map((r) => Object.fromEntries([...CONFIG.d_key_columns, 'repeat'].map((k) => [k, r[k]]))) };
+      const dRunlist = { runs: dRows.map((r) => ({ folder: r.folder, encoder: r.encoder, q: r.q, tau_f: r.tau_f, hint: r.hint, rate: r.rate, beta: r.beta, repeat: r.repeat })) };
       const label = (z, d, dl) => F.fitLabel({ pilot: false, zRows: z, dRows: d, runlist, dRunlist: dl }).label;
       const cases = [
         ['complete', label(zRows, dRows, dRunlist), true],
         ['Z duplicate in place of a repeat', label([...zRows.slice(0, -1), { ...zRows[0] }], dRows, dRunlist), false],
+        ['Z duplicate added, nothing missing', label([...zRows, { ...zRows[0] }], dRows, dRunlist), false],
+        ['D duplicate added, nothing missing', label(zRows, [...dRows, { ...dRows[0] }], dRunlist), false],
+        ['Z row with its cell id but other options', label([{ ...zRows[0], kz: '100' }, ...zRows.slice(1)], dRows, dRunlist), false],
+        ['rows from two run lists (hash column)', label(zRows.map((r, i) => ({ ...r, runlist_hash: i ? 'aaa' : 'bbb' })), dRows, dRunlist), false],
         ['one D run missing', label(zRows, dRows.slice(1), dRunlist), false],
         ['no D run plan', label(zRows, dRows, null), false],
       ];
       const bad = cases.filter(([, got, full]) => full !== (got === 'FULL'));
       return { value: cases.map(([n, , full]) => `${n}: ${full ? 'FULL' : 'not FULL'}`).join('; '), measured: cases.map(([n, got]) => `${n}: ${got}`).join('; '), pass: bad.length === 0 };
+    }),
+    'H1 every option the runner keys on is in the configuration key (ZW9 gap)': need(() => {
+      const f = F.buildFitFromRows({ zRows: gapFixture(), dRows: [], runlist: noRunlist });
+      const z = f.configurations.filter((c) => c.kind === 'Z');
+      return { value: '3 configurations of 3 repeats (gap 0, 1, 2)', measured: `${z.length} configuration(s): ${z.map((c) => `gap ${c.options.gap} x ${c.runs}`).join(', ')}`, pass: z.length === 3 && z.every((c) => c.runs === 3) && new Set(z.map((c) => c.options.gap)).size === 3 };
+    }),
+    'H2 bytes are every retained file for both ways; payload fits add the metadata': need(() => {
+      const d = F.buildFitFromRows({ zRows: [], dRows: targetFixture(), runlist: noRunlist });
+      const c = cfg(d, 'typing', 50);
+      const wantD = ((1e6 * Math.exp(0.02 * 50) + D_META) * 60) / c.t_s;
+      const dv = d.validation.d.rows.filter((v) => v.quantity === 'bytes');
+      const dvBad = dv.filter((v) => !(relErr(v.measured, d.configurations.find((x) => x.key === v.key)?.fit?.bytes_total?.mean) <= 1e-12)).length;
+      const { zRows, runlist } = sizeFixture();
+      const z = F.buildFitFromRows({ zRows, dRows: [], runlist });
+      const zc = z.configurations.find((x) => x.size === '640x360');
+      const wantZ = ((zBytesPerFrame(zc.px) * zc.n_new + Z_TRUTH.meta) * 60) / zc.t_s;
+      const zetaErr = relErr(zc.fit.zeta, zBytesPerFrame(zc.px) / (zc.px * 3));
+      const errs = [relErr(c.bytes_min, wantD), relErr(zc.bytes_min, wantZ), zetaErr];
+      return { value: 'D and Z bytes/min from bytes_disk; Z zeta from the payload; D held-out bytes measured as bytes_disk', measured: `errors D ${errs[0]}, Z ${errs[1]}, zeta ${errs[2]}; ${dv.length} D held-out bytes rows, ${dvBad} not on bytes_disk`, pass: dv.length > 0 && dvBad === 0 && Math.max(...errs) <= 1e-9 };
+    }),
+    'H5 eligibility by requested configuration: every repeat present and ok': need(() => {
+      const f = F.buildFitFromRows({ zRows: [], dRows: requestedFixture(), runlist: noRunlist });
+      const at = (s, q) => f.configurations.find((c) => c.kind === 'D' && c.content === s && c.options.q === String(q));
+      const [t50, t40, s50, u50] = [at('typing', 50), at('typing', 40), at('scroll', 50), at('ui', 50)];
+      const ok = t50?.eligible === false && t40?.eligible === false && /setting_refused/.test(t40?.status ?? '') && s50?.eligible === false && u50?.eligible === true;
+      const say = (n, c) => `${n}: ${c ? (c.eligible ? 'eligible' : `blocked (${c.clause})`) : 'absent'}`;
+      return { value: 'typing q50 blocked, its refused repeat listed under q40, scroll q50 blocked, ui q50 eligible', measured: [say('typing q50', t50), say('typing q40', t40), say('scroll q50', s50), say('ui q50', u50)].join('; '), pass: ok };
+    }),
+    'H6 validity checks block, known-result misses are reported': need(() => {
+      const { d, z } = validityFixture();
+      const f = F.buildFitFromRows({ zRows: z, dRows: d, runlist: noRunlist });
+      const t = f.configurations.find((c) => c.kind === 'D' && c.content === 'typing');
+      const s = f.configurations.find((c) => c.kind === 'D' && c.content === 'scroll');
+      const zc = f.configurations.find((c) => c.kind === 'Z');
+      const ok = t?.eligible === true && (t.known_misses ?? []).some((m) => m.startsWith('pass_keyframes ')) && s?.eligible === false
+        && zc?.eligible === false && /pass_ramOs/.test(zc.clause ?? '') && (zc.known_misses ?? []).some((m) => m.startsWith('pass_ram '));
+      return { value: 'D pass_keyframes 0: eligible, miss reported; D ocr_error: blocked; Z pass_ramOs 0: blocked, pass_ram miss reported', measured: `D typing ${t?.eligible ? 'eligible' : 'blocked'} [${t?.known_misses ?? '-'}]; D scroll ${s?.eligible ? 'eligible' : `blocked (${s?.clause})`}; Z ${zc?.eligible ? 'eligible' : `blocked (${zc?.clause})`} [${zc?.known_misses ?? '-'}]`, pass: ok };
+    }),
+    'M2 predicted RAM from equation 4 at the target size, else pending': need(() => {
+      const { zRows, runlist } = sizeFixture();
+      const f = F.buildFitFromRows({ zRows, dRows: [], runlist });
+      const r = (f.predicted?.rows ?? []).find((x) => x.cell === 4);
+      const ok = !!r && !(typeof r.ram === 'number' && Number.isFinite(r.ram)) && /^pending/.test(r.ram_status ?? '');
+      return { value: 'RAM pending (M_cctx at the target size and window is not known before a run)', measured: r ? `ram ${r.ram}, status ${r.ram_status}` : 'no predicted row', pass: ok };
     }),
     '#15 a non-text row passes O only where every text scenario passes at its q': need(() => {
       const f = target();
@@ -244,14 +303,20 @@ function findingChecks(F, inputs) {
       const ok = rows.length === 1 && Number.isFinite(rows[0].predicted) && relErr(rows[0].predicted, truth) <= CONFIG.self_test_tolerance;
       return { value: `held-out bytes/frame at 1920x1080 = ${truth.toFixed(1)}`, measured: rows.map((v) => `${v.verdict}, predicted ${v.predicted}`).join('; ') || 'no held-out bytes row', pass: ok };
     }),
-    '#18 D bytes: P and K apart, predicted with the requested GOP': need(() => {
+    '#18 M5 D bytes: P and K apart, predicted only where a GOP sweep supports it': need(() => {
       if (!F.fitDBytes) return { value: '-', measured: 'fit.mjs has no fitDBytes', pass: false };
-      const { train, held } = dBytesConfigs();
-      const m = F.fitDBytes(train);
-      const rho = m.coefficients?.K_over_P?.DW1 ?? {};
-      const errs = [...held.map((c) => relErr(m.predict(c), c.truth)), ...Object.entries(D_BYTES_TRUTH.rho).map(([c, v]) => relErr(rho[c], v)), relErr(m.coefficients?.a_E?.DW1, D_BYTES_TRUTH.a)];
+      const T = D_BYTES_TRUTH;
+      const one = dBytesCase([70]);
+      const m1 = F.fitDBytes(one.train);
+      const sup = one.make('typing', 70, 100);
+      const unsup = one.make('typing', 50, 100);
+      const two = dBytesCase([50, 70]);
+      const m2 = F.fitDBytes(two.train);
+      const far = two.make('scroll', 90, 200);
+      const errs = [relErr(m1.predict(sup), sup.truth), relErr(m2.predict(far), far.truth), relErr(m2.coefficients?.a_E?.DW1, T.a), relErr(m2.coefficients?.b_E?.DW1, T.b)];
       const w = Math.max(...errs);
-      return { value: 'bytes at tau_f 100 and 200, K/P and a_E within 1e-6', measured: `worst relative error ${w}`, pass: Number.isFinite(w) && w <= CONFIG.self_test_tolerance };
+      const pend = Number.isNaN(m1.predict(unsup));
+      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a) and q 90 tau 200 within 1e-6', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance };
     }),
     'eq 4 fitted terms: mu and m_d0 from training rows': need(() => {
       const { zRows, runlist } = ramFixture();
@@ -296,10 +361,12 @@ function checks(fit, F, fitError, inputs) {
     return [...g.values()].some((s) => s.size >= 2);
   };
   const dPxCount = () => new Set(inFit('D').map((c) => c.px)).size;
+  // An encoder's own px_out count: c_enc(E) and M_enc(E) are fitted per encoder (CPU from quality-mode rows).
+  const encPxOut = (e) => new Set(inFit('D').filter((c) => c.way === e && c.options.rate === 'quality').map((c) => c.px_out)).size;
   const tauSweep = (encoder) => {
     const g = new Map();
     for (const c of inFit('D').filter((x) => x.options.encoder === encoder && x.options.hint === CONFIG.d_base.hint && x.options.rate === CONFIG.d_base.rate)) { const k = `${c.options.encoder}|${c.folder}|${c.options.q}`; g.set(k, (g.get(k) ?? new Set()).add(c.options.tau_f)); }
-    return [...g.values()].some((s) => s.size >= 2);
+    return new Set([...g].filter(([, s]) => s.size >= 2).map(([k]) => k.split('|')[2])).size;
   };
   return {
     ...findingChecks(F, inputs),
@@ -337,7 +404,10 @@ function checks(fit, F, fitError, inputs) {
       const err = relErr(e.coefficients.T_measured_h, e.coefficients.T_total_h);
       return { value: `T_total ${e.coefficients.T_total_h.toFixed(2)} h`, measured: `wall ${e.coefficients.T_measured_h.toFixed(2)} h (${(100 * err).toFixed(1)} %)`, pass: err <= CONFIG.run_time_tolerance };
     }),
-    'eq 7 D bytes': need(() => equation(fit, 'eq7_d_bytes', (p) => /^K\/P \((.+)\)$/.test(p) && !tauSweep(/^K\/P \((.+)\)$/.exec(p)[1]))),
+    'eq 7 D bytes': need(() => equation(fit, 'eq7_d_bytes', (p) => {
+      const m = /^(K\/P|b_E) \((.+)\)$/.exec(p);
+      return !!m && (m[1] === 'K/P' ? tauSweep(m[2]) === 0 : tauSweep(m[2]) < 2);
+    })),
     'eq 7 D quality': need(() => equation(fit, 'eq7_d_quality', () => false)),
     'eq 7 D q_min': need(() => {
       const e = fit.equations?.eq7_d_qmin;
@@ -364,8 +434,8 @@ function checks(fit, F, fitError, inputs) {
       const values = Object.entries(e.coefficients ?? {}).map(([g, v]) => `${g}: ${v}`).join('; ');
       return { value: 'recomputed from the CSV', measured: `${groups.size} groups; ${values}${bad.length ? `; misses: ${bad.join('; ')}` : ''}`, pass: groups.size > 0 && bad.length === 0 };
     }),
-    'eq 7 D CPU': need(() => equation(fit, 'eq7_d_cpu', (p) => dPxCount() < 2 && /^(c_comp|c_file|e0|e1|e2|c_enc)/.test(p))),
-    'eq 7 D RAM': need(() => equation(fit, 'eq7_d_ram', (p) => dPxCount() < 2 && /^(M_live|m0|m1|M_enc)/.test(p))),
+    'eq 7 D CPU': need(() => equation(fit, 'eq7_d_cpu', (p) => (/^(c_enc)\((.+)\)/.test(p) ? encPxOut(/^c_enc\((.+?)\)/.exec(p)[1]) < 2 : dPxCount() < 2 && /^(c_comp|c_file)/.test(p)))),
+    'eq 7 D RAM': need(() => equation(fit, 'eq7_d_ram', (p) => (/^M_enc\((.+?)\)/.test(p) ? encPxOut(/^M_enc\((.+?)\)/.exec(p)[1]) < 2 : dPxCount() < 2 && /^M_live/.test(p)))),
     'Z validation': need(() => {
       const held = [...new Set(inputs.z.filter((r) => r.held_out === '1').map((r) => keyOf('Z', r)))];
       if (!held.length) return { value: 'within 10 %', measured: `pending: full run (0 held-out Z rows in the input; held-out cells in the run list: ${fit.validation?.z?.runlist_held_out ?? '?'})`, pass: PENDING };

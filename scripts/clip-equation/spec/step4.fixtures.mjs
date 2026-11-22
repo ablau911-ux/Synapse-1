@@ -10,7 +10,7 @@ import { CONFIG } from './step4.mjs';
 const str = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v === undefined || v === null ? '' : String(v)]));
 const pxOf = (size) => size.split('x').map(Number).reduce((a, b) => a * b, 1);
 
-export const Z_TRUTH = { zeta0: 0.05, eta: 0.9, c0: 1e5, kappa: 3, m0: 1e7, mCctx: 5e5, frames: 100 };
+export const Z_TRUTH = { zeta0: 0.05, eta: 0.9, c0: 1e5, kappa: 3, m0: 1e7, mCctx: 5e5, frames: 100, meta: 30000 };
 
 /** Bytes per frame of the Z truth at px. */
 export const zBytesPerFrame = (px) => Z_TRUTH.zeta0 * (px / CONFIG.px0) ** (Z_TRUTH.eta - 1) * px * 3;
@@ -22,8 +22,8 @@ export function zRow(o) {
   const mComp = Z_TRUTH.m0 + Z_TRUTH.mCctx + px * 3;
   const mDec = Z_TRUTH.m0 + 1e5 + px * 3;
   return str({
-    folder: 'typing-640x360', way: 'ZW12', level: -3, layout: 'bgr', mode: 'prefix', tile: 32, wlog: 20, ldm: 0, dict: 0, workers: 0, kz: 20, theta: 25, drain: 0, frames_cap: '', rep: 1,
-    px, frames: f, frames_decoded: f, diff_sum: 0, bytes_out: zBytesPerFrame(px) * f, comp_cpu_ns: (Z_TRUTH.c0 + Z_TRUTH.kappa * px) * f, write_cpu_ns: 0,
+    folder: 'typing-640x360', way: 'ZW12', level: -3, layout: 'bgr', mode: 'prefix', tile: 32, gap: 0, wlog: 21, ldm: 0, dict: 0, workers: 0, kz: 20, theta: 25, drain: 0, frames_cap: '', rep: 1,
+    px, frames: f, frames_decoded: f, diff_sum: 0, bytes_out: zBytesPerFrame(px) * f, frame_bytes: zBytesPerFrame(px) * f, bytes_disk: zBytesPerFrame(px) * f + Z_TRUTH.meta, comp_cpu_ns: (Z_TRUTH.c0 + Z_TRUTH.kappa * px) * f, write_cpu_ns: 0,
     peak_private: mComp, m0_private: Z_TRUTH.m0, known_m_comp: mComp, m_cctx_est: Z_TRUTH.mCctx, bc: 1,
     dec_cpu_ns: 2 * px * f, dec_peak_private: mDec, known_m_dec: mDec, t_ready_ns: 1e6, run_wall_ms: 1000, cell: '', held_out: 0, error: '',
     ...o,
@@ -36,9 +36,9 @@ export function zRow(o) {
  */
 export function sizeFixture() {
   const cells = [
-    { id: 1, way: 'ZW12', kz: 20, level: -3, size: '640x360', status: 'run', wlog: 20 },
-    { id: 2, way: 'ZW12', kz: 20, level: -3, size: '1280x720', status: 'run', wlog: 22 },
-    { id: 3, way: 'ZW12', kz: 20, level: -3, size: '1920x1080', status: 'held-out', wlog: 23 },
+    { id: 1, way: 'ZW12', kz: 20, level: -3, size: '640x360', status: 'run', wlog: 21 },
+    { id: 2, way: 'ZW12', kz: 20, level: -3, size: '1280x720', status: 'run', wlog: 23 },
+    { id: 3, way: 'ZW12', kz: 20, level: -3, size: '1920x1080', status: 'held-out', wlog: 24 },
     { id: 4, way: 'ZW12', kz: 20, level: -3, size: '506x333', status: 'predicted' },
   ];
   const zRows = cells.filter((c) => c.status !== 'predicted').flatMap((c) => [1, 2, 3].map((rep) => zRow({
@@ -84,7 +84,43 @@ export function dRow(o) {
     n_new: n, frames: n, keyframes: Math.ceil(n / 20), bytes: 1e6, a_rt_ns: 1e8, a_w_ns: 5e8, m_live: 2e7, m_worker: 1e8,
     ssim_mean: 0.99, psnr_mean: 40, psnr_global: 40, r: 1, run_wall_ms: 1000,
     ...o,
+    bytes_disk: o.bytes_disk ?? Number(o.bytes ?? 1e6) + D_META,
   });
+}
+
+/** Bytes of frames.jsonl and clip.json beside the MP4 payload of a D clip (M4). */
+export const D_META = 50000;
+
+/** H1: ZW9 with merge gap 0, 1 and 2 (3 repeats each) are three configurations, never one with 9 repeats. */
+export function gapFixture() {
+  return [0, 1, 2].flatMap((gap) => [1, 2, 3].map((rep) => zRow({ way: 'ZW9', mode: 'rect', wlog: 0, gap, rep })));
+}
+
+/**
+ * H5: eligibility by requested configuration. typing q 50: repeat 3 refused q and was recorded under
+ * its actual q 40; scroll q 50: repeat 2 missing; ui q 50: complete (control). Requested settings in *_req.
+ */
+export function requestedFixture() {
+  const req = (r) => ({ ...r, q_req: r.q_req ?? r.q, tau_f_req: r.tau_f, hint_req: r.hint, rate_req: r.rate, beta_req: r.beta });
+  const row = (scenario, repeat, o = {}) => req(dRow({ folder: `${scenario}-640x360`, scenario, q: 50, repeat, ...o }));
+  return [
+    row('typing', 1), row('typing', 2), row('typing', 3, { q: 40, q_req: 50, status: 'setting_refused:q' }),
+    row('scroll', 1), row('scroll', 3),
+    row('ui', 1), row('ui', 2), row('ui', 3),
+  ];
+}
+
+/**
+ * H6: validity blocks, a known-result miss is reported. D typing q 50 has pass_keyframes = 0 (#297) and
+ * stays eligible; D scroll q 50 has status ocr_error; Z ZW1 has pass_ramOs = 0 (RAM-base rule breach).
+ */
+export function validityFixture() {
+  const d = [1, 2, 3].flatMap((repeat) => [
+    dRow({ folder: 'typing-640x360', scenario: 'typing', repeat, pass_keyframes: 0, pass_frames: 1 }),
+    dRow({ folder: 'scroll-640x360', scenario: 'scroll', repeat, status: repeat === 2 ? 'ocr_error' : 'ok' }),
+  ]);
+  const z = [1, 2, 3].map((rep) => zRow({ way: 'ZW1', mode: 'whole', wlog: 0, rep, pass_ramOs: 0, pass_ram: 0 }));
+  return { d, z };
 }
 
 /**
@@ -107,26 +143,30 @@ export function targetFixture() {
   return rows;
 }
 
-/** Synthetic D configurations for fitDBytes (#18): P = p * px * exp(a q), K = rho * P, bytes = (n - n_k) P + n_k K. */
-export const D_BYTES_TRUTH = { p: { typing: 2e-3, scroll: 5e-3 }, a: 0.031, rho: { typing: 6, scroll: 3 } };
+/**
+ * Synthetic D configurations for fitDBytes (#18, M5): P = p_c * px * exp(a q), K = k_c * px * exp(b q)
+ * with b != a, bytes = (n - n_key) P + n_key K. `sweeps` = the q values with a GOP sweep (tau_f 20, 40,
+ * 100, 200); every q of 30..90 runs at tau_f 20; hint-off rows must not enter the fit.
+ */
+export const D_BYTES_TRUTH = { p: { typing: 2e-3, scroll: 5e-3 }, k: { typing: 1.5e-2, scroll: 2e-2 }, a: 0.031, b: 0.024 };
 
-export function dBytesConfigs() {
+export function dBytesCase(sweeps) {
   const n = 400;
   const pxOut = 1280 * 720;
   const T = D_BYTES_TRUTH;
   const make = (content, q, tau, hint = '1') => {
     const nk = Math.ceil(n / tau);
     const P = T.p[content] * pxOut * Math.exp(T.a * q);
-    const bytes = (n - nk) * P + nk * T.rho[content] * P * (hint === '1' ? 1 : 1.5);
+    const K = T.k[content] * pxOut * Math.exp(T.b * q);
+    const bytes = ((n - nk) * P + nk * K) * (hint === '1' ? 1 : 1.5);
     return { kind: 'D', way: 'DW1', content, folder: `${content}-640x360`, size: '640x360', px_out: pxOut, n_new: n, eligible: true, in_fit: true, status: 'ok',
       options: { encoder: 'DW1', q: String(q), tau_f: String(tau), hint, rate: 'quality' }, fit: { bytes: { mean: bytes, spread: 0 }, keyframes: nk }, truth: bytes };
   };
   const train = [];
   for (const c of ['typing', 'scroll']) {
     for (const q of [30, 50, 70, 90]) train.push(make(c, q, 20));
-    for (const tau of [40, 100, 200]) train.push(make(c, 70, tau));
+    for (const q of sweeps) for (const tau of [40, 100, 200]) train.push(make(c, q, tau));
     train.push(make(c, 70, 20, '0'), make(c, 90, 40, '0'));
   }
-  const held = [make('typing', 50, 100), make('scroll', 90, 200)];
-  return { train, held };
+  return { train, make };
 }

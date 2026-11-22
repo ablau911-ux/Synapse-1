@@ -6,11 +6,20 @@
   "fit_out": "results/fit.json",
   "results_md": "../../docs/clip-recorder-experiments-results.md",
   "results_csv": "results/results.csv",
-  "z_key_columns": ["folder", "way", "level", "layout", "mode", "tile", "wlog", "ldm", "dict", "workers", "kz", "theta", "drain", "frames_cap"],
+  "z_key_columns": ["folder", "way", "level", "layout", "mode", "tile", "gap", "wlog", "ldm", "dict", "workers", "kz", "theta", "drain", "frames_cap"],
   "d_key_columns": ["folder", "encoder", "q", "tau_f", "hint", "rate", "beta"],
   "text_scenarios": ["typing", "scroll", "ui"],
   "tolerance": { "bytes": 0.10, "cpu": 0.10, "ram": 0.10, "ram_dec": 0.10, "ssim": 0.005 },
   "dict_train_frames": 20,
+  "checks": {
+    "note": "Manager decision on #295 H6. Validity checks block a run from the fit and from J: a status not in ok_statuses (setting_refused, frame_map, ocr_error, error, not_activated), a validity_pass column at 0 (measurement rules M1 to M4 and M8), a missing repeat. Every other pass_* column is a known-result equation: a miss is reported per row and in the results, never blocking.",
+    "ok_statuses": ["ok"],
+    "validity_pass": {
+      "Z": ["pass_frames", "pass_bytes", "pass_bytesAll", "pass_inputFormat", "pass_cpuTotal", "pass_dictCpu", "pass_cpuCycles", "pass_ramOs", "pass_ldm", "pass_rectList"],
+      "D": ["pass_frames"]
+    }
+  },
+  "runlist_hash_columns": ["runlist_hash", "plan_hash", "list_hash"],
   "hold_out": { "share": 0.2, "seed": 20261122, "generator": "mulberry32" },
   "px0": 230400,
   "d_base": { "tau_f": "20", "hint": "1", "rate": "quality" },

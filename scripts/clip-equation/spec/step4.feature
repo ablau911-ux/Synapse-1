@@ -14,10 +14,35 @@ Feature: Every equation of the plan is fitted, and the held-out runs are predict
     Then each is dropped and out of the fit, and the failure counts are kept
     # Equation: eligible = every repeat ok and R read on every repeat of a text scenario | Known: 3 dropped, 4 failed runs, 3 blocked configurations
 
-  Scenario: #10 FULL only when the unique keys match both run plans
-    Given a Z run list and a D run plan with fixture rows: complete, a duplicate in place of a repeat, one D run missing, no D plan
+  Scenario: #10 M1 FULL only when the resolved keys match both run plans, without duplicates
+    Given a Z run list and a D run plan with fixture rows: complete; duplicates; a row with its cell id but other options; rows from two run lists; a D run missing; no D plan
     Then only the complete case is labeled FULL
-    # Equation: FULL = (unique Z keys = planned Z keys) and (unique D keys = planned D keys) | Known: FULL, not, not, not
+    # Equation: FULL = (resolved Z keys = planned Z keys) and (resolved D keys = planned D keys) and duplicates = 0 and one run list hash | Known: FULL, then not FULL in all 7 other cases
+
+  Scenario: H1 every option the runner keys on is in the configuration key (ZW9 gap)
+    Given ZW9 rows with merge gap 0, 1 and 2, three repeats each
+    Then they are three configurations of three repeats
+    # Equation: key columns = the CSV's option columns (before rep) and the configured list | Known: 3 x 3
+
+  Scenario: H2 bytes are every retained file for both ways; payload fits add the metadata
+    Given D rows with an MP4 payload and bytes_disk, and Z rows with frame_bytes and bytes_disk
+    Then bytes per minute come from bytes_disk for both ways, zeta from the Z payload, and D held-out bytes are judged on bytes_disk
+    # Equation: B_min = (payload * N_new / frames + metadata) * 60 / t | Known: within 1e-9
+
+  Scenario: H5 eligibility by requested configuration: every repeat present and ok
+    Given a requested configuration with one repeat refused (recorded under its actual q), one with a repeat missing, and a complete one
+    Then the first two are blocked, the refused repeat is listed under its actual settings, the complete one is eligible
+    # Equation: eligible(requested) = every repeat 1..R present with status ok | Known: blocked, listed, blocked, eligible
+
+  Scenario: H6 validity checks block, known-result misses are reported
+    Given D rows with pass_keyframes = 0 (#297), D rows with status ocr_error, and Z rows with pass_ramOs = 0
+    Then the keyframe miss is reported and the configuration stays eligible; the OCR error and the RAM-base breach block
+    # Equation: blocked = a validity check failed (fit-config checks.validity_*) | Known: eligible with a reported miss; blocked; blocked
+
+  Scenario: M2 predicted RAM from equation 4 at the target size, else pending
+    Given a predicted run list cell at a size with no run
+    Then its RAM is pending, never another size's M_cctx
+    # Equation: M_comp(target) = M_0 + M_cctx(L, W_eff(px)) + B_c * px * 3 (+ M_train) | Known: pending
 
   Scenario: #15 a non-text row passes O only where every text scenario passes at its q
     Given text scenarios with R = 1 at q 50 and typing R = 0.9 at q 60
@@ -39,10 +64,10 @@ Feature: Every equation of the plan is fitted, and the held-out runs are predict
     Then the held-out bytes are predicted from the fitted intercept
     # Equation: zeta(px) = zeta(px0) * (px / px0)^(eta - 1), one group per run list cell | Known: exact within 1e-6
 
-  Scenario: #18 D bytes: P and K apart, predicted with the requested GOP
-    Given D configurations made exactly from P = p * px * exp(a q), K = rho * P, with a GOP sweep at q 70 and hint-off rows
-    Then K/P and a_E are recovered and held-out configurations at tau_f 100 and 200 are predicted
-    # Equation: bytes = (n - n_key) * P + n_key * K, n_key = ceil(n / tau_f) | Known: within 1e-6
+  Scenario: #18 M5 D bytes: P and K apart, predicted only where a GOP sweep supports it
+    Given D configurations made exactly from P = p * px * exp(a q) and K = k * px * exp(b q) with b != a, hint-off rows, and GOP sweeps at q 70 only, then at q 50 and 70
+    Then with one sweep q 70 tau_f 100 is exact and q 50 tau_f 100 is pending; with two sweeps a_E and b_E are fitted apart and q 90 tau_f 200 is exact
+    # Equation: bytes = (n - n_key) * P + n_key * K, n_key = ceil(n / tau_f) | Known: within 1e-6; pending where no sweep supports
 
   Scenario: eq 4 fitted terms: mu and m_d0 from training rows
     Given ZW16 rows made with M_train = mu * S_samples and decoder rows with a fixed overhead m_d0, ZW16 1920x1080 held out

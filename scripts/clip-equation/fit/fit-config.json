@@ -2,6 +2,7 @@
   "note": "Tunables of fit/fit.mjs, fit/results.mjs and spec/step4.mjs, spec/step5.mjs. Spec: docs/clip-recorder-experiments-plan.md, 'How absolute and predictable is reached', 'Method', 'Equations'.",
   "corpus_root": "C:\\Users\\Adam\\clip-corpus",
   "runlist": "results/z-runlist.json",
+  "d_runlist": "results/d-runlist.json",
   "fit_out": "results/fit.json",
   "results_md": "../../docs/clip-recorder-experiments-results.md",
   "results_csv": "results/results.csv",

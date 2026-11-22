@@ -22,7 +22,33 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
 export const CONFIG = JSON.parse(fs.readFileSync(path.join(HERE, 'fit-config.json'), 'utf8'));
 
-const num = (v) => (v === undefined || v === '' ? NaN : Number(v));
+/** A CSV number; "inf", "infinity" and "∞" are Infinity (the probe's PSNR at MSE 0, plan M7). */
+const num = (v) => {
+  if (v === undefined || v === null || v === '') return NaN;
+  const s = String(v).trim().toLowerCase();
+  return ['inf', '+inf', 'infinity', '+infinity', '∞'].includes(s) ? Infinity : Number(s);
+};
+const MAX2 = 255 * 255;
+
+/** PSNR-Y of one run from the clip's total MSE (M7): the probe's MSE column when it writes one, else its global PSNR, else its mean PSNR. */
+function runPsnr(r) {
+  const mse = num(r.mse_y ?? r.mse_total ?? r.mse);
+  if (Number.isFinite(mse)) return mse === 0 ? Infinity : 10 * Math.log10(MAX2 / mse);
+  const g = num(r.psnr_global);
+  return Number.isNaN(g) ? num(r.psnr_mean) : g;
+}
+
+/** PSNR over the repeats through their mean MSE, so a repeat at MSE 0 (inf) is averaged, never dropped; inf is kept as "inf". */
+function meanPsnr(values) {
+  const mse = mean(values.map((p) => (p === Infinity ? 0 : MAX2 / 10 ** (p / 10))));
+  return mse === 0 ? 'inf' : 10 * Math.log10(MAX2 / mse);
+}
+
+/** R of one D run: a number, or "n/a" when the source text of the region was empty (M7). */
+const runR = (r) => (String(r.r ?? '').trim().toLowerCase() === 'n/a' ? 'n/a' : num(r.r));
+
+/** The size-validation group of a run list cell: its requested options without size (never the window the probe resolved from the frame size). */
+export const cellOptions = (cell) => JSON.stringify(Object.fromEntries(Object.entries(cell).filter(([k]) => !['id', 'size', 'cost_s', 'status'].includes(k)).sort(([a], [b]) => a.localeCompare(b))));
 const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
 const spread = (a) => (Math.max(...a) - Math.min(...a)) / 2;
 const stat = (a) => ({ mean: mean(a), spread: spread(a) });
@@ -162,19 +188,22 @@ function options(kind, r) {
 }
 
 /** One configuration of way Z: the repeats of one key. */
-function zConfiguration(key, rows, heldCells) {
+function zConfiguration(key, rows, list) {
   const r0 = rows[0];
   const t = clipSeconds(r0.folder);
   const frames = num(r0.frames);
   const nNew = corpusNNew(r0.folder);
   const scale = (nNew / frames) * 60 / t;
-  const error = rows.find((r) => r.error)?.error ?? '';
+  const failed = rows.filter((r) => r.error || (r.status !== undefined && r.status !== '' && r.status !== 'ok'));
+  const error = failed.length ? `${failed.length} of ${rows.length} repeats failed: ${failed[0].error || failed[0].status}` : '';
   const exact = rows.every((r) => r.diff_sum === '0' && num(r.frames_decoded) === num(r.frames));
-  const held = rows.some((r) => r.held_out === '1' || heldCells.has(String(r.cell)));
+  const held = rows.some((r) => r.held_out === '1' || list.heldCells.has(String(r.cell)));
   const kept = !error && exact;
   const px = num(r0.px);
+  const cell = list.cells.get(String(r0.cell ?? ''));
   return {
     kind: 'Z', key, cfg: cfgOf('Z', r0), way: r0.way, options: options('Z', r0), folder: r0.folder, content: contentOf(r0.folder), size: sizeOf(r0.folder),
+    group: `${cell ? `cell ${cellOptions(cell)}` : cfgOf('Z', r0)}|${contentOf(r0.folder)}`, cell: cell?.id ?? null, failed_runs: failed.length, eligible: kept,
     px, n_new: nNew, t_s: t, runs: rows.length, frames, capped: frames < nNew, status: error ? 'error' : 'ok',
     bytes_min: mean(rows.map((r) => num(r.bytes_out))) * scale,
     cpu_s_min: stat(rows.map((r) => ((num(r.comp_cpu_ns) + num(r.write_cpu_ns)) / 1e9) * scale)),
@@ -196,24 +225,37 @@ function zConfiguration(key, rows, heldCells) {
   };
 }
 
-/** One configuration of way D: the repeats of one key. */
+/**
+ * One configuration of way D: the repeats of one key. It is eligible (M10) only when every repeat
+ * succeeded (status ok; a refused setting, M5, is a status of its own) and, on a text scenario,
+ * every repeat read R; failed repeats are counted, never silently dropped.
+ */
 function dConfiguration(key, rows) {
   const r0 = rows[0];
   const t = clipSeconds(r0.folder);
-  const base = { kind: 'D', key, cfg: cfgOf('D', r0), way: r0.encoder, options: options('D', r0), folder: r0.folder, content: contentOf(r0.folder), size: sizeOf(r0.folder), runs: rows.length, t_s: t, n_new: num(r0.n_new), status: r0.status };
+  const text = CONFIG.text_scenarios.includes(r0.scenario);
+  const failed = rows.filter((r) => r.status !== 'ok');
+  const status = failed.length ? (failed[0].status || 'error') : 'ok';
+  const base = {
+    kind: 'D', key, cfg: cfgOf('D', r0), way: r0.encoder, options: options('D', r0), folder: r0.folder, content: contentOf(r0.folder), size: sizeOf(r0.folder),
+    runs: rows.length, failed_runs: failed.length, t_s: t, n_new: num(r0.n_new), status, text, px: num(r0.width) * num(r0.height), held_out: false, O: false,
+  };
   const ok = rows.filter((r) => r.status === 'ok');
-  if (!ok.length) return { ...base, px: num(r0.width) * num(r0.height), O: false, clause: `cannot run: ${r0.status}: ${r0.error}`, held_out: false, in_fit: false, text: false };
+  if (!ok.length) return { ...base, eligible: false, in_fit: false, clause: `cannot run: ${failed.length} of ${rows.length} repeats ${status}${failed[0].error ? `: ${failed[0].error}` : ''}` };
+  const rs = rows.map(runR);
+  const rNa = rs.every((v) => v === 'n/a');
+  const rMissing = text && !rNa ? rs.filter((v) => !Number.isFinite(v)).length : 0;
+  const rFinite = rs.filter((v) => Number.isFinite(v));
+  const eligible = !failed.length && !rMissing;
   const n = num(r0.n_new);
   const pxOut = num(r0.out_w) * num(r0.out_h);
-  const rs = ok.map((r) => num(r.r)).filter(Number.isFinite);
   return {
-    ...base, px: num(r0.width) * num(r0.height), px_out: pxOut, frames: num(r0.frames),
-    text: CONFIG.text_scenarios.includes(r0.scenario),
+    ...base, px_out: pxOut, frames: num(r0.frames), eligible, in_fit: eligible,
+    clause: failed.length ? `${failed.length} of ${rows.length} repeats failed: ${status}${failed[0].error ? `: ${failed[0].error}` : ''}` : rMissing ? `R not read on ${rMissing} of ${rows.length} repeats` : '',
     bytes_min: mean(ok.map((r) => num(r.bytes))) * 60 / t,
     cpu_s_min: stat(ok.map((r) => ((num(r.a_rt_ns) + num(r.a_w_ns)) / 1e9) * 60 / t)),
     ram_peak: stat(ok.map((r) => num(r.m_live) + num(r.m_worker))),
-    ssim: mean(ok.map((r) => num(r.ssim_mean))), psnr: mean(ok.map((r) => num(r.psnr_mean))), r: rs.length ? Math.min(...rs) : NaN,
-    held_out: false, in_fit: true,
+    ssim: mean(ok.map((r) => num(r.ssim_mean))), psnr: meanPsnr(ok.map(runPsnr)), r: rNa ? 'n/a' : rFinite.length ? Math.min(...rFinite) : NaN,
     fit: {
       bytes: stat(ok.map((r) => num(r.bytes))), y_bytes: mean(ok.map((r) => num(r.bytes))) / (n * pxOut),
       ssim: stat(ok.map((r) => num(r.ssim_mean))),
@@ -227,10 +269,10 @@ function dConfiguration(key, rows) {
 
 const qminGroup = (c) => `${c.way} ${c.size} tau${c.options.tau_f ?? ''} hint${c.options.hint ?? ''} ${c.options.rate ?? ''} beta${c.options.beta ?? ''}`;
 
-/** q_min(E, px): the lowest q with R = 1 on every text scenario; "not reached" when every q misses. */
+/** q_min(E, px): the lowest q with R = 1 on every text scenario, from training rows only (M10); "not reached" when every q misses. */
 function qMin(dConfigs) {
   const groups = new Map();
-  for (const c of dConfigs.filter((x) => x.status === 'ok' && x.text)) {
+  for (const c of dConfigs.filter((x) => x.in_fit && x.text && typeof x.r === 'number')) {
     const byQ = groups.get(qminGroup(c)) ?? new Map();
     byQ.set(c.options.q, (byQ.get(c.options.q) ?? new Map()).set(c.content, c.r));
     groups.set(qminGroup(c), byQ);
@@ -244,23 +286,38 @@ function qMin(dConfigs) {
   return out;
 }
 
-/** O for D: own R = 1 on a text scenario; q >= q_min(E, px) on the others. */
-function applyDTarget(dConfigs, qmin) {
-  for (const c of dConfigs.filter((x) => x.status === 'ok')) {
-    if (c.text) {
+/**
+ * O for D at the q actually run (M7): a text scenario with R read passes on its own R = 1; any other
+ * row (non-text, or text with R n/a) passes only when every text scenario with R read at the same
+ * E, size, options and q is eligible with R = 1. q_min is reported, never used for O.
+ */
+function applyDTarget(dConfigs) {
+  const textAt = new Map();
+  for (const c of dConfigs.filter((x) => x.text)) {
+    const k = `${qminGroup(c)}|q${c.options.q}`;
+    textAt.set(k, (textAt.get(k) ?? new Map()).set(c.content, c));
+  }
+  const rText = (r) => (Number.isFinite(r) ? r.toFixed(4) : 'not read');
+  for (const c of dConfigs.filter((x) => x.eligible)) {
+    if (c.text && c.r !== 'n/a') {
       c.O = c.r === 1;
-      c.clause = c.O ? '' : `R = ${Number.isFinite(c.r) ? c.r.toFixed(4) : 'not read'} < 1`;
-    } else {
-      const q = qmin[qminGroup(c)];
-      c.O = typeof q === 'number' && Number(c.options.q) >= q;
-      c.clause = c.O ? '' : typeof q === 'number' ? `q ${c.options.q} < q_min ${q}` : `q_min(E, px) ${q ?? 'pending: full run (no text scenario run)'}`;
+      c.clause = c.O ? '' : `R = ${rText(c.r)} < 1`;
+      continue;
     }
+    const cell = textAt.get(`${qminGroup(c)}|q${c.options.q}`) ?? new Map();
+    const used = CONFIG.text_scenarios.filter((s) => cell.get(s)?.r !== 'n/a');
+    const bad = used.filter((s) => !(cell.get(s)?.eligible && cell.get(s)?.r === 1));
+    const missing = bad.filter((s) => !cell.has(s));
+    c.O = used.length > 0 && bad.length === 0;
+    if (!used.length) { c.clause = `text at q ${c.options.q}: R n/a on every text scenario`; continue; }
+    c.clause = c.O ? '' : `text at q ${c.options.q}: ${bad.map((s) => (missing.includes(s) ? `${s} not run` : !cell.get(s).eligible ? `${s} not eligible` : `${s} R = ${rText(cell.get(s).r)}`)).join(', ')}`;
   }
 }
 
 // ---------- equations ----------
 
-const zGroup = (c) => `${c.cfg}|${c.content}`;
+/** The group that shares zeta(px0) and kappa_c across sizes: the run list cell (#17), else the key without the folder; plus the content. */
+const zGroup = (c) => c.group;
 
 function fitZ(z) {
   const fitSet = z.filter((c) => c.in_fit);
@@ -288,8 +345,8 @@ function fitZ(z) {
   const c0 = Object.fromEntries(modes.filter((m) => cpuFits[m].identifiable).map((m) => [m, cpuFits[m].c0]));
   const kappaD = {};
   for (const c of fitSet) (kappaD[`L${c.options.level}|${c.options.mode}`] ??= []).push(c.fit.dec_ns_per_px_frame);
-  const ramRel = z.flatMap((c) => c.fit.ram_rel);
-  const ramDecRel = z.flatMap((c) => c.fit.ram_dec_rel);
+  const ramRel = fitSet.flatMap((c) => c.fit.ram_rel);
+  const ramDecRel = fitSet.flatMap((c) => c.fit.ram_dec_rel);
   const tol = CONFIG.tolerance.ram;
   return {
     fits: { zetaFits, cpuFits },
@@ -315,9 +372,9 @@ function fitZ(z) {
       pending: Object.keys(c0).length ? [] : [{ part: 'c_0', reason: 'every configuration ran at one size, so c_0 and px * kappa_c are not separable; kappa_c = C / (N_new * px)' }],
     },
     eq4_z_ram: {
-      title: 'Z RAM', equation: 'M_comp = M_0 + M_cctx(L, W) + B_c * px * 3; M_dec = M_0 + M_dctx(W) + B_d * px * 3', fit_n: z.length,
+      title: 'Z RAM', equation: 'M_comp = M_0 + M_cctx(L, W) + B_c * px * 3; M_dec = M_0 + M_dctx(W) + B_d * px * 3', fit_n: fitSet.length,
       coefficients: {
-        M_0_bytes: mean(z.map((c) => c.fit.m0)),
+        M_0_bytes: mean(fitSet.map((c) => c.fit.m0)),
         share_within_10pct_comp: ramRel.filter((v) => Math.abs(v) <= tol).length / ramRel.length,
         share_within_10pct_dec: ramDecRel.filter((v) => Math.abs(v) <= tol).length / ramDecRel.length,
       },
@@ -330,35 +387,83 @@ function fitZ(z) {
   };
 }
 
+/**
+ * Equation 7 bytes (#18), on base hint and rate only (other factors fixed):
+ * 1. K and P apart per (E, folder, q) where tau_f varies: bytes = (n - n_key) * P + n_key * K, least squares.
+ * 2. K/P per (E, content) from those splits; P across q: ln(bytes / (px_out * ((n - n_key) + n_key * K/P))) = ln p_E,c + a_E * q.
+ *    Without a split for every content of E, P is fitted at the base tau_f with K folded in and predicts that tau_f only.
+ * The prediction uses the requested GOP: n_key = ceil(n_new / tau_f).
+ */
+export function fitDBytes(configs) {
+  const baseTau = CONFIG.d_base.tau_f;
+  const set = configs.filter((c) => c.in_fit && c.eligible !== false && c.options.hint === CONFIG.d_base.hint && c.options.rate === CONFIG.d_base.rate);
+  const g = (c) => `${c.way}|${c.content}`;
+  const sweep = new Map();
+  for (const c of set) sweep.set(`${c.way}|${c.folder}|q${c.options.q}`, [...(sweep.get(`${c.way}|${c.folder}|q${c.options.q}`) ?? []), c]);
+  const split = {};
+  const ratios = new Map();
+  for (const [k, s] of sweep) {
+    if (new Set(s.map((c) => c.options.tau_f)).size < 2) continue;
+    const f = leastSquares(s.map((c) => [c.n_new - c.fit.keyframes, c.fit.keyframes]), s.map((c) => c.fit.bytes.mean));
+    if (!f.rankOk) continue;
+    split[k] = { P_bytes: f.beta[0], K_bytes: f.beta[1], K_over_P: f.beta[1] / f.beta[0] };
+    ratios.set(g(s[0]), [...(ratios.get(g(s[0])) ?? []), f.beta[1] / f.beta[0]]);
+  }
+  const rho = new Map([...ratios].map(([k, v]) => [k, mean(v)]));
+  const coefficients = { a_E: {}, p_E_c: {}, K_over_P: {}, ...(Object.keys(split).length ? { P_K_split: split } : {}) };
+  const fits = {};
+  const res = [];
+  const pending = [];
+  let fitN = 0;
+  for (const e of new Set(set.map((c) => c.way))) {
+    const mine = set.filter((c) => c.way === e);
+    const withK = mine.every((c) => rho.has(g(c)));
+    const use = withK ? mine : mine.filter((c) => c.options.tau_f === baseTau);
+    const frames = (c, nk) => (c.n_new - nk) + nk * (withK ? rho.get(g(c)) : 1);
+    const f = fitSharedSlope(use.map((c) => ({ g: g(c), x: Number(c.options.q), y: Math.log(c.fit.bytes.mean / (c.px_out * frames(c, c.fit.keyframes))) })));
+    fits[e] = { f, withK };
+    fitN += use.length;
+    if (f.identifiable) {
+      coefficients.a_E[e] = f.slope;
+      coefficients.p_E_c[e] = Object.fromEntries(Object.entries(f.intercept).map(([k, v]) => [k.split('|')[1], Math.exp(v)]));
+      res.push(...f.residuals.map((r) => Math.exp(r) - 1));
+    }
+    if (withK) coefficients.K_over_P[e] = Object.fromEntries([...rho].filter(([k]) => k.startsWith(`${e}|`)).map(([k, v]) => [k.split('|')[1], v]));
+    else pending.push({ part: `K/P (${e})`, reason: `no GOP sweep for ${e} on every content: P fitted at tau_f ${baseTau} with K folded in, so only tau_f ${baseTau} is predicted` });
+  }
+  const predict = (c) => {
+    const m = fits[c.way];
+    if (!m?.f.identifiable || c.options.hint !== CONFIG.d_base.hint || c.options.rate !== CONFIG.d_base.rate) return NaN;
+    const lp = m.f.intercept[g(c)];
+    if (!Number.isFinite(lp)) return NaN;
+    const P = Math.exp(lp + m.f.slope * Number(c.options.q)) * c.px_out;
+    if (!m.withK) return c.options.tau_f === baseTau ? P * c.n_new : NaN;
+    const nk = Math.ceil(c.n_new / Number(c.options.tau_f));
+    return (c.n_new - nk) * P + nk * rho.get(g(c)) * P;
+  };
+  return { coefficients, res, pending, predict, fit_n: fitN };
+}
+
 function fitD(d, zFits, z) {
   const fitSet = d.filter((c) => c.in_fit && c.status === 'ok');
   const base = fitSet.filter((c) => c.options.tau_f === CONFIG.d_base.tau_f && c.options.hint === CONFIG.d_base.hint && c.options.rate === CONFIG.d_base.rate);
   const encoders = [...new Set(base.map((c) => c.way))];
   const g = (c) => `${c.way}|${c.content}`;
-  const bytes = {};
   const ssim = {};
   const psnr = {};
-  const res = { bytes: [], ssim: [], psnr: [] };
+  const res = { ssim: [], psnr: [] };
+  const finitePsnr = (c) => typeof c.psnr === 'number' && Number.isFinite(c.psnr);
   for (const e of encoders) {
     const set = base.filter((c) => c.way === e);
-    bytes[e] = fitSharedSlope(set.map((c) => ({ g: g(c), x: Number(c.options.q), y: Math.log(c.fit.y_bytes) })));
     ssim[e] = fitSharedSlope(set.filter((c) => c.ssim < 1).map((c) => ({ g: g(c), x: Number(c.options.q), y: Math.log(1 - c.ssim) })));
-    psnr[e] = fitSharedSlope(set.map((c) => ({ g: g(c), x: Number(c.options.q), y: c.psnr })));
-    res.bytes.push(...bytes[e].residuals.map((r) => Math.exp(r) - 1));
+    psnr[e] = fitSharedSlope(set.filter(finitePsnr).map((c) => ({ g: g(c), x: Number(c.options.q), y: c.psnr })));
     for (const c of set) {
       if (ssim[e].identifiable && c.ssim < 1) res.ssim.push(Math.abs(1 - Math.exp(ssim[e].intercept[g(c)] + ssim[e].slope * Number(c.options.q)) - c.ssim));
-      if (psnr[e].identifiable) res.psnr.push((psnr[e].intercept[g(c)] + psnr[e].slope * Number(c.options.q) - c.psnr) / c.psnr);
+      if (psnr[e].identifiable && finitePsnr(c)) res.psnr.push((psnr[e].intercept[g(c)] + psnr[e].slope * Number(c.options.q) - c.psnr) / c.psnr);
     }
   }
-  // K and P apart: groups (E, folder, q) with two tau_f or more.
-  const sweep = new Map();
-  for (const c of fitSet.filter((x) => x.options.rate === 'quality')) sweep.set(`${c.way}|${c.folder}|q${c.options.q}`, [...(sweep.get(`${c.way}|${c.folder}|q${c.options.q}`) ?? []), c]);
-  const kp = {};
-  for (const [k, set] of sweep) {
-    if (new Set(set.map((c) => c.options.tau_f)).size < 2) continue;
-    const f = leastSquares(set.map((c) => [c.n_new - c.fit.keyframes, c.fit.keyframes]), set.map((c) => c.fit.bytes.mean));
-    if (f.rankOk) kp[k] = { P_bytes: f.beta[0], K_bytes: f.beta[1], K_over_P: f.beta[1] / f.beta[0] };
-  }
+  const psnrInf = base.filter((c) => c.psnr === 'inf').length;
+  const bytesModel = fitDBytes(fitSet);
   // CPU: a_rt / N = c_file + c_comp * px; a_w / N = e0 + A * px_out + B * px_out * q (A = c_dec + c_conv + e1, B = e1 * e2).
   const pxs = new Set(fitSet.map((c) => c.px));
   const onePx = pxs.size < 2;
@@ -421,17 +526,15 @@ function fitD(d, zFits, z) {
   const coef = (fits, slopeName, interceptName, map = (v) => v, slopeMap = (v) => v) => Object.fromEntries(Object.entries(fits).filter(([, f]) => f.identifiable)
     .map(([e, f]) => [e, { [slopeName]: slopeMap(f.slope), [interceptName]: Object.fromEntries(Object.entries(f.intercept).map(([k, v]) => [k.split('|')[1], map(v)])) }]));
   return {
-    fits: { bytes, ssim, psnr, cpu, ram, kp },
+    fits: { bytesModel, ssim, psnr, cpu, ram },
     eq7_d_bytes: {
-      title: 'D bytes', equation: 'bytes_D = t * (n_new * P + (n_new / tau_f) * (K - P)); P = p_E,c * px * exp(a_E * q) (fitted at tau_f 20 with K folded in)', fit_n: base.length,
-      coefficients: { P_at_tau20: coef(bytes, 'a_E', 'p_E,c', Math.exp), ...(Object.keys(kp).length ? { K_and_P: kp } : {}) },
-      residuals: residualStats(res.bytes),
-      pending: Object.keys(kp).length ? [] : [{ part: 'K/P', reason: 'no tau_f sweep in the input (grid B, D3)' }],
+      title: 'D bytes', equation: 'bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); P = p_E,c * px * exp(a_E * q); K = (K/P)_E,c * P, K/P from a GOP sweep at one q with every other factor fixed', fit_n: bytesModel.fit_n,
+      coefficients: bytesModel.coefficients, residuals: residualStats(bytesModel.res), pending: bytesModel.pending,
     },
     eq7_d_quality: {
       title: 'D quality', equation: 'Q_ssim = 1 - s_E,c * exp(-g_E * q); Q_psnr = m_E,c + l_E * q', fit_n: base.length,
       coefficients: { Q_ssim: coef(ssim, 'g_E', 's_E,c', Math.exp, (s) => -s), Q_psnr: coef(psnr, 'l_E', 'm_E,c') },
-      residuals: { ...residualStats(res.psnr), max_abs_ssim: res.ssim.length ? Math.max(...res.ssim) : 0, note: 'max_abs_rel and rms_rel are of PSNR; max_abs_ssim is the SSIM error' },
+      residuals: { ...residualStats(res.psnr), max_abs_ssim: res.ssim.length ? Math.max(...res.ssim) : 0, note: `max_abs_rel and rms_rel are of PSNR; max_abs_ssim is the SSIM error; ${psnrInf} configuration(s) with PSNR inf (MSE 0) are outside the PSNR line` },
       pending: [],
     },
     eq7_d_cpu: {
@@ -472,9 +575,8 @@ function validateD(d, dFits) {
   const g = (c) => `${c.way}|${c.content}`;
   return d.filter((c) => c.held_out).flatMap((c) => {
     const q = Number(c.options.q);
-    const b = dFits.bytes[c.way];
     const s = dFits.ssim[c.way];
-    const bytes = b?.identifiable && Number.isFinite(b.intercept[g(c)]) ? Math.exp(b.intercept[g(c)] + b.slope * q) * c.px_out * c.n_new : NaN;
+    const bytes = dFits.bytesModel.predict(c);
     const ssim = s?.identifiable && Number.isFinite(s.intercept[g(c)]) ? 1 - Math.exp(s.intercept[g(c)] + s.slope * q) : NaN;
     const cpu = (dFits.cpu.predict.a_rt(c) + dFits.cpu.predict.a_w(c)) * c.n_new;
     const ram = dFits.ram.predict.live(c) + dFits.ram.predict.worker(c);
@@ -493,49 +595,126 @@ function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
   const list = (v) => (v ? v.split(',').map((p) => path.resolve(p)) : []);
-  return { z: list(args.z), d: list(args.d), runlist: path.resolve(BASE, args.runlist ?? CONFIG.runlist), out: path.resolve(BASE, args.out ?? CONFIG.fit_out) };
+  return { z: list(args.z), d: list(args.d), runlist: path.resolve(BASE, args.runlist ?? CONFIG.runlist), druns: path.resolve(BASE, args.druns ?? CONFIG.d_runlist), out: path.resolve(BASE, args.out ?? CONFIG.fit_out) };
 }
 
-export function buildFit({ z: zPaths, d: dPaths, runlist: runlistPath }) {
-  const read = (paths) => paths.map((p) => ({ path: p, rows: readRuns(p).rows }));
-  const zIn = read(zPaths);
-  const dIn = read(dPaths);
-  const runlist = fs.existsSync(runlistPath) ? JSON.parse(fs.readFileSync(runlistPath, 'utf8')) : { cells: [], counts: {} };
-  const heldCells = new Set(runlist.cells.filter((c) => c.status === 'held-out').map((c) => String(c.id)));
-  const z = [...groupRows('Z', zIn.flatMap((i) => i.rows))].map(([k, rows]) => zConfiguration(k, rows, heldCells));
-  const d = [...groupRows('D', dIn.flatMap((i) => i.rows))].map(([k, rows]) => dConfiguration(k, rows));
-  const qmin = qMin(d);
-  applyDTarget(d, qmin);
-  const eligible = d.filter((c) => c.status === 'ok' && c.options.tau_f === CONFIG.d_base.tau_f && c.options.hint === CONFIG.d_base.hint && c.options.rate === CONFIG.d_base.rate).map((c) => c.key);
+/**
+ * FULL only when the unique run keys match both run plans (#10): Z = (run list cell, folder, repeat)
+ * of every cell that runs, D = (D key columns, repeat) of the D run plan. Duplicates never fill a gap.
+ */
+export function fitLabel({ pilot, zRows, dRows, runlist, dRunlist }) {
+  if (pilot) return { label: 'PILOT, not final', coverage: null };
+  const zPlanned = new Set((runlist?.cells ?? []).filter((c) => c.status === 'run' || c.status === 'held-out')
+    .flatMap((c) => (runlist.contents ?? []).flatMap((s) => Array.from({ length: runlist.repeats ?? 0 }, (_, i) => `${c.id}|${s}-${c.size}|${i + 1}`))));
+  const dCols = [...CONFIG.d_key_columns, 'repeat'];
+  const dPlanned = dRunlist ? new Set((dRunlist.runs ?? []).map((r) => dCols.map((k) => String(r[k] ?? '')).join('|'))) : null;
+  const side = (planned, rows, key) => {
+    const found = new Map();
+    for (const r of rows) found.set(key(r), (found.get(key(r)) ?? 0) + 1);
+    return {
+      planned: planned ? planned.size : null, unique: found.size, duplicates: [...found.values()].reduce((s, n) => s + n - 1, 0),
+      missing: planned ? [...planned].filter((k) => !found.has(k)).length : null, unplanned: planned ? [...found.keys()].filter((k) => !planned.has(k)).length : null,
+    };
+  };
+  const z = side(zPlanned, zRows, (r) => `${r.cell ?? ''}|${r.folder}|${r.rep}`);
+  const d = side(dPlanned, dRows, (r) => dCols.map((k) => String(r[k] ?? '')).join('|'));
+  const complete = (s) => s.planned > 0 && s.missing === 0 && s.unplanned === 0;
+  return { label: complete(z) && complete(d) ? 'FULL' : 'INCOMPLETE full run, not final', coverage: { z, d, d_plan: dPlanned ? 'given' : 'none' } };
+}
+
+/**
+ * The run list cells marked predicted (#20), one row per content, from the fitted size models of
+ * their group: bytes (eq. 1), compress CPU (eq. 3) and RAM above M_0 (eq. 4), with the relative rms
+ * residual of each equation as uncertainty. A cell whose every content is pending is one row.
+ */
+function predictCells(runlist, z, zf) {
+  const contents = runlist.contents ?? [];
+  const unc = { bytes: zf.eq1_z_bytes.residuals?.rms_rel, cpu: zf.eq3_z_cpu.residuals?.rms_rel, ram: zf.eq4_z_ram.residuals?.rms_rel };
+  const rows = [];
+  for (const cell of runlist.cells.filter((c) => c.status === 'predicted')) {
+    const px = cell.size.split('x').map(Number).reduce((a, b) => a * b, 1);
+    const head = { cell: cell.id, way: cell.way, options: cellOptions(cell), size: cell.size, px };
+    const per = contents.map((content) => {
+      const group = `cell ${head.options}|${content}`;
+      const sample = z.find((c) => c.group === group && c.in_fit);
+      if (!sample) return { content, status: 'pending: no run of this cell at another size' };
+      const zfit = zf.fits.zetaFits[sample.options.mode ?? ''];
+      const kfit = zf.fits.cpuFits[sample.options.mode ?? ''];
+      const lz = zfit?.identifiable ? zfit.intercept[group] : NaN;
+      if (!Number.isFinite(lz)) return { content, status: 'pending: eta needs two sizes in the fit' };
+      const folder = `${content}-${cell.size}`;
+      let perMin = NaN;
+      try { perMin = (corpusNNew(folder) * 60) / clipSeconds(folder); } catch { perMin = NaN; }
+      const bpf = Math.exp(lz + zfit.slope * Math.log(px / CONFIG.px0)) * px * 3;
+      const cpf = kfit?.identifiable && Number.isFinite(kfit.slope[group]) ? kfit.c0 + kfit.slope[group] * px : NaN;
+      return {
+        content, status: 'predicted', bytes_per_frame: bpf, bytes_min: bpf * perMin, bytes_rel_unc: unc.bytes,
+        cpu_ns_per_frame: cpf, cpu_s_min: (cpf * perMin) / 1e9, cpu_rel_unc: unc.cpu, ram: sample.fit.m_cctx + sample.fit.bc * px * 3, ram_rel_unc: unc.ram,
+      };
+    });
+    if (per.length && per.every((p) => p.status !== 'predicted' && p.status === per[0].status)) rows.push({ ...head, content: 'all', folder: `*-${cell.size}`, status: per[0].status });
+    else for (const p of per) rows.push({ ...head, folder: `${p.content}-${cell.size}`, ...p });
+  }
+  return { contents, uncertainty: 'relative rms residual of the fitted equation: eq. 1 bytes, eq. 3 CPU, eq. 4 RAM', note: 'CPU is compress CPU only (eq. 3); RAM is above M_0', rows };
+}
+
+/** The fit from CSV rows: splits first, then the fits on training rows only, then validation (M10). */
+export function buildFitFromRows({ zRows = [], dRows = [], runlist = { cells: [], contents: [] }, dRunlist = null, pilot = false, inputs = null }) {
+  const list = { heldCells: new Set(runlist.cells.filter((c) => c.status === 'held-out').map((c) => String(c.id))), cells: new Map(runlist.cells.map((c) => [String(c.id), c])) };
+  const z = [...groupRows('Z', zRows)].map(([k, rows]) => zConfiguration(k, rows, list));
+  const d = [...groupRows('D', dRows)].map(([k, rows]) => dConfiguration(k, rows));
+  const eligible = d.filter((c) => c.eligible && c.options.tau_f === CONFIG.d_base.tau_f && c.options.hint === CONFIG.d_base.hint && c.options.rate === CONFIG.d_base.rate).map((c) => c.key);
   const heldD = drawHoldOut(eligible);
   for (const c of d) if (heldD.includes(c.key)) { c.held_out = true; c.in_fit = false; }
+  const qmin = qMin(d);
+  applyDTarget(d);
   const zf = fitZ(z);
   const df = fitD(d, zf.fits, z);
-  const zRows = zIn.reduce((s, i) => s + i.rows.length, 0);
-  const pilot = [...zPaths, ...dPaths].some((p) => /pilot/i.test(path.basename(p)));
-  const label = pilot ? 'PILOT, not final' : zRows < (runlist.counts?.runs ?? 0) ? 'INCOMPLETE full run, not final' : 'FULL';
-  const { fits: _zf, ...zEquations } = zf;
+  const { label, coverage } = fitLabel({ pilot, zRows, dRows, runlist, dRunlist });
+  const zFailed = zRows.filter((r) => r.error || (r.status !== undefined && r.status !== '' && r.status !== 'ok')).length;
+  const { fits: zFits, ...zEquations } = zf;
   const { fits: _df, ...dEquations } = df;
+  const models = {
+    z_bytes: Object.fromEntries(Object.entries(zFits.zetaFits).map(([m, f]) => [m, { identifiable: f.identifiable, eta: f.identifiable ? f.slope + 1 : null, ln_zeta_px0: f.intercept, px0: CONFIG.px0 }])),
+    z_cpu: Object.fromEntries(Object.entries(zFits.cpuFits).map(([m, f]) => [m, { identifiable: f.identifiable, c0_ns: f.c0, kappa_ns_per_px: f.slope }])),
+    d_bytes: df.eq7_d_bytes.coefficients,
+  };
   return {
-    created: new Date().toISOString(), label,
-    inputs: { z: zIn.map((i) => ({ path: i.path, rows: i.rows.length })), d: dIn.map((i) => ({ path: i.path, rows: i.rows.length })), runlist: runlistPath, corpus_root: CONFIG.corpus_root },
-    config: CONFIG,
-    configurations: [...z, ...d],
+    created: new Date().toISOString(), label, coverage,
+    failures: {
+      z: { runs_failed: zFailed, configs_blocked: z.filter((c) => !c.eligible).length },
+      d: { runs_failed: dRows.filter((r) => r.status !== 'ok').length, configs_blocked: d.filter((c) => !c.eligible).length },
+    },
+    inputs, config: CONFIG, configurations: [...z, ...d], models,
+    predicted: predictCells(runlist, z, zf),
     equations: {
       ...zEquations,
       eq6_run_time: {
-        title: 'run time', equation: 'T = sum over runs of N_new * px * 3 / v(L, m) * repeats', fit_n: zRows,
-        coefficients: { T_total_h: runlist.T_total_h ?? NaN, runs_planned: runlist.counts?.runs ?? 0, T_measured_h: zIn.flatMap((i) => i.rows).reduce((s, r) => s + num(r.run_wall_ms), 0) / 3.6e6 },
-        residuals: null, pending: zRows >= (runlist.counts?.runs ?? 0) ? [] : [{ part: 'T', reason: `${zRows} of ${runlist.counts?.runs} planned Z runs` }],
+        title: 'run time', equation: 'T = sum over runs of N_new * px * 3 / v(L, m) * repeats', fit_n: zRows.length,
+        coefficients: { T_total_h: runlist.T_total_h ?? NaN, runs_planned: runlist.counts?.runs ?? 0, T_measured_h: zRows.reduce((s, r) => s + num(r.run_wall_ms), 0) / 3.6e6 },
+        residuals: null, pending: zRows.length >= (runlist.counts?.runs ?? 0) ? [] : [{ part: 'T', reason: `${zRows.length} of ${runlist.counts?.runs} planned Z runs` }],
       },
       ...dEquations,
-      eq7_d_qmin: { title: 'D q_min', equation: 'q_min(E, px) = min { q : R = 1 on every text scenario }', fit_n: d.length, coefficients: qmin, residuals: null, pending: [] },
+      eq7_d_qmin: { title: 'D q_min', equation: 'q_min(E, px) = min { q : R = 1 on every text scenario } (training rows; reported, O is judged at the q run)', fit_n: d.filter((c) => c.in_fit && c.text).length, coefficients: qmin, residuals: null, pending: [] },
     },
     validation: {
-      z: { runlist_held_out: heldCells.size, held_out_keys: z.filter((c) => c.held_out).map((c) => c.key), rows: validateZ(z, zf.fits) },
+      z: { runlist_held_out: list.heldCells.size, held_out_keys: z.filter((c) => c.held_out).map((c) => c.key), rows: validateZ(z, zf.fits) },
       d: { generator: 'mulberry32', seed: CONFIG.hold_out.seed, share: CONFIG.hold_out.share, eligible: eligible.length, held_out_keys: heldD, rows: validateD(d, df.fits) },
     },
   };
+}
+
+export function buildFit({ z: zPaths, d: dPaths, runlist: runlistPath, druns: dRunlistPath }) {
+  const read = (paths) => paths.map((p) => ({ path: p, rows: readRuns(p).rows }));
+  const zIn = read(zPaths);
+  const dIn = read(dPaths);
+  const json = (p) => (p && fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null);
+  const runlist = json(runlistPath) ?? { cells: [], counts: {}, contents: [] };
+  const pilot = [...zPaths, ...dPaths].some((p) => /pilot/i.test(path.basename(p)));
+  return buildFitFromRows({
+    zRows: zIn.flatMap((i) => i.rows), dRows: dIn.flatMap((i) => i.rows), runlist, dRunlist: json(dRunlistPath), pilot,
+    inputs: { z: zIn.map((i) => ({ path: i.path, rows: i.rows.length })), d: dIn.map((i) => ({ path: i.path, rows: i.rows.length })), runlist: runlistPath, d_runlist: dRunlistPath, corpus_root: CONFIG.corpus_root },
+  });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

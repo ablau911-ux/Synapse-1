@@ -26,8 +26,9 @@ const LOCK_SUFFIX: &str = ".lock";
 const RECORDER_LOCK_FILE: &str = "recorder.lock";
 const TEMP_SUFFIX: &str = ".tmp";
 const PART_SUFFIX: &str = ".part";
-/// A rename of `clip.json` or of a segment `.part` file is tried this many
-/// times in all while another program holds the file for a moment.
+/// A rename of `clip.json`, a segment `.part` file or a waiting frame is
+/// tried this many times in all while another program holds the file for a
+/// moment.
 const RENAME_ATTEMPTS: u32 = 5;
 /// The sleep between two rename attempts.
 const RENAME_RETRY_SLEEP_MS: u64 = 100;
@@ -125,7 +126,7 @@ impl WaitingFrameWriter {
         let temp = path.with_extension(format!("{WAITING_FRAME_EXTENSION}{TEMP_SUFFIX}"));
         std::fs::write(&temp, &self.compressed)
             .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
-        std::fs::rename(&temp, &path)
+        rename_retrying(&temp, &path)
             .map_err(|error| format!("could not rename {}: {error}", temp.display()))?;
         Ok(self.compressed.len() as u64)
     }

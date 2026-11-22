@@ -11,8 +11,10 @@
 //!   `desktop_worker` (F6, F10): no hidden desktop, no window, no 10 s wait.
 //! - `ClipWorker` runs in the child process: B1, B2, B8 and B9.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::clip_folder::{
     BReport, ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, RecorderLock,
@@ -43,16 +45,24 @@ const WORKER_LOCK_FILE: &str = "worker.lock";
 /// frames once).
 const NO_PROGRESS_CRASH_LIMIT: u32 = 2;
 
+/// The worker cap leaves room for the largest live share of this many recent
+/// seconds, so a jump in the live share does not push the sum past the limit.
+const CAP_SHARE_WINDOW_SECONDS: usize = 3;
+
 /// The live share and the worker cap, in percent of the whole machine.
 pub(super) struct ProcessorBudget {
     live_share_bits: AtomicU64,
     worker_cap_bits: AtomicU64,
+    /// The live shares of the last `CAP_SHARE_WINDOW_SECONDS` seconds,
+    /// newest last.
+    recent_shares: Mutex<VecDeque<f64>>,
 }
 
 static BUDGET: ProcessorBudget = ProcessorBudget {
     live_share_bits: AtomicU64::new(0),
     // 10.0_f64 as bits: the whole limit while nothing is recorded.
     worker_cap_bits: AtomicU64::new(0x4024_0000_0000_0000),
+    recent_shares: Mutex::new(VecDeque::new()),
 };
 
 impl ProcessorBudget {
@@ -61,10 +71,19 @@ impl ProcessorBudget {
     }
 
     /// Records the live part's share of the last second; the worker's cap
-    /// becomes `CPU_LIMIT_PERCENT` minus it (never below zero). Returns the cap.
+    /// becomes `CPU_LIMIT_PERCENT` minus the largest share of the last
+    /// `CAP_SHARE_WINDOW_SECONDS` seconds (never below zero). Returns the cap.
     pub(super) fn set_live_share(&self, percent: f64) -> f64 {
         let share = percent.max(0.0);
-        let cap = (CPU_LIMIT_PERCENT - share).max(0.0);
+        let largest = {
+            let mut recent = self.recent_shares();
+            recent.push_back(share);
+            while recent.len() > CAP_SHARE_WINDOW_SECONDS {
+                recent.pop_front();
+            }
+            recent.iter().copied().fold(0.0, f64::max)
+        };
+        let cap = (CPU_LIMIT_PERCENT - largest).max(0.0);
         self.live_share_bits
             .store(share.to_bits(), Ordering::Relaxed);
         self.worker_cap_bits.store(cap.to_bits(), Ordering::Relaxed);
@@ -73,7 +92,14 @@ impl ProcessorBudget {
 
     /// The live part ended: the worker may use the whole limit again.
     pub(super) fn clear_live_share(&self) {
+        self.recent_shares().clear();
         self.set_live_share(0.0);
+    }
+
+    fn recent_shares(&self) -> MutexGuard<'_, VecDeque<f64>> {
+        self.recent_shares
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(super) fn live_share(&self) -> f64 {

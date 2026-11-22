@@ -4,12 +4,18 @@
   Plays a fixed schedule of ordinary UI events, by time from the schedule start:
     ?start=<unix ms>  the schedule start (wall clock); without it, 3 s after the page loads.
   The schedule is printed on the page (static text) and exposed as window.schedule:
-  [{ id, t_ms, name, expect, until_ms? }], expect = the timeline kind the viewer must report.
+  [{ id, t_ms, region, name, expect, until_ms?, many? }], expect = the timeline kind the viewer must
+  report; region = the element holding the change; many = the row may give several events (typing).
+  window.always lists what runs from page load (the spinners), each with its rect at load.
   The actual timing is exposed as window.actualTiming, one entry per schedule row, in ms from the
   schedule start: set_ms = the animation frame that made the change, shown_ms = the next animation
-  frame (the change is on screen by then); for a flash also hide_ms and hidden_ms. A flash stays
+  frame (the change is on screen by then), rect = the region's box in CSS px of the viewport when
+  the change was made; for a flash also hide_ms and hidden_ms. A flash stays
   on screen FLASH_MS from its shown_ms, so a late frame never shortens or hides it (issue #293).
-  window.scheduleBoxFits is true when the printed schedule is shown whole and nothing covers it.
+  window.scheduleBoxFits is true when the printed schedule is shown whole, inside every viewport
+  edge, and no card covers it; it is measured again on every resize.
+  Boundary clips: record the page so that the clip ends 150 ms and, in a second run, exactly
+  200 ms (SETTLE_MS) after the "last change" row is shown; d5.feature checks both outcomes.
   Always running, from page load to past the clip end:
     - a lone spinner (an ordinary 32 px border-arc spinner, 1 turn per second), far from all else;
     - spinner B beside a label, until a checkmark replaces it.
@@ -52,6 +58,8 @@
   #altcard { left: 960px; top: 400px; width: 120px; height: 110px; }
   #alt { position: absolute; left: 30px; top: 25px; width: 60px; height: 60px; background: rgb(128, 128, 128); }
   #altflash { position: absolute; left: 0; top: 0; width: 60px; height: 60px; background: #202020; display: none; }
+  #endcard { left: 960px; top: 540px; width: 100px; height: 60px; }
+  #endlabel { position: absolute; left: 12px; top: 16px; }
   #trackcard { left: 16px; top: 560px; width: 860px; height: 72px; }
   #track { position: absolute; left: 30px; top: 16px; width: 800px; height: 40px; background: #e8e8e8; }
   #playhead { position: absolute; left: 0; top: 0; width: 2px; height: 40px; background: #c00000; }
@@ -71,6 +79,7 @@
 <div class="card" id="savecard"><div class="spinner" id="spinnerB"></div><div id="check">&#x2714;</div><div id="saveLabel">Saving 1 of 3 files</div></div>
 <div class="card" id="flashcard"><div id="flash"></div><div id="status">Status: idle</div></div>
 <div class="card" id="altcard"><div id="alt"><div id="altflash"></div></div></div>
+<div class="card" id="endcard"><div id="endlabel">Done: no</div></div>
 <div class="card" id="trackcard"><div id="track"><div id="playhead"></div></div></div>
 <div class="card" id="typecard"><div id="field"><span id="typed"></span><span id="caret"></span></div></div>
 <div class="card" id="lonecard"><div class="spinner" id="spinnerA"></div></div>
@@ -89,21 +98,29 @@
   const ALT_STEP_MS = 50;           // a new value every recorded instant
 
   // t_ms from the schedule start; expect = the timeline kind the viewer must report.
+  // region = the element whose box holds the change (its rect is measured when the change is made).
   const schedule = [
-    { id: 'select', t_ms: 2000, name: 'list selection #cce8ff on white', expect: 'change' },
-    { id: 'fill', t_ms: 4000, name: 'grey fill #d0d0d0 on white', expect: 'change' },
-    { id: 'fade', t_ms: 6000, name: 'dialog fades in over 300 ms', expect: 'change' },
-    { id: 'label', t_ms: 8000, name: 'label changes beside running spinner B', expect: 'change' },
-    { id: 'check', t_ms: 10000, name: 'checkmark replaces spinner B', expect: 'change' },
-    { id: 'flash', t_ms: 12000, name: '50 ms flash', expect: 'short_lived' },
-    { id: 'status', t_ms: 12000, name: 'status label changes beside the flash', expect: 'change' },
-    { id: 'playhead', t_ms: 14000, name: 'playhead (2 px) starts moving, 20 px/s', expect: 'animating' },
-    { id: 'alternate', t_ms: 15000, until_ms: 16000, name: 'grey square alternates 100/156 around 128', expect: 'animating' },
-    { id: 'typing', t_ms: 16000, name: 'typing starts, 20 characters, 120 ms each', expect: 'change' },
-    { id: 'darkflash', t_ms: 16400, name: '50 ms dark flash in the grey square', expect: 'short_lived' },
-    { id: 'still', t_ms: 19000, until_ms: 29000, name: 'still period: nothing new (caret blinks)', expect: 'none' },
+    { id: 'select', t_ms: 2000, region: 'item3', name: 'list selection #cce8ff on white', expect: 'change' },
+    { id: 'fill', t_ms: 4000, region: 'fill', name: 'grey fill #d0d0d0 on white', expect: 'change' },
+    { id: 'fade', t_ms: 6000, region: 'dialog', name: 'dialog fades in over 300 ms', expect: 'change' },
+    { id: 'label', t_ms: 8000, region: 'saveLabel', name: 'label changes beside running spinner B', expect: 'change' },
+    { id: 'check', t_ms: 10000, region: 'check', name: 'checkmark replaces spinner B', expect: 'change' },
+    { id: 'flash', t_ms: 12000, region: 'flash', name: '50 ms flash', expect: 'short_lived' },
+    { id: 'status', t_ms: 12000, region: 'status', name: 'status label changes beside the flash', expect: 'change' },
+    { id: 'playhead', t_ms: 14000, region: 'track', name: 'playhead (2 px) starts moving, 20 px/s', expect: 'animating' },
+    { id: 'alternate', t_ms: 15000, until_ms: 16000, region: 'alt', name: 'grey square alternates 100/156 around 128', expect: 'animating' },
+    { id: 'typing', t_ms: 16000, until_ms: 18400, region: 'field', many: true, name: 'typing starts, 20 characters, 120 ms each', expect: 'change' },
+    { id: 'darkflash', t_ms: 16400, region: 'alt', name: '50 ms dark flash in the grey square', expect: 'short_lived' },
+    { id: 'still', t_ms: 19000, until_ms: 29000, region: null, name: 'still period: nothing new (caret blinks)', expect: 'none' },
+    { id: 'boundary', t_ms: 30000, region: 'endlabel', name: 'last change; boundary clips end 150/200 ms on', expect: 'change' },
   ];
   window.schedule = schedule;
+  // Running from page load, measured at load: the viewer must report each as one animation.
+  const always = [
+    { id: 'lone', region: 'spinnerA', name: 'lone spinner', expect: 'animating' },
+    { id: 'spinnerB', region: 'spinnerB', until_ms: 10000, name: 'spinner B until the checkmark', expect: 'animating' },
+  ];
+  window.always = always;
 
   const param = Number(new URLSearchParams(location.search).get('start'));
   const start = Number.isFinite(param) && param > 0 ? param : Date.now() + AUTO_START_MS;
@@ -117,12 +134,28 @@
       '  ' + e.name + '\n        expect: ' + e.expect).join('\n') +
     '\n\nalways: lone spinner (bottom right),\n        spinner B until 10000';
 
-  // The printed schedule is shown whole: nothing cut off, and no card or window edge below it.
-  const box = $('schedule').getBoundingClientRect();
-  window.scheduleBoxFits = $('schedule').scrollHeight <= $('schedule').clientHeight
-    && $('schedule').scrollWidth <= $('schedule').clientWidth
-    && box.bottom <= $('trackcard').getBoundingClientRect().top
-    && box.bottom <= window.innerHeight;
+  // The rect of an element in CSS px of the viewport, or null when it has no box.
+  function rectOf(id) {
+    if (!id) return null;
+    const r = $(id).getBoundingClientRect();
+    return r.width > 0 && r.height > 0 ? { x: r.left, y: r.top, w: r.width, h: r.height } : null;
+  }
+  const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+
+  // The printed schedule is shown whole: nothing cut off, inside every viewport edge, and no
+  // card covers it. Measured at load and again on every resize.
+  function updateBoxFits() {
+    const el = $('schedule');
+    const box = el.getBoundingClientRect();
+    const covered = [...document.querySelectorAll('.card, #dialog')].some(c => overlaps(box, c.getBoundingClientRect()));
+    window.scheduleBoxFits = el.scrollHeight <= el.clientHeight && el.scrollWidth <= el.clientWidth
+      && box.left >= 0 && box.top >= 0 && box.right <= window.innerWidth && box.bottom <= window.innerHeight
+      && !covered;
+  }
+  updateBoxFits();
+  window.addEventListener('resize', updateBoxFits);
+  for (const row of always) row.rect = rectOf(row.region);
+  window.pagePixelRatio = window.devicePixelRatio;
 
   let caretTimer = null;
   function blinkCaret() {
@@ -162,6 +195,7 @@
     } },
     darkflash: { once: () => { $('altflash').style.display = 'block'; }, flash: 'altflash' },
     still: {},
+    boundary: { once: () => { $('endlabel').textContent = 'Done: yes'; } },
   };
 
   // The actual timing (see the header): a change made in one animation frame is on screen by
@@ -185,6 +219,7 @@
       if (actual.set_ms === undefined) {
         if (step.once) step.once();
         mark(actual, 'set_ms', 'shown_ms', t);
+        actual.rect = rectOf(row.region);
       }
       if (step.tick) step.tick(t - row.t_ms, row);
       if (step.flash && actual.shown_ms !== undefined && actual.hide_ms === undefined && t - actual.shown_ms >= FLASH_MS) {

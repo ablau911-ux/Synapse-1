@@ -286,9 +286,10 @@ A stable interval that an animation overlaps is not listed as "no change".
 - a playhead;
 - a grey square that alternates 100/156 around its anchor grey 128: SAME as the anchor, DIFF frame to frame (issue #293 finding 2);
 - a 50 ms flash in that square 400 ms after it stops alternating (issue #293 finding 5);
-- typing with a caret.
+- typing with a caret;
+- a last change for the boundary clips, which end 150 ms and exactly `SETTLE_MS` after it: the first is reported as still changing, the second as settled (issue #293 finding 4).
 
-It prints the schedule and exposes the actual timing of every event, measured from its presentation; a flash stays on screen 50 ms from its presentation. Checked by `scripts/clip-equation/spec/d5.feature` (`node run-spec.mjs d5 <viewer-output.json> <schedule.json>`). Accepted when:
+It prints the schedule and exposes the actual timing and the region of every event, measured from its presentation; a flash stays on screen 50 ms from its presentation. Each reported event is matched to one scheduled event by kind, region and start within one instant; an unmatched or duplicate event fails. Checked by `scripts/clip-equation/spec/d5.feature` (`node run-spec.mjs d5 <viewer-output.json> <schedule.json>`). Accepted when:
 - every scheduled event is reported with the right type, its start within one instant;
 - a still clip gives no event;
 - a lone spinner gives exactly one animation;

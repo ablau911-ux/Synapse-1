@@ -16,6 +16,7 @@ Fixed by the owner earlier, and not experiment factors: f = 20 fps; flashes of 5
 2. **Equations before numbers.** Every measured quantity has an equation below, with named symbols. The experiments measure the symbols. The equation then predicts every other combination.
 3. **Validation.** About 20 % of the runs (one scenario and one duration per encoder) are held out of the fit and must be predicted. Target: bytes, CPU time and RAM within ±10 %, quality within ±0.005 SSIM. A quantity that misses the target is reported as "not predictable" with its spread; it is never fitted harder to pass.
 4. **Repeats.** Every configuration runs 3 times. Results report the mean and the spread. Whether a hardware encoder gives byte-identical output for identical input is itself a result.
+5. **Every action has an equation with a known result** (owner, 2026-11-22 20:58). Before an action runs, its equation and the value it must give are written down (section "Acceptance"). The check script compares the outcome with that value. A quantity with no exact value yet, such as CPU time, gets a prior prediction from `docs/clip-recorder-equation.md` before its first run, and after the fit it gets the fitted prediction, which a held-out run must meet.
 
 ## Equations
 
@@ -106,6 +107,53 @@ Run design (the full product is 3 × 4 × 11 × 4 × 2 × 4 × 6 × 2 ≈ 25,000
 6. **Results.**
    - `docs/clip-recorder-experiments-results.md`: one table with a row per configuration (mean and spread of the 3 repeats), every equation with its fitted coefficients, the validation table, and the Pareto front of bytes against quality against CPU against RAM.
    - Raw CSV beside it in `scripts/clip-equation/results/`.
+
+## Acceptance (BDD): every action, its equation and its known result
+
+Owner, 2026-11-22: test scripts are allowed, TDD and BDD, and every action shows an equation whose result is known. Each step's scenarios live in `scripts/clip-equation/spec/<step>.feature`, checked by one runner, `scripts/clip-equation/spec/run-spec.mjs <step>`. The runner computes each equation's value from its inputs, compares it with the outcome, prints both, and exits non-zero on the first miss. The builder of a step writes the feature file and its checks first, shows them failing, then builds until they pass. No `tests/` or `benches/` path and no Rust test attributes, so the push gate stays green.
+
+Symbols as in section "Equations"; t = 20 s, f = 20 fps; w × h = recorded size = σ · window size.
+
+**Step 1, corpus** (per capture folder, 6 scenarios × 4 sizes = 24 folders):
+
+| Action | Equation | Known result |
+|---|---|---|
+| list encoders | count(H.264 encoders) ≥ 1; every entry has a name or vendor id, a hardware flag and a CLSID | ≥ 1, no empty field |
+| capture instants | N_inst = t · f | 400 per folder |
+| lost instants | N_lost = N_inst − N_new − N_rep | 0 |
+| frame size | bytes(frame) = w · h · 3 | 1920 × 1080: 6,220,800; 1280 × 720 (also the 640 × 360 window at σ = 2): 2,764,800; 1518 × 999 (the 506 × 333 window at σ = 3): 4,549,446 |
+| repeats | stored files = N_new; each repeat line names an earlier stored frame | files = N_new |
+| still page | N_new(still) = 1 | 1 |
+| flash page | flashes = t · 1 per s | 20, each in one or more new frames |
+| repeatability | differing new frames between two captures of typing at 1280 × 720 | 0 (the pages are seeded and driven by frame count) |
+| waiting bytes | D_wait = Σ zstd(L = −3) bytes of the stored frames | equals the folder's file sizes summed, to the byte |
+
+**Step 2, encoding** (per configuration, 3 runs):
+
+| Action | Equation | Known result |
+|---|---|---|
+| frames encoded | N_enc = N_new of the corpus folder | exact |
+| keyframes | N_key = ⌈N_enc / τ_f⌉ | exact for τ_f ∈ {20, 40, 100, 200} |
+| B-frames | count(B) | 0 |
+| file bytes, D and L2 | bytes = Σ P + N_key · (K − P) (equation 1) | before the fit: the prior from `docs/clip-recorder-equation.md`, reported with its error; after the fit: within ±10 % on held-out rows |
+| file bytes, Z | bytes_Z(L) = Σ zstd(L) bytes of the N_new frames | exact, to the byte (zstd is deterministic for one level and version) |
+| Z round trip | Σ \|decoded − corpus\| over all pixels | 0 |
+| repeat identity, software encoder | bytes of run 1 = run 2 = run 3 | identical |
+| CPU and RAM | equations 3 and 4 | prior reported with its error; after the fit within ±10 % on held-out rows |
+
+**Step 3, quality:**
+
+| Action | Equation | Known result |
+|---|---|---|
+| meter self-check | SSIM-Y(x, x); PSNR-Y(x, x); R(x, x) | 1; ∞; 1 |
+| known distortion | Y + d on every pixel, no clipping: MSE = d², PSNR = 20 · log10(255 / d) | d = 4: 36.0896 dB within 0.01 dB |
+| flashes in the decoded flash clip | found = scheduled = t · 1 per s | 20 for every q ≥ q_min |
+| Z quality | SSIM-Y; R | 1; 1 (lossless) |
+| quality curve | equation 2 | after the fit, held-out SSIM within ±0.005 |
+
+**Step 4, equations:** every equation of this plan has its fitted coefficients and residuals. Each held-out row is predicted: bytes, CPU time and RAM within ±10 %, SSIM within ±0.005. A quantity that misses is marked "not predictable" with its spread, and it is never refitted to pass.
+
+**Step 5, results:** rows in `docs/clip-recorder-experiments-results.md` = configurations run = (grid A + grid B + grid C) × scenarios, counted from `results/encoders.json`; every row is in the CSV in `scripts/clip-equation/results/`; every equation is listed with its coefficients beside the validation table and the Pareto front.
 
 ## Choosing the configuration
 

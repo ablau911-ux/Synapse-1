@@ -38,6 +38,10 @@ const EXIT_FAILED: u8 = 1;
 const EXIT_BUSY: u8 = 2;
 /// Held by the worker that owns a clip, so two workers never encode one clip.
 const WORKER_LOCK_FILE: &str = "worker.lock";
+/// The clip fails on this many worker crashes in a row without a newly
+/// committed segment (B10: the segment is encoded again from its waiting
+/// frames once).
+const NO_PROGRESS_CRASH_LIMIT: u32 = 2;
 
 /// The live share and the worker cap, in percent of the whole machine.
 pub(super) struct ProcessorBudget {
@@ -765,16 +769,11 @@ impl ClipWorkerHost {
     }
 
     fn run(&self) {
+        // Worker crashes in a row without a newly committed segment, per clip.
+        let mut no_progress = std::collections::HashMap::new();
         loop {
             let folder = self.next();
-            let segments_before = ClipJson::read(&folder).map_or(0, |clip| clip.segments.len());
-            match WorkerRun::supervise(&folder) {
-                Ok(EXIT_READY | EXIT_FAILED | EXIT_BUSY) => {}
-                Ok(code) => {
-                    self.after_crash(&folder, segments_before, &format!("exit code {code}"));
-                }
-                Err(error) => self.after_crash(&folder, segments_before, &error),
-            }
+            self.work_on(&folder, &mut no_progress);
             // B4, C14: a failed clip gets no further worker, so a recording
             // that still runs into it stops now.
             if ClipJson::read(&folder).is_ok_and(|clip| clip.state == ClipState::Failed) {
@@ -783,20 +782,58 @@ impl ClipWorkerHost {
         }
     }
 
-    /// A worker crash loses nothing: the clip enters the queue again while it
-    /// makes progress; a crash without a new committed segment fails it.
-    fn after_crash(&self, folder: &Path, segments_before: usize, detail: &str) {
+    /// One worker run on a clip, unless the clip is already ready or failed
+    /// (the recorder enqueues its clip again when it stops). The run is judged
+    /// by the state in `clip.json` afterwards, never by the exit code alone.
+    fn work_on(&self, folder: &Path, no_progress: &mut std::collections::HashMap<PathBuf, u32>) {
+        let segments_before = match ClipJson::read(folder) {
+            Ok(clip) if matches!(clip.state, ClipState::Ready | ClipState::Failed) => {
+                no_progress.remove(folder);
+                return;
+            }
+            clip => clip.map_or(0, |clip| clip.segments.len()),
+        };
+        let detail = match WorkerRun::supervise(folder) {
+            // Another worker process holds the clip; its host judges the outcome.
+            Ok(EXIT_BUSY) => return,
+            Ok(code) => format!("exit code {code}"),
+            Err(error) => error,
+        };
+        self.after_crash(folder, segments_before, &detail, no_progress);
+    }
+
+    /// A clip still `recording` or `encoding` after its worker ended was left
+    /// mid-work (a crash, a kill, or a worker that could not start), whatever
+    /// the exit code. A worker crash loses nothing: the clip enters the queue
+    /// again and the segment is encoded again from its waiting frames (B10); the
+    /// second crash in a row without a new committed segment fails it, as B4
+    /// does for the encoder.
+    fn after_crash(
+        &self,
+        folder: &Path,
+        segments_before: usize,
+        detail: &str,
+        no_progress: &mut std::collections::HashMap<PathBuf, u32>,
+    ) {
         let Ok(clip) = ClipJson::read(folder) else {
             return;
         };
         if matches!(clip.state, ClipState::Ready | ClipState::Failed) {
+            no_progress.remove(folder);
             return;
         }
-        if clip.segments.len() > segments_before || clip.state == ClipState::Recording {
+        let crashes = if clip.segments.len() > segments_before {
+            0
+        } else {
+            no_progress.get(folder).copied().unwrap_or(0) + 1
+        };
+        if crashes < NO_PROGRESS_CRASH_LIMIT {
+            no_progress.insert(folder.to_path_buf(), crashes);
             tracing::warn!(code = "CLIP_WORKER_CRASHED", folder = %folder.display(), detail);
             self.enqueue(folder.to_path_buf());
             return;
         }
+        no_progress.remove(folder);
         let failure = format!("the clip worker ended without progress: {detail}");
         let _ = ClipJson::update(folder, |clip| {
             clip.state = ClipState::Failed;
@@ -872,6 +909,17 @@ impl WorkerRun {
                 .get("seconds_over_limit")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            // A clip can take several worker runs (a crash re-queues it): the
+            // maxima and the worker time cover all of them.
+            let previous = |key: &str| {
+                detail
+                    .get(key)
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            let worker_share = worker_share.max(previous("max_worker_share_percent"));
+            let max_sum = max_sum.max(previous("max_sum_percent"));
+            let seconds = seconds + previous("worker_seconds");
             detail.insert(
                 "max_worker_share_percent".to_owned(),
                 serde_json::json!(worker_share),

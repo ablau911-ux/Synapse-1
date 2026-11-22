@@ -1300,6 +1300,9 @@ mod live {
                 outcome,
                 "readback=screenshot_record"
             );
+            // The clip enters the worker queue (once): a worker that ended
+            // during the recording no longer leaves it in `encoding`.
+            super::super::clip_worker::ClipWorkerHost::global().enqueue(self.plan.folder.clone());
         }
     }
 

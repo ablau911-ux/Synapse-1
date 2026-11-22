@@ -748,8 +748,9 @@ struct Activity {
     start: u64,
     /// The last instant it changed against the previous frame.
     last_move: u64,
-    /// It animated at some instant of this change.
-    animated: bool,
+    /// The last instant of this change at which it animated: the end of its
+    /// animated stretch; `None` when it never animated.
+    animated_until: Option<u64>,
     /// The instants at which it was DIFF from its anchor.
     differed: Vec<u64>,
 }
@@ -956,7 +957,7 @@ impl<'a> Analyzer<'a> {
                 state.active = Some(Activity {
                     start,
                     last_move: instant,
-                    animated: false,
+                    animated_until: None,
                     differed: Vec::new(),
                 });
             }
@@ -969,7 +970,9 @@ impl<'a> Analyzer<'a> {
             if moved {
                 activity.last_move = instant;
             }
-            activity.animated |= animating;
+            if animating {
+                activity.animated_until = Some(instant);
+            }
             state.stable_since = self.recent.stable_since(&picture, b, instant);
         }
         if !moved_any {
@@ -1035,7 +1038,10 @@ impl<'a> Analyzer<'a> {
             after: Vec::new(),
             footprint: None,
         };
-        if activity.animated {
+        // A return to the anchor starts at the first instant that was not
+        // SAME, or after an animation at its first DIFF after the stretch.
+        let mut return_start = activity.start;
+        if let Some(animated_until) = activity.animated_until {
             let running = match close {
                 Close::Cut(end) => end <= state.animating_until(self.instants),
                 Close::Settled(_) => false,
@@ -1053,15 +1059,21 @@ impl<'a> Analyzer<'a> {
             // While it animates, its anchor stays frozen and it makes no event;
             // once it stops, it is compared like any settling block. That change
             // starts where the motion stopped, so a checkmark that replaces a
-            // spinner starts at the checkmark. Back at its anchor, it makes no
-            // second event: the animation already reports that interval (a
-            // playhead would otherwise leave a short-lived change in every block
-            // it crossed).
+            // spinner starts at the checkmark. Back at its anchor, the animated
+            // stretch makes no FLASH or REVERTED: the animation already reports
+            // that interval (a playhead would otherwise leave a short-lived
+            // change in every block it crossed). Owner decision, issue #293:
+            // only that stretch is exempt; a later excursion of the same block
+            // away from its anchor is classified as usual.
             if running {
                 return;
             }
             episode.start = activity.last_move.min(episode.end);
-            activity.differed.clear();
+            activity.differed.retain(|at| *at > animated_until);
+            return_start = activity
+                .differed
+                .first()
+                .map_or(episode.start, |first| (*first).min(episode.end));
         }
         match picture.test(&self.anchor, b) {
             Verdict::Diff => {
@@ -1072,6 +1084,7 @@ impl<'a> Analyzer<'a> {
                 self.episodes.push(episode);
             }
             Verdict::Same if !activity.differed.is_empty() => {
+                episode.start = return_start;
                 let span = self.clip.t_of(episode.end) - self.clip.t_of(episode.start);
                 episode.outcome = if span <= SHORT_LIVED_MS {
                     Outcome::Flash

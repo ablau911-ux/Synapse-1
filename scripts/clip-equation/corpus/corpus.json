@@ -24,5 +24,14 @@
     { "width": 506, "height": 333, "sigma": 3 }
   ],
   "repeat": { "of": "typing-1280x720", "folder": "typing-1280x720-repeat" },
+  "text_regions_about": "M7: fixed text regions per text scenario where R is read (way D), in window pixels at sigma 1 (the probe scales them by sigma): insets from the left, top, right and bottom edges, then optional caps max_width, max_height (px) and max_width_fraction (of the window width). From the pages: typing = the inside of #box (body padding 16 + border 1 + padding 14); scroll = the text column (body padding 40 px left and right, p max-width 900); ui = the menu bar (#bar, about 36 px high) and the list (#main padding 14 18 below the bar, #list 46 % wide).",
+  "text_regions": {
+    "typing": [{ "name": "text box", "left": 31, "top": 31, "right": 31, "bottom": 31 }],
+    "scroll": [{ "name": "text column", "left": 40, "top": 0, "right": 40, "bottom": 0, "max_width": 900 }],
+    "ui": [
+      { "name": "menu bar", "left": 0, "top": 0, "right": 0, "bottom": 0, "max_height": 36 },
+      { "name": "list", "left": 18, "top": 51, "right": 0, "bottom": 14, "max_width_fraction": 0.42 }
+    ]
+  },
   "flash": { "bgr": [80, 32, 255], "min_pixels": 1000, "box_left_fraction": 0.6, "box_top": 40, "box_width": 160, "box_height": 120, "per_second": 1 }
 }

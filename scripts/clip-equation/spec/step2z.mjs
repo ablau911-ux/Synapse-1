@@ -16,6 +16,8 @@ import * as runner from '../runs/run-z.mjs';
 const DEFAULT_CORPUS = 'C:\\Users\\Adam\\clip-corpus';
 const INSTANT_MS = 50;
 const RAM_TOLERANCE = 0.10;
+// Dictionary training uses the first 20 new frames (plan factor Z4; exp_z.rs DICT_TRAIN_FRAMES).
+const DICT_TRAIN_FRAMES = 20;
 // Ways with independent frames (seek 1); every other way keeps the previous frame or a stream.
 const INDEPENDENT_WAYS = new Set(['ZW0', 'ZW1', 'ZW2', 'ZW3', 'ZW4', 'ZW5', 'ZW6', 'ZW16', 'ZW17']);
 
@@ -84,7 +86,16 @@ export function ramKnown(r) {
   return { scenario: 'ram', known, label: Math.round(known) };
 }
 
-/** The per-row checks of one run: { scenario, known, measured, ok } or { scenario, note }. */
+/**
+ * The known decoder RAM of one row before the fitted m_d0 (equation 4): M_0 + M_dctx + B_d · px · 3 + b_max.
+ * M_dctx is the probe's estimate (single-pass DCtx for one stream with K_z = 1). One calculation for the
+ * checks and the runner's saved `known_m_dec`.
+ */
+export function ramDecKnown(r) {
+  return num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * num(r.w) * num(r.h) * 3 + (num(r.b_max) || 0);
+}
+
+/** The per-row checks of one run: { scenario, known, measured, ok }, { scenario, note } or { scenario, known, measured, fit: true }. */
 export function rowChecks(r, folder) {
   const px = num(r.w) * num(r.h);
   // A pilot run may cover only the first `frames_cap` new frames: then N_comp = that cap.
@@ -130,7 +141,15 @@ export function rowChecks(r, folder) {
       num(r.rect_listed_bytes) === num(r.rect_src_bytes) && (box ? r.way === 'ZW9b' && num(r.rects_max) <= 1 : r.way === 'ZW9' && num(r.gap) >= 0));
   }
   const ram = ramKnown(r);
-  add(ram.scenario, ram.label, num(r.peak_private), within(ram.known, num(r.peak_private), RAM_TOLERANCE));
+  if (num(r.dict) > 0) {
+    // M_comp(ZW16) gains M_train = μ · S_samples, μ fitted in step 4: known after the fit.
+    const samples = Math.min(DICT_TRAIN_FRAMES, nKnown) * px * 3;
+    out.push({ scenario: 'ramDict', fit: true, known: `${ram.label} + μ · S_samples (S_samples ${samples})`, measured: num(r.peak_private) });
+  } else {
+    add(ram.scenario, ram.label, num(r.peak_private), within(ram.known, num(r.peak_private), RAM_TOLERANCE));
+  }
+  // The decoder context zstd allocated equals its estimate (one stream with K_z = 1: single pass, no window).
+  if (r.mode !== 'raw') add('dctx', num(r.m_dctx_est), num(r.dctx_sizeof), num(r.dctx_sizeof) === num(r.m_dctx_est));
   if (r.known_m_comp !== undefined) add('ramShared', Math.round(ram.known), num(r.known_m_comp), num(r.known_m_comp) === ram.known);
   const rate = num(r.rate);
   if (rate > 0) {
@@ -147,8 +166,8 @@ export function rowChecks(r, folder) {
   const seekOk = independent ? num(r.n_dec_worst) === 1 : num(r.n_dec_worst) >= 1 && num(r.n_dec_worst) <= kz;
   add('seek', independent ? 1 : `<= ${kz}`, num(r.n_dec_worst), seekOk);
   // + b_max: the compressed frame the viewer reads is held too (largest clip file, known after compressing).
-  const mDec = num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * px * 3 + (num(r.b_max) || 0);
-  add('ramDec', Math.round(mDec), num(r.dec_peak_private), within(mDec, num(r.dec_peak_private), RAM_TOLERANCE));
+  // M_dec gains m_d0, fitted in step 4: known after the fit.
+  out.push({ scenario: 'ramDec', fit: true, known: `${Math.round(ramDecKnown(r))} + m_d0`, measured: num(r.dec_peak_private) });
   const readyMs = num(r.t_ready_ns) / 1e6;
   add('ready', `<= ${INSTANT_MS} ms`, `${readyMs.toFixed(2)} ms`, readyMs <= INSTANT_MS);
   return out;
@@ -206,6 +225,12 @@ class Scenario {
     this.misses = [];
     this.notes = [];
     this.pending = null;
+    this.fitRows = [];
+  }
+
+  /** A row whose known value needs a coefficient fitted in step 4: printed, never a pass or a fail here. */
+  fitRow(row, known, measured) {
+    this.fitRows.push(`${row.folder} ${row.way} L=${row.level} ${row.mode}/${row.layout} rep ${row.rep}: known ${known}, measured ${measured}`);
   }
 
   check(row, known, measured, ok) {
@@ -223,13 +248,15 @@ class Scenario {
   }
 
   print(out) {
-    const state = this.info ? 'INFO' : this.pending !== null ? 'PENDING' : this.ok ? 'PASS' : 'FAIL';
+    const state = this.info ? 'INFO' : this.fit ? 'PENDING-FIT' : this.pending !== null ? 'PENDING' : this.ok ? 'PASS' : 'FAIL';
     out(`${state}  ${this.name}: ${this.equation}  (${this.passed} rows pass, ${this.misses.length} miss)`);
     if (this.pending !== null) out(`        ${this.pending}`);
     if (this.passed === 0 && this.misses.length === 0 && this.pending === null) out('        no rows to check');
     for (const miss of this.misses.slice(0, 8)) out(`        miss: ${miss}`);
     if (this.misses.length > 8) out(`        ... ${this.misses.length - 8} more`);
     for (const note of this.notes.slice(0, 8)) out(`        ${note}`);
+    for (const row of this.fitRows.slice(0, 4)) out(`        ${row}`);
+    if (this.fitRows.length) out(`        ${this.fitRows.length} rows, checked on the held-out rows in step 4`);
   }
 }
 
@@ -261,12 +288,18 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     runtime: new Scenario('run time', 'full-run wall time within ±20 % of T (equation 6)'),
     roundTrip: new Scenario('round trip', 'Σ |decoded − corpus| = 0'),
     seek: new Scenario('seek cost', 'N_dec(worst) = 1 independent; <= K_z otherwise'),
-    ramDec: new Scenario('decoder RAM', 'M_dec = M_0 + M_dctx + B_d · px · 3 + b_max within ±10 % of decode peak private bytes'),
+    ramDec: new Scenario('decoder RAM', 'M_dec = M_0 + M_dctx + B_d · px · 3 + b_max + m_d0 (m_d0 fitted) within ±10 % of decode peak private bytes'),
+    ramDict: new Scenario('RAM with a trained dictionary', 'M_comp(ZW16) = M_0 + M_cctx + B_c · px · 3 + μ · S_samples (μ fitted), S_samples = N_train · px · 3'),
+    dctx: new Scenario('decoder context', 'M_dctx (zstd estimate; one stream with K_z = 1: ZSTD_estimateDCtxSize, single pass) = ZSTD_sizeof_DCtx after the last frame'),
     ready: new Scenario('time until ready', `t_ready = t_close <= ${INSTANT_MS} ms`),
   };
   s.cpu.pending = 'needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only';
   s.runtime.pending = 'needs the full run; z-pilot.md gives T';
   s.oneShot.info = true;
+  for (const name of ['ramDec', 'ramDict']) {
+    s[name].fit = true;
+    s[name].pending = 'known after the fit (step 4)';
+  }
 
   const configKey = (r) => runner.rowKey({ ...r, rep: '' });
   const byConfig = new Map();
@@ -280,6 +313,7 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     }
     for (const c of checks) {
       if (c.note) s[c.scenario].notes.push(c.note);
+      else if (c.fit) s[c.scenario].fitRow(r, c.known, c.measured);
       else s[c.scenario].check(r, c.known, c.measured, c.ok);
     }
     const key = configKey(r);

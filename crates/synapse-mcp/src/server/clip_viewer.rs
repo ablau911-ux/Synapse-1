@@ -125,7 +125,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 12;
+const ANALYSIS_VERSION: u32 = 13;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -1015,12 +1015,15 @@ impl<'a> Analyzer<'a> {
         let Some(mut activity) = self.states[b].active.take() else {
             return;
         };
-        let Some((_, picture)) = self.recent.latest() else {
+        let Some((shown_at, picture)) = self.recent.latest() else {
             return;
         };
         let state = &self.states[b];
+        // Settling is confirmed no earlier than the picture it settles on was
+        // decoded: a newer picture SAME as older ones moves stable_since back,
+        // so `at` can lie before it. `shown_at` is before any boundary.
         let settle_frame = match close {
-            Close::Settled(at) => at,
+            Close::Settled(at) => at.max(*shown_at),
             Close::Cut(end) => end.saturating_sub(1),
         };
         let mut episode = BlockEpisode {
@@ -1445,7 +1448,12 @@ impl Event {
             Outcome::Reverted => {
                 format!("returned to the previous picture at {}", fmt_time(end_ms))
             }
-            _ if self.settled => format!("settled at {} (frame {})", fmt_time(end_ms), self.end),
+            _ if self.settled => format!(
+                "settled at {} (frame {}), confirmed at frame {}",
+                fmt_time(end_ms),
+                self.end,
+                self.settle_frame
+            ),
             _ if self.generation == last_generation => {
                 "still changing when the clip ended".to_owned()
             }

@@ -89,6 +89,22 @@ Package 0 changes no product code. It writes measurement programs and one result
 
 Package 0 reports, for each figure, the development PC value and the weakest-machine estimate (scaled as in equation section 6). The weakest-machine figures stay estimates until a run on a real Core i3.
 
+### 0b. Compression of the waiting frames (package 0b, in `scripts/clip-equation/probe/`)
+
+Added 2026-11-22 09:20 IST. Rule R9 (equation line 27) and equation line 249 require the waiting frames in a cheaper form than raw; version 4 kept them raw (E8). The owner asked for the best method found online, then chose to measure the two finalists and decide on the numbers (2026-11-22). Research: `docs/clip-recorder-waiting-compression-research.md` (commit `660f9573`).
+
+Package 0b changes no product code. It adds one probe subcommand and appends one section to `scripts/clip-equation/results-package0.md`.
+
+| # | Measurement | Decides |
+|---|---|---|
+| M10 | Real frames: capture the new frames of windows the probe opens itself (no input to any other app), each at least 20 s: the flash page `scripts/clip-equation/flash-page.html` with and without `?anim=1`, a page that scrolls text by itself, a page that types text into a text box by itself, a playing video or a canvas animation, and one still window. At least one scenario at σ = 2 and one at σ = 3 (a small window) | the input of M11 to M13 |
+| M11 | Per scenario, single thread, release build: bytes per frame and ns per pixel for compression and decompression of (a) raw, (b) `lz4_flex` on the whole frame, (c) changed tiles + `lz4_flex`, (d) changed tiles + zstd level −1 and 1, each with tiles of 32, 64 and 128 px, alpha kept and dropped; a full keyframe every `WAITING_KEYFRAME_FRAMES` = 16 frames and after a size change | method, tile size, alpha |
+| M12 | Write cost per frame with the compressed sizes: create a `.tmp`, write, rename, against the raw write | c_disk with compression |
+| M13 | Exactness: decoded B, G, R equal the source byte for byte; the NV12 produced by the existing `Nv12Canvas::draw` from decoded frames equals the one from the source for σ = 1, 2, 3 | lossless proof |
+| M14 | The live share at the measured figures, for the development PC and the weakest-machine estimate (equation section 6 scaling), at 1080p with the measured new-frame rates | B within 10 % |
+
+Choice rule: the method with the fewest bytes whose compression keeps the live share within its part of `CPU_LIMIT_PERCENT` on the weakest-machine estimate at the M4 worst rate; when both qualify, the one with the fewer bytes. The owner sees the figures before the choice goes into section A (A8) as plan version 4.2.
+
 ### O. Observer, in `synapse-capture` (new, for clips only)
 
 The existing screenshot paths stay as they are. The clip recorder gets its own frame handler and its own capture handle.
@@ -299,6 +315,7 @@ Each product package is built by one agent from this plan with a time and tool-c
 | # | Package | Contains |
 |---|---|---|
 | 0 | Measurements | M1 to M9 in `scripts/clip-equation/`; one results file; `run_equation.py` with c_obs, the real c_read and c_disk. No product code |
+| 0b | Compression measurements | M10 to M14 in the probe; one section in `results-package0.md`. No product code |
 | 1 | Observer | O1 to O4 in `synapse-capture`: gated settings, Windows floor, slots by instant, threading rule, identity before read-back; existing screenshot paths unchanged |
 | 2 | Live part | A1 to A12; the four `record*` operations; `frames.jsonl` with frame size and cursor position; the waiting folder; `clip.json` at start with state and the registry; the public free-bytes-to-level function in `synapse-storage`; the updated contracts (O1); conditions C, G, T |
 | 3a | Worker lifecycle | The long-lived worker mode, its job and processor cap, the queue, segment forming (B2), commit (B8), ready (B9) and recovery (B10) |

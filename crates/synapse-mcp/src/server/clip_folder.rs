@@ -26,12 +26,12 @@ const LOCK_SUFFIX: &str = ".lock";
 const RECORDER_LOCK_FILE: &str = "recorder.lock";
 const TEMP_SUFFIX: &str = ".tmp";
 const PART_SUFFIX: &str = ".part";
-/// A rename of `clip.json`, a segment `.part` file or a waiting frame is
-/// tried this many times in all while another program holds the file for a
-/// moment.
-const RENAME_ATTEMPTS: u32 = 5;
-/// The sleep between two rename attempts.
-const RENAME_RETRY_SLEEP_MS: u64 = 100;
+/// A rename of `clip.json`, a segment `.part` file or a waiting frame, and
+/// a read of `clip.json`, is tried this many times in all while another
+/// program holds the file for a moment.
+const BRIEF_HOLD_ATTEMPTS: u32 = 5;
+/// The sleep between two such attempts.
+const BRIEF_HOLD_RETRY_SLEEP_MS: u64 = 100;
 /// Windows errors of a file another program holds for a moment: access
 /// denied (5), sharing violation (32), lock violation (33).
 const BRIEF_HOLD_OS_ERRORS: [i32; 3] = [5, 32, 33];
@@ -126,7 +126,7 @@ impl WaitingFrameWriter {
         let temp = path.with_extension(format!("{WAITING_FRAME_EXTENSION}{TEMP_SUFFIX}"));
         std::fs::write(&temp, &self.compressed)
             .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
-        rename_retrying(&temp, &path)
+        retry_brief_hold(|| std::fs::rename(&temp, &path))
             .map_err(|error| format!("could not rename {}: {error}", temp.display()))?;
         Ok(self.compressed.len() as u64)
     }
@@ -626,7 +626,7 @@ impl ClipJson {
     /// Reads `clip.json` of a clip folder.
     pub(super) fn read(folder: &Path) -> Result<Self, String> {
         let path = folder.join(CLIP_JSON_FILE);
-        let text = std::fs::read_to_string(&path)
+        let text = retry_brief_hold(|| std::fs::read_to_string(&path))
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let clip: Self = serde_json::from_str(&text)
             .map_err(|error| format!("{} is not valid: {error}", path.display()))?;
@@ -743,27 +743,30 @@ pub(super) fn write_atomically(path: &Path, value: &impl Serialize) -> Result<()
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
     drop(file);
-    rename_retrying(&temp, path)
+    retry_brief_hold(|| std::fs::rename(&temp, path))
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
 }
 
-/// Renames `from` to `to`, replacing `to`. When another program holds one of
-/// the files for a moment (antivirus, indexer: `BRIEF_HOLD_OS_ERRORS`), the
-/// rename is tried again, up to `RENAME_ATTEMPTS` times in all and
-/// `RENAME_RETRY_SLEEP_MS` apart; any other error fails at once.
-pub(super) fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+/// Runs a file operation (a rename that replaces, a read). When another
+/// program holds the file for a moment (antivirus, indexer, or another
+/// process replacing it: `BRIEF_HOLD_OS_ERRORS`), the operation is tried
+/// again, up to `BRIEF_HOLD_ATTEMPTS` times in all and
+/// `BRIEF_HOLD_RETRY_SLEEP_MS` apart; any other error fails at once.
+pub(super) fn retry_brief_hold<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let mut attempt = 1;
     loop {
-        match std::fs::rename(from, to) {
+        match operation() {
             Err(error)
-                if attempt < RENAME_ATTEMPTS
+                if attempt < BRIEF_HOLD_ATTEMPTS
                     && cfg!(windows)
                     && error
                         .raw_os_error()
                         .is_some_and(|code| BRIEF_HOLD_OS_ERRORS.contains(&code)) =>
             {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(RENAME_RETRY_SLEEP_MS));
+                std::thread::sleep(std::time::Duration::from_millis(BRIEF_HOLD_RETRY_SLEEP_MS));
             }
             outcome => return outcome,
         }

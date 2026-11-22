@@ -1,0 +1,25 @@
+step2d: corpus C:\Users\Adam\clip-corpus; runs results/d-proof-295r2.csv: 8 rows
+action | equation | known | equation value | measured | result
+D: encoders | count(activated) | 4 | 4 | 3 (DW1 DW2 DW4); misses: DW3 0x8000ffff | FAIL
+D: frames encoded | N_enc = N_new | exact, every run | N_new per folder | 2/2 runs equal | PASS
+D: keyframes | N_key = ceil(N_enc / tau_f) | exact for tau_f in {20, 40, 100, 200} | ceil(N_enc / tau_f) | 0/2 runs equal; misses: typing-640x360 DW2 q70 tau20: 9 != 8; typing-1920x1080 DW2 q70 tau20: 9 != 8 | FAIL
+D: B-frames | count(B) | 0 | 0 | 2/2 runs with 0 | PASS
+D: meter self-check | SSIM-Y(x, x); PSNR-Y(x, x); R(x, x) | 1; inf; 1 | 1; inf; 1 | 1; inf; 1 (OCR 88 chars) | PASS
+D: known distortion | MSE = d^2, PSNR = 20 * log10(255 / d), d = 4 | 36.0896 dB within 0.01 dB | 36.0896 dB | 36.0896 dB (clipped pixels 0) | PASS
+D: live and worker are two processes | pid_live != pid_worker; way_cpu_ns = a_rt_ns + a_w_ns | every run (M2, M3) | two pids; a_rt + a_w | 2/2 runs | PASS
+D: RAM base excludes corpus buffers | input = bgra; os_peak_private > os_peak_at_m0 for live and worker | every run (M1, M3, #5) | bgra; peak > peak at M_0 | 2/2 runs | PASS
+D: RAM is the OS peak of both phases | ram_os = live_ram_os + worker_ram_os; m_live = live_ram_os; m_worker = worker_ram_os | every run (M3, #11) | live + worker | 2/2 runs | PASS
+D: bytes include frames.jsonl and clip.json | bytes_disk = frame_bytes + index_bytes + clip_json_bytes = on-disk sum; frame_bytes = MP4; index_lines = N_inst | exact, every run (M4, #6) | MP4 + frames.jsonl + clip.json | 2/2 runs | PASS
+D: a refused setting is recorded as refused | status = setting_refused:<first differing name> iff read-back != requested | every run (M5, #7) | refused iff read-back differs | 4/4 runs | PASS
+D: beta never 0 | beta > 0; rate = quality implies beta = FALLBACK_BITS_PER_PIXEL_FRAME = 0.10 | every run (M5, #7) | > 0; quality 0.1 | 2816/2816 runs and plan rows | PASS
+D: every decoded frame mapped by time | frames_mapped = N_new; missing = extra = mistimed = 0, else status frame_map | every run (M6, #9) | N_new mapped, else frame_map | 4/4 runs (2 frame_map) | PASS
+D: R n/a on empty source text | r = n/a iff r_source_chars = 0; r_regions = regions of the scenario | every run (M7, #14) | n/a iff no source text | 2/2 runs | PASS
+D: PSNR inf at zero MSE | psnr_global = 10 * log10(255^2 / mse_y), inf at mse_y = 0 | within 1e-6 dB, every run (M7, #22) | 10 log10(255^2 / mse_y) | 2/2 runs | PASS
+D: run list with unique keys | runs = count(plan A) + count(plan B) = 2808; unique keys = runs | exact (M9) | 2808 unique | 2808 runs, 2808 unique, 0 with an unresolved key | PASS
+D: worker M_0 is input only | max - min of worker_m0_private per folder <= 2 MB | every folder (M2, M3, H3) | spread <= 2 MB | 2/2 folders (typing-640x360 0.00 MB; typing-1920x1080 0.00 MB) | PASS
+D: an OCR failure is not R n/a | OCR error implies status = ocr_error and r != n/a | the injected run and every row (M7, H4) | ocr_error; r not n/a | injected run: status ocr_error, r error; 8/8 rows | PASS
+D: run list identity | list_id = hash(runs) = hash(plan now); row.list_id = list_id | exact (M9, M3 of the re-review) | list_id 3f1b0e549506302f | file 3f1b0e549506302f, plan now 3f1b0e549506302f, 0/0 full-run rows | PASS
+D: bytes against the prior | prior B_min = 10.3 MB * px_out / (1252 * 890) (Quick Sync, q 70, docs/clip-recorder-equation.md section 6) | reported, no pass or fail before the fit | prior | 2 runs; typing-640x360 DW2 q70: 0.50 vs 8.52 MB/min (-94.2 %); typing-1920x1080 DW2 q70: 0.35 vs 19.17 MB/min (-98.2 %) | PENDING
+D: CPU against the prior | prior a_w = N_new * px_out * (c_conv + c_enc(E)), c_conv 1.65 ns, c_enc 7.0 ns (software) or 2.0 ns (hardware) per pixel | reported, no pass or fail before the fit | prior | typing-640x360 DW2 q70: a_w 958 vs 1140 ms (-16.0 %); typing-1920x1080 DW2 q70: a_w 2157 vs 2565 ms (-15.9 %) | PENDING
+D: RAM against the prior | prior M_worker = px_out * (3 + 1.5), one frame held (d = 1), M0_w and M_enc not yet known | reported, no pass or fail before the fit | prior | typing-640x360 DW2 q70: M_worker 361.0 vs 4.1 MB (8604.7 %); typing-1920x1080 DW2 q70: M_worker 711.2 vs 9.3 MB (7521.9 %) | PENDING
+step2d: 2 failed

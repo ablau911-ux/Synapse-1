@@ -103,7 +103,7 @@ Package 0b changes no product code. It adds one probe subcommand and appends one
 | M13 | Exactness: decoded B, G, R equal the source byte for byte; the NV12 produced by the existing `Nv12Canvas::draw` from decoded frames equals the one from the source for σ = 1, 2, 3 | lossless proof |
 | M14 | The live share at the measured figures, for the development PC and the weakest-machine estimate (equation section 6 scaling), at 1080p with the measured new-frame rates | B within 10 % |
 
-Choice rule: the method with the fewest bytes whose compression keeps the live share within its part of `CPU_LIMIT_PERCENT` on the weakest-machine estimate at the M4 worst rate; when both qualify, the one with the fewer bytes. The owner sees the figures before the choice goes into section A (A8) as plan version 4.2.
+Choice rule: the method with the fewest bytes whose compression keeps the live share within its part of `CPU_LIMIT_PERCENT` on the weakest-machine estimate at the M4 worst rate; when both qualify, the one with the fewer bytes. The owner sees the figures before the choice goes into section A (A8).
 
 ### O. Observer, in `synapse-capture` (new, for clips only)
 

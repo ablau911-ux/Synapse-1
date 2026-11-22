@@ -320,7 +320,10 @@ impl ClipWorker {
             samples: &samples,
         };
         let encoded = super::clip_encoder::encode_segment(&part, &input)?;
-        std::fs::File::open(&part)
+        // FlushFileBuffers needs write access on Windows; a read-only handle gets "Access is denied".
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
             .and_then(|file| file.sync_all())
             .map_err(|error| format!("could not flush {}: {error}", part.display()))?;
         let file_name = super::clip_folder::segment_file_name(index);

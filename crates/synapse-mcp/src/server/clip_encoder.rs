@@ -19,7 +19,7 @@
 //! All calls stay on the thread that created the encoder: it initialises COM
 //! (MTA) and Media Foundation for that thread and shuts both down on drop.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
@@ -43,7 +43,7 @@ use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::capture_clip::RECORD_FPS;
-use super::clip_folder::{QualityReport, WAITING_BYTES_PER_PIXEL, read_waiting_frame};
+use super::clip_folder::{QualityReport, WAITING_BYTES_PER_PIXEL, WaitingFrameReader};
 
 /// q: `CODECAPI_AVEncCommonQuality` level (0..=100). Condition Q stays
 /// `unverified` until q_min is calibrated for the encoder used (C6).
@@ -63,7 +63,7 @@ const HNS_PER_MS: i64 = 10_000;
 /// Upper bound on transforms walked when looking for the encoder in the chain.
 const MAX_TRANSFORMS_PER_STREAM: u32 = 8;
 
-/// One frame of a segment: its raw file (captured B, G, R rows, lz4), its captured
+/// One frame of a segment: its raw file (captured B, G, R rows, zstd), its captured
 /// size, and its time within the segment (B5).
 pub(super) struct SegmentSample {
     pub(super) raw: std::path::PathBuf,
@@ -83,6 +83,9 @@ pub(super) struct SegmentInput<'a> {
     pub(super) scale: u32,
     pub(super) fps: u32,
     pub(super) samples: &'a [SegmentSample],
+    /// The last good picture of the segment before, drawn only when the
+    /// first samples of this one cannot be read (its times are unused).
+    pub(super) seed: Option<&'a SegmentSample>,
 }
 
 /// A finished segment file and what the encoder granted for it.
@@ -94,6 +97,10 @@ pub(super) struct EncodedSegment {
     pub(super) encoder: String,
     pub(super) hardware: bool,
     pub(super) quality: QualityReport,
+    /// Instants whose waiting frame could not be read back (named as lost).
+    pub(super) unreadable_instants: Vec<u64>,
+    /// The raw file of the last picture drawn: the seed of the next segment.
+    pub(super) last_good: Option<PathBuf>,
 }
 
 /// Encodes one segment into `path` (the `.part` file) and finalizes it. B4:
@@ -121,17 +128,36 @@ fn encode_once(
     let size = RecordedSize::of(input);
     let mut encoder = ClipEncoder::create(path, size.width, size.height, input.fps, hardware)?;
     let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
+    let mut reader = WaitingFrameReader::new()?;
+    let mut unreadable_instants = Vec::new();
+    let mut last_good: Option<PathBuf> = None;
     for sample in input.samples {
         // A bad or short waiting frame counts as missing, as a frame without a
         // raw file does when the segment is formed: the picture before it stays.
-        match read_waiting_frame(&sample.raw, sample.width, sample.height) {
-            Ok(bgr) => canvas.draw(&bgr, sample.width, sample.height),
-            Err(error) => tracing::warn!(
-                code = "CLIP_WAITING_FRAME_UNREADABLE",
-                instant = sample.instant,
-                error = %error,
-                "the previous picture is kept for this instant"
-            ),
+        // Its instant is named as lost (cause `waiting_unreadable`).
+        match reader.read(&sample.raw, sample.width, sample.height) {
+            Ok(bgr) => {
+                canvas.draw(&bgr, sample.width, sample.height);
+                last_good = Some(sample.raw.clone());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    code = "CLIP_WAITING_FRAME_UNREADABLE",
+                    instant = sample.instant,
+                    error = %error,
+                    "the previous picture is kept for this instant"
+                );
+                unreadable_instants.push(sample.instant);
+                // Nothing drawn yet in this segment: the picture before it is
+                // the last good one of the segment before (the seed).
+                if last_good.is_none()
+                    && let Some(seed) = input.seed
+                    && let Ok(bgr) = reader.read(&seed.raw, seed.width, seed.height)
+                {
+                    canvas.draw(&bgr, seed.width, seed.height);
+                    last_good = Some(seed.raw.clone());
+                }
+            }
         }
         encoder.write_nv12(
             &canvas.nv12,
@@ -160,6 +186,8 @@ fn encode_once(
         encoder: readback.encoder,
         hardware: readback.hardware,
         quality: readback.quality,
+        unreadable_instants,
+        last_good,
     })
 }
 

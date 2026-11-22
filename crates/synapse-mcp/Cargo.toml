@@ -27,7 +27,6 @@ futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
 image.workspace = true
-lz4_flex = "0.14"
 metrics.workspace = true
 notify.workspace = true
 rmcp = { workspace = true, features = [
@@ -63,6 +62,7 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Variant", "Win32_System_Com_StructuredStorage"] }

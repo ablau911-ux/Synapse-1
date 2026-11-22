@@ -309,12 +309,14 @@ impl ClipWorker {
         let part = self
             .folder
             .join(super::clip_folder::segment_part_name(index));
+        let seed = self.seed(lines, range, &samples);
         let input = super::clip_encoder::SegmentInput {
             canvas_width: range.canvas.0,
             canvas_height: range.canvas.1,
             scale: super::capture_clip::scale_for_height(range.canvas.1),
             fps: clip.fps,
             samples: &samples,
+            seed: seed.as_ref(),
         };
         let encoded = super::clip_encoder::encode_segment(&part, &input)?;
         // FlushFileBuffers needs write access on Windows; a read-only handle gets "Access is denied".
@@ -347,8 +349,18 @@ impl ClipWorker {
             hardware: encoded.hardware,
             quality: encoded.quality,
         };
-        ClipJson::update(&self.folder, |clip| clip.segments.push(checkpoint))?;
-        self.delete_committed_raw(lines, range, &samples);
+        let unreadable = encoded
+            .unreadable_instants
+            .iter()
+            .map(|&instant| LostInstant {
+                instant,
+                cause: LossCause::WaitingUnreadable,
+            });
+        ClipJson::update(&self.folder, |clip| {
+            clip.segments.push(checkpoint);
+            clip.add_lost(unreadable);
+        })?;
+        self.delete_committed_raw(&samples, seed.as_ref(), encoded.last_good.as_ref());
         tracing::info!(
             code = "CLIP_SEGMENT_COMMITTED",
             folder = %self.folder.display(),
@@ -407,19 +419,42 @@ impl ClipWorker {
             .collect()
     }
 
-    /// Deletes the raw frames of a committed segment, except the last new
-    /// frame: it is the picture shown at the start of the next segment.
-    fn delete_committed_raw(
+    /// The last good picture before the segment (kept by the segment before),
+    /// when it is not already the segment's first sample.
+    fn seed(
         &self,
         lines: &[FrameLine],
         range: SegmentRange,
         samples: &[super::clip_encoder::SegmentSample],
+    ) -> Option<super::clip_encoder::SegmentSample> {
+        let at = picture_at(lines, &self.folder, range.first.checked_sub(1)?)?;
+        let line = &lines[at];
+        let raw = raw_frame_path(&self.folder, line.instant);
+        (samples.first().map(|first| &first.raw) != Some(&raw)).then(|| {
+            super::clip_encoder::SegmentSample {
+                raw,
+                width: line.width,
+                height: line.height,
+                instant: line.instant,
+                local_ms: 0,
+                duration_ms: 0,
+            }
+        })
+    }
+
+    /// Deletes the raw frames of a committed segment, except the last picture
+    /// the encoder could draw: it is the picture shown at the start of the
+    /// next segment, also when this segment's last frame was unreadable. The
+    /// seed is deleted once a newer good picture replaces it.
+    fn delete_committed_raw(
+        &self,
+        samples: &[super::clip_encoder::SegmentSample],
+        seed: Option<&super::clip_encoder::SegmentSample>,
+        last_good: Option<&PathBuf>,
     ) {
-        let keep = picture_at(lines, &self.folder, range.last)
-            .map(|at| raw_frame_path(&self.folder, lines[at].instant));
-        for sample in samples {
-            if Some(&sample.raw) != keep.as_ref() {
-                let _ = std::fs::remove_file(&sample.raw);
+        for raw in samples.iter().chain(seed).map(|sample| &sample.raw) {
+            if Some(raw) != last_good {
+                let _ = std::fs::remove_file(raw);
             }
         }
     }

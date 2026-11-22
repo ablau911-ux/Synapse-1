@@ -588,6 +588,7 @@ pub(super) fn scale_for_height(height: u32) -> u32 {
 
 #[cfg(windows)]
 mod live {
+    use std::collections::VecDeque;
     use std::io::Write as _;
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -600,9 +601,9 @@ mod live {
     use super::super::clip_folder::{
         CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
         ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
-        ObserverGrant, StopReason, WAITING_BYTES_PER_PIXEL, WAITING_DIR, write_waiting_frame,
+        ObserverGrant, StopReason, WAITING_DIR, WaitingFrameWriter,
     };
-    use super::super::clip_worker::{ProcessorBudget, SEGMENT_RAW_BUDGET_BYTES};
+    use super::super::clip_worker::ProcessorBudget;
     use super::super::{CaptureClipResponse, ErrorData};
     use super::{
         CLIP_JSON_FILE, ClipPlan, ClipTarget, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS,
@@ -744,9 +745,13 @@ mod live {
     struct DiskGuard {
         measured_free: u64,
         written_since: u64,
-        /// Compressed bytes written to `waiting/` (what the disk holds).
+        /// Compressed bytes written to `waiting/` over the whole clip (T).
         raw_written: u64,
-        pixels_written: u64,
+        /// Frames written and not yet in a committed segment: instant,
+        /// compressed bytes, pixels.
+        retained: VecDeque<(u64, u64, u64)>,
+        retained_bytes: u64,
+        retained_pixels: u64,
         measured_at: Instant,
     }
 
@@ -756,7 +761,9 @@ mod live {
                 measured_free: Self::measure(folder)?,
                 written_since: 0,
                 raw_written: 0,
-                pixels_written: 0,
+                retained: VecDeque::new(),
+                retained_bytes: 0,
+                retained_pixels: 0,
                 measured_at: Instant::now(),
             })
         }
@@ -767,24 +774,41 @@ mod live {
             })
         }
 
-        /// `bytes`: the compressed bytes actually written; `pixels`: the
-        /// pixels of the frame they hold.
-        fn wrote(&mut self, bytes: u64, pixels: u64) {
+        /// Instant k's waiting frame: `bytes` compressed bytes actually
+        /// written, holding `pixels` pixels.
+        fn wrote(&mut self, instant: u64, bytes: u64, pixels: u64) {
             self.written_since += bytes;
             self.raw_written += bytes;
-            self.pixels_written += pixels;
+            self.retained.push_back((instant, bytes, pixels));
+            self.retained_bytes += bytes;
+            self.retained_pixels += pixels;
+        }
+
+        /// Frames up to the last committed segment are no longer retained
+        /// (the worker deletes their files).
+        fn forget_committed(&mut self, folder: &Path) {
+            let Some(last) = ClipJson::read(folder)
+                .ok()
+                .and_then(|clip| clip.segments.last().map(|segment| segment.last_instant))
+            else {
+                return;
+            };
+            while let Some(&(instant, bytes, pixels)) = self.retained.front()
+                && instant <= last
+            {
+                self.retained.pop_front();
+                self.retained_bytes -= bytes;
+                self.retained_pixels -= pixels;
+            }
         }
 
         /// The raw bytes of the open segment plus their estimated encoded size (C13).
-        /// The segment budget counts decompressed B, G, R bytes (the encoder's
-        /// input), so it caps the pixels; the compressed bytes are never more.
+        /// The raw bytes are the compressed bytes actually retained in
+        /// `waiting/`, never clamped (incompressible frames can grow).
         fn finalize_reserve(&self) -> u64 {
-            let open_raw = self.raw_written.min(SEGMENT_RAW_BUDGET_BYTES);
-            let open_pixels = self
-                .pixels_written
-                .min(SEGMENT_RAW_BUDGET_BYTES / WAITING_BYTES_PER_PIXEL);
-            let encoded = open_pixels as f64 * FALLBACK_BITS_PER_PIXEL_FRAME / BITS_PER_BYTE;
-            open_raw + encoded as u64
+            let encoded =
+                self.retained_pixels as f64 * FALLBACK_BITS_PER_PIXEL_FRAME / BITS_PER_BYTE;
+            self.retained_bytes + encoded as u64
         }
 
         /// `false` once the clip volume would fall to storage pressure Level 1.
@@ -793,6 +817,7 @@ mod live {
                 self.measured_free = Self::measure(folder)?;
                 self.written_since = 0;
                 self.measured_at = Instant::now();
+                self.forget_committed(folder);
             }
             let available = self
                 .measured_free
@@ -810,6 +835,7 @@ mod live {
         machine: Machine,
         observer: ClipObserver,
         frames: std::io::BufWriter<std::fs::File>,
+        waiting: WaitingFrameWriter,
         meter: LiveMeter,
         disk: DiskGuard,
         origin_hns: i64,
@@ -867,6 +893,7 @@ mod live {
                 machine,
                 observer,
                 frames: std::io::BufWriter::new(frames_file),
+                waiting: WaitingFrameWriter::new().map_err(internal_error)?,
                 meter,
                 disk,
                 origin_hns,
@@ -1133,11 +1160,11 @@ mod live {
         }
 
         /// One raw frame file in `waiting/` at its captured size (A8: B, G, R
-        /// compressed with `lz4_flex`).
+        /// compressed with zstd through the recording's one context).
         fn write_raw(&mut self, k: u64, bgra: &[u8]) -> Result<(), String> {
-            let written = write_waiting_frame(&self.plan.folder, k, bgra)?;
+            let written = self.waiting.write(&self.plan.folder, k, bgra)?;
             self.disk
-                .wrote(written, bgra.len() as u64 / BGRA_BYTES_PER_PIXEL);
+                .wrote(k, written, bgra.len() as u64 / BGRA_BYTES_PER_PIXEL);
             Ok(())
         }
 
@@ -1243,7 +1270,9 @@ mod live {
                     clip.stop_reason = Some(reason);
                 }
                 clip.recorded_ms = recorded_ms;
-                clip.lost = lost;
+                // Losses the worker already named (unreadable waiting frames
+                // of committed segments) stay, in the list and in C and T.
+                let worker_lost = std::mem::replace(&mut clip.lost, lost);
                 // The recorder owns C, G, T and the live part of B; the
                 // worker's B measurements and Q already in `clip.json` stay.
                 let mut conditions = conditions;
@@ -1253,6 +1282,7 @@ mod live {
                     .take()
                     .map(|live| merge_live_b(clip.conditions.b.take(), live));
                 clip.conditions = conditions;
+                clip.add_lost(worker_lost);
                 clip.state
             });
             let outcome = match updated {

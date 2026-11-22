@@ -1903,15 +1903,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lz4_flex"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "lzma-rust2"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3597,7 +3588,6 @@ dependencies = [
  "http",
  "hyper",
  "image",
- "lz4_flex",
  "metrics",
  "notify",
  "portable-pty",
@@ -3631,6 +3621,7 @@ dependencies = [
  "uuid",
  "windows 0.62.2",
  "x11rb",
+ "zstd",
 ]
 
 [[package]]
@@ -4210,12 +4201,6 @@ dependencies = [
  "sha1",
  "thiserror 2.0.18",
 ]
-
-[[package]]
-name = "twox-hash"
-version = "2.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"
@@ -5170,6 +5155,24 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
 
 [[package]]
 name = "zstd-sys"

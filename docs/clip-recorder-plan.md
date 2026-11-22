@@ -207,6 +207,92 @@ Contract (O1). `FACADE_TOOL_CONTRACTS` (`tool_profiles.rs:391-396`) gets updated
 | D6 | A token budget per call sets N (at most `MAX_IMAGES_PER_CALL`), using the equation's token formula. The timeline is returned on page 1 only (S4) | A call stays inside the client's result cap | N |
 | D7 | The decoder's forward-read limit is computed from the keyframe interval, in frames (O2) | Seek stays bounded when τ changes | τ |
 
+### D5 as an equation (2026-11-22; replaces the invented rules)
+
+Owner decision (2026-11-22): D5 gets an equation first. Its earlier rules were invented by the builder and failed on ordinary UIs. Sources: `docs/clip-recorder-change-detection-research.md` (anchor comparison, two thresholds), `docs/clip-recorder-review-build/` (the Fable D5 review), and the measured encoder noise.
+
+**Measured noise (quality 70, GOP 20, proof clip).** In one 8 × 8 block of static content, the number of pixels whose largest R, G or B difference to the previous frame exceeds δ:
+
+| δ | 32 | 48 | 64 |
+|---|---|---|---|
+| noise maximum ν(δ), static text | 7 | 6 | 1 |
+| noise maximum, blank area | 0 | 0 | 0 |
+
+**1. Block test.** For a block b and two pictures X and Y, n_δ(b; X, Y) = the number of pixels of b whose largest channel difference between X and Y exceeds δ.
+
+    DIFF(b; X, Y)  ⇔  n_δhi ≥ N_hi  or  n_δlo ≥ N_lo
+    SAME(b; X, Y)  ⇔  n_δhi ≤ ν(δ_hi)  and  n_δlo ≤ ν(δ_lo)
+    otherwise: undecided
+
+Thresholds follow from the noise with a safety factor of 2 and from the smallest change that must be seen:
+
+    N_hi > 2 · ν(δ_hi)                    δ_hi = 64:  N_hi = 3        (text strokes, contrast above 64)
+    2 · ν(δ_lo) < N_lo ≤ 32               δ_lo = 32:  N_lo = 16       (a flat fill over half a block)
+
+What is guaranteed to be seen:
+- a change whose contrast exceeds 64 on at least 3 pixels of a block;
+- a change whose contrast exceeds 32 on at least 16 pixels of a block. Examples: a list selection #cce8ff on white (51) and a grey fill #d0d0d0 on white (47).
+
+Named limit: a change with contrast of 32 or less (a hover tint #e5f3ff on white, 26) is not detected.
+
+No false change follows while the noise stays within ν.
+
+**2. Anchor.** Each block keeps an anchor A_b, its last settled picture. Frames are compared with the anchor, not with the previous frame.
+
+    quiet → active      when DIFF(b; F_t, A_b); the start is the first instant that was not SAME
+    active → settled    when SAME(b; F_t, F_t−k) for every k = 1 … K_s,   K_s = SETTLE_MS · f / 1000 = 4
+    at settle:   DIFF(b; F_t, A_b)   →  CHANGED, and A_b := F_t
+                 SAME(b; F_t, A_b)   →  RETURNED: a FLASH if end − start ≤ SHORT_LIVED_MS, otherwise REVERTED
+                 undecided           →  A_b := F_t, no event (drift and noise)
+
+Consequence: a fade of any length is detected once its total contrast passes the block test, because the difference to the anchor accumulates. A flash of one recorded instant (50 ms) is a FLASH. At the end of the clip and at a resize, every active block is closed with the clip time; "settled" then means quiet for at least `SETTLE_MS`.
+
+**3. Animation.** The activity of a block is the share of frames in the last W_a = `SHORT_LIVED_MS` in which DIFF(b; F_t, F_t−1) held.
+
+    animating(b, t)  ⇔  activity ≥ ANIMATING_CHANGE_SHARE = 0.5
+
+- While a block animates, its anchor is frozen and it makes no event.
+- When it stops, it is compared with its anchor like any settling block. So a checkmark that replaces a spinner is a CHANGED event.
+- Connected animating blocks form one animation interval.
+- There is no absorption: a block that is not animating is never swallowed by a neighbour.
+
+**4. Events.** Blocks with the same outcome (CHANGED, FLASH, REVERTED, animation) whose intervals overlap and that are 8-neighbours, a gap of `REGION_GAP_BLOCKS` allowed, form one event with one bounding box. A flash beside a change therefore gives two events.
+
+**5. Caret and cursor.**
+- A block change is a caret when all of these hold:
+  - its footprint is at most `CARET_MAX_WIDTH_PX` wide and 8 to 48 px tall;
+  - it alternates between exactly two pictures, one of them the anchor;
+  - it does so for at least 2 cycles in one place;
+  - its half-period is 400 to 700 ms (the Windows default is 530 ms).
+  A playhead or a meter fails this and is reported.
+- The cursor box `CURSOR_MASK_PX` at the logged position is masked, as before.
+
+**6. Picks within the budget (D6).** One image per event:
+- CHANGED: the settle frame;
+- FLASH or REVERTED: the frame with the most changed blocks;
+- animation: its first frame, and its end frame when it stops before the clip ends.
+
+A stable interval that an animation overlaps is not listed as "no change".
+
+**7. Proof of the equation.** The page `scripts/clip-equation/ui-events-page.html` plays a fixed schedule of known events:
+- a list selection;
+- a grey fill;
+- a 300 ms fade;
+- a label that changes beside a spinner;
+- a checkmark that replaces a spinner;
+- a 50 ms flash beside a change;
+- a playhead;
+- typing with a caret.
+
+It prints the schedule. Accepted when:
+- every scheduled event is reported with the right type, its start within one instant;
+- a still clip gives no event;
+- a lone spinner gives exactly one animation;
+- the keyframe instants give no event;
+- the flash proof clip gives one FLASH per flash.
+
+The noise table is measured again on these clips. If ν is exceeded, the thresholds are recomputed from the formulas above, not hand-tuned.
+
 ## Clip folder
 
     clip.json                    written at start; state, checkpoints and conditions; replaced atomically

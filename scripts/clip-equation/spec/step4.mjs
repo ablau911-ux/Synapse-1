@@ -370,7 +370,12 @@ function findingChecks(F, inputs) {
       // Round 4: the published equation is the formula of the model that predicts (P and K apart, both slopes).
       const eqOk = /K = k_E,c \* px \* exp\(b_E \* q\)/.test(m2.equation ?? '') && /P = p_E,c \* px \* exp\(a_E \* q\)/.test(m2.equation ?? '') && !/K\/P from a GOP sweep at one q/.test(m2.equation ?? '')
         && /folded/.test(m1.equation ?? '');
-      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a), q 90 tau 200 within 1e-6, published model "P and K apart" with residuals 0', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}; model ${used}; max residual ${resMax}; published equation: ${m2.equation ?? 'none'}`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance && /apart/.test(used ?? '') && resMax <= CONFIG.self_test_tolerance && eqOk };
+      // Round 5: in folded mode the published formula has no K term and names only coefficients that exist.
+      const folded = m1.equation ?? '';
+      const foldOk = !/K =|k_E,c|b_E|\bP = /.test(folded) && /bytes_D = n_new \* px \* p_folded_E,c \* exp\(a_folded_E \* q\)/.test(folded)
+        && Number.isFinite(m1.coefficients?.a_E_folded?.DW1) && Object.values(m1.coefficients?.p_E_c_folded?.DW1 ?? {}).length > 0
+        && Object.values(m1.coefficients?.p_E_c_folded?.DW1 ?? {}).every(Number.isFinite) && m1.coefficients?.b_E?.DW1 === undefined;
+      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a), q 90 tau 200 within 1e-6, published model "P and K apart" with residuals 0', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}; model ${used}; max residual ${resMax}; published equation: ${m2.equation ?? 'none'}; folded (one sweep): ${folded} (${foldOk ? 'no K term' : 'K term or missing coefficient'})`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance && /apart/.test(used ?? '') && resMax <= CONFIG.self_test_tolerance && eqOk && foldOk };
     }),
     'eq 4 fitted terms: mu and m_d0 from training rows': need(() => {
       const { zRows, runlist } = ramFixture();

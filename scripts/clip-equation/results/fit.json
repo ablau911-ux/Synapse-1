@@ -1,0 +1,6917 @@
+{
+ "created": "2026-11-22T20:01:26.698Z",
+ "label": "PILOT, not final",
+ "inputs": {
+  "z": [
+   {
+    "path": "C:\\Users\\Adam\\Synapse-clip-viewer\\scripts\\clip-equation\\results\\z-pilot.csv",
+    "rows": 75
+   }
+  ],
+  "d": [
+   {
+    "path": "C:\\Users\\Adam\\Synapse-clip\\scripts\\clip-equation\\results\\d-pilot.csv",
+    "rows": 24
+   }
+  ],
+  "runlist": "C:\\Users\\Adam\\Synapse-clip-docs\\scripts\\clip-equation\\results\\z-runlist.json",
+  "corpus_root": "C:\\Users\\Adam\\clip-corpus"
+ },
+ "config": {
+  "note": "Tunables of fit/fit.mjs, fit/results.mjs and spec/step4.mjs, spec/step5.mjs. Spec: docs/clip-recorder-experiments-plan.md, 'How absolute and predictable is reached', 'Method', 'Equations'.",
+  "corpus_root": "C:\\Users\\Adam\\clip-corpus",
+  "runlist": "results/z-runlist.json",
+  "fit_out": "results/fit.json",
+  "results_md": "../../docs/clip-recorder-experiments-results.md",
+  "results_csv": "results/results.csv",
+  "z_key_columns": [
+   "folder",
+   "way",
+   "level",
+   "layout",
+   "mode",
+   "tile",
+   "wlog",
+   "ldm",
+   "dict",
+   "workers",
+   "kz",
+   "theta",
+   "drain",
+   "frames_cap"
+  ],
+  "d_key_columns": [
+   "folder",
+   "encoder",
+   "q",
+   "tau_f",
+   "hint",
+   "rate",
+   "beta"
+  ],
+  "text_scenarios": [
+   "typing",
+   "scroll",
+   "ui"
+  ],
+  "tolerance": {
+   "bytes": 0.1,
+   "cpu": 0.1,
+   "ram": 0.1,
+   "ssim": 0.005
+  },
+  "hold_out": {
+   "share": 0.2,
+   "seed": 20261122,
+   "generator": "mulberry32"
+  },
+  "px0": 230400,
+  "d_base": {
+   "tau_f": "20",
+   "hint": "1",
+   "rate": "quality"
+  },
+  "worker_bytes_per_px": 4.5,
+  "c_conv_ns_per_px": 1.65,
+  "t_ready_limit_ms": 50,
+  "run_time_tolerance": 0.2,
+  "self_test_tolerance": 0.000001,
+  "j_tolerance": 1e-9
+ },
+ "configurations": [
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-1|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-1|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-1",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 142259262,
+   "cpu_s_min": {
+    "mean": 2.544824307,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01905693560313786,
+    "bytes_per_frame": {
+     "mean": 118549.385,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1724426.95,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.851186735628858,
+    "peak_private": {
+     "mean": 15032320,
+     "spread": 0
+    },
+    "known_m_comp": 14811160,
+    "m0": 8040448,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014931983720383818
+    ],
+    "ram_dec_rel": [
+     0.03155711731365334
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-2|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-2|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-2",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 147662373,
+   "cpu_s_min": {
+    "mean": 2.686833678,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6983680,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01978073197980967,
+    "bytes_per_frame": {
+     "mean": 123051.9775,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1822144.6775,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9085002724729938,
+    "peak_private": {
+     "mean": 15015936,
+     "spread": 0
+    },
+    "known_m_comp": 14802968,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014386844584140154
+    ],
+    "ram_dec_rel": [
+     0.030665313145791833
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 3,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 148950549,
+   "cpu_s_min": {
+    "mean": 2.669893434,
+    "spread": 0.19469117999999996
+   },
+   "ram_peak": {
+    "mean": 6980949.333333333,
+    "spread": 4096
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.019953294994212965,
+    "bytes_per_frame": {
+     "mean": 124125.4575,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1817047.0008333332,
+     "spread": 137228.32374999998
+    },
+    "dec_ns_per_px_frame": 0.8986537667984825,
+    "peak_private": {
+     "mean": 15026858.666666666,
+     "spread": 10240
+    },
+    "known_m_comp": 14816621.333333334,
+    "m0": 8045909.333333333,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.013821968381781591,
+     0.014362999023978617,
+     0.014382864827220305
+    ],
+    "ram_dec_rel": [
+     0.029995023158799868,
+     0.03053429326470457,
+     0.03057745918290853
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-4|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-4|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-4",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 153390591,
+   "cpu_s_min": {
+    "mean": 2.784181239,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.02054807942708333,
+    "bytes_per_frame": {
+     "mean": 127825.4925,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1874003.385,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9211910409432871,
+    "peak_private": {
+     "mean": 15036416,
+     "spread": 0
+    },
+    "known_m_comp": 14815256,
+    "m0": 8044544,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014927855448464745
+    ],
+    "ram_dec_rel": [
+     0.030846555686583225
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-5|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-5|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-5",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 177075339,
+   "cpu_s_min": {
+    "mean": 2.765825085,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.023720869100437244,
+    "bytes_per_frame": {
+     "mean": 147562.7825,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1842439.46,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9343951292438272,
+    "peak_private": {
+     "mean": 15028224,
+     "spread": 0
+    },
+    "known_m_comp": 14807064,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014936114276267058
+    ],
+    "ram_dec_rel": [
+     0.029319396764648346
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-6|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-6|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-6",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 177652608,
+   "cpu_s_min": {
+    "mean": 2.707538241,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.023798199588477367,
+    "bytes_per_frame": {
+     "mean": 148043.84,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1812692.295,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9045923635223766,
+    "peak_private": {
+     "mean": 15020032,
+     "spread": 0
+    },
+    "known_m_comp": 14798872,
+    "m0": 8028160,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014944382247511837
+    ],
+    "ram_dec_rel": [
+     0.029294442111150055
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-7|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-7|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-7",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 187742334,
+   "cpu_s_min": {
+    "mean": 2.811761247,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.025149811117541155,
+    "bytes_per_frame": {
+     "mean": 156451.945,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1854527.6925,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.940935699990355,
+    "peak_private": {
+     "mean": 15024128,
+     "spread": 0
+    },
+    "known_m_comp": 14802968,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014940247118010388
+    ],
+    "ram_dec_rel": [
+     0.0283740458215072
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-10|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-10|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-10",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 260449071,
+   "cpu_s_min": {
+    "mean": 2.744093982,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.03488954676247428,
+    "bytes_per_frame": {
+     "mean": 217040.8925,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1775816.8,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8995260501060957,
+    "peak_private": {
+     "mean": 15036416,
+     "spread": 0
+    },
+    "known_m_comp": 14815256,
+    "m0": 8044544,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014927855448464745
+    ],
+    "ram_dec_rel": [
+     0.02400898007327003
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-20|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-20|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-20",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 343569111,
+   "cpu_s_min": {
+    "mean": 2.432228865,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6983680,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.04602424004951132,
+    "bytes_per_frame": {
+     "mean": 286307.5925,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1571039.625,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9973294451678241,
+    "peak_private": {
+     "mean": 15020032,
+     "spread": 0
+    },
+    "known_m_comp": 14807064,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014382864827220305
+    ],
+    "ram_dec_rel": [
+     0.018142676855331174
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-50|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-50|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-50",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 531378861,
+   "cpu_s_min": {
+    "mean": 2.439488409,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6991872,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.07118308215985082,
+    "bytes_per_frame": {
+     "mean": 442815.7175,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1476217.8775,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.0241712010513118,
+    "peak_private": {
+     "mean": 15024128,
+     "spread": 0
+    },
+    "known_m_comp": 14802968,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014940247118010388
+    ],
+    "ram_dec_rel": [
+     0.03971849122051946
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-100|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|-100|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "-100",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 761897904,
+   "cpu_s_min": {
+    "mean": 2.265977742,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6979584,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.10206322659465021,
+    "bytes_per_frame": {
+     "mean": 634914.92,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1275475.4,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9381133367091049,
+    "peak_private": {
+     "mean": 15020032,
+     "spread": 0
+    },
+    "known_m_comp": 14811160,
+    "m0": 8040448,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.014102339047042906
+    ],
+    "ram_dec_rel": [
+     0.03865169826534276
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|1|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|1|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "1",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 128685870,
+   "cpu_s_min": {
+    "mean": 2.6796496800000003,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 7012352,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.017238654996141977,
+    "bytes_per_frame": {
+     "mean": 107238.225,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1802489.09,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8591528247974537,
+    "peak_private": {
+     "mean": 15044608,
+     "spread": 0
+    },
+    "known_m_comp": 14835736,
+    "m0": 8032256,
+    "m_cctx": 582680,
+    "bc": 1,
+    "ram_rel": [
+     0.014078977948920095
+    ],
+    "ram_dec_rel": [
+     0.033865400775477034
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|2|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|2|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "2",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 138828345,
+   "cpu_s_min": {
+    "mean": 2.773155381,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 7204864,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.018597332738554528,
+    "bytes_per_frame": {
+     "mean": 115690.2875,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1884306.4225,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8408369442033179,
+    "peak_private": {
+     "mean": 15249408,
+     "spread": 0
+    },
+    "known_m_comp": 15044632,
+    "m0": 8044544,
+    "m_cctx": 779288,
+    "bc": 1,
+    "ram_rel": [
+     0.013611233561578642
+    ],
+    "ram_dec_rel": [
+     0.04651029217494267
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|3|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|3|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 122093925,
+   "cpu_s_min": {
+    "mean": 2.590665006,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 7741440,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.016355603378986627,
+    "bytes_per_frame": {
+     "mean": 101744.9375,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1815668.3275,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.7798977141203703,
+    "peak_private": {
+     "mean": 15777792,
+     "spread": 0
+    },
+    "known_m_comp": 15560728,
+    "m0": 8036352,
+    "m_cctx": 1303576,
+    "bc": 1,
+    "ram_rel": [
+     0.013949475885704062
+    ],
+    "ram_dec_rel": [
+     0.009306226005619785
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|4|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|4|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "4",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 122107416,
+   "cpu_s_min": {
+    "mean": 2.76293541,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 9052160,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.016357410622427983,
+    "bytes_per_frame": {
+     "mean": 101756.18,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1896647.775,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8000940055941358,
+    "peak_private": {
+     "mean": 17088512,
+     "spread": 0
+    },
+    "known_m_comp": 16871448,
+    "m0": 8036352,
+    "m_cctx": 2614296,
+    "bc": 1,
+    "ram_rel": [
+     0.012865759951368726
+    ],
+    "ram_dec_rel": [
+     0.009023798612952908
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|5|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|5|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "5",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 94904670,
+   "cpu_s_min": {
+    "mean": 5.773627011,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 9584640,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01271335278420782,
+    "bytes_per_frame": {
+     "mean": 79087.225,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 4434004.37,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9202656479070216,
+    "peak_private": {
+     "mean": 17616896,
+     "spread": 0
+    },
+    "known_m_comp": 17391640,
+    "m0": 8032256,
+    "m_cctx": 3138584,
+    "bc": 1,
+    "ram_rel": [
+     0.012951970026978479
+    ],
+    "ram_dec_rel": [
+     0.009593151133799651
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|6|bgr|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW1|6|bgr|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW1",
+   "options": {
+    "level": "6",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 94411920,
+   "cpu_s_min": {
+    "mean": 7.410525,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 9584640,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.012647344393004117,
+    "bytes_per_frame": {
+     "mean": 78676.6,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 5761187.4275,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.0715056447723765,
+    "peak_private": {
+     "mean": 17633280,
+     "spread": 0
+    },
+    "known_m_comp": 17408024,
+    "m0": 8048640,
+    "m_cctx": 3138584,
+    "bc": 1,
+    "ram_rel": [
+     0.01293977995434749
+    ],
+    "ram_dec_rel": [
+     0.009328736480390416
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|7|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "cfg": "Z|ZW1|7|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "way": "ZW1",
+   "options": {
+    "level": "7",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "100"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 100,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 91124244,
+   "cpu_s_min": {
+    "mean": 8.687827812,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 12185600,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.012206929976851851,
+    "bytes_per_frame": {
+     "mean": 75936.87,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 6762154.98,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.0369649064429012,
+    "peak_private": {
+     "mean": 20221952,
+     "spread": 0
+    },
+    "known_m_comp": 20017176,
+    "m0": 8036352,
+    "m_cctx": 5760024,
+    "bc": 1,
+    "ram_rel": [
+     0.010230014463578678
+    ],
+    "ram_dec_rel": [
+     0.006358152774566502
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|8|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "cfg": "Z|ZW1|8|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "way": "ZW1",
+   "options": {
+    "level": "8",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "100"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 100,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 84743028,
+   "cpu_s_min": {
+    "mean": 10.983639456,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 12173312,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.011352107445987655,
+    "bytes_per_frame": {
+     "mean": 70619.19,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 8653831.15,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9993543981481482,
+    "peak_private": {
+     "mean": 20209664,
+     "spread": 0
+    },
+    "known_m_comp": 20017176,
+    "m0": 8036352,
+    "m_cctx": 5760024,
+    "bc": 1,
+    "ram_rel": [
+     0.009616141657544501
+    ],
+    "ram_dec_rel": [
+     0.0070240362371704786
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|9|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "cfg": "Z|ZW1|9|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "way": "ZW1",
+   "options": {
+    "level": "9",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "100"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 100,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 82584552,
+   "cpu_s_min": {
+    "mean": 10.976013456,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 17424384,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.011062959747942388,
+    "bytes_per_frame": {
+     "mean": 68820.46,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 8634320.79,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9743012490354939,
+    "peak_private": {
+     "mean": 25464832,
+     "spread": 0
+    },
+    "known_m_comp": 25264152,
+    "m0": 8040448,
+    "m_cctx": 11002904,
+    "bc": 1,
+    "ram_rel": [
+     0.007943270765628705
+    ],
+    "ram_dec_rel": [
+     0.0062710371501258156
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|10|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "cfg": "Z|ZW1|10|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "way": "ZW1",
+   "options": {
+    "level": "10",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "100"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 100,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 77664588,
+   "cpu_s_min": {
+    "mean": 13.892298816,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 27934720,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.010403885352366254,
+    "bytes_per_frame": {
+     "mean": 64720.49,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 11080057.04,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8932015335648148,
+    "peak_private": {
+     "mean": 35966976,
+     "spread": 0
+    },
+    "known_m_comp": 35741720,
+    "m0": 8032256,
+    "m_cctx": 21488664,
+    "bc": 1,
+    "ram_rel": [
+     0.006302326804641746
+    ],
+    "ram_dec_rel": [
+     0.00685903462741207
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|11|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "cfg": "Z|ZW1|11|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "way": "ZW1",
+   "options": {
+    "level": "11",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "100"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 100,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 74097060,
+   "cpu_s_min": {
+    "mean": 20.798359416,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 27930624,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.00992598218878601,
+    "bytes_per_frame": {
+     "mean": 61747.55,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 16802199.94,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8430264612268519,
+    "peak_private": {
+     "mean": 35975168,
+     "spread": 0
+    },
+    "known_m_comp": 35754008,
+    "m0": 8044544,
+    "m_cctx": 21488664,
+    "bc": 1,
+    "ram_rel": [
+     0.006185600226973155
+    ],
+    "ram_dec_rel": [
+     0.005935256797853229
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|12|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "cfg": "Z|ZW1|12|bgr|whole|32|0|0|0|0|20|25|0|100",
+   "way": "ZW1",
+   "options": {
+    "level": "12",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "100"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 100,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 74098176,
+   "cpu_s_min": {
+    "mean": 20.810509128,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 48992256,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.009926131687242799,
+    "bytes_per_frame": {
+     "mean": 61748.48,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 16813079.36,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8420818238811728,
+    "peak_private": {
+     "mean": 57020416,
+     "spread": 0
+    },
+    "known_m_comp": 56709144,
+    "m0": 8028160,
+    "m_cctx": 42460184,
+    "bc": 1,
+    "ram_rel": [
+     0.0054889207990866514
+    ],
+    "ram_dec_rel": [
+     0.006226249762406542
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|13|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "cfg": "Z|ZW1|13|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "way": "ZW1",
+   "options": {
+    "level": "13",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "20"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 20,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 71761620,
+   "cpu_s_min": {
+    "mean": 32.63465586,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 40570880,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.009613128536522634,
+    "bytes_per_frame": {
+     "mean": 59801.35,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 26583935.95,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8603305603780864,
+    "peak_private": {
+     "mean": 48607232,
+     "spread": 0
+    },
+    "known_m_comp": 48328728,
+    "m0": 8036352,
+    "m_cctx": 34071576,
+    "bc": 1,
+    "ram_rel": [
+     0.005762700810168229
+    ],
+    "ram_dec_rel": [
+     0.006391627128701237
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|14|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "cfg": "Z|ZW1|14|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "way": "ZW1",
+   "options": {
+    "level": "14",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "20"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 20,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 65988060,
+   "cpu_s_min": {
+    "mean": 45.9074655,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 57352192,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.008839707111625515,
+    "bytes_per_frame": {
+     "mean": 54990.05,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 37728073.55,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.827842399691358,
+    "peak_private": {
+     "mean": 65384448,
+     "spread": 0
+    },
+    "known_m_comp": 65101848,
+    "m0": 8032256,
+    "m_cctx": 50848792,
+    "bc": 1,
+    "ram_rel": [
+     0.004340890599603255
+    ],
+    "ram_dec_rel": [
+     0.0024771621860997938
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|15|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "cfg": "Z|ZW1|15|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "way": "ZW1",
+   "options": {
+    "level": "15",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "20"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 20,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 62428140,
+   "cpu_s_min": {
+    "mean": 64.61355162000001,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 74211328,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.0083628231095679,
+    "bytes_per_frame": {
+     "mean": 52023.45,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 53319368.7,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.816054012345679,
+    "peak_private": {
+     "mean": 82235392,
+     "spread": 0
+    },
+    "known_m_comp": 81870872,
+    "m0": 8024064,
+    "m_cctx": 67626008,
+    "bc": 1,
+    "ram_rel": [
+     0.0044523771531345116
+    ],
+    "ram_dec_rel": [
+     0.002427813212669532
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|16|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "cfg": "Z|ZW1|16|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "way": "ZW1",
+   "options": {
+    "level": "16",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "20"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 20,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 61559760,
+   "cpu_s_min": {
+    "mean": 107.57671206,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 40697856,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.008246495627572016,
+    "bytes_per_frame": {
+     "mean": 51299.8,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 89155427.8,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.3522064766589506,
+    "peak_private": {
+     "mean": 48738304,
+     "spread": 0
+    },
+    "known_m_comp": 48482072,
+    "m0": 8040448,
+    "m_cctx": 34220824,
+    "bc": 1,
+    "ram_rel": [
+     0.0052850876505443085
+    ],
+    "ram_dec_rel": [
+     0.006449451470832024
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|17|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "cfg": "Z|ZW1|17|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "way": "ZW1",
+   "options": {
+    "level": "17",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "20"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 20,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 58503780,
+   "cpu_s_min": {
+    "mean": 112.50704286,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 57491456,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.007837119020061728,
+    "bytes_per_frame": {
+     "mean": 48753.15,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 93142763.25,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.32576490162037036,
+    "peak_private": {
+     "mean": 65540096,
+     "spread": 0
+    },
+    "known_m_comp": 65267480,
+    "m0": 8048640,
+    "m_cctx": 50998040,
+    "bc": 1,
+    "ram_rel": [
+     0.004176904026323676
+    ],
+    "ram_dec_rel": [
+     0.006067716619217435
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|18|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "cfg": "Z|ZW1|18|bgr|whole|32|0|0|0|0|20|25|0|20",
+   "way": "ZW1",
+   "options": {
+    "level": "18",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "20"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 20,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 58782000,
+   "cpu_s_min": {
+    "mean": 138.57230136,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 58134528,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.007874389146090535,
+    "bytes_per_frame": {
+     "mean": 48985,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 114882867.8,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.42798155381944447,
+    "peak_private": {
+     "mean": 66166784,
+     "spread": 0
+    },
+    "known_m_comp": 65895574,
+    "m0": 8032256,
+    "m_cctx": 51642518,
+    "bc": 1,
+    "ram_rel": [
+     0.004115754420774906
+    ],
+    "ram_dec_rel": [
+     0.0026573363831197683
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|19|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "cfg": "Z|ZW1|19|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "way": "ZW1",
+   "options": {
+    "level": "19",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "5"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 5,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 53364960,
+   "cpu_s_min": {
+    "mean": 284.55107807999997,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 91774976,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.007148726851851852,
+    "bytes_per_frame": {
+     "mean": 44470.8,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 236479306.8,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.4854230324074074,
+    "peak_private": {
+     "mean": 99807232,
+     "spread": 0
+    },
+    "known_m_comp": 99450006,
+    "m0": 8032256,
+    "m_cctx": 85196950,
+    "bc": 1,
+    "ram_rel": [
+     0.003592015871773804
+    ],
+    "ram_dec_rel": [
+     0.0030709599897069625
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|20|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "cfg": "Z|ZW1|20|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "way": "ZW1",
+   "options": {
+    "level": "20",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "5"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 5,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 53364960,
+   "cpu_s_min": {
+    "mean": 284.21432136000004,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 108625920,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.007148726851851852,
+    "bytes_per_frame": {
+     "mean": 44470.8,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 236191933.2,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.4991278935185185,
+    "peak_private": {
+     "mean": 116662272,
+     "spread": 0
+    },
+    "known_m_comp": 116231318,
+    "m0": 8036352,
+    "m_cctx": 101974166,
+    "bc": 1,
+    "ram_rel": [
+     0.003707727034464154
+    ],
+    "ram_dec_rel": [
+     0.0030700863685776065
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|21|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "cfg": "Z|ZW1|21|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "way": "ZW1",
+   "options": {
+    "level": "21",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "5"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 5,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 52514880,
+   "cpu_s_min": {
+    "mean": 382.42066968,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 142213120,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.007034850823045268,
+    "bytes_per_frame": {
+     "mean": 43762.4,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 318048599,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.4735960648148148,
+    "peak_private": {
+     "mean": 150245376,
+     "spread": 0
+    },
+    "known_m_comp": 149781654,
+    "m0": 8032256,
+    "m_cctx": 135528598,
+    "bc": 1,
+    "ram_rel": [
+     0.0030959866419955546
+    ],
+    "ram_dec_rel": [
+     0.0031213453486868665
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|22|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "cfg": "Z|ZW1|22|bgr|whole|32|0|0|0|0|20|25|0|5",
+   "way": "ZW1",
+   "options": {
+    "level": "22",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "5"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 5,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 52002000,
+   "cpu_s_min": {
+    "mean": 611.3865518399999,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 142233600,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.006966145833333334,
+    "bytes_per_frame": {
+     "mean": 43335,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 508877844.8,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.48968180941358025,
+    "peak_private": {
+     "mean": 150274048,
+     "spread": 0
+    },
+    "known_m_comp": 149789846,
+    "m0": 8040448,
+    "m_cctx": 135528598,
+    "bc": 1,
+    "ram_rel": [
+     0.0032325422111723115
+    ],
+    "ram_dec_rel": [
+     0.0031488946371577343
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW7|-3|bgr|xor|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW7|-3|bgr|xor|32|0|0|0|0|20|25|0|",
+   "way": "ZW7",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "xor",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 204671796,
+   "cpu_s_min": {
+    "mean": 3.971145921,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13217792,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.02741766814557613,
+    "bytes_per_frame": {
+     "mean": 170559.83,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2855511.7925,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9594400752314814,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21023768,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.01076305636553828
+    ],
+    "ram_dec_rel": [
+     0.019270287935574986
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW8|-3|bgr|tiles|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW8|-3|bgr|tiles|32|0|0|0|0|20|25|0|",
+   "way": "ZW8",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "tiles",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 153777276,
+   "cpu_s_min": {
+    "mean": 2.990584014,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19460096,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.020599879436728395,
+    "bytes_per_frame": {
+     "mean": 128147.73,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2080935.245,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.6889548900462963,
+    "peak_private": {
+     "mean": 27496448,
+     "spread": 0
+    },
+    "known_m_comp": 27248664,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.00909343665436221
+    ],
+    "ram_dec_rel": [
+     0.022367771067236177
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW8|-3|bgr|tiles|64|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW8|-3|bgr|tiles|64|0|0|0|0|20|25|0|",
+   "way": "ZW8",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "tiles",
+    "tile": "64",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 150432537,
+   "cpu_s_min": {
+    "mean": 3.1739040660000004,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19447808,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.020151820907278805,
+    "bytes_per_frame": {
+     "mean": 125360.4475,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2236615.9975,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.7612286904417438,
+    "peak_private": {
+     "mean": 27480064,
+     "spread": 0
+    },
+    "known_m_comp": 27244568,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.008643778091838344
+    ],
+    "ram_dec_rel": [
+     0.021958555688071417
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW8|-3|bgr|tiles|128|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW8|-3|bgr|tiles|128|0|0|0|0|20|25|0|",
+   "way": "ZW8",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "tiles",
+    "tile": "128",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 148200018,
+   "cpu_s_min": {
+    "mean": 3.3945114059999995,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19451904,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.0198527544688786,
+    "bytes_per_frame": {
+     "mean": 123500.015,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2359242.22,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.7564220040027007,
+    "peak_private": {
+     "mean": 27488256,
+     "spread": 0
+    },
+    "known_m_comp": 27248664,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.008792798061585698
+    ],
+    "ram_dec_rel": [
+     0.022083272423270104
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW9|-3|bgr|rect|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW9|-3|bgr|rect|32|0|0|0|0|20|25|0|",
+   "way": "ZW9",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "rect",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 140291970,
+   "cpu_s_min": {
+    "mean": 3.9978652320000005,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19451904,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01879339875900206,
+    "bytes_per_frame": {
+     "mean": 116909.975,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2922651.755,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.6004394302179784,
+    "peak_private": {
+     "mean": 27475968,
+     "spread": 0
+    },
+    "known_m_comp": 27236376,
+    "m0": 8024064,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.008796765032176086
+    ],
+    "ram_dec_rel": [
+     0.022505736051168592
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW0|-3|bgr|raw|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW0|-3|bgr|raw|32|0|0|0|0|20|25|0|",
+   "way": "ZW0",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "raw",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 7464960000,
+   "cpu_s_min": {
+    "mean": 2.929034529,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 6344704,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 1,
+    "bytes_per_frame": {
+     "mean": 6220800,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 397358.0275,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.17285043282214507,
+    "peak_private": {
+     "mean": 14385152,
+     "spread": 0
+    },
+    "known_m_comp": 14261248,
+    "m0": 8040448,
+    "m_cctx": 0,
+    "bc": 1,
+    "ram_rel": [
+     0.008688159689811159
+    ],
+    "ram_dec_rel": [
+     0.011498850114988501
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|16384|",
+   "cfg": "Z|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|16384|",
+   "way": "ZW1",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "16384"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 149033070,
+   "cpu_s_min": {
+    "mean": 2.78975406,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 7774208,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01996434944058642,
+    "bytes_per_frame": {
+     "mean": 124194.225,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1957329.44,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8742658600983796,
+    "peak_private": {
+     "mean": 15810560,
+     "spread": 0
+    },
+    "known_m_comp": 14807064,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.0677714366602319
+    ],
+    "ram_dec_rel": [
+     0.008793108315850588
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW2|-3|bgra|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW2|-3|bgra|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW2",
+   "options": {
+    "level": "-3",
+    "layout": "bgra",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 162076305,
+   "cpu_s_min": {
+    "mean": 4.053950844,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 17383424,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.021711610644933127,
+    "bytes_per_frame": {
+     "mean": 135063.5875,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2888024.72,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.1605715832368828,
+    "peak_private": {
+     "mean": 25415680,
+     "spread": 0
+    },
+    "known_m_comp": 25170968,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2.6666666666666665,
+    "ram_rel": [
+     0.009721994005157053
+    ],
+    "ram_dec_rel": [
+     0.019976216293160133
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW3|-3|planar|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW3|-3|planar|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW3",
+   "options": {
+    "level": "-3",
+    "layout": "planar",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 268430823,
+   "cpu_s_min": {
+    "mean": 3.457501638,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13213696,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.035958775800540126,
+    "bytes_per_frame": {
+     "mean": 223692.3525,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2458439.01,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8356617392457562,
+    "peak_private": {
+     "mean": 21245952,
+     "spread": 0
+    },
+    "known_m_comp": 21023768,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010568229253671369
+    ],
+    "ram_dec_rel": [
+     0.01655752941785304
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW4|-3|sg|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW4|-3|sg|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW4",
+   "options": {
+    "level": "-3",
+    "layout": "sg",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 148601313,
+   "cpu_s_min": {
+    "mean": 3.763060947,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13230080,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.019906511622299384,
+    "bytes_per_frame": {
+     "mean": 123834.4275,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2687970.13,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.3410417474440586,
+    "peak_private": {
+     "mean": 21262336,
+     "spread": 0
+    },
+    "known_m_comp": 21023768,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.011347537701139016
+    ],
+    "ram_dec_rel": [
+     0.022642016869067656
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW4|-3|sgp|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW4|-3|sgp|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW4",
+   "options": {
+    "level": "-3",
+    "layout": "sgp",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 268391295,
+   "cpu_s_min": {
+    "mean": 3.47951721,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13213696,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.03595348066165124,
+    "bytes_per_frame": {
+     "mean": 223659.4125,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2457863.01,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8675655803915895,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21027864,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010566170677154846
+    ],
+    "ram_dec_rel": [
+     0.01657473427492011
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW5|-3|ycocg|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW5|-3|ycocg|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW5",
+   "options": {
+    "level": "-3",
+    "layout": "ycocg",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 272160036,
+   "cpu_s_min": {
+    "mean": 3.856915221,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13217792,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.036458338155864196,
+    "bytes_per_frame": {
+     "mean": 226800.03,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2724486.145,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9252678566261574,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21023768,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.01076305636553828
+    ],
+    "ram_dec_rel": [
+     0.016639352008644727
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW6|-3|predl|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW6|-3|predl|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW6",
+   "options": {
+    "level": "-3",
+    "layout": "predl",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 159905391,
+   "cpu_s_min": {
+    "mean": 3.420739359,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13221888,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.021420796762474277,
+    "bytes_per_frame": {
+     "mean": 133254.4925,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2335108.39,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 2.3167715277777776,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21019672,
+    "m0": 8028160,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010960018786211317
+    ],
+    "ram_dec_rel": [
+     0.021789139845546156
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW6|-3|predu|whole|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW6|-3|predu|whole|32|0|0|0|0|20|25|0|",
+   "way": "ZW6",
+   "options": {
+    "level": "-3",
+    "layout": "predu",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 158977320,
+   "cpu_s_min": {
+    "mean": 3.1224189090000003,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13225984,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.021296473122427984,
+    "bytes_per_frame": {
+     "mean": 132481.1,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2122970.3175,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.951703239535108,
+    "peak_private": {
+     "mean": 21266432,
+     "spread": 0
+    },
+    "known_m_comp": 21031960,
+    "m0": 8040448,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.011148366581146027
+    ],
+    "ram_dec_rel": [
+     0.0218137948904735
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW7|-3|bgr|xor|32|0|0|0|0|1|25|0|",
+   "cfg": "Z|ZW7|-3|bgr|xor|32|0|0|0|0|1|25|0|",
+   "way": "ZW7",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "xor",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "1",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 148950549,
+   "cpu_s_min": {
+    "mean": 2.9484093810000003,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13213696,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.019953294994212965,
+    "bytes_per_frame": {
+     "mean": 124125.4575,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2042968.9725,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9254599705825617,
+    "peak_private": {
+     "mean": 21270528,
+     "spread": 0
+    },
+    "known_m_comp": 21048344,
+    "m0": 8056832,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010555889812519217
+    ],
+    "ram_dec_rel": [
+     0.030251955102166297
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW7|-3|bgr|xor|32|0|0|0|0|100|25|0|",
+   "cfg": "Z|ZW7|-3|bgr|xor|32|0|0|0|0|100|25|0|",
+   "way": "ZW7",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "xor",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "100",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 207003420,
+   "cpu_s_min": {
+    "mean": 4.378978934999999,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13238272,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.027730010609567902,
+    "bytes_per_frame": {
+     "mean": 172502.85,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 3143909.035,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.0069910867573302,
+    "peak_private": {
+     "mean": 21270528,
+     "spread": 0
+    },
+    "known_m_comp": 21023768,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.011737191924872839
+    ],
+    "ram_dec_rel": [
+     0.019270287935574986
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW7|-3|bgr|xor|32|0|0|0|0|all|25|0|",
+   "cfg": "Z|ZW7|-3|bgr|xor|32|0|0|0|0|all|25|0|",
+   "way": "ZW7",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "xor",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "all",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 207404043,
+   "cpu_s_min": {
+    "mean": 4.007400336,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13217792,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.027783677742412555,
+    "bytes_per_frame": {
+     "mean": 172836.7025,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2902639.695,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9821410337094908,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21023768,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.01076305636553828
+    ],
+    "ram_dec_rel": [
+     0.019270287935574986
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW7|-3|bgr|sub|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW7|-3|bgr|sub|32|0|0|0|0|20|25|0|",
+   "way": "ZW7",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "sub",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 288776034,
+   "cpu_s_min": {
+    "mean": 4.915618974,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13221888,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.038684203800154325,
+    "bytes_per_frame": {
+     "mean": 240646.695,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 3611342.405,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.2114548852237654,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21019672,
+    "m0": 8028160,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010960018786211317
+    ],
+    "ram_dec_rel": [
+     0.015717897997133613
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW12|-3|bgr|prefix|32|24|0|0|0|1|25|0|",
+   "cfg": "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|1|25|0|",
+   "way": "ZW12",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "prefix",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "1",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 140151156,
+   "cpu_s_min": {
+    "mean": 2.898539586,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13209600,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01877453542952675,
+    "bytes_per_frame": {
+     "mean": 116792.63,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1979400.3575,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8424596583236883,
+    "peak_private": {
+     "mean": 21250048,
+     "spread": 0
+    },
+    "known_m_comp": 21031960,
+    "m0": 8040448,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.01036936167622989
+    ],
+    "ram_dec_rel": [
+     0.030490762686763984
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW12|-3|bgr|prefix|32|24|0|0|0|20|25|0|",
+   "cfg": "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|20|25|0|",
+   "way": "ZW12",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "prefix",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 139909362,
+   "cpu_s_min": {
+    "mean": 3.0404923440000005,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13217792,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.018742144900977364,
+    "bytes_per_frame": {
+     "mean": 116591.135,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2128665.9675,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8793251555266204,
+    "peak_private": {
+     "mean": 21245952,
+     "spread": 0
+    },
+    "known_m_comp": 21019672,
+    "m0": 8028160,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010765153709344276
+    ],
+    "ram_dec_rel": [
+     0.022379928649364816
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW12|-3|bgr|prefix|32|24|0|0|0|100|25|0|",
+   "cfg": "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|100|25|0|",
+   "way": "ZW12",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "prefix",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "100",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 139906557,
+   "cpu_s_min": {
+    "mean": 3.070668792,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13217792,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01874176914544753,
+    "bytes_per_frame": {
+     "mean": 116588.7975,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2158844.615,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.899196250482253,
+    "peak_private": {
+     "mean": 21241856,
+     "spread": 0
+    },
+    "known_m_comp": 21015576,
+    "m0": 8024064,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.010767251870707708
+    ],
+    "ram_dec_rel": [
+     0.022186376466855583
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW12|-3|bgr|prefix|32|24|0|0|0|all|25|0|",
+   "cfg": "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|all|25|0|",
+   "way": "ZW12",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "prefix",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "all",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 139904901,
+   "cpu_s_min": {
+    "mean": 2.9992915470000003,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13225984,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.018741547309027776,
+    "bytes_per_frame": {
+     "mean": 116587.4175,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2109402.2275,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8845768036265432,
+    "peak_private": {
+     "mean": 21262336,
+     "spread": 0
+    },
+    "known_m_comp": 21027864,
+    "m0": 8036352,
+    "m_cctx": 549912,
+    "bc": 2,
+    "ram_rel": [
+     0.011150538162126215
+    ],
+    "ram_dec_rel": [
+     0.022173206711002837
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|23|0|0|0|20|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|23|0|0|0|20|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "23",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 51131535,
+   "cpu_s_min": {
+    "mean": 2.293727829,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 15589376,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.006849539046424898,
+    "bytes_per_frame": {
+     "mean": 42609.6125,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1528524.6725,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.6201639033564815,
+    "peak_private": {
+     "mean": 23642112,
+     "spread": 0
+    },
+    "known_m_comp": 23474713,
+    "m0": 8052736,
+    "m_cctx": 9201177,
+    "bc": 1,
+    "ram_rel": [
+     0.007131034999235134
+    ],
+    "ram_dec_rel": [
+     0.006552676344943221
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|24|0|0|0|20|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|24|0|0|0|20|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 37251309,
+   "cpu_s_min": {
+    "mean": 2.128876773,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 24006656,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.0049901552051183126,
+    "bytes_per_frame": {
+     "mean": 31042.7575,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1420081.8925,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.5869009536554783,
+    "peak_private": {
+     "mean": 32038912,
+     "spread": 0
+    },
+    "known_m_comp": 31842841,
+    "m0": 8032256,
+    "m_cctx": 17589785,
+    "bc": 1,
+    "ram_rel": [
+     0.006157459379959219
+    ],
+    "ram_dec_rel": [
+     0.0054670724889242205
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|25|0|0|0|20|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|25|0|0|0|20|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "25",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 24833649,
+   "cpu_s_min": {
+    "mean": 1.937490414,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 40808448,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.0033266955214763375,
+    "bytes_per_frame": {
+     "mean": 20694.7075,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1258603.155,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.4990560956790123,
+    "peak_private": {
+     "mean": 48844800,
+     "spread": 0
+    },
+    "known_m_comp": 48624153,
+    "m0": 8036352,
+    "m_cctx": 34367001,
+    "bc": 1,
+    "ram_rel": [
+     0.004537806550584027
+    ],
+    "ram_dec_rel": [
+     0.004237609520140741
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|27|0|0|0|20|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|27|0|0|0|20|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "27",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 12286035,
+   "cpu_s_min": {
+    "mean": 1.892319555,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 141680640,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.001645827305169753,
+    "bytes_per_frame": {
+     "mean": 10238.3625,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1222918.26,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.5093657057773919,
+    "peak_private": {
+     "mean": 149712896,
+     "spread": 0
+    },
+    "known_m_comp": 149283353,
+    "m0": 8032256,
+    "m_cctx": 135030297,
+    "bc": 1,
+    "ram_rel": [
+     0.002877367043062062
+    ],
+    "ram_dec_rel": [
+     0.0026989929438754083
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|24|0|0|0|1|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|24|0|0|0|1|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "1",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 140151156,
+   "cpu_s_min": {
+    "mean": 2.668554006,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 13422592,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01877453542952675,
+    "bytes_per_frame": {
+     "mean": 116792.63,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1817312.99,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8692946457851081,
+    "peak_private": {
+     "mean": 21463040,
+     "spread": 0
+    },
+    "known_m_comp": 31851033,
+    "m0": 8040448,
+    "m_cctx": 17589785,
+    "bc": 1,
+    "ram_rel": [
+     -0.32614304848448716
+    ],
+    "ram_dec_rel": [
+     -0.5381845202950363
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|24|0|0|0|100|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|24|0|0|0|100|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "100",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 36008601,
+   "cpu_s_min": {
+    "mean": 2.033802417,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 23998464,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.004823683047196502,
+    "bytes_per_frame": {
+     "mean": 30007.1675,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1340216.315,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.5860658239293981,
+    "peak_private": {
+     "mean": 32026624,
+     "spread": 0
+    },
+    "known_m_comp": 31838745,
+    "m0": 8028160,
+    "m_cctx": 17589785,
+    "bc": 1,
+    "ram_rel": [
+     0.005900954952841263
+    ],
+    "ram_dec_rel": [
+     0.005470386004084759
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW13|-3|bgr|stream|32|24|0|0|0|all|25|0|",
+   "cfg": "Z|ZW13|-3|bgr|stream|32|24|0|0|0|all|25|0|",
+   "way": "ZW13",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "all",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 35648973,
+   "cpu_s_min": {
+    "mean": 2.125366065,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 24002560,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.004775507571373457,
+    "bytes_per_frame": {
+     "mean": 29707.4775,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1406903.6825,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.5766105794270834,
+    "peak_private": {
+     "mean": 32030720,
+     "spread": 0
+    },
+    "known_m_comp": 31838745,
+    "m0": 8028160,
+    "m_cctx": 17589785,
+    "bc": 1,
+    "ram_rel": [
+     0.0060296032397005594
+    ],
+    "ram_dec_rel": [
+     0.005599840154465097
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW14|-3|bgr|stream|32|24|1|0|0|20|25|0|",
+   "cfg": "Z|ZW14|-3|bgr|stream|32|24|1|0|0|20|25|0|",
+   "way": "ZW14",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "stream",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "1",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 30492510,
+   "cpu_s_min": {
+    "mean": 6.113583332999999,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 25083904,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.004084751961162552,
+    "bytes_per_frame": {
+     "mean": 25410.425,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 4683908.3025,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.5142565972222222,
+    "peak_private": {
+     "mean": 33116160,
+     "spread": 0
+    },
+    "known_m_comp": 32924185,
+    "m0": 8032256,
+    "m_cctx": 18671129,
+    "bc": 1,
+    "ram_rel": [
+     0.005830820109897937
+    ],
+    "ram_dec_rel": [
+     0.005499393863443532
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW15|-3|bgr|prefix|32|24|1|0|0|20|25|0|",
+   "cfg": "Z|ZW15|-3|bgr|prefix|32|24|1|0|0|20|25|0|",
+   "way": "ZW15",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "prefix",
+    "tile": "32",
+    "wlog": "24",
+    "ldm": "1",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 10633296,
+   "cpu_s_min": {
+    "mean": 8.036782248,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 14303232,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.0014244277263374485,
+    "bytes_per_frame": {
+     "mean": 8861.08,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 6275818.2,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.2303642047646605,
+    "peak_private": {
+     "mean": 22331392,
+     "spread": 0
+    },
+    "known_m_comp": 22101016,
+    "m0": 8028160,
+    "m_cctx": 1631256,
+    "bc": 2,
+    "ram_rel": [
+     0.010423774183051132
+    ],
+    "ram_dec_rel": [
+     0.008661540282151848
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW16|-3|bgr|whole|32|0|0|110|0|20|25|0|40",
+   "cfg": "Z|ZW16|-3|bgr|whole|32|0|0|110|0|20|25|0|40",
+   "way": "ZW16",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "110",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "40"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 40,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 153234210,
+   "cpu_s_min": {
+    "mean": 2.57409609,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 7229440,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.02052713075488683,
+    "bytes_per_frame": {
+     "mean": 127695.175,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1761965.475,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.928203197337963,
+    "peak_private": {
+     "mean": 15470592,
+     "spread": 0
+    },
+    "known_m_comp": 15091496,
+    "m0": 8241152,
+    "m_cctx": 629544,
+    "bc": 1,
+    "ram_rel": [
+     0.025119842327096003
+    ],
+    "ram_dec_rel": [
+     0.04270573830245075
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW16|-3|bgr|whole|32|0|0|1024|0|20|25|0|40",
+   "cfg": "Z|ZW16|-3|bgr|whole|32|0|0|1024|0|20|25|0|40",
+   "way": "ZW16",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "1024",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0",
+    "frames_cap": "40"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 40,
+   "capped": true,
+   "status": "ok",
+   "bytes_min": 153227880,
+   "cpu_s_min": {
+    "mean": 2.79383949,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 7139328,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.020526282793209876,
+    "bytes_per_frame": {
+     "mean": 127689.9,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 1905310.225,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.949062729070216,
+    "peak_private": {
+     "mean": 16302080,
+     "spread": 0
+    },
+    "known_m_comp": 15960808,
+    "m0": 9162752,
+    "m_cctx": 577256,
+    "bc": 1,
+    "ram_rel": [
+     0.021381874902573855
+    ],
+    "ram_dec_rel": [
+     0.04751166111156434
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW17|-3|bgr|whole|32|0|0|0|1|20|25|0|",
+   "cfg": "Z|ZW17|-3|bgr|whole|32|0|0|0|1|20|25|0|",
+   "way": "ZW17",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "1",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 149307849,
+   "cpu_s_min": {
+    "mean": 3.387458613,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 17661952,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.020001158613040124,
+    "bytes_per_frame": {
+     "mean": 124423.2075,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2411552.1975,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9103690719039352,
+    "peak_private": {
+     "mean": 25694208,
+     "spread": 0
+    },
+    "known_m_comp": 14802968,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     0.735747047483991
+    ],
+    "ram_dec_rel": [
+     0.03764063314744275
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW17|-3|bgr|whole|32|0|0|0|2|20|25|0|",
+   "cfg": "Z|ZW17|-3|bgr|whole|32|0|0|0|2|20|25|0|",
+   "way": "ZW17",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "whole",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "2",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 149307849,
+   "cpu_s_min": {
+    "mean": 3.289707666,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 22458368,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.020001158613040124,
+    "bytes_per_frame": {
+     "mean": 124423.2075,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2339854.77,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9030728322723766,
+    "peak_private": {
+     "mean": 30498816,
+     "spread": 0
+    },
+    "known_m_comp": 14811160,
+    "m0": 8040448,
+    "m_cctx": 549912,
+    "bc": 1,
+    "ram_rel": [
+     1.0591780792321466
+    ],
+    "ram_dec_rel": [
+     0.038749966876595446
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW18|-3|bgr|switch|32|0|0|0|0|20|10|0|",
+   "cfg": "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|10|0|",
+   "way": "ZW18",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "switch",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "10",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 148951749,
+   "cpu_s_min": {
+    "mean": 3.166512948,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19460096,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01995345574524177,
+    "bytes_per_frame": {
+     "mean": 124126.4575,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2235168.75,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.9005749529803241,
+    "peak_private": {
+     "mean": 27492352,
+     "spread": 0
+    },
+    "known_m_comp": 27244568,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.009094803778867039
+    ],
+    "ram_dec_rel": [
+     0.02223670598002256
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW18|-3|bgr|switch|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|25|0|",
+   "way": "ZW18",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "switch",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 148951749,
+   "cpu_s_min": {
+    "mean": 3.2703286140000003,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19451904,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.01995345574524177,
+    "bytes_per_frame": {
+     "mean": 124126.4575,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2295555.1475,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8858616307388117,
+    "peak_private": {
+     "mean": 27496448,
+     "spread": 0
+    },
+    "known_m_comp": 27256856,
+    "m0": 8044544,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.008790155401635464
+    ],
+    "ram_dec_rel": [
+     0.022025793761991673
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW18|-3|bgr|switch|32|0|0|0|0|20|50|0|",
+   "cfg": "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|50|0|",
+   "way": "ZW18",
+   "options": {
+    "level": "-3",
+    "layout": "bgr",
+    "mode": "switch",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "50",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 153778476,
+   "cpu_s_min": {
+    "mean": 3.0816193949999997,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19460096,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.020600040187757202,
+    "bytes_per_frame": {
+     "mean": 128148.73,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 2162228.2975,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.7016059847608025,
+    "peak_private": {
+     "mean": 27492352,
+     "spread": 0
+    },
+    "known_m_comp": 27244568,
+    "m0": 8032256,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.009094803778867039
+    ],
+    "ram_dec_rel": [
+     0.022372145801319153
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW19|-3|ycocg|xor|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW19|-3|ycocg|xor|32|0|0|0|0|20|25|0|",
+   "way": "ZW19",
+   "options": {
+    "level": "-3",
+    "layout": "ycocg",
+    "mode": "xor",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 341894295,
+   "cpu_s_min": {
+    "mean": 5.217238578,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 19443712,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.04579988305362654,
+    "bytes_per_frame": {
+     "mean": 284911.9125,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 3868428.3425,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 1.2300006209008487,
+    "peak_private": {
+     "mean": 27488256,
+     "spread": 0
+    },
+    "known_m_comp": 27256856,
+    "m0": 8044544,
+    "m_cctx": 549912,
+    "bc": 3,
+    "ram_rel": [
+     0.008489607165257798
+    ],
+    "ram_dec_rel": [
+     0.01023377139397885
+    ]
+   }
+  },
+  {
+   "kind": "Z",
+   "key": "Z|scroll-1920x1080|ZW19|-3|ycocg|tiles|32|0|0|0|0|20|25|0|",
+   "cfg": "Z|ZW19|-3|ycocg|tiles|32|0|0|0|0|20|25|0|",
+   "way": "ZW19",
+   "options": {
+    "level": "-3",
+    "layout": "ycocg",
+    "mode": "tiles",
+    "tile": "32",
+    "wlog": "0",
+    "ldm": "0",
+    "dict": "0",
+    "workers": "0",
+    "kz": "20",
+    "theta": "25",
+    "drain": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "px": 2073600,
+   "n_new": 400,
+   "t_s": 20,
+   "runs": 1,
+   "frames": 400,
+   "capped": false,
+   "status": "ok",
+   "bytes_min": 295512501,
+   "cpu_s_min": {
+    "mean": 4.703503041,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 25690112,
+    "spread": 0
+   },
+   "ssim": 1,
+   "psnr": "inf",
+   "r": 1,
+   "O": true,
+   "clause": "",
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "zeta": 0.039586615467464,
+    "bytes_per_frame": {
+     "mean": 246260.4175,
+     "spread": 0
+    },
+    "comp_ns_per_frame": {
+     "mean": 3437228.79,
+     "spread": 0
+    },
+    "dec_ns_per_px_frame": 0.8136113003954475,
+    "peak_private": {
+     "mean": 33734656,
+     "spread": 0
+    },
+    "known_m_comp": 33477656,
+    "m0": 8044544,
+    "m_cctx": 549912,
+    "bc": 4,
+    "ram_rel": [
+     0.007676762076771444
+    ],
+    "ram_dec_rel": [
+     0.012598882454249522
+    ]
+   }
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW1|30|20|1|quality|0",
+   "cfg": "D|DW1|30|20|1|quality|0",
+   "way": "DW1",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 143,
+   "text": true,
+   "bytes_min": 150948,
+   "cpu_s_min": {
+    "mean": 5.437444758,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 127668224,
+    "spread": 0
+   },
+   "ssim": 0.998550948534286,
+   "psnr": 49.115247000464954,
+   "r": 0.9328165802089172,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 50316,
+     "spread": 0
+    },
+    "y_bytes": 0.00016968563843563843,
+    "ssim": {
+     "mean": 0.998550948534286,
+     "spread": 0
+    },
+    "a_rt_frame": 2025280.097902098,
+    "a_w_frame": 10649416.307692308,
+    "cpu_ns": {
+     "mean": 1812481586,
+     "spread": 0
+    },
+    "m_live": 19763200,
+    "m_worker": 107905024,
+    "ram": {
+     "mean": 127668224,
+     "spread": 0
+    },
+    "keyframes": 9
+   },
+   "O": false,
+   "clause": "R = 0.9328 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW1|70|20|1|quality|0",
+   "cfg": "D|DW1|70|20|1|quality|0",
+   "way": "DW1",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 143,
+   "text": true,
+   "bytes_min": 293145,
+   "cpu_s_min": {
+    "mean": 5.423597861999999,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 141041664,
+    "spread": 0
+   },
+   "ssim": 0.9997383246260886,
+   "psnr": 58.59298035731821,
+   "r": 0.9772870185370184,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 97715,
+     "spread": 0
+    },
+    "y_bytes": 0.00032953398838815503,
+    "ssim": {
+     "mean": 0.9997383246260886,
+     "spread": 0
+    },
+    "a_rt_frame": 2033495.4475524474,
+    "a_w_frame": 10608923.811188811,
+    "cpu_ns": {
+     "mean": 1807865954,
+     "spread": 0
+    },
+    "m_live": 19271680,
+    "m_worker": 121769984,
+    "ram": {
+     "mean": 141041664,
+     "spread": 0
+    },
+    "keyframes": 9
+   },
+   "O": false,
+   "clause": "R = 0.9773 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW1|100|20|1|quality|0",
+   "cfg": "D|DW1|100|20|1|quality|0",
+   "way": "DW1",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 143,
+   "text": true,
+   "bytes_min": 363327,
+   "cpu_s_min": {
+    "mean": 5.582832399,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 129978368,
+    "spread": 0
+   },
+   "ssim": 0.9999796845131409,
+   "psnr": 66.01193580724983,
+   "r": 0.9707888599329607,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 121109,
+     "spread": 0
+    },
+    "y_bytes": 0.0004084278954070621,
+    "ssim": {
+     "mean": 0.9999796845131409,
+     "spread": 0
+    },
+    "a_rt_frame": 2014030.013986014,
+    "a_w_frame": 10999565.321678322,
+    "cpu_ns": {
+     "mean": 1860944133,
+     "spread": 0
+    },
+    "m_live": 18726912,
+    "m_worker": 111251456,
+    "ram": {
+     "mean": 129978368,
+     "spread": 0
+    },
+    "keyframes": 9
+   },
+   "O": false,
+   "clause": "R = 0.9708 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW2|30|20|1|quality|0",
+   "cfg": "D|DW2|30|20|1|quality|0",
+   "way": "DW2",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 143,
+   "text": true,
+   "bytes_min": 262263,
+   "cpu_s_min": {
+    "mean": 7.802135202,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 713736192,
+    "spread": 0
+   },
+   "ssim": 0.999162832765931,
+   "psnr": 50.04050853961619,
+   "r": 0.9263696546844515,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 87421,
+     "spread": 0
+    },
+    "y_bytes": 0.0002948185109643443,
+    "ssim": {
+     "mean": 0.999162832765931,
+     "spread": 0
+    },
+    "a_rt_frame": 2118624.685314685,
+    "a_w_frame": 16068170.657342657,
+    "cpu_ns": {
+     "mean": 2600711734,
+     "spread": 0
+    },
+    "m_live": 19382272,
+    "m_worker": 694353920,
+    "ram": {
+     "mean": 713736192,
+     "spread": 0
+    },
+    "keyframes": 9
+   },
+   "O": false,
+   "clause": "R = 0.9264 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW2|70|20|1|quality|0",
+   "cfg": "D|DW2|70|20|1|quality|0",
+   "way": "DW2",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 143,
+   "text": true,
+   "bytes_min": 351987,
+   "cpu_s_min": {
+    "mean": 7.344054437999999,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 749154304,
+    "spread": 0
+   },
+   "ssim": 0.9999274137250553,
+   "psnr": 61.36915432390891,
+   "r": 0.9938362521317068,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 117329,
+     "spread": 0
+    },
+    "y_bytes": 0.00039568022640939306,
+    "ssim": {
+     "mean": 0.9999274137250553,
+     "spread": 0
+    },
+    "a_rt_frame": 2046726.3006993006,
+    "a_w_frame": 15072281.713286713,
+    "cpu_ns": {
+     "mean": 2448018146,
+     "spread": 0
+    },
+    "m_live": 19677184,
+    "m_worker": 729477120,
+    "ram": {
+     "mean": 749154304,
+     "spread": 0
+    },
+    "keyframes": 9
+   },
+   "O": false,
+   "clause": "R = 0.9938 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW2|100|20|1|quality|0",
+   "cfg": "D|DW2|100|20|1|quality|0",
+   "way": "DW2",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 143,
+   "text": true,
+   "bytes_min": 444333,
+   "cpu_s_min": {
+    "mean": 7.409751621,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 737062912,
+    "spread": 0
+   },
+   "ssim": 0.9999809590141321,
+   "psnr": 66.32595853456304,
+   "r": 0.9589150474709129,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 148111,
+     "spread": 0
+    },
+    "y_bytes": 0.000499489418760252,
+    "ssim": {
+     "mean": 0.9999809590141321,
+     "spread": 0
+    },
+    "a_rt_frame": 2046720.6853146853,
+    "a_w_frame": 15225427.615384616,
+    "cpu_ns": {
+     "mean": 2469917207,
+     "spread": 0
+    },
+    "m_live": 19341312,
+    "m_worker": 717721600,
+    "ram": {
+     "mean": 737062912,
+     "spread": 0
+    },
+    "keyframes": 9
+   },
+   "O": false,
+   "clause": "R = 0.9589 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW3|30|20|1|quality|0",
+   "cfg": "D|DW3|30|20|1|quality|0",
+   "way": "DW3",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "not_activated",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: not_activated: activation failed: Catastrophic failure (0x8000FFFF)",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW3|70|20|1|quality|0",
+   "cfg": "D|DW3|70|20|1|quality|0",
+   "way": "DW3",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "not_activated",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: not_activated: activation failed: Catastrophic failure (0x8000FFFF)",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW3|100|20|1|quality|0",
+   "cfg": "D|DW3|100|20|1|quality|0",
+   "way": "DW3",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "not_activated",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: not_activated: activation failed: Catastrophic failure (0x8000FFFF)",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW4|30|20|1|quality|0",
+   "cfg": "D|DW4|30|20|1|quality|0",
+   "way": "DW4",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "no_product_path",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: no_product_path: DW4 activates; system-memory NV12: no (SetOutputType 0x80041000); the product's Sink Writer cannot select it",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW4|70|20|1|quality|0",
+   "cfg": "D|DW4|70|20|1|quality|0",
+   "way": "DW4",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "no_product_path",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: no_product_path: DW4 activates; system-memory NV12: no (SetOutputType 0x80041000); the product's Sink Writer cannot select it",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|typing-1920x1080|DW4|100|20|1|quality|0",
+   "cfg": "D|DW4|100|20|1|quality|0",
+   "way": "DW4",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "typing-1920x1080",
+   "content": "typing",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 143,
+   "status": "no_product_path",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: no_product_path: DW4 activates; system-memory NV12: no (SetOutputType 0x80041000); the product's Sink Writer cannot select it",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW1|30|20|1|quality|0",
+   "cfg": "D|DW1|30|20|1|quality|0",
+   "way": "DW1",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 400,
+   "text": true,
+   "bytes_min": 11458650,
+   "cpu_s_min": {
+    "mean": 17.543615187,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 131850240,
+    "spread": 0
+   },
+   "ssim": 0.9891479323709457,
+   "psnr": 35.36649082406269,
+   "r": 0.9947316773153695,
+   "held_out": true,
+   "in_fit": false,
+   "fit": {
+    "bytes": {
+     "mean": 3819550,
+     "spread": 0
+    },
+    "y_bytes": 0.00460497444058642,
+    "ssim": {
+     "mean": 0.9891479323709457,
+     "spread": 0
+    },
+    "a_rt_frame": 3366121.595,
+    "a_w_frame": 11253557.7275,
+    "cpu_ns": {
+     "mean": 5847871729,
+     "spread": 0
+    },
+    "m_live": 18726912,
+    "m_worker": 113123328,
+    "ram": {
+     "mean": 131850240,
+     "spread": 0
+    },
+    "keyframes": 21
+   },
+   "O": false,
+   "clause": "R = 0.9947 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW1|70|20|1|quality|0",
+   "cfg": "D|DW1|70|20|1|quality|0",
+   "way": "DW1",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 400,
+   "text": true,
+   "bytes_min": 28257240,
+   "cpu_s_min": {
+    "mean": 18.012136208999998,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 144605184,
+    "spread": 0
+   },
+   "ssim": 0.998347407558612,
+   "psnr": 45.64021816991794,
+   "r": 0.9974244918735877,
+   "held_out": true,
+   "in_fit": false,
+   "fit": {
+    "bytes": {
+     "mean": 9419080,
+     "spread": 0
+    },
+    "y_bytes": 0.01135595100308642,
+    "ssim": {
+     "mean": 0.998347407558612,
+     "spread": 0
+    },
+    "a_rt_frame": 3349176.17,
+    "a_w_frame": 11660937.3375,
+    "cpu_ns": {
+     "mean": 6004045403,
+     "spread": 0
+    },
+    "m_live": 19554304,
+    "m_worker": 125050880,
+    "ram": {
+     "mean": 144605184,
+     "spread": 0
+    },
+    "keyframes": 21
+   },
+   "O": false,
+   "clause": "R = 0.9974 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW1|100|20|1|quality|0",
+   "cfg": "D|DW1|100|20|1|quality|0",
+   "way": "DW1",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 400,
+   "text": true,
+   "bytes_min": 75319260,
+   "cpu_s_min": {
+    "mean": 17.13530673,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 144662528,
+    "spread": 0
+   },
+   "ssim": 0.9997079950157053,
+   "psnr": 52.215528431091364,
+   "r": 0.9965514422199024,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 25106420,
+     "spread": 0
+    },
+    "y_bytes": 0.030269121334876543,
+    "ssim": {
+     "mean": 0.9997079950157053,
+     "spread": 0
+    },
+    "a_rt_frame": 3325539.86,
+    "a_w_frame": 10953882.415,
+    "cpu_ns": {
+     "mean": 5711768910,
+     "spread": 0
+    },
+    "m_live": 19632128,
+    "m_worker": 125030400,
+    "ram": {
+     "mean": 144662528,
+     "spread": 0
+    },
+    "keyframes": 21
+   },
+   "O": false,
+   "clause": "R = 0.9966 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW2|30|20|1|quality|0",
+   "cfg": "D|DW2|30|20|1|quality|0",
+   "way": "DW2",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 400,
+   "text": true,
+   "bytes_min": 10397862,
+   "cpu_s_min": {
+    "mean": 23.961501006,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 715841536,
+    "spread": 0
+   },
+   "ssim": 0.9904241947548216,
+   "psnr": 35.493357638956915,
+   "r": 0.9963322150755429,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 3465954,
+     "spread": 0
+    },
+    "y_bytes": 0.004178667534722222,
+    "ssim": {
+     "mean": 0.9904241947548216,
+     "spread": 0
+    },
+    "a_rt_frame": 3356045.495,
+    "a_w_frame": 16611872.01,
+    "cpu_ns": {
+     "mean": 7987167002,
+     "spread": 0
+    },
+    "m_live": 19349504,
+    "m_worker": 696492032,
+    "ram": {
+     "mean": 715841536,
+     "spread": 0
+    },
+    "keyframes": 21
+   },
+   "O": false,
+   "clause": "R = 0.9963 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW2|70|20|1|quality|0",
+   "cfg": "D|DW2|70|20|1|quality|0",
+   "way": "DW2",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 400,
+   "text": true,
+   "bytes_min": 27738228,
+   "cpu_s_min": {
+    "mean": 24.404295735,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 716361728,
+    "spread": 0
+   },
+   "ssim": 0.9986593337585216,
+   "psnr": 46.30463680287946,
+   "r": 0.9964954610292628,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 9246076,
+     "spread": 0
+    },
+    "y_bytes": 0.011147371720679013,
+    "ssim": {
+     "mean": 0.9986593337585216,
+     "spread": 0
+    },
+    "a_rt_frame": 3326253.585,
+    "a_w_frame": 17010659.5275,
+    "cpu_ns": {
+     "mean": 8134765245,
+     "spread": 0
+    },
+    "m_live": 19009536,
+    "m_worker": 697352192,
+    "ram": {
+     "mean": 716361728,
+     "spread": 0
+    },
+    "keyframes": 21
+   },
+   "O": false,
+   "clause": "R = 0.9965 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW2|100|20|1|quality|0",
+   "cfg": "D|DW2|100|20|1|quality|0",
+   "way": "DW2",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "ok",
+   "px": 2073600,
+   "px_out": 2073600,
+   "frames": 400,
+   "text": true,
+   "bytes_min": 79961727,
+   "cpu_s_min": {
+    "mean": 25.554774912,
+    "spread": 0
+   },
+   "ram_peak": {
+    "mean": 717410304,
+    "spread": 0
+   },
+   "ssim": 0.9996836845210488,
+   "psnr": 51.682187393742495,
+   "r": 0.9964679609275404,
+   "held_out": false,
+   "in_fit": true,
+   "fit": {
+    "bytes": {
+     "mean": 26653909,
+     "spread": 0
+    },
+    "y_bytes": 0.03213482470100309,
+    "ssim": {
+     "mean": 0.9996836845210488,
+     "spread": 0
+    },
+    "a_rt_frame": 3319605.2825,
+    "a_w_frame": 17976040.4775,
+    "cpu_ns": {
+     "mean": 8518258304,
+     "spread": 0
+    },
+    "m_live": 18776064,
+    "m_worker": 698634240,
+    "ram": {
+     "mean": 717410304,
+     "spread": 0
+    },
+    "keyframes": 21
+   },
+   "O": false,
+   "clause": "R = 0.9965 < 1"
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW3|30|20|1|quality|0",
+   "cfg": "D|DW3|30|20|1|quality|0",
+   "way": "DW3",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "not_activated",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: not_activated: activation failed: Catastrophic failure (0x8000FFFF)",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW3|70|20|1|quality|0",
+   "cfg": "D|DW3|70|20|1|quality|0",
+   "way": "DW3",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "not_activated",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: not_activated: activation failed: Catastrophic failure (0x8000FFFF)",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW3|100|20|1|quality|0",
+   "cfg": "D|DW3|100|20|1|quality|0",
+   "way": "DW3",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "not_activated",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: not_activated: activation failed: Catastrophic failure (0x8000FFFF)",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW4|30|20|1|quality|0",
+   "cfg": "D|DW4|30|20|1|quality|0",
+   "way": "DW4",
+   "options": {
+    "q": "30",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "no_product_path",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: no_product_path: DW4 activates; system-memory NV12: no (SetOutputType 0x80041000); the product's Sink Writer cannot select it",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW4|70|20|1|quality|0",
+   "cfg": "D|DW4|70|20|1|quality|0",
+   "way": "DW4",
+   "options": {
+    "q": "70",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "no_product_path",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: no_product_path: DW4 activates; system-memory NV12: no (SetOutputType 0x80041000); the product's Sink Writer cannot select it",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  },
+  {
+   "kind": "D",
+   "key": "D|scroll-1920x1080|DW4|100|20|1|quality|0",
+   "cfg": "D|DW4|100|20|1|quality|0",
+   "way": "DW4",
+   "options": {
+    "q": "100",
+    "tau_f": "20",
+    "hint": "1",
+    "rate": "quality",
+    "beta": "0"
+   },
+   "folder": "scroll-1920x1080",
+   "content": "scroll",
+   "size": "1920x1080",
+   "runs": 1,
+   "t_s": 20,
+   "n_new": 400,
+   "status": "no_product_path",
+   "px": 2073600,
+   "O": false,
+   "clause": "cannot run: no_product_path: DW4 activates; system-memory NV12: no (SetOutputType 0x80041000); the product's Sink Writer cannot select it",
+   "held_out": false,
+   "in_fit": false,
+   "text": false
+  }
+ ],
+ "equations": {
+  "eq1_z_bytes": {
+   "title": "Z bytes",
+   "equation": "b_k = zeta(L, m, c, px) * px * 3 (+ h); zeta(px) = zeta(px0) * (px / px0)^(eta_m - 1)",
+   "fit_n": 73,
+   "coefficients": {
+    "zeta": {
+     "Z|ZW1|-1|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.01905693560313786,
+     "Z|ZW1|-2|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.01978073197980967,
+     "Z|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.019953294994212965,
+     "Z|ZW1|-4|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.02054807942708333,
+     "Z|ZW1|-5|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.023720869100437244,
+     "Z|ZW1|-6|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.023798199588477367,
+     "Z|ZW1|-7|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.025149811117541155,
+     "Z|ZW1|-10|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.03488954676247428,
+     "Z|ZW1|-20|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.04602424004951132,
+     "Z|ZW1|-50|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.07118308215985082,
+     "Z|ZW1|-100|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.10206322659465021,
+     "Z|ZW1|1|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.017238654996141977,
+     "Z|ZW1|2|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.018597332738554528,
+     "Z|ZW1|3|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.016355603378986627,
+     "Z|ZW1|4|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.016357410622427983,
+     "Z|ZW1|5|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.01271335278420782,
+     "Z|ZW1|6|bgr|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.012647344393004117,
+     "Z|ZW1|7|bgr|whole|32|0|0|0|0|20|25|0|100|scroll@1920x1080": 0.012206929976851851,
+     "Z|ZW1|8|bgr|whole|32|0|0|0|0|20|25|0|100|scroll@1920x1080": 0.011352107445987655,
+     "Z|ZW1|9|bgr|whole|32|0|0|0|0|20|25|0|100|scroll@1920x1080": 0.011062959747942388,
+     "Z|ZW1|10|bgr|whole|32|0|0|0|0|20|25|0|100|scroll@1920x1080": 0.010403885352366254,
+     "Z|ZW1|11|bgr|whole|32|0|0|0|0|20|25|0|100|scroll@1920x1080": 0.00992598218878601,
+     "Z|ZW1|12|bgr|whole|32|0|0|0|0|20|25|0|100|scroll@1920x1080": 0.009926131687242799,
+     "Z|ZW1|13|bgr|whole|32|0|0|0|0|20|25|0|20|scroll@1920x1080": 0.009613128536522634,
+     "Z|ZW1|14|bgr|whole|32|0|0|0|0|20|25|0|20|scroll@1920x1080": 0.008839707111625515,
+     "Z|ZW1|15|bgr|whole|32|0|0|0|0|20|25|0|20|scroll@1920x1080": 0.0083628231095679,
+     "Z|ZW1|16|bgr|whole|32|0|0|0|0|20|25|0|20|scroll@1920x1080": 0.008246495627572016,
+     "Z|ZW1|17|bgr|whole|32|0|0|0|0|20|25|0|20|scroll@1920x1080": 0.007837119020061728,
+     "Z|ZW1|18|bgr|whole|32|0|0|0|0|20|25|0|20|scroll@1920x1080": 0.007874389146090535,
+     "Z|ZW1|19|bgr|whole|32|0|0|0|0|20|25|0|5|scroll@1920x1080": 0.007148726851851852,
+     "Z|ZW1|20|bgr|whole|32|0|0|0|0|20|25|0|5|scroll@1920x1080": 0.007148726851851852,
+     "Z|ZW1|21|bgr|whole|32|0|0|0|0|20|25|0|5|scroll@1920x1080": 0.007034850823045268,
+     "Z|ZW1|22|bgr|whole|32|0|0|0|0|20|25|0|5|scroll@1920x1080": 0.006966145833333334,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.02741766814557613,
+     "Z|ZW8|-3|bgr|tiles|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.020599879436728395,
+     "Z|ZW8|-3|bgr|tiles|64|0|0|0|0|20|25|0||scroll@1920x1080": 0.020151820907278805,
+     "Z|ZW8|-3|bgr|tiles|128|0|0|0|0|20|25|0||scroll@1920x1080": 0.0198527544688786,
+     "Z|ZW9|-3|bgr|rect|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.01879339875900206,
+     "Z|ZW0|-3|bgr|raw|32|0|0|0|0|20|25|0||scroll@1920x1080": 1,
+     "Z|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|16384||scroll@1920x1080": 0.01996434944058642,
+     "Z|ZW2|-3|bgra|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.021711610644933127,
+     "Z|ZW3|-3|planar|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.035958775800540126,
+     "Z|ZW4|-3|sg|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.019906511622299384,
+     "Z|ZW4|-3|sgp|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.03595348066165124,
+     "Z|ZW5|-3|ycocg|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.036458338155864196,
+     "Z|ZW6|-3|predl|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.021420796762474277,
+     "Z|ZW6|-3|predu|whole|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.021296473122427984,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|1|25|0||scroll@1920x1080": 0.019953294994212965,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|100|25|0||scroll@1920x1080": 0.027730010609567902,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|all|25|0||scroll@1920x1080": 0.027783677742412555,
+     "Z|ZW7|-3|bgr|sub|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.038684203800154325,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|1|25|0||scroll@1920x1080": 0.01877453542952675,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|20|25|0||scroll@1920x1080": 0.018742144900977364,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|100|25|0||scroll@1920x1080": 0.01874176914544753,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|all|25|0||scroll@1920x1080": 0.018741547309027776,
+     "Z|ZW13|-3|bgr|stream|32|23|0|0|0|20|25|0||scroll@1920x1080": 0.006849539046424898,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|20|25|0||scroll@1920x1080": 0.0049901552051183126,
+     "Z|ZW13|-3|bgr|stream|32|25|0|0|0|20|25|0||scroll@1920x1080": 0.0033266955214763375,
+     "Z|ZW13|-3|bgr|stream|32|27|0|0|0|20|25|0||scroll@1920x1080": 0.001645827305169753,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|1|25|0||scroll@1920x1080": 0.01877453542952675,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|100|25|0||scroll@1920x1080": 0.004823683047196502,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|all|25|0||scroll@1920x1080": 0.004775507571373457,
+     "Z|ZW14|-3|bgr|stream|32|24|1|0|0|20|25|0||scroll@1920x1080": 0.004084751961162552,
+     "Z|ZW15|-3|bgr|prefix|32|24|1|0|0|20|25|0||scroll@1920x1080": 0.0014244277263374485,
+     "Z|ZW16|-3|bgr|whole|32|0|0|110|0|20|25|0|40|scroll@1920x1080": 0.02052713075488683,
+     "Z|ZW16|-3|bgr|whole|32|0|0|1024|0|20|25|0|40|scroll@1920x1080": 0.020526282793209876,
+     "Z|ZW17|-3|bgr|whole|32|0|0|0|1|20|25|0||scroll@1920x1080": 0.020001158613040124,
+     "Z|ZW17|-3|bgr|whole|32|0|0|0|2|20|25|0||scroll@1920x1080": 0.020001158613040124,
+     "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|10|0||scroll@1920x1080": 0.01995345574524177,
+     "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.01995345574524177,
+     "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|50|0||scroll@1920x1080": 0.020600040187757202,
+     "Z|ZW19|-3|ycocg|xor|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.04579988305362654,
+     "Z|ZW19|-3|ycocg|tiles|32|0|0|0|0|20|25|0||scroll@1920x1080": 0.039586615467464
+    },
+    "eta": {}
+   },
+   "residuals": {
+    "n": 73,
+    "max_abs_rel": 0,
+    "rms_rel": 0,
+    "note": "repeat residuals of bytes per frame (zstd is deterministic); eta residuals need two sizes"
+   },
+   "pending": [
+    {
+     "part": "eta",
+     "reason": "every configuration ran at one size"
+    }
+   ]
+  },
+  "eq2_z_quality": {
+   "title": "Z quality",
+   "equation": "sum |decoded - corpus| = 0  =>  SSIM-Y = 1, PSNR-Y = inf, R = 1",
+   "fit_n": 73,
+   "coefficients": {
+    "runs_exact": 75,
+    "runs": 75
+   },
+   "residuals": {
+    "n": 73,
+    "max_abs_rel": 0,
+    "rms_rel": 0
+   },
+   "pending": []
+  },
+  "eq3_z_cpu": {
+   "title": "Z CPU",
+   "equation": "C_comp / N_new = c_0(m) + px * kappa_c(L, m, c); C_dec = N_dec * px * kappa_d(L, m)",
+   "fit_n": 73,
+   "coefficients": {
+    "c_0_ns": {},
+    "kappa_c_ns_per_px": {
+     "Z|ZW1|-1|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8316102189429012,
+     "Z|ZW1|-2|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8787348946277006,
+     "Z|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8762765243216306,
+     "Z|ZW1|-4|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.9037439163773148,
+     "Z|ZW1|-5|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8885221161265432,
+     "Z|ZW1|-6|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8741764539930555,
+     "Z|ZW1|-7|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8943517035590278,
+     "Z|ZW1|-10|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8563931327160493,
+     "Z|ZW1|-20|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.7576387080439815,
+     "Z|ZW1|-50|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.711910627652392,
+     "Z|ZW1|-100|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.6151019483024691,
+     "Z|ZW1|1|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8692559268904321,
+     "Z|ZW1|2|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.9087125880111883,
+     "Z|ZW1|3|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.8756116548514661,
+     "Z|ZW1|4|bgr|whole|32|0|0|0|0|20|25|0||scroll": 0.9146642433449074,
+     "Z|ZW1|5|bgr|whole|32|0|0|0|0|20|25|0||scroll": 2.1383122926311726,
+     "Z|ZW1|6|bgr|whole|32|0|0|0|0|20|25|0||scroll": 2.7783504183545524,
+     "Z|ZW1|7|bgr|whole|32|0|0|0|0|20|25|0|100|scroll": 3.2610701099537036,
+     "Z|ZW1|8|bgr|whole|32|0|0|0|0|20|25|0|100|scroll": 4.173336781442901,
+     "Z|ZW1|9|bgr|whole|32|0|0|0|0|20|25|0|100|scroll": 4.163927850115741,
+     "Z|ZW1|10|bgr|whole|32|0|0|0|0|20|25|0|100|scroll": 5.343391705246914,
+     "Z|ZW1|11|bgr|whole|32|0|0|0|0|20|25|0|100|scroll": 8.102912779706791,
+     "Z|ZW1|12|bgr|whole|32|0|0|0|0|20|25|0|100|scroll": 8.108159413580246,
+     "Z|ZW1|13|bgr|whole|32|0|0|0|0|20|25|0|20|scroll": 12.820185161072532,
+     "Z|ZW1|14|bgr|whole|32|0|0|0|0|20|25|0|20|scroll": 18.19447991415895,
+     "Z|ZW1|15|bgr|whole|32|0|0|0|0|20|25|0|20|scroll": 25.71343012152778,
+     "Z|ZW1|16|bgr|whole|32|0|0|0|0|20|25|0|20|scroll": 42.99548022762346,
+     "Z|ZW1|17|bgr|whole|32|0|0|0|0|20|25|0|20|scroll": 44.91838505497685,
+     "Z|ZW1|18|bgr|whole|32|0|0|0|0|20|25|0|20|scroll": 55.40261757330247,
+     "Z|ZW1|19|bgr|whole|32|0|0|0|0|20|25|0|5|scroll": 114.0428755787037,
+     "Z|ZW1|20|bgr|whole|32|0|0|0|0|20|25|0|5|scroll": 113.90428877314815,
+     "Z|ZW1|21|bgr|whole|32|0|0|0|0|20|25|0|5|scroll": 153.37991849922838,
+     "Z|ZW1|22|bgr|whole|32|0|0|0|0|20|25|0|5|scroll": 245.4079112654321,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|20|25|0||scroll": 1.3770793752411266,
+     "Z|ZW8|-3|bgr|tiles|32|0|0|0|0|20|25|0||scroll": 1.003537444540895,
+     "Z|ZW8|-3|bgr|tiles|64|0|0|0|0|20|25|0||scroll": 1.0786149679301698,
+     "Z|ZW8|-3|bgr|tiles|128|0|0|0|0|20|25|0||scroll": 1.13775184220679,
+     "Z|ZW9|-3|bgr|rect|32|0|0|0|0|20|25|0||scroll": 1.409457829378858,
+     "Z|ZW0|-3|bgr|raw|32|0|0|0|0|20|25|0||scroll": 0.19162713517554011,
+     "Z|ZW1|-3|bgr|whole|32|0|0|0|0|20|25|16384||scroll": 0.9439281635802469,
+     "Z|ZW2|-3|bgra|whole|32|0|0|0|0|20|25|0||scroll": 1.3927588348765432,
+     "Z|ZW3|-3|planar|whole|32|0|0|0|0|20|25|0||scroll": 1.1855898003472223,
+     "Z|ZW4|-3|sg|whole|32|0|0|0|0|20|25|0||scroll": 1.296281891396605,
+     "Z|ZW4|-3|sgp|whole|32|0|0|0|0|20|25|0||scroll": 1.1853120225694445,
+     "Z|ZW5|-3|ycocg|whole|32|0|0|0|0|20|25|0||scroll": 1.313891852334105,
+     "Z|ZW6|-3|predl|whole|32|0|0|0|0|20|25|0||scroll": 1.1261132282021604,
+     "Z|ZW6|-3|predu|whole|32|0|0|0|0|20|25|0||scroll": 1.0238089879918981,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|1|25|0||scroll": 0.9852280924479166,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|100|25|0||scroll": 1.5161598355516974,
+     "Z|ZW7|-3|bgr|xor|32|0|0|0|0|all|25|0||scroll": 1.3998069516782408,
+     "Z|ZW7|-3|bgr|sub|32|0|0|0|0|20|25|0||scroll": 1.741581020929784,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|1|25|0||scroll": 0.9545719316647376,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|20|25|0||scroll": 1.0265557327835648,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|100|25|0||scroll": 1.0411094786844135,
+     "Z|ZW12|-3|bgr|prefix|32|24|0|0|0|all|25|0||scroll": 1.017265734712577,
+     "Z|ZW13|-3|bgr|stream|32|23|0|0|0|20|25|0||scroll": 0.7371357409818673,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|20|25|0||scroll": 0.684838875626929,
+     "Z|ZW13|-3|bgr|stream|32|25|0|0|0|20|25|0||scroll": 0.6069652560763888,
+     "Z|ZW13|-3|bgr|stream|32|27|0|0|0|20|25|0||scroll": 0.5897561053240741,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|1|25|0||scroll": 0.8764047984182098,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|100|25|0||scroll": 0.6463234543788581,
+     "Z|ZW13|-3|bgr|stream|32|24|0|0|0|all|25|0||scroll": 0.6784836431809413,
+     "Z|ZW14|-3|bgr|stream|32|24|1|0|0|20|25|0||scroll": 2.2588292353877315,
+     "Z|ZW15|-3|bgr|prefix|32|24|1|0|0|20|25|0||scroll": 3.026532696759259,
+     "Z|ZW16|-3|bgr|whole|32|0|0|110|0|20|25|0|40|scroll": 0.8497132884837963,
+     "Z|ZW16|-3|bgr|whole|32|0|0|1024|0|20|25|0|40|scroll": 0.9188417365933642,
+     "Z|ZW17|-3|bgr|whole|32|0|0|0|1|20|25|0||scroll": 1.1629784903067129,
+     "Z|ZW17|-3|bgr|whole|32|0|0|0|2|20|25|0||scroll": 1.1284021846064816,
+     "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|10|0||scroll": 1.0779170283564814,
+     "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|25|0||scroll": 1.1070385549286266,
+     "Z|ZW18|-3|bgr|switch|32|0|0|0|0|20|50|0||scroll": 1.042741270013503,
+     "Z|ZW19|-3|ycocg|xor|32|0|0|0|0|20|25|0||scroll": 1.8655615077642747,
+     "Z|ZW19|-3|ycocg|tiles|32|0|0|0|0|20|25|0||scroll": 1.6576141927083334
+    },
+    "kappa_d_ns_per_px": {
+     "L-1|whole": 0.851186735628858,
+     "L-2|whole": 0.9085002724729938,
+     "L-3|whole": 1.0663239024414373,
+     "L-4|whole": 0.9211910409432871,
+     "L-5|whole": 0.9343951292438272,
+     "L-6|whole": 0.9045923635223766,
+     "L-7|whole": 0.940935699990355,
+     "L-10|whole": 0.8995260501060957,
+     "L-20|whole": 0.9973294451678241,
+     "L-50|whole": 1.0241712010513118,
+     "L-100|whole": 0.9381133367091049,
+     "L1|whole": 0.8591528247974537,
+     "L2|whole": 0.8408369442033179,
+     "L3|whole": 0.7798977141203703,
+     "L4|whole": 0.8000940055941358,
+     "L5|whole": 0.9202656479070216,
+     "L6|whole": 1.0715056447723765,
+     "L7|whole": 1.0369649064429012,
+     "L8|whole": 0.9993543981481482,
+     "L9|whole": 0.9743012490354939,
+     "L10|whole": 0.8932015335648148,
+     "L11|whole": 0.8430264612268519,
+     "L12|whole": 0.8420818238811728,
+     "L13|whole": 0.8603305603780864,
+     "L14|whole": 0.827842399691358,
+     "L15|whole": 0.816054012345679,
+     "L16|whole": 0.3522064766589506,
+     "L17|whole": 0.32576490162037036,
+     "L18|whole": 0.42798155381944447,
+     "L19|whole": 0.4854230324074074,
+     "L20|whole": 0.4991278935185185,
+     "L21|whole": 0.4735960648148148,
+     "L22|whole": 0.48968180941358025,
+     "L-3|xor": 1.0208065574363425,
+     "L-3|tiles": 0.7550542212215471,
+     "L-3|rect": 0.6004394302179784,
+     "L-3|raw": 0.17285043282214507,
+     "L-3|sub": 1.2114548852237654,
+     "L-3|prefix": 0.7471844145447532,
+     "L-3|stream": 0.595214288104022,
+     "L-3|switch": 0.8293475228266461
+    }
+   },
+   "residuals": {
+    "n": 73,
+    "max_abs_rel": 2.1569930696829667e-16,
+    "rms_rel": 9.012019979733922e-17
+   },
+   "pending": [
+    {
+     "part": "c_0",
+     "reason": "every configuration ran at one size, so c_0 and px * kappa_c are not separable; kappa_c = C / (N_new * px)"
+    }
+   ]
+  },
+  "eq4_z_ram": {
+   "title": "Z RAM",
+   "equation": "M_comp = M_0 + M_cctx(L, W) + B_c * px * 3; M_dec = M_0 + M_dctx(W) + B_d * px * 3",
+   "fit_n": 73,
+   "coefficients": {
+    "M_0_bytes": 8054157.442922373,
+    "share_within_10pct_comp": 0.96,
+    "share_within_10pct_dec": 0.9866666666666667
+   },
+   "residuals": {
+    "n": 75,
+    "max_abs_rel": 1.0591780792321466,
+    "rms_rel": 0.15416887235039453
+   },
+   "pending": []
+  },
+  "eq5_z_ready": {
+   "title": "Z time until ready",
+   "equation": "t_ready = t_close",
+   "fit_n": 73,
+   "coefficients": {
+    "limit_ms": 50
+   },
+   "residuals": null,
+   "pending": []
+  },
+  "eq6_run_time": {
+   "title": "run time",
+   "equation": "T = sum over runs of N_new * px * 3 / v(L, m) * repeats",
+   "fit_n": 75,
+   "coefficients": {
+    "T_total_h": 16.05214787365816,
+    "runs_planned": 23202,
+    "T_measured_h": 0.07853
+   },
+   "residuals": null,
+   "pending": [
+    {
+     "part": "T",
+     "reason": "75 of 23202 planned Z runs"
+    }
+   ]
+  },
+  "eq7_d_bytes": {
+   "title": "D bytes",
+   "equation": "bytes_D = t * (n_new * P + (n_new / tau_f) * (K - P)); P = p_E,c * px * exp(a_E * q) (fitted at tau_f 20 with K folded in)",
+   "fit_n": 10,
+   "coefficients": {
+    "P_at_tau20": {
+     "DW1": {
+      "a_E": 0.012766770873193235,
+      "p_E,c": {
+       "typing": 0.00012112980643100292,
+       "scroll": 0.00844395674755967
+      }
+     },
+     "DW2": {
+      "a_E": 0.01820756850711968,
+      "p_E,c": {
+       "typing": 0.00011516275010997147,
+       "scroll": 0.003398069916468903
+      }
+     }
+    }
+   },
+   "residuals": {
+    "n": 10,
+    "max_abs_rel": 0.531083836076861,
+    "rms_rel": 0.2670621785981312
+   },
+   "pending": [
+    {
+     "part": "K/P",
+     "reason": "no tau_f sweep in the input (grid B, D3)"
+    }
+   ]
+  },
+  "eq7_d_quality": {
+   "title": "D quality",
+   "equation": "Q_ssim = 1 - s_E,c * exp(-g_E * q); Q_psnr = m_E,c + l_E * q",
+   "fit_n": 10,
+   "coefficients": {
+    "Q_ssim": {
+     "DW1": {
+      "g_E": 0.05997887757625087,
+      "s_E,c": {
+       "typing": 0.010767734459670233,
+       "scroll": 0.11755465216644402
+      }
+     },
+     "DW2": {
+      "g_E": 0.051586601232259895,
+      "s_E,c": {
+       "typing": 0.0032711751956712738,
+       "scroll": 0.049711540861659756
+      }
+     }
+    },
+    "Q_psnr": {
+     "DW1": {
+      "l_E": 0.2411413803036513,
+      "m_E,c": {
+       "typing": 41.83062903476758,
+       "scroll": 28.101390400726235
+      }
+     },
+     "DW2": {
+      "l_E": 0.2343802178686078,
+      "m_E,c": {
+       "typing": 43.61985927478886,
+       "scroll": 28.868046087285776
+      }
+     }
+    }
+   },
+   "residuals": {
+    "n": 10,
+    "max_abs_rel": 0.022243462769739004,
+    "rms_rel": 0.012356919749346081,
+    "max_abs_ssim": 0.0010007425694797956,
+    "note": "max_abs_rel and rms_rel are of PSNR; max_abs_ssim is the SSIM error"
+   },
+   "pending": []
+  },
+  "eq7_d_cpu": {
+   "title": "D CPU",
+   "equation": "a_rt = n_new * px * c_comp(-3) + n_new * c_file; a_w = n_new * px * (c_dec(-3) + c_conv) + n_new * c_enc(E, q, px); c_enc = e0_E + e1_E * px * (1 + e2_E * q)",
+   "fit_n": 10,
+   "coefficients": {
+    "a_rt_per_frame_ns_at_one_px": 2561232.1453269226,
+    "c_enc(DW1)": {
+     "a_w_per_frame_ns_at_q0": 10426405.134006672,
+     "B_ns_per_px_q": 0.0024211794616974575,
+     "at_px_out": 2073600
+    },
+    "c_enc(DW2)": {
+     "a_w_per_frame_ns_at_q0": 16119428.809679652,
+     "B_ns_per_px_q": 0.0015044839203993982,
+     "at_px_out": 2073600
+    },
+    "c_dec_ns_per_px_from_Z": 0.886459813448431,
+    "c_conv_ns_per_px_prior": 1.65
+   },
+   "residuals": {
+    "n": 20,
+    "max_abs_rel": 0.2716951224862474,
+    "rms_rel": 0.17585571254807125
+   },
+   "pending": [
+    {
+     "part": "c_comp, c_file",
+     "reason": "every D run has one px"
+    },
+    {
+     "part": "c_enc(DW1) e0, e1",
+     "reason": "every DW1 run has one px_out, so e0 and A * px are not separable"
+    },
+    {
+     "part": "c_enc(DW2) e0, e1",
+     "reason": "every DW2 run has one px_out, so e0 and A * px are not separable"
+    }
+   ]
+  },
+  "eq7_d_ram": {
+   "title": "D RAM",
+   "equation": "M_D = M_live + M_worker; M_worker = M0_w + px * (3 + 1.5) * d + M_enc(E, px); M_enc = m0_E + m1_E * px",
+   "fit_n": 10,
+   "coefficients": {
+    "M_live_bytes_at_one_px": 19292979.2,
+    "M_enc(DW1)": {
+     "M0_w_plus_M_enc_bytes": 107158016,
+     "at_px_out": 2073600
+    },
+    "M_enc(DW2)": {
+     "M0_w_plus_M_enc_bytes": 696340650.6666666,
+     "at_px_out": 2073600
+    }
+   },
+   "residuals": {
+    "n": 10,
+    "max_abs_rel": 0.06355513490968581,
+    "rms_rel": 0.03628910213842137
+   },
+   "pending": [
+    {
+     "part": "M_live(px)",
+     "reason": "every D run has one px"
+    },
+    {
+     "part": "M_enc(DW1) m0, m1",
+     "reason": "every DW1 run has one px_out"
+    },
+    {
+     "part": "M_enc(DW2) m0, m1",
+     "reason": "every DW2 run has one px_out"
+    }
+   ]
+  },
+  "eq7_d_qmin": {
+   "title": "D q_min",
+   "equation": "q_min(E, px) = min { q : R = 1 on every text scenario }",
+   "fit_n": 24,
+   "coefficients": {
+    "DW1 1920x1080 tau20 hint1 quality beta0": "not reached",
+    "DW2 1920x1080 tau20 hint1 quality beta0": "not reached"
+   },
+   "residuals": null,
+   "pending": []
+  }
+ },
+ "validation": {
+  "z": {
+   "runlist_held_out": 0,
+   "held_out_keys": [],
+   "rows": []
+  },
+  "d": {
+   "generator": "mulberry32",
+   "seed": 20261122,
+   "share": 0.2,
+   "eligible": 12,
+   "held_out_keys": [
+    "D|scroll-1920x1080|DW1|70|20|1|quality|0",
+    "D|scroll-1920x1080|DW1|30|20|1|quality|0"
+   ],
+   "rows": [
+    {
+     "key": "D|scroll-1920x1080|DW1|30|20|1|quality|0",
+     "quantity": "bytes",
+     "predicted": 10272286.410502922,
+     "measured": 3819550,
+     "error": 1.6893970259593203,
+     "verdict": "not predictable",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|30|20|1|quality|0",
+     "quantity": "cpu",
+     "predicted": 5255301604.514748,
+     "measured": 5847871729,
+     "error": 0.1013309032663381,
+     "verdict": "not predictable",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|30|20|1|quality|0",
+     "quantity": "ram",
+     "predicted": 135782195.2,
+     "measured": 131850240,
+     "error": 0.029821373097235076,
+     "verdict": "within",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|30|20|1|quality|0",
+     "quantity": "ssim",
+     "predicted": 0.9805560294810237,
+     "measured": 0.9891479323709457,
+     "error": 0.008591902889921954,
+     "verdict": "not predictable",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|70|20|1|quality|0",
+     "quantity": "bytes",
+     "predicted": 17117827.497127756,
+     "measured": 9419080,
+     "error": 0.8173566311282797,
+     "verdict": "not predictable",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|70|20|1|quality|0",
+     "quantity": "cpu",
+     "predicted": 5335630528.223162,
+     "measured": 6004045403,
+     "error": 0.11132741841739838,
+     "verdict": "not predictable",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|70|20|1|quality|0",
+     "quantity": "ram",
+     "predicted": 135782195.2,
+     "measured": 144605184,
+     "error": 0.06101433265352376,
+     "verdict": "within",
+     "spread": 0
+    },
+    {
+     "key": "D|scroll-1920x1080|DW1|70|20|1|quality|0",
+     "quantity": "ssim",
+     "predicted": 0.9982345918326644,
+     "measured": 0.998347407558612,
+     "error": 0.00011281572594756817,
+     "verdict": "within",
+     "spread": 0
+    }
+   ]
+  }
+ }
+}

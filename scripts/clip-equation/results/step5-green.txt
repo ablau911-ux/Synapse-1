@@ -1,0 +1,11 @@
+step5: fit C:\Users\Adam\Synapse-clip-docs\scripts\clip-equation\results\fit.json; results C:\Users\Adam\Synapse-clip-docs\docs\clip-recorder-experiments-results.md
+action | equation | known | equation value | measured | result
+rows equal configurations | rows(results.csv) = rows(results.md table) = count(distinct configuration keys in the CSVs) | equal | 97 | results.csv 97; results file table 97 | PASS
+every CSV row present | sum(runs) over results.csv = rows of the CSVs | equal; no CSV row missing | 99 | sum(runs) 99; missing 0; wrong counts 0 | PASS
+per-minute values | bytes/min = mean(bytes) * (N_new / frames) * 60 / t | within 1e-9 relative on every row | mean(bytes) * N_new / frames * 60 / t | 97/97 rows equal | PASS
+J for every kept row | J = bytes / bytes* + CPU / CPU* + RAM / RAM* | recomputed J within 1e-9 on every kept row | J = bytes/bytes* + CPU/CPU* + RAM/RAM* | 73 kept with J (0 wrong); 24 dropped, 0 without clause or with J | PASS
+J* = 3 | J = 1 + 1 + 1 | 3 exactly (synthetic set, and every folder whose least-J row is least on all three) | 3 | synthetic J = 3; real folders with a row least on all three: none | PASS
+Pareto front | dominated(a) = exists b: b <= a on bytes, CPU and RAM and b < a on one | verified by brute force | non-dominated set | 19 front rows over 1 folders; 0 flags differ | PASS
+best way and its equations | best = argmin mean J over the shared corpus folders | the same configuration as recomputed; equations present | Z|ZW15|-3|bgr|prefix|32|24|1|0|0|20|25|0| | results file names Z|ZW15|-3|bgr|prefix|32|24|1|0|0|20|25|0| (mean J 7.5014 over 1 folders); 5 equation lines | PASS
+results file header | label = PILOT when any input file is a pilot CSV | header present and label right | PILOT, not final | inputs named with rows: true; PILOT label: true | PASS
+step5: all passed

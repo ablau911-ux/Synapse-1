@@ -1,0 +1,21 @@
+{
+  "note": "Tunables of fit/fit.mjs, fit/results.mjs and spec/step4.mjs, spec/step5.mjs. Spec: docs/clip-recorder-experiments-plan.md, 'How absolute and predictable is reached', 'Method', 'Equations'.",
+  "corpus_root": "C:\\Users\\Adam\\clip-corpus",
+  "runlist": "results/z-runlist.json",
+  "fit_out": "results/fit.json",
+  "results_md": "../../docs/clip-recorder-experiments-results.md",
+  "results_csv": "results/results.csv",
+  "z_key_columns": ["folder", "way", "level", "layout", "mode", "tile", "wlog", "ldm", "dict", "workers", "kz", "theta", "drain", "frames_cap"],
+  "d_key_columns": ["folder", "encoder", "q", "tau_f", "hint", "rate", "beta"],
+  "text_scenarios": ["typing", "scroll", "ui"],
+  "tolerance": { "bytes": 0.10, "cpu": 0.10, "ram": 0.10, "ssim": 0.005 },
+  "hold_out": { "share": 0.2, "seed": 20261122, "generator": "mulberry32" },
+  "px0": 230400,
+  "d_base": { "tau_f": "20", "hint": "1", "rate": "quality" },
+  "worker_bytes_per_px": 4.5,
+  "c_conv_ns_per_px": 1.65,
+  "t_ready_limit_ms": 50,
+  "run_time_tolerance": 0.20,
+  "self_test_tolerance": 1e-6,
+  "j_tolerance": 1e-9
+}

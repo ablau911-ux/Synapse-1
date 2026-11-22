@@ -44,9 +44,19 @@ const STEP_TIMEOUT_MS = 60000;
  * timestamp handed to requestAnimationFrame callbacks comes from the
  * compositor's real frame clock (it advanced about 17 ms per 50 ms instant).
  * The pages compute their step from that timestamp, so this script, added to
- * every page before its own scripts run, hands them performance.now() instead.
+ * every page before its own scripts run, hands them the virtual clock instead.
+ * Refreshes also run between two instants while virtual time advances; the
+ * flash page keeps state across refreshes (a flash stays on for 50 ms from
+ * its first refresh), so a refresh between instants made flashes fall between
+ * screenshots (18 to 20 of 20, measured). The clock handed to rAF is therefore
+ * the last instant s_j at or before Date.now() (exact virtual ms): every
+ * refresh between s_j and s_j+1 sees the page exactly as the screenshot at s_j.
  */
-const VIRTUAL_RAF = '(() => { const raf = window.requestAnimationFrame.bind(window); window.requestAnimationFrame = (callback) => raf(() => callback(performance.now())); })();';
+function virtualRaf(s0, instantMs) {
+  return `(() => { const raf = window.requestAnimationFrame.bind(window);
+    const instant = () => ${s0} + ${instantMs} * Math.floor((Date.now() - ${s0}) / ${instantMs}) - performance.timeOrigin;
+    window.requestAnimationFrame = (callback) => raf(() => callback(instant())); })();`;
+}
 
 /** Decodes an 8-bit, non-interlaced RGB or RGBA PNG to B,G,R bytes. */
 function pngToBgr(png) {
@@ -219,11 +229,14 @@ class HeadlessChrome {
   async connect() {
     const portFile = path.join(this.profile, 'DevToolsActivePort');
     const deadline = Date.now() + STEP_TIMEOUT_MS;
-    while (!fs.existsSync(portFile) || !fs.readFileSync(portFile, 'utf8').includes('\n')) {
+    let text = '';
+    while (!text.includes('\n')) {
       if (Date.now() > deadline || this.process.exitCode !== null) throw new Error('Chrome did not open its DevTools port');
       await new Promise((resolve) => setTimeout(resolve, 100));
+      // Chrome may still hold the file open while writing it (EBUSY, measured): read again later.
+      try { text = fs.readFileSync(portFile, 'utf8'); } catch { text = ''; }
     }
-    const port = fs.readFileSync(portFile, 'utf8').split('\n')[0].trim();
+    const port = text.split('\n')[0].trim();
     const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
     const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
     const page = targets.find((target) => target.type === 'page');
@@ -272,7 +285,7 @@ class Capture {
     try {
       const cdp = await chrome.connect();
       await cdp.send('Page.enable');
-      await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: VIRTUAL_RAF });
+      await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: virtualRaf(s0, CONFIG.instant_ms) });
       await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
       await cdp.send('Emulation.setVirtualTimePolicy', { policy: 'pause', initialVirtualTime: CONFIG.virtual_start_unix_ms / 1000 });
       const loaded = cdp.once('Page.loadEventFired');

@@ -177,8 +177,8 @@ impl RecordedSize {
         let side = u64::from(MAX_ENCODE_SIDE);
         if macroblocks <= MAX_ENCODE_MACROBLOCKS && width <= side && height <= side {
             return Self {
-                width: even(width),
-                height: even(height),
+                width: even_up(width),
+                height: even_up(height),
                 bound_held: true,
             };
         }
@@ -187,14 +187,24 @@ impl RecordedSize {
             .min(side as f64 / width as f64)
             .min(side as f64 / height as f64);
         Self {
-            width: even((width as f64 * factor).floor() as u64),
-            height: even((height as f64 * factor).floor() as u64),
+            width: even_down((width as f64 * factor).floor() as u64),
+            height: even_down((height as f64 * factor).floor() as u64),
             bound_held: false,
         }
     }
 }
 
-fn even(value: u64) -> u32 {
+/// NV12 needs even sides. Within the bound an odd size is padded up by one
+/// black column or row, so every captured pixel stays (B3, G). Padding never
+/// crosses the bound: the side limit is even and a 16-pixel macroblock count
+/// does not change.
+fn even_up(value: u64) -> u32 {
+    u32::try_from((value.max(1) + 1) & !1).unwrap_or(!1)
+}
+
+/// Above the bound the picture is already shrunk; rounding down keeps it
+/// inside the bound.
+fn even_down(value: u64) -> u32 {
     u32::try_from(value.max(2) & !1).unwrap_or(!1)
 }
 

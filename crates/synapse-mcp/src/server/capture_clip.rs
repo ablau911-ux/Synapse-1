@@ -27,8 +27,8 @@ use serde_json::json;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipRegistry, FRAMES_FILE, StopReason, WAITING_DIR, clips_root,
-    file_size_and_sha256,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason, WAITING_DIR,
+    clips_root, file_size_and_sha256,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -81,10 +81,12 @@ impl StopReason {
     }
 }
 
-/// The shared controls of the running recording: stop and the planned end.
+/// The shared controls of the running recording: stop, the planned end, and
+/// the length recorded so far (published on every instant, not written to disk).
 struct RecordingControl {
     stop: AtomicBool,
     end_ms: AtomicU64,
+    recorded_ms: AtomicU64,
 }
 
 /// The one running recording of the service (A2: only one recorder, so the
@@ -126,6 +128,7 @@ impl Recorders {
         let control = Arc::new(RecordingControl {
             stop: AtomicBool::new(false),
             end_ms: AtomicU64::new(end_ms),
+            recorded_ms: AtomicU64::new(0),
         });
         *active = Some(ActiveClip {
             clip_id: clip_id.to_owned(),
@@ -170,6 +173,19 @@ impl Recorders {
             .filter(|running| running.clip_id == clip_id)?;
         running.control.stop.store(true, Ordering::Relaxed);
         running.thread.take()
+    }
+}
+
+/// B4, C14: the clip worker marked this clip `failed` (the encoder failed
+/// twice); a recording that still runs into it stops, keeping its committed
+/// segments. The recorder never overwrites `failed` when it finishes.
+#[cfg(windows)]
+pub(super) fn stop_failed_recording(folder: &std::path::Path) {
+    if let Some(running) = Recorders::active()
+        .as_ref()
+        .filter(|running| running.folder == folder)
+    {
+        running.control.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -285,16 +301,18 @@ impl SynapseService {
 
 /// `record_status`: the state of a clip, read from its `clip.json`.
 pub(super) fn clip_status(clip_id: &str) -> Result<ClipStatusResponse, ErrorData> {
-    let folder = Recorders::find(clip_id)
-        .map(|(_, folder)| folder)
-        .or_else(|| ClipRegistry::folder_of(clip_id))
-        .ok_or_else(|| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("no clip with id {clip_id} in the active-clip registry or the default clips folder"),
-            )
-        })?;
-    status_of(&folder)
+    if let Some((control, folder)) = Recorders::find(clip_id) {
+        return status_of(&folder, Some(&control));
+    }
+    let folder = ClipRegistry::folder_of(clip_id).ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "no clip with id {clip_id} in the active-clip registry or the default clips folder"
+            ),
+        )
+    })?;
+    status_of(&folder, None)
 }
 
 /// `record_stop`: ends the recording now; idempotent by clip id.
@@ -316,11 +334,22 @@ pub(super) fn clip_extend(clip_id: &str, add_ms: u64) -> Result<ClipStatusRespon
     let end_ms = control.end_ms.fetch_add(add_ms, Ordering::Relaxed) + add_ms;
     ClipJson::update(&folder, |clip| clip.end_ms = clip.end_ms.max(end_ms))
         .map_err(internal_error)?;
-    status_of(&folder)
+    status_of(&folder, Some(&control))
 }
 
-fn status_of(folder: &std::path::Path) -> Result<ClipStatusResponse, ErrorData> {
+/// The status from `clip.json`; while the clip is still recording, the length
+/// is the one the recorder publishes on every instant (`live`).
+fn status_of(
+    folder: &std::path::Path,
+    live: Option<&RecordingControl>,
+) -> Result<ClipStatusResponse, ErrorData> {
     let clip = ClipJson::read(folder).map_err(internal_error)?;
+    let recorded_ms = match live {
+        Some(control) if clip.state == ClipState::Recording => clip
+            .recorded_ms
+            .max(control.recorded_ms.load(Ordering::Relaxed)),
+        _ => clip.recorded_ms,
+    };
     let frames_waiting = std::fs::read_dir(folder.join(WAITING_DIR))
         .map(|read| read.filter_map(Result::ok).count() as u64)
         .unwrap_or(0);
@@ -330,7 +359,7 @@ fn status_of(folder: &std::path::Path) -> Result<ClipStatusResponse, ErrorData> 
         state: clip.state.as_str().to_owned(),
         stop_reason: clip.stop_reason.map(|reason| reason.as_str().to_owned()),
         failure: clip.failure.clone(),
-        seconds_recorded: clip.recorded_ms as f64 / 1_000.0,
+        seconds_recorded: recorded_ms as f64 / 1_000.0,
         end_ms: clip.end_ms,
         frames_waiting,
         segments: clip
@@ -627,7 +656,6 @@ mod live {
                 clip.state = ClipState::Failed;
                 clip.failure = Some(error.message.to_string());
             });
-            let _ = ClipRegistry::remove(&plan.clip_id);
         }
     }
 
@@ -939,6 +967,9 @@ mod live {
 
         /// A6 to A12: one instant every 1 / f until a stop. Returns why it stopped.
         fn run(&mut self, control: &RecordingControl) -> StopReason {
+            control
+                .recorded_ms
+                .store(instant_ms(self.next_instant), Ordering::Relaxed);
             loop {
                 let k = self.next_instant;
                 if control.stop.load(Ordering::Relaxed) {
@@ -960,6 +991,10 @@ mod live {
                     return reason;
                 }
                 self.next_instant = k + 1;
+                // `record_status` reads the live length from here (no disk write).
+                control
+                    .recorded_ms
+                    .store(instant_ms(self.next_instant), Ordering::Relaxed);
                 self.meter.tick(&self.observer);
             }
         }
@@ -1183,22 +1218,33 @@ mod live {
                 }),
             };
             let lost = std::mem::take(&mut self.lost);
+            // B4, C14: a clip the worker already marked `failed` stays failed;
+            // its failure, not the recorder's stop, is why it ended.
             let updated = ClipJson::update(&self.plan.folder, |clip| {
-                clip.state = ClipState::Encoding;
-                clip.stop_reason = Some(reason);
+                let failed = clip.state == ClipState::Failed;
+                if !failed {
+                    clip.state = ClipState::Encoding;
+                    clip.stop_reason = Some(reason);
+                }
                 clip.recorded_ms = recorded_ms;
                 clip.lost = lost;
                 clip.conditions = conditions;
+                clip.state
             });
-            if let Err(error) = updated {
-                tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
-            }
+            let outcome = match updated {
+                Ok((_, state)) => state.as_str(),
+                Err(error) => {
+                    tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
+                    ClipState::Encoding.as_str()
+                }
+            };
             tracing::info!(
                 code = "CAPTURE_CLIP_STOPPED",
                 clip_id = %self.plan.clip_id,
                 stop_reason = reason.as_str(),
                 recorded_ms,
-                "readback=screenshot_record outcome=encoding"
+                outcome,
+                "readback=screenshot_record"
             );
         }
     }

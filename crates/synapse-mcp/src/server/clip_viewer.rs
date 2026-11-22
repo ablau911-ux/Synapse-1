@@ -69,8 +69,6 @@ const RESPONSE_TEXT_TOKENS: u64 = 1_500;
 const TEXT_CHARS_PER_TOKEN: usize = 4;
 /// Close-ups enlarge by whole-number duplication (D3).
 const CLOSEUP_SCALE: u32 = 2;
-/// Largest `clip_frame` output; crop a smaller region instead.
-const MAX_FRAME_OUTPUT_PIXELS: u64 = 3_840 * 2_160;
 
 /// Side of the change-test blocks, in recorded clip pixels.
 const BLOCK: usize = 8;
@@ -547,6 +545,8 @@ struct Transient {
     start: u64,
     end: u64,
     blocks: Vec<usize>,
+    /// The picture size the block indices refer to (a resize changes it).
+    size: (usize, usize),
 }
 
 /// A region that kept changing for longer than `SHORT_LIVED_MS`.
@@ -554,6 +554,8 @@ struct Animation {
     start: u64,
     end: u64,
     blocks: Vec<usize>,
+    /// The picture size the block indices refer to (a resize changes it).
+    size: (usize, usize),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -796,6 +798,7 @@ impl<'a> Analyzer<'a> {
                     start,
                     end: instant,
                     blocks: vec![index],
+                    size: (width, height),
                 }),
             }
         }
@@ -815,12 +818,13 @@ impl<'a> Analyzer<'a> {
                 state.animating = false;
             }
         }
+        // The block indices refer to the current picture size; animations of
+        // an earlier size are never merged with them.
+        let size = (self.width, self.height);
         for (start, end, index) in ended {
-            match self
-                .animations
-                .iter_mut()
-                .find(|animation| animation.start <= end && start <= animation.end)
-            {
+            match self.animations.iter_mut().find(|animation| {
+                animation.size == size && animation.start <= end && start <= animation.end
+            }) {
                 Some(animation) => {
                     animation.start = animation.start.min(start);
                     animation.end = animation.end.max(end);
@@ -830,6 +834,7 @@ impl<'a> Analyzer<'a> {
                     start,
                     end,
                     blocks: vec![index],
+                    size,
                 }),
             }
         }
@@ -903,7 +908,9 @@ impl<'a> Analyzer<'a> {
         if clip.t_of(last).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
             timeline.push(static_entry(clip, quiet_from, last));
         }
-        let cols = self.width.div_ceil(BLOCK);
+        let sized_bbox = |blocks: &[usize], (width, height): (usize, usize)| {
+            blocks_bbox(blocks, width.div_ceil(BLOCK), width, height)
+        };
         let covered = |start: u64| {
             self.done
                 .iter()
@@ -914,7 +921,7 @@ impl<'a> Analyzer<'a> {
             .iter()
             .filter(|transient| !covered(transient.start))
         {
-            let bbox = blocks_bbox(&transient.blocks, cols, self.width, self.height);
+            let bbox = sized_bbox(&transient.blocks, transient.size);
             picks.push(pick(clip, transient.start, "short-lived region change"));
             timeline.push(region_entry(
                 clip,
@@ -927,7 +934,7 @@ impl<'a> Analyzer<'a> {
             ));
         }
         for animation in &self.animations {
-            let bbox = blocks_bbox(&animation.blocks, cols, self.width, self.height);
+            let bbox = sized_bbox(&animation.blocks, animation.size);
             picks.push(pick(clip, animation.start, "animating region"));
             timeline.push(region_entry(
                 clip,
@@ -1452,9 +1459,13 @@ impl ClipView {
         let closeup = params.scale.is_some_and(|scale| scale > 1.0);
         let factor = if closeup { CLOSEUP_SCALE } else { 1 };
         let (width, height) = (image.width() * factor, image.height() * factor);
-        if u64::from(width) * u64::from(height) > MAX_FRAME_OUTPUT_PIXELS {
+        // D6: the call stays inside its token budget (tokens = w · h / 770 + 1500).
+        let tokens = u64::from(width) * u64::from(height) / PIXELS_PER_TOKEN + RESPONSE_TEXT_TOKENS;
+        if tokens > CALL_TOKEN_BUDGET {
+            let max_pixels =
+                CALL_TOKEN_BUDGET.saturating_sub(RESPONSE_TEXT_TOKENS) * PIXELS_PER_TOKEN;
             return Err(params_invalid(format!(
-                "a {width}x{height} image is larger than {MAX_FRAME_OUTPUT_PIXELS} pixels; pass a smaller region or no close-up"
+                "a {width}x{height} image costs about {tokens} tokens, over the {CALL_TOKEN_BUDGET}-token call budget (at most {max_pixels} pixels); pass a smaller region (x, y, w, h in recorded pixels) or no close-up"
             )));
         }
         if closeup {
@@ -1589,7 +1600,11 @@ impl ClipView {
         }
         self.check_committed(start)?;
         let duration = self.clip.duration_ms();
-        if end >= duration && end < self.clip.recorded_ms() {
+        // D4: a range that reaches uncommitted time (its end included) is
+        // refused; only a finished clip clamps the end to its last frame.
+        let uncommitted =
+            self.clip.recorded_ms() > duration || self.clip.clip.state != ClipState::Ready;
+        if end >= duration && uncommitted {
             return Err(self.clip.waiting_error(end));
         }
         Ok((start, end.min(duration - 1)))

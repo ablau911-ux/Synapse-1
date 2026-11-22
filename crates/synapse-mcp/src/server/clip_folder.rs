@@ -18,7 +18,8 @@ pub(super) const CLIP_JSON_FILE: &str = "clip.json";
 pub(super) const FRAMES_FILE: &str = "frames.jsonl";
 pub(super) const WAITING_DIR: &str = "waiting";
 pub(super) const VIEWS_DIR: &str = "views";
-/// Lists active clips whose folder is not under the default clips folder.
+/// Lists clips whose folder is not under the default clips folder; entries
+/// stay after the clip is ready or failed.
 const REGISTRY_FILE: &str = "active-clips.json";
 const LOCK_SUFFIX: &str = ".lock";
 const TEMP_SUFFIX: &str = ".tmp";
@@ -424,7 +425,10 @@ pub(super) struct RegistryEntry {
     pub(super) folder: PathBuf,
 }
 
-/// The active-clip registry under the default clips folder (A4, B10).
+/// The active-clip registry under the default clips folder (A4, B10). An
+/// entry stays after the clip is ready or failed, so `record_status` and
+/// `record_stop` still find a clip in another folder by its id; recovery
+/// skips clips in a terminal state.
 pub(super) struct ClipRegistry;
 
 impl ClipRegistry {
@@ -454,11 +458,6 @@ impl ClipRegistry {
         })
     }
 
-    /// Drops a clip once it is ready or failed.
-    pub(super) fn remove(clip_id: &str) -> Result<(), String> {
-        Self::change(|entries| entries.retain(|entry| entry.clip_id != clip_id))
-    }
-
     fn change(edit: impl FnOnce(&mut Vec<RegistryEntry>)) -> Result<(), String> {
         let root = clips_root();
         std::fs::create_dir_all(&root)
@@ -470,11 +469,12 @@ impl ClipRegistry {
         write_atomically(&path, &entries)
     }
 
-    /// The folder of a clip id: the registry, then the default folder.
+    /// The folder of a clip id: the registry, then the default folder. A
+    /// registered folder that no longer holds a `clip.json` is skipped.
     pub(super) fn folder_of(clip_id: &str) -> Option<PathBuf> {
         Self::entries()
             .into_iter()
-            .find(|entry| entry.clip_id == clip_id)
+            .find(|entry| entry.clip_id == clip_id && entry.folder.join(CLIP_JSON_FILE).is_file())
             .map(|entry| entry.folder)
             .or_else(|| {
                 let folder = clips_root().join(clip_id);

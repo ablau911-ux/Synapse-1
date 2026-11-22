@@ -229,7 +229,6 @@ pub(crate) fn run_clip_worker_from_cli(folder: &Path) -> u8 {
                 clip.state = ClipState::Failed;
                 clip.failure = Some(error);
             });
-            let _ = clip_id_of(folder).map(|id| ClipRegistry::remove(&id));
             EXIT_FAILED
         }
     }
@@ -237,10 +236,6 @@ pub(crate) fn run_clip_worker_from_cli(folder: &Path) -> u8 {
 
 #[cfg(windows)]
 use fs2::FileExt;
-
-fn clip_id_of(folder: &Path) -> Option<String> {
-    ClipJson::read(folder).ok().map(|clip| clip.clip_id)
-}
 
 /// One clip, worked on by the worker process.
 #[cfg(windows)]
@@ -440,7 +435,6 @@ impl ClipWorker {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
-        ClipRegistry::remove(&clip.clip_id)?;
         tracing::info!(
             code = "CLIP_READY",
             folder = %self.folder.display(),
@@ -666,16 +660,23 @@ impl ClipWorkerHost {
             let segments_before = ClipJson::read(&folder).map_or(0, |clip| clip.segments.len());
             match WorkerRun::supervise(&folder) {
                 Ok(EXIT_READY | EXIT_FAILED | EXIT_BUSY) => {}
-                Ok(code) => self.after_crash(folder, segments_before, &format!("exit code {code}")),
-                Err(error) => self.after_crash(folder, segments_before, &error),
+                Ok(code) => {
+                    self.after_crash(&folder, segments_before, &format!("exit code {code}"));
+                }
+                Err(error) => self.after_crash(&folder, segments_before, &error),
+            }
+            // B4, C14: a failed clip gets no further worker, so a recording
+            // that still runs into it stops now.
+            if ClipJson::read(&folder).is_ok_and(|clip| clip.state == ClipState::Failed) {
+                super::capture_clip::stop_failed_recording(&folder);
             }
         }
     }
 
     /// A worker crash loses nothing: the clip enters the queue again while it
     /// makes progress; a crash without a new committed segment fails it.
-    fn after_crash(&self, folder: PathBuf, segments_before: usize, detail: &str) {
-        let Ok(clip) = ClipJson::read(&folder) else {
+    fn after_crash(&self, folder: &Path, segments_before: usize, detail: &str) {
+        let Ok(clip) = ClipJson::read(folder) else {
             return;
         };
         if matches!(clip.state, ClipState::Ready | ClipState::Failed) {
@@ -683,15 +684,14 @@ impl ClipWorkerHost {
         }
         if clip.segments.len() > segments_before || clip.state == ClipState::Recording {
             tracing::warn!(code = "CLIP_WORKER_CRASHED", folder = %folder.display(), detail);
-            self.enqueue(folder);
+            self.enqueue(folder.to_path_buf());
             return;
         }
         let failure = format!("the clip worker ended without progress: {detail}");
-        let _ = ClipJson::update(&folder, |clip| {
+        let _ = ClipJson::update(folder, |clip| {
             clip.state = ClipState::Failed;
             clip.failure = Some(failure);
         });
-        let _ = ClipRegistry::remove(&clip.clip_id);
     }
 }
 

@@ -1,0 +1,44 @@
+step2z: 78 rows from C:\Users\Adam\AppData\Local\Temp\zfix-proof.csv
+PASS  frames compressed: N_comp = N_new of the folder  (78 rows pass, 0 miss)
+PASS  bytes: bytes = Σ output sizes = Σ clip file sizes on disk  (78 rows pass, 0 miss)
+PASS  bytes of every retained file: bytes = Σ frame files + frames.jsonl (one line per instant) + clip.json  (78 rows pass, 0 miss)
+PASS  baseline equals the corpus: ZW1, L = -3, the corpus writer's call (16 KB output drain): frame bytes = D_wait  (1 rows pass, 0 miss)
+INFO  one-shot call: ZW1, L = -3, one ZSTD_compress2 per frame: frame bytes − D_wait, reported  (0 rows pass, 0 miss)
+        no rows to check
+        one-shot ZSTD_compress2: frame files 584399 B, D_wait 584757 B, difference -358 B (typing-640x360)
+        one-shot ZSTD_compress2: frame files 584399 B, D_wait 584757 B, difference -358 B (typing-640x360)
+        one-shot ZSTD_compress2: frame files 584399 B, D_wait 584757 B, difference -358 B (typing-640x360)
+PASS  input format: every way receives B,G,R,A; the conversion it needs is timed (convert cycles > 0 unless the layout is B,G,R,A)  (78 rows pass, 0 miss)
+PASS  CPU of all the way's work: way cycles = convert + compress (with context creation) + write + dictionary training  (78 rows pass, 0 miss)
+PASS  dictionary training CPU: dict > 0: train cycles > 0 and inside the way's CPU  (2 rows pass, 0 miss)
+PASS  RAM from the OS peak: RAM = PeakPagefileUsage after the work − M_0 (M_0 after the input is prepared); the work sets the peak  (78 rows pass, 0 miss)
+PASS  ldm set explicitly: ZSTD_c_enableLongDistanceMatching read back = 1 when ldm=1, 2 when ldm=0  (77 rows pass, 0 miss)
+PASS  ZW9 rectangle list, ZW9b one box: Σ bytes compressed = Σ rows · bytes of the listed rectangles; ZW9b at most 1 rectangle per frame  (4 rows pass, 0 miss)
+PASS  saved RAM prediction: known_m_comp of the runner = the check's equation 4 (with the workers and W_eff corrections)  (78 rows pass, 0 miss)
+PASS  run list: budget = T_floor + 4 h; T_total <= budget; held-out = round(0.2 · multi-size cells); mulberry32 seed 20261122  (1 rows pass, 0 miss)
+PASS  resume keys: planned key = saved key for every row; planning twice gives the same unique keys  (3 rows pass, 0 miss)
+PASS  determinism: bytes(run 1) = bytes(run 2) = bytes(run 3)  (1 rows pass, 0 miss)
+FAIL  RAM while compressing: M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes (one thread, frames)  (66 rows pass, 2 miss)
+        miss: typing-640x360 ZW16 L=-3 whole/bgr rep 1: known 5298544, measured 31854592
+        miss: typing-640x360 ZW16 L=-3 whole/bgr rep 1: known 5269224, measured 35008512
+PASS  RAM, nbWorkers > 0: M_comp = M_0 + ZSTD_sizeof_CCtx + B_c · px · 3 within ±10 %  (2 rows pass, 0 miss)
+PASS  RAM, one stream: M_comp = M_0 + M_cctx − 2^W + W_eff + B_c · px · 3 within ±10 %; W_eff = min(2^W, px · 3) when K_z = 1, else 2^W  (8 rows pass, 0 miss)
+PASS  CPU from the cycle counter: C = cycles / rate · 10^9 (rate from clip-probe exp-rate); one thread: C <= 1.02 · wall  (78 rows pass, 0 miss)
+PENDING  CPU: C_comp = N_new · (c_0 + px · κ_c), held-out rows within ±10 %  (0 rows pass, 0 miss)
+        needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only
+PENDING  run time: full-run wall time within ±20 % of T (equation 6)  (0 rows pass, 0 miss)
+        needs the full run; z-pilot.md gives T
+PASS  round trip: Σ |decoded − corpus| = 0  (78 rows pass, 0 miss)
+PASS  seek cost: N_dec(worst) = 1 independent; <= K_z otherwise  (78 rows pass, 0 miss)
+FAIL  decoder RAM: M_dec = M_0 + M_dctx + B_d · px · 3 + b_max within ±10 % of decode peak private bytes  (26 rows pass, 52 miss)
+        miss: typing-640x360 ZW1 L=-1 whole/bgr rep 1: known 4107003, measured 5337088
+        miss: typing-640x360 ZW1 L=-2 whole/bgr rep 1: known 4123633, measured 5357568
+        miss: typing-640x360 ZW1 L=-3 whole/bgr rep 1: known 4107387, measured 4575232
+        miss: typing-640x360 ZW1 L=-4 whole/bgr rep 1: known 4103570, measured 5332992
+        miss: typing-640x360 ZW1 L=-5 whole/bgr rep 1: known 4114284, measured 5402624
+        miss: typing-640x360 ZW1 L=-6 whole/bgr rep 1: known 4110373, measured 5394432
+        miss: typing-640x360 ZW1 L=-7 whole/bgr rep 1: known 4111391, measured 4636672
+        miss: typing-640x360 ZW1 L=-10 whole/bgr rep 1: known 4115222, measured 4636672
+        ... 44 more
+PASS  time until ready: t_ready = t_close <= 50 ms  (78 rows pass, 0 miss)
+step2z: 20 pass, 2 fail, 2 pending, 1 info

@@ -4,7 +4,7 @@
 //
 //   node run-z.mjs --plan                      count the full run list
 //   node run-z.mjs --full [--limit N]          run it into results/z-runs.csv (resumable)
-//   node run-z.mjs --pilot [folder]            the pilot into results/z-pilot.csv (resumable)
+//   node run-z.mjs --pilot [folder] [csv]      the pilot into results/z-pilot.csv or [csv] (resumable)
 //   node run-z.mjs --estimate                  T (equation 6) of the full run from the pilot
 //
 // Repeats: bytes are deterministic, so they come from run 1; CPU and RAM from runs 1 to 3.
@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CorpusFolder, rowChecks } from '../spec/step2z.mjs';
+import { CorpusFolder, rowChecks, ramKnown } from '../spec/step2z.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -34,7 +34,7 @@ const GRID_A_MODES = [
   { way: 'ZW8', tile: 32, kz: 20 },
   { way: 'ZW8', tile: 64, kz: 20 },
   { way: 'ZW8', tile: 128, kz: 20 },
-  { way: 'ZW9', kz: 20 },
+  { way: 'ZW9', gap: 0, kz: 20 },
 ];
 // Grid B: one factor at a time around the baseline (L = -3, whole frame), and every other runnable way.
 const GRID_B = [
@@ -49,6 +49,9 @@ const GRID_B = [
   { way: 'ZW6', layout: 'predu' },
   ...[1, 100, 'all'].map((kz) => ({ way: 'ZW7', kz })),
   { way: 'ZW7', mode: 'sub', kz: 20 },
+  // ZW9 merge gap 1 and 2 tiles (ways register); ZW9b one global bounding box, a separate way (M8).
+  ...[1, 2].map((gap) => ({ way: 'ZW9', gap, kz: 20 })),
+  { way: 'ZW9b', kz: 20 },
   ...[1, 20, 100, 'all'].map((kz) => ({ way: 'ZW12', kz })),
   ...[23, 24, 25, 27].map((wlog) => ({ way: 'ZW13', wlog, kz: 20 })),
   ...[1, 100, 'all'].map((kz) => ({ way: 'ZW13', kz })),
@@ -68,23 +71,69 @@ export const NOT_RUN = {
   ZW20: 'nvCOMP on the NVIDIA GPU: CUDA only, the capture adapter is the Intel GPU, no crate',
 };
 
-const OPTION_COLUMNS = ['folder', 'way', 'level', 'layout', 'mode', 'tile', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain', 'frames_cap', 'rep'];
+const OPTION_COLUMNS = ['folder', 'way', 'level', 'layout', 'mode', 'tile', 'gap', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain', 'frames_cap', 'rep'];
 const MEASURED_COLUMNS = [
   'w', 'h', 'px', 'n_new', 'd_wait', 'frames', 'bytes_out', 'bytes_disk', 'bytes_per_frame', 'files', 'dict_bytes',
+  'frame_bytes', 'index_bytes', 'clip_json_bytes', 'index_lines', 'input',
+  'way_cpu_ns', 'way_cycles', 'way_wall_ns', 'way_cpu_per_frame_ns', 'convert_cpu_ns', 'convert_cycles',
   'comp_cpu_ns', 'comp_gpt_ns', 'comp_cycles', 'comp_wall_ns', 'comp_cpu_per_frame_ns', 'comp_wall_total_ns',
-  'write_cpu_ns', 'write_wall_ns', 'corpus_cpu_ns', 'corpus_wall_ns', 'train_cpu_ns', 'train_wall_ns',
-  'm0_private', 'm0_ws', 'peak_private', 'peak_private_sampled', 'b_max', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'bd',
+  'write_cpu_ns', 'write_cycles', 'write_wall_ns', 'corpus_cpu_ns', 'corpus_wall_ns', 'train_cpu_ns', 'train_cycles', 'train_wall_ns',
+  'm0_private', 'm0_ws', 'os_peak_at_m0', 'ram_os', 'peak_private', 'peak_private_sampled', 'b_max', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'bd',
+  'ldm_read', 'rect_src_bytes', 'rect_listed_bytes', 'rects_max',
   'dec_cpu_ns', 'dec_gpt_ns', 'dec_wall_ns', 'dec_cpu_per_frame_ns', 'dec_peak_private', 'dec_peak_ws', 'read_cpu_ns', 'corpus_dec_cpu_ns',
   'frames_decoded', 'diff_sum', 'diff_frames', 'n_dec_worst', 't_ready_ns', 'run_wall_ms',
 ];
 const KNOWN_COLUMNS = ['rate', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
-const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_baseline', 'pass_baselineWriter', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_ramDec', 'pass_ready', 'error'];
+const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_bytesAll', 'pass_baseline', 'pass_inputFormat', 'pass_cpuTotal', 'pass_dictCpu', 'pass_ramOs', 'pass_ldm', 'pass_rectList', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_ramShared', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_ramDec', 'pass_ready', 'error'];
 const COLUMNS = [...OPTION_COLUMNS, ...MEASURED_COLUMNS, ...KNOWN_COLUMNS, ...PASS_COLUMNS];
 
 const folders = () => SCENARIOS.flatMap((s) => SIZES.map((z) => `${s}-${z}`));
 const optionKey = (r) => OPTION_COLUMNS.map((c) => String(r[c] ?? '')).join('|');
-export const plannedKey = optionKey;
-export const rowKey = optionKey;
+
+// The probe's own defaults (exp_z.rs, Way::defaults and Way::from_args), resolved here the same way
+// at planning, lookup and append (M9). The runner stops when a probe row resolves differently.
+const WAY_DEFAULTS = {
+  ZW0: ['bgr', 'raw'], ZW1: ['bgr', 'whole'], ZW16: ['bgr', 'whole'], ZW17: ['bgr', 'whole'], ZW2: ['bgra', 'whole'],
+  ZW3: ['planar', 'whole'], ZW4: ['sg', 'whole'], ZW5: ['ycocg', 'whole'], ZW6: ['predl', 'whole'], ZW7: ['bgr', 'xor'],
+  ZW8: ['bgr', 'tiles'], ZW9: ['bgr', 'rect'], ZW9b: ['bgr', 'box'], ZW12: ['bgr', 'prefix'], ZW15: ['bgr', 'prefix'],
+  ZW13: ['bgr', 'stream'], ZW14: ['bgr', 'stream'], ZW18: ['bgr', 'switch'], ZW19: ['planar', 'xor'],
+};
+
+/** The window that reaches one frame back, ceil(log2(2 * px * 3)) (exp_z.rs: next_power_of_two().trailing_zeros()). */
+function reach(folder) {
+  const [w, h] = folder.split('-').pop().split('x').map(Number);
+  let bits = 0;
+  while (2 ** bits < 2 * w * h * 3) bits += 1;
+  return bits;
+}
+
+/** A run with every probe option resolved to the value the probe will use. */
+export function resolveRun(run) {
+  const [layout, mode] = WAY_DEFAULTS[run.way] ?? [];
+  if (!layout) throw new Error(`unknown way ${run.way}`);
+  const given = (k) => run[k] !== undefined && run[k] !== '';
+  const m = given('mode') ? run.mode : mode;
+  return {
+    ...run,
+    layout: given('layout') ? run.layout : layout,
+    mode: m,
+    tile: given('tile') ? run.tile : 32,
+    gap: given('gap') ? run.gap : 0,
+    wlog: given('wlog') ? run.wlog : (m === 'prefix' || m === 'stream' ? reach(run.folder) : 0),
+    ldm: given('ldm') ? run.ldm : (run.way === 'ZW14' || run.way === 'ZW15' ? 1 : 0),
+    dict: given('dict') ? run.dict : (run.way === 'ZW16' ? 110 : 0),
+    workers: given('workers') ? run.workers : 0,
+    kz: given('kz') ? run.kz : 20,
+    theta: given('theta') ? run.theta : 25,
+    drain: given('drain') ? run.drain : 0,
+    frames_cap: run.frames_cap ?? '',
+  };
+}
+
+/** The key a planned run is looked up by: its options with the probe's defaults resolved. */
+export const plannedKey = (run) => optionKey(resolveRun(run));
+/** The key of a saved row: the options the probe reported. */
+export const rowKey = (row) => optionKey(row);
 
 /** The full run list: Grid A-Z, then Grid B, for every folder; each configuration × 3 repeats. */
 export function fullPlan() {
@@ -114,10 +163,10 @@ export function pilotPlan(folder) {
   return runs;
 }
 
-// Run list v2 (manager, 2026-11-22 about 21:37): the coverage floor, then larger sizes by cost.
+// Run list v2 (plan, "Run design" 6): the coverage floor, then larger sizes by cost while T_total <= T_floor + 4 h.
 const FLOOR_SIZE = '640x360';
 const LARGER_SIZES = ['506x333', '1280x720', '1920x1080'];
-const BUDGET_S = 12 * 3600;
+const BUDGET_EXTRA_S = 4 * 3600;
 const HOLD_OUT_SHARE = 0.2;
 const HOLD_OUT_SEED = 20261122;
 const PILOT_PX = 1920 * 1080;
@@ -185,7 +234,7 @@ function seeded(seed) {
 }
 
 /** results/z-runlist.json: cells (way, options, level, size; 6 contents × 3 repeats each), cheapest first. */
-export function buildRunList(budgetS = BUDGET_S) {
+export function buildRunList(budgetHours = null) {
   const model = costModel(path.join(RESULTS, 'z-pilot.csv'));
   const { swept, once } = wayConfigs();
   const cellCost = (config, level, size) => {
@@ -196,6 +245,7 @@ export function buildRunList(budgetS = BUDGET_S) {
   const floor = [...swept.flatMap((c) => LEVELS.map((l) => make(c, l, FLOOR_SIZE))), ...once.map((c) => make(c, -3, FLOOR_SIZE))];
   for (const cell of floor) cell.status = 'run';
   const floorS = floor.reduce((s, c) => s + c.cost_s, 0);
+  const budgetS = budgetHours === null ? floorS + BUDGET_EXTRA_S : budgetHours * 3600;
   const larger = [...swept.flatMap((c) => LEVELS.flatMap((l) => LARGER_SIZES.map((z) => make(c, l, z)))), ...once.flatMap((c) => LARGER_SIZES.map((z) => make(c, -3, z)))]
     .sort((x, y) => x.cost_s - y.cost_s);
   let total = floorS;
@@ -220,7 +270,7 @@ export function buildRunList(budgetS = BUDGET_S) {
   const count = (s) => cells.filter((c) => c.status === s).length;
   const list = {
     created: new Date().toISOString(),
-    rule: 'coverage floor: every runnable way and option level x every Z1 level x 6 contents at 640x360; then the larger sizes cell by cell, cheapest predicted cell first, while T_total <= 12 h; cells left out are predicted by the size equations (eq. 1 eta, eq. 3 px-linear kappa_c); 20 % of the cells that run at more than one size are held out (seeded, drawn from the larger sizes)',
+    rule: 'coverage floor: every runnable way and option level x every Z1 level x 6 contents at 640x360; then the larger sizes cell by cell, cheapest predicted cell first, while T_total <= T_floor + 4 h; cells left out are predicted by the size equations (eq. 1 eta, eq. 3 px-linear kappa_c); 20 % of the cells that run at more than one size are held out (seeded, drawn from the larger sizes)',
     equation: 'T = sum over runs of (t_0 + N_new * (px / px_pilot) * (a + c(L, m))) * repeats; c(L, m) = c_ZW1(L) * c_m(-3) / c_ZW1(-3); equation 6 with v(L, m) = px_pilot * 3 / (a + c(L, m)) plus t_0 per subprocess',
     coefficients: { t_0_s: model.t0, a_s_per_frame: model.a, px_pilot: PILOT_PX, c_ZW1_s_per_frame: Object.fromEntries(model.cLevel), pilot: 'results/z-pilot.csv' },
     repeats: REPEATS,
@@ -256,7 +306,9 @@ class Csv {
       const cols = head.split(',');
       for (const line of lines) {
         const values = line.split(',');
-        this.done.add(optionKey(Object.fromEntries(cols.map((c, i) => [c, values[i]]))));
+        const key = rowKey(Object.fromEntries(cols.map((c, i) => [c, values[i]])));
+        if (this.done.has(key)) throw new Error(`${path.basename(file)} has the run key ${key} twice`);
+        this.done.add(key);
       }
     } else {
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -265,18 +317,21 @@ class Csv {
   }
 
   has(run) {
-    return this.done.has(optionKey(run));
+    return this.done.has(plannedKey(run));
   }
 
+  /** Appends a row whose key is new; a key already saved is rejected (M9). */
   append(row) {
+    const key = rowKey(row);
+    if (this.done.has(key)) throw new Error(`run key ${key} is already in ${path.basename(this.file)}`);
     fs.appendFileSync(this.file, `${COLUMNS.map((c) => String(row[c] ?? '').replace(/[,\n]/g, ';')).join(',')}\n`);
-    this.done.add(optionKey(row));
+    this.done.add(key);
   }
 }
 
 function probeArgs(run, rate) {
   const args = ['exp-z', `folder=${path.join(CORPUS, run.folder)}`, `out=${SCRATCH}`, `rate=${rate}`];
-  for (const key of ['way', 'level', 'layout', 'mode', 'tile', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain', 'rep']) {
+  for (const key of ['way', 'level', 'layout', 'mode', 'tile', 'gap', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain', 'rep']) {
     if (run[key] !== undefined && run[key] !== '') args.push(`${key}=${run[key]}`);
   }
   if (run.frames_cap) args.push(`frames=${run.frames_cap}`);
@@ -311,6 +366,8 @@ function cycleRate() {
 
 async function runAll(runs, csvFile, limit = Infinity) {
   const csv = new Csv(csvFile);
+  const keys = runs.map(plannedKey);
+  if (new Set(keys).size !== keys.length) throw new Error('the plan has a run key twice');
   const todo = runs.filter((r) => !csv.has(r)).slice(0, limit);
   console.log(`run-z: ${runs.length} runs, ${runs.length - todo.length} already in ${path.basename(csvFile)}, ${todo.length} to run`);
   if (todo.length === 0) return;
@@ -320,12 +377,15 @@ async function runAll(runs, csvFile, limit = Infinity) {
   for (const [i, run] of todo.entries()) {
     const { json, error, wallMs } = await runProbe(probeArgs(run, rate));
     const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, rate, error };
-    for (const key of ['layout', 'mode', 'tile', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain']) row[key] = json?.[key] ?? run[key] ?? '';
+    const planned = resolveRun(run);
+    for (const key of ['layout', 'mode', 'tile', 'gap', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain']) row[key] = json?.[key] ?? planned[key];
+    row.frames_cap = planned.frames_cap;
+    if (rowKey(row) !== plannedKey(run)) throw new Error(`the probe resolved ${plannedKey(run)} as ${rowKey(row)}: fix WAY_DEFAULTS in run-z.mjs`);
     if (json) {
       const folder = CorpusFolder.of(CORPUS, run.folder);
       row.known_n_new = folder.nNew;
       row.known_d_wait = folder.dWait;
-      row.known_m_comp = json.m0_private + json.m_cctx_est + json.bc * json.px * 3;
+      row.known_m_comp = ramKnown(row).known;
       row.known_m_dec = json.m0_private + json.m_dctx_est + json.bd * json.px * 3 + json.b_max;
       for (const c of rowChecks(row, folder)) if (!c.note) row[`pass_${c.scenario}`] = c.ok ? 1 : 0;
     }
@@ -449,12 +509,12 @@ async function main() {
     const plan = fullPlan();
     console.log(`full run: ${plan.length} runs (${plan.length / REPEATS} configurations × ${REPEATS} repeats); not run: ${Object.keys(NOT_RUN).join(', ')}`);
   } else if (flag === '--runlist') {
-    const list = buildRunList(arg ? Number(arg) * 3600 : BUDGET_S);
+    const list = buildRunList(arg ? Number(arg) : null);
     console.log(`z-runlist.json: T_total ${list.T_total_h.toFixed(2)} h (floor ${list.T_floor_h.toFixed(2)} h); cells ${JSON.stringify(list.counts)}; t_0 ${list.coefficients.t_0_s.toFixed(3)} s, a ${(list.coefficients.a_s_per_frame * 1e3).toFixed(2)} ms/frame; no pilot row: ${list.ways_without_pilot_row.join(', ') || 'none'}`);
   } else if (flag === '--full') {
     await runAll(listRuns(), path.join(RESULTS, 'z-runs.csv'), Number(process.argv[4] ?? Infinity));
   } else if (flag === '--pilot') {
-    await runAll(pilotPlan(arg ?? 'scroll-1920x1080'), path.join(RESULTS, 'z-pilot.csv'));
+    await runAll(pilotPlan(arg ?? 'scroll-1920x1080'), process.argv[4] ? path.resolve(process.argv[4]) : path.join(RESULTS, 'z-pilot.csv'));
   } else if (flag === '--estimate') {
     const e = estimate(path.join(RESULTS, 'z-pilot.csv'));
     console.log(`T = ${(e.seconds / 3600).toFixed(1)} h over ${e.runs} runs`);

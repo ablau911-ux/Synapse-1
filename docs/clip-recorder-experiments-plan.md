@@ -85,8 +85,9 @@ Checked as Σ |decoded − corpus| = 0 over every pixel of every frame.
     M_comp = M_0 + M_cctx(L, W) + B_c · px · 3                   B_c = frames held: 1 (whole), 2 (XOR, tiles, rectangles)
     M_dec  = M_0 + M_dctx(W) + B_d · px · 3
     M_cctx, M_dctx: zstd's own estimates (`ZSTD_estimateCCtxSize_usingCParams`, `ZSTD_estimateDCtxSize`)
-    stream ways:   W_eff = min(2^windowLog, frame bytes rounded up to a power of 2)    (zstd sizes the window to a known source)
-    nbWorkers > 0: M_cctx = ZSTD_sizeof_CCtx after the context is set up              (the estimates cover one thread only)
+    stream ways:   W_eff = min(2^windowLog, px · 3) when each frame is its own zstd frame with a known size (K_z = 1),
+                   W_eff = 2^windowLog otherwise                                       (zstd's rule in ZSTD_resetCCtx_internal)
+    nbWorkers > 0: M_cctx = ZSTD_sizeof_CCtx after the last frame                    (the estimates cover one thread only; the workspace is allocated at the first frame)
     viewer:        M_dec gains b_max, the largest clip file, which the viewer holds while it decodes
 
 Corrections from the step 2a pilot (`65fe9549`), each checked by its own row in `spec/step2z.mjs`. CPU is read from the process cycle counter (user plus kernel, all threads), because `GetProcessTimes` advances in 15.6 ms ticks and read 0.5 to 0.8 of the true time.
@@ -149,7 +150,8 @@ Run design (owner decision, 2026-11-22 about 20:47: every option at every level;
   2. The other sizes are added cell by cell, cheapest predicted cell first, until T_total reaches 12 h.
   3. Cells left out are predicted by the size equations (η in equation 1, px-linear κ_c in equation 3) and marked "predicted".
   4. 20 % of the cells that run at more than one size are held out with a fixed seed, so step 4 proves the size prediction.
-  5. The list and T_total are in `scripts/clip-equation/results/z-runlist.json`. Way D's full run follows way Z's, never at the same time, so neither disturbs the other's CPU figures.
+  5. The list and T_total are in `scripts/clip-equation/results/z-runlist.json`. Way D's full run and way Z's run one after the other, never at the same time, so neither disturbs the other's CPU figures.
+  6. As built (`1cfd8ed2`, 21:42): the coverage floor alone is T = 16.05 h (levels 19 to 22 take 10.16 h of it), so at 12 h no larger cell fits and nothing can be held out. Decision: the budget is floor + 4 h, T_total ≈ 20 h, with the 1,242 cheapest larger cells, 20 % of them held out (mulberry32, seed 20261122). Reason: the owner's order of costs is tokens, then PC, then time; this choice needs no new code, keeps every option at every level, and proves the size prediction. Order: way D's full run first (≈ 5 h, results sooner), then way Z.
 - Every runnable way of `docs/clip-recorder-ways.md` that is not one of these factors is added as a row of grid B.
 
 ## Procedure

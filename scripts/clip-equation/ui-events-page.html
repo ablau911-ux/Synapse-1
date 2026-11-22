@@ -4,7 +4,12 @@
   Plays a fixed schedule of ordinary UI events, by time from the schedule start:
     ?start=<unix ms>  the schedule start (wall clock); without it, 3 s after the page loads.
   The schedule is printed on the page (static text) and exposed as window.schedule:
-  [{ t_ms, name, expect, until_ms? }], expect = the timeline kind the viewer must report.
+  [{ id, t_ms, name, expect, until_ms? }], expect = the timeline kind the viewer must report.
+  The actual timing is exposed as window.actualTiming, one entry per schedule row, in ms from the
+  schedule start: set_ms = the animation frame that made the change, shown_ms = the next animation
+  frame (the change is on screen by then); for a flash also hide_ms and hidden_ms. A flash stays
+  on screen FLASH_MS from its shown_ms, so a late frame never shortens or hides it (issue #293).
+  window.scheduleBoxFits is true when the printed schedule is shown whole and nothing covers it.
   Always running, from page load to past the clip end:
     - a lone spinner (an ordinary 32 px border-arc spinner, 1 turn per second), far from all else;
     - spinner B beside a label, until a checkmark replaces it.
@@ -19,9 +24,9 @@
   html, body { margin: 0; height: 100%; overflow: hidden; }
   body { background: #f4f4f8; color: #222; font: 16px/1.5 "Segoe UI", Arial, sans-serif; }
   .card { position: absolute; background: #ffffff; border: 1px solid #c8c8d0; border-radius: 6px; }
-  #schedule { position: absolute; left: 16px; top: 16px; width: 430px; height: 400px; background: #fffbe6;
+  #schedule { position: absolute; left: 16px; top: 16px; width: 430px; background: #fffbe6;
               border: 1px solid #d8cf9c; border-radius: 6px; padding: 8px 12px; box-sizing: border-box;
-              font: 13px/1.45 Consolas, monospace; white-space: pre; overflow: hidden; }
+              font: 12px/1.3 Consolas, monospace; white-space: pre; }
   #list { left: 480px; top: 16px; width: 260px; height: 160px; padding: 6px 0; box-sizing: border-box; }
   #list div { height: 28px; line-height: 28px; padding: 0 14px; }
   #list div.selected { background: #cce8ff; }
@@ -44,6 +49,9 @@
   #flashcard { left: 480px; top: 400px; width: 420px; height: 110px; }
   #flash { position: absolute; left: 24px; top: 24px; width: 80px; height: 60px; background: #ff2050; display: none; }
   #status { position: absolute; left: 140px; top: 40px; }
+  #altcard { left: 960px; top: 400px; width: 120px; height: 110px; }
+  #alt { position: absolute; left: 30px; top: 25px; width: 60px; height: 60px; background: rgb(128, 128, 128); }
+  #altflash { position: absolute; left: 0; top: 0; width: 60px; height: 60px; background: #202020; display: none; }
   #trackcard { left: 16px; top: 560px; width: 860px; height: 72px; }
   #track { position: absolute; left: 30px; top: 16px; width: 800px; height: 40px; background: #e8e8e8; }
   #playhead { position: absolute; left: 0; top: 0; width: 2px; height: 40px; background: #c00000; }
@@ -62,6 +70,7 @@
 <div id="dialog"><b>Delete this file?</b>It cannot be restored.<br><span>Cancel</span><span>Delete</span></div>
 <div class="card" id="savecard"><div class="spinner" id="spinnerB"></div><div id="check">&#x2714;</div><div id="saveLabel">Saving 1 of 3 files</div></div>
 <div class="card" id="flashcard"><div id="flash"></div><div id="status">Status: idle</div></div>
+<div class="card" id="altcard"><div id="alt"><div id="altflash"></div></div></div>
 <div class="card" id="trackcard"><div id="track"><div id="playhead"></div></div></div>
 <div class="card" id="typecard"><div id="field"><span id="typed"></span><span id="caret"></span></div></div>
 <div class="card" id="lonecard"><div class="spinner" id="spinnerA"></div></div>
@@ -72,19 +81,27 @@
   const TYPE_MS_PER_CHAR = 120;
   const CARET_HALF_PERIOD_MS = 530; // the Windows default caret blink
   const AUTO_START_MS = 3000;
+  // The grey square: its anchor is grey 128; it alternates 100/156, each SAME as the anchor
+  // (28 <= delta_lo 32, with room for encoder noise) and DIFF frame to frame (56 on every pixel).
+  const ALT_GREY = 128;
+  const ALT_LOW = 100;
+  const ALT_HIGH = 156;
+  const ALT_STEP_MS = 50;           // a new value every recorded instant
 
   // t_ms from the schedule start; expect = the timeline kind the viewer must report.
   const schedule = [
-    { t_ms: 2000, name: 'list selection #cce8ff on white', expect: 'change' },
-    { t_ms: 4000, name: 'grey fill #d0d0d0 on white', expect: 'change' },
-    { t_ms: 6000, name: 'dialog fades in over 300 ms', expect: 'change' },
-    { t_ms: 8000, name: 'label changes beside running spinner B', expect: 'change' },
-    { t_ms: 10000, name: 'checkmark replaces spinner B', expect: 'change' },
-    { t_ms: 12000, name: '50 ms flash', expect: 'short_lived' },
-    { t_ms: 12000, name: 'status label changes beside the flash', expect: 'change' },
-    { t_ms: 14000, name: 'playhead (2 px) starts moving, 20 px/s', expect: 'animating' },
-    { t_ms: 16000, name: 'typing starts, 20 characters, 120 ms each', expect: 'change' },
-    { t_ms: 19000, until_ms: 29000, name: 'still period: nothing new (caret blinks)', expect: 'none' },
+    { id: 'select', t_ms: 2000, name: 'list selection #cce8ff on white', expect: 'change' },
+    { id: 'fill', t_ms: 4000, name: 'grey fill #d0d0d0 on white', expect: 'change' },
+    { id: 'fade', t_ms: 6000, name: 'dialog fades in over 300 ms', expect: 'change' },
+    { id: 'label', t_ms: 8000, name: 'label changes beside running spinner B', expect: 'change' },
+    { id: 'check', t_ms: 10000, name: 'checkmark replaces spinner B', expect: 'change' },
+    { id: 'flash', t_ms: 12000, name: '50 ms flash', expect: 'short_lived' },
+    { id: 'status', t_ms: 12000, name: 'status label changes beside the flash', expect: 'change' },
+    { id: 'playhead', t_ms: 14000, name: 'playhead (2 px) starts moving, 20 px/s', expect: 'animating' },
+    { id: 'alternate', t_ms: 15000, until_ms: 16000, name: 'grey square alternates 100/156 around 128', expect: 'animating' },
+    { id: 'typing', t_ms: 16000, name: 'typing starts, 20 characters, 120 ms each', expect: 'change' },
+    { id: 'darkflash', t_ms: 16400, name: '50 ms dark flash in the grey square', expect: 'short_lived' },
+    { id: 'still', t_ms: 19000, until_ms: 29000, name: 'still period: nothing new (caret blinks)', expect: 'none' },
   ];
   window.schedule = schedule;
 
@@ -100,18 +117,14 @@
       '  ' + e.name + '\n        expect: ' + e.expect).join('\n') +
     '\n\nalways: lone spinner (bottom right),\n        spinner B until 10000';
 
-  const actions = {
-    2000: () => $('item3').classList.add('selected'),
-    4000: () => $('fill').classList.add('on'),
-    6000: () => $('dialog').classList.add('on'),
-    8000: () => { $('saveLabel').textContent = 'Saving 2 of 3 files'; },
-    10000: () => { $('spinnerB').style.display = 'none'; $('check').style.display = 'block'; },
-    12000: () => { $('flash').style.display = 'block'; $('status').textContent = 'Status: synced'; },
-  };
-  const done = new Set();
-  let flashOffAt = null;
-  let caretTimer = null;
+  // The printed schedule is shown whole: nothing cut off, and no card or window edge below it.
+  const box = $('schedule').getBoundingClientRect();
+  window.scheduleBoxFits = $('schedule').scrollHeight <= $('schedule').clientHeight
+    && $('schedule').scrollWidth <= $('schedule').clientWidth
+    && box.bottom <= $('trackcard').getBoundingClientRect().top
+    && box.bottom <= window.innerHeight;
 
+  let caretTimer = null;
   function blinkCaret() {
     clearInterval(caretTimer);
     $('caret').style.visibility = 'visible';
@@ -121,23 +134,64 @@
     }, CARET_HALF_PERIOD_MS);
   }
 
-  function frame() {
-    const t = Date.now() - start;
-    for (const [at, act] of Object.entries(actions)) {
-      if (t >= Number(at) && !done.has(at)) { done.add(at); act(); if (Number(at) === 12000) flashOffAt = Number(at) + FLASH_MS; }
-    }
-    if (flashOffAt !== null && t >= flashOffAt) { $('flash').style.display = 'none'; flashOffAt = null; }
-    if (t >= 14000) {
-      const x = Math.min(798, Math.floor((t - 14000) * PLAYHEAD_PX_PER_S / 1000));
-      $('playhead').style.left = x + 'px';
-    }
-    if (t >= 16000) {
-      const n = Math.min(TYPE_TEXT.length, Math.floor((t - 16000) / TYPE_MS_PER_CHAR) + 1);
+  function setGrey(value) {
+    $('alt').style.background = 'rgb(' + value + ', ' + value + ', ' + value + ')';
+  }
+
+  // Per schedule row: once = the change made at its start; tick(t) = run every frame from its
+  // start, t in ms since the start; flash = the element hidden FLASH_MS after it was shown.
+  const steps = {
+    select: { once: () => $('item3').classList.add('selected') },
+    fill: { once: () => $('fill').classList.add('on') },
+    fade: { once: () => $('dialog').classList.add('on') },
+    label: { once: () => { $('saveLabel').textContent = 'Saving 2 of 3 files'; } },
+    check: { once: () => { $('spinnerB').style.display = 'none'; $('check').style.display = 'block'; } },
+    flash: { once: () => { $('flash').style.display = 'block'; }, flash: 'flash' },
+    status: { once: () => { $('status').textContent = 'Status: synced'; } },
+    playhead: { tick: t => { $('playhead').style.left = Math.min(798, Math.floor(t * PLAYHEAD_PX_PER_S / 1000)) + 'px'; } },
+    alternate: { tick: (t, row) => {
+      const running = t < row.until_ms - row.t_ms;
+      setGrey(running ? (Math.floor(t / ALT_STEP_MS) % 2 ? ALT_HIGH : ALT_LOW) : ALT_GREY);
+    } },
+    typing: { tick: t => {
+      const n = Math.min(TYPE_TEXT.length, Math.floor(t / TYPE_MS_PER_CHAR) + 1);
       if ($('typed').textContent.length !== n) {
         $('typed').textContent = TYPE_TEXT.slice(0, n);
         blinkCaret(); // solid while typing, blinks from the last key on
       }
-    }
+    } },
+    darkflash: { once: () => { $('altflash').style.display = 'block'; }, flash: 'altflash' },
+    still: {},
+  };
+
+  // The actual timing (see the header): a change made in one animation frame is on screen by
+  // the next one, whose time is written into the field waiting for it.
+  const actualTiming = schedule.map(row => ({ name: row.name, t_ms: row.t_ms }));
+  window.actualTiming = actualTiming;
+  let awaitingPaint = [];
+  function mark(entry, setField, shownField, t) {
+    entry[setField] = t;
+    awaitingPaint.push([entry, shownField]);
+  }
+
+  function frame(timestamp) {
+    const t = performance.timeOrigin + timestamp - start;
+    for (const [entry, field] of awaitingPaint) entry[field] = t;
+    awaitingPaint = [];
+    schedule.forEach((row, index) => {
+      if (t < row.t_ms) return;
+      const step = steps[row.id];
+      const actual = actualTiming[index];
+      if (actual.set_ms === undefined) {
+        if (step.once) step.once();
+        mark(actual, 'set_ms', 'shown_ms', t);
+      }
+      if (step.tick) step.tick(t - row.t_ms, row);
+      if (step.flash && actual.shown_ms !== undefined && actual.hide_ms === undefined && t - actual.shown_ms >= FLASH_MS) {
+        $(step.flash).style.display = 'none';
+        mark(actual, 'hide_ms', 'hidden_ms', t);
+      }
+    });
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

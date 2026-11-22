@@ -81,5 +81,5 @@ Feature: The viewer reports each scheduled UI event once, with its type and star
 
   Scenario: #293-7 the schedule box shows every row
     Given the page's schedule box
-    Then its content fits the box: nothing is cut off
-    # Equation: scrollHeight <= clientHeight | Known: true
+    Then its content fits the box and nothing covers it: no row is cut off or hidden
+    # Equation: scroll size <= client size, box bottom <= top of the track card and of the window (window.scheduleBoxFits) | Known: true

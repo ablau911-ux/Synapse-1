@@ -98,7 +98,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 3;
+const ANALYSIS_VERSION: u32 = 4;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -852,9 +852,12 @@ impl<'a> Analyzer<'a> {
             episode.short_lived =
                 span(self.clip, episode.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS;
         }
+        // A resize ends comparison continuity: a change before it is never
+        // compared with, or merged into, a picture of another size.
         if !episode.reverted
             && let Some(previous) = self.done.last_mut()
             && !previous.reverted
+            && (previous.blocks.width, previous.blocks.height) == (width, height)
             && span(self.clip, previous.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS
             && BlockMap::between(&previous.before, &self.shown, width, height).count == 0
         {

@@ -1,0 +1,24 @@
+step2z: 0 rows from results/z-runs.csv (no CSV at results/z-runs.csv)
+FAIL  frames compressed: N_comp = N_new of the folder  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  bytes: bytes = Σ output sizes = Σ clip file sizes on disk  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  baseline equals the corpus: ZW1, L = -3, interleaved, independent: bytes = D_wait  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  determinism: bytes(run 1) = bytes(run 2) = bytes(run 3)  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  RAM while compressing: M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes  (0 rows pass, 0 miss)
+        no rows to check
+PENDING  CPU: C_comp = N_new · (c_0 + px · κ_c), held-out rows within ±10 %  (0 rows pass, 0 miss)
+        needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only
+PENDING  run time: full-run wall time within ±20 % of T (equation 6)  (0 rows pass, 0 miss)
+        needs the full run; z-pilot.md gives T
+FAIL  round trip: Σ |decoded − corpus| = 0  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  seek cost: N_dec(worst) = 1 independent; <= K_z otherwise  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  decoder RAM: M_dec = M_0 + M_dctx + B_d · px · 3 within ±10 % of decode peak private bytes  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  time until ready: t_ready = t_close <= 50 ms  (0 rows pass, 0 miss)
+        no rows to check
+step2z: 0 pass, 9 fail, 2 pending

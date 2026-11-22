@@ -18,7 +18,7 @@
 //! `screenshot capture`; the recorder runs on its own thread; the folder must
 //! not exist; the error codes and their context fields.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -398,21 +398,36 @@ fn run_recorder_thread(
             return;
         }
     };
-    let _claim = RecorderClaim {
+    let mut claim = RecorderClaim {
         clip_id: &plan.clip_id,
+        folder: &plan.folder,
+        returned: false,
     };
     record(&plan, &control, started);
+    claim.returned = true;
 }
 
 /// Ends the recorder's claim when the recorder thread ends, also by a panic:
 /// the live share is cleared and the one-recording claim released, so a later
-/// `record` is not refused until the service restarts.
+/// `record` is not refused until the service restarts. A recorder that did
+/// not return (a panic; only dev builds unwind) leaves a clip still
+/// `recording` as `failed`, so the worker does not wait for it forever.
 struct RecorderClaim<'a> {
     clip_id: &'a str,
+    folder: &'a Path,
+    returned: bool,
 }
 
 impl Drop for RecorderClaim<'_> {
     fn drop(&mut self) {
+        if !self.returned && self.folder.join(CLIP_JSON_FILE).is_file() {
+            let _ = ClipJson::update(self.folder, |clip| {
+                if clip.state == ClipState::Recording {
+                    clip.state = ClipState::Failed;
+                    clip.failure = Some("the recorder thread ended without finishing".to_owned());
+                }
+            });
+        }
         super::clip_worker::ProcessorBudget::global().clear_live_share();
         Recorders::release(self.clip_id);
     }

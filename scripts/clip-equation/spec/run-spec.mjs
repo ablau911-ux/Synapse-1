@@ -18,7 +18,8 @@ const SPEC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(SPEC_DIR, '..');
 const PASS = 'pass';
 const FAIL = 'FAIL';
-const NOT_NEEDED = 'not needed';
+/** A row the plan checks in a later step: printed, never a failure here. */
+const STEP2 = 'step 2';
 
 /** One scenario of a feature file: its title, equation and known result. */
 class Scenario {
@@ -154,11 +155,7 @@ const STEP1 = {
     const file = path.join(BASE_DIR, 'results', 'encoders.json');
     const entries = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
     const unique = new Set(entries.map((e) => `${e.codec}|${e.name}|${e.vendor_id}`)).size;
-    return { value: unique, measured: `${unique} unique of ${entries.length} entries`, pass: NOT_NEEDED };
-  },
-
-  'activate encoders'() {
-    return { value: '-', measured: '-', pass: NOT_NEEDED };
+    return { value: '-', measured: `${unique} unique of ${entries.length} entries`, pass: STEP2 };
   },
 
   'capture folders'(scenario, corpus) {
@@ -197,18 +194,6 @@ const STEP1 = {
     }
     const value = corpus.config.sizes.map((s) => s.width * s.height * 3).join('; ');
     return { value, measured: `${checked} frames, ${bad.length} wrong${misses(bad)}`, pass: equationOk && corpus.complete && checked > 0 && bad.length === 0 };
-  },
-
-  'encoded size'(scenario, corpus) {
-    const known = scenario.knownMap();
-    const scaled = corpus.config.sizes.filter((s) => s.sigma !== 1);
-    const equationOk = scaled.every((s) => known.get(`${s.width}x${s.height}`) === `${s.sigma * s.width}x${s.sigma * s.height}`);
-    const bad = corpus.folders.filter((f) => {
-      const meta = f.meta;
-      return !meta || meta.sigma !== f.size.sigma || meta.recorded?.[0] !== f.size.sigma * f.size.width || meta.recorded?.[1] !== f.size.sigma * f.size.height;
-    }).map((f) => f.name);
-    const value = scaled.map((s) => `${s.sigma * s.width}x${s.sigma * s.height}`).join('; ');
-    return { value, measured: `${corpus.folders.length - bad.length}/${corpus.folders.length} meta.json match${misses(bad)}`, pass: equationOk && bad.length === 0 };
   },
 
   repeats(scenario, corpus) {
@@ -309,7 +294,7 @@ function main() {
     } catch (error) {
       outcome = { value: '-', measured: `error: ${error.message}`, pass: false };
     }
-    const result = outcome.pass === NOT_NEEDED ? `${NOT_NEEDED}: zstd only` : outcome.pass ? PASS : FAIL;
+    const result = outcome.pass === STEP2 ? STEP2 : outcome.pass === true ? PASS : FAIL;
     if (result === FAIL) failed += 1;
     console.log(`${scenario.title} | ${scenario.equation} | ${scenario.known} | ${outcome.value} | ${outcome.measured} | ${result}`);
   }

@@ -52,20 +52,32 @@
   let lastFlash = -1; // number of the last flash started, so each starts once
   const log = [];
 
+  // Corpus mode (?start=<Unix ms>, experiments plan F7): the page time starts
+  // at `start` instead of the first refresh, the first flash is at 0.5 s so a
+  // 20 s capture holds 20 flashes, and the counter, clock and log show only
+  // values that depend on the 50 ms instant count, never on refresh timing.
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  const corpus = START > 0;
+  if (corpus) t0 = START - performance.timeOrigin;
+  const FIRST_FLASH_MS = corpus ? 500 : 1000;
+
   function flashWindow(n) {
     const phase = (n * PHASE_STEP_MS) % RECORD_INTERVAL_MS;
-    return { start: 1000 + n * FLASH_PERIOD_MS + phase, phase };
+    return { start: FIRST_FLASH_MS + n * FLASH_PERIOD_MS + phase, phase };
   }
 
   function frame(now) {
     if (t0 === null) t0 = now;
     const t = now - t0;
+    if (t < 0) { requestAnimationFrame(frame); return; }
     refresh += 1;
-    counterEl.textContent = refresh;
-    clockEl.textContent = 't=' + (t / 1000).toFixed(3) + ' s';
-    if (anim) animEl.style.transform = 'translateX(' + ((t / 4) % 600) + 'px)';
+    const k = Math.floor(t / RECORD_INTERVAL_MS);
+    counterEl.textContent = corpus ? k : refresh;
+    clockEl.textContent = corpus ? 't=' + (k * RECORD_INTERVAL_MS / 1000).toFixed(2) + ' s'
+      : 't=' + (t / 1000).toFixed(3) + ' s';
+    if (anim) animEl.style.transform = 'translateX(' + (((corpus ? k * RECORD_INTERVAL_MS : t) / 4) % 600) + 'px)';
 
-    const n = Math.max(0, Math.floor((t - 1000) / FLASH_PERIOD_MS));
+    const n = Math.max(0, Math.floor((t - FIRST_FLASH_MS) / FLASH_PERIOD_MS));
     const w = flashWindow(n);
     // The flash starts at the first refresh at or after its start time and
     // stays on until FLASH_MS after that first shown refresh, so it is on the
@@ -81,8 +93,8 @@
       flashEl.style.display = 'none';
       if (current) {
         log.unshift('flash ' + current.n + '  start ' + (current.start / 1000).toFixed(3) +
-          ' s  phase ' + current.phase + ' ms  refresh ' + current.first + '..' + current.last +
-          '  on ' + (t - current.firstT).toFixed(1) + ' ms');
+          ' s  phase ' + current.phase + ' ms' + (corpus ? '' : '  refresh ' + current.first + '..' +
+          current.last + '  on ' + (t - current.firstT).toFixed(1) + ' ms'));
         log.length = Math.min(log.length, LOG_LINES);
         logEl.textContent = log.join('\n');
         current = null;

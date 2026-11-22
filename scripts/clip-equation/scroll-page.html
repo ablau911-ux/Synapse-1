@@ -38,15 +38,23 @@
   }
   document.getElementById('text').innerHTML = html;
 
-  let last = null, position = 0;
+  // Driven by the recording's instant count, never by wall time: step k is
+  // the number of whole 50 ms instants since the start (?start=<Unix ms>, or
+  // the first refresh without it); the scroll position is a pure function
+  // of k, so two captures on the same instant grid are identical.
+  const INSTANT_MS = 50;
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  let startPerf = START > 0 ? START - performance.timeOrigin : null;
+  let shown = -1;
   function frame(now) {
-    if (last !== null) {
+    if (startPerf === null) startPerf = now;
+    const k = Math.max(0, Math.floor((now - startPerf) / INSTANT_MS));
+    if (k !== shown) {
       const root = document.scrollingElement;
-      position += SCROLL_PX_PER_S * (now - last) / 1000;
-      if (position > root.scrollHeight - root.clientHeight) position = 0;
-      root.scrollTop = Math.floor(position);
+      const range = Math.max(1, root.scrollHeight - root.clientHeight);
+      root.scrollTop = Math.floor(k * SCROLL_PX_PER_S * INSTANT_MS / 1000) % range;
+      shown = k;
     }
-    last = now;
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

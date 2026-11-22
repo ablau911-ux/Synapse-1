@@ -1217,25 +1217,28 @@ mod live {
             let _ = self.frames.flush();
             let stats = self.observer.stop();
             let recorded_ms = instant_ms(self.next_instant);
-            for overflow in &stats.slot_overflow_instants {
-                if let Ok(instant) = u64::try_from(*overflow)
-                    && instant < self.next_instant
-                    && !self.lost.iter().any(|lost| lost.instant == instant)
-                {
-                    self.lost.push(LostInstant {
-                        instant,
-                        cause: LossCause::SlotOverflow,
-                    });
-                }
-            }
-            self.lost.sort_by_key(|lost| lost.instant);
+            // The recorder's own losses first, so an instant it named keeps
+            // its cause; then the slot overflows the observer counted.
+            let next_instant = self.next_instant;
+            let overflow = stats
+                .slot_overflow_instants
+                .iter()
+                .filter_map(|&instant| u64::try_from(instant).ok())
+                .filter(|&instant| instant < next_instant)
+                .map(|instant| LostInstant {
+                    instant,
+                    cause: LossCause::SlotOverflow,
+                });
+            let lost: Vec<LostInstant> = std::mem::take(&mut self.lost)
+                .into_iter()
+                .chain(overflow)
+                .collect();
             let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
-            let failed: Vec<u64> = self.lost.iter().map(|lost| lost.instant).collect();
-            let held = |ok: bool| if ok { "held" } else { "not_held" }.to_owned();
+            // C and T start held; `add_lost` names every loss in them.
             let conditions = Conditions {
                 c: Some(ConditionStatus {
-                    status: held(failed.is_empty()),
-                    failed_instants: failed.clone(),
+                    status: "held".to_owned(),
+                    failed_instants: Vec::new(),
                     detail: Some(serde_json::json!({
                         "max_hold_ms": stats.max_hold_hns as f64 / HNS_PER_MS as f64,
                         "reference_period_ms": reference_hns as f64 / HNS_PER_MS as f64,
@@ -1260,17 +1263,16 @@ mod live {
                 q: None,
                 b: None,
                 t: Some(ConditionStatus {
-                    status: held(failed.is_empty()),
-                    failed_instants: failed,
+                    status: "held".to_owned(),
+                    failed_instants: Vec::new(),
                     detail: Some(serde_json::json!({
                         "length_ms": recorded_ms,
                         "raw_bytes": self.disk.raw_written,
-                        "instants_lost": self.lost.len(),
+                        "instants_lost": 0,
                         "stop_reason": reason.as_str(),
                     })),
                 }),
             };
-            let lost = std::mem::take(&mut self.lost);
             let live_b = BReport::Live {
                 threads: self.machine.threads,
                 max_live_share_percent: self.meter.max_share,
@@ -1289,7 +1291,7 @@ mod live {
                 clip.recorded_ms = recorded_ms;
                 // Losses the worker already named (unreadable waiting frames
                 // of committed segments) stay, in the list and in C and T.
-                let worker_lost = std::mem::replace(&mut clip.lost, lost);
+                let worker_lost = std::mem::take(&mut clip.lost);
                 // The recorder owns C, G, T and the live part of B; the
                 // worker's B measurements and Q already in `clip.json` stay.
                 let mut conditions = conditions;
@@ -1297,6 +1299,7 @@ mod live {
                 conditions.b = clip.conditions.b.take();
                 conditions.merge_b(live_b);
                 clip.conditions = conditions;
+                clip.add_lost(lost);
                 clip.add_lost(worker_lost);
                 clip.state
             });

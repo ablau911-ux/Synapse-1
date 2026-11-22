@@ -193,6 +193,14 @@ class HeadlessChrome {
       '--force-device-scale-factor=1',
       '--hide-scrollbars',
       '--disable-gpu',
+      // Every compositor stage on the paused virtual clock: without these, a
+      // screenshot of the typing page (it sets scrollTop) at 1280x720 and
+      // 1920x1080 waited forever for a frame (measured 2026-11-22).
+      '--run-all-compositor-stages-before-draw',
+      '--disable-threaded-scrolling',
+      '--disable-threaded-animation',
+      '--disable-checker-imaging',
+      '--disable-new-content-rendering-timeout',
       '--mute-audio',
       '--no-first-run',
       '--no-default-browser-check',

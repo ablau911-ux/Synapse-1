@@ -68,6 +68,7 @@ Measured as wall time from the stop to `ready`; compared with the equation.
 
     D_wait(t) = t · n_new · z(L, c) · px · 3            z = compressed ratio of the waiting coder at level L (package 0b)
     D_clip(t) = bytes(t)
+    Architecture Z:  bytes_Z(t) = t · n_new · z(L, c) · px · 3,   a_w = 0,   M_worker = 0,   the viewer decodes with c_dec_z(L) ns per pixel
 
 ## Factors: every existing option
 
@@ -75,7 +76,7 @@ The harness first enumerates every Media Foundation video encoder on this PC (`M
 
 | # | Factor | Levels |
 |---|---|---|
-| F1 | Architecture | **D**: deferred, waiting frames zstd −3, worker encodes (built). **D0**: deferred with raw waiting frames (reference). **L2**: live encode in the service with the hardware encoder, no waiting files, no worker |
+| F1 | Architecture | **D**: deferred, waiting frames zstd −3, worker encodes H.264/HEVC/AV1 (built). **D0**: deferred with raw waiting frames (reference). **L2**: live encode in the service with the hardware encoder, no waiting files, no worker. **Z**: no video encoder at all; the zstd frames themselves are the clip, at zstd levels −3, 1, 3 and 9 (lossless, so R = 1 and SSIM = 1). Only repeated frames are skipped, as today. Agents see the clip only through the viewer's PNG images, so a standard player is not required (owner question, 2026-11-22: "we said zstd, why H.264?") |
 | F2 | Encoder E | every encoder found: e.g. Intel Quick Sync H.264, Microsoft software H.264, Quick Sync HEVC, Quick Sync AV1 |
 | F3 | Rate control | quality mode q ∈ {30, 40, 50, 60, 70, 80, 90, 100}; plus the bitrate fallback β ∈ {0.05, 0.10, 0.20} bit per pixel per frame |
 | F4 | GOP τ_f | 20, 40, 100, 200 encoded frames |

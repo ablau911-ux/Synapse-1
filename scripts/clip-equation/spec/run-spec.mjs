@@ -302,4 +302,6 @@ function main() {
   process.exit(failed ? 1 : 0);
 }
 
-if (process.argv[2] === 'step2z') process.exitCode = (await import('./step2z.mjs')).run([process.argv[3] ?? path.join(BASE_DIR, 'results', 'z-runs.csv'), ...process.argv.slice(4)]); else main();
+if (process.argv[2] === 'step2z') process.exitCode = (await import('./step2z.mjs')).run([process.argv[3] ?? path.join(BASE_DIR, 'results', 'z-runs.csv'), ...process.argv.slice(4)]);
+else if (process.argv[2] === 'step2d') process.exitCode = (await import('./step2d.mjs')).main(process.argv[3], process.argv[4]);
+else main();

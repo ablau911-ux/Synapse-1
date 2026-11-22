@@ -344,8 +344,10 @@ impl SlotTable {
         since.div_euclid(self.instant_hns) + i64::from(since.rem_euclid(self.instant_hns) != 0)
     }
 
-    /// Handler side: the texture the frame is copied into, or `None` when every
-    /// slot is taken (the instant is lost and named).
+    /// Handler side: the texture the frame is copied into. When every slot is
+    /// taken, the newest unread pinned instant is lost and named and its slot
+    /// is reused; `None` only when no such slot exists (the new instant is
+    /// lost and named).
     fn slot_for_frame(
         &mut self,
         device: &ID3D11Device,
@@ -365,7 +367,18 @@ impl SlotTable {
         if let Some(older) = self.candidate.take() {
             self.pinned.push_back(older);
         }
-        let Some(slot) = self.free.pop() else {
+        // No slot free: the newest frame takes the newest unread pinned slot
+        // (never the front, which the reader may be reading back), and that
+        // older instant is the one lost, so a window that then goes still
+        // shows its last picture.
+        let slot = if let Some(slot) = self.free.pop() {
+            slot
+        } else if self.pinned.len() > 1
+            && let Some(newest) = self.pinned.pop_back()
+        {
+            self.overflow_instants.push(newest.instant);
+            newest.slot
+        } else {
             self.overflow_instants.push(instant);
             return Ok(None);
         };

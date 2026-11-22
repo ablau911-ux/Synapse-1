@@ -188,6 +188,51 @@ fn settled_at(lines: &[FrameLine], index: usize, closed: bool) -> Option<bool> {
     closed.then_some(true)
 }
 
+/// Every instant that would have shown a picture the encoder could not read:
+/// from its sample up to the next sample (the next new frame) or the end of
+/// the segment. A picture held over from the segment before keeps the cause
+/// it was named with there.
+fn unreadable_lost(
+    clip: &ClipJson,
+    lines: &[FrameLine],
+    range: SegmentRange,
+    samples: &[super::clip_encoder::SegmentSample],
+    unreadable: &[(usize, LossCause)],
+) -> Vec<LostInstant> {
+    let end = lines[range.last].instant + 1;
+    let held_cause = shown_at(lines, range.first)
+        .map(|at| lines[at].instant)
+        .filter(|&instant| instant < lines[range.first].instant)
+        .and_then(|instant| clip.lost.iter().find(|lost| lost.instant == instant))
+        .map(|lost| lost.cause)
+        .filter(|cause| {
+            matches!(
+                cause,
+                LossCause::WaitingUnreadable | LossCause::WaitingMissing
+            )
+        });
+    let mut lost = Vec::new();
+    for &(order, cause) in unreadable {
+        let Some(sample) = samples.get(order) else {
+            continue;
+        };
+        let to = samples.get(order + 1).map_or(end, |next| next.instant);
+        let cause = if order == 0 {
+            held_cause.unwrap_or(cause)
+        } else {
+            cause
+        };
+        lost.extend((sample.instant..to).map(|instant| LostInstant { instant, cause }));
+    }
+    lost
+}
+
+/// The line of the picture on screen at `index`: the last new line at or
+/// before it, whether or not its waiting file is still there.
+fn shown_at(lines: &[FrameLine], index: usize) -> Option<usize> {
+    (0..=index).rev().find(|&at| lines[at].new)
+}
+
 /// The instant whose picture is shown at the start of a segment: the segment's
 /// first line when it is new, else the last new frame before it.
 fn picture_at(lines: &[FrameLine], folder: &Path, index: usize) -> Option<usize> {
@@ -349,13 +394,7 @@ impl ClipWorker {
             hardware: encoded.hardware,
             quality: encoded.quality,
         };
-        let unreadable = encoded
-            .unreadable_instants
-            .iter()
-            .map(|&instant| LostInstant {
-                instant,
-                cause: LossCause::WaitingUnreadable,
-            });
+        let unreadable = unreadable_lost(clip, lines, range, &samples, &encoded.unreadable);
         ClipJson::update(&self.folder, |clip| {
             clip.segments.push(checkpoint);
             clip.add_lost(unreadable);
@@ -380,8 +419,11 @@ impl ClipWorker {
         start_ms: u64,
         end_ms: u64,
     ) -> Vec<super::clip_encoder::SegmentSample> {
+        // Every expected new frame is a sample, also when its waiting file is
+        // missing: the encoder then keeps the picture before it and its
+        // instants are named as lost (`waiting_missing`).
         let mut picks: Vec<(usize, u64)> = Vec::new();
-        if let Some(at) = picture_at(lines, &self.folder, range.first) {
+        if let Some(at) = shown_at(lines, range.first) {
             picks.push((at, 0));
         }
         for (index, line) in lines
@@ -390,7 +432,7 @@ impl ClipWorker {
             .take(range.last + 1)
             .skip(range.first + 1)
         {
-            if line.new && raw_frame_path(&self.folder, line.instant).is_file() {
+            if line.new {
                 picks.push((index, line.t_ms - start_ms));
             }
         }

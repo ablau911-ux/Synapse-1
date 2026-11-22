@@ -121,6 +121,13 @@ impl WaitingFrameWriter {
     }
 }
 
+/// Why a waiting frame could not be read back: the loss cause its instants
+/// get, and the detail for the log.
+pub(super) struct WaitingReadError {
+    pub(super) cause: LossCause,
+    pub(super) message: String,
+}
+
 /// Reads waiting frames back through one reused zstd context.
 pub(super) struct WaitingFrameReader {
     decompressor: zstd::bulk::Decompressor<'static>,
@@ -133,17 +140,43 @@ impl WaitingFrameReader {
         Ok(Self { decompressor })
     }
 
-    /// A waiting frame as B, G, R rows of `width` × `height`. A missing,
-    /// short or damaged file, or one of another size, is an error.
-    pub(super) fn read(&mut self, path: &Path, width: u32, height: u32) -> Result<Vec<u8>, String> {
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    /// A waiting frame as B, G, R rows of `width` × `height`. A missing file
+    /// is `waiting_missing`; a short or damaged file, or one of another size,
+    /// is `waiting_unreadable`.
+    pub(super) fn read(
+        &mut self,
+        path: &Path,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, WaitingReadError> {
+        let bytes = std::fs::read(path).map_err(|error| WaitingReadError {
+            cause: if error.kind() == std::io::ErrorKind::NotFound {
+                LossCause::WaitingMissing
+            } else {
+                LossCause::WaitingUnreadable
+            },
+            message: format!("could not read {}: {error}", path.display()),
+        })?;
+        self.decode(path, &bytes, width, height)
+            .map_err(|message| WaitingReadError {
+                cause: LossCause::WaitingUnreadable,
+                message,
+            })
+    }
+
+    fn decode(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
         let expected =
             usize::try_from(u64::from(width) * u64::from(height) * WAITING_BYTES_PER_PIXEL)
                 .map_err(|_| format!("{} is too large for this machine", path.display()))?;
         // The content size in the zstd frame header is checked first, so a
         // damaged header never sizes an allocation.
-        let stored = zstd::zstd_safe::get_frame_content_size(&bytes)
+        let stored = zstd::zstd_safe::get_frame_content_size(bytes)
             .ok()
             .flatten()
             .and_then(|size| usize::try_from(size).ok());
@@ -155,7 +188,7 @@ impl WaitingFrameReader {
         }
         let bgr = self
             .decompressor
-            .decompress(&bytes, expected)
+            .decompress(bytes, expected)
             .map_err(|error| format!("could not decompress {}: {error}", path.display()))?;
         if bgr.len() != expected {
             return Err(format!(
@@ -232,6 +265,9 @@ pub(super) enum LossCause {
     /// The clip worker could not read the waiting frame back (damaged or
     /// short file); the picture before it was kept in the segment.
     WaitingUnreadable,
+    /// The waiting frame of a new picture was not on disk when the clip
+    /// worker encoded its segment; the picture before it was kept.
+    WaitingMissing,
 }
 
 /// One line of `frames.jsonl`: one per instant s_k.

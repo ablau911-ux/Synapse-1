@@ -43,7 +43,7 @@ use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::capture_clip::RECORD_FPS;
-use super::clip_folder::{QualityReport, WAITING_BYTES_PER_PIXEL, WaitingFrameReader};
+use super::clip_folder::{LossCause, QualityReport, WAITING_BYTES_PER_PIXEL, WaitingFrameReader};
 
 /// q: `CODECAPI_AVEncCommonQuality` level (0..=100). Condition Q stays
 /// `unverified` until q_min is calibrated for the encoder used (C6).
@@ -97,8 +97,9 @@ pub(super) struct EncodedSegment {
     pub(super) encoder: String,
     pub(super) hardware: bool,
     pub(super) quality: QualityReport,
-    /// Instants whose waiting frame could not be read back (named as lost).
-    pub(super) unreadable_instants: Vec<u64>,
+    /// The samples (index in `SegmentInput::samples`) whose waiting frame
+    /// could not be read back, with the loss cause.
+    pub(super) unreadable: Vec<(usize, LossCause)>,
     /// The raw file of the last picture drawn: the seed of the next segment.
     pub(super) last_good: Option<PathBuf>,
 }
@@ -129,12 +130,11 @@ fn encode_once(
     let mut encoder = ClipEncoder::create(path, size.width, size.height, input.fps, hardware)?;
     let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
     let mut reader = WaitingFrameReader::new()?;
-    let mut unreadable_instants = Vec::new();
+    let mut unreadable = Vec::new();
     let mut last_good: Option<PathBuf> = None;
-    for sample in input.samples {
-        // A bad or short waiting frame counts as missing, as a frame without a
-        // raw file does when the segment is formed: the picture before it stays.
-        // Its instant is named as lost (cause `waiting_unreadable`).
+    for (order, sample) in input.samples.iter().enumerate() {
+        // A missing, bad or short waiting frame: the picture before it stays,
+        // and the clip worker names its instants as lost with the cause.
         match reader.read(&sample.raw, sample.width, sample.height) {
             Ok(bgr) => {
                 canvas.draw(&bgr, sample.width, sample.height);
@@ -144,10 +144,10 @@ fn encode_once(
                 tracing::warn!(
                     code = "CLIP_WAITING_FRAME_UNREADABLE",
                     instant = sample.instant,
-                    error = %error,
+                    error = %error.message,
                     "the previous picture is kept for this instant"
                 );
-                unreadable_instants.push(sample.instant);
+                unreadable.push((order, error.cause));
                 // Nothing drawn yet in this segment: the picture before it is
                 // the last good one of the segment before (the seed).
                 if last_good.is_none()
@@ -186,7 +186,7 @@ fn encode_once(
         encoder: readback.encoder,
         hardware: readback.hardware,
         quality: readback.quality,
-        unreadable_instants,
+        unreadable,
         last_good,
     })
 }

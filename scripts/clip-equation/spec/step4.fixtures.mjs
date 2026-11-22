@@ -5,6 +5,8 @@
 // Z rows from zeta(px) = zeta0 * (px / px0)^(eta - 1) and C / frame = c0 + kappa * px; D rows with
 // a chosen R, status and PSNR per configuration and q. Corpus folders are real (t and N_new come
 // from the corpus), the measured values are not.
+import fs from 'node:fs';
+import path from 'node:path';
 import { CONFIG } from './step4.mjs';
 
 const str = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v === undefined || v === null ? '' : String(v)]));
@@ -75,21 +77,39 @@ export function ramFixture() {
   return { zRows, runlist: { contents: ['typing'], repeats: 3, counts: { runs: 12 }, cells } };
 }
 
-/** One way D CSV row; `o` overrides any column. */
-export function dRow(o) {
-  const n = 100;
-  return str({
-    grid: 'A', folder: 'typing-640x360', scenario: 'typing', width: 640, height: 360, sigma: 2, out_w: 1280, out_h: 720,
-    encoder: 'DW1', q: 50, tau_f: 20, hint: 1, rate: 'quality', beta: 0.1, repeat: 1, status: 'ok', error: '',
-    n_new: n, frames: n, keyframes: Math.ceil(n / 20), bytes: 1e6, a_rt_ns: 1e8, a_w_ns: 5e8, m_live: 2e7, m_worker: 1e8,
-    ssim_mean: 0.99, psnr_mean: 40, psnr_global: 40, r: 1, run_wall_ms: 1000,
-    ...o,
-    bytes_disk: o.bytes_disk ?? Number(o.bytes ?? 1e6) + D_META,
-  });
+/** N_new and N_inst of a corpus folder (the measurement rows of spec/step2d.mjs compare with them). */
+function corpusCounts(folder) {
+  const lines = fs.readFileSync(path.join(CONFIG.corpus_root, folder, 'frames.jsonl'), 'utf8').split('\n').filter((l) => l.trim());
+  return { nNew: lines.filter((l) => JSON.parse(l).new === true).length, nInst: lines.length };
 }
 
 /** Bytes of frames.jsonl and clip.json beside the MP4 payload of a D clip (M4). */
 export const D_META = 50000;
+
+/**
+ * One way D CSV row that keeps every measurement rule of spec/step2d.mjs (two processes, RAM base and
+ * OS peak of both phases, retained bytes, beta > 0, frames mapped by time); `o` overrides any column.
+ */
+export function dRow(o) {
+  const folder = o.folder ?? 'typing-640x360';
+  const { nNew, nInst } = corpusCounts(folder);
+  const n = 100;
+  const r = {
+    grid: 'A', folder, scenario: 'typing', width: 640, height: 360, sigma: 2, out_w: 1280, out_h: 720,
+    encoder: 'DW1', q: 50, tau_f: 20, hint: 1, rate: 'quality', beta: 0.1, repeat: 1, status: 'ok', error: '',
+    n_new: n, frames: n, keyframes: Math.ceil(n / 20), bytes: 1e6, a_rt_ns: 1e8, a_w_ns: 5e8, m_live: 2e7, m_worker: 1e8,
+    ssim_mean: 0.99, psnr_mean: 40, psnr_global: 40, r: 1, run_wall_ms: 1000,
+    live_pid: 11, worker_pid: 12, input: 'bgra', live_os_peak_at_m0: 1e7, live_os_peak_private: 3e7, worker_os_peak_at_m0: 1e7, worker_os_peak_private: 1.2e8,
+    index_bytes: D_META - 5000, clip_json_bytes: 5000, index_lines: nInst, frames_mapped: nNew, frames_missing: 0, frames_extra: 0, frames_mistimed: 0,
+    ...o,
+  };
+  const bytes = Number(r.bytes);
+  return str({
+    ...r, frame_bytes: o.frame_bytes ?? bytes, bytes_disk: o.bytes_disk ?? bytes + D_META, bytes_on_disk: o.bytes_on_disk ?? o.bytes_disk ?? bytes + D_META,
+    way_cpu_ns: o.way_cpu_ns ?? Number(r.a_rt_ns) + Number(r.a_w_ns), live_ram_os: o.live_ram_os ?? r.m_live, worker_ram_os: o.worker_ram_os ?? r.m_worker,
+    ram_os: o.ram_os ?? Number(r.m_live) + Number(r.m_worker),
+  });
+}
 
 /** H1: ZW9 with merge gap 0, 1 and 2 (3 repeats each) are three configurations, never one with 9 repeats. */
 export function gapFixture() {
@@ -104,7 +124,9 @@ export function requestedFixture() {
   const req = (r) => ({ ...r, q_req: r.q_req ?? r.q, tau_f_req: r.tau_f, hint_req: r.hint, rate_req: r.rate, beta_req: r.beta });
   const row = (scenario, repeat, o = {}) => req(dRow({ folder: `${scenario}-640x360`, scenario, q: 50, repeat, ...o }));
   return [
-    row('typing', 1), row('typing', 2), row('typing', 3, { q: 40, q_req: 50, status: 'setting_refused:q' }),
+    row('typing', 1), row('typing', 2), row('typing', 3, { q: 40, q_req: 50, status: 'setting_refused:q', bytes: 9e9 }),
+    // typing q 40 requested and run as such: its 3 valid repeats must stay one complete configuration (round 3).
+    row('typing', 1, { q: 40 }), row('typing', 2, { q: 40 }), row('typing', 3, { q: 40 }),
     row('scroll', 1), row('scroll', 3),
     row('ui', 1), row('ui', 2), row('ui', 3),
   ];
@@ -118,6 +140,9 @@ export function validityFixture() {
   const d = [1, 2, 3].flatMap((repeat) => [
     dRow({ folder: 'typing-640x360', scenario: 'typing', repeat, pass_keyframes: 0, pass_frames: 1 }),
     dRow({ folder: 'scroll-640x360', scenario: 'scroll', repeat, status: repeat === 2 ? 'ocr_error' : 'ok' }),
+    // Round 3: D measurement rules of spec/step2d.mjs. ui: RAM of the two phases does not add up (M3); flash: CPU is not live + worker (M2).
+    dRow({ folder: 'ui-640x360', scenario: 'ui', repeat, ram_os: 5e7 }),
+    dRow({ folder: 'flash-640x360', scenario: 'flash', repeat, r: 'n/a', way_cpu_ns: 1 }),
   ]);
   const z = [1, 2, 3].map((rep) => zRow({ way: 'ZW1', mode: 'whole', wlog: 0, rep, pass_ramOs: 0, pass_ram: 0 }));
   return { d, z };

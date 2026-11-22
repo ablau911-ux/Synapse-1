@@ -13,8 +13,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readRuns } from './step2d.mjs';
+import { D_ROW_RULES, readRuns } from './step2d.mjs';
 import { PENDING, relErr, runFeature } from './feature.mjs';
+import { runListIdentity as zListId } from '../runs/run-z.mjs';
+import { D_KEY, runListIdentity as dListId } from '../runs/run-d.mjs';
 import { D_BYTES_TRUTH, D_META, RAM_TRUTH, Z_TRUTH, dBytesCase, gapFixture, ramFixture, requestedFixture, sizeFixture, targetFixture, validityFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -59,13 +61,19 @@ function mulberry32(seed) {
  * The D configurations whose every repeat succeeded and, on a text scenario, read R (a number, or
  * n/a on every repeat): plan M10, "a configuration needs all of its repeats to succeed".
  */
+/** The requested configuration of a D row (*_req columns), as the runner keys it. */
+export const dRequestedKey = (r) => `D|${CONFIG.d_key_columns.map((c) => (r[`${c}_req`] !== undefined && r[`${c}_req`] !== '' ? r[`${c}_req`] : r[c] ?? '')).join('|')}`;
+/** A D row recorded under settings other than requested (refused): a configuration of its own, apart. */
+export const dMoved = (r) => keyOf('D', r) !== dRequestedKey(r);
+
 export function completeD(rows) {
   const groups = new Map();
-  for (const r of rows) groups.set(keyOf('D', r), [...(groups.get(keyOf('D', r)) ?? []), r]);
-  const req = (r) => `D|${CONFIG.d_key_columns.map((c) => (r[`${c}_req`] !== undefined && r[`${c}_req`] !== '' ? r[`${c}_req`] : r[c] ?? '')).join('|')}`;
+  for (const r of rows.filter((x) => !dMoved(x))) groups.set(keyOf('D', r), [...(groups.get(keyOf('D', r)) ?? []), r]);
+  const req = dRequestedKey;
   const byReq = new Map();
   for (const r of rows) byReq.set(req(r), [...(byReq.get(req(r)) ?? []), r]);
-  const valid = (r) => CONFIG.checks.ok_statuses.includes(r.status || 'ok') && CONFIG.checks.validity_pass.D.every((c) => r[c] !== '0');
+  const valid = (r) => CONFIG.checks.ok_statuses.includes(r.status || 'ok') && CONFIG.checks.validity_pass.D.every((c) => r[c] !== '0')
+    && (r.status !== 'ok' || CONFIG.checks.validity_rules.D.every((name) => D_ROW_RULES[name](r, CONFIG.corpus_root)));
   const reqComplete = (k) => {
     const rs = byReq.get(k) ?? [];
     const reps = new Set(rs.map((r) => Number(r.repeat)));
@@ -202,11 +210,19 @@ function findingChecks(F, inputs) {
       return { value: 'typing, scroll, ui at q 70 dropped and out of the fit; 4 failed runs, 3 blocked', measured: bad.length ? bad.join('; ') : 'as known', pass: bad.length === 0 };
     }),
     '#10 M1 FULL only when the resolved keys match both run plans, without duplicates': need(() => {
-      const { zRows, runlist } = sizeFixture();
-      const dRows = targetFixture();
-      const dRunlist = { runs: dRows.map((r) => ({ folder: r.folder, encoder: r.encoder, q: r.q, tau_f: r.tau_f, hint: r.hint, rate: r.rate, beta: r.beta, repeat: r.repeat })) };
-      const label = (z, d, dl) => F.fitLabel({ pilot: false, zRows: z, dRows: d, runlist, dRunlist: dl }).label;
+      const { zRows: z0, runlist: rl0 } = sizeFixture();
+      const d0 = targetFixture();
+      const runlist = { ...rl0, hash: zListId(rl0) };
+      const dl0 = { key: D_KEY, repeats: 3, runs: d0.map((r) => ({ folder: r.folder, encoder: r.encoder, q: r.q, tau_f: r.tau_f, hint: r.hint, rate: r.rate, beta: r.beta, repeat: r.repeat })) };
+      const dRunlist = { ...dl0, hash: dListId(dl0) };
+      const zRows = z0.map((r) => ({ ...r, runlist_hash: runlist.hash }));
+      const dRows = d0.map((r) => ({ ...r, runlist_hash: dRunlist.hash }));
+      const planHashes = { z: runlist.hash, d: dRunlist.hash };
+      const label = (z, d, dl, o = {}) => F.fitLabel({ pilot: false, zRows: z, dRows: d, runlist: o.runlist ?? runlist, dRunlist: dl, planHashes: o.planHashes ?? planHashes }).label;
       const cases = [
+        ['Z rows without runlist_hash', label(z0, dRows, dRunlist), false],
+        ['stale Z list: the plan rebuilt now has another hash', label(zRows, dRows, dRunlist, { planHashes: { ...planHashes, z: 'feedfacefeedface' } }), false],
+        ['Z list whose hash is not the hash of its content', label(zRows.map((r) => ({ ...r, runlist_hash: '0123' })), dRows, dRunlist, { runlist: { ...runlist, hash: '0123' }, planHashes: { ...planHashes, z: '0123' } }), false],
         ['complete', label(zRows, dRows, dRunlist), true],
         ['Z duplicate in place of a repeat', label([...zRows.slice(0, -1), { ...zRows[0] }], dRows, dRunlist), false],
         ['Z duplicate added, nothing missing', label([...zRows, { ...zRows[0] }], dRows, dRunlist), false],
@@ -242,9 +258,11 @@ function findingChecks(F, inputs) {
       const f = F.buildFitFromRows({ zRows: [], dRows: requestedFixture(), runlist: noRunlist });
       const at = (s, q) => f.configurations.find((c) => c.kind === 'D' && c.content === s && c.options.q === String(q));
       const [t50, t40, s50, u50] = [at('typing', 50), at('typing', 40), at('scroll', 50), at('ui', 50)];
-      const ok = t50?.eligible === false && t40?.eligible === false && /setting_refused/.test(t40?.status ?? '') && s50?.eligible === false && u50?.eligible === true;
-      const say = (n, c) => `${n}: ${c ? (c.eligible ? 'eligible' : `blocked (${c.clause})`) : 'absent'}`;
-      return { value: 'typing q50 blocked, its refused repeat listed under q40, scroll q50 blocked, ui q50 eligible', measured: [say('typing q50', t50), say('typing q40', t40), say('scroll q50', s50), say('ui q50', u50)].join('; '), pass: ok };
+      const refused = f.configurations.filter((c) => c.kind === 'D' && c.refused);
+      const ok = t50?.eligible === false && t40?.eligible === true && t40.runs === 3 && t40.bytes_min < 1e9 && refused.length === 1 && refused[0].eligible === false
+        && /setting_refused/.test(refused[0].status) && s50?.eligible === false && u50?.eligible === true;
+      const say = (n, c) => `${n}: ${c ? (c.eligible ? `eligible x ${c.runs}` : `blocked (${c.clause})`) : 'absent'}`;
+      return { value: 'typing q50 blocked; typing q40 eligible with its own 3 repeats; the refused repeat listed apart; scroll q50 blocked; ui q50 eligible', measured: [say('typing q50', t50), say('typing q40', t40), `refused apart: ${refused.map((c) => `${c.status} x ${c.runs}`).join(', ') || 'none'}`, say('scroll q50', s50), say('ui q50', u50)].join('; '), pass: ok };
     }),
     'H6 validity checks block, known-result misses are reported': need(() => {
       const { d, z } = validityFixture();
@@ -252,9 +270,13 @@ function findingChecks(F, inputs) {
       const t = f.configurations.find((c) => c.kind === 'D' && c.content === 'typing');
       const s = f.configurations.find((c) => c.kind === 'D' && c.content === 'scroll');
       const zc = f.configurations.find((c) => c.kind === 'Z');
+      const u = f.configurations.find((c) => c.kind === 'D' && c.content === 'ui');
+      const fl = f.configurations.find((c) => c.kind === 'D' && c.content === 'flash');
       const ok = t?.eligible === true && (t.known_misses ?? []).some((m) => m.startsWith('pass_keyframes ')) && s?.eligible === false
+        && u?.eligible === false && fl?.eligible === false
         && zc?.eligible === false && /pass_ramOs/.test(zc.clause ?? '') && (zc.known_misses ?? []).some((m) => m.startsWith('pass_ram '));
-      return { value: 'D pass_keyframes 0: eligible, miss reported; D ocr_error: blocked; Z pass_ramOs 0: blocked, pass_ram miss reported', measured: `D typing ${t?.eligible ? 'eligible' : 'blocked'} [${t?.known_misses ?? '-'}]; D scroll ${s?.eligible ? 'eligible' : `blocked (${s?.clause})`}; Z ${zc?.eligible ? 'eligible' : `blocked (${zc?.clause})`} [${zc?.known_misses ?? '-'}]`, pass: ok };
+      const say = (c) => (c?.eligible ? 'eligible' : `blocked (${c?.clause})`);
+      return { value: 'D pass_keyframes 0: eligible, miss reported; D ocr_error, D RAM phases (M3), D CPU phases (M2): blocked; Z pass_ramOs 0: blocked, pass_ram miss reported', measured: `D typing ${say(t)} [${t?.known_misses ?? '-'}]; D scroll ${say(s)}; D ui ${say(u)}; D flash ${say(fl)}; Z ${say(zc)} [${zc?.known_misses ?? '-'}]`, pass: ok };
     }),
     'M2 predicted RAM from equation 4 at the target size, else pending': need(() => {
       const { zRows, runlist } = sizeFixture();
@@ -285,11 +307,13 @@ function findingChecks(F, inputs) {
       const base = { zRows, dRows: inputs.d.map((r) => ({ ...r })), runlist: noRunlist };
       const a = F.buildFitFromRows(base);
       const heldD = new Set(a.validation.d.held_out_keys);
-      const x = (v) => String(Number(v) * 1.7);
+      // x 2 keeps the D measurement rules exact (way CPU = live + worker, RAM = live + worker, bytes = sum of parts).
+      const x = (v) => String(Number(v) * 2);
+      const xs = (r, cols) => Object.fromEntries(cols.filter((c) => r[c] !== undefined && r[c] !== '').map((c) => [c, x(r[c])]));
       const b = F.buildFitFromRows({
         ...base,
         zRows: zRows.map((r) => (keyOf('Z', r) !== zKey ? r : { ...r, bytes_out: x(r.bytes_out), comp_cpu_ns: x(r.comp_cpu_ns), peak_private: x(r.peak_private), m0_private: x(r.m0_private), known_m_comp: x(r.known_m_comp), dec_cpu_ns: x(r.dec_cpu_ns) })),
-        dRows: base.dRows.map((r) => (!heldD.has(keyOf('D', r)) ? r : { ...r, bytes: x(r.bytes), a_rt_ns: x(r.a_rt_ns), a_w_ns: x(r.a_w_ns), m_live: x(r.m_live), m_worker: x(r.m_worker), ssim_mean: '0.5', psnr_mean: '10', psnr_global: '10', r: r.r === '1' ? '0.5' : '1' })),
+        dRows: base.dRows.map((r) => (!heldD.has(keyOf('D', r)) ? r : { ...r, ...xs(r, ['bytes', 'frame_bytes', 'index_bytes', 'clip_json_bytes', 'bytes_disk', 'bytes_on_disk', 'a_rt_ns', 'a_w_ns', 'way_cpu_ns', 'm_live', 'm_worker', 'live_ram_os', 'worker_ram_os', 'ram_os']), ssim_mean: '0.5', psnr_mean: '10', psnr_global: '10', r: r.r === '1' ? '0.5' : '1' })),
       });
       const ser = (e) => JSON.stringify(e, (k, v) => (typeof v === 'number' && !Number.isFinite(v) ? String(v) : v));
       const changed = Object.keys(a.equations).filter((id) => ser(a.equations[id]) !== ser(b.equations[id]));
@@ -316,7 +340,10 @@ function findingChecks(F, inputs) {
       const errs = [relErr(m1.predict(sup), sup.truth), relErr(m2.predict(far), far.truth), relErr(m2.coefficients?.a_E?.DW1, T.a), relErr(m2.coefficients?.b_E?.DW1, T.b)];
       const w = Math.max(...errs);
       const pend = Number.isNaN(m1.predict(unsup));
-      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a) and q 90 tau 200 within 1e-6', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance };
+      // Round 3: the published model is the one that predicts, and its residuals go through that predictor (exact data: 0).
+      const used = m2.coefficients?.model?.DW1;
+      const resMax = Math.max(...(m2.res ?? [NaN]).map(Math.abs));
+      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a), q 90 tau 200 within 1e-6, published model "P and K apart" with residuals 0', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}; model ${used}; max residual ${resMax}`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance && /apart/.test(used ?? '') && resMax <= CONFIG.self_test_tolerance };
     }),
     'eq 4 fitted terms: mu and m_d0 from training rows': need(() => {
       const { zRows, runlist } = ramFixture();

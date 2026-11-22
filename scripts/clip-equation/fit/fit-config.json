@@ -17,6 +17,10 @@
     "validity_pass": {
       "Z": ["pass_frames", "pass_bytes", "pass_bytesAll", "pass_inputFormat", "pass_cpuTotal", "pass_dictCpu", "pass_cpuCycles", "pass_ramOs", "pass_ldm", "pass_rectList"],
       "D": ["pass_frames"]
+    },
+    "validity_rules": {
+      "note": "Rules of one D run owned by spec/step2d.mjs D_ROW_RULES (M1 input, M2 CPU of both phases, M3 RAM base and OS peak of both phases, M4 retained bytes, M5 beta > 0, M6 frames mapped by time); a broken rule blocks like a validity pass_* row.",
+      "D": ["two_processes", "ram_base", "ram_os_both", "retained_bytes", "beta_positive", "frames_mapped"]
     }
   },
   "runlist_hash_columns": ["runlist_hash", "plan_hash", "list_hash"],

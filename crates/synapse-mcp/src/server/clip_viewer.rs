@@ -125,7 +125,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 11;
+const ANALYSIS_VERSION: u32 = 12;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -762,6 +762,11 @@ struct BlockState {
     moves: VecDeque<u64>,
     /// The first instant of the picture it shows now (SAME since then).
     stable_since: u64,
+    /// While quiet: the first instant of its current run of pictures that
+    /// are not SAME as its anchor. An undecided picture is not yet a change
+    /// and never moves the anchor; it only dates the start of the change
+    /// once the block becomes DIFF (D5 step 2).
+    pending: Option<u64>,
     active: Option<Activity>,
 }
 
@@ -910,18 +915,40 @@ impl<'a> Analyzer<'a> {
                     state.moves.pop_front();
                 }
             }
-            let to_anchor = picture.test(&self.anchor, b);
-            if state.active.is_none() && to_anchor == Verdict::Same {
-                continue;
-            }
-            // quiet -> active at the first instant that is not SAME.
+            // D5 step 3 from the frame-to-frame test alone: a block can
+            // animate while every picture stays SAME as its anchor.
             let animating = instant < state.animating_until(instants);
-            let activity = state.active.get_or_insert_with(|| Activity {
-                start: instant,
-                last_move: instant,
-                animated: false,
-                differed: Vec::new(),
-            });
+            let to_anchor = picture.test(&self.anchor, b);
+            if state.active.is_none() {
+                if to_anchor == Verdict::Same {
+                    state.pending = None;
+                } else {
+                    state.pending = state.pending.or(Some(instant));
+                }
+                if to_anchor != Verdict::Diff && !animating {
+                    continue;
+                }
+                // quiet -> active on DIFF, or once it animates; the start is
+                // the first instant that was not SAME, or the first motion
+                // of the animation when that is earlier.
+                let first_move = state.moves.front().copied().filter(|_| animating);
+                let start = state
+                    .pending
+                    .take()
+                    .into_iter()
+                    .chain(first_move)
+                    .min()
+                    .unwrap_or(instant);
+                state.active = Some(Activity {
+                    start,
+                    last_move: instant,
+                    animated: false,
+                    differed: Vec::new(),
+                });
+            }
+            let Some(activity) = state.active.as_mut() else {
+                continue;
+            };
             if to_anchor == Verdict::Diff {
                 activity.differed.push(instant);
             }

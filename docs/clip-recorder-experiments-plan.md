@@ -89,6 +89,10 @@ Checked as Σ |decoded − corpus| = 0 over every pixel of every frame.
                    W_eff = 2^windowLog otherwise                                       (zstd's rule in ZSTD_resetCCtx_internal)
     nbWorkers > 0: M_cctx = ZSTD_sizeof_CCtx after the last frame                    (the estimates cover one thread only; the workspace is allocated at the first frame)
     viewer:        M_dec gains b_max, the largest clip file, which the viewer holds while it decodes
+    dictionary:    M_comp(ZW16) gains M_train = μ · S_samples,  S_samples = N_train · px · 3       (μ fitted)
+    decoder:       M_dec gains m_d0, a fixed per-process overhead                                    (fitted)
+
+The two fitted terms come from the fix pilot of #295 (`c5e9090b`). ZW16 measured 31.9 and 35.0 MB against 5.3 MB without a training term. The decoder at 640 × 360 measured 0.5 to 1.2 MB above the equation in 52 of 78 rows. Their per-row RAM checks in step 2 become "known after the fit", and step 4 checks them on the held-out rows like every other fitted coefficient.
 
 Corrections from the step 2a pilot (`65fe9549`), each checked by its own row in `spec/step2z.mjs`. CPU is read from the process cycle counter (user plus kernel, all threads), because `GetProcessTimes` advances in 15.6 ms ticks and read 0.5 to 0.8 of the true time.
 

@@ -14,6 +14,7 @@
 //!   clip-probe compress    M10 to M14 (package 0b) compression of the waiting frames
 //!   clip-probe exp-encoders  experiments step 1a: every H.264, HEVC and AV1 encoder
 //!   clip-probe exp-corpus    experiments step 1b: the fixed lossless frame corpus
+//!   clip-probe exp-z         experiments steps 2 and 3, way Z: one zstd way on one corpus folder
 //!
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.
@@ -27,6 +28,9 @@ mod disk;
 mod encoder;
 mod exp_corpus;
 mod exp_encoders;
+#[allow(dead_code)]
+mod exp_meter;
+mod exp_z;
 mod gpu;
 mod hash_frames;
 mod info;
@@ -74,8 +78,10 @@ fn main() {
         "compress" => compress::run(),
         "exp-encoders" => exp_encoders::run(),
         "exp-corpus" => exp_corpus::run(),
+        "exp-z" => exp_z::run(),
+        "exp-rate" => exp_meter::run_rate(),
         _ => Err(format!(
-            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders or exp-corpus"
+            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus or exp-z"
         )),
     };
     if let Err(error) = outcome {

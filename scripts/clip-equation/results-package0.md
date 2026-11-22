@@ -864,3 +864,52 @@ M14 at 1920 x 1080, 20 new frames per second, worst scenario per figure (frames 
 | (d) tiles+zstd -1 tile 32 alpha dropped | 32 | 2.6773 / 0.4137 | 2.544 | 1847 | 1.15 % | 16.49 % | no |
 | (d) tiles+zstd 1 tile 128 alpha dropped | 128 | 2.2534 / 0.3521 | 3.634 | 1604 | 1.40 % | 20.20 % | no |
 ```
+
+
+## Package 0b, full comparison at 1920 × 1080 (run of 2026-11-22 11:26 JST, stopped before its own summary)
+
+Run by `clip-probe compress` from commit `32b50129` (release, single thread unless noted). Raw output: 12 scenarios, 739 rows, every method byte-exact in B, G, R and NV12-equal for σ 1, 2, 3 (0 mismatches). The probe was stopped by the owner before it printed M14 and the choice; the table below was computed afterwards from its rows.
+
+Cell = bytes per frame, then the live share on the weakest-machine **estimate** at 20 new frames per second. Live share = (base + compress ns/px + write µs per frame / px) · px · 20 · 3.68 / 4 threads, base = 0.936 ns/px, calibrated so that raw without alpha gives the package 0b figure of 8.64 %. Write time is measured per file (create, write, rename); it is noisy for raw files (±0.5 points). Alpha dropped in every row.
+
+| Method | Typing | Flash | Scroll | Video |
+|---|---|---|---|---|
+| raw | 6.2 MB, 9.8 % | 6.2 MB, 8.6 % | 6.2 MB, 8.9 % | 6.2 MB, 9.9 % |
+| whole lz4 | 34.8 KB, 6.9 % | 63.2 KB, 6.4 % | 222.3 KB, 7.6 % | 5.6 MB, 14.9 % |
+| whole lz4 HC 3 | 32.0 KB, 17.0 % | 51.7 KB, 15.1 % | 153.5 KB, 20.2 % | 5.1 MB, 245.2 % |
+| whole lz4 HC 9 | 31.4 KB, 29.5 % | 49.3 KB, 29.2 % | 132.0 KB, 70.7 % | 5.1 MB, 264.4 % |
+| whole zstd -7 | 10.9 KB, 7.3 % | 35.4 KB, 6.7 % | 155.1 KB, 8.8 % | 5.7 MB, 15.2 % |
+| whole zstd -5 | 9.9 KB, 7.6 % | 32.4 KB, 6.8 % | 146.0 KB, 8.6 % | 5.6 MB, 15.7 % |
+| whole zstd -3 | 8.6 KB, 8.0 % | 25.0 KB, 6.8 % | 123.4 KB, 8.7 % | 5.6 MB, 15.9 % |
+| whole zstd -1 | 8.0 KB, 7.4 % | 23.8 KB, 6.9 % | 118.0 KB, 8.7 % | 5.6 MB, 18.0 % |
+| whole zstd 1 | 7.5 KB, 7.8 % | 21.2 KB, 6.6 % | 108.0 KB, 8.4 % | 5.0 MB, 25.4 % |
+| whole zstd 3 | 7.3 KB, 7.7 % | 20.7 KB, 7.2 % | 102.4 KB, 8.9 % | 4.7 MB, 71.6 % |
+| whole zstd 6 | 6.5 KB, 10.9 % | 17.5 KB, 9.4 % | 80.9 KB, 16.0 % | 4.3 MB, 162.9 % |
+| whole zstd 1 x2 threads | 7.4 KB, 8.6 % | 21.3 KB, 7.9 % | 108.3 KB, 9.8 % | 5.1 MB, 26.1 % |
+| whole deflate miniz 1 | 46.2 KB, 8.0 % | 73.8 KB, 7.7 % | 194.7 KB, 10.1 % | 4.8 MB, 88.9 % |
+| whole deflate zlib-rs 1 | 71.8 KB, 11.2 % | 94.4 KB, 7.8 % | 221.0 KB, 9.2 % | 5.6 MB, 116.3 % |
+| png fast | 50.5 KB, 8.4 % | 107.0 KB, 7.8 % | 404.9 KB, 10.6 % | 4.2 MB, 34.7 % |
+| qoi | 65.1 KB, 11.7 % | 69.0 KB, 8.7 % | 259.8 KB, 12.3 % | 3.6 MB, 34.1 % |
+| whole snappy | 303.1 KB, 7.4 % | 321.7 KB, 6.7 % | 433.9 KB, 9.0 % | 5.7 MB, 13.5 % |
+| xor+lz4 | 25.3 KB, 8.0 % | 33.3 KB, 7.2 % | 376.7 KB, 13.7 % | 5.8 MB, 14.8 % |
+| xor+zstd -1 | 0.9 KB, 8.9 % | 7.0 KB, 8.0 % | 161.7 KB, 12.8 % | 5.7 MB, 17.1 % |
+| xor+zstd 1 | 0.9 KB, 9.6 % | 6.9 KB, 8.5 % | 140.1 KB, 12.6 % | 4.1 MB, 24.9 % |
+| tiles+lz4 tile 32 | 3.1 KB, 6.2 % | 9.0 KB, 5.3 % | 210.0 KB, 10.8 % | 5.7 MB, 18.9 % |
+| tiles+lz4 tile 64 | 2.9 KB, 6.7 % | 9.1 KB, 6.2 % | 209.5 KB, 9.5 % | 5.7 MB, 19.5 % |
+| tiles+lz4 tile 128 | 3.5 KB, 6.2 % | 10.4 KB, 6.3 % | 210.1 KB, 9.8 % | 5.8 MB, 22.5 % |
+| tiles+zstd -1 tile 32 | 1.1 KB, 5.8 % | 4.9 KB, 5.5 % | 118.7 KB, 10.6 % | 5.5 MB, 23.1 % |
+| tiles+zstd -1 tile 64 | 0.9 KB, 7.3 % | 5.2 KB, 6.5 % | 116.9 KB, 11.6 % | 5.5 MB, 25.2 % |
+| tiles+zstd -1 tile 128 | 1.2 KB, 6.4 % | 6.1 KB, 6.1 % | 114.8 KB, 11.2 % | 5.5 MB, 26.6 % |
+| tiles+zstd 1 tile 32 | 1.0 KB, 5.6 % | 4.5 KB, 5.3 % | 108.9 KB, 11.3 % | 4.8 MB, 26.0 % |
+| tiles+zstd 1 tile 64 | 0.8 KB, 7.1 % | 4.8 KB, 6.4 % | 106.8 KB, 11.0 % | 4.6 MB, 30.3 % |
+| tiles+zstd 1 tile 128 | 1.2 KB, 6.4 % | 5.7 KB, 6.4 % | 104.9 KB, 11.3 % | 4.5 MB, 26.8 % |
+| adaptive 25% | 405.3 KB, 6.3 % | 402.2 KB, 6.1 % | 6.2 MB, 11.1 % | 6.2 MB, 9.9 % |
+| adaptive 50% | 405.3 KB, 6.6 % | 402.2 KB, 6.1 % | 501.2 KB, 12.1 % | 6.2 MB, 10.0 % |
+| adaptive 75% | 405.3 KB, 8.4 % | 402.2 KB, 6.3 % | 501.2 KB, 11.7 % | 6.2 MB, 10.1 % |
+
+Findings:
+
+- Only raw without alpha stays within 10 % in all four (8.6 to 9.9 %). Video (photo-like content changing every frame) passes 10 % with every coder: lz4 14.9 %, zstd −3 15.9 %, zstd 1 25.4 %.
+- Video left out: whole-frame zstd at levels −3 to 3 gives the fewest bytes within 10 % (zstd 1: 7.5 KB, 21 KB, 108 KB; 6.6 to 8.4 %). That is about 3 times smaller than whole-frame lz4 (35 KB, 63 KB, 222 KB; 6.4 to 7.6 %) for 0.2 to 1.1 points more.
+- Tiles and XOR delta give the smallest typing and flash frames (0.8 to 7 KB), but go over 10 % on scroll (10.6 to 13.7 %). lz4 HC, zstd 6, deflate, png fast and qoi cost too much. Snappy is cheap but big (303 to 434 KB). Two zstd threads cost more total processor time than one.
+- The adaptive rows (tiles below X % changed, raw above) wrote 27 of 421 frames raw even on typing, which makes their average 400 KB; as built in the probe they do not help.

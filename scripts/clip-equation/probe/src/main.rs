@@ -33,6 +33,7 @@ mod exp_d;
 mod exp_settings;
 mod exp_encoders;
 #[allow(dead_code)]
+mod exp_measure;
 mod exp_meter;
 mod exp_z;
 mod gpu;

@@ -1,6 +1,7 @@
 {
   "_about": "Inputs of experiments step 1 (docs/clip-recorder-experiments-plan.md, F6, F7, Procedure step 1). Read by corpus/render.mjs and spec/run-spec.mjs.",
   "root": "C:\\Users\\Adam\\clip-corpus",
+  "chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "t_s": 20,
   "f_fps": 20,
   "instant_ms": 50,

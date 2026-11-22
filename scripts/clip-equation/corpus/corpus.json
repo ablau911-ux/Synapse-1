@@ -1,0 +1,27 @@
+{
+  "_about": "Inputs of experiments step 1 (docs/clip-recorder-experiments-plan.md, F6, F7, Procedure step 1). Read by corpus/render.mjs and spec/run-spec.mjs.",
+  "root": "C:\\Users\\Adam\\clip-corpus",
+  "t_s": 20,
+  "f_fps": 20,
+  "instant_ms": 50,
+  "page_lead_ms": 40,
+  "load_ms": 2000,
+  "virtual_start_unix_ms": 1767225600000,
+  "zstd_level": -3,
+  "scenarios": {
+    "typing": "typing-page.html",
+    "flash": "flash-page.html",
+    "scroll": "scroll-page.html",
+    "video": "video-page.html",
+    "still": "still-page.html",
+    "ui": "ui-page.html"
+  },
+  "sizes": [
+    { "width": 1920, "height": 1080, "sigma": 1 },
+    { "width": 1280, "height": 720, "sigma": 1 },
+    { "width": 640, "height": 360, "sigma": 2 },
+    { "width": 506, "height": 333, "sigma": 3 }
+  ],
+  "repeat": { "of": "typing-1280x720", "folder": "typing-1280x720-repeat" },
+  "flash": { "bgr": [80, 32, 255], "min_pixels": 1000, "box_left_fraction": 0.6, "box_top": 40, "box_width": 160, "box_height": 120, "per_second": 1 }
+}

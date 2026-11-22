@@ -11,7 +11,9 @@
 //!        `Nv12Canvas::draw` equals the source's at the scenario's σ values
 //!   M14  live share at 1920 x 1080 and 20 new frames per second (M4 worst)
 //!
-//! `clip-probe compress [scenario ...]` runs all scenarios or the named ones.
+//! `clip-probe compress [--capture-only] [scenario ...]` runs all scenarios or
+//! the named ones, with every method of `Method::all` (none with
+//! `--capture-only`, which reports only the M10 delivery figures).
 //! Frames stay in memory only and are dropped after each scenario; written
 //! files are deleted after each method.
 
@@ -21,6 +23,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+};
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
@@ -38,7 +43,9 @@ use crate::waiting_codec::{Coder, Decoder, Encoder, Method, Picture, same_pictur
 /// M10: each scenario is captured for at least 20 s.
 const CAPTURE_SECONDS: u64 = 21;
 /// Time for the page to load and start moving before the capture starts.
-const SETTLE: Duration = Duration::from_millis(2500);
+/// (2.5 s in the first run; the first window of a run then rendered its
+/// timer-driven page at 3 frames per second for a while.)
+const SETTLE: Duration = Duration::from_millis(5000);
 /// Package 0 result: 11 ms is the requested update interval (M3).
 const REQUESTED_INTERVAL_MS: f64 = 11.0;
 /// Memory bound for one scenario's frames (21 s at 20 new frames per second is 420).
@@ -72,7 +79,44 @@ struct Scenario {
     sigmas: &'static [u32],
 }
 
-const SCENARIOS: [Scenario; 8] = [
+/// Outer size of the 1080p windows: 1920 x 1080 visible plus Windows'
+/// invisible 7-pixel resize borders left, right and bottom.
+const FULL_HD_OUTER: (i32, i32) = (1934, 1087);
+const FULL_HD_POSITION: (i32, i32) = (-7, 0);
+
+const SCENARIOS: [Scenario; 12] = [
+    Scenario {
+        name: "flash-1080",
+        page: "flash-page.html",
+        query: "",
+        title: "Clip proof page",
+        size: FULL_HD_OUTER,
+        sigmas: &[1],
+    },
+    Scenario {
+        name: "scroll-1080",
+        page: "scroll-page.html",
+        query: "",
+        title: "clip0b scroll",
+        size: FULL_HD_OUTER,
+        sigmas: &[1],
+    },
+    Scenario {
+        name: "typing-1080",
+        page: "typing-page.html",
+        query: "",
+        title: "clip0b typing",
+        size: FULL_HD_OUTER,
+        sigmas: &[1],
+    },
+    Scenario {
+        name: "video-1080",
+        page: "video-page.html",
+        query: "",
+        title: "clip0b video",
+        size: FULL_HD_OUTER,
+        sigmas: &[1],
+    },
     Scenario {
         name: "flash",
         page: "flash-page.html",
@@ -141,6 +185,7 @@ const SCENARIOS: [Scenario; 8] = [
 
 /// One method's figures in one scenario.
 struct Row {
+    scenario: &'static str,
     method: Method,
     frames: usize,
     bytes_per_frame: f64,
@@ -150,7 +195,17 @@ struct Row {
 }
 
 pub fn run() -> Result<()> {
-    let wanted: Vec<String> = std::env::args().skip(2).collect();
+    let mut wanted: Vec<String> = std::env::args().skip(2).collect();
+    // `--capture-only`: M10 delivery figures only, no method runs.
+    let capture_only = wanted.first().is_some_and(|first| first == "--capture-only");
+    if capture_only {
+        wanted.remove(0);
+    }
+    let methods = if capture_only { Vec::new() } else { Method::all() };
+    // With the display asleep (owner away), Windows composes only a few
+    // frames per second; keep the display on for this run, as a video player
+    // does. No input is sent anywhere. Cleared when `_awake` drops.
+    let _awake = DisplayAwake::request();
     let rate = CycleRate::calibrate();
     let pages = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -162,10 +217,32 @@ pub fn run() -> Result<()> {
         .filter(|s| wanted.is_empty() || wanted.iter().any(|w| w == s.name))
     {
         let (pictures, seconds, delivered) = capture(scenario, &pages)?;
-        rows.extend(measure(scenario, &pictures, seconds, delivered, rate)?);
+        rows.extend(measure(
+            scenario, &methods, &pictures, seconds, delivered, rate,
+        )?);
     }
-    report_live_share(&rows);
+    if !rows.is_empty() {
+        report_live_share(&rows);
+    }
     Ok(())
+}
+
+/// Holds a "display required" power request for the life of the value.
+struct DisplayAwake;
+
+impl DisplayAwake {
+    fn request() -> Self {
+        // SAFETY: a power request for this thread; no pointers.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+        Self
+    }
+}
+
+impl Drop for DisplayAwake {
+    fn drop(&mut self) {
+        // SAFETY: clears this thread's power request.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    }
 }
 
 /// M10: opens the scenario's page, captures it and closes it again.
@@ -174,7 +251,7 @@ fn capture(scenario: &Scenario, pages: &std::path::Path) -> Result<(Vec<Picture>
         &pages.join(scenario.page),
         scenario.query,
         scenario.title,
-        (40, 40),
+        if scenario.size == FULL_HD_OUTER { FULL_HD_POSITION } else { (40, 40) },
         scenario.size,
     )?;
     std::thread::sleep(SETTLE);
@@ -207,6 +284,7 @@ fn capture(scenario: &Scenario, pages: &std::path::Path) -> Result<(Vec<Picture>
 /// M11 to M13 for one scenario; prints one markdown table.
 fn measure(
     scenario: &Scenario,
+    methods: &[Method],
     pictures: &[Picture],
     seconds: f64,
     delivered: u32,
@@ -227,6 +305,9 @@ fn measure(
         pictures.len() as f64 / seconds,
         scenario.sigmas
     );
+    if methods.is_empty() {
+        return Ok(Vec::new());
+    }
     let source_nv12: Vec<Vec<u64>> = {
         let mut hashers: Vec<Nv12Hasher> = scenario
             .sigmas
@@ -248,22 +329,36 @@ fn measure(
     );
     println!("|---|---|---|---|---|---|---|---|");
     let mut rows = Vec::new();
-    for method in Method::all() {
+    for &method in methods {
         let mut encoder = Encoder::new(method)?;
         let mut files = Vec::with_capacity(pictures.len());
         // One reused output buffer, as the live part would have; the copy kept
         // for M12 and M13 is made outside the timed part.
+        // A coder with its own threads is timed over the whole process (all
+        // its threads' processor time, not wall time).
+        let cycles_now: fn() -> u64 = if method.threaded() {
+            clock::process_cycles
+        } else {
+            clock::thread_cycles
+        };
         let (mut cycles, mut out) = (0_u64, Vec::new());
         for (index, picture) in pictures.iter().enumerate() {
             let previous = index.checked_sub(1).map(|at| &pictures[at]);
-            let start = clock::thread_cycles();
+            let start = cycles_now();
             encoder.encode(picture, previous, &mut out)?;
-            cycles += clock::thread_cycles() - start;
+            cycles += cycles_now() - start;
             files.push(out.clone());
         }
         let compress_ns_px = rate.seconds(cycles) * 1e9 / pixels as f64;
+        let paths = match method.coder {
+            Coder::Adaptive(_) => {
+                let (tiles, full) = encoder.paths();
+                format!(" (tile path {tiles}, raw path {full})")
+            }
+            _ => String::new(),
+        };
 
-        let mut decoder = Decoder::new()?;
+        let mut decoder = Decoder::new(method)?;
         let mut hashers: Vec<Nv12Hasher> = scenario
             .sigmas
             .iter()
@@ -306,12 +401,13 @@ fn measure(
                 .join(", ")
         };
         println!(
-            "| {} | {bytes_per_frame:.0} | {:.1} | {compress_ns_px:.3} | {decompress_ns_px:.3} | {write_us_frame:.0} ({write_files}) | {exact}/{} | {nv12} |",
+            "| {}{paths} | {bytes_per_frame:.0} | {:.1} | {compress_ns_px:.3} | {decompress_ns_px:.3} | {write_us_frame:.0} ({write_files}) | {exact}/{} | {nv12} |",
             method.name(),
             raw_bytes / bytes_per_frame,
             files.len()
         );
         rows.push(Row {
+            scenario: scenario.name,
             method,
             frames: files.len(),
             bytes_per_frame,
@@ -363,18 +459,16 @@ fn write_cost(files: &[Vec<u8>], rate: CycleRate) -> Result<(f64, usize)> {
     Ok((rate.micros(cycles) / count as f64, count))
 }
 
-/// M14: the live share at 1920 x 1080 and 20 new frames per second, per
-/// method at its best tile size, with the worst scenario's figures.
+/// M14: the live share at 1920 x 1080 and 20 new frames per second for every
+/// method in every scenario with at least `MIN_FRAMES_FOR_WORST` frames, the
+/// plan's choice (fewest bytes with the weakest-machine share within
+/// `CPU_LIMIT_PERCENT` in every scenario), the same without video, and the
+/// Pareto front of mean bytes against mean compress time.
 fn report_live_share(rows: &[Row]) {
     // Write cost per file = a + b · bytes, least squares over every M12 point.
-    let points: Vec<(f64, f64)> = rows
-        .iter()
-        .map(|r| (r.bytes_per_frame, r.write_us_frame))
-        .collect();
+    let points: Vec<(f64, f64)> = rows.iter().map(|r| (r.bytes_per_frame, r.write_us_frame)).collect();
     let n = points.len() as f64;
-    let (sx, sy) = points
-        .iter()
-        .fold((0.0, 0.0), |(sx, sy), (x, y)| (sx + x, sy + y));
+    let (sx, sy) = points.iter().fold((0.0, 0.0), |(sx, sy), (x, y)| (sx + x, sy + y));
     let (mx, my) = (sx / n, sy / n);
     let sxx: f64 = points.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();
     let sxy: f64 = points.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
@@ -385,82 +479,92 @@ fn report_live_share(rows: &[Row]) {
         per_byte * 1000.0,
         (per_file + per_byte * PX_1080 * 4.0) * 1e3 / PX_1080
     );
+    // Share in percent of one machine for one row, at 1080p.
+    let share = |row: &Row, (_, threads, ratio, delivered): (&str, f64, f64, f64)| -> f64 {
+        let write_us = per_file + per_byte * row.bytes_per_px * PX_1080;
+        let per_frame_s = PX_1080 * (C_READ_1080 + row.compress_ns_px) * 1e-9 + write_us * 1e-6;
+        ratio * (delivered * C_OBS_MS * 1e-3 + NEW_PER_SECOND * per_frame_s) / threads * 100.0
+    };
 
-    let mut families: Vec<(Coder, bool)> = Vec::new();
-    for row in rows {
-        if !families.contains(&(row.method.coder, row.method.keep_alpha)) {
-            families.push((row.method.coder, row.method.keep_alpha));
+    let counted: Vec<&Row> = rows.iter().filter(|r| r.frames >= MIN_FRAMES_FOR_WORST).collect();
+    let mut scenarios: Vec<&str> = Vec::new();
+    let mut methods: Vec<Method> = Vec::new();
+    for row in &counted {
+        if !scenarios.contains(&row.scenario) {
+            scenarios.push(row.scenario);
+        }
+        if !methods.contains(&row.method) {
+            methods.push(row.method);
         }
     }
     println!(
-        "\nM14 at 1920 x 1080, {NEW_PER_SECOND} new frames per second, worst scenario per figure (frames ≥ {MIN_FRAMES_FOR_WORST})"
+        "\nM14 at 1920 x 1080, {NEW_PER_SECOND} new frames per second: weakest-machine share (estimate) per scenario; scenarios with fewer than {MIN_FRAMES_FOR_WORST} frames left out"
     );
     println!(
-        "| method | best tile | bytes/px worst / mean | compress ns/px worst | write µs/frame at 1080p | live share dev PC | live share weakest (estimate) | within {CPU_LIMIT_PERCENT} % |"
+        "| method | mean bytes/px | mean compress ns/px | {} | max weakest | max weakest without video | max dev PC |",
+        scenarios.join(" | ")
     );
-    println!("|---|---|---|---|---|---|---|---|");
-    for (coder, keep_alpha) in families {
-        let tiles: Vec<u32> = if coder.uses_tiles() {
-            vec![32, 64, 128]
-        } else {
-            vec![0]
-        };
-        let of_tile = |tile: u32| -> Vec<&Row> {
-            rows.iter()
-                .filter(|r| {
-                    r.method.coder == coder
-                        && r.method.keep_alpha == keep_alpha
-                        && r.method.tile == tile
-                        && r.frames >= MIN_FRAMES_FOR_WORST
-                })
-                .collect()
-        };
-        let mean_bytes = |rows: &[&Row]| {
-            rows.iter().map(|r| r.bytes_per_px).sum::<f64>() / rows.len().max(1) as f64
-        };
-        let Some(tile) = tiles
+    println!("|---|---|---|{}---|---|---|", "---|".repeat(scenarios.len()));
+    // (method, mean bytes/px, mean compress ns/px, max weakest, max weakest without video)
+    let mut summary: Vec<(Method, f64, f64, f64, f64)> = Vec::new();
+    for method in methods {
+        let of_method: Vec<&&Row> = counted.iter().filter(|r| r.method == method).collect();
+        let mean_bytes = of_method.iter().map(|r| r.bytes_per_px).sum::<f64>() / of_method.len() as f64;
+        let mean_compress = of_method.iter().map(|r| r.compress_ns_px).sum::<f64>() / of_method.len() as f64;
+        let cells: Vec<String> = scenarios
             .iter()
-            .copied()
-            .min_by(|a, b| mean_bytes(&of_tile(*a)).total_cmp(&mean_bytes(&of_tile(*b))))
-        else {
-            continue;
-        };
-        let chosen = of_tile(tile);
-        if chosen.is_empty() {
-            continue;
-        }
-        let worst_bytes = chosen.iter().map(|r| r.bytes_per_px).fold(0.0, f64::max);
-        let worst_compress = chosen.iter().map(|r| r.compress_ns_px).fold(0.0, f64::max);
-        let write_us = per_file + per_byte * worst_bytes * PX_1080;
-        let shares: Vec<f64> = MACHINES
-            .iter()
-            .map(|(_, threads, ratio, delivered)| {
-                let per_frame_s = PX_1080 * (C_READ_1080 + worst_compress) * 1e-9 + write_us * 1e-6;
-                ratio * (delivered * C_OBS_MS * 1e-3 + NEW_PER_SECOND * per_frame_s) / threads
-                    * 100.0
+            .map(|name| {
+                of_method
+                    .iter()
+                    .find(|r| r.scenario == *name)
+                    .map_or("-".to_owned(), |r| format!("{:.2}", share(r, MACHINES[1])))
             })
             .collect();
-        let name = Method {
-            coder,
-            tile,
-            keep_alpha,
-        }
-        .name();
+        let max_of = |video: bool, machine: (&str, f64, f64, f64)| {
+            of_method
+                .iter()
+                .filter(|r| video || !r.scenario.contains("video"))
+                .map(|r| share(r, machine))
+                .fold(0.0, f64::max)
+        };
+        let (worst, worst_no_video) = (max_of(true, MACHINES[1]), max_of(false, MACHINES[1]));
         println!(
-            "| {name} | {} | {worst_bytes:.4} / {:.4} | {worst_compress:.3} | {write_us:.0} | {:.2} % | {:.2} % | {} |",
-            if coder.uses_tiles() {
-                tile.to_string()
-            } else {
-                "-".to_owned()
-            },
-            mean_bytes(&chosen),
-            shares[0],
-            shares[1],
-            if shares[1] <= CPU_LIMIT_PERCENT {
-                "yes"
-            } else {
-                "no"
-            }
+            "| {} | {mean_bytes:.4} | {mean_compress:.3} | {} | {worst:.2} | {worst_no_video:.2} | {:.2} |",
+            method.name(),
+            cells.join(" | "),
+            max_of(true, MACHINES[0])
+        );
+        summary.push((method, mean_bytes, mean_compress, worst, worst_no_video));
+    }
+    let pick = |worst: fn(&(Method, f64, f64, f64, f64)) -> f64| {
+        summary
+            .iter()
+            .filter(|entry| worst(entry) <= CPU_LIMIT_PERCENT)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or("none".to_owned(), |entry| {
+                format!("{} ({:.4} bytes/px mean, {:.2} % weakest)", entry.0.name(), entry.1, worst(entry))
+            })
+    };
+    println!("\nM14 choice, every scenario: {}", pick(|entry| entry.3));
+    println!("M14 choice, video left out: {}", pick(|entry| entry.4));
+    println!("\nPareto front (mean bytes/px against mean compress ns/px; no other method is better on both):");
+    let mut front: Vec<&(Method, f64, f64, f64, f64)> = summary
+        .iter()
+        .filter(|a| {
+            !summary
+                .iter()
+                .any(|b| b.1 <= a.1 && b.2 <= a.2 && (b.1 < a.1 || b.2 < a.2))
+        })
+        .collect();
+    front.sort_by(|a, b| a.2.total_cmp(&b.2));
+    for entry in front {
+        println!(
+            "| {} | {:.4} bytes/px | {:.3} ns/px | max weakest {:.2} % | without video {:.2} % |",
+            entry.0.name(),
+            entry.1,
+            entry.2,
+            entry.3,
+            entry.4
         );
     }
 }

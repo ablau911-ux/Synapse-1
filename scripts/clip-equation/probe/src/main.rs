@@ -16,6 +16,7 @@
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.
 
+mod block_coders;
 mod chrome_window;
 mod clock;
 mod compress;

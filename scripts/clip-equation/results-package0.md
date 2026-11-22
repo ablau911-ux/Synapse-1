@@ -568,7 +568,7 @@ hw-hint: frames=100 keys=0,20,40,60,80 types={"I":5,"P":95}
 
 ## Package 0b: compression of the waiting frames (M10 to M14)
 
-Measured 2026-11-22 09:50 to 09:57 (system clock, JST) on the same development PC with `clip-probe compress` (release build, `lz4_flex` 0.14.2 with its default safe features, `zstd` 0.14.4 over zstd-sys 2.0.16 / zstd 1.5.7). Plan: `docs/clip-recorder-plan.md` section 0b; research: `docs/clip-recorder-waiting-compression-research.md`. No product code was changed.
+Measured 2026-11-22 09:50 to 09:57 (system clock, JST) on the same development PC with `clip-probe compress` (release build, `lz4_flex` 0.14.2 with its default safe features, `zstd` 0.14.4 over zstd-sys 2.1.3 / zstd 1.5.7; corrected 2026-11-22: the first version of this line said zstd-sys 2.0.16, which is the main workspace's copy, not the probe's). Plan: `docs/clip-recorder-plan.md` section 0b; research: `docs/clip-recorder-waiting-compression-research.md`. No product code was changed.
 
 How it was measured:
 

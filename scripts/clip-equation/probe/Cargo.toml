@@ -14,7 +14,14 @@ windows-capture = "=2.0.0"
 parking_lot = "0.12.5"
 # Package 0b (plan section 0b, M11): the two compression finalists for the waiting frames.
 lz4_flex = "0.14.2"
-zstd = "0.14.4"
+zstd = { version = "0.14.4", features = ["zstdmt"] }
+# Package 0b follow-up (owner, 2026-11-22: "comprehensive testing of all possibilities").
+lz4 = "1.28.1"
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+miniz_oxide = "0.9.1"
+png = "0.18.1"
+qoi = "0.4.1"
+snap = "1.1.2"
 
 [dependencies.windows]
 version = "=0.62.2"
@@ -32,6 +39,7 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
     "Win32_System_Performance",
+    "Win32_System_Power",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_System_WindowsProgramming",

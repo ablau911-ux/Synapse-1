@@ -445,13 +445,18 @@ impl Estimate {
     fn dctx(way: &Way, dict: usize) -> usize {
         // SAFETY: pure size functions.
         unsafe {
-            let base = if way.mode == Mode::Stream {
+            // One stream with K_z = 1: each chunk is a whole zstd frame with its content size, so
+            // ZSTD_decompressStream takes its single-pass path straight into the output: no window, no buffers.
+            let base = if way.mode == Mode::Stream && way.kz > 1 {
                 sys::ZSTD_estimateDStreamSize(1usize << way.window_log)
             } else {
                 sys::ZSTD_estimateDCtxSize()
             };
             let ddict = if dict > 0 {
                 sys::ZSTD_estimateDDictSize(dict, sys::ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy)
+            } else if way.mode == Mode::Prefix && way.kz > 1 {
+                // ZSTD_DCtx_refPrefix builds a DDict that references the previous frame: its own size only.
+                sys::ZSTD_estimateDDictSize(0, sys::ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef)
             } else {
                 0
             };
@@ -1262,6 +1267,8 @@ pub fn run() -> Result<()> {
     }
     let (dec_peak_ws, dec_peak_private) = sampler.take_peaks();
     let rect_listed = decoder.listed;
+    // SAFETY: a live context; its size after the last frame is what zstd allocated (window, buffers, dictionary).
+    let dctx_sizeof = unsafe { sys::ZSTD_sizeof_DCtx(decoder.unpacker.dctx) };
     drop(decoder);
     if !args.flag("keep", false) {
         let _ = std::fs::remove_dir_all(&clip);
@@ -1274,7 +1281,7 @@ pub fn run() -> Result<()> {
         "{{\"folder\":\"{folder_name}\",{},\"rep\":{rep},\"w\":{w},\"h\":{h},\"n_new\":{},\"d_wait\":{},\"frames\":{},\"bytes_out\":{bytes_out},\"bytes_disk\":{bytes_disk},\"bytes_per_frame\":{},{},\
 \"input\":\"bgra\",{},{},{},{},{},{},\"comp_cpu_per_frame_ns\":{},\"way_cpu_per_frame_ns\":{},\"comp_wall_total_ns\":{wall_comp_total},\"dict_bytes\":{},{},\
 {},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"peak_private_sampled\":{peak_sampled},\"b_max\":{b_max},\"peak_ws\":{peak_ws},\"os_peak_ws\":{os_ws},\
-\"m_cctx_est\":{},\"cctx_sizeof\":{cctx_sizeof},\"bc\":{bc},\"m_dctx_est\":{},\"bd\":{bd},\"ldm_read\":{ldm_read},\"rect_src_bytes\":{rect_src},\"rect_listed_bytes\":{rect_listed},\"rects_max\":{rects_max},\
+\"m_cctx_est\":{},\"cctx_sizeof\":{cctx_sizeof},\"bc\":{bc},\"m_dctx_est\":{},\"dctx_sizeof\":{dctx_sizeof},\"bd\":{bd},\"ldm_read\":{ldm_read},\"rect_src_bytes\":{rect_src},\"rect_listed_bytes\":{rect_listed},\"rects_max\":{rects_max},\
 {},{},{},\"dec_cpu_per_frame_ns\":{},\"dec_peak_private\":{dec_peak_private},\"dec_peak_ws\":{dec_peak_ws},\
 \"frames_decoded\":{decoded},\"diff_sum\":{diff_sum},\"diff_frames\":{diff_frames},\"n_dec_worst\":{n_dec_worst},\"t_ready_ns\":{t_ready_ns}}}",
         way.json(),

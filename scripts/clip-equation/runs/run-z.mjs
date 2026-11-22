@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { CorpusFolder, rowChecks, ramKnown } from '../spec/step2z.mjs';
+import { CorpusFolder, rowChecks, ramKnown, ramDecKnown } from '../spec/step2z.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -78,13 +78,13 @@ const MEASURED_COLUMNS = [
   'way_cpu_ns', 'way_cycles', 'way_wall_ns', 'way_cpu_per_frame_ns', 'convert_cpu_ns', 'convert_cycles',
   'comp_cpu_ns', 'comp_gpt_ns', 'comp_cycles', 'comp_wall_ns', 'comp_cpu_per_frame_ns', 'comp_wall_total_ns',
   'write_cpu_ns', 'write_cycles', 'write_wall_ns', 'corpus_cpu_ns', 'corpus_wall_ns', 'train_cpu_ns', 'train_cycles', 'train_wall_ns',
-  'm0_private', 'm0_ws', 'os_peak_at_m0', 'ram_os', 'peak_private', 'peak_private_sampled', 'b_max', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'bd',
+  'm0_private', 'm0_ws', 'os_peak_at_m0', 'ram_os', 'peak_private', 'peak_private_sampled', 'b_max', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'dctx_sizeof', 'bd',
   'ldm_read', 'rect_src_bytes', 'rect_listed_bytes', 'rects_max',
   'dec_cpu_ns', 'dec_gpt_ns', 'dec_wall_ns', 'dec_cpu_per_frame_ns', 'dec_peak_private', 'dec_peak_ws', 'read_cpu_ns', 'corpus_dec_cpu_ns',
   'frames_decoded', 'diff_sum', 'diff_frames', 'n_dec_worst', 't_ready_ns', 'run_wall_ms',
 ];
 const KNOWN_COLUMNS = ['rate', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
-const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_bytesAll', 'pass_baseline', 'pass_inputFormat', 'pass_cpuTotal', 'pass_dictCpu', 'pass_ramOs', 'pass_ldm', 'pass_rectList', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_ramShared', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_ramDec', 'pass_ready', 'error'];
+const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_bytesAll', 'pass_baseline', 'pass_inputFormat', 'pass_cpuTotal', 'pass_dictCpu', 'pass_ramOs', 'pass_ldm', 'pass_rectList', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_ramShared', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_dctx', 'pass_ready', 'error'];
 const COLUMNS = [...OPTION_COLUMNS, ...MEASURED_COLUMNS, ...KNOWN_COLUMNS, ...PASS_COLUMNS];
 
 const folders = () => SCENARIOS.flatMap((s) => SIZES.map((z) => `${s}-${z}`));
@@ -386,8 +386,8 @@ async function runAll(runs, csvFile, limit = Infinity) {
       row.known_n_new = folder.nNew;
       row.known_d_wait = folder.dWait;
       row.known_m_comp = ramKnown(row).known;
-      row.known_m_dec = json.m0_private + json.m_dctx_est + json.bd * json.px * 3 + json.b_max;
-      for (const c of rowChecks(row, folder)) if (!c.note) row[`pass_${c.scenario}`] = c.ok ? 1 : 0;
+      row.known_m_dec = ramDecKnown(row);
+      for (const c of rowChecks(row, folder)) if (!c.note && !c.fit) row[`pass_${c.scenario}`] = c.ok ? 1 : 0;
     }
     csv.append(row);
     console.log(`[${i + 1}/${todo.length}] ${run.folder} ${run.way} L=${run.level} ${row.mode}/${row.layout} rep ${run.rep}: ${json ? `${json.bytes_per_frame} B/frame, ${(json.comp_cpu_per_frame_ns / 1e6).toFixed(2)} ms/frame, ${(wallMs / 1000).toFixed(1)} s` : error}`);

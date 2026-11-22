@@ -6,7 +6,7 @@ This is step 3 of the owner's work order: the equation in `docs/clip-recorder-eq
 
 History. Version 1 (commit ad0047d1) was built as commits 7709f70c, 7e4cf3eb and be2447f8. Version 2 (f354496d) was reviewed against the code (issue #290). Version 3 (30392a46) folded in that review and was itself reviewed by Codex and Opus, consolidated, and decided by Fable. The full record is in `docs/clip-recorder-review-v3/` (`1-codex-gpt-6-astra.md`, `2-opus-4-8.md`, `3-consolidation-and-jev.md`, `4-fable-decisions.md`; the last one is binding). Decision numbers below (S1 to S9, C1 to C18, O1 to O5, E1 to E8) refer to `4-fable-decisions.md`.
 
-## Where the build stands (2026-11-22 16:30 IST)
+## Where the build stands (2026-11-22 18:00 IST)
 
 - **Built:** packages 0, 0b, 1, 2, 3a, 3b and 4. Package 5 (proof) is partly done: see "Proof results so far" under Proof.
 - **Reviews:** Codex reviewed every fix round; Fable 5.2 reviewed the component logic (`docs/clip-recorder-review-build/fable-5-2-c00ff762.md`) and the new D5 analyzer. The review findings that are accepted are fixed or queued; the rest are listed under "Open items".
@@ -125,7 +125,7 @@ The existing screenshot paths stay as they are. The clip recorder gets its own f
 | O3 | Measure the longest hold time (composition time to frame release) and count pinned-slot overflows. Each overflow is a lost instant, recorded with its cause | The clip reports proven losses and the hold time against T_r | conditions |
 | O4 | On request for instant s_k: return the identity (composition time) of the pinned frame first. Read back to the processor only when the caller asks for it after its repeat check, on the reader thread | A repeated frame costs no read-back; the only read-back is one per new recorded frame | C (2), a_rt |
 
-Slots. `OBSERVE_SLOTS` = `MAX_SELECTION_LATENESS_INSTANTS` + 2: one candidate slot for the open instant, one pinned slot per instant the reader may still be behind, and one spare. A pinned slot is never overwritten. When no slot is free, the instant is recorded as lost. The lateness bound comes from package 0 (M7).
+Slots. `OBSERVE_SLOTS` = `MAX_SELECTION_LATENESS_INSTANTS` + 2: one candidate slot for the open instant, one pinned slot per instant the reader may still be behind, and one spare. A pinned slot is never overwritten while the reader may be reading it. When no slot is free, the newest frame takes the newest unread pinned slot and that older instant is recorded as lost (`989aaebb`), so a window that then goes still shows its last picture. The lateness bound comes from package 0 (M7).
 
 Threading rule (C3). Multithread protection is on for the capture device. The handler only issues GPU copies and never maps. The reader thread never holds the device context across a wait. The mechanism (package 0 proposes `Map` with "do not wait" and a retry) is confirmed by M6.
 
@@ -510,13 +510,16 @@ From the Fable 5.2 logic review and the live tests. Each one is either unverifie
 
 | Item | Why it is open |
 |---|---|
-| A brief file lock (antivirus, indexer) on a rename or a `clip.json` replace fails the clip; no retry | how often it happens is unverified |
-| On a slot overflow the observer drops the newest frame; if the window then goes still, later instants repeat the older picture while only one instant is named lost | rare (needs a recorder stall of 200 ms or more during a burst); the fix is in the hot path |
-| The cursor position is sampled when the instant is handled, 50 ms or more after composition; the mask can miss a drawn cursor | matters only on Windows 10 before 2004 (cursor drawn in) |
-| The viewer uses frame zero's σ for every segment | P3; only after a resize across the 480-line boundary |
-| The worker cap follows the previous second's live share; `GetThreadTimes` may under-count short bursts | unverified; B reports `not_held` honestly when the sum passes 10 % |
-| 28 of about 30 flashes were found as short-lived on the proof clip | under review (start-up absorption and the clip end) |
+| The share measurement uses `GetThreadTimes`, which may under-count short bursts | unverified; needs one comparison with `QueryThreadCycleTime` |
+| 28 of about 30 flashes were found as short-lived on the proof clip | likely the page: some flashes lasted 48.6 ms at 144 Hz; the page is fixed (`b608bce4`) and the case is checked again with the D5 rebuild |
 | The weakest machine's figures | still computed estimates until a run on a real Core i3 |
+
+## Changes on 2026-11-22, 16:30 to 18:00 IST
+
+- Owner's order: all code fixes first, then one verification round (Codex review, one build, live tests), then the experiments (`docs/clip-recorder-experiments-plan.md`, paused).
+- D5 written as an equation (section D) and being rebuilt from it.
+- Recovery and worker fixes from the Fable review (`b42b3c7b`, `a8f14db9`, `34ffd5a9`, `3178ff93`) and consolidations (`3c77c48a`, `2f998548`, `44278279`, `5e8e2662`, `185fb5a4`, `662a9fe2`).
+- Open items closed in code (not yet run live): one lock-file open (`d1f060de`), waiting-frame names (`a6978277`), retry on a brief file hold (`51dd54b5`), slot overflow keeps the newest frame (`989aaebb`), cursor position sampled with the frame (`5204cbd1`), σ per segment (`d989e139`), worker cap from the largest live share of the last 3 s (`0b0450e9`), a recorder that ends without `finish` marks its clip `failed` (`80ece2de`).
 
 ## Changes on 2026-11-22, 14:30 to 16:30 IST
 

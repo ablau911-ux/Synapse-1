@@ -154,6 +154,32 @@ Run design (owner decision, 2026-11-22 about 20:47: every option at every level;
   6. As built (`1cfd8ed2`, 21:42): the coverage floor alone is T = 16.05 h (levels 19 to 22 take 10.16 h of it), so at 12 h no larger cell fits and nothing can be held out. Decision: the budget is floor + 4 h, T_total ≈ 20 h, with the 1,242 cheapest larger cells, 20 % of them held out (mulberry32, seed 20261122). Reason: the owner's order of costs is tokens, then PC, then time; this choice needs no new code, keeps every option at every level, and proves the size prediction. Order: way D's full run first (≈ 5 h, results sooner), then way Z.
 - Every runnable way of `docs/clip-recorder-ways.md` that is not one of these factors is added as a row of grid B.
 
+## Measurement rules, the same for both ways (2026-11-22 22:20, from the harness review #295)
+
+The way D full run was stopped at 22:18 after 425 of 2,808 runs, because the review found that Z and D were not measured the same way. These rules are binding for every run; a run that breaks one is not a result.
+
+- **M1 Input.** Every way receives each new frame as B, G, R, A, the format Windows capture delivers. It is expanded from the corpus before the timer starts. Any conversion a way needs is part of its timed work: B, G, R, A to B, G, R for the zstd ways that drop alpha, and to NV12 for way D.
+- **M2 CPU.** The process cycle counter delta covers all of a way's work for one clip, including one-time setup:
+  - Z: conversion, compression, writing, context creation and dictionary training.
+  - D: the live process (conversion, zstd −3, writing), plus the worker process (reading, decoding, σ scaling, NV12, encoding, writing).
+  - Corpus decoding and verification are never counted.
+- **M3 RAM.** Each measured process prepares its input, then takes M_0. Its RAM is the OS peak of private bytes (`PeakPagefileUsage`) after the work, minus M_0. Way D's live part and worker run as two separate processes, as in the product (E2), and RAM_D = M_live + M_worker (equation 7).
+- **M4 Bytes.** Bytes count every file the product would keep for the clip:
+  - Z: the frame files, `frames.jsonl` and `clip.json`.
+  - D: the MP4 segments, `frames.jsonl` and `clip.json`. The waiting files are deleted at `ready`, so they are not counted.
+  - Both ways write `frames.jsonl` in the same format.
+- **M5 Settings.** A run records the requested and the read-back settings (q, rate mode, GOP, hint, ldm, window). If they differ, the run is recorded under its actual settings with status `setting_refused:<name>` and does not count as the requested configuration. Quality mode keeps the product's fallback β = `FALLBACK_BITS_PER_PIXEL_FRAME` (0.10).
+- **M6 Frame mapping (D).** A decoded frame is matched to a corpus new frame by presentation time, within half an instant. A missing, extra or mistimed frame fails the run with status `frame_map`.
+- **M7 Quality.** PSNR-Y is computed from the clip's total MSE (∞ when MSE = 0). SSIM-Y is the mean over frames. R is measured on fixed text regions per scenario, defined in `corpus/corpus.json`. If the source text read in a region is empty, R = n/a for that scenario and it is not used for O. Text and non-text rows pass O only at the q actually run.
+- **M8 Ways as registered.** ldm is set explicitly on or off in every run. ZW9 is the register's list of merged changed-tile rectangles, with its merge gap. A single global bounding box is a separate way, ZW9b.
+- **M9 Runner.** A run key has its defaults resolved the same way at planning, lookup and append, and duplicate keys are rejected. The run list (floor + 4 h, 20 % hold-out) is regenerated and checked before `--full`.
+- **M10 Fit.**
+  - Splits are made first, and coefficients come only from training rows. A configuration needs all of its repeats to succeed.
+  - Failure counts are kept. FULL is printed only when the unique keys match both run plans.
+  - Predicted cells appear with their uncertainty. The published equations come from the fitted models themselves.
+  - D's P and K are fitted separately, and the prediction uses the GOP.
+  - The best-way check is computed independently, with fixed test cases.
+
 ## Procedure
 
 1. **Corpus.**

@@ -3,7 +3,8 @@
 //! `frames.jsonl`, encodes them and commits them (packages 3a and 3b).
 //!
 //! - `ProcessorBudget` owns the 10 % rule (E3, E10): the live part reports its
-//!   measured share every second (A9) and the worker's cap is what remains.
+//!   measured share every second (A9) and the worker's cap is 10 % minus the
+//!   largest live share of the last `CAP_SHARE_WINDOW_SECONDS` seconds.
 //! - `ClipWorkerHost` runs in the service: one worker at a time for the whole
 //!   service, a first-in first-out queue that recovered clips also enter (C11),
 //!   a job with a hard processor cap recomputed every second, and recovery at

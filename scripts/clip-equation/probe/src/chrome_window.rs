@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowTextW, HWND_TOPMOST, IsWindowVisible, PostMessageW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WM_CLOSE,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_BOTTOM, IsWindowVisible,
+    PostMessageW, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowPos, WM_CLOSE,
 };
 use windows::core::BOOL;
 
@@ -21,6 +21,9 @@ const CHROME: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
 const CHROME_CLASS: &str = "Chrome_WidgetWin_1";
 const FIND_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(6);
+/// Where Chrome first shows the window: right of a 1920-pixel-wide screen,
+/// so nothing appears in front of the owner's windows before it is moved.
+const OFFSCREEN: (i32, i32) = (2600, 0);
 
 pub struct ChromeWindow {
     child: Child,
@@ -46,10 +49,13 @@ impl ChromeWindow {
             "file:///{}{query}",
             page.to_string_lossy().replace('\\', "/")
         );
+        // Owner rule (2026-11-22): the window opens off the screen and is then
+        // moved into place BEHIND every other window, never in front.
+        let foreground_before = unsafe { GetForegroundWindow() }.0 as isize;
         let child = Command::new(CHROME)
             .arg(format!("--app={url}"))
             .arg(format!("--user-data-dir={}", profile.display()))
-            .arg(format!("--window-position={},{}", position.0, position.1))
+            .arg(format!("--window-position={},{}", OFFSCREEN.0, OFFSCREEN.1))
             .arg(format!("--window-size={},{}", size.0, size.1))
             .args([
                 "--no-first-run",
@@ -78,21 +84,26 @@ impl ChromeWindow {
                 .find(|(hwnd, text)| !before.contains(hwnd) && text == title)
             {
                 window.hwnd = hwnd;
-                // Topmost without activation, as the package 0 probe window:
-                // a covered Chrome window renders only a few frames per second.
+                // Into place at the bottom of the z-order, without activation
+                // (owner rule: behind the owner's windows; the occlusion flags
+                // above keep a covered window rendering).
                 // SAFETY: the probe's own window; no focus change.
                 unsafe {
                     SetWindowPos(
                         HWND(hwnd as *mut _),
-                        Some(HWND_TOPMOST),
+                        Some(HWND_BOTTOM),
+                        position.0,
+                        position.1,
                         0,
                         0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
                     )
                 }
                 .map_err(crate::win("SetWindowPos"))?;
+                let foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
+                if foreground_after == hwnd || foreground_after != foreground_before {
+                    println!("chrome_window note=foreground changed (before {foreground_before:#x}, after {foreground_after:#x}, probe window {hwnd:#x})");
+                }
                 return Ok(window);
             }
             std::thread::sleep(Duration::from_millis(100));

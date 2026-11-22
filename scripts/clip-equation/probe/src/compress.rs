@@ -228,10 +228,10 @@ pub fn run() -> Result<()> {
 }
 
 /// Holds a "display required" power request for the life of the value.
-struct DisplayAwake;
+pub(crate) struct DisplayAwake;
 
 impl DisplayAwake {
-    fn request() -> Self {
+    pub(crate) fn request() -> Self {
         // SAFETY: a power request for this thread; no pointers.
         unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
         Self

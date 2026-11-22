@@ -97,7 +97,7 @@ export function bestEquations(fit, c) {
       modelled
         ? `- Bytes (eq. 1): b_k = ζ · px · 3, ζ(px) = ζ(px0) · (px / px0)^(η − 1), ζ(px0) = ${fmt(Math.exp(lz), 6)} (px0 = ${zm.px0}), η = ${fmt(zm.eta, 4)} ⇒ ζ = ${fmt(zeta, 6)} at ${c.size} (px = ${c.px})`
         : `- Bytes (eq. 1): b_k = ζ · px · 3, ζ = ${fmt(zeta, 6)} measured at ${c.size} (px = ${c.px}); η = pending: full run (needs two sizes)`,
-      `- Bytes per minute: B_min = 60 · n_new · ζ · px · 3 = 60 · ${fmt(c.n_new / c.t_s, 3)} · ${fmt(zeta, 6)} · ${c.px} · 3 = ${mb(60 * (c.n_new / c.t_s) * zeta * c.px * 3)} MB/min`,
+      `- Bytes per minute: B_min = 60 · (N_new · ζ · px · 3 + metadata) / t = 60 · (${c.n_new} · ${fmt(zeta, 6)} · ${c.px} · 3 + ${fmt(c.fit.meta ?? 0, 0)}) / ${c.t_s} = ${mb((60 * (c.n_new * zeta * c.px * 3 + (c.fit.meta ?? 0))) / c.t_s)} MB/min (metadata: frames.jsonl and clip.json)`,
       `- Quality (eq. 2): Σ |decoded − corpus| = 0 ⇒ SSIM-Y = 1, PSNR-Y = ∞, R = 1`,
       `- CPU (eq. 3): C_comp / N_new = c_0 + px · κ_c, κ_c = ${fmt(kappa, 4)} ns/px, c_0 = ${c0 === undefined ? 'pending: full run (needs two sizes)' : `${fmt(c0, 0)} ns`}; measured with writing: ${fmt(c.cpu_s_min.mean, 4)} s/min`,
       (() => {
@@ -109,10 +109,12 @@ export function bestEquations(fit, c) {
     ];
   }
   const g = c.content;
-  const b = { a_E: fit.models?.d_bytes?.a_E?.[c.way], 'p_E,c': fit.models?.d_bytes?.p_E_c?.[c.way], rho: fit.models?.d_bytes?.K_over_P?.[c.way]?.[g] };
+  const m = fit.models?.d_bytes ?? {};
+  const apart = m.b_E?.[c.way] !== undefined;
+  const b = { a_E: apart ? m.a_E[c.way] : m.a_E_folded?.[c.way], 'p_E,c': apart ? m.p_E_c?.[c.way] : m.p_E_c_folded?.[c.way], rho: m.K_over_P_at_q?.[c.way]?.[`${g}|q${c.options.q}`] };
   const s = eq.eq7_d_quality.coefficients.Q_ssim?.[c.way];
   return [
-    `- Bytes (eq. 7): bytes = (n_new − n_key) · P + n_key · K, n_key = ⌈n_new / τ_f⌉ = ${Math.ceil(c.n_new / Number(c.options.tau_f))}; P = p_E,c · px · exp(a_E · q), p = ${fmt(b['p_E,c']?.[g], 6)}, a = ${fmt(b.a_E, 5)}; K / P = ${b.rho === undefined ? `pending: full run (no GOP sweep; P fitted at τ_f ${CONFIG.d_base.tau_f} with K folded in)` : fmt(b.rho, 4)}`,
+    `- Bytes (eq. 7): bytes = (n_new − n_key) · P + n_key · K, n_key = ⌈n_new / τ_f⌉ = ${Math.ceil(c.n_new / Number(c.options.tau_f))}; P = p_E,c · px · exp(a_E · q), p = ${fmt(b['p_E,c']?.[g], 6)}, a = ${fmt(b.a_E, 5)}; K / P = ${apart ? `apart: K = k_E,c · px · exp(b_E · q), b_E = ${fmt(m.b_E[c.way], 5)}` : b.rho === undefined ? `pending: full run (no GOP sweep at q ${c.options.q}; P fitted at τ_f ${CONFIG.d_base.tau_f} with K folded in)` : `${fmt(b.rho, 4)} measured at q ${c.options.q}`}; bytes on disk add the metadata ${mb(c.fit.meta ?? NaN)} MB (frames.jsonl, clip.json)`,
     `- Quality (eq. 7): Q_ssim = 1 − s · exp(−g · q), s = ${fmt(s?.['s_E,c']?.[g], 5)}, g = ${fmt(s?.g_E, 5)}`,
     `- CPU and RAM (eq. 7): see the equations section (${c.way})`,
   ];
@@ -132,7 +134,9 @@ function markdown(fit, rows, best) {
     '',
     `Failures kept (plan M10: a configuration needs all of its repeats): way Z ${fit.failures?.z?.runs_failed ?? 0} failed runs, ${fit.failures?.z?.configs_blocked ?? 0} configurations blocked; way D ${fit.failures?.d?.runs_failed ?? 0} failed runs, ${fit.failures?.d?.configs_blocked ?? 0} configurations blocked (failed or refused repeat, or R not read).${fit.coverage ? ` Coverage of the run plans: Z ${fit.coverage.z.unique} unique keys of ${fit.coverage.z.planned} planned (${fit.coverage.z.missing} missing, ${fit.coverage.z.duplicates} duplicates); D ${fit.coverage.d_plan === 'none' ? 'no run plan given' : `${fit.coverage.d.unique} of ${fit.coverage.d.planned} (${fit.coverage.d.missing} missing, ${fit.coverage.d.duplicates} duplicates)`}.` : ''}`,
     '',
-    'Definitions. bytes/min = mean(bytes) · (N_new / frames) · 60 / t (t = 20 s; frames < N_new only in the pilot\'s capped runs). CPU = process cycle-counter CPU to create the clip, in s per minute of clip: way Z compress + write, way D live + worker (a_rt + a_w). RAM = peak private bytes above the process base: way Z peak − M_0, way D M_live + M_worker. Spread = half the range of the repeats. J = bytes/bytes* + CPU/CPU* + RAM/RAM*, the stars being the least values among the kept configurations of the same corpus folder (the same frames).',
+    `Checks (plan M10, #295 H6; \`fit/fit-config.json\` "checks"). Validity checks block a run from the fit and from J: a status other than ${CONFIG.checks.ok_statuses.join(', ')} (setting_refused, frame_map, ocr_error, error), a missing repeat of the requested configuration, and the measurement-rule rows ${Object.entries(CONFIG.checks.validity_pass).map(([k, v]) => `${k}: ${v.join(', ')}`).join('; ')}. Every other pass_* row is a known-result equation: a miss is a fact about the way, listed in the configuration table as "known-result misses", and never blocks. Configurations with a known-result miss: ${rows.filter((r) => r.c.known_misses?.length).length}.`,
+    '',
+    'Definitions. bytes/min = (payload · N_new / frames + metadata) · 60 / t, from bytes_disk (every retained file: frames or MP4, frames.jsonl, clip.json; M4) for both ways (t = 20 s; frames < N_new only in the pilot\'s capped runs). CPU = process cycle-counter CPU to create the clip, in s per minute of clip: way Z compress + write, way D live + worker (a_rt + a_w). RAM = peak private bytes above the process base: way Z peak − M_0, way D M_live + M_worker. Spread = half the range of the repeats. J = bytes/bytes* + CPU/CPU* + RAM/RAM*, the stars being the least values among the kept configurations of the same corpus folder (the same frames).',
     '',
     '## Best way',
     '',
@@ -172,7 +176,7 @@ function markdown(fit, rows, best) {
     const q = c.status === 'ok' ? `${fmt(c.ssim, 5)} / ${fmt(c.psnr, 2)} / ${fmt(c.r, 4)}` : '-';
     const cpu = c.cpu_s_min ? `${fmt(c.cpu_s_min.mean, 4)} ± ${fmt(c.cpu_s_min.spread, 4)}` : '-';
     const ram = c.ram_peak ? `${mb(c.ram_peak.mean)} ± ${mb(c.ram_peak.spread)}` : '-';
-    out.push(`| ${c.way} | ${cell(optText(c))}${c.capped ? ` (${c.frames} of ${c.n_new} frames)` : ''}${c.held_out ? ' (held out)' : ''} | ${c.size} | ${c.content} | ${c.bytes_min === undefined ? '-' : mb(c.bytes_min)} | ${q} | ${cpu} | ${ram} | ${c.O ? 'kept' : `dropped: ${cell(c.clause)}`} | ${r.J === null ? '-' : fmt(r.J, 4)} |`);
+    out.push(`| ${c.way} | ${cell(optText(c))}${c.capped ? ` (${c.frames} of ${c.n_new} frames)` : ''}${c.held_out ? ' (held out)' : ''} | ${c.size} | ${c.content} | ${c.bytes_min === undefined ? '-' : mb(c.bytes_min)} | ${q} | ${cpu} | ${ram} | ${c.O ? 'kept' : `dropped: ${cell(c.clause)}`}${c.known_misses?.length ? `; known-result misses: ${cell(c.known_misses.join(' '))}` : ''} | ${r.J === null ? '-' : fmt(r.J, 4)} |`);
   }
   out.push('<!-- table:configurations:end -->', '');
   out.push('## Predicted cells (run list, not run)', '', ...predictedLines(fit.predicted));
@@ -180,10 +184,10 @@ function markdown(fit, rows, best) {
 }
 
 function csv(rows, predicted) {
-  const cols = ['row_type', 'prediction', 'kind', 'key', 'cfg', 'way', 'options', 'folder', 'content', 'size', 'px', 'runs', 'failed_runs', 'frames', 'n_new', 't_s', 'bytes_min', 'ssim', 'psnr', 'r', 'cpu_s_min', 'cpu_spread', 'ram_peak', 'ram_spread', 'O', 'clause', 'J', 'pareto', 'held_out', 'cell', 'bytes_rel_unc', 'cpu_rel_unc', 'ram_rel_unc'];
+  const cols = ['row_type', 'prediction', 'kind', 'key', 'cfg', 'way', 'options', 'folder', 'content', 'size', 'px', 'runs', 'failed_runs', 'frames', 'n_new', 't_s', 'bytes_min', 'ssim', 'psnr', 'r', 'cpu_s_min', 'cpu_spread', 'ram_peak', 'ram_spread', 'O', 'clause', 'J', 'pareto', 'held_out', 'cell', 'bytes_rel_unc', 'cpu_rel_unc', 'ram_rel_unc', 'known_misses'];
   const v = (x) => (x === undefined || x === null || Number.isNaN(x) ? '' : String(x).replace(/[,\r\n]/g, ';'));
   const lines = rows.map(({ c, J, pareto }) => ['measured', '', c.kind, c.key, c.cfg, c.way, optText(c), c.folder, c.content, c.size, c.px, c.runs, c.failed_runs, c.frames, c.n_new, c.t_s, c.bytes_min, c.ssim, c.psnr, c.r,
-    c.cpu_s_min?.mean, c.cpu_s_min?.spread, c.ram_peak?.mean, c.ram_peak?.spread, c.O ? 'kept' : 'dropped', c.clause, J, pareto ? 1 : 0, c.held_out ? 1 : 0, c.cell ?? '', '', '', ''].map(v).join(','));
+    c.cpu_s_min?.mean, c.cpu_s_min?.spread, c.ram_peak?.mean, c.ram_peak?.spread, c.O ? 'kept' : 'dropped', c.clause, J, pareto ? 1 : 0, c.held_out ? 1 : 0, c.cell ?? '', '', '', '', (c.known_misses ?? []).join(' ')].map(v).join(','));
   const pred = (predicted?.rows ?? []).map((p) => ['predicted', p.status, 'Z', '', '', p.way, p.options, p.folder, p.content, p.size, p.px, 0, '', '', '', '', p.bytes_min, '', '', '',
     p.cpu_s_min, '', p.ram, '', '', '', '', '', '', p.cell, p.bytes_rel_unc, p.cpu_rel_unc, p.ram_rel_unc].map(v).join(','));
   return `${cols.join(',')}\n${[...lines, ...pred].join('\n')}\n`;
@@ -201,7 +205,7 @@ function predictedLines(predicted) {
   out.push(`- predicted: ${done.length} cell × content`, '');
   if (done.length) {
     out.push('| cell | way | options | folder | bytes/min (MB) ± | CPU s/min ± | RAM (MB) ± |', '|---|---|---|---|---|---|---|');
-    for (const r of done) out.push(`| ${r.cell} | ${r.way} | ${cell(r.options)} | ${r.folder} | ${mb(r.bytes_min)} ± ${(100 * r.bytes_rel_unc).toFixed(1)} % | ${fmt(r.cpu_s_min, 4)} ± ${(100 * r.cpu_rel_unc).toFixed(1)} % | ${mb(r.ram)} ± ${(100 * r.ram_rel_unc).toFixed(1)} % |`);
+    for (const r of done) out.push(`| ${r.cell} | ${r.way} | ${cell(r.options)} | ${r.folder} | ${mb(r.bytes_min)} ± ${(100 * r.bytes_rel_unc).toFixed(1)} % | ${fmt(r.cpu_s_min, 4)} ± ${(100 * r.cpu_rel_unc).toFixed(1)} % | ${typeof r.ram === 'number' ? `${mb(r.ram)} ± ${(100 * r.ram_rel_unc).toFixed(1)} %` : 'pending'} |`);
     out.push('');
   }
   return out;

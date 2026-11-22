@@ -13,7 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRuns } from './step2d.mjs';
 import { relErr, runFeature } from './feature.mjs';
 import { CONFIG, keyOf, loadInputs } from './step4.mjs';
-import { sizeFixture, zBytesPerFrame } from './step4.fixtures.mjs';
+import { Z_TRUTH, sizeFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -37,16 +37,19 @@ function corpusNNew(folder) {
 /** The CSV rows grouped by configuration key, with bytes per minute recomputed here. */
 function groupInputs(inputs) {
   const groups = new Map();
-  const add = (kind, r, bytes, frames) => {
+  // H2: every retained file (bytes_disk) for both ways; a capped Z run scales its payload, not its metadata.
+  const add = (kind, r, payload, total, frames) => {
     const key = keyOf(kind, r);
-    const g = groups.get(key) ?? { key, folder: r.folder, rows: 0, bytes: [], frames, nNew: corpusNNew(r.folder) };
+    const g = groups.get(key) ?? { key, folder: r.folder, rows: 0, bytes: [], nNew: corpusNNew(r.folder) };
     g.rows += 1;
-    if (Number.isFinite(bytes)) g.bytes.push(bytes);
+    const clip = payload * (g.nNew / frames) + (total - payload);
+    if (Number.isFinite(clip)) g.bytes.push(clip);
     groups.set(key, g);
   };
-  for (const r of inputs.z) add('Z', r, r.bytes_disk !== undefined && r.bytes_disk !== '' ? num(r.bytes_disk) : num(r.bytes_out), num(r.frames));
-  for (const r of inputs.d) add('D', r, r.status === 'ok' ? num(r.bytes) : NaN, num(r.n_new));
-  for (const g of groups.values()) g.bytesMin = g.bytes.length ? mean(g.bytes) * (g.nNew / g.frames) * 60 / clipSeconds(g.folder) : NaN;
+  const has = (r, c) => r[c] !== undefined && r[c] !== '';
+  for (const r of inputs.z) add('Z', r, num(has(r, 'frame_bytes') ? r.frame_bytes : r.bytes_out), num(has(r, 'bytes_disk') ? r.bytes_disk : r.bytes_out), num(r.frames));
+  for (const r of inputs.d) add('D', r, r.status === 'ok' ? num(r.bytes) : NaN, r.status === 'ok' ? num(has(r, 'bytes_disk') ? r.bytes_disk : r.bytes) : NaN, corpusNNew(r.folder));
+  for (const g of groups.values()) g.bytesMin = g.bytes.length ? (mean(g.bytes) * 60) / clipSeconds(g.folder) : NaN;
   return groups;
 }
 
@@ -121,7 +124,7 @@ function checks(ctx) {
       const f = F.buildFitFromRows({ zRows, dRows: [], runlist });
       const c = f.configurations.find((x) => x.held_out);
       const lines = R.bestEquations(f, c);
-      const want = (60 * (c.n_new / c.t_s) * zBytesPerFrame(c.px) / 1e6).toFixed(2);
+      const want = ((60 * (c.n_new * zBytesPerFrame(c.px) + Z_TRUTH.meta)) / c.t_s / 1e6).toFixed(2);
       const real = (md.split('## Equations of the best way')[1] ?? '').split(/\r?\n## /)[0];
       const broken = [...lines, ...real.split(/\r?\n/)].filter((l) => /NaN|undefined/.test(l));
       return { value: `held-out 1920x1080: B_min ${want} MB/min; no NaN`, measured: `${lines.length} lines; B_min line: ${lines.find((l) => l.includes('MB/min')) ?? 'none'}; ${broken.length} lines with NaN or undefined`, pass: lines.some((l) => l.includes(`= ${want} MB/min`)) && broken.length === 0 };

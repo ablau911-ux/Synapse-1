@@ -317,6 +317,11 @@ impl ClipWorker {
             let closed = clip.state == ClipState::Encoding;
             match next_segment(&self.folder, &lines, start, closed) {
                 Some(range) => self.commit(&clip, &lines, range)?,
+                // No line and no segment: the service ended before frame zero
+                // was written, so the recovered clip holds nothing to be ready.
+                None if closed && clip.segments.is_empty() => {
+                    return Err("no frame recorded".to_owned());
+                }
                 None if closed => return self.ready(),
                 None => std::thread::sleep(std::time::Duration::from_millis(WORKER_TICK_MS)),
             }
@@ -642,38 +647,62 @@ pub(crate) fn recover_clips_on_start() {
         });
 }
 
-#[cfg(windows)]
 fn mark_service_restart(folder: &Path) -> Result<(), String> {
     let lines = read_frame_lines(folder).map_err(|error| error.to_string())?;
     ClipJson::update(folder, |clip| {
         let committed = clip.segments.last().map(|segment| segment.last_instant);
-        for line in &lines {
-            let uncommitted = committed.is_none_or(|last| line.instant > last);
-            if uncommitted && line.new && !raw_frame_path(folder, line.instant).is_file() {
-                clip.lost.push(LostInstant {
-                    instant: line.instant,
-                    cause: LossCause::ServiceRestart,
-                });
-            }
-        }
-        clip.recorded_ms = lines
-            .last()
-            .map_or(0, |line| line.t_ms + 1_000 / u64::from(clip.fps.max(1)));
+        let mut lost: Vec<LostInstant> = lines
+            .iter()
+            .filter(|line| {
+                committed.is_none_or(|last| line.instant > last)
+                    && line.new
+                    && !raw_frame_path(folder, line.instant).is_file()
+            })
+            .map(|line| LostInstant {
+                instant: line.instant,
+                cause: LossCause::ServiceRestart,
+            })
+            .collect();
+        // The instants after the last written line up to the planned end were
+        // never handled: instant k belongs to the clip while k / f < end_ms.
+        let fps = u64::from(clip.fps.max(1));
+        let first_unwritten = lines.last().map_or(0, |line| line.instant + 1);
+        let planned_instants = clip.end_ms.saturating_mul(fps).div_ceil(1_000);
+        lost.extend(
+            (first_unwritten..planned_instants).map(|instant| LostInstant {
+                instant,
+                cause: LossCause::ServiceRestart,
+            }),
+        );
+        clip.recorded_ms = lines.last().map_or(0, |line| line.t_ms + 1_000 / fps);
         clip.state = ClipState::Encoding;
         clip.stop_reason = Some(StopReason::ServiceRestart);
-        if let Some(t) = clip.conditions.t.as_mut() {
-            t.status = "not_held".to_owned();
-        } else {
-            clip.conditions.t = Some(super::clip_folder::ConditionStatus {
-                status: "not_held".to_owned(),
-                failed_instants: clip.lost.iter().map(|lost| lost.instant).collect(),
+        // The recorder never wrote C and T (it writes them when it stops);
+        // they start held and `add_lost` names every loss in them.
+        let length_ms = clip.recorded_ms;
+        clip.conditions
+            .c
+            .get_or_insert_with(|| super::clip_folder::ConditionStatus {
+                status: "held".to_owned(),
+                failed_instants: Vec::new(),
                 detail: Some(serde_json::json!({
-                    "length_ms": clip.recorded_ms,
-                    "stop_reason": StopReason::ServiceRestart.as_str(),
-                    "note": "the service ended during the recording; instants after the last written line are not in the clip",
+                    "delivery_completeness": "checked only in the proof",
+                    "note": "the service ended during the recording; the hold time was not measured",
                 })),
             });
-        }
+        clip.conditions
+            .t
+            .get_or_insert_with(|| super::clip_folder::ConditionStatus {
+                status: "held".to_owned(),
+                failed_instants: Vec::new(),
+                detail: Some(serde_json::json!({
+                    "length_ms": length_ms,
+                    "instants_lost": 0,
+                    "stop_reason": StopReason::ServiceRestart.as_str(),
+                    "note": "the service ended during the recording; the instants after the last written line are named as lost",
+                })),
+            });
+        clip.add_lost(lost);
     })
     .map(drop)
 }
@@ -838,6 +867,7 @@ impl WorkerRun {
                 .take()
                 .and_then(|value| value.as_object().cloned())
                 .unwrap_or_default();
+            let live_measured = detail.contains_key("max_live_share_percent");
             let previous_over = detail
                 .get("seconds_over_limit")
                 .and_then(serde_json::Value::as_u64)
@@ -856,10 +886,14 @@ impl WorkerRun {
                 "limit_percent".to_owned(),
                 serde_json::json!(CPU_LIMIT_PERCENT),
             );
-            b.status = if live_held && previous_over + over == 0 {
+            b.status = if !live_held || previous_over + over > 0 {
+                "not_held".to_owned()
+            } else if live_measured {
                 "held".to_owned()
             } else {
-                "not_held".to_owned()
+                // No live figure (the service ended during the recording):
+                // the sum cannot be shown to stay within the limit.
+                "unverified".to_owned()
             };
             b.detail = Some(serde_json::Value::Object(detail));
             clip.conditions.b = Some(b);

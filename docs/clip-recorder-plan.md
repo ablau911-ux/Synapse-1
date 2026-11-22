@@ -254,7 +254,7 @@ Consequence: a fade of any length is detected once its total contrast passes the
 - While a block animates, its anchor is frozen and it makes no event.
 - When it stops, it is compared with its anchor like any settling block. So a checkmark that replaces a spinner is a CHANGED event.
 - As built (`ea3e8514`): that change starts at the block's last motion, not at the start of the animation, so "checkmark replaces spinner" starts within one instant of the replacement.
-- Owner decision (2026-11-22 21:07, issue #293): a block that animated and ends back at its anchor makes no FLASH or REVERTED event for that animated stretch; the animation event already covers it. Only that stretch is exempt: a later return in the same block is classified as usual. Without this, a playhead would give a short-lived change in every block it crosses.
+- Owner decision (2026-11-22 about 20:42, issue #293): a block that animated and ends back at its anchor makes no FLASH or REVERTED event for that animated stretch; the animation event already covers it. Only that stretch is exempt: a later return in the same block is classified as usual. Without this, a playhead would give a short-lived change in every block it crosses.
 - Connected animating blocks form one animation interval.
 - There is no absorption: a block that is not animating is never swallowed by a neighbour.
 
@@ -521,7 +521,7 @@ From the Fable 5.2 logic review and the live tests. Each one is either unverifie
 - Last code fixes: the cursor per instant on repeated lines (`7472ea12`), retry on a brief file hold for the waiting-frame rename and the unlocked `clip.json` read (`891c280d`, `7d2cb399`), the worker cap rule in the module doc (`a5e9a801`), recovery keeps the losses named in `frames.jsonl` (`bf5930e1`).
 - D5 rebuilt from the equation (`ea3e8514`) with the proof page (`3077349b`). Two rules added as built, in D5 step 3. The parameter map lists the D5 constants as built.
 - All code fixes are done.
-- 20:40, owner: the experiments run now (`docs/clip-recorder-experiments-plan.md`): equations for everything, every option, one results table, and this plan corrected from the results. Codex reviews the fixes meanwhile, read-only.
+- About 20:33, owner: the experiments run now (`docs/clip-recorder-experiments-plan.md`): equations for everything, every option, one results table, and this plan corrected from the results. Codex reviews the fixes meanwhile, read-only.
 
 ## Changes on 2026-11-22, 16:30 to 18:00 IST
 

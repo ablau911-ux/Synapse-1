@@ -1,6 +1,6 @@
 # Clip recorder: experiment plan — equations for every quantity
 
-Status 2026-11-22 21:45 IST: active; two ways, Z (zstd alone) and D (zstd then H.264), every option of each, J decides (owner, 21:40). Branch `feature/clip-capture`. Owner: Adam. Work log: issue #290. Edited in place, no version numbers.
+Status 2026-11-22 21:00 IST: active; two ways, Z (zstd alone) and D (zstd then H.264), every option of each, J decides (owner, about 20:57). Times of the owner's decisions are taken from the commits that recorded them. Branch `feature/clip-capture`. Owner: Adam. Work log: issue #290. Edited in place, no version numbers.
 
 ## Goal (owner, 2026-11-22)
 
@@ -10,11 +10,11 @@ End result wanted: **a small video file, of high quality, whose creation uses as
 
 Fixed by the owner earlier, and not experiment factors: f = 20 fps; flashes of 50 ms or more are in the clip; at most 10 % processor (E10); at least 480 lines; lossless waiting frames (E11); no cursor in the picture (E9); quality before bytes.
 
-## Method (owner, 2026-11-22 21:08): the target, every way to it, keep what reaches it, save the best equation
+## Method (owner, 2026-11-22 about 20:42): the target, every way to it, keep what reaches it, save the best equation
 
 "I want to get to x + y. Find me all the ways to get there and log every way. Try all the ways you found and keep those that produce the outcome x + y. Save the equation that does it better than the others."
 
-1. **Target (x + y).** Owner, 2026-11-22 21:15: "forget other variables, we are testing all options". Every way is judged by four numbers only: file size, quality, CPU and RAM. Quality is SSIM-Y, PSNR-Y and R, the share of text read identically. "High quality" is the bar that a way must pass:
+1. **Target (x + y).** Owner, 2026-11-22 about 20:47: "forget other variables, we are testing all options". Every way is judged by four numbers only: file size, quality, CPU and RAM. Quality is SSIM-Y, PSNR-Y and R, the share of text read identically. "High quality" is the bar that a way must pass:
 
        O = [R = 1]
 
@@ -41,15 +41,15 @@ Fixed by the owner earlier, and not experiment factors: f = 20 fps; flashes of 5
 2. **Equations before numbers.** Every measured quantity has an equation below, with named symbols. The experiments measure the symbols. The equation then predicts every other combination.
 3. **Validation.** About 20 % of the runs (one scenario and one duration per encoder) are held out of the fit and must be predicted. Target: bytes, CPU time and RAM within ±10 %, quality within ±0.005 SSIM. A quantity that misses the target is reported as "not predictable" with its spread; it is never fitted harder to pass.
 4. **Repeats.** Every configuration runs 3 times. Results report the mean and the spread. Whether a hardware encoder gives byte-identical output for identical input is itself a result.
-5. **Every action has an equation with a known result** (owner, 2026-11-22 20:58). Before an action runs, its equation and the value it must give are written down (section "Acceptance"). The check script compares the outcome with that value. A quantity with no exact value yet, such as CPU time, gets a prior prediction from `docs/clip-recorder-equation.md` before its first run, and after the fit it gets the fitted prediction, which a held-out run must meet.
+5. **Every action has an equation with a known result** (owner, 2026-11-22 about 20:38). Before an action runs, its equation and the value it must give are written down (section "Acceptance"). The check script compares the outcome with that value. A quantity with no exact value yet, such as CPU time, gets a prior prediction from `docs/clip-recorder-equation.md` before its first run, and after the fit it gets the fitted prediction, which a held-out run must meet.
 
-## Two ways compared: zstd alone (Z) and zstd then H.264 (D) (owner, 2026-11-22 21:30 and 21:40)
+## Two ways compared: zstd alone (Z) and zstd then H.264 (D) (owner, 2026-11-22 about 20:53 and 20:57)
 
-At 21:30 the owner said: "We said zstd is the only encoder we need." Asked why the built design encodes H.264 after zstd, he was given the logged reasons:
+At about 20:53 the owner said: "We said zstd is the only encoder we need." Asked why the built design encodes H.264 after zstd, he was given the logged reasons:
 1. The 10 % processor limit on the weakest machine. Writing frames with zstd −3 while recording is cheap (1.4 % measured). Encoding H.264 live would pass the limit, so a worker encodes afterwards within what is left (`docs/clip-recorder-equation.md`, t_ready; E3, E10).
 2. Small files (R9). H.264 is lossy and much smaller on changing content: changing text measured 10 to 15 MB per minute (`docs/clip-recorder-equation.md`, section 6). zstd −3 at 1080p measured 8.6 KB per frame for typing, 25 KB for a flash and 123 KB for scrolling (E11), which is about 148 MB per minute for scrolling at 20 new frames per second.
 
-He then decided (21:40) that both ways run on the same corpus and J decides:
+He then decided (about 20:57) that both ways run on the same corpus and J decides:
 - **Z: zstd alone.** The zstd frames are the clip. There is no worker. Every zstd option is tested (factors Z1 to Z7). The coder is lossless, so SSIM-Y = 1, PSNR-Y = ∞ and R = 1 for every option. σ = 1, because σ only protects text from a video encoder's colour loss.
 - **D: zstd, then H.264.** Waiting frames are zstd −3 (E11), and a worker encodes H.264 afterwards. Every H.264 encoder found on this PC is tested (factors D1 to D5). σ as in the product.
 
@@ -134,7 +134,7 @@ D passes O only with q ≥ q_min. Its J uses bytes_D, CPU = a_rt + a_w over the 
 
 Fixed: f = 20; only new frames are stored; repeats are lines in `frames.jsonl`.
 
-Run design (owner decision, 2026-11-22 21:15: every option at every level; the main factors in full, the others one at a time; the equations predict the rest and held-out runs prove it):
+Run design (owner decision, 2026-11-22 about 20:47: every option at every level; the main factors in full, the others one at a time; the equations predict the rest and held-out runs prove it):
 - **Grid A-Z (full):** Z1 × Z2 × F6 × F7 = 33 × 6 × 4 × 6 = 4,752 runs, with independent frames, no dictionary, interleaved layout, nbWorkers 0.
 - **Grid A-D (full):** D1 × D2 × F6 × F7 = 4 × 8 × 4 × 6 = 768 encodes, at τ_f 20, hint on, quality mode.
 - **Grid B (one at a time):** Z3, Z4, Z5, Z6 and Z7, each level, around the Z baseline (L = −3, whole frame); D3, D4 and D5, each level, around the D baseline (E = Intel Quick Sync, q = 70); for every F6 and F7.
@@ -146,7 +146,7 @@ Run design (owner decision, 2026-11-22 21:15: every option at every level; the m
 
 1. **Corpus.**
    - Scenario pages under `scripts/clip-equation/` drive themselves by frame count with fixed seeds, never by input to other apps.
-   - Each is rendered once for 20 s by headless Chrome through the DevTools protocol: virtual time advances 50 ms per instant, and one screenshot is taken at each instant at the window size. No window appears on the owner's screen. A frame equal in every pixel to the previous one is a repeat. (Changed 2026-11-22 21:25: a visible Chrome `--app` window took the keyboard focus, against the owner's window rule, and its title bar made repeated captures differ in 50 of 160 new frames.)
+   - Each is rendered once for 20 s by headless Chrome through the DevTools protocol: virtual time advances 50 ms per instant, and one screenshot is taken at each instant at the window size. No window appears on the owner's screen. A frame equal in every pixel to the previous one is a repeat. (Changed 2026-11-22 20:51: a visible Chrome `--app` window took the keyboard focus, against the owner's window rule, and its title bar made repeated captures differ in 50 of 160 new frames.)
    - The capture path's own costs (c_obs, c_read) come from package 0 and the live tests, not from this corpus.
    - Frames are stored losslessly (zstd −3) with their instants.
 2. **Compress.** One probe subprocess per run reads a corpus folder, decompresses it to raw frames in memory before the timer starts, then compresses with the configuration and writes the clip to a scratch folder. It reports its own CPU time and peak memory, and the bytes.

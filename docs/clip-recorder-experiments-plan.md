@@ -1,6 +1,6 @@
 # Clip recorder: experiment plan — equations for every quantity
 
-Status 2026-11-22 16:51 IST. Branch `feature/clip-capture`. Owner: Adam. Work log: issue #290. Edited in place, no version numbers.
+Status 2026-11-22 20:45 IST: active again on the owner's instruction (20:40), after all code fixes landed. Branch `feature/clip-capture`. Owner: Adam. Work log: issue #290. Edited in place, no version numbers.
 
 ## Goal (owner, 2026-11-22)
 
@@ -90,7 +90,7 @@ Fixed: f = 20; B-frames 0; NV12 input; variable time stamps (only new frames are
 Run design (the full product is 3 × 4 × 11 × 4 × 2 × 4 × 6 × 2 ≈ 25,000 runs, too many for one PC):
 - **Grid A (full):** E × q × c × size at τ_f 20, hint on, latency off: about 4 × 8 × 6 × 4 = 768 encodes per architecture D.
 - **Grid B (one factor at a time)** around the baseline (E = Quick Sync H.264, q = 70, τ_f 20, hint on, 1080p) for F3 β, F4, F5, F8, for every E and c.
-- **Grid C (architecture):** D0, D and L2 at the baseline and at the chosen q of every E, for every c.
+- **Grid C (architecture):** D0, D and L2 at the baseline and at the chosen q of every E, for every c; Z at zstd levels −3, 1, 3 and 9 for every c and every size of F6.
 - Each configuration runs 3 times. Expected machine time: 2 to 3 hours. The runs are headless after the corpus capture.
 
 ## Procedure
@@ -113,6 +113,14 @@ Run design (the full product is 3 × 4 × 11 × 4 × 2 × 4 × 6 × 2 ≈ 25,000
 2. Among the configurations that pass: the **Pareto front** of bytes per minute, CPU time per minute and peak RAM.
 3. **Recommendation:** the front point with the least CPU plus RAM whose bytes are within 10 % of the smallest passing file. The owner sees the whole front and decides. The product changes only after that decision.
 
+## Correcting the building plan from the results
+
+After the owner's decision, `docs/clip-recorder-plan.md` is edited in place:
+- the architecture (D, L2 or Z) and the encoder and its settings that were chosen;
+- every constant of the parameter map that the results set (q, τ_f, β, the hint, the waiting coder level), with the result row it comes from;
+- the equations of this plan with their fitted coefficients replace the estimates in `docs/clip-recorder-equation.md`;
+- the work packages that the change needs, then one verification round (Codex review, one release build, live tests) on the corrected product.
+
 ## Out of scope here
 
-The viewer's change analysis (D5) gets its own equation next. This plan covers the recording and encoding pipeline only.
+The viewer's change analysis (D5) has its own equation in the building plan, section "D5 as an equation". This plan covers the recording and encoding pipeline only.

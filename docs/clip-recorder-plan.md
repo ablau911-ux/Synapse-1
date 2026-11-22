@@ -520,7 +520,8 @@ From the Fable 5.2 logic review and the live tests. Each one is either unverifie
 
 - Last code fixes: the cursor per instant on repeated lines (`7472ea12`), retry on a brief file hold for the waiting-frame rename and the unlocked `clip.json` read (`891c280d`, `7d2cb399`), the worker cap rule in the module doc (`a5e9a801`), recovery keeps the losses named in `frames.jsonl` (`bf5930e1`).
 - D5 rebuilt from the equation (`ea3e8514`) with the proof page (`3077349b`). Two rules added as built, in D5 step 3. The parameter map lists the D5 constants as built.
-- All code fixes are done. Next: the verification round.
+- All code fixes are done.
+- 20:40, owner: the experiments run now (`docs/clip-recorder-experiments-plan.md`): equations for everything, every option, one results table, and this plan corrected from the results. Codex reviews the fixes meanwhile, read-only.
 
 ## Changes on 2026-11-22, 16:30 to 18:00 IST
 

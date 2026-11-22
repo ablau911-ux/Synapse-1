@@ -8,6 +8,23 @@
 
 Feature: One results table with every configuration, J, the Pareto front and the best way
 
+  # Rows of issue #295 (plan "Measurement rules" M10).
+
+  Scenario: #24 best way: fixed cases, computed independently
+    Given fixed sets of kept configurations with J per folder, including unequal folder coverage and a configuration dropped in one folder
+    Then fit/results.mjs and this check's own computation both name the winner worked out by hand
+    # Equation: best = argmin mean J over the folders shared by the configurations never dropped | Known: B, A, A, B, A
+
+  Scenario: #21 best-way equations from the fitted models
+    Given a held-out configuration of a size not in the fit, and the published results file
+    Then its equations come from the fitted model, with numbers and no NaN
+    # Equation: B_min = 60 * n_new * zeta(px0) * (px / px0)^(eta - 1) * px * 3 | Known: the model's value; no NaN or undefined
+
+  Scenario: #20 predicted cells in the results
+    Given the run list named in fit.json
+    Then results/results.csv has the predicted cells of the run list, each with its prediction status
+    # Equation: rows(predicted, per content) = predicted cells * contents | Known: equal; none without a status
+
   Scenario: rows equal configurations
     Given the input CSVs named in fit.json
     Then results/results.csv has one row per configuration found in the CSVs, and the results file's table has the same rows

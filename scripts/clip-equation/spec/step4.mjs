@@ -15,6 +15,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRuns } from './step2d.mjs';
 import { PENDING, relErr, runFeature } from './feature.mjs';
+import { D_BYTES_TRUTH, dBytesConfigs, sizeFixture, targetFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -52,10 +53,24 @@ function mulberry32(seed) {
   };
 }
 
-/** The D hold-out redone here: eligible keys sorted, shuffled by mulberry32, the first share taken. */
+/**
+ * The D configurations whose every repeat succeeded and, on a text scenario, read R (a number, or
+ * n/a on every repeat): plan M10, "a configuration needs all of its repeats to succeed".
+ */
+export function completeD(rows) {
+  const groups = new Map();
+  for (const r of rows) groups.set(keyOf('D', r), [...(groups.get(keyOf('D', r)) ?? []), r]);
+  const text = new Set(CONFIG.text_scenarios);
+  const isNa = (r) => String(r.r ?? '').trim().toLowerCase() === 'n/a';
+  return new Set([...groups].filter(([, rs]) => rs.every((r) => r.status === 'ok')
+    && (!text.has(rs[0].scenario) || rs.every(isNa) || rs.every((r) => r.r !== '' && Number.isFinite(Number(r.r))))).map(([k]) => k));
+}
+
+/** The D hold-out redone here: complete base keys sorted, shuffled by mulberry32, the first share taken. */
 export function drawD(rows) {
   const base = CONFIG.d_base;
-  const eligible = [...new Set(rows.filter((r) => r.status === 'ok' && r.tau_f === base.tau_f && r.hint === base.hint && r.rate === base.rate).map((r) => keyOf('D', r)))].sort();
+  const complete = completeD(rows);
+  const eligible = [...new Set(rows.filter((r) => complete.has(keyOf('D', r)) && r.tau_f === base.tau_f && r.hint === base.hint && r.rate === base.rate).map((r) => keyOf('D', r)))].sort();
   const random = mulberry32(CONFIG.hold_out.seed);
   const shuffled = eligible.map((k) => [random(), k]).sort((a, b) => a[0] - b[0]).map(([, k]) => k);
   return { eligible, held: shuffled.slice(0, Math.round(CONFIG.hold_out.share * eligible.length)) };
@@ -156,6 +171,102 @@ function validation(fit, kind, heldKeys, quantities) {
   return { ok: problems.length === 0, pending, text: `${heldKeys.length} held out; ${within} within, ${notPredictable} not predictable, ${pending} pending${problems.length ? `; misses: ${problems.slice(0, 4).join('; ')}` : ''}` };
 }
 
+/** The rows of issue #295 (#8, #10, #15 to #18, #20, M7), on synthetic fixtures with known results. */
+function findingChecks(F, inputs) {
+  const need = (fn) => () => (F?.buildFitFromRows ? fn() : { value: '-', measured: 'fit.mjs has no buildFitFromRows', pass: false });
+  const noRunlist = { cells: [], contents: [] };
+  const target = () => F.buildFitFromRows({ zRows: [], dRows: targetFixture(), runlist: noRunlist });
+  const cfg = (f, scenario, q) => f.configurations.find((c) => c.kind === 'D' && c.content === scenario && c.options.q === String(q));
+  return {
+    '#8 failed repeats, missing R and refused settings block a configuration': need(() => {
+      const f = target();
+      const bad = [];
+      for (const [s, q, failed] of [['typing', 70, 1], ['scroll', 70, 0], ['ui', 70, 3]]) {
+        const c = cfg(f, s, q);
+        if (!c || c.O !== false || c.in_fit !== false || c.failed_runs !== failed) bad.push(`${s} q${q}: O ${c?.O}, in_fit ${c?.in_fit}, failed_runs ${c?.failed_runs}`);
+      }
+      if (!cfg(f, 'typing', 50)?.O) bad.push('typing q50 not kept');
+      const n = f.failures?.d;
+      if (!n || n.runs_failed !== 4 || n.configs_blocked !== 3) bad.push(`failure counts ${JSON.stringify(n)}`);
+      return { value: 'typing, scroll, ui at q 70 dropped and out of the fit; 4 failed runs, 3 blocked', measured: bad.length ? bad.join('; ') : 'as known', pass: bad.length === 0 };
+    }),
+    '#10 FULL only when the unique keys match both run plans': need(() => {
+      const { zRows, runlist } = sizeFixture();
+      const dRows = targetFixture();
+      const dRunlist = { runs: dRows.map((r) => Object.fromEntries([...CONFIG.d_key_columns, 'repeat'].map((k) => [k, r[k]]))) };
+      const label = (z, d, dl) => F.fitLabel({ pilot: false, zRows: z, dRows: d, runlist, dRunlist: dl }).label;
+      const cases = [
+        ['complete', label(zRows, dRows, dRunlist), true],
+        ['Z duplicate in place of a repeat', label([...zRows.slice(0, -1), { ...zRows[0] }], dRows, dRunlist), false],
+        ['one D run missing', label(zRows, dRows.slice(1), dRunlist), false],
+        ['no D run plan', label(zRows, dRows, null), false],
+      ];
+      const bad = cases.filter(([, got, full]) => full !== (got === 'FULL'));
+      return { value: cases.map(([n, , full]) => `${n}: ${full ? 'FULL' : 'not FULL'}`).join('; '), measured: cases.map(([n, got]) => `${n}: ${got}`).join('; '), pass: bad.length === 0 };
+    }),
+    '#15 a non-text row passes O only where every text scenario passes at its q': need(() => {
+      const f = target();
+      const a = cfg(f, 'flash', 50);
+      const b = cfg(f, 'flash', 60);
+      const say = (c) => (c?.O ? 'kept' : `dropped (${c?.clause})`);
+      return { value: 'flash q50 kept, flash q60 dropped', measured: `flash q50 ${say(a)}; flash q60 ${say(b)}`, pass: a?.O === true && b?.O === false };
+    }),
+    'M7 PSNR is inf at MSE 0': need(() => {
+      const f = target();
+      const a = cfg(f, 'flash', 50);
+      const nums = numbers(f.equations.eq7_d_quality.coefficients);
+      const bad = nums.filter((v) => !Number.isFinite(v)).length;
+      return { value: 'PSNR inf; quality coefficients finite', measured: `flash q50 PSNR ${a?.psnr}; ${nums.length} quality coefficients, ${bad} not finite`, pass: a?.psnr === 'inf' && nums.length > 0 && bad === 0 };
+    }),
+    '#16 held-out rows never change a coefficient': need(() => {
+      if (!inputs.z.length || !inputs.d.length) return { value: '-', measured: 'needs the input CSVs of fit.json', pass: false };
+      const zRows = inputs.z.map((r) => ({ ...r }));
+      const zKey = keyOf('Z', zRows[0]);
+      for (const r of zRows) if (keyOf('Z', r) === zKey) r.held_out = '1';
+      const base = { zRows, dRows: inputs.d.map((r) => ({ ...r })), runlist: noRunlist };
+      const a = F.buildFitFromRows(base);
+      const heldD = new Set(a.validation.d.held_out_keys);
+      const x = (v) => String(Number(v) * 1.7);
+      const b = F.buildFitFromRows({
+        ...base,
+        zRows: zRows.map((r) => (keyOf('Z', r) !== zKey ? r : { ...r, bytes_out: x(r.bytes_out), comp_cpu_ns: x(r.comp_cpu_ns), peak_private: x(r.peak_private), m0_private: x(r.m0_private), known_m_comp: x(r.known_m_comp), dec_cpu_ns: x(r.dec_cpu_ns) })),
+        dRows: base.dRows.map((r) => (!heldD.has(keyOf('D', r)) ? r : { ...r, bytes: x(r.bytes), a_rt_ns: x(r.a_rt_ns), a_w_ns: x(r.a_w_ns), m_live: x(r.m_live), m_worker: x(r.m_worker), ssim_mean: '0.5', psnr_mean: '10', psnr_global: '10', r: r.r === '1' ? '0.5' : '1' })),
+      });
+      const ser = (e) => JSON.stringify(e, (k, v) => (typeof v === 'number' && !Number.isFinite(v) ? String(v) : v));
+      const changed = Object.keys(a.equations).filter((id) => ser(a.equations[id]) !== ser(b.equations[id]));
+      return { value: 'every equation identical', measured: `1 Z and ${heldD.size} D held-out configurations changed; equations changed: ${changed.join(', ') || 'none'}`, pass: heldD.size > 0 && changed.length === 0 };
+    }),
+    '#17 size groups follow the run list cell, not the resolved window': need(() => {
+      const { zRows, runlist } = sizeFixture();
+      const f = F.buildFitFromRows({ zRows, dRows: [], runlist });
+      const rows = f.validation.z.rows.filter((v) => v.quantity === 'bytes');
+      const truth = zBytesPerFrame(1920 * 1080);
+      const ok = rows.length === 1 && Number.isFinite(rows[0].predicted) && relErr(rows[0].predicted, truth) <= CONFIG.self_test_tolerance;
+      return { value: `held-out bytes/frame at 1920x1080 = ${truth.toFixed(1)}`, measured: rows.map((v) => `${v.verdict}, predicted ${v.predicted}`).join('; ') || 'no held-out bytes row', pass: ok };
+    }),
+    '#18 D bytes: P and K apart, predicted with the requested GOP': need(() => {
+      if (!F.fitDBytes) return { value: '-', measured: 'fit.mjs has no fitDBytes', pass: false };
+      const { train, held } = dBytesConfigs();
+      const m = F.fitDBytes(train);
+      const rho = m.coefficients?.K_over_P?.DW1 ?? {};
+      const errs = [...held.map((c) => relErr(m.predict(c), c.truth)), ...Object.entries(D_BYTES_TRUTH.rho).map(([c, v]) => relErr(rho[c], v)), relErr(m.coefficients?.a_E?.DW1, D_BYTES_TRUTH.a)];
+      const w = Math.max(...errs);
+      return { value: 'bytes at tau_f 100 and 200, K/P and a_E within 1e-6', measured: `worst relative error ${w}`, pass: Number.isFinite(w) && w <= CONFIG.self_test_tolerance };
+    }),
+    '#20 predicted cells appear with status and uncertainty': need(() => {
+      const { zRows, runlist } = sizeFixture();
+      const f = F.buildFitFromRows({ zRows, dRows: [], runlist });
+      const rows = f.predicted?.rows ?? [];
+      const want = runlist.cells.filter((c) => c.status === 'predicted').length * runlist.contents.length;
+      const covered = rows.reduce((s, r) => s + (r.content === 'all' ? runlist.contents.length : 1), 0);
+      const r = rows.find((x) => x.cell === 4 && x.content === 'typing');
+      const truth = zBytesPerFrame(506 * 333);
+      const ok = covered === want && r?.status === 'predicted' && relErr(r.bytes_per_frame, truth) <= CONFIG.self_test_tolerance && Number.isFinite(r.bytes_rel_unc);
+      return { value: `${want} cell x content; bytes/frame ${truth.toFixed(1)} with uncertainty`, measured: r ? `${covered} covered; ${r.status}, bytes/frame ${r.bytes_per_frame}, uncertainty ${r.bytes_rel_unc}` : `${covered} covered, no row for cell 4`, pass: ok };
+    }),
+  };
+}
+
 function checks(fit, F, fitError, inputs) {
   const need = (fn) => () => (fit ? fn() : { value: '-', measured: fitError, pass: false });
   const needF = (fn) => () => (F ? fn() : { value: '-', measured: `no fitter: ${fitError}`, pass: false });
@@ -167,12 +278,13 @@ function checks(fit, F, fitError, inputs) {
     return [...g.values()].some((s) => s.size >= 2);
   };
   const dPxCount = () => new Set(inFit('D').map((c) => c.px)).size;
-  const tauSweep = () => {
+  const tauSweep = (encoder) => {
     const g = new Map();
-    for (const c of inFit('D')) { const k = `${c.options.encoder}|${c.folder}|${c.options.q}`; g.set(k, (g.get(k) ?? new Set()).add(c.options.tau_f)); }
+    for (const c of inFit('D').filter((x) => x.options.encoder === encoder && x.options.hint === CONFIG.d_base.hint && x.options.rate === CONFIG.d_base.rate)) { const k = `${c.options.encoder}|${c.folder}|${c.options.q}`; g.set(k, (g.get(k) ?? new Set()).add(c.options.tau_f)); }
     return [...g.values()].some((s) => s.size >= 2);
   };
   return {
+    ...findingChecks(F, inputs),
     'fitter self-test: power law in px': needF(() => t.power()),
     'fitter self-test: px-linear CPU': needF(() => t.cpu()),
     'fitter self-test: D curves': needF(() => t.d()),
@@ -207,14 +319,16 @@ function checks(fit, F, fitError, inputs) {
       const err = relErr(e.coefficients.T_measured_h, e.coefficients.T_total_h);
       return { value: `T_total ${e.coefficients.T_total_h.toFixed(2)} h`, measured: `wall ${e.coefficients.T_measured_h.toFixed(2)} h (${(100 * err).toFixed(1)} %)`, pass: err <= CONFIG.run_time_tolerance };
     }),
-    'eq 7 D bytes': need(() => equation(fit, 'eq7_d_bytes', (p) => p === 'K/P' && !tauSweep())),
+    'eq 7 D bytes': need(() => equation(fit, 'eq7_d_bytes', (p) => /^K\/P \((.+)\)$/.test(p) && !tauSweep(/^K\/P \((.+)\)$/.exec(p)[1]))),
     'eq 7 D quality': need(() => equation(fit, 'eq7_d_quality', () => false)),
     'eq 7 D q_min': need(() => {
       const e = fit.equations?.eq7_d_qmin;
       if (!e) return { value: '-', measured: 'no eq7_d_qmin in fit.json', pass: false };
       const text = new Set(CONFIG.text_scenarios);
       const groups = new Map();
-      for (const r of inputs.d.filter((x) => x.status === 'ok' && text.has(x.scenario))) {
+      const complete = completeD(inputs.d);
+      const held = new Set(drawD(inputs.d).held);
+      for (const r of inputs.d.filter((x) => complete.has(keyOf('D', x)) && !held.has(keyOf('D', x)) && text.has(x.scenario) && String(x.r).toLowerCase() !== 'n/a')) {
         const g = `${r.encoder} ${sizeOf(r.folder)} tau${r.tau_f} hint${r.hint} ${r.rate} beta${r.beta}`;
         const byQ = groups.get(g) ?? new Map();
         const cell = byQ.get(r.q) ?? new Map();

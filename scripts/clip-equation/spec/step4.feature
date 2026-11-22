@@ -7,6 +7,48 @@
 
 Feature: Every equation of the plan is fitted, and the held-out runs are predicted
 
+  # Rows of issue #295 (plan "Measurement rules" M5, M7, M10), on synthetic fixtures in spec/step4.fixtures.mjs.
+
+  Scenario: #8 failed repeats, missing R and refused settings block a configuration
+    Given D configurations with one failed repeat, one repeat without R and one refused setting (status setting_refused:q)
+    Then each is dropped and out of the fit, and the failure counts are kept
+    # Equation: eligible = every repeat ok and R read on every repeat of a text scenario | Known: 3 dropped, 4 failed runs, 3 blocked configurations
+
+  Scenario: #10 FULL only when the unique keys match both run plans
+    Given a Z run list and a D run plan with fixture rows: complete, a duplicate in place of a repeat, one D run missing, no D plan
+    Then only the complete case is labeled FULL
+    # Equation: FULL = (unique Z keys = planned Z keys) and (unique D keys = planned D keys) | Known: FULL, not, not, not
+
+  Scenario: #15 a non-text row passes O only where every text scenario passes at its q
+    Given text scenarios with R = 1 at q 50 and typing R = 0.9 at q 60
+    Then flash at q 50 is kept and flash at q 60 is dropped, whatever q_min is
+    # Equation: O(non-text, E, q) = every text scenario at the same E, size and q has R = 1 | Known: kept, dropped
+
+  Scenario: M7 PSNR is inf at MSE 0
+    Given D rows that report PSNR inf and MSE 0
+    Then the configuration's PSNR is inf and every quality coefficient is finite
+    # Equation: PSNR = 10 * log10(255^2 / MSE), inf at MSE = 0 | Known: inf; 0 coefficients not finite
+
+  Scenario: #16 held-out rows never change a coefficient
+    Given the input CSVs, fitted twice: once as they are, once with every held-out row's measurements changed
+    Then every equation (coefficients, residuals, q_min) is the same
+    # Equation: coefficients = f(training rows only) | Known: identical
+
+  Scenario: #17 size groups follow the run list cell, not the resolved window
+    Given ZW12 (prefix, window resolved from the frame size) at 640x360 and 1280x720 in the fit and 1920x1080 held out
+    Then the held-out bytes are predicted from the fitted intercept
+    # Equation: zeta(px) = zeta(px0) * (px / px0)^(eta - 1), one group per run list cell | Known: exact within 1e-6
+
+  Scenario: #18 D bytes: P and K apart, predicted with the requested GOP
+    Given D configurations made exactly from P = p * px * exp(a q), K = rho * P, with a GOP sweep at q 70 and hint-off rows
+    Then K/P and a_E are recovered and held-out configurations at tau_f 100 and 200 are predicted
+    # Equation: bytes = (n - n_key) * P + n_key * K, n_key = ceil(n / tau_f) | Known: within 1e-6
+
+  Scenario: #20 predicted cells appear with status and uncertainty
+    Given a run list cell marked predicted
+    Then the fit has a row for it per content with its prediction status, predicted values and uncertainty
+    # Equation: rows(predicted) = predicted cells * contents | Known: equal; bytes/frame exact within 1e-6
+
   Scenario: fitter self-test: power law in px
     Given data made exactly from ln zeta = ln zeta_0(g) + (eta - 1) * ln(px / px0) with known zeta_0 and eta
     Then the fitter returns those coefficients

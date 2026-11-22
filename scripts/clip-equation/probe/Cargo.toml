@@ -23,10 +23,18 @@ miniz_oxide = "0.9.1"
 png = "0.18.1"
 qoi = "0.4.1"
 snap = "1.1.2"
+# exp-d: the copied product encoder and decoder log through `tracing`.
+tracing = "0.1"
 
 [dependencies.windows]
 version = "=0.62.2"
 features = [
+    # exp-d: R by Windows.Media.Ocr on decoded and source frames.
+    "Foundation",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -37,6 +45,8 @@ features = [
     "Win32_Media_MediaFoundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    # exp-d: the copied clip decoder seeks with a PROPVARIANT.
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
     "Win32_System_Ole",
     "Win32_System_Performance",

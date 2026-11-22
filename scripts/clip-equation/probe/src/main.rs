@@ -27,6 +27,9 @@ mod delivery;
 mod disk;
 mod encoder;
 mod exp_corpus;
+mod exp_d;
+#[allow(dead_code)]
+mod exp_settings;
 mod exp_encoders;
 #[allow(dead_code)]
 mod exp_meter;
@@ -79,6 +82,7 @@ fn main() {
         "exp-encoders" => exp_encoders::run(),
         "exp-corpus" => exp_corpus::run(),
         "exp-z" => exp_z::run(),
+        "exp-d" => exp_d::run(),
         "exp-rate" => exp_meter::run_rate(),
         _ => Err(format!(
             "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus or exp-z"

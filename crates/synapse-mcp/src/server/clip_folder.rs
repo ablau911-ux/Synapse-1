@@ -676,6 +676,16 @@ impl ClipJson {
     }
 }
 
+/// Opens a lock file for writing: creates it when missing and never
+/// truncates it, so the lock can be taken on it.
+pub(super) fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+}
+
 /// An exclusive lock on `<file>.lock`, held across one read-modify-write.
 struct FolderLock {
     file: std::fs::File,
@@ -688,11 +698,7 @@ impl FolderLock {
     }
 
     fn on(path: &Path) -> Result<Self, String> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
+        let file = open_lock_file(path)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
         file.lock_exclusive()
             .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
@@ -741,11 +747,7 @@ impl RecorderLock {
     /// Takes the lock of a new clip folder.
     pub(super) fn acquire(folder: &Path) -> Result<Self, String> {
         let path = folder.join(RECORDER_LOCK_FILE);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
+        let file = open_lock_file(&path)
             .map_err(|error| format!("could not open {}: {error}", path.display()))?;
         file.try_lock_exclusive()
             .map_err(|error| format!("could not lock {}: {error}", path.display()))?;

@@ -260,12 +260,7 @@ pub(crate) fn run_clip_worker_from_cli(folder: &Path) -> u8 {
     use fs2::FileExt as _;
 
     let lock_path = folder.join(WORKER_LOCK_FILE);
-    let Ok(lock) = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-    else {
+    let Ok(lock) = super::clip_folder::open_lock_file(&lock_path) else {
         return EXIT_FAILED;
     };
     if lock.try_lock_exclusive().is_err() {

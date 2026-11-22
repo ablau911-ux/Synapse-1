@@ -17187,8 +17187,8 @@ fn validate_screenshot_file_facade_params(params: &ScreenshotParams) -> Result<(
     Ok(())
 }
 
-/// `record` takes `window_hwnd` or `monitor_index`, `duration_ms`, `fps` and
-/// `folder`; returns them bounds-checked.
+/// `record` takes `window_hwnd` or `monitor_index`, `duration_ms` and
+/// `folder`; it rejects `fps` (the rate is fixed); returns them bounds-checked.
 fn validate_screenshot_record_facade_params(
     params: ScreenshotParams,
 ) -> Result<CaptureClipParams, ErrorData> {

@@ -554,7 +554,7 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     // 5 and 6. Decode, frame mapping by time (M6), quality, R and flashes.
     let sampler = MemorySampler::start();
     let regions = TextRegion::parse(args.text_or("regions", ""))?;
-    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions)?;
+    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions, args.flag("ocr_fail", false))?;
     quality.put(out);
     let status = if !used_matches {
         "wrong_encoder".to_owned()
@@ -975,6 +975,7 @@ fn measure_quality(
     sampler: &MemorySampler,
     rate: f64,
     regions: &[TextRegion],
+    inject_ocr_failure: bool,
 ) -> Result<Quality> {
     let n = folder.new_frames.len();
     let mut quality = Quality { rate, n_new: n, ..Quality::default() };
@@ -1050,7 +1051,9 @@ fn measure_quality(
     quality.r_regions = if text { regions.len() } else { 0 };
     if text && !regions.is_empty() {
         let wall = Instant::now();
-        match ocr_share(folder, &ocr_decoded, regions) {
+        // `ocr_fail=1`: the step2d check of the error path makes OCR fail on purpose.
+        let read = if inject_ocr_failure { Err("injected OCR failure (ocr_fail=1)".to_owned()) } else { ocr_share(folder, &ocr_decoded, regions) };
+        match read {
             Ok((r, chars, note)) => {
                 quality.r = r;
                 quality.r_source_chars = chars;

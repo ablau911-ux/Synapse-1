@@ -1228,6 +1228,8 @@ pub fn run() -> Result<()> {
     let clip_bytes = write.time(|| files.finish(&clip_json))?;
     let t_ready_ns = wall_ns().saturating_sub(last_comp_end);
     let wall_comp_total = wall_ns().saturating_sub(wall_start);
+    // Memory samplers that ran during the measured work (M2, M3: none, as in way D).
+    let samplers_in_work = crate::exp_meter::samplers_running();
     let ram_read = ram.read();
     let (peak_ws, peak_sampled) = sampler.take_peaks();
     let os_ws = os_peak_working_set();
@@ -1280,7 +1282,7 @@ pub fn run() -> Result<()> {
     println!(
         "{{\"folder\":\"{folder_name}\",{},\"rep\":{rep},\"w\":{w},\"h\":{h},\"n_new\":{},\"d_wait\":{},\"frames\":{},\"bytes_out\":{bytes_out},\"bytes_disk\":{bytes_disk},\"bytes_per_frame\":{},{},\
 \"input\":\"bgra\",{},{},{},{},{},{},\"comp_cpu_per_frame_ns\":{},\"way_cpu_per_frame_ns\":{},\"comp_wall_total_ns\":{wall_comp_total},\"dict_bytes\":{},{},\
-{},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"peak_private_sampled\":{peak_sampled},\"b_max\":{b_max},\"peak_ws\":{peak_ws},\"os_peak_ws\":{os_ws},\
+{},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"peak_private_sampled\":{peak_sampled},\"samplers_in_work\":{samplers_in_work},\"b_max\":{b_max},\"peak_ws\":{peak_ws},\"os_peak_ws\":{os_ws},\
 \"m_cctx_est\":{},\"cctx_sizeof\":{cctx_sizeof},\"bc\":{bc},\"m_dctx_est\":{},\"dctx_sizeof\":{dctx_sizeof},\"bd\":{bd},\"ldm_read\":{ldm_read},\"rect_src_bytes\":{rect_src},\"rect_listed_bytes\":{rect_listed},\"rects_max\":{rects_max},\
 {},{},{},\"dec_cpu_per_frame_ns\":{},\"dec_peak_private\":{dec_peak_private},\"dec_peak_ws\":{dec_peak_ws},\
 \"frames_decoded\":{decoded},\"diff_sum\":{diff_sum},\"diff_frames\":{diff_frames},\"n_dec_worst\":{n_dec_worst},\"t_ready_ns\":{t_ready_ns}}}",

@@ -92,6 +92,23 @@ Feature: Way D encodes every new frame of the corpus with every H.264 encoder
     Then it holds grid A-D and the D part of grid B with every key resolved, and no key twice
     # Equation: runs = count(plan A) + count(plan B) = 2808; unique keys = runs | Known: exact (M9)
 
+  # Round 2 of #295 (Codex re-review at cfe995d4): H3, H4, M3.
+
+  Scenario: D: worker M_0 is input only
+    Given finished runs of one folder with a hardware and a software encoder
+    Then the worker's M_0 is the same within 2 MB, because the device manager and every encoder setup are created inside the measured work
+    # Equation: max - min of worker_m0_private per folder <= 2 MB | Known: every folder (M2, M3, H3)
+
+  Scenario: D: an OCR failure is not R n/a
+    Given a run whose OCR fails (ocr_fail=1 makes it fail on purpose)
+    Then its status is ocr_error and R is not n/a; n/a stays for OCR that read no source text
+    # Equation: OCR error implies status = ocr_error and r != n/a | Known: the injected run and every row (M7, H4)
+
+  Scenario: D: run list identity
+    Given results/d-runlist.json and the plan of run-d.mjs
+    Then the list's id is the hash of its runs, equals the id of the plan regenerated now, and every full-run row names it
+    # Equation: list_id = hash(runs) = hash(plan now); row.list_id = list_id | Known: exact (M9, M3 of the re-review)
+
   Scenario: D: bytes against the prior
     Given a finished run in quality mode
     Then its bytes per minute are printed beside the prior and the error

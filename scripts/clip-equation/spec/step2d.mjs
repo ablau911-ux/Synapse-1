@@ -9,6 +9,7 @@
 // CPU and RAM have only a prior before the fit: they print the error and are PENDING,
 // which is neither a pass nor a miss.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -80,6 +81,32 @@ function readRunList() {
 }
 
 const label = (r) => `${r.folder} ${r.encoder} q${r.q_req ?? r.q}`;
+
+// The runner, for its run list identity (loaded here so a missing export is a failed row, not a crash).
+const runD = await import('../runs/run-d.mjs').catch((e) => ({ loadError: e.message }));
+// H3: the worker's M_0 holds only its input, so encoders differ by noise only.
+const M0_SPREAD_BYTES = 2e6;
+const OCR_FOLDER = 'typing-640x360';
+
+/** One D run (live, then worker) on typing at 640 x 360 with the software encoder and OCR made to fail. */
+function injectedOcrRun(root) {
+  if (!fs.existsSync(PROBE)) return { status: 'no probe', error: PROBE };
+  const rate = /rate=\d+/.exec(spawnSync(PROBE, ['exp-rate'], { encoding: 'utf8', windowsHide: true }).stdout || '')?.[0] ?? 'rate=0';
+  const scratch = path.join(os.tmpdir(), `clip-exp-d-ocr-${process.pid}`);
+  const regions = (CORPUS.text_regions?.typing ?? []).map((g) => [g.left, g.top, g.right, g.bottom, g.max_width ?? 0, g.max_height ?? 0, g.max_width_fraction ?? 0].join(':')).join(';');
+  const common = [`folder=${path.join(root, OCR_FOLDER)}`, 'encoder=DW2', 'name=', 'vendor=', 'hw=0', 'q=70', 'gop=20', 'hint=1', 'ratemode=quality',
+    'beta=0.1', `scratch=${scratch}`, 'repeat=1', rate, `regions=${regions}`, 'ocr_fail=1'];
+  const json = (argv) => {
+    const line = (spawnSync(PROBE, argv, { encoding: 'utf8', windowsHide: true }).stdout || '').split(/\r?\n/).find((l) => l.startsWith('{'));
+    return line ? JSON.parse(line) : { status: 'no JSON' };
+  };
+  try {
+    const live = json(['exp-d', 'phase=live', ...common]);
+    return live.status === 'ok' ? json(['exp-d', 'phase=worker', ...common]) : live;
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
 
 /** The scenarios of the feature file with their equation and known result. */
 function readScenarios() {
@@ -238,6 +265,36 @@ function checks(rows, root) {
       const unresolved = (list.runs ?? []).filter((r) => D_KEY.some((k) => r[k] === undefined || r[k] === null || r[k] === '')).length;
       const unique = new Set(keys).size;
       return { value: `${EXPECTED_RUNS} unique`, measured: `${keys.length} runs, ${unique} unique, ${unresolved} with an unresolved key`, pass: keys.length === EXPECTED_RUNS && unique === keys.length && unresolved === 0 };
+    },
+    'D: worker M_0 is input only': needRows(() => {
+      const byFolder = new Map();
+      for (const r of rows.filter((x) => x.worker_m0_private)) {
+        if (!byFolder.has(r.folder)) byFolder.set(r.folder, { hw: false, sw: false, m0: [] });
+        const f = byFolder.get(r.folder);
+        f.m0.push(num(r.worker_m0_private));
+        if (r.hardware_used === '1') f.hw = true; else f.sw = true;
+      }
+      const both = [...byFolder].filter(([, f]) => f.hw && f.sw);
+      const spread = (f) => Math.max(...f.m0) - Math.min(...f.m0);
+      const bad = both.filter(([, f]) => spread(f) > M0_SPREAD_BYTES).map(([name, f]) => `${name}: ${(Math.min(...f.m0) / 1e6).toFixed(1)} to ${(Math.max(...f.m0) / 1e6).toFixed(1)} MB`);
+      const lines = both.map(([name, f]) => `${name} ${(spread(f) / 1e6).toFixed(2)} MB`);
+      return { value: `spread <= ${M0_SPREAD_BYTES / 1e6} MB`, measured: `${both.length - bad.length}/${both.length} folders (${lines.join('; ')})${misses(bad)}`, pass: both.length > 0 && bad.length === 0 };
+    }),
+    'D: an OCR failure is not R n/a': () => {
+      const bad = rows.filter((r) => String(r.r_note ?? '').startsWith('OCR failed') && !(r.status === 'ocr_error' && r.r !== 'n/a')).map((r) => `${label(r)}: ${r.status}, r ${r.r}`);
+      const injected = injectedOcrRun(root);
+      const ok = injected.status === 'ocr_error' && injected.r !== undefined && injected.r !== 'n/a';
+      return { value: 'ocr_error; r not n/a', measured: `injected run: status ${injected.status}, r ${injected.r}${injected.error ? ` (${String(injected.error).slice(0, 80)})` : ''}; ${rows.length - bad.length}/${rows.length} rows${misses(bad)}`, pass: ok && bad.length === 0 };
+    },
+    'D: run list identity': () => {
+      const list = readRunList();
+      if (!list) return { value: 'list_id', measured: `no ${RUNLIST}`, pass: false };
+      if (typeof runD.runListIdentity !== 'function') return { value: 'list_id', measured: `run-d.mjs has no run list identity${runD.loadError ? ` (${runD.loadError})` : ''}`, pass: false };
+      const own = runD.runListIdentity(list);
+      const plan = runD.planIdentity(list.repeats ?? 3);
+      const full = rows.filter((r) => r.grid && r.grid !== 'pilot');
+      const bad = full.filter((r) => r.list_id !== list.list_id).map((r) => `${label(r)}: ${r.list_id || 'no list_id'}`);
+      return { value: `list_id ${own}`, measured: `file ${list.list_id ?? 'none'}, plan now ${plan}, ${full.length - bad.length}/${full.length} full-run rows${misses(bad)}`, pass: list.list_id === own && own === plan && bad.length === 0 };
     },
     'D: bytes against the prior': needRows(() => {
       const runs = okRows(rows).filter((r) => r.rate === 'quality' && r.repeat === '1');

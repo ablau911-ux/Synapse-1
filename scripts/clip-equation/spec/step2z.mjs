@@ -9,7 +9,9 @@
 // when any check misses. CPU and run time need the fit and the full run: they are
 // printed as PENDING and do not pass.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as runner from '../runs/run-z.mjs';
 
@@ -216,6 +218,42 @@ export function runnerChecks(rows, s) {
 
 export { CorpusFolder };
 
+const PROBE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'probe', 'target', 'release', 'clip-probe.exe');
+
+/** One small Z run (ZW1, L = -3, 20 frames of typing at 640 x 360) by the probe itself; its JSON line. */
+function smallZRun(corpusRoot) {
+  if (!fs.existsSync(PROBE)) return { error: `no probe at ${PROBE}` };
+  const rate = /rate=\d+/.exec(spawnSync(PROBE, ['exp-rate'], { encoding: 'utf8', windowsHide: true }).stdout || '')?.[0] ?? 'rate=0';
+  const out = path.join(os.tmpdir(), `clip-exp-z-check-${process.pid}`);
+  try {
+    const res = spawnSync(PROBE, ['exp-z', `folder=${path.join(corpusRoot, 'typing-640x360')}`, `out=${out}`, rate, 'way=ZW1', 'level=-3', 'rep=1', 'frames=20'], { encoding: 'utf8', windowsHide: true });
+    const line = (res.stdout || '').split(/\r?\n/).find((l) => l.startsWith('{'));
+    return line ? JSON.parse(line) : { error: `no JSON, exit ${res.status}` };
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+}
+
+/** Round 2 of #295 (Codex re-review at cfe995d4): M6 no sampler thread in Z's measured work; M3 run list identity. */
+function roundTwoChecks(rows, s, corpusRoot) {
+  const small = smallZRun(corpusRoot);
+  s.samplerFree.check({ folder: 'typing-640x360', way: 'ZW1', level: -3, mode: 'whole', layout: 'bgr', rep: 1 }, '0 samplers',
+    small.error ?? `${small.samplers_in_work ?? 'not reported'} samplers, way_cpu_ns ${small.way_cpu_ns}`, small.samplers_in_work === 0);
+  for (const r of rows.filter((x) => x.samplers_in_work !== undefined && x.samplers_in_work !== '')) s.samplerFree.check(r, '0 samplers', r.samplers_in_work, r.samplers_in_work === '0');
+  if (typeof runner.runListIdentity !== 'function') {
+    s.listId.check({ folder: 'z-runlist.json' }, 'list_id', 'run-z.mjs has no run list identity', false);
+    return;
+  }
+  const list = JSON.parse(fs.readFileSync(runner.RUNLIST, 'utf8'));
+  const own = runner.runListIdentity(list);
+  const preflight = runner.preflightRunList({ write: false });
+  s.listId.check({ folder: 'z-runlist.json' }, `list_id ${own}; plan now ${preflight.planId}`, `file ${list.list_id ?? 'none'}${preflight.mismatches.length ? `; differs: ${preflight.mismatches.join(', ')}` : ''}`,
+    list.list_id === own && own === preflight.planId && preflight.mismatches.length === 0);
+  const full = rows.filter((r) => r.cell);
+  const bad = full.filter((r) => r.list_id !== list.list_id);
+  if (full.length) s.listId.check({ folder: 'CSV' }, `${full.length} full-run rows name ${list.list_id}`, `${full.length - bad.length} do`, bad.length === 0);
+}
+
 /** One Gherkin scenario: its equation and a check per row. */
 class Scenario {
   constructor(name, equation) {
@@ -292,6 +330,8 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     ramDict: new Scenario('RAM with a trained dictionary', 'M_comp(ZW16) = M_0 + M_cctx + B_c · px · 3 + μ · S_samples (μ fitted), S_samples = N_train · px · 3'),
     dctx: new Scenario('decoder context', 'M_dctx (zstd estimate; one stream with K_z = 1: ZSTD_estimateDCtxSize, single pass) = ZSTD_sizeof_DCtx after the last frame'),
     ready: new Scenario('time until ready', `t_ready = t_close <= ${INSTANT_MS} ms`),
+    samplerFree: new Scenario('no memory sampler in the measured work', 'memory samplers running during the way\'s measured work = 0 (RAM is the OS peak; CPU measured as in way D)'),
+    listId: new Scenario('run list identity', 'z-runlist.json list_id = hash of its plan = hash of the plan rebuilt now (budget, factors, hold-out seed); every full-run row names it'),
   };
   s.cpu.pending = 'needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only';
   s.runtime.pending = 'needs the full run; z-pilot.md gives T';
@@ -331,6 +371,7 @@ export function run(argv = process.argv.slice(2), out = console.log) {
   } catch (e) {
     s.resume.check({ folder: 'runner' }, 'the runner\'s plan and keys', `error: ${e.message}`, false);
   }
+  roundTwoChecks(rows, s, corpusRoot);
 
   for (const scenario of Object.values(s)) scenario.print(out);
   const failed = Object.values(s).filter((x) => x.counted && !x.ok).length;

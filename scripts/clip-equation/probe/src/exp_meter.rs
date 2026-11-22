@@ -126,6 +126,14 @@ pub fn wall_ns() -> u64 {
     u64::try_from(clock::now_hns()).unwrap_or(0) * 100
 }
 
+/// Memory samplers running now in this process (checks M2/M3: none may run during a way's measured work).
+static SAMPLERS_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many `MemorySampler` threads run now.
+pub fn samplers_running() -> usize {
+    SAMPLERS_RUNNING.load(Ordering::Relaxed)
+}
+
 /// Samples the memory of this process every 50 ms on its own thread; the
 /// peaks since the last `take_peaks` are kept.
 pub struct MemorySampler {
@@ -141,6 +149,7 @@ impl MemorySampler {
         let peak_ws = Arc::new(AtomicU64::new(0));
         let peak_private = Arc::new(AtomicU64::new(0));
         let (s, w, p) = (stop.clone(), peak_ws.clone(), peak_private.clone());
+        SAMPLERS_RUNNING.fetch_add(1, Ordering::Relaxed);
         let thread = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
                 let (ws, private) = memory_now();
@@ -174,6 +183,7 @@ impl Drop for MemorySampler {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+            SAMPLERS_RUNNING.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

@@ -1135,7 +1135,7 @@ mod live {
                 new: false,
                 width: 0,
                 height: 0,
-                cursor: None,
+                cursor: self.cursor_now(),
                 composed_hns: None,
                 lost: None,
                 minimized: false,
@@ -1146,23 +1146,33 @@ mod live {
             FrameLine {
                 width: frame.width,
                 height: frame.height,
-                cursor: self.cursor(frame),
                 composed_hns: Some(frame.composed_hns),
                 ..self.blank_line(k)
             }
         }
 
+        /// A new frame logs the cursor the observer read with it (C15), so
+        /// the position belongs to that composition.
         fn new_line(&self, k: u64, frame: &ObservedFrame) -> FrameLine {
             FrameLine {
                 new: true,
+                cursor: frame.cursor.and_then(|at| self.in_frame_pixels(at)),
                 ..self.repeat_line(k, frame)
             }
         }
 
-        /// The cursor in frame pixels (E9: logged, not drawn), at the position
-        /// the observer read with the frame (C15).
-        fn cursor(&self, frame: &ObservedFrame) -> Option<[i32; 2]> {
-            let (x, y) = frame.cursor?;
+        /// The cursor in frame pixels when the instant is handled (E9: logged
+        /// per instant, not drawn), for repeated lines and lines without a frame.
+        fn cursor_now(&self) -> Option<[i32; 2]> {
+            let mut point = windows::Win32::Foundation::POINT::default();
+            // SAFETY: one out-parameter.
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut point) }
+                .ok()?;
+            self.in_frame_pixels((point.x, point.y))
+        }
+
+        /// A screen position in frame pixels.
+        fn in_frame_pixels(&self, (x, y): (i32, i32)) -> Option<[i32; 2]> {
             let (left, top) = self.plan.target.origin()?;
             Some([x - left, y - top])
         }

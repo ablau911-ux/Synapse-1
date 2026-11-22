@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use synapse_core::Rect;
-use windows::Win32::Foundation::{FILETIME, RECT};
+use windows::Win32::Foundation::{FILETIME, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
@@ -43,6 +43,7 @@ use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::{Interface as _, w};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -158,6 +159,10 @@ pub struct ObservedFrame {
     pub width: u32,
     pub height: u32,
     pub dirty: Option<Rect>,
+    /// The cursor's screen position, read when the handler took the frame,
+    /// so a logged position belongs to this composition (E9, C15); `None`
+    /// when Windows does not report it.
+    pub cursor: Option<(i32, i32)>,
 }
 
 /// One frame read back to the processor: tightly packed BGRA rows.
@@ -195,6 +200,15 @@ pub fn current_thread_cpu_hns() -> i64 {
         return 0;
     }
     filetime_hns(kernel).saturating_add(filetime_hns(user))
+}
+
+/// The cursor's screen position; `None` when Windows does not report it
+/// (for example while the secure desktop shows).
+fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    // SAFETY: one out-parameter.
+    unsafe { GetCursorPos(&raw mut point) }.ok()?;
+    Some((point.x, point.y))
 }
 
 fn filetime_hns(time: FILETIME) -> i64 {
@@ -540,6 +554,7 @@ impl GraphicsCaptureApiHandler for ClipFrameHandler {
             } else {
                 None
             },
+            cursor: cursor_position(),
         };
         {
             // The table stays locked while the copy is issued, so the reader

@@ -1120,7 +1120,7 @@ mod live {
                 new: false,
                 width: 0,
                 height: 0,
-                cursor: self.cursor(),
+                cursor: None,
                 composed_hns: None,
                 lost: None,
                 minimized: false,
@@ -1131,6 +1131,7 @@ mod live {
             FrameLine {
                 width: frame.width,
                 height: frame.height,
+                cursor: self.cursor(frame),
                 composed_hns: Some(frame.composed_hns),
                 ..self.blank_line(k)
             }
@@ -1143,14 +1144,12 @@ mod live {
             }
         }
 
-        /// The cursor in frame pixels (E9: logged, not drawn).
-        fn cursor(&self) -> Option<[i32; 2]> {
-            let mut point = windows::Win32::Foundation::POINT::default();
-            // SAFETY: one out-parameter.
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut point) }
-                .ok()?;
+        /// The cursor in frame pixels (E9: logged, not drawn), at the position
+        /// the observer read with the frame (C15).
+        fn cursor(&self, frame: &ObservedFrame) -> Option<[i32; 2]> {
+            let (x, y) = frame.cursor?;
             let (left, top) = self.plan.target.origin()?;
-            Some([point.x - left, point.y - top])
+            Some([x - left, y - top])
         }
 
         fn write_line(&mut self, line: &FrameLine) -> Result<(), String> {

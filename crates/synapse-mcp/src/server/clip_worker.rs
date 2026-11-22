@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::clip_folder::{
-    ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, RecorderLock, StopReason,
-    raw_frame_path, read_frame_lines,
+    BReport, ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, RecorderLock,
+    StopReason, raw_frame_path, read_frame_lines,
 };
 
 /// U_max: the recorder never uses more than this share of the processor time
@@ -897,60 +897,14 @@ impl WorkerRun {
     /// Condition B: the live share, the worker cap and the worker's share
     /// against 10 % in every second, and the time until ready.
     fn report_b(&self, folder: &Path) {
-        let worker_share = self.max_worker_share;
-        let max_sum = self.max_sum;
-        let over = self.seconds_over_limit;
-        let seconds = self.started.elapsed().as_secs_f64();
-        let _ = ClipJson::update(folder, |clip| {
-            let mut b = clip.conditions.b.take().unwrap_or_default();
-            let live_held = b.status != "not_held";
-            let mut detail = b
-                .detail
-                .take()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default();
-            let live_measured = detail.contains_key("max_live_share_percent");
-            let previous_over = detail
-                .get("seconds_over_limit")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            // A clip can take several worker runs (a crash re-queues it): the
-            // maxima and the worker time cover all of them.
-            let previous = |key: &str| {
-                detail
-                    .get(key)
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0)
-            };
-            let worker_share = worker_share.max(previous("max_worker_share_percent"));
-            let max_sum = max_sum.max(previous("max_sum_percent"));
-            let seconds = seconds + previous("worker_seconds");
-            detail.insert(
-                "max_worker_share_percent".to_owned(),
-                serde_json::json!(worker_share),
-            );
-            detail.insert("max_sum_percent".to_owned(), serde_json::json!(max_sum));
-            detail.insert(
-                "seconds_over_limit".to_owned(),
-                serde_json::json!(previous_over + over),
-            );
-            detail.insert("worker_seconds".to_owned(), serde_json::json!(seconds));
-            detail.insert(
-                "limit_percent".to_owned(),
-                serde_json::json!(CPU_LIMIT_PERCENT),
-            );
-            b.status = if !live_held || previous_over + over > 0 {
-                "not_held".to_owned()
-            } else if live_measured {
-                "held".to_owned()
-            } else {
-                // No live figure (the service ended during the recording):
-                // the sum cannot be shown to stay within the limit.
-                "unverified".to_owned()
-            };
-            b.detail = Some(serde_json::Value::Object(detail));
-            clip.conditions.b = Some(b);
-        });
+        let report = BReport::Worker {
+            max_worker_share_percent: self.max_worker_share,
+            max_sum_percent: self.max_sum,
+            seconds_over_limit: self.seconds_over_limit,
+            worker_seconds: self.started.elapsed().as_secs_f64(),
+            limit_percent: CPU_LIMIT_PERCENT,
+        };
+        let _ = ClipJson::update(folder, |clip| clip.conditions.merge_b(report));
     }
 }
 

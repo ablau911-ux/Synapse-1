@@ -614,7 +614,7 @@ mod live {
 
     use super::super::clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME;
     use super::super::clip_folder::{
-        CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
+        BReport, CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
         ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
         ObserverGrant, RecorderLock, StopReason, WAITING_DIR, WaitingFrameWriter,
     };
@@ -1258,20 +1258,7 @@ mod live {
                     })),
                 }),
                 q: None,
-                b: Some(ConditionStatus {
-                    status: if self.meter.seconds_over_limit == 0 {
-                        "pending_worker".to_owned()
-                    } else {
-                        "not_held".to_owned()
-                    },
-                    failed_instants: Vec::new(),
-                    detail: Some(serde_json::json!({
-                        "threads": self.machine.threads,
-                        "max_live_share_percent": self.meter.max_share,
-                        "max_worker_cap_given_percent": self.meter.max_worker_cap_given,
-                        "live_seconds_at_limit": self.meter.seconds_over_limit,
-                    })),
-                }),
+                b: None,
                 t: Some(ConditionStatus {
                     status: held(failed.is_empty()),
                     failed_instants: failed,
@@ -1284,6 +1271,12 @@ mod live {
                 }),
             };
             let lost = std::mem::take(&mut self.lost);
+            let live_b = BReport::Live {
+                threads: self.machine.threads,
+                max_live_share_percent: self.meter.max_share,
+                max_worker_cap_given_percent: self.meter.max_worker_cap_given,
+                live_seconds_at_limit: self.meter.seconds_over_limit,
+            };
             // B4, C14: a clip the worker already marked `failed` stays failed;
             // its failure, not the recorder's stop, is why it ended.
             // Only a clip still `recording` takes the recorder's stop; a state
@@ -1301,10 +1294,8 @@ mod live {
                 // worker's B measurements and Q already in `clip.json` stay.
                 let mut conditions = conditions;
                 conditions.q = clip.conditions.q.take();
-                conditions.b = conditions
-                    .b
-                    .take()
-                    .map(|live| merge_live_b(clip.conditions.b.take(), live));
+                conditions.b = clip.conditions.b.take();
+                conditions.merge_b(live_b);
                 clip.conditions = conditions;
                 clip.add_lost(worker_lost);
                 clip.state
@@ -1328,35 +1319,6 @@ mod live {
             // during the recording no longer leaves it in `encoding`.
             super::super::clip_worker::ClipWorkerHost::global().enqueue(self.plan.folder.clone());
         }
-    }
-
-    /// Condition B is measured by both parts: the live share here, the
-    /// worker's share by `report_b` whenever a worker run ends (possibly
-    /// before the recording finishes). The live part is added to what is
-    /// already in `clip.json`; the worker's measurements and a `not_held`
-    /// verdict are never erased.
-    fn merge_live_b(worker: Option<ConditionStatus>, live: ConditionStatus) -> ConditionStatus {
-        let Some(mut merged) = worker else {
-            return live;
-        };
-        let mut detail = merged
-            .detail
-            .take()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        let worker_reported = detail.contains_key("seconds_over_limit");
-        if let Some(serde_json::Value::Object(live_detail)) = live.detail {
-            detail.extend(live_detail);
-        }
-        merged.status = if merged.status == "not_held" || live.status == "not_held" {
-            "not_held".to_owned()
-        } else if worker_reported {
-            merged.status
-        } else {
-            live.status
-        };
-        merged.detail = Some(serde_json::Value::Object(detail));
-        merged
     }
 
     /// `clip.json` at start: state `recording` (A4).

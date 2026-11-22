@@ -422,6 +422,155 @@ pub(super) struct Conditions {
     pub(super) t: Option<ConditionStatus>,
 }
 
+/// One part's figures for condition B.
+pub(super) enum BReport {
+    /// The live part, once when the recording stops (A9, A10).
+    Live {
+        threads: u32,
+        max_live_share_percent: f64,
+        max_worker_cap_given_percent: f64,
+        live_seconds_at_limit: u64,
+    },
+    /// The host, after every clip worker run.
+    Worker {
+        max_worker_share_percent: f64,
+        max_sum_percent: f64,
+        seconds_over_limit: u64,
+        worker_seconds: f64,
+        limit_percent: f64,
+    },
+}
+
+/// The verdict of condition B; `clip.json` keeps it as its status string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BStatus {
+    Held,
+    NotHeld,
+    /// The live part reported; the clip worker has not yet.
+    PendingWorker,
+    /// The clip worker reported without a live figure (the service ended
+    /// during the recording).
+    Unverified,
+}
+
+impl BStatus {
+    fn parse(status: &str) -> Option<Self> {
+        match status {
+            "held" => Some(Self::Held),
+            "not_held" => Some(Self::NotHeld),
+            "pending_worker" => Some(Self::PendingWorker),
+            "unverified" => Some(Self::Unverified),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::NotHeld => "not_held",
+            Self::PendingWorker => "pending_worker",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+impl Conditions {
+    /// The one merge of condition B. Two parts measure it at different times:
+    /// the live part when the recording stops, and the host after every clip
+    /// worker run (possibly before the recording stops). Each report adds its
+    /// figures to the detail; a `not_held` verdict and the other part's figures
+    /// are never erased. The worker's figures cover all of its runs: the
+    /// maxima and the worker time over every run, the seconds over the limit
+    /// summed.
+    pub(super) fn merge_b(&mut self, report: BReport) {
+        let stored = self.b.take();
+        let stored_status = stored
+            .as_ref()
+            .and_then(|condition| BStatus::parse(&condition.status));
+        let mut detail = stored
+            .and_then(|condition| condition.detail)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        let live_reported = detail.contains_key("max_live_share_percent");
+        let worker_reported = detail.contains_key("seconds_over_limit");
+        let was_not_held = stored_status == Some(BStatus::NotHeld);
+        let status = match report {
+            BReport::Live {
+                threads,
+                max_live_share_percent,
+                max_worker_cap_given_percent,
+                live_seconds_at_limit,
+            } => {
+                detail.insert("threads".to_owned(), serde_json::json!(threads));
+                detail.insert(
+                    "max_live_share_percent".to_owned(),
+                    serde_json::json!(max_live_share_percent),
+                );
+                detail.insert(
+                    "max_worker_cap_given_percent".to_owned(),
+                    serde_json::json!(max_worker_cap_given_percent),
+                );
+                detail.insert(
+                    "live_seconds_at_limit".to_owned(),
+                    serde_json::json!(live_seconds_at_limit),
+                );
+                if was_not_held || live_seconds_at_limit > 0 {
+                    BStatus::NotHeld
+                } else if worker_reported {
+                    stored_status.unwrap_or(BStatus::PendingWorker)
+                } else {
+                    BStatus::PendingWorker
+                }
+            }
+            BReport::Worker {
+                max_worker_share_percent,
+                max_sum_percent,
+                seconds_over_limit,
+                worker_seconds,
+                limit_percent,
+            } => {
+                let previous = |key: &str| {
+                    detail
+                        .get(key)
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0)
+                };
+                let over = detail
+                    .get("seconds_over_limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    + seconds_over_limit;
+                let worker_share =
+                    max_worker_share_percent.max(previous("max_worker_share_percent"));
+                let max_sum = max_sum_percent.max(previous("max_sum_percent"));
+                let seconds = worker_seconds + previous("worker_seconds");
+                detail.insert(
+                    "max_worker_share_percent".to_owned(),
+                    serde_json::json!(worker_share),
+                );
+                detail.insert("max_sum_percent".to_owned(), serde_json::json!(max_sum));
+                detail.insert("seconds_over_limit".to_owned(), serde_json::json!(over));
+                detail.insert("worker_seconds".to_owned(), serde_json::json!(seconds));
+                detail.insert("limit_percent".to_owned(), serde_json::json!(limit_percent));
+                if was_not_held || over > 0 {
+                    BStatus::NotHeld
+                } else if live_reported {
+                    BStatus::Held
+                } else {
+                    // No live figure: the sum cannot be shown to stay within
+                    // the limit.
+                    BStatus::Unverified
+                }
+            }
+        };
+        self.b = Some(ConditionStatus {
+            status: status.as_str().to_owned(),
+            failed_instants: Vec::new(),
+            detail: Some(serde_json::Value::Object(detail)),
+        });
+    }
+}
+
 /// A lost instant with its cause.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(super) struct LostInstant {

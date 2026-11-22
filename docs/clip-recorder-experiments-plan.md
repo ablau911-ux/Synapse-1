@@ -85,6 +85,11 @@ Checked as Σ |decoded − corpus| = 0 over every pixel of every frame.
     M_comp = M_0 + M_cctx(L, W) + B_c · px · 3                   B_c = frames held: 1 (whole), 2 (XOR, tiles, rectangles)
     M_dec  = M_0 + M_dctx(W) + B_d · px · 3
     M_cctx, M_dctx: zstd's own estimates (`ZSTD_estimateCCtxSize_usingCParams`, `ZSTD_estimateDCtxSize`)
+    stream ways:   W_eff = min(2^windowLog, frame bytes rounded up to a power of 2)    (zstd sizes the window to a known source)
+    nbWorkers > 0: M_cctx = ZSTD_sizeof_CCtx after the context is set up              (the estimates cover one thread only)
+    viewer:        M_dec gains b_max, the largest clip file, which the viewer holds while it decodes
+
+Corrections from the step 2a pilot (`65fe9549`), each checked by its own row in `spec/step2z.mjs`. CPU is read from the process cycle counter (user plus kernel, all threads), because `GetProcessTimes` advances in 15.6 ms ticks and read 0.5 to 0.8 of the true time.
 
 Measured: peak private bytes and peak working set of the run's process (`GetProcessMemoryInfo`, every 50 ms).
 
@@ -139,7 +144,12 @@ Run design (owner decision, 2026-11-22 about 20:47: every option at every level;
 - **Grid A-D (full):** D1 × D2 × F6 × F7 = 4 × 8 × 4 × 6 = 768 encodes, at τ_f 20, hint on, quality mode.
 - **Grid B (one at a time):** Z3, Z4, Z5, Z6 and Z7, each level, around the Z baseline (L = −3, whole frame); D3, D4 and D5, each level, around the D baseline (E = Intel Quick Sync, q = 70); for every F6 and F7.
 - Bytes are deterministic, so each configuration's bytes come from 1 run. CPU and RAM come from 3 runs.
-- T (equation 6) is computed from the pilot before the full run; levels whose T is too long for one evening are run on one size and predicted for the others, and that is reported.
+- T (equation 6) is computed from the pilot before the full run. The step 2a pilot (`65fe9549`) gave T = 34.8 h for grids A-Z and B with 3 repeats; levels 19 to 22 at 1920 × 1080 and 1280 × 720 alone took about 20 h. Run list v2 (21:40), chosen by equation 6:
+  1. Coverage floor: every runnable way × every level × every content at 640 × 360, so every option runs at every level. The context ways ZW12 to ZW15 get the full level sweep, because they lead the pilot (scroll 1920 × 1080 at L −3: prefix + ldm 8.9 KB per frame, stream W27 10.2 KB, whole frame 124 KB).
+  2. The other sizes are added cell by cell, cheapest predicted cell first, until T_total reaches 12 h.
+  3. Cells left out are predicted by the size equations (η in equation 1, px-linear κ_c in equation 3) and marked "predicted".
+  4. 20 % of the cells that run at more than one size are held out with a fixed seed, so step 4 proves the size prediction.
+  5. The list and T_total are in `scripts/clip-equation/results/z-runlist.json`. Way D's full run follows way Z's, never at the same time, so neither disturbs the other's CPU figures.
 - Every runnable way of `docs/clip-recorder-ways.md` that is not one of these factors is added as a row of grid B.
 
 ## Procedure
@@ -183,7 +193,8 @@ Symbols as in section "Equations"; t = 20 s, f = 20 fps.
 |---|---|---|
 | frames compressed | N_comp = N_new of the corpus folder | exact |
 | bytes | bytes = Σ output sizes | equals the clip's file sizes on disk, to the byte |
-| baseline equals the corpus | whole frame, L = −3, independent, interleaved: bytes = D_wait of the folder | exact, to the byte (same coder, level and frames) |
+| baseline equals the corpus | whole frame, L = −3, independent, interleaved, with the corpus writer's call (streamed, 16 KB output drain): bytes = D_wait of the folder | exact, to the byte (same libzstd 1.5.7, same call) |
+| one-shot call | the same frames with one `ZSTD_compress2` call per frame, as the product writes them | a known difference from D_wait caused by the block splits of the call (pilot: 49,650,183 against 49,677,690 B on scroll 1920 × 1080); reported, not a pass/fail |
 | determinism | bytes of run 1 = run 2 = run 3 | identical |
 | RAM | M_comp = M_0 + M_cctx(L, W) + B_c · px · 3 (equation 4) | within ±10 % of the measured peak private bytes |
 | CPU | equation 3 with κ_c from the fit set | held-out rows within ±10 % |

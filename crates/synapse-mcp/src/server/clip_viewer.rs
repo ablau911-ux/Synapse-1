@@ -98,7 +98,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 6;
+const ANALYSIS_VERSION: u32 = 7;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -446,6 +446,20 @@ impl BlockMap {
         self.count = self.changed.iter().filter(|flag| **flag).count() as u64;
     }
 
+    fn union(&self, other: &Self) -> Self {
+        let mut union = self.clone();
+        union.merge(other);
+        union
+    }
+
+    /// `true` when a block is changed in both maps (same picture size).
+    fn overlaps(&self, other: &Self) -> bool {
+        self.changed
+            .iter()
+            .zip(&other.changed)
+            .any(|(here, there)| *here && *there)
+    }
+
     fn percent(&self) -> f64 {
         (self.count as f64 * 1_000.0 / self.changed.len().max(1) as f64).round() / 10.0
     }
@@ -553,6 +567,8 @@ struct Transient {
     blocks: Vec<usize>,
     /// The picture size the block indices refer to (a resize changes it).
     size: (usize, usize),
+    /// The resize generation of the change (see `Analyzer`).
+    generation: u64,
 }
 
 /// A region that kept changing for longer than `SHORT_LIVED_MS`.
@@ -642,6 +658,7 @@ impl<'a> Analyzer<'a> {
         }
         let end = clip.last_frame();
         analyzer.end_animations(end, true);
+        analyzer.absorb_into_animations();
         Ok(analyzer.finish())
     }
 
@@ -692,6 +709,21 @@ impl<'a> Analyzer<'a> {
         for (index, state) in self.states.iter().enumerate() {
             if state.animating {
                 episode_blocks.unset(index);
+            }
+        }
+        // D5: changed blocks connected to an animating block belong to that
+        // animating region (its digits that change less often), not to a
+        // change of their own.
+        let animating: std::collections::HashSet<usize> = (0..self.states.len())
+            .filter(|&index| self.states[index].animating)
+            .collect();
+        if !animating.is_empty() {
+            for group in episode_blocks.block_groups() {
+                if touches(&group, &animating, episode_blocks.cols) {
+                    for index in group {
+                        episode_blocks.unset(index);
+                    }
+                }
             }
         }
         self.previous = instant;
@@ -824,6 +856,7 @@ impl<'a> Analyzer<'a> {
                     end: instant,
                     blocks: vec![index],
                     size: (width, height),
+                    generation: self.generation,
                 }),
             }
         }
@@ -844,18 +877,24 @@ impl<'a> Analyzer<'a> {
             }
         }
         // The block indices refer to the current picture size; animations of
-        // an earlier resize generation are never merged with them.
+        // an earlier resize generation are never merged with them. A block
+        // joins an animation of the same time that it touches, so separate
+        // animating regions (a counter, a clock) stay separate intervals.
         let (size, generation) = ((self.width, self.height), self.generation);
+        let cols = self.width.div_ceil(BLOCK);
         for (start, end, index) in ended {
             match self.animations.iter_mut().find(|animation| {
                 animation.generation == generation
                     && animation.start <= end
                     && start <= animation.end
+                    && blocks_touch(&[index], &animation.blocks, cols)
             }) {
                 Some(animation) => {
                     animation.start = animation.start.min(start);
                     animation.end = animation.end.max(end);
-                    animation.blocks.push(index);
+                    if !animation.blocks.contains(&index) {
+                        animation.blocks.push(index);
+                    }
                 }
                 None => self.animations.push(Animation {
                     start,
@@ -868,6 +907,75 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// D5: the animations of one region become one interval, and a
+    /// short-lived change that touches an animation during its interval is
+    /// part of it (never reported or picked on its own). Repeats until
+    /// nothing more joins, so a region grows over its parts that change less
+    /// often.
+    fn absorb_into_animations(&mut self) {
+        let overlap = |a: (u64, u64), b: (u64, u64)| a.0 <= b.1 && b.0 <= a.1;
+        loop {
+            let mut joined = false;
+            let mut index = 0;
+            while index < self.animations.len() {
+                let mut other = index + 1;
+                while other < self.animations.len() {
+                    let (here, there) = (&self.animations[index], &self.animations[other]);
+                    let joins = here.generation == there.generation
+                        && overlap((here.start, here.end), (there.start, there.end))
+                        && blocks_touch(&there.blocks, &here.blocks, here.size.0.div_ceil(BLOCK));
+                    if joins {
+                        let there = self.animations.swap_remove(other);
+                        let here = &mut self.animations[index];
+                        here.start = here.start.min(there.start);
+                        here.end = here.end.max(there.end);
+                        for block in there.blocks {
+                            if !here.blocks.contains(&block) {
+                                here.blocks.push(block);
+                            }
+                        }
+                        joined = true;
+                    } else {
+                        other += 1;
+                    }
+                }
+                index += 1;
+            }
+            let mut kept = Vec::with_capacity(self.transients.len());
+            for transient in std::mem::take(&mut self.transients) {
+                let animation = self.animations.iter_mut().find(|animation| {
+                    animation.generation == transient.generation
+                        && overlap(
+                            (animation.start, animation.end),
+                            (transient.start, transient.end),
+                        )
+                        && blocks_touch(
+                            &transient.blocks,
+                            &animation.blocks,
+                            animation.size.0.div_ceil(BLOCK),
+                        )
+                });
+                match animation {
+                    Some(animation) => {
+                        animation.start = animation.start.min(transient.start);
+                        animation.end = animation.end.max(transient.end);
+                        for block in transient.blocks {
+                            if !animation.blocks.contains(&block) {
+                                animation.blocks.push(block);
+                            }
+                        }
+                        joined = true;
+                    }
+                    None => kept.push(transient),
+                }
+            }
+            self.transients = kept;
+            if !joined {
+                break;
+            }
+        }
+    }
+
     /// Ends a change; marks it short-lived when the picture is back to the
     /// one before it within `SHORT_LIVED_MS`, also when the return came as a
     /// separate change right after.
@@ -875,7 +983,10 @@ impl<'a> Analyzer<'a> {
         let (width, height) = (self.width, self.height);
         let span = |clip: &ViewedClip, start: u64, end: u64| clip.t_of(end) - clip.t_of(start);
         episode.settled = settled;
-        if BlockMap::between(&episode.before, &self.shown, width, height).count == 0 {
+        // A change is compared only within its own blocks: an animating
+        // region elsewhere (excluded from the change) never hides a return.
+        if !BlockMap::between(&episode.before, &self.shown, width, height).overlaps(&episode.blocks)
+        {
             episode.reverted = true;
             episode.short_lived =
                 span(self.clip, episode.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS;
@@ -887,7 +998,8 @@ impl<'a> Analyzer<'a> {
             && !previous.reverted
             && previous.generation == episode.generation
             && span(self.clip, previous.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS
-            && BlockMap::between(&previous.before, &self.shown, width, height).count == 0
+            && !BlockMap::between(&previous.before, &self.shown, width, height)
+                .overlaps(&previous.blocks.union(&episode.blocks))
         {
             previous.reverted = true;
             previous.short_lived = true;
@@ -1112,6 +1224,24 @@ fn region_entry(
             fmt_time(end_ms)
         ),
     }
+}
+
+/// `true` when a block of `blocks` is one of `others` or one of their eight
+/// neighbours (the connectivity of `BlockMap::block_groups`).
+fn blocks_touch(blocks: &[usize], others: &[usize], cols: usize) -> bool {
+    let others: std::collections::HashSet<usize> = others.iter().copied().collect();
+    touches(blocks, &others, cols)
+}
+
+fn touches(blocks: &[usize], others: &std::collections::HashSet<usize>, cols: usize) -> bool {
+    let cols = cols.max(1);
+    blocks.iter().any(|&index| {
+        let (col, row) = (index % cols, index / cols);
+        (row.saturating_sub(1)..=row + 1).any(|near_row| {
+            (col.saturating_sub(1)..=(col + 1).min(cols - 1))
+                .any(|near_col| others.contains(&(near_row * cols + near_col)))
+        })
+    })
 }
 
 /// The bounding box of a set of blocks, in recorded pixels.

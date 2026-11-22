@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::clip_folder::{
     ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, StopReason,
-    WAITING_BYTES_PER_PIXEL, raw_frame_path, read_frame_lines,
+    raw_frame_path, read_frame_lines,
 };
 
 /// U_max: the recorder never uses more than this share of the processor time
@@ -25,8 +25,7 @@ pub(super) const CPU_LIMIT_PERCENT: f64 = 10.0;
 /// A segment closes after this much clip time.
 pub(super) const SEGMENT_MS: u64 = 60_000;
 /// A segment closes when its retained raw bytes reach this (package 0, M4/M5; S6).
-/// Counted as decompressed B, G, R bytes, the encoder's input: the compressed
-/// size of a waiting frame is not in `frames.jsonl` and is never larger.
+/// Counted as the sizes of its waiting files on disk (compressed).
 pub(super) const SEGMENT_RAW_BUDGET_BYTES: u64 = 1 << 30;
 /// A new window size counts as settled once it held this long (E4).
 pub(super) const RESIZE_SETTLE_MS: u64 = 500;
@@ -117,7 +116,10 @@ pub(super) struct SegmentRange {
 
 /// B2: forms the next segment from the lines at and after `start`. `None`
 /// while the clip is still recording and the next segment is not complete.
+/// The raw budget counts the waiting files of `folder` as they are on disk
+/// (compressed), read for each new frame.
 pub(super) fn next_segment(
+    folder: &Path,
     lines: &[FrameLine],
     start: usize,
     closed: bool,
@@ -150,7 +152,7 @@ pub(super) fn next_segment(
         let over_time = line.t_ms.saturating_sub(first.t_ms) >= SEGMENT_MS;
         let resized = line.width != 0 && size(line) != canvas;
         let frame_bytes = if line.new {
-            u64::from(line.width) * u64::from(line.height) * WAITING_BYTES_PER_PIXEL
+            std::fs::metadata(raw_frame_path(folder, line.instant)).map_or(0, |file| file.len())
         } else {
             0
         };
@@ -313,7 +315,7 @@ impl ClipWorker {
                 lines.partition_point(|line| line.instant <= segment.last_instant)
             });
             let closed = clip.state == ClipState::Encoding;
-            match next_segment(&lines, start, closed) {
+            match next_segment(&self.folder, &lines, start, closed) {
                 Some(range) => self.commit(&clip, &lines, range)?,
                 None if closed => return self.ready(),
                 None => std::thread::sleep(std::time::Duration::from_millis(WORKER_TICK_MS)),

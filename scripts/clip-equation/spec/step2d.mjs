@@ -27,6 +27,16 @@ const PRIOR_PX = 1252 * 890;
 const C_CONV_NS = 1.65;
 const C_ENC_NS = { software: 7.0, hardware: 2.0 };
 const T_S = 20;
+const CORPUS = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'corpus', 'corpus.json'), 'utf8'));
+const TEXT_SCENARIOS = ['typing', 'scroll', 'ui'];
+// The product's bitrate fallback (clip_encoder.rs FALLBACK_BITS_PER_PIXEL_FRAME), kept in quality mode (M5).
+const FALLBACK_BETA = 0.10;
+const RUNLIST = path.join(HERE, '..', 'results', 'd-runlist.json');
+// The D key of the fit (fit/fit-config.json d_key_columns, plus the repeat).
+const D_KEY = ['folder', 'encoder', 'q', 'tau_f', 'hint', 'rate', 'beta', 'repeat'];
+// Plan "Run design": grid A-D = encoders x 8 q x folders; grid B (D part) = 3 GOPs + hint off + 3 betas per folder; 3 repeats.
+const FOLDERS = Object.keys(CORPUS.scenarios).length * CORPUS.sizes.length;
+const EXPECTED_RUNS = (KNOWN_ENCODERS * 8 * FOLDERS + 7 * FOLDERS) * 3;
 const PASS = 'PASS';
 const FAIL = 'FAIL';
 const PENDING = 'PENDING';
@@ -53,7 +63,23 @@ class CorpusFolder {
     }
     return CorpusFolder.cache.get(key);
   }
+
+  /** N_inst: the lines of the folder's frames.jsonl, one per instant (a lost instant has none). */
+  static nInst(root, name) {
+    const key = `inst|${path.join(root, name)}`;
+    if (!CorpusFolder.cache.has(key)) {
+      CorpusFolder.cache.set(key, fs.readFileSync(path.join(root, name, 'frames.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).length);
+    }
+    return CorpusFolder.cache.get(key);
+  }
 }
+
+/** results/d-runlist.json, or null when run-d.mjs has not written it. */
+function readRunList() {
+  return fs.existsSync(RUNLIST) ? JSON.parse(fs.readFileSync(RUNLIST, 'utf8')) : null;
+}
+
+const label = (r) => `${r.folder} ${r.encoder} q${r.q_req ?? r.q}`;
 
 /** The scenarios of the feature file with their equation and known result. */
 function readScenarios() {
@@ -124,6 +150,91 @@ function checks(rows, root) {
       const m = getMeter();
       if (m.error) return { value: PSNR_D4.toFixed(4), measured: m.error, pass: false };
       return { value: `${PSNR_D4.toFixed(4)} dB`, measured: `${Number(m.psnr_d4).toFixed(4)} dB (clipped pixels ${m.clipped_d4})`, pass: m.clipped_d4 === 0 && Math.abs(m.psnr_d4 - PSNR_D4) <= PSNR_TOLERANCE_DB };
+    },
+    'D: live and worker are two processes': needRows(() => {
+      const runs = okRows(rows);
+      const bad = runs.filter((r) => !(r.live_pid && r.worker_pid && r.live_pid !== r.worker_pid && num(r.way_cpu_ns) === num(r.a_rt_ns) + num(r.a_w_ns)))
+        .map((r) => `${label(r)}: pid ${r.live_pid ?? '-'}/${r.worker_pid ?? '-'}, way_cpu ${r.way_cpu_ns ?? '-'} vs ${num(r.a_rt_ns) + num(r.a_w_ns)}`);
+      return { value: 'two pids; a_rt + a_w', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: RAM base excludes corpus buffers': needRows(() => {
+      const runs = okRows(rows);
+      const bad = runs.filter((r) => !(r.input === 'bgra' && num(r.live_os_peak_private) > num(r.live_os_peak_at_m0) && num(r.worker_os_peak_private) > num(r.worker_os_peak_at_m0)))
+        .map((r) => `${label(r)}: input ${r.input ?? '-'}, live peak ${r.live_os_peak_private ?? '-'} vs ${r.live_os_peak_at_m0 ?? '-'}, worker peak ${r.worker_os_peak_private ?? '-'} vs ${r.worker_os_peak_at_m0 ?? '-'}`);
+      return { value: 'bgra; peak > peak at M_0', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: RAM is the OS peak of both phases': needRows(() => {
+      const runs = okRows(rows);
+      const bad = runs.filter((r) => !(num(r.live_ram_os) > 0 && num(r.worker_ram_os) > 0 && num(r.ram_os) === num(r.live_ram_os) + num(r.worker_ram_os)
+        && num(r.m_live) === num(r.live_ram_os) && num(r.m_worker) === num(r.worker_ram_os)))
+        .map((r) => `${label(r)}: ram_os ${r.ram_os ?? '-'} = ${r.live_ram_os ?? '-'} + ${r.worker_ram_os ?? '-'}?`);
+      return { value: 'live + worker', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: bytes include frames.jsonl and clip.json': needRows(() => {
+      const runs = okRows(rows);
+      const bad = runs.filter((r) => {
+        const sum = num(r.frame_bytes) + num(r.index_bytes) + num(r.clip_json_bytes);
+        return !(num(r.bytes_disk) === sum && num(r.bytes_on_disk) === sum && num(r.frame_bytes) === num(r.bytes) && num(r.clip_json_bytes) > 0
+          && num(r.index_lines) === CorpusFolder.nInst(root, r.folder));
+      }).map((r) => `${label(r)}: disk ${r.bytes_disk ?? '-'} on disk ${r.bytes_on_disk ?? '-'} = ${r.frame_bytes ?? '-'} + ${r.index_bytes ?? '-'} + ${r.clip_json_bytes ?? '-'}, lines ${r.index_lines ?? '-'}/${CorpusFolder.nInst(root, r.folder)}`);
+      return { value: 'MP4 + frames.jsonl + clip.json', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: a refused setting is recorded as refused': needRows(() => {
+      const runs = rows.filter((r) => r.activated === '1' && r.status !== 'no_product_path');
+      const bad = runs.filter((r) => {
+        const pairs = [['rate', r.rate_req, r.rate_read], ['q', r.q_req, r.q_read], ['tau_f', r.tau_f_req, r.tau_f_read], ['hint', r.hint_req, r.hint_read]];
+        if (pairs.some(([, req, read]) => req === undefined || read === undefined || req === '' || read === '')) return true;
+        const refused = pairs.find(([name, req, read]) => (name === 'q' && r.rate_read !== 'quality' ? false : String(req) !== String(read)));
+        const keysActual = String(r.q) === String(r.rate_read === 'quality' ? r.q_read : 0) && String(r.tau_f) === String(r.tau_f_read) && String(r.hint) === String(r.hint_read) && r.rate === r.rate_read;
+        return refused ? !(r.status === `setting_refused:${refused[0]}` && keysActual) : (r.status.startsWith('setting_refused') || !keysActual);
+      }).map((r) => `${label(r)}: ${r.status}; req ${r.rate_req}/${r.q_req}/${r.tau_f_req}/${r.hint_req} read ${r.rate_read}/${r.q_read}/${r.tau_f_read}/${r.hint_read}`);
+      return { value: 'refused iff read-back differs', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: beta never 0': needRows(() => {
+      const list = readRunList();
+      const all = [...rows.map((r) => ({ where: label(r), rate: r.rate_req ?? r.rate, beta: r.beta_req ?? r.beta })), ...(list?.runs ?? []).map((r) => ({ where: `plan ${r.folder} ${r.encoder} q${r.q}`, rate: r.rate, beta: r.beta }))];
+      const bad = all.filter((r) => !(num(r.beta) > 0 && (r.rate !== 'quality' || num(r.beta) === FALLBACK_BETA))).map((r) => `${r.where}: ${r.rate} beta ${r.beta}`);
+      return { value: `> 0; quality ${FALLBACK_BETA}`, measured: `${all.length - bad.length}/${all.length} runs and plan rows${list ? '' : ' (no run list)'}${misses(bad)}`, pass: list !== null && bad.length === 0 };
+    }),
+    'D: every decoded frame mapped by time': needRows(() => {
+      const runs = rows.filter((r) => r.status === 'ok' || r.status === 'frame_map');
+      const bad = runs.filter((r) => {
+        const clean = num(r.frames_mapped) === CorpusFolder.nNew(root, r.folder) && num(r.frames_missing) === 0 && num(r.frames_extra) === 0 && num(r.frames_mistimed) === 0;
+        return r.status === 'ok' ? !clean : clean;
+      }).map((r) => `${label(r)}: ${r.status}, mapped ${r.frames_mapped ?? '-'}/${CorpusFolder.nNew(root, r.folder)}, missing ${r.frames_missing ?? '-'}, extra ${r.frames_extra ?? '-'}, mistimed ${r.frames_mistimed ?? '-'}`);
+      const mapFails = runs.filter((r) => r.status === 'frame_map').length;
+      return { value: 'N_new mapped, else frame_map', measured: `${runs.length - bad.length}/${runs.length} runs (${mapFails} frame_map)${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: R n/a on empty source text': needRows(() => {
+      const regions = CORPUS.text_regions ?? {};
+      const missingRegions = TEXT_SCENARIOS.filter((s) => !(regions[s]?.length > 0));
+      const runs = okRows(rows);
+      const bad = runs.filter((r) => {
+        const want = regions[r.scenario]?.length ?? 0;
+        if (!TEXT_SCENARIOS.includes(r.scenario)) return r.r !== 'n/a';
+        if (num(r.r_regions) !== want || r.r_source_chars === undefined || r.r_source_chars === '') return true;
+        return num(r.r_source_chars) === 0 ? r.r !== 'n/a' : !(num(r.r) >= 0 && num(r.r) <= 1);
+      }).map((r) => `${label(r)}: r ${r.r}, regions ${r.r_regions ?? '-'}/${regions[r.scenario]?.length ?? 0}, source chars ${r.r_source_chars ?? '-'}`);
+      const noRegions = missingRegions.length ? [`corpus.json has no text_regions for ${missingRegions.join(' ')}`] : [];
+      return { value: 'n/a iff no source text', measured: `${runs.length - bad.length}/${runs.length} runs${misses([...noRegions, ...bad])}`, pass: runs.length > 0 && bad.length === 0 && noRegions.length === 0 };
+    }),
+    'D: PSNR inf at zero MSE': needRows(() => {
+      const runs = okRows(rows);
+      const bad = runs.filter((r) => {
+        if (r.mse_y === undefined || r.mse_y === '') return true;
+        const mse = num(r.mse_y);
+        if (mse === 0) return r.psnr_global !== 'inf';
+        return !(Math.abs(num(r.psnr_global) - 10 * Math.log10((255 * 255) / mse)) <= 1e-6);
+      }).map((r) => `${label(r)}: mse_y ${r.mse_y ?? '-'}, psnr_global ${r.psnr_global}`);
+      return { value: '10 log10(255^2 / mse_y)', measured: `${runs.length - bad.length}/${runs.length} runs${misses(bad)}`, pass: runs.length > 0 && bad.length === 0 };
+    }),
+    'D: run list with unique keys': () => {
+      const list = readRunList();
+      if (!list) return { value: EXPECTED_RUNS, measured: `no ${RUNLIST}`, pass: false };
+      const keys = (list.runs ?? []).map((r) => D_KEY.map((k) => String(r[k] ?? '')).join('|'));
+      const unresolved = (list.runs ?? []).filter((r) => D_KEY.some((k) => r[k] === undefined || r[k] === null || r[k] === '')).length;
+      const unique = new Set(keys).size;
+      return { value: `${EXPECTED_RUNS} unique`, measured: `${keys.length} runs, ${unique} unique, ${unresolved} with an unresolved key`, pass: keys.length === EXPECTED_RUNS && unique === keys.length && unresolved === 0 };
     },
     'D: bytes against the prior': needRows(() => {
       const runs = okRows(rows).filter((r) => r.rate === 'quality' && r.repeat === '1');

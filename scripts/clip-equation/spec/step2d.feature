@@ -39,6 +39,59 @@ Feature: Way D encodes every new frame of the corpus with every H.264 encoder
     Then PSNR-Y(x, x') is 20 * log10(255 / 4) within 0.01 dB
     # Equation: MSE = d^2, PSNR = 20 * log10(255 / d), d = 4 | Known: 36.0896 dB within 0.01 dB
 
+  # Measurement rules M1 to M7 and M9 (plan, "Measurement rules, the same for both ways"; issue #295).
+
+  Scenario: D: live and worker are two processes
+    Given a finished run
+    Then the live part and the worker ran as two processes with different ids
+    And the way's CPU is the sum of both processes' cycle counters
+    # Equation: pid_live != pid_worker; way_cpu_ns = a_rt_ns + a_w_ns | Known: every run (M2, M3)
+
+  Scenario: D: RAM base excludes corpus buffers
+    Given a finished run whose input was prepared as B, G, R, A before M_0
+    Then each phase set its own OS peak above the peak at M_0
+    # Equation: input = bgra; os_peak_private > os_peak_at_m0 for live and worker | Known: every run (M1, M3, #5)
+
+  Scenario: D: RAM is the OS peak of both phases
+    Given a finished run
+    Then RAM_D is the live OS peak above its M_0 plus the worker OS peak above its M_0
+    # Equation: ram_os = live_ram_os + worker_ram_os; m_live = live_ram_os; m_worker = worker_ram_os | Known: every run (M3, #11)
+
+  Scenario: D: bytes include frames.jsonl and clip.json
+    Given a finished run
+    Then the clip's bytes are the MP4, frames.jsonl with one line per instant, and clip.json, equal to the folder on disk
+    # Equation: bytes_disk = frame_bytes + index_bytes + clip_json_bytes = on-disk sum; frame_bytes = MP4; index_lines = N_inst | Known: exact, every run (M4, #6)
+
+  Scenario: D: a refused setting is recorded as refused
+    Given a run with requested and read-back q, rate mode, GOP and hint
+    Then a run whose read-back differs has status setting_refused:<name> and its key columns hold the read-back values
+    # Equation: status = setting_refused:<first differing name> iff read-back != requested | Known: every run (M5, #7)
+
+  Scenario: D: beta never 0
+    Given every planned and every finished run
+    Then beta is above 0, and quality mode keeps the product fallback 0.10
+    # Equation: beta > 0; rate = quality implies beta = FALLBACK_BITS_PER_PIXEL_FRAME = 0.10 | Known: every run (M5, #7)
+
+  Scenario: D: every decoded frame mapped by time
+    Given a run decoded from its clip
+    Then every decoded frame maps to one new frame within half an instant, and a run with a missing, extra or mistimed frame has status frame_map
+    # Equation: frames_mapped = N_new; missing = extra = mistimed = 0, else status frame_map | Known: every run (M6, #9)
+
+  Scenario: D: R n/a on empty source text
+    Given the fixed text regions of corpus.json for every text scenario
+    Then R is read on those regions, and R is n/a when the source text read is empty or the scenario has no text
+    # Equation: r = n/a iff r_source_chars = 0; r_regions = regions of the scenario | Known: every run (M7, #14)
+
+  Scenario: D: PSNR inf at zero MSE
+    Given a finished run
+    Then PSNR-Y is computed from the clip's total MSE of Y, inf when that MSE is 0
+    # Equation: psnr_global = 10 * log10(255^2 / mse_y), inf at mse_y = 0 | Known: within 1e-6 dB, every run (M7, #22)
+
+  Scenario: D: run list with unique keys
+    Given results/d-runlist.json written by run-d.mjs
+    Then it holds grid A-D and the D part of grid B with every key resolved, and no key twice
+    # Equation: runs = count(plan A) + count(plan B) = 2808; unique keys = runs | Known: exact (M9)
+
   Scenario: D: bytes against the prior
     Given a finished run in quality mode
     Then its bytes per minute are printed beside the prior and the error

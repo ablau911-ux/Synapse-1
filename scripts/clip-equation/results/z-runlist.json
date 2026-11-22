@@ -1,5 +1,5 @@
 {
- "created": "2026-11-22T21:19:26.614Z",
+ "created": "2026-11-22T21:22:58.682Z",
  "rule": "coverage floor: every runnable way and option level x every Z1 level x 6 contents at 640x360; then the larger sizes cell by cell, cheapest predicted cell first, while T_total <= T_floor + 4 h; cells left out are predicted by the size equations (eq. 1 eta, eq. 3 px-linear kappa_c); 20 % of the cells that run at more than one size are held out (seeded, drawn from the larger sizes)",
  "equation": "T = sum over runs of (t_0 + N_new * (px / px_pilot) * (a + c(L, m))) * repeats; c(L, m) = c_ZW1(L) * c_m(-3) / c_ZW1(-3); equation 6 with v(L, m) = px_pilot * 3 / (a + c(L, m)) plus t_0 per subprocess",
  "coefficients": {
@@ -52550,5 +52550,5 @@
    "status": "predicted"
   }
  ],
- "list_id": "95cade8369e839d5"
+ "hash": "95cade8369e839d5"
 }

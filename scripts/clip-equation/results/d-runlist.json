@@ -1,4 +1,4 @@
-{"about":"Way D full run plan (docs/clip-recorder-experiments-plan.md, \"Run design\"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).","key":["folder","encoder","q","tau_f","hint","rate","beta","repeat"],"repeats":3,"list_id":"3f1b0e549506302f","counts":{"runs":2808,"A":2304,"B":504},"runs":[
+{"about":"Way D full run plan (docs/clip-recorder-experiments-plan.md, \"Run design\"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).","key":["folder","encoder","q","tau_f","hint","rate","beta","repeat"],"repeats":3,"hash":"3f1b0e549506302f","counts":{"runs":2808,"A":2304,"B":504},"runs":[
   {"folder":"typing-1920x1080","encoder":"DW1","q":30,"tau_f":20,"hint":1,"rate":"quality","beta":0.1,"repeat":1},
   {"folder":"typing-1920x1080","encoder":"DW1","q":30,"tau_f":20,"hint":1,"rate":"quality","beta":0.1,"repeat":2},
   {"folder":"typing-1920x1080","encoder":"DW1","q":30,"tau_f":20,"hint":1,"rate":"quality","beta":0.1,"repeat":3},

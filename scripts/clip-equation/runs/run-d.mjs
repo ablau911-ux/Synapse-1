@@ -52,7 +52,7 @@ const COLUMNS = ['grid', 'folder', 'scenario', 'width', 'height', 'sigma', 'out_
   'decoded_frames', 'frames_mapped', 'frames_missing', 'frames_extra', 'frames_mistimed', 'time_offsets', 'mp4_time_offsets',
   't_decode_ns', 'a_dec_ns', 'a_dec_gpt_ns', 'm_decode', 'cycle_rate', 't_quality_ns', 't_ocr_ns',
   'ssim_mean', 'ssim_min', 'psnr_mean', 'psnr_min', 'mse_y', 'psnr_global', 'identical_frames', 'r', 'r_regions', 'r_source_chars', 'r_note', 'flashes', 'wall_ms',
-  'known_frames', 'known_keyframes', 'known_b', 'known_flashes', 'pass_frames', 'pass_keyframes', 'pass_b', 'list_id'];
+  'known_frames', 'known_keyframes', 'known_b', 'known_flashes', 'pass_frames', 'pass_keyframes', 'pass_b', 'runlist_hash'];
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => (a.includes('=') ? a.split(/=(.*)/s).slice(0, 2) : [a, '1'])));
 
@@ -140,10 +140,10 @@ export const planIdentity = (repeats = 3) => runListIdentity(planList(repeats));
 export function writeRunList(repeats = 3) {
   const list = planList(repeats);
   const listId = runListIdentity(list);
-  const head = { about: 'Way D full run plan (docs/clip-recorder-experiments-plan.md, "Run design"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).', key: D_KEY, repeats, list_id: listId, counts: { runs: list.runs.length, A: plan('A', repeats).length, B: plan('B', repeats).length } };
+  const head = { about: 'Way D full run plan (docs/clip-recorder-experiments-plan.md, "Run design"), written by runs/run-d.mjs; keys resolved as at lookup and append (M9).', key: D_KEY, repeats, hash: listId, counts: { runs: list.runs.length, A: plan('A', repeats).length, B: plan('B', repeats).length } };
   const body = list.runs.map((r) => `  ${JSON.stringify(r)}`).join(',\n');
   fs.writeFileSync(RUNLIST, `${JSON.stringify(head).slice(0, -1)},"runs":[\n${body}\n]}\n`);
-  return { runs: list.runs.length, unique: list.runs.length, list_id: listId };
+  return { runs: list.runs.length, unique: list.runs.length, hash: listId };
 }
 
 /**
@@ -155,12 +155,12 @@ function preflightRunList(repeats, doneRows) {
   const planId = planIdentity(repeats);
   const file = fs.existsSync(RUNLIST) ? JSON.parse(fs.readFileSync(RUNLIST, 'utf8')) : null;
   const fileId = file ? runListIdentity(file) : null;
-  if (file && file.list_id === fileId && fileId === planId) {
-    const other = doneRows.filter((r) => r.list_id !== planId);
-    if (other.length) throw new Error(`${other.length} rows of the CSV come from another run list (${other[0].list_id || 'none'}), not ${planId}: start a new CSV`);
+  if (file && file.hash === fileId && fileId === planId) {
+    const other = doneRows.filter((r) => r.runlist_hash !== planId);
+    if (other.length) throw new Error(`${other.length} rows of the CSV come from another run list (${other[0].runlist_hash || 'none'}), not ${planId}: start a new CSV`);
     return planId;
   }
-  if (doneRows.length) throw new Error(`d-runlist.json (${file?.list_id ?? 'missing'}) is not the plan now (${planId}) and the CSV already has rows: refusing to mix run lists`);
+  if (doneRows.length) throw new Error(`d-runlist.json (${file?.hash ?? 'missing'}) is not the plan now (${planId}) and the CSV already has rows: refusing to mix run lists`);
   writeRunList(repeats);
   console.log(`d-runlist.json rewritten: ${planId}`);
   return planId;
@@ -276,7 +276,7 @@ function runGrid(grid) {
     const out = runOne(run, cfg);
     const firstKey = plannedKey({ ...run, repeat: 1 });
     const first = run.repeat > 1 ? firsts.get(firstKey) : null;
-    const merged = { ...row(run, cfg, out, first), list_id: listId };
+    const merged = { ...row(run, cfg, out, first), runlist_hash: listId };
     fs.appendFileSync(csv, `${COLUMNS.map((c) => clean(merged[c])).join(',')}\n`);
     doneKeys.add(key);
     if (run.repeat === 1) firsts.set(firstKey, out);

@@ -84,7 +84,7 @@ const MEASURED_COLUMNS = [
   'dec_cpu_ns', 'dec_gpt_ns', 'dec_wall_ns', 'dec_cpu_per_frame_ns', 'dec_peak_private', 'dec_peak_ws', 'read_cpu_ns', 'corpus_dec_cpu_ns',
   'frames_decoded', 'diff_sum', 'diff_frames', 'n_dec_worst', 't_ready_ns', 'run_wall_ms',
 ];
-const KNOWN_COLUMNS = ['rate', 'list_id', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
+const KNOWN_COLUMNS = ['rate', 'runlist_hash', 'cell', 'held_out', 'known_n_new', 'known_d_wait', 'known_m_comp', 'known_m_dec'];
 const PASS_COLUMNS = ['pass_frames', 'pass_bytes', 'pass_bytesAll', 'pass_baseline', 'pass_inputFormat', 'pass_cpuTotal', 'pass_dictCpu', 'pass_ramOs', 'pass_ldm', 'pass_rectList', 'pass_ram', 'pass_ramWorkers', 'pass_ramStream', 'pass_ramShared', 'pass_cpuCycles', 'pass_roundTrip', 'pass_seek', 'pass_dctx', 'pass_ready', 'error'];
 const COLUMNS = [...OPTION_COLUMNS, ...MEASURED_COLUMNS, ...KNOWN_COLUMNS, ...PASS_COLUMNS];
 
@@ -285,14 +285,14 @@ export function buildRunList(budgetHours = null, { write = true } = {}) {
     not_run: NOT_RUN,
     cells,
   };
-  list.list_id = runListIdentity(list);
+  list.hash = runListIdentity(list);
   if (write) fs.writeFileSync(RUNLIST, `${JSON.stringify(list, null, 1)}\n`);
   return list;
 }
 
 /** The identity of a run list: a hash of everything in it except when it was made and the id itself (M9). */
 export function runListIdentity(list) {
-  const { created: _created, list_id: _id, ...plan } = list;
+  const { created: _created, hash: _hash, ...plan } = list;
   return crypto.createHash('sha256').update(JSON.stringify(plan)).digest('hex').slice(0, 16);
 }
 
@@ -315,19 +315,19 @@ export function preflightRunList({ write = false, doneRows = [] } = {}) {
     const gone = [...a].filter((k) => !b.has(k)).length;
     const added = [...b].filter((k) => !a.has(k)).length;
     if (gone || added) mismatches.push(`factor set: ${gone} cells not in the plan now, ${added} new`);
-    if (file.list_id !== runListIdentity(file)) mismatches.push(`list_id ${file.list_id ?? 'none'} is not the hash of the list`);
-    else if (file.list_id !== fresh.list_id) mismatches.push(`list ${file.list_id}, plan now ${fresh.list_id}`);
+    if (file.hash !== runListIdentity(file)) mismatches.push(`hash ${file.hash ?? 'none'} is not the hash of the list`);
+    else if (file.hash !== fresh.hash) mismatches.push(`list ${file.hash}, plan now ${fresh.hash}`);
   }
   if (write && mismatches.length) {
     if (doneRows.length) throw new Error(`z-runlist.json is not the plan now (${mismatches.join('; ')}) and z-runs.csv has rows: refusing to mix run lists`);
     fs.writeFileSync(RUNLIST, `${JSON.stringify(fresh, null, 1)}\n`);
-    console.log(`z-runlist.json rewritten (${mismatches.join('; ')}): ${fresh.list_id}`);
+    console.log(`z-runlist.json rewritten (${mismatches.join('; ')}): ${fresh.hash}`);
   }
   if (write) {
-    const other = doneRows.filter((r) => r.list_id !== fresh.list_id);
-    if (other.length) throw new Error(`${other.length} rows of z-runs.csv come from another run list (${other[0].list_id || 'none'}): start a new CSV`);
+    const other = doneRows.filter((r) => r.runlist_hash !== fresh.hash);
+    if (other.length) throw new Error(`${other.length} rows of z-runs.csv come from another run list (${other[0].runlist_hash || 'none'}): start a new CSV`);
   }
-  return { planId: fresh.list_id, fileId: file?.list_id ?? null, mismatches };
+  return { planId: fresh.hash, fileId: file?.hash ?? null, mismatches };
 }
 
 /** The runs of the list, cheapest cell first: every content, repeats 1 to 3. */
@@ -427,7 +427,7 @@ async function runAll(runs, csvFile, limit = Infinity, listId = '') {
   console.log(`run-z: cycle rate ${rate} per second`);
   for (const [i, run] of todo.entries()) {
     const { json, error, wallMs } = await runProbe(probeArgs(run, rate));
-    const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, rate, error, list_id: listId };
+    const row = { ...run, ...(json ?? {}), folder: run.folder, way: run.way, level: run.level, rep: run.rep, run_wall_ms: wallMs, rate, error, runlist_hash: listId };
     const planned = resolveRun(run);
     for (const key of ['layout', 'mode', 'tile', 'gap', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain']) row[key] = json?.[key] ?? planned[key];
     row.frames_cap = planned.frames_cap;

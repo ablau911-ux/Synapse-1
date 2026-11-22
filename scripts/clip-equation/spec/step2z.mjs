@@ -241,17 +241,17 @@ function roundTwoChecks(rows, s, corpusRoot) {
     small.error ?? `${small.samplers_in_work ?? 'not reported'} samplers, way_cpu_ns ${small.way_cpu_ns}`, small.samplers_in_work === 0);
   for (const r of rows.filter((x) => x.samplers_in_work !== undefined && x.samplers_in_work !== '')) s.samplerFree.check(r, '0 samplers', r.samplers_in_work, r.samplers_in_work === '0');
   if (typeof runner.runListIdentity !== 'function') {
-    s.listId.check({ folder: 'z-runlist.json' }, 'list_id', 'run-z.mjs has no run list identity', false);
+    s.listId.check({ folder: 'z-runlist.json' }, 'hash', 'run-z.mjs has no run list identity', false);
     return;
   }
   const list = JSON.parse(fs.readFileSync(runner.RUNLIST, 'utf8'));
   const own = runner.runListIdentity(list);
   const preflight = runner.preflightRunList({ write: false });
-  s.listId.check({ folder: 'z-runlist.json' }, `list_id ${own}; plan now ${preflight.planId}`, `file ${list.list_id ?? 'none'}${preflight.mismatches.length ? `; differs: ${preflight.mismatches.join(', ')}` : ''}`,
-    list.list_id === own && own === preflight.planId && preflight.mismatches.length === 0);
+  s.listId.check({ folder: 'z-runlist.json' }, `hash ${own}; plan now ${preflight.planId}`, `file ${list.hash ?? 'none'}${preflight.mismatches.length ? `; differs: ${preflight.mismatches.join(', ')}` : ''}`,
+    list.hash === own && own === preflight.planId && preflight.mismatches.length === 0);
   const full = rows.filter((r) => r.cell);
-  const bad = full.filter((r) => r.list_id !== list.list_id);
-  if (full.length) s.listId.check({ folder: 'CSV' }, `${full.length} full-run rows name ${list.list_id}`, `${full.length - bad.length} do`, bad.length === 0);
+  const bad = full.filter((r) => r.runlist_hash !== list.hash);
+  if (full.length) s.listId.check({ folder: 'CSV' }, `${full.length} full-run rows name ${list.hash}`, `${full.length - bad.length} do`, bad.length === 0);
 }
 
 /** One Gherkin scenario: its equation and a check per row. */
@@ -331,7 +331,7 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     dctx: new Scenario('decoder context', 'M_dctx (zstd estimate; one stream with K_z = 1: ZSTD_estimateDCtxSize, single pass) = ZSTD_sizeof_DCtx after the last frame'),
     ready: new Scenario('time until ready', `t_ready = t_close <= ${INSTANT_MS} ms`),
     samplerFree: new Scenario('no memory sampler in the measured work', 'memory samplers running during the way\'s measured work = 0 (RAM is the OS peak; CPU measured as in way D)'),
-    listId: new Scenario('run list identity', 'z-runlist.json list_id = hash of its plan = hash of the plan rebuilt now (budget, factors, hold-out seed); every full-run row names it'),
+    listId: new Scenario('run list identity', 'z-runlist.json hash = hash of its plan = hash of the plan rebuilt now (budget, factors, hold-out seed); every full-run row names it'),
   };
   s.cpu.pending = 'needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only';
   s.runtime.pending = 'needs the full run; z-pilot.md gives T';

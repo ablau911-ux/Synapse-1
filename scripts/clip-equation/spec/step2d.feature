@@ -107,7 +107,7 @@ Feature: Way D encodes every new frame of the corpus with every H.264 encoder
   Scenario: D: run list identity
     Given results/d-runlist.json and the plan of run-d.mjs
     Then the list's id is the hash of its runs, equals the id of the plan regenerated now, and every full-run row names it
-    # Equation: list_id = hash(runs) = hash(plan now); row.list_id = list_id | Known: exact (M9, M3 of the re-review)
+    # Equation: list hash = hash(runs) = hash(plan now); row.runlist_hash = list hash | Known: exact (M9, M3 of the re-review)
 
   Scenario: D: bytes against the prior
     Given a finished run in quality mode

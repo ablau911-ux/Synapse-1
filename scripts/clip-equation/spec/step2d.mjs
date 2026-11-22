@@ -288,13 +288,13 @@ function checks(rows, root) {
     },
     'D: run list identity': () => {
       const list = readRunList();
-      if (!list) return { value: 'list_id', measured: `no ${RUNLIST}`, pass: false };
-      if (typeof runD.runListIdentity !== 'function') return { value: 'list_id', measured: `run-d.mjs has no run list identity${runD.loadError ? ` (${runD.loadError})` : ''}`, pass: false };
+      if (!list) return { value: 'hash', measured: `no ${RUNLIST}`, pass: false };
+      if (typeof runD.runListIdentity !== 'function') return { value: 'hash', measured: `run-d.mjs has no run list identity${runD.loadError ? ` (${runD.loadError})` : ''}`, pass: false };
       const own = runD.runListIdentity(list);
       const plan = runD.planIdentity(list.repeats ?? 3);
       const full = rows.filter((r) => r.grid && r.grid !== 'pilot');
-      const bad = full.filter((r) => r.list_id !== list.list_id).map((r) => `${label(r)}: ${r.list_id || 'no list_id'}`);
-      return { value: `list_id ${own}`, measured: `file ${list.list_id ?? 'none'}, plan now ${plan}, ${full.length - bad.length}/${full.length} full-run rows${misses(bad)}`, pass: list.list_id === own && own === plan && bad.length === 0 };
+      const bad = full.filter((r) => r.runlist_hash !== list.hash).map((r) => `${label(r)}: ${r.runlist_hash || 'no runlist_hash'}`);
+      return { value: `hash ${own}`, measured: `file ${list.hash ?? 'none'}, plan now ${plan}, ${full.length - bad.length}/${full.length} full-run rows${misses(bad)}`, pass: list.hash === own && own === plan && bad.length === 0 };
     },
     'D: bytes against the prior': needRows(() => {
       const runs = okRows(rows).filter((r) => r.rate === 'quality' && r.repeat === '1');

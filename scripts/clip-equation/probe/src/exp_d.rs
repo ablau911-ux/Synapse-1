@@ -169,7 +169,8 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     let name = args.text_or("name", "").to_owned();
     let vendor = args.text_or("vendor", "").to_owned();
     let hardware = args.flag("hw", !vendor.is_empty());
-    let rate = args.text_or("rate", "quality").to_owned();
+    // `rate=` is the cycle-counter rate (`exp-rate`), so the rate mode has its own key.
+    let rate = args.text_or("ratemode", "quality").to_owned();
     let q: u32 = args.number("q", 70)?;
     let tau: u32 = args.number("gop", 20)?;
     let hint = args.flag("hint", true);

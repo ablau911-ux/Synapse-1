@@ -112,7 +112,7 @@ function runOne(run, cfg) {
   const scratch = path.join(SCRATCH, `${process.pid}-${Date.now()}`);
   const flash = CORPUS.flash;
   const argv = ['exp-d', `folder=${path.join(CORPUS.root, run.folder)}`, `encoder=${run.enc.way}`, `name=${run.enc.name}`,
-    `vendor=${run.enc.vendor}`, `hw=${run.enc.hw}`, `q=${run.q}`, `gop=${run.tau}`, `hint=${run.hint}`, `rate=${run.rate}`,
+    `vendor=${run.enc.vendor}`, `hw=${run.enc.hw}`, `q=${run.q}`, `gop=${run.tau}`, `hint=${run.hint}`, `ratemode=${run.rate}`,
     `beta=${run.beta}`, `scratch=${scratch}`, `repeat=${run.repeat}`, rateArg(), `window_width=${cfg.width}`,
     `flash=${flash.bgr.join(':')}:${flash.box_left_fraction}:${flash.box_top}:${flash.box_width}:${flash.box_height}:${flash.min_pixels}`];
   const start = Date.now();

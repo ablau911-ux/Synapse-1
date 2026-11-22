@@ -49,7 +49,7 @@ impl DecodedFrame {
     }
 }
 
-/// The Source Reader of one `clip.mp4`, with RGB32 output.
+/// The Source Reader of one segment file (`segment-NNNN.mp4`), with RGB32 output.
 pub(super) struct ClipDecoder {
     // Field order matters: the reader is released before Media Foundation
     // shuts down (fields drop in declaration order).

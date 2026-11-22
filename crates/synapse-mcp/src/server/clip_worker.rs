@@ -335,7 +335,7 @@ impl ClipWorker {
     }
 
     /// B10: a `.part` file is the segment that was being encoded; it is
-    /// deleted and encoded again from its raw frames.
+    /// deleted and encoded again from its waiting frames.
     fn discard_part_files(&self) {
         if let Ok(read) = std::fs::read_dir(&self.folder) {
             for entry in read.filter_map(Result::ok) {
@@ -347,7 +347,7 @@ impl ClipWorker {
     }
 
     /// B8: encodes a segment into `segment-NNNN.mp4.part`, flushes it, renames
-    /// it, records its checkpoint, and only then deletes its raw frames.
+    /// it, records its checkpoint, and only then deletes its waiting frames.
     fn commit(
         &self,
         clip: &ClipJson,
@@ -360,7 +360,7 @@ impl ClipWorker {
         let samples = self.samples(lines, range, start_ms, end_ms);
         if samples.is_empty() {
             return Err(format!(
-                "segment {index} has no raw frame to start from (instants {}..={})",
+                "segment {index} has no waiting frame to start from (instants {}..={})",
                 lines[range.first].instant, lines[range.last].instant
             ));
         }
@@ -497,7 +497,7 @@ impl ClipWorker {
         })
     }
 
-    /// Deletes the raw frames of a committed segment, except the last picture
+    /// Deletes the waiting frames of a committed segment, except the last picture
     /// the encoder could draw: it is the picture shown at the start of the
     /// next segment, also when this segment's last frame was unreadable. The
     /// seed is deleted once a newer good picture replaces it.

@@ -1,6 +1,6 @@
 //! The clip folder (docs/clip-recorder-plan.md, version 4.1, "Clip folder"):
 //! its file names, `clip.json` with the clip state, `frames.jsonl` lines, the
-//! raw frames waiting in `waiting/`, and the active-clip registry.
+//! waiting frames in `waiting/`, and the active-clip registry.
 //!
 //! The live part (`capture_clip`), the clip worker and the viewer all read and
 //! write a clip only through this module. `clip.json` is always replaced
@@ -58,7 +58,7 @@ pub(super) fn is_part_file(path: &Path) -> bool {
         .is_some_and(|extension| extension == "part")
 }
 
-/// The raw frame of instant k: tightly packed B, G, R rows at the captured
+/// The waiting frame of instant k: tightly packed B, G, R rows at the captured
 /// size (the size is in its `frames.jsonl` line), compressed whole with zstd
 /// (A8). Each file stands alone.
 pub(super) fn raw_frame_path(folder: &Path, instant: u64) -> PathBuf {

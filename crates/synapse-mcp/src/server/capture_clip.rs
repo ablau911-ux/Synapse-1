@@ -7,8 +7,8 @@
 //! is on disk. The recorder thread then handles one instant s_k every 1 / f:
 //! it asks the clip observer (`synapse_capture::ClipObserver`) for the identity
 //! of the frame shown at s_k, writes only a line for a repeated frame, and for
-//! a new frame checks the privacy gate, reads it back and writes it raw into
-//! `waiting/` at its captured size. The live part does no scaling and no
+//! a new frame checks the privacy gate, reads it back and writes it into
+//! `waiting/` at its captured size (B, G, R compressed with zstd). The live part does no scaling and no
 //! encoding (C5); the clip worker forms and encodes segments from
 //! `frames.jsonl`.
 //!
@@ -941,7 +941,8 @@ mod live {
                 recorded_width: frame.width * scale,
                 recorded_height: frame.height * scale,
             };
-            self.write_raw(0, &pixels.bgra).map_err(internal_error)?;
+            self.write_waiting(0, &pixels.bgra)
+                .map_err(internal_error)?;
             self.write_line(&self.new_line(0, &frame))
                 .map_err(internal_error)?;
             self.last_recorded = Some(frame);
@@ -1088,7 +1089,7 @@ mod live {
                 tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
                 StopReason::CaptureFailed
             })?;
-            if let Err(error) = self.write_raw(k, &pixels.bgra) {
+            if let Err(error) = self.write_waiting(k, &pixels.bgra) {
                 tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
                 self.lost.push(LostInstant {
                     instant: k,
@@ -1160,9 +1161,9 @@ mod live {
                 .map_err(|error| format!("frames.jsonl write failed: {error}"))
         }
 
-        /// One raw frame file in `waiting/` at its captured size (A8: B, G, R
+        /// One waiting frame in `waiting/` at its captured size (A8: B, G, R
         /// compressed with zstd through the recording's one context).
-        fn write_raw(&mut self, k: u64, bgra: &[u8]) -> Result<(), String> {
+        fn write_waiting(&mut self, k: u64, bgra: &[u8]) -> Result<(), String> {
             let written = self.waiting.write(&self.plan.folder, k, bgra)?;
             self.disk
                 .wrote(k, written, bgra.len() as u64 / BGRA_BYTES_PER_PIXEL);

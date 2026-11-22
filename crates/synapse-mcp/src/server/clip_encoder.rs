@@ -1,7 +1,7 @@
 //! H.264 segment encoder on the Media Foundation Sink Writer
 //! (docs/clip-recorder-plan.md, version 4.1, section B, operations B3 to B7).
 //!
-//! `encode_segment` turns the raw frames of one segment into one H.264
+//! `encode_segment` turns the waiting frames of one segment into one H.264
 //! (High profile, yuv420) file:
 //!
 //! - B3: each pixel is duplicated σ × σ and converted to NV12; above the
@@ -63,7 +63,7 @@ const HNS_PER_MS: i64 = 10_000;
 /// Upper bound on transforms walked when looking for the encoder in the chain.
 const MAX_TRANSFORMS_PER_STREAM: u32 = 8;
 
-/// One frame of a segment: its raw file (captured B, G, R rows, zstd), its captured
+/// One frame of a segment: its waiting file (captured B, G, R rows, zstd), its captured
 /// size, and its time within the segment (B5).
 pub(super) struct SegmentSample {
     pub(super) raw: std::path::PathBuf,
@@ -100,12 +100,12 @@ pub(super) struct EncodedSegment {
     /// The samples (index in `SegmentInput::samples`) whose waiting frame
     /// could not be read back, with the loss cause.
     pub(super) unreadable: Vec<(usize, LossCause)>,
-    /// The raw file of the last picture drawn: the seed of the next segment.
+    /// The waiting file of the last picture drawn: the seed of the next segment.
     pub(super) last_good: Option<PathBuf>,
 }
 
 /// Encodes one segment into `path` (the `.part` file) and finalizes it. B4:
-/// on any encoder failure the segment is encoded once more from its raw
+/// on any encoder failure the segment is encoded once more from its waiting
 /// frames with hardware transforms off.
 pub(super) fn encode_segment(path: &Path, input: &SegmentInput) -> Result<EncodedSegment, String> {
     encode_once(path, input, true).or_else(|hardware_error| {

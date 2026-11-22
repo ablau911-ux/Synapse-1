@@ -83,6 +83,8 @@ const COLUMNS = [...OPTION_COLUMNS, ...MEASURED_COLUMNS, ...KNOWN_COLUMNS, ...PA
 
 const folders = () => SCENARIOS.flatMap((s) => SIZES.map((z) => `${s}-${z}`));
 const optionKey = (r) => OPTION_COLUMNS.map((c) => String(r[c] ?? '')).join('|');
+export const plannedKey = optionKey;
+export const rowKey = optionKey;
 
 /** The full run list: Grid A-Z, then Grid B, for every folder; each configuration × 3 repeats. */
 export function fullPlan() {
@@ -119,7 +121,7 @@ const BUDGET_S = 12 * 3600;
 const HOLD_OUT_SHARE = 0.2;
 const HOLD_OUT_SEED = 20261122;
 const PILOT_PX = 1920 * 1080;
-const RUNLIST = path.join(RESULTS, 'z-runlist.json');
+export const RUNLIST = path.join(RESULTS, 'z-runlist.json');
 
 /** Every runnable way and option level swept over every level; ZW0 and the corpus writer's call once. */
 function wayConfigs() {
@@ -237,7 +239,7 @@ export function buildRunList(budgetS = BUDGET_S) {
 }
 
 /** The runs of the list, cheapest cell first: every content, repeats 1 to 3. */
-function listRuns() {
+export function listRuns() {
   const list = JSON.parse(fs.readFileSync(RUNLIST, 'utf8'));
   return list.cells.filter((c) => c.status !== 'predicted').flatMap((c) => SCENARIOS.flatMap((sc) => Array.from({ length: REPEATS }, (_, i) => {
     const { id, size, status, cost_s: _cost, ...config } = c;

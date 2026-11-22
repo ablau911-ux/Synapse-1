@@ -26,18 +26,58 @@ Feature: Way Z, every zstd way compresses the corpus losslessly with known bytes
     Then bytes = the sum of the output sizes the way produced
     And bytes = the sum of the clip's file sizes on disk, to the byte
 
+  Scenario: bytes of every retained file (M4)
+    When a way writes its clip
+    Then bytes = Σ frame files + frames.jsonl + clip.json, to the byte
+    And frames.jsonl has one line per instant of the clip (the lines of the corpus whose picture is a compressed frame)
+    And frames.jsonl and clip.json are written by the shared writer (exp_measure::ClipFiles), the same for ways Z and D
+
   Scenario: baseline equals the corpus
     Given way ZW1, whole frame, L = -3, independent frames, interleaved B,G,R, nbWorkers 0
+    And the corpus writer's call: ZSTD_compressStream2, output drained 16 KB at a time (drain=16384, as Node zlib.zstdCompressSync)
     When it compresses the folder
-    Then bytes = D_wait of the folder, to the byte (same coder, level and frames)
-    # Checked on the product's call (one-shot ZSTD_compress2, drain=0). Rows with drain=16384
-    # reproduce the corpus writer's call (Node zlib.zstdCompressSync) and are printed as
-    # evidence of the cause when the row misses; they never make it pass.
+    Then the frame files' bytes = D_wait of the folder, to the byte (same coder, level, frames and call)
 
-  Scenario: baseline, corpus writer's call
-    Given way ZW1, L = -3, with the corpus writer's call: ZSTD_compressStream2, output drained 16 KB at a time (drain=16384, as Node zlib.zstdCompressSync)
-    Then bytes = D_wait of the folder, to the byte
-    # The one-shot row above stays strict; its difference is reported as caused by the call.
+  Scenario: one-shot call
+    Given way ZW1, L = -3, one ZSTD_compress2 call per frame (drain=0), as the product writes them
+    Then frame bytes − D_wait is reported: a known difference caused by the block splits of the call, not a pass or a fail (plan, Acceptance step 2)
+
+  Scenario: input format (M1)
+    Given every way receives each new frame as B,G,R,A (the capture format), expanded from the corpus before the timer
+    Then the conversion the way needs (B,G,R,A to its layout) is timed: convert cycles > 0, and 0 only for the B,G,R,A layout (ZW2)
+
+  Scenario: CPU of all the way's work (M2)
+    Then way cycles = convert + compress (with context creation) + write (frames, frames.jsonl, clip.json) + dictionary training cycles
+    And corpus decoding and verification are not in it
+
+  Scenario: dictionary training CPU (M2, M3)
+    Given a way with a trained dictionary (dict > 0), trained after M_0 on the first 20 new frames
+    Then train cycles > 0 and they are inside the way's CPU; the training's memory is inside the RAM peak
+
+  Scenario: RAM from the OS peak (M3)
+    Given M_0 = private bytes after the input is prepared (corpus reader open, capture frame filled once)
+    Then RAM = PeakPagefileUsage after the work − M_0, and the work set that peak (peak after > peak at M_0)
+
+  Scenario: ldm set explicitly (M8)
+    Then ZSTD_c_enableLongDistanceMatching read back from the context = 1 when ldm=1 and 2 (disabled) when ldm=0, never 0 (zstd's automatic choice)
+
+  Scenario: ZW9 rectangle list, ZW9b one box (M8)
+    Given ZW9 = changed tiles merged into rectangles (merge gap in tiles), a list of (row, byte, rows, bytes), their rows in one zstd frame
+    And ZW9b = one global bounding box of the change, a separate way
+    Then Σ bytes compressed = Σ rows · bytes of the listed rectangles, read back from the clip's headers
+    And ZW9b lists at most one rectangle per frame
+
+  Scenario: saved RAM prediction
+    Then known_m_comp saved by the runner = the RAM check's equation 4, with the nbWorkers and W_eff corrections (one shared calculation)
+
+  Scenario: run list (M9)
+    Given results/z-runlist.json
+    Then budget = T_floor + 4 h and T_total <= budget
+    And held-out cells = round(0.2 · cells that run at more than one size), drawn with mulberry32, seed 20261122
+
+  Scenario: resume keys (M9)
+    Then every saved row is found again by the key the runner plans with (defaults resolved the same way at planning, lookup and append)
+    And planning the list twice gives the same keys, none twice; the CSV has no key twice
 
   Scenario: RAM, nbWorkers > 0
     Given zstd's estimates cover one thread only

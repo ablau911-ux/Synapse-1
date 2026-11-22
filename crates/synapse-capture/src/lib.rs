@@ -16,7 +16,7 @@ pub use backend::{CaptureBackend, CaptureBackendPreference};
 // WinRT `SoftwareBitmap` helpers in `bitmap` stay `#[cfg(windows)]`, so off
 // Windows this glob re-exports only the BGRA entry point that `synapse-mcp` calls.
 pub use bitmap::*;
-pub use config::{CaptureConfig, CaptureTarget, ResolvedCaptureTarget};
+pub use config::{CaptureConfig, CaptureTarget, ClipSource, ResolvedCaptureTarget};
 pub use controller::{
     CaptureController, CaptureHandle, register_capture_metrics, resolve_capture_target,
     spawn_capture_loop, validate_hwnd,
@@ -28,9 +28,9 @@ pub use frame::*;
 // The clip recorder's own observer (plan section O); Windows only.
 #[cfg(windows)]
 pub use platform::{
-    ClipObserver, ClipSource, HNS_PER_MS, MAX_SELECTION_LATENESS_INSTANTS, MIN_WINDOWS_BUILD,
-    OBSERVE_SLOTS, ObservedFrame, ObservedPixels, ObserverSettings, ObserverStats,
-    REQUESTED_UPDATE_INTERVAL_MS, current_thread_cpu_hns, now_hns, windows_build,
+    ClipObserver, HNS_PER_MS, MAX_SELECTION_LATENESS_INSTANTS, MIN_WINDOWS_BUILD, OBSERVE_SLOTS,
+    ObservedFrame, ObservedPixels, ObserverSettings, ObserverStats, REQUESTED_UPDATE_INTERVAL_MS,
+    check_windows_build, current_thread_cpu_hns, now_hns, windows_build,
 };
 pub use stats::{CaptureStats, CaptureThreadPriority};
 

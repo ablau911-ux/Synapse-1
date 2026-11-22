@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rmcp::{RoleServer, service::RequestContext};
 use serde_json::json;
+use synapse_capture::ClipSource;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
@@ -56,19 +57,11 @@ const FIRST_FRAME_TIMEOUT_MS: u64 = 3_000;
 const CLIP_SOURCE_OF_TRUTH: &str =
     "clip folder files (clip.json, frames.jsonl, waiting/, segment-NNNN.mp4) + target metadata";
 
-/// What to record.
-#[derive(Clone, Copy, Debug)]
-enum ClipTarget {
-    Window { hwnd: i64 },
-    Monitor { monitor_index: u32 },
-}
-
-impl ClipTarget {
-    fn id(self) -> String {
-        match self {
-            Self::Window { hwnd } => format!("window:{hwnd:#x}"),
-            Self::Monitor { monitor_index } => format!("monitor:{monitor_index}"),
-        }
+/// The target id in error data: `window:0x…` or `monitor:N`.
+fn target_id(target: ClipSource) -> String {
+    match target {
+        ClipSource::Window { hwnd } => format!("window:{hwnd:#x}"),
+        ClipSource::Monitor { monitor_index } => format!("monitor:{monitor_index}"),
     }
 }
 
@@ -192,7 +185,7 @@ pub(super) fn stop_failed_recording(folder: &std::path::Path) {
 /// A validated recording request.
 struct ClipPlan {
     clip_id: String,
-    target: ClipTarget,
+    target: ClipSource,
     /// The window's process name for the privacy gate; monitors read the
     /// foreground app on every instant and every visible window each second.
     app: Option<String>,
@@ -206,8 +199,8 @@ impl ClipPlan {
     fn privacy_stop(&self) -> Option<StopReason> {
         let foreground_app;
         let app = match self.target {
-            ClipTarget::Window { .. } => self.app.as_deref(),
-            ClipTarget::Monitor { .. } => {
+            ClipSource::Window { .. } => self.app.as_deref(),
+            ClipSource::Monitor { .. } => {
                 foreground_app = synapse_a11y::current_foreground_context()
                     .ok()
                     .map(|context| context.process_name);
@@ -222,7 +215,7 @@ impl ClipPlan {
     /// E6: for a monitor, an excluded app visible anywhere on it stops the clip,
     /// even when it is not in front.
     fn excluded_app_visible(&self) -> bool {
-        let ClipTarget::Monitor { monitor_index } = self.target else {
+        let ClipSource::Monitor { monitor_index } = self.target else {
             return false;
         };
         synapse_a11y::visible_top_level_window_contexts()
@@ -248,7 +241,7 @@ impl SynapseService {
         let target = self
             .capture_clip_target(&params, request_context)
             .map_err(|error| with_clip_context(error, "session_target"))?;
-        let target_id = target.id();
+        let target_id = target_id(target);
         let m3_state = self.m3_state_handle();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let thread = std::thread::Builder::new()
@@ -279,9 +272,9 @@ impl SynapseService {
         &self,
         params: &CaptureClipParams,
         request_context: &RequestContext<RoleServer>,
-    ) -> Result<ClipTarget, ErrorData> {
+    ) -> Result<ClipSource, ErrorData> {
         if let Some(monitor_index) = params.monitor_index {
-            return Ok(ClipTarget::Monitor { monitor_index });
+            return Ok(ClipSource::Monitor { monitor_index });
         }
         let session_target = self.request_session_target(request_context)?;
         let hwnd = super::m1_tools::perception_window_hwnd(
@@ -295,7 +288,7 @@ impl SynapseService {
                 "screenshot operation=record requires window_hwnd, monitor_index, or a bound session window target (set_target)",
             )
         })?;
-        Ok(ClipTarget::Window { hwnd })
+        Ok(ClipSource::Window { hwnd })
     }
 }
 
@@ -387,7 +380,7 @@ type StartSender = tokio::sync::oneshot::Sender<Result<CaptureClipResponse, Erro
 /// until a stop. The start result goes to the `record` call through `started`.
 fn run_recorder_thread(
     m3_state: &SharedM3State,
-    target: ClipTarget,
+    target: ClipSource,
     params: &CaptureClipParams,
     started: StartSender,
 ) {
@@ -430,7 +423,7 @@ impl Drop for RecorderClaim<'_> {
 /// opening storage may block.
 fn capture_clip_plan(
     m3_state: &SharedM3State,
-    target: ClipTarget,
+    target: ClipSource,
     params: &CaptureClipParams,
 ) -> Result<ClipPlan, ErrorData> {
     let privacy = {
@@ -483,10 +476,10 @@ fn capture_clip_plan(
         ));
     }
     let app = match target {
-        ClipTarget::Window { hwnd } => synapse_a11y::foreground_context(hwnd)
+        ClipSource::Window { hwnd } => synapse_a11y::foreground_context(hwnd)
             .ok()
             .map(|context| context.process_name),
-        ClipTarget::Monitor { .. } => None,
+        ClipSource::Monitor { .. } => None,
     };
     let plan = ClipPlan {
         clip_id,
@@ -621,10 +614,9 @@ mod live {
     use super::super::clip_worker::ProcessorBudget;
     use super::super::{CaptureClipResponse, ErrorData};
     use super::{
-        CLIP_JSON_FILE, ClipPlan, ClipTarget, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS,
-        FIRST_FRAME_TIMEOUT_MS, FRAMES_FILE, RECORD_FPS, REFERENCE_REFRESH_HZ, RecordingControl,
-        StartSender, file_size_and_sha256, internal_error, scale_for_height, stop_error,
-        thread_failed,
+        CLIP_JSON_FILE, ClipPlan, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS, FIRST_FRAME_TIMEOUT_MS,
+        FRAMES_FILE, RECORD_FPS, REFERENCE_REFRESH_HZ, RecordingControl, StartSender,
+        file_size_and_sha256, internal_error, scale_for_height, stop_error, thread_failed,
     };
     use crate::m1::mcp_error;
 
@@ -683,7 +675,6 @@ mod live {
     /// A1: what this machine is; no constant of one PC in the code.
     struct Machine {
         threads: u32,
-        windows_build: u32,
     }
 
     impl Machine {
@@ -692,7 +683,6 @@ mod live {
                 threads: std::thread::available_parallelism().map_or(1, |threads| {
                     u32::try_from(threads.get()).unwrap_or(u32::MAX)
                 }),
-                windows_build: synapse_capture::windows_build().unwrap_or(0),
             }
         }
     }
@@ -849,7 +839,6 @@ mod live {
         /// Held for the life of the recording; released when it is dropped,
         /// after `finish` wrote the stop.
         _recorder_lock: RecorderLock,
-        source: ClipSource,
         machine: Machine,
         observer: ClipObserver,
         frames: std::io::BufWriter<std::fs::File>,
@@ -868,16 +857,14 @@ mod live {
         /// A1, A3 to A5 and frame zero.
         fn start(plan: &'a ClipPlan) -> Result<Self, ErrorData> {
             let machine = Machine::read();
-            if machine.windows_build < synapse_capture::MIN_WINDOWS_BUILD {
-                return Err(mcp_error(
-                    error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED,
-                    format!(
-                        "screenshot operation=record needs Windows 10 version 1903 (build {}) or later; this is build {}",
-                        synapse_capture::MIN_WINDOWS_BUILD,
-                        machine.windows_build
-                    ),
-                ));
-            }
+            // The observer owns the Windows build rule; applied before the
+            // clip folder exists, so an old Windows leaves nothing behind.
+            synapse_capture::check_windows_build().map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("screenshot operation=record: {error}"),
+                )
+            })?;
             std::fs::create_dir_all(plan.folder.join(WAITING_DIR)).map_err(|error| {
                 internal_error(format!(
                     "could not create {}: {error}",
@@ -891,11 +878,7 @@ mod live {
                 .create(&plan.folder)
                 .map_err(internal_error)?;
             ClipRegistry::add(&plan.clip_id, &plan.folder).map_err(internal_error)?;
-            let source = match plan.target {
-                ClipTarget::Window { hwnd } => ClipSource::Window { hwnd },
-                ClipTarget::Monitor { monitor_index } => ClipSource::Monitor { monitor_index },
-            };
-            let observer = ClipObserver::start(source, instant_hns()).map_err(|error| {
+            let observer = ClipObserver::start(plan.target, instant_hns()).map_err(|error| {
                 mcp_error(
                     error.code(),
                     format!("screenshot operation=record: {error}"),
@@ -911,7 +894,6 @@ mod live {
             let mut recording = Self {
                 plan,
                 _recorder_lock: recorder_lock,
-                source,
                 machine,
                 observer,
                 frames: std::io::BufWriter::new(frames_file),
@@ -1169,7 +1151,7 @@ mod live {
             // SAFETY: one out-parameter.
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut point) }
                 .ok()?;
-            let (left, top) = self.source.origin()?;
+            let (left, top) = self.plan.target.origin()?;
             Some([point.x - left, point.y - top])
         }
 
@@ -1193,21 +1175,21 @@ mod live {
         fn window_closed(&self) -> bool {
             match self.plan.target {
                 // SAFETY: IsWindow accepts any handle value.
-                ClipTarget::Window { hwnd } => !unsafe {
+                ClipSource::Window { hwnd } => !unsafe {
                     windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(window_handle(hwnd)))
                 }
                 .as_bool(),
-                ClipTarget::Monitor { .. } => false,
+                ClipSource::Monitor { .. } => false,
             }
         }
 
         fn window_minimized(&self) -> bool {
             match self.plan.target {
                 // SAFETY: IsIconic accepts any handle value.
-                ClipTarget::Window { hwnd } => unsafe {
+                ClipSource::Window { hwnd } => unsafe {
                     windows::Win32::UI::WindowsAndMessaging::IsIconic(window_handle(hwnd)).as_bool()
                 },
-                ClipTarget::Monitor { .. } => false,
+                ClipSource::Monitor { .. } => false,
             }
         }
 
@@ -1346,9 +1328,9 @@ mod live {
         }
     }
 
-    fn target_info(target: ClipTarget) -> ClipTargetInfo {
+    fn target_info(target: ClipSource) -> ClipTargetInfo {
         match target {
-            ClipTarget::Window { hwnd } => {
+            ClipSource::Window { hwnd } => {
                 let context = synapse_a11y::foreground_context(hwnd).ok();
                 ClipTargetInfo {
                     kind: "window".to_owned(),
@@ -1359,7 +1341,7 @@ mod live {
                     title: context.map(|c| c.window_title),
                 }
             }
-            ClipTarget::Monitor { monitor_index } => ClipTargetInfo {
+            ClipSource::Monitor { monitor_index } => ClipTargetInfo {
                 kind: "monitor".to_owned(),
                 monitor_index: Some(monitor_index),
                 ..ClipTargetInfo::default()
@@ -1379,7 +1361,7 @@ mod live {
             }
             std::thread::sleep(Duration::from_millis(instant_ms(1)));
         }
-        if let ClipTarget::Window { hwnd } = plan.target
+        if let ClipSource::Window { hwnd } = plan.target
             // SAFETY: IsWindow accepts any handle value.
             && !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(window_handle(hwnd))) }
                 .as_bool()

@@ -14,9 +14,9 @@ pub use bitmap::{
 };
 pub use capture::{run_dxgi_capture, run_graphics_capture};
 pub use clip_observer::{
-    ClipObserver, ClipSource, HNS_PER_MS, MAX_SELECTION_LATENESS_INSTANTS, MIN_WINDOWS_BUILD,
-    OBSERVE_SLOTS, ObservedFrame, ObservedPixels, ObserverSettings, ObserverStats,
-    REQUESTED_UPDATE_INTERVAL_MS, current_thread_cpu_hns, now_hns, windows_build,
+    ClipObserver, HNS_PER_MS, MAX_SELECTION_LATENESS_INSTANTS, MIN_WINDOWS_BUILD, OBSERVE_SLOTS,
+    ObservedFrame, ObservedPixels, ObserverSettings, ObserverStats, REQUESTED_UPDATE_INTERVAL_MS,
+    check_windows_build, current_thread_cpu_hns, now_hns, windows_build,
 };
 pub use coords::{
     screen_to_window as screen_to_window_impl, window_to_screen as window_to_screen_impl,

@@ -57,7 +57,7 @@ use windows_capture::window::Window;
 use super::capture::union_dirty_regions;
 use super::common::hwnd_from_i64;
 use super::target::validate_hwnd;
-use crate::CaptureError;
+use crate::{CaptureError, ClipSource};
 
 /// Windows 10 version 1903 (E5): windows-capture 2.0.0 needs it.
 pub const MIN_WINDOWS_BUILD: u32 = 18_362;
@@ -75,13 +75,6 @@ const MAP_RETRY_SLEEP_MS: u64 = 1;
 /// 100 ns units per millisecond (composition times are in 100 ns units).
 pub const HNS_PER_MS: i64 = 10_000;
 const HNS_PER_SECOND: i64 = 10_000_000;
-
-/// What the clip records.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClipSource {
-    Window { hwnd: i64 },
-    Monitor { monitor_index: u32 },
-}
 
 /// The session settings Windows granted for this clip (O1).
 #[allow(
@@ -284,6 +277,25 @@ pub fn windows_build() -> Option<u32> {
         .position(|&unit| unit == 0)
         .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..end]).trim().parse().ok()
+}
+
+/// O1: clip recording refuses Windows builds below `MIN_WINDOWS_BUILD`.
+/// `ClipObserver::start` applies it; the recorder applies it before it
+/// creates a clip folder (A2).
+///
+/// # Errors
+///
+/// `CAPTURE_GRAPHICS_API_UNSUPPORTED` below `MIN_WINDOWS_BUILD`.
+pub fn check_windows_build() -> Result<(), CaptureError> {
+    let build = windows_build().unwrap_or(0);
+    if build < MIN_WINDOWS_BUILD {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!(
+                "clip recording needs Windows 10 version 1903 (build {MIN_WINDOWS_BUILD}) or later; this is build {build}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// A frame held in a slot for an instant.
@@ -584,14 +596,7 @@ impl ClipObserver {
     /// `CAPTURE_GRAPHICS_API_UNSUPPORTED` below `MIN_WINDOWS_BUILD` or when the
     /// session cannot start; `CAPTURE_TARGET_INVALID` for a bad window or monitor.
     pub fn start(source: ClipSource, instant_hns: i64) -> Result<Self, CaptureError> {
-        let build = windows_build().unwrap_or(0);
-        if build < MIN_WINDOWS_BUILD {
-            return Err(CaptureError::GraphicsApiUnsupported {
-                detail: format!(
-                    "clip recording needs Windows 10 version 1903 (build {MIN_WINDOWS_BUILD}) or later; this is build {build}"
-                ),
-            });
-        }
+        check_windows_build()?;
         if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
             return Err(CaptureError::GraphicsApiUnsupported {
                 detail: "Windows Graphics Capture is not supported on this system".to_owned(),

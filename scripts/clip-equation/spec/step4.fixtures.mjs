@@ -133,6 +133,20 @@ export function requestedFixture() {
 }
 
 /**
+ * H5 round 4: a refusal into an existing valid group. typing, scroll, ui and flash run valid at q 40
+ * (3 repeats each); typing requested q 50 ran 2 valid repeats, its repeat 3 was refused and recorded
+ * under q 40. `withRefusal` false drops that one row, so both fits can be compared.
+ */
+export function refusalIntoValidFixture(withRefusal = true) {
+  const req = (r) => ({ ...r, q_req: r.q_req ?? r.q, tau_f_req: r.tau_f, hint_req: r.hint, rate_req: r.rate, beta_req: r.beta });
+  const row = (scenario, q, repeat, o = {}) => req(dRow({ folder: `${scenario}-640x360`, scenario, q, repeat, r: scenario === 'flash' ? 'n/a' : 1, ...o }));
+  const rows = ['typing', 'scroll', 'ui', 'flash'].flatMap((s) => [1, 2, 3].map((k) => row(s, 40, k)));
+  rows.push(row('typing', 50, 1), row('typing', 50, 2));
+  if (withRefusal) rows.push(row('typing', 40, 3, { q_req: 50, status: 'setting_refused:q', bytes: 9e9, r: 0.5 }));
+  return rows;
+}
+
+/**
  * H6: validity blocks, a known-result miss is reported. D typing q 50 has pass_keyframes = 0 (#297) and
  * stays eligible; D scroll q 50 has status ocr_error; Z ZW1 has pass_ramOs = 0 (RAM-base rule breach).
  */

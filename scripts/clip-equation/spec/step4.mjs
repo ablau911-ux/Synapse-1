@@ -17,13 +17,15 @@ import { D_ROW_RULES, readRuns } from './step2d.mjs';
 import { PENDING, relErr, runFeature } from './feature.mjs';
 import { runListIdentity as zListId } from '../runs/run-z.mjs';
 import { D_KEY, runListIdentity as dListId } from '../runs/run-d.mjs';
-import { D_BYTES_TRUTH, D_META, RAM_TRUTH, Z_TRUTH, dBytesCase, gapFixture, ramFixture, requestedFixture, sizeFixture, targetFixture, validityFixture, zBytesPerFrame } from './step4.fixtures.mjs';
+import { D_BYTES_TRUTH, D_META, RAM_TRUTH, Z_TRUTH, dBytesCase, gapFixture, ramFixture, refusalIntoValidFixture, requestedFixture, sizeFixture, targetFixture, validityFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
 const FEATURE = path.join(HERE, 'step4.feature');
 export const CONFIG = JSON.parse(fs.readFileSync(path.join(BASE, 'fit', 'fit-config.json'), 'utf8'));
 const FIT_MODULE = path.join(BASE, 'fit', 'fit.mjs');
+/** fit/results.mjs (J and the best way), loaded by main for the H5 round 4 row. */
+let results = null;
 
 /** Z key columns: the configured list plus every option column the runner wrote before `rep` (H1). */
 const zKeyColumns = (row) => { const c = Object.keys(row); const i = c.indexOf('rep'); return [...new Set([...CONFIG.z_key_columns, ...(i > 0 ? c.slice(0, i) : [])])]; };
@@ -264,6 +266,28 @@ function findingChecks(F, inputs) {
       const say = (n, c) => `${n}: ${c ? (c.eligible ? `eligible x ${c.runs}` : `blocked (${c.clause})`) : 'absent'}`;
       return { value: 'typing q50 blocked; typing q40 eligible with its own 3 repeats; the refused repeat listed apart; scroll q50 blocked; ui q50 eligible', measured: [say('typing q50', t50), say('typing q40', t40), `refused apart: ${refused.map((c) => `${c.status} x ${c.runs}`).join(', ') || 'none'}`, say('scroll q50', s50), say('ui q50', u50)].join('; '), pass: ok };
     }),
+    'H5 a refusal into a valid group leaves its O, J and text verdicts unchanged': need(() => {
+      const R = results;
+      if (!R?.costJ) return { value: '-', measured: 'no fit/results.mjs', pass: false };
+      const fitOf = (w) => F.buildFitFromRows({ zRows: [], dRows: refusalIntoValidFixture(w), runlist: noRunlist });
+      const view = (f) => {
+        const own = f.configurations.filter((c) => c.kind === 'D' && !c.refused);
+        const kept = own.filter((c) => c.O);
+        const js = R.costJ(kept.map((c) => ({ folder: c.folder, bytes: c.bytes_min, cpu: c.cpu_s_min.mean, ram: c.ram_peak.mean })));
+        const best = R.bestWay(kept.map((c, i) => ({ cfg: c.cfg, folder: c.folder, J: js[i] })), f.configurations.filter((c) => !c.refused).map((c) => ({ cfg: c.cfg, folder: c.folder, kept: !!c.O })));
+        return { o: Object.fromEntries(own.map((c) => [c.key, `${c.O}|${c.clause}`])), j: Object.fromEntries(kept.map((c, i) => [c.key, js[i]])), best: best?.cfg ?? null };
+      };
+      const a = fitOf(true);
+      const [va, vb] = [view(a), view(fitOf(false))];
+      const refused = a.configurations.filter((c) => c.refused);
+      // The refusal's own requested configuration (typing q 50) is incomplete either way; every other one must not move.
+      const own = new Set(refused.flatMap((c) => c.refused_from ?? []));
+      const changed = Object.keys(vb.o).filter((k) => !own.has(k) && (va.o[k] !== vb.o[k] || va.j[k] !== vb.j[k]));
+      const sharedCfg = refused.filter((r) => a.configurations.some((c) => !c.refused && c.cfg === r.cfg)).length;
+      const flash = a.configurations.find((c) => c.kind === 'D' && c.content === 'flash' && !c.refused);
+      const ok = refused.length === 1 && refused[0].O === false && sharedCfg === 0 && changed.length === 0 && va.best === vb.best && flash?.O === true;
+      return { value: 'flash q40 kept; every valid configuration the same O, clause and J with and without the refusal; refused cfg distinct; same best way', measured: `${refused.length} refused (cfg shared ${sharedCfg}); flash q40 ${flash?.O ? 'kept' : `dropped (${flash?.clause})`}; changed: ${changed.join(', ') || 'none'}; best ${va.best} / ${vb.best}`, pass: ok };
+    }),
     'H6 validity checks block, known-result misses are reported': need(() => {
       const { d, z } = validityFixture();
       const f = F.buildFitFromRows({ zRows: z, dRows: d, runlist: noRunlist });
@@ -343,7 +367,10 @@ function findingChecks(F, inputs) {
       // Round 3: the published model is the one that predicts, and its residuals go through that predictor (exact data: 0).
       const used = m2.coefficients?.model?.DW1;
       const resMax = Math.max(...(m2.res ?? [NaN]).map(Math.abs));
-      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a), q 90 tau 200 within 1e-6, published model "P and K apart" with residuals 0', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}; model ${used}; max residual ${resMax}`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance && /apart/.test(used ?? '') && resMax <= CONFIG.self_test_tolerance };
+      // Round 4: the published equation is the formula of the model that predicts (P and K apart, both slopes).
+      const eqOk = /K = k_E,c \* px \* exp\(b_E \* q\)/.test(m2.equation ?? '') && /P = p_E,c \* px \* exp\(a_E \* q\)/.test(m2.equation ?? '') && !/K\/P from a GOP sweep at one q/.test(m2.equation ?? '')
+        && /folded/.test(m1.equation ?? '');
+      return { value: 'sweep at q 70: q 70 tau 100 exact, q 50 tau 100 pending; sweeps at q 50 and 70: a_E, b_E (b != a), q 90 tau 200 within 1e-6, published model "P and K apart" with residuals 0', measured: `worst relative error ${w}; q 50 tau 100 with one sweep: ${m1.predict(unsup)}; model ${used}; max residual ${resMax}; published equation: ${m2.equation ?? 'none'}`, pass: pend && Number.isFinite(w) && w <= CONFIG.self_test_tolerance && /apart/.test(used ?? '') && resMax <= CONFIG.self_test_tolerance && eqOk };
     }),
     'eq 4 fitted terms: mu and m_d0 from training rows': need(() => {
       const { zRows, runlist } = ramFixture();
@@ -485,6 +512,7 @@ export async function main(fitPath = path.join(BASE, CONFIG.fit_out)) {
   let F = null;
   let fit = null;
   let fitError = '';
+  try { results = await import(pathToFileURL(path.join(BASE, 'fit', 'results.mjs')).href); } catch { results = null; }
   try { F = await import(pathToFileURL(FIT_MODULE).href); } catch (err) { fitError = `${path.relative(BASE, FIT_MODULE)}: ${err.message.split('\n')[0]}`; }
   if (fs.existsSync(fitPath)) fit = JSON.parse(fs.readFileSync(fitPath, 'utf8'));
   else fitError = `${fitError ? `${fitError}; ` : ''}no fit file at ${fitPath}`;

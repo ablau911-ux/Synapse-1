@@ -34,6 +34,11 @@ Feature: Every equation of the plan is fitted, and the held-out runs are predict
     Then the first two are blocked, the refused repeat is listed under its actual settings, the complete one is eligible
     # Equation: eligible(requested) = every repeat 1..R present with status ok | Known: blocked, listed, blocked, eligible
 
+  Scenario: H5 a refusal into a valid group leaves its O, J and text verdicts unchanged
+    Given typing, scroll, ui and flash valid at q 40, and a typing repeat requested at q 50 that was refused and recorded under q 40
+    Then the refused run is listed apart with a cfg of its own, and every valid configuration has the same O, clause and J, and the best way is the same, with and without it
+    # Equation: O, J and best = f(valid configurations only) | Known: flash q40 kept; nothing changed
+
   Scenario: H6 validity checks block, known-result misses are reported
     Given D rows with pass_keyframes = 0 (#297), D rows with status ocr_error, and Z rows with pass_ramOs = 0
     Then the keyframe miss is reported and the configuration stays eligible; the OCR error and the RAM-base breach block

@@ -375,15 +375,34 @@ impl Way {
         self.kz != usize::MAX && (k + 1) % self.kz == 0
     }
 
-    /// Frame-sized buffers the way holds while compressing (B_c) and decoding (B_d).
-    fn buffers(&self) -> (usize, usize) {
-        let layout_copy = usize::from(self.layout != Layout::Bgr);
+    /// Long-distance matching set explicitly, the same on the context and in the
+    /// estimate: zstd's estimate does not fill unset ldm fields (minMatch 0 divides by zero).
+    /// hashLog = W − 7, minMatch 64, bucketSizeLog 4, hashRateLog 7 ([I], ways register ZW14).
+    fn ldm_params(&self) -> [(sys::ZSTD_cParameter, u32); 4] {
+        [
+            (sys::ZSTD_cParameter::ZSTD_c_ldmHashLog, self.window_log.saturating_sub(7).max(6)),
+            (sys::ZSTD_cParameter::ZSTD_c_ldmMinMatch, 64),
+            (sys::ZSTD_cParameter::ZSTD_c_ldmBucketSizeLog, 4),
+            (sys::ZSTD_cParameter::ZSTD_c_ldmHashRateLog, 7),
+        ]
+    }
+
+    /// Frame-sized buffers the way holds while compressing (B_c) and decoding (B_d),
+    /// in units of px · 3 bytes (a B,G,R,A layout buffer is 4/3). Every buffer is
+    /// allocated up front, so the count is known before the run:
+    /// compress: output (+ layout copy) (+ previous frame) (+ gathered tiles);
+    /// decode: frame (+ delta or prefix target when K_z > 1, always for the switch) (+ B,G,R copy).
+    /// The compressed frame the viewer reads is `b_max` bytes, counted apart.
+    fn buffers(&self) -> (f64, f64) {
+        let q = self.layout.bytes_per_pixel() as f64 / 3.0;
+        let copy = if self.layout == Layout::Bgr { 0.0 } else { 1.0 };
+        let delta_target = if self.kz > 1 { q } else { 0.0 };
         match self.mode {
-            Mode::Raw => (1 + layout_copy, 1 + layout_copy),
-            Mode::Whole => (1 + layout_copy, 1 + layout_copy),
-            Mode::Xor | Mode::Sub | Mode::Prefix => (2 + layout_copy, 2 + layout_copy),
-            Mode::Tiles | Mode::Rect | Mode::Switch => (3 + layout_copy, 2 + layout_copy),
-            Mode::Stream => (1 + layout_copy, 1 + layout_copy),
+            Mode::Raw | Mode::Whole => (q + copy * q, q + copy),
+            Mode::Xor | Mode::Sub | Mode::Prefix => (2.0 * q + copy * q, q + delta_target + copy),
+            Mode::Tiles | Mode::Rect => (3.0 * q + copy * q, q + delta_target + copy),
+            Mode::Switch => (3.0 * q + copy * q, 2.0 * q + copy),
+            Mode::Stream => (q + copy * q, q + copy),
         }
     }
 
@@ -427,6 +446,11 @@ impl Estimate {
             set(sys::ZSTD_cParameter::ZSTD_c_targetLength, cp.targetLength);
             set(sys::ZSTD_cParameter::ZSTD_c_strategy, cp.strategy as u32);
             set(sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, if way.ldm { 1 } else { 2 });
+            if way.ldm {
+                for (param, value) in way.ldm_params() {
+                    set(param, value);
+                }
+            }
             let size = if way.mode == Mode::Stream {
                 sys::ZSTD_estimateCStreamSize_usingCCtxParams(params)
             } else {
@@ -477,6 +501,9 @@ impl Packer {
         }
         if way.ldm {
             packer.set(sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, 1)?;
+            for (param, value) in way.ldm_params() {
+                packer.set(param, value as i32)?;
+            }
         }
         if way.workers > 0 {
             packer.set(sys::ZSTD_cParameter::ZSTD_c_nbWorkers, way.workers as i32)?;
@@ -504,7 +531,8 @@ impl Packer {
             if let Some(prefix) = prefix {
                 zstd_check(sys::ZSTD_CCtx_refPrefix(self.cctx, prefix.as_ptr().cast(), prefix.len()), "refPrefix")?;
             }
-            let bound = sys::ZSTD_compressBound(src.len());
+            // Slack for the tile bitmap or rectangle header put in front later: no reallocation.
+            let bound = sys::ZSTD_compressBound(src.len()) + 65536;
             out.clear();
             out.reserve(bound);
             if self.drain > 0 && prefix.is_none() {
@@ -766,6 +794,8 @@ struct WayEncoder {
 impl WayEncoder {
     fn new(way: &Way, w: usize, h: usize, dict: &[u8]) -> Result<Self> {
         let packer = if way.mode == Mode::Raw { None } else { Some(Packer::new(way, dict)?) };
+        let size = w * h * way.layout.bytes_per_pixel();
+        let gathers = matches!(way.mode, Mode::Tiles | Mode::Rect | Mode::Switch);
         Ok(Self {
             grid: TileGrid::new(way.layout, w, h, way.tile),
             way: way.clone(),
@@ -773,7 +803,7 @@ impl WayEncoder {
             packer,
             view: Vec::new(),
             prev: Vec::new(),
-            gather: Vec::new(),
+            gather: Vec::with_capacity(if gathers { size } else { 0 }),
             bits: Vec::new(),
             out: Vec::new(),
         })
@@ -875,7 +905,11 @@ impl WayDecoder {
             way: way.clone(),
             w,
             cur: vec![0; size],
-            tmp: Vec::new(),
+            tmp: if way.mode == Mode::Switch || (way.mode.keeps_previous() && way.mode != Mode::Stream && way.kz > 1) {
+                vec![0; size]
+            } else {
+                Vec::new()
+            },
             bgr: if way.layout == Layout::Bgr { Vec::new() } else { vec![0; w * h * 3] },
             chain: 0,
         })
@@ -1065,8 +1099,11 @@ pub fn run() -> Result<()> {
     // Compress.
     let mut comp = Spent::default();
     let mut write = Spent::default();
+    // The OS keeps the exact peak of private bytes; when compressing sets a new one, it is the phase's peak.
+    let os_base = os_peak_private();
     let wall_start = wall_ns();
     let mut encoder = comp.time(|| WayEncoder::new(&way, w, h, &dict))?;
+    let mut b_max = 0usize;
     let mut bytes_out = dict.len() as u64;
     let mut files: Vec<PathBuf> = Vec::new();
     if !dict.is_empty() {
@@ -1084,6 +1121,7 @@ pub fn run() -> Result<()> {
         let path = clip.join(format!("f-{k:04}.bin"));
         write.time(|| std::fs::write(&path, &encoder.out)).map_err(|e| format!("write {}: {e}", path.display()))?;
         bytes_out += encoder.out.len() as u64;
+        b_max = b_max.max(encoder.out.len());
         files.push(path);
     }
     let cctx_sizeof = encoder.packer.as_ref().map_or(0, Packer::size);
@@ -1097,8 +1135,9 @@ pub fn run() -> Result<()> {
     write.time(|| std::fs::write(clip.join("clip.json"), &clip_json)).map_err(|e| format!("clip.json: {e}"))?;
     let t_ready_ns = wall_ns().saturating_sub(last_comp_end);
     let wall_comp_total = wall_ns().saturating_sub(wall_start);
-    let (peak_ws, peak_private) = sampler.take_peaks();
+    let (peak_ws, peak_sampled) = sampler.take_peaks();
     let (os_ws, os_private) = (os_peak_working_set(), os_peak_private());
+    let peak_private = if os_private > os_base { os_private } else { peak_sampled };
     drop(encoder);
     let mut bytes_disk = 0;
     for path in &files {
@@ -1111,7 +1150,7 @@ pub fn run() -> Result<()> {
     let mut read = Spent::default();
     sampler.take_peaks();
     let mut decoder = dec.time(|| WayDecoder::new(&way, w, h, &dict))?;
-    let mut payload = Vec::new();
+    let mut payload = Vec::with_capacity(b_max);
     let tail = clip.join("f-end.bin");
     let (mut diff_sum, mut diff_frames, mut n_dec_worst, mut decoded) = (0u64, 0u64, 0usize, 0usize);
     for k in 0..corpus.new_frames {
@@ -1143,7 +1182,7 @@ pub fn run() -> Result<()> {
     println!(
         "{{\"folder\":\"{folder_name}\",{},\"rep\":{rep},\"w\":{w},\"h\":{h},\"n_new\":{},\"d_wait\":{},\"frames\":{},\"bytes_out\":{bytes_out},\"bytes_disk\":{bytes_disk},\"bytes_per_frame\":{},\"files\":{},\
 {},{},{},{},\"comp_cpu_per_frame_ns\":{},\"comp_wall_total_ns\":{wall_comp_total},\"dict_bytes\":{},{},\
-\"m0_private\":{m0_private},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"peak_ws\":{peak_ws},\"os_peak_private\":{os_private},\"os_peak_ws\":{os_ws},\
+\"m0_private\":{m0_private},\"m0_ws\":{m0_ws},\"peak_private\":{peak_private},\"peak_private_sampled\":{peak_sampled},\"b_max\":{b_max},\"peak_ws\":{peak_ws},\"os_peak_private\":{os_private},\"os_peak_ws\":{os_ws},\
 \"m_cctx_est\":{},\"cctx_sizeof\":{cctx_sizeof},\"bc\":{bc},\"m_dctx_est\":{},\"bd\":{bd},\
 {},{},{},\"dec_cpu_per_frame_ns\":{},\"dec_peak_private\":{dec_peak_private},\"dec_peak_ws\":{dec_peak_ws},\
 \"frames_decoded\":{decoded},\"diff_sum\":{diff_sum},\"diff_frames\":{diff_frames},\"n_dec_worst\":{n_dec_worst},\"t_ready_ns\":{t_ready_ns}}}",
@@ -1160,8 +1199,8 @@ pub fn run() -> Result<()> {
         comp.cpu_from_cycles(rate) / n,
         dict.len(),
         format_args!("\"px\":{px}"),
-        Estimate::cctx(&way, px * way.layout.bytes_per_pixel(), dict.len()),
-        Estimate::dctx(&way, dict.len()),
+        if way.mode == Mode::Raw { 0 } else { Estimate::cctx(&way, px * way.layout.bytes_per_pixel(), dict.len()) },
+        if way.mode == Mode::Raw { 0 } else { Estimate::dctx(&way, dict.len()) },
         dec.json("dec", rate),
         read.json("read", rate),
         corpus_dec.json("corpus_dec", rate),

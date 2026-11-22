@@ -68,7 +68,8 @@ Feature: Way Z, every zstd way compresses the corpus losslessly with known bytes
   Scenario: decoder RAM (equation 4)
     Given M_dctx = zstd's own estimate (ZSTD_estimateDCtxSize, or ZSTD_estimateDStreamSize for one stream)
     And B_d = 1 for independent frames, 2 for ways that keep the previous frame
-    Then M_dec = M_0 + M_dctx + B_d · px · 3 is within ±10 % of the measured peak private bytes of the decode phase
+    And b_max = the largest clip file, the compressed frame the viewer holds while it decodes (a term added to equation 4)
+    Then M_dec = M_0 + M_dctx + B_d · px · 3 + b_max is within ±10 % of the measured peak private bytes of the decode phase
 
   Scenario: time until ready (equation 5)
     When the last frame has arrived

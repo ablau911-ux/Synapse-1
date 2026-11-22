@@ -73,7 +73,7 @@ const MEASURED_COLUMNS = [
   'w', 'h', 'px', 'n_new', 'd_wait', 'frames', 'bytes_out', 'bytes_disk', 'bytes_per_frame', 'files', 'dict_bytes',
   'comp_cpu_ns', 'comp_gpt_ns', 'comp_cycles', 'comp_wall_ns', 'comp_cpu_per_frame_ns', 'comp_wall_total_ns',
   'write_cpu_ns', 'write_wall_ns', 'corpus_cpu_ns', 'corpus_wall_ns', 'train_cpu_ns', 'train_wall_ns',
-  'm0_private', 'm0_ws', 'peak_private', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'bd',
+  'm0_private', 'm0_ws', 'peak_private', 'peak_private_sampled', 'b_max', 'peak_ws', 'os_peak_private', 'os_peak_ws', 'm_cctx_est', 'cctx_sizeof', 'bc', 'm_dctx_est', 'bd',
   'dec_cpu_ns', 'dec_gpt_ns', 'dec_wall_ns', 'dec_cpu_per_frame_ns', 'dec_peak_private', 'dec_peak_ws', 'read_cpu_ns', 'corpus_dec_cpu_ns',
   'frames_decoded', 'diff_sum', 'diff_frames', 'n_dec_worst', 't_ready_ns', 'run_wall_ms',
 ];
@@ -191,7 +191,7 @@ async function runAll(runs, csvFile, limit = Infinity) {
       row.known_n_new = folder.nNew;
       row.known_d_wait = folder.dWait;
       row.known_m_comp = json.m0_private + json.m_cctx_est + json.bc * json.px * 3;
-      row.known_m_dec = json.m0_private + json.m_dctx_est + json.bd * json.px * 3;
+      row.known_m_dec = json.m0_private + json.m_dctx_est + json.bd * json.px * 3 + json.b_max;
       for (const c of rowChecks(row, folder)) if (!c.note) row[`pass_${c.scenario}`] = c.ok ? 1 : 0;
     }
     csv.append(row);
@@ -213,11 +213,13 @@ export function estimate(pilotCsv) {
   }
   const vBase = vLevel.get(-3);
   // A way's cost relative to ZW1 at L = -3, assumed the same at every level: v(L, m) = v_ZW1(L) · v_m(-3) / v_ZW1(-3).
-  const ratio = new Map();
-  for (const r of rows.filter((x) => Number(x.level) === -3)) {
-    const key = wayKey(r);
-    ratio.set(key, speed(r) / vBase);
-  }
+  const base = rows.filter((x) => Number(x.level) === -3);
+  const ratioOf = (config) => {
+    const row = base.find((r) => r.way === config.way && Object.entries(config)
+      .filter(([k]) => !['folder', 'level', 'rep', 'frames_cap', 'way'].includes(k))
+      .every(([k, v]) => String(r[k]) === String(v)));
+    return row ? speed(row) / vBase : null;
+  };
   const plan = fullPlan();
   let seconds = 0;
   const cells = new Map();
@@ -226,19 +228,84 @@ export function estimate(pilotCsv) {
     const folder = CorpusFolder.of(CORPUS, run.folder);
     const [w, h] = run.folder.split('-').pop().split('x').map(Number);
     const raw = folder.nNew * w * h * 3;
-    const r = ratio.get(wayKey(run)) ?? (missing.add(wayKey(run)), 1);
+    const r = ratioOf(run) ?? (missing.add(run.way), 1);
     const v = (vLevel.get(run.level) ?? vBase) * r;
     const s = raw / v;
     seconds += s;
     const cell = `L=${run.level} ${w}x${h}`;
     cells.set(cell, (cells.get(cell) ?? 0) + s);
   }
-  return { runs: plan.length, seconds, vLevel, ratio, cells, missing };
+  return { runs: plan.length, seconds, vLevel, cells, missing, rows };
 }
 
-function wayKey(r) {
-  const mode = r.mode || '';
-  return [r.way, r.layout || '', mode, r.tile || '', r.wlog || '', r.dict || '', r.workers || '', r.kz || '', r.theta || '', r.drain || ''].join('/');
+/** results/z-pilot.md: the pilot table, the step2z output on the pilot CSV, and T. */
+async function report() {
+  const csvFile = path.join(RESULTS, 'z-pilot.csv');
+  const e = estimate(csvFile);
+  const { run: check } = await import('../spec/step2z.mjs');
+  const lines = [];
+  const code = check([csvFile, CORPUS], (l) => lines.push(l));
+  const mb = (b) => (Number(b) / 1048576).toFixed(1);
+  const ms = (ns) => (Number(ns) / 1e6).toFixed(2);
+  const table = e.rows.map((r) => `| ${r.way} | ${r.layout}/${r.mode} | ${[r.tile && r.mode.match(/tiles|switch/) ? `tile ${r.tile}` : '', r.wlog !== '0' ? `W ${r.wlog}` : '', r.ldm === '1' ? 'ldm' : '', r.dict !== '0' ? `dict ${r.dict} KB` : '', r.workers !== '0' ? `workers ${r.workers}` : '', r.mode.match(/xor|sub|tiles|rect|prefix|stream|switch/) ? `K_z ${r.kz}` : '', r.mode === 'switch' ? `θ ${r.theta} %` : '', r.drain !== '0' ? `drain ${r.drain}` : ''].filter(Boolean).join(', ')} | ${r.level} | ${r.rep} | ${r.frames} | ${r.bytes_per_frame} | ${ms(r.comp_cpu_per_frame_ns)} | ${mb(r.peak_private - r.m0_private)} | ${mb(r.m_cctx_est)} | ${ms(r.dec_cpu_per_frame_ns)} | ${mb(r.dec_peak_private - r.m0_private)} | ${r.n_dec_worst} | ${r.diff_sum} | ${ms(r.t_ready_ns)} | ${(r.run_wall_ms / 1000).toFixed(1)} |`);
+  const hours = e.seconds / 3600;
+  const slow = [...e.cells.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
+    .map(([cell, s]) => `| ${cell} | ${(s / 3600).toFixed(2)} | ${(100 * s / e.seconds).toFixed(1)} % |`);
+  const vTable = [...e.vLevel.entries()].sort((a, b) => a[0] - b[0]).map(([l, v]) => `| ${l} | ${(v / 1e6).toFixed(1)} |`);
+  const errors = e.rows.length < fs.readFileSync(csvFile, 'utf8').trim().split('\n').length - 1;
+  const md = [
+    '# Clip experiments, way Z: pilot and run time T',
+    '',
+    `Pilot on \`scroll-1920x1080\` (N_new = 400, px = 2,073,600, 6,220,800 B per frame): ZW1 at all 33 levels, the baseline 3 times, and one run of every other runnable way at L = -3. Runner: \`node scripts/clip-equation/runs/run-z.mjs --pilot\`; raw rows: \`results/z-pilot.csv\`. Slow levels ran on the first frames only (\`frames_cap\`: 100 frames for L 7 to 12, 20 for L 13 to 18, 5 for L 19 to 22, 40 for the dictionary ways), because v is per byte.`,
+    '',
+    'Columns: bytes per frame (Σ file sizes on disk / frames); compress CPU per frame (process cycles, user plus kernel, every thread, at the measured cycle rate; corpus decode and file writes excluded); RAM = peak private bytes over M_0; M_cctx = zstd\'s own estimate; decode CPU per frame; decoder RAM = decode-phase peak private bytes over M_0; N_dec = frames decoded to show the worst frame; Σ|diff| = round trip over every pixel; t_ready = last frame compressed to clip.json closed; wall = the whole subprocess.',
+    '',
+    '| way | layout/mode | options | L | rep | frames | B/frame | comp ms/frame | RAM MB | M_cctx MB | dec ms/frame | dec RAM MB | N_dec | Σ\\|diff\\| | t_ready ms | wall s |',
+    '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|',
+    ...table,
+    '',
+    errors ? 'Some pilot runs failed; see the `error` column of the CSV.' : 'Every pilot run finished.',
+    '',
+    'Ways not run (docs/clip-recorder-ways.md section 4):',
+    ...Object.entries(NOT_RUN).map(([id, why]) => `- ${id}: ${why}.`),
+    '',
+    '## Check output (`node scripts/clip-equation/spec/step2z.mjs results/z-pilot.csv`)',
+    '',
+    '```',
+    ...lines,
+    '```',
+    '',
+    `Exit code ${code}.`,
+    '',
+    '### Rows that miss, and their causes (pilot of 2026-11-22)',
+    '',
+    '- **Baseline equals the corpus.** Same libzstd on both sides (zstd-sys 2.1.3 = zstd 1.5.7; Node `process.versions.zstd` = 1.5.7) and the same frame header (frame header descriptor 0x80: 4-byte content size, no single-segment flag, no checksum, no dictionary; the first 14 bytes are identical). The bodies differ: the corpus writer (`corpus/render.mjs`, `zlib.zstdCompressSync`) drains the output 16 KB at a time, which puts zstd in buffered mode, and its block splitting differs from the one-shot `ZSTD_compress2` of the product (`zstd::bulk::compress`). Proof: Node itself gives 1,782 B for typing-1280x720 frame 0 at chunkSize 16 KB and 64 KB, and 1,770 B at 1 MB and 8 MB, the same as exp-z one-shot; exp-z with `drain=16384` gives D_wait to the byte (49,677,690 B). One-shot gives 49,650,183 B, 27,507 B (0.055 %) fewer. The row stays a miss: the known result assumed the same call, not only the same coder.',
+    '- **RAM, ZW17 nbWorkers 1 and 2.** zstd\'s estimate functions cover single-threaded compression only (zstd.h: "Estimate CCtx size is supported for single-threaded compression only"), so M_cctx is the single-thread estimate (0.52 MB). `ZSTD_sizeof_CCtx` after the run is 10.5 MB (1 worker) and 15.1 MB (2 workers), and M_0 + that + B_c · px · 3 matches the measured peak within 1 %. No zstd estimate exists for this row.',
+    '- **RAM and decoder RAM, ZW13 with K_z = 1.** `ZSTD_estimateCStreamSize_usingCCtxParams` and `ZSTD_estimateDStreamSize` take no source size, so they count a 2^W window (16 MB at W = 24). With K_z = 1 every zstd frame ends in its first call, so zstd knows the 6.2 MB frame size and sizes the window to it (`ZSTD_sizeof_CCtx` 6.7 MB). Every other stream row matches its estimate exactly (`ZSTD_sizeof_CCtx` = the estimate to the byte for W 23, 24, 25 and 27).',
+    '- **Corrections made in this step, before the rerun** (first pilot, kept out of the CSV): long-distance matching crashed inside zstd\'s estimate with a division by zero (`STATUS_INTEGER_DIVIDE_BY_ZERO`) because unset ldm fields stay 0 there; the ldm parameters are now set explicitly on the context and in the estimate. B_c and B_d now count every buffer the way allocates up front (a B,G,R,A buffer is 4/3 of px · 3; the gathered tiles and the delta target are allocated at the start, so a reallocation can no longer double them for a moment). The compress peak is the operating system\'s exact `PeakPagefileUsage` when compressing sets a new peak (the 50 ms sampler missed short peaks). Equation 4 for the decoder gains b_max, the largest clip file, which the viewer holds while it decodes (ZW0 raw: 6.2 MB).',
+    '- **CPU.** `GetProcessTimes` advances in clock ticks of 15.6 ms; around one frame (about 2 ms at L = -3) it read 0 for whole runs and 0.5 to 0.8 of the true time over 400 frames. Compress and decode CPU are therefore the process cycle counter (`QueryProcessCycleTime`, user plus kernel, every thread) at the measured cycle rate; the `GetProcessTimes` sums are kept in the `*_gpt_ns` columns.',
+    '',
+    '## Run time of the full run (equation 6)',
+    '',
+    '    T = Σ_runs N_new · px · 3 / v(L, m) · repeats',
+    '    v(L, m) = v_ZW1(L) · v_m(-3) / v_ZW1(-3)        v = raw bytes per second of the whole run subprocess',
+    '',
+    `Runs: ${e.runs} (Grid A-Z 4,752 + Grid B ${e.runs / REPEATS - 4752} configurations, × ${REPEATS} repeats), over every folder's own N_new and px.`,
+    '',
+    `**T = ${hours.toFixed(1)} h** (${Math.round(e.seconds)} s).`,
+    '',
+    'Assumptions: v per raw byte measured on scroll at 1920 × 1080 holds for every content and size; a way\'s cost ratio to ZW1 at L = -3 holds at every level (for tiles and rectangles zstd sees only the changed part, so at slow levels this overestimates their time). Video frames compress worst, so their v at slow levels is the largest unknown.',
+    e.missing.size ? `Ways with no pilot row, counted at the ZW1 speed: ${[...e.missing].join(', ')}.` : '',
+    '',
+    '| L | v_ZW1(L), MB/s of raw frames |',
+    '|---|---|',
+    ...vTable,
+    '',
+    hours > 10 ? '### Slowest level and size cells (all modes, contents and repeats)\n\n| cell | hours | share of T |\n|---|---|---|\n' + slow.join('\n') : '',
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(RESULTS, 'z-pilot.md'), md);
+  console.log(`wrote z-pilot.md; T = ${hours.toFixed(1)} h; step2z exit ${code}`);
 }
 
 async function main() {
@@ -253,8 +320,10 @@ async function main() {
   } else if (flag === '--estimate') {
     const e = estimate(path.join(RESULTS, 'z-pilot.csv'));
     console.log(`T = ${(e.seconds / 3600).toFixed(1)} h over ${e.runs} runs`);
+  } else if (flag === '--report') {
+    await report();
   } else {
-    console.log('usage: node run-z.mjs --plan | --full [--limit N] | --pilot [folder] | --estimate');
+    console.log('usage: node run-z.mjs --plan | --full [--limit N] | --pilot [folder] | --estimate | --report');
   }
 }
 

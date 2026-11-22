@@ -80,7 +80,8 @@ export function rowChecks(r, folder) {
   const independent = isIndependent(r);
   const seekOk = independent ? num(r.n_dec_worst) === 1 : num(r.n_dec_worst) >= 1 && num(r.n_dec_worst) <= kz;
   add('seek', independent ? 1 : `<= ${kz}`, num(r.n_dec_worst), seekOk);
-  const mDec = num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * px * 3;
+  // + b_max: the compressed frame the viewer reads is held too (largest clip file, known after compressing).
+  const mDec = num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * px * 3 + (num(r.b_max) || 0);
   add('ramDec', Math.round(mDec), num(r.dec_peak_private), within(mDec, num(r.dec_peak_private), RAM_TOLERANCE));
   const readyMs = num(r.t_ready_ns) / 1e6;
   add('ready', `<= ${INSTANT_MS} ms`, `${readyMs.toFixed(2)} ms`, readyMs <= INSTANT_MS);
@@ -134,7 +135,7 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     runtime: new Scenario('run time', 'full-run wall time within ±20 % of T (equation 6)'),
     roundTrip: new Scenario('round trip', 'Σ |decoded − corpus| = 0'),
     seek: new Scenario('seek cost', 'N_dec(worst) = 1 independent; <= K_z otherwise'),
-    ramDec: new Scenario('decoder RAM', 'M_dec = M_0 + M_dctx + B_d · px · 3 within ±10 % of decode peak private bytes'),
+    ramDec: new Scenario('decoder RAM', 'M_dec = M_0 + M_dctx + B_d · px · 3 + b_max within ±10 % of decode peak private bytes'),
     ready: new Scenario('time until ready', `t_ready = t_close <= ${INSTANT_MS} ms`),
   };
   s.cpu.pending = 'needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only';

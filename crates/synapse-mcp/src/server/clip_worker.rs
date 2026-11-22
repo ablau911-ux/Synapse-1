@@ -737,7 +737,17 @@ fn mark_service_restart(folder: &Path) -> Result<(), String> {
                     "note": "the service ended during the recording; the instants after the last written line are named as lost",
                 })),
             });
-        clip.add_lost(lost);
+        // The losses the recorder named in its lines come first, each with
+        // its own cause (only `finish` copies them into `clip.json`, and it
+        // never ran); `add_lost` keeps the first cause of an instant, so no
+        // instant is named twice.
+        let named = lines.iter().filter_map(|line| {
+            line.lost.map(|cause| LostInstant {
+                instant: line.instant,
+                cause,
+            })
+        });
+        clip.add_lost(named.chain(lost));
     })
     .map(drop)
 }

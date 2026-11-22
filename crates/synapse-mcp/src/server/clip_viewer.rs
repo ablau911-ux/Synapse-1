@@ -98,7 +98,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 5;
+const ANALYSIS_VERSION: u32 = 6;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -558,6 +558,8 @@ struct Animation {
     blocks: Vec<usize>,
     /// The picture size the block indices refer to (a resize changes it).
     size: (usize, usize),
+    /// The resize generation of the run (see `Analyzer`).
+    generation: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -594,6 +596,8 @@ struct Analyzer<'a> {
     /// Goes up on every size change; changes are compared and merged only
     /// within one generation, also when a later resize restores the size.
     generation: u64,
+    /// Captured size (frames.jsonl) of the picture last decoded.
+    captured: (u32, u32),
     previous: u64,
     decoded: u64,
     new_without_change: u64,
@@ -614,6 +618,7 @@ impl<'a> Analyzer<'a> {
             animations: Vec::new(),
             resizes: Vec::new(),
             generation: 0,
+            captured: (0, 0),
             previous: 0,
             decoded: 0,
             new_without_change: 0,
@@ -639,7 +644,15 @@ impl<'a> Analyzer<'a> {
     fn step(&mut self, instant: u64, frame: &DecodedFrame) {
         let (width, height) = (frame.width as usize, frame.height as usize);
         let current = rgb(&frame.bgra);
-        if (width, height) != (self.width, self.height) {
+        // A resize is a change of the captured size in frames.jsonl: an odd
+        // size padded up to even can decode at the same size as before.
+        let captured = self
+            .clip
+            .line(instant)
+            .filter(|line| line.width != 0 && line.height != 0)
+            .map_or(self.captured, |line| (line.width, line.height));
+        if (width, height) != (self.width, self.height) || captured != self.captured {
+            self.captured = captured;
             if self.width != 0 {
                 if let Some(episode) = self.open.take() {
                     self.close(episode, true);
@@ -827,11 +840,13 @@ impl<'a> Analyzer<'a> {
             }
         }
         // The block indices refer to the current picture size; animations of
-        // an earlier size are never merged with them.
-        let size = (self.width, self.height);
+        // an earlier resize generation are never merged with them.
+        let (size, generation) = ((self.width, self.height), self.generation);
         for (start, end, index) in ended {
             match self.animations.iter_mut().find(|animation| {
-                animation.size == size && animation.start <= end && start <= animation.end
+                animation.generation == generation
+                    && animation.start <= end
+                    && start <= animation.end
             }) {
                 Some(animation) => {
                     animation.start = animation.start.min(start);
@@ -843,6 +858,7 @@ impl<'a> Analyzer<'a> {
                     end,
                     blocks: vec![index],
                     size,
+                    generation,
                 }),
             }
         }

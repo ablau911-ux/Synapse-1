@@ -48,7 +48,8 @@
 
   let refresh = 0;
   let t0 = null;
-  let current = null; // flash being shown: {n, start, phase, first, last}
+  let current = null; // flash being shown: {n, start, phase, first, last, firstT}
+  let lastFlash = -1; // number of the last flash started, so each starts once
   const log = [];
 
   function flashWindow(n) {
@@ -66,16 +67,22 @@
 
     const n = Math.max(0, Math.floor((t - 1000) / FLASH_PERIOD_MS));
     const w = flashWindow(n);
-    const on = t >= w.start && t < w.start + FLASH_MS;
+    // The flash starts at the first refresh at or after its start time and
+    // stays on until FLASH_MS after that first shown refresh, so it is on the
+    // screen for at least FLASH_MS (whole refreshes can otherwise make it
+    // shorter than one recording interval).
+    const starting = !current && t >= w.start && t < w.start + FLASH_MS && lastFlash !== n;
+    const on = starting || (current && t - current.firstT < FLASH_MS);
     if (on) {
-      if (!current || current.n !== n) current = { n, start: w.start, phase: w.phase, first: refresh };
+      if (!current) { current = { n, start: w.start, phase: w.phase, first: refresh, firstT: t }; lastFlash = n; }
       current.last = refresh;
       flashEl.style.display = 'block';
     } else {
       flashEl.style.display = 'none';
       if (current) {
         log.unshift('flash ' + current.n + '  start ' + (current.start / 1000).toFixed(3) +
-          ' s  phase ' + current.phase + ' ms  refresh ' + current.first + '..' + current.last);
+          ' s  phase ' + current.phase + ' ms  refresh ' + current.first + '..' + current.last +
+          '  on ' + (t - current.firstT).toFixed(1) + ' ms');
         log.length = Math.min(log.length, LOG_LINES);
         logEl.textContent = log.join('\n');
         current = null;

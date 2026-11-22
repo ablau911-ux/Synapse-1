@@ -44,7 +44,7 @@ function groupInputs(inputs) {
     if (Number.isFinite(bytes)) g.bytes.push(bytes);
     groups.set(key, g);
   };
-  for (const r of inputs.z) add('Z', r, num(r.bytes_out), num(r.frames));
+  for (const r of inputs.z) add('Z', r, r.bytes_disk !== undefined && r.bytes_disk !== '' ? num(r.bytes_disk) : num(r.bytes_out), num(r.frames));
   for (const r of inputs.d) add('D', r, r.status === 'ok' ? num(r.bytes) : NaN, num(r.n_new));
   for (const g of groups.values()) g.bytesMin = g.bytes.length ? mean(g.bytes) * (g.nNew / g.frames) * 60 / clipSeconds(g.folder) : NaN;
   return groups;

@@ -44,6 +44,15 @@ function meanPsnr(values) {
   return mse === 0 ? 'inf' : 10 * Math.log10(MAX2 / mse);
 }
 
+/** A column when the CSV has it, else the fallback (the pilot of 53a47612 predates the M1 to M4 columns of c5e9090b). */
+const col = (r, name, fallback) => (r[name] !== undefined && r[name] !== '' ? num(r[name]) : fallback());
+/** Way Z bytes (M4): every retained file, bytes_disk (frame_bytes is the payload only). */
+const zBytes = (r) => col(r, 'bytes_disk', () => num(r.bytes_out));
+/** Way Z CPU (M2): all of the way's work, way_cpu_ns (conversion, compression, writing, training). */
+const zCpu = (r) => col(r, 'way_cpu_ns', () => num(r.comp_cpu_ns) + num(r.write_cpu_ns));
+/** Way Z RAM (M3): the OS peak of private bytes minus M_0, ram_os. */
+const zRam = (r) => col(r, 'ram_os', () => num(r.peak_private) - num(r.m0_private));
+
 /** R of one D run: a number, or "n/a" when the source text of the region was empty (M7). */
 const runR = (r) => (String(r.r ?? '').trim().toLowerCase() === 'n/a' ? 'n/a' : num(r.r));
 
@@ -205,22 +214,26 @@ function zConfiguration(key, rows, list) {
     kind: 'Z', key, cfg: cfgOf('Z', r0), way: r0.way, options: options('Z', r0), folder: r0.folder, content: contentOf(r0.folder), size: sizeOf(r0.folder),
     group: `${cell ? `cell ${cellOptions(cell)}` : cfgOf('Z', r0)}|${contentOf(r0.folder)}`, cell: cell?.id ?? null, failed_runs: failed.length, eligible: kept,
     px, n_new: nNew, t_s: t, runs: rows.length, frames, capped: frames < nNew, status: error ? 'error' : 'ok',
-    bytes_min: mean(rows.map((r) => num(r.bytes_out))) * scale,
-    cpu_s_min: stat(rows.map((r) => ((num(r.comp_cpu_ns) + num(r.write_cpu_ns)) / 1e9) * scale)),
-    ram_peak: stat(rows.map((r) => num(r.peak_private) - num(r.m0_private))),
+    bytes_min: mean(rows.map(zBytes)) * scale,
+    cpu_s_min: stat(rows.map((r) => (zCpu(r) / 1e9) * scale)),
+    ram_peak: stat(rows.map(zRam)),
     ssim: exact ? 1 : NaN, psnr: exact ? 'inf' : NaN, r: exact ? 1 : 0,
     O: kept, clause: error ? `run error: ${error}` : exact ? '' : `R < 1: round trip differs (diff_sum ${rows.map((r) => r.diff_sum).join('/')})`,
     held_out: held, in_fit: kept && !held,
     fit: {
-      zeta: mean(rows.map((r) => num(r.bytes_out) / num(r.frames))) / (px * 3),
-      bytes_per_frame: stat(rows.map((r) => num(r.bytes_out) / num(r.frames))),
-      comp_ns_per_frame: stat(rows.map((r) => num(r.comp_cpu_ns) / num(r.frames))),
+      zeta: mean(rows.map((r) => zBytes(r) / num(r.frames))) / (px * 3),
+      bytes_per_frame: stat(rows.map((r) => zBytes(r) / num(r.frames))),
+      comp_ns_per_frame: stat(rows.map((r) => zCpu(r) / num(r.frames))),
       dec_ns_per_px_frame: mean(rows.map((r) => num(r.dec_cpu_ns) / (num(r.frames_decoded) * px))),
       peak_private: stat(rows.map((r) => num(r.peak_private))),
       known_m_comp: mean(rows.map((r) => num(r.known_m_comp))),
       m0: mean(rows.map((r) => num(r.m0_private))), m_cctx: num(r0.m_cctx_est), bc: num(r0.bc),
-      ram_rel: rows.map((r) => (num(r.peak_private) - num(r.known_m_comp)) / num(r.known_m_comp)),
-      ram_dec_rel: rows.map((r) => (num(r.dec_peak_private) - num(r.known_m_dec)) / num(r.known_m_dec)),
+      ram_os: stat(rows.map(zRam)),
+      m_eq: mean(rows.map((r) => num(r.known_m_comp) - num(r.m0_private))),
+      s_train: num(r0.dict) > 0 ? Math.min(frames, CONFIG.dict_train_frames) * px * 3 : 0,
+      m_dec_eq: mean(rows.map((r) => num(r.known_m_dec))),
+      dec_peak: stat(rows.map((r) => num(r.dec_peak_private))),
+      dec_excess: mean(rows.map((r) => num(r.dec_peak_private) - num(r.known_m_dec))),
     },
   };
 }
@@ -345,11 +358,28 @@ function fitZ(z) {
   const c0 = Object.fromEntries(modes.filter((m) => cpuFits[m].identifiable).map((m) => [m, cpuFits[m].c0]));
   const kappaD = {};
   for (const c of fitSet) (kappaD[`L${c.options.level}|${c.options.mode}`] ??= []).push(c.fit.dec_ns_per_px_frame);
-  const ramRel = fitSet.flatMap((c) => c.fit.ram_rel);
-  const ramDecRel = fitSet.flatMap((c) => c.fit.ram_dec_rel);
+  // Equation 4's fitted terms, from training rows only: mu by least squares through 0 on S_samples
+  // (ZW16 rows, M_train = mu * S_samples); m_d0 = the mean decoder peak above M_0 + M_dctx + B_d * px * 3 + b_max.
+  const dictSet = fitSet.filter((c) => c.fit.s_train > 0 && Number.isFinite(c.fit.ram_os.mean - c.fit.m_eq));
+  const mu = dictSet.length ? dictSet.reduce((s, c) => s + c.fit.s_train * (c.fit.ram_os.mean - c.fit.m_eq), 0) / dictSet.reduce((s, c) => s + c.fit.s_train ** 2, 0) : NaN;
+  const decSet = fitSet.filter((c) => Number.isFinite(c.fit.dec_excess));
+  const md0 = decSet.length ? mean(decSet.map((c) => c.fit.dec_excess)) : NaN;
+  const ram = {
+    mu, md0,
+    /** RAM above M_0 of equation 4 with M_train. */
+    predict: (c) => c.fit.m_eq + (c.fit.s_train > 0 ? mu * c.fit.s_train : 0),
+    /** Decoder peak private bytes of equation 4 with m_d0. */
+    predictDec: (c) => c.fit.m_dec_eq + md0,
+  };
+  const ramRel = fitSet.map((c) => (ram.predict(c) - c.fit.ram_os.mean) / (c.fit.m0 + c.fit.ram_os.mean));
+  const ramDecRel = decSet.map((c) => (ram.predictDec(c) - c.fit.dec_peak.mean) / c.fit.dec_peak.mean);
+  const ramPending = [
+    ...(Number.isFinite(mu) ? [] : [{ part: 'mu', reason: 'no ZW16 (dictionary) row in the fit set' }]),
+    ...(Number.isFinite(md0) ? [] : [{ part: 'm_d0', reason: 'no decoder row in the fit set' }]),
+  ];
   const tol = CONFIG.tolerance.ram;
   return {
-    fits: { zetaFits, cpuFits },
+    fits: { zetaFits, cpuFits, ram },
     eq1_z_bytes: {
       title: 'Z bytes', equation: 'b_k = zeta(L, m, c, px) * px * 3 (+ h); zeta(px) = zeta(px0) * (px / px0)^(eta_m - 1)', fit_n: fitSet.length,
       coefficients: { zeta: Object.fromEntries(fitSet.map((c) => [`${zGroup(c)}@${c.size}`, c.fit.zeta])), eta, ...(etaMissing.length && anyEta ? { eta_missing_modes: etaMissing.join(' ') } : {}) },
@@ -362,7 +392,7 @@ function fitZ(z) {
       residuals: residualStats(z.map((c) => (c.r === 1 ? 0 : 1))), pending: [],
     },
     eq3_z_cpu: {
-      title: 'Z CPU', equation: 'C_comp / N_new = c_0(m) + px * kappa_c(L, m, c); C_dec = N_dec * px * kappa_d(L, m)', fit_n: fitSet.length,
+      title: 'Z CPU', equation: 'C_way / N_new = c_0(m) + px * kappa_c(L, m, c), C_way = way_cpu_ns (conversion, compression, writing, training; M2); C_dec = N_dec * px * kappa_d(L, m)', fit_n: fitSet.length,
       coefficients: {
         c_0_ns: c0,
         kappa_c_ns_per_px: Object.fromEntries(fitSet.map((c) => [zGroup(c), cpuFits[c.options.mode ?? ''].slope[zGroup(c)]])),
@@ -372,13 +402,15 @@ function fitZ(z) {
       pending: Object.keys(c0).length ? [] : [{ part: 'c_0', reason: 'every configuration ran at one size, so c_0 and px * kappa_c are not separable; kappa_c = C / (N_new * px)' }],
     },
     eq4_z_ram: {
-      title: 'Z RAM', equation: 'M_comp = M_0 + M_cctx(L, W) + B_c * px * 3; M_dec = M_0 + M_dctx(W) + B_d * px * 3', fit_n: fitSet.length,
+      title: 'Z RAM', equation: 'M_comp = M_0 + M_cctx(L, W) + B_c * px * 3 (+ M_train = mu * S_samples for a dictionary, S_samples = N_train * px * 3); M_dec = M_0 + M_dctx(W) + B_d * px * 3 + b_max + m_d0', fit_n: fitSet.length,
       coefficients: {
         M_0_bytes: mean(fitSet.map((c) => c.fit.m0)),
+        ...(Number.isFinite(mu) ? { mu_train: mu, mu_fit_n: dictSet.length } : {}),
+        ...(Number.isFinite(md0) ? { m_d0_bytes: md0, m_d0_fit_n: decSet.length } : {}),
         share_within_10pct_comp: ramRel.filter((v) => Math.abs(v) <= tol).length / ramRel.length,
         share_within_10pct_dec: ramDecRel.filter((v) => Math.abs(v) <= tol).length / ramDecRel.length,
       },
-      residuals: residualStats(ramRel), pending: [],
+      residuals: { ...residualStats(ramRel), dec: residualStats(ramDecRel), note: 'max_abs_rel and rms_rel are of M_comp; dec is of M_dec' }, pending: ramPending,
     },
     eq5_z_ready: {
       title: 'Z time until ready', equation: 't_ready = t_close', fit_n: z.length,
@@ -566,7 +598,8 @@ function validateZ(z, zFits) {
     return [
       verdict('bytes', bpf, c.fit.bytes_per_frame.mean, c.fit.bytes_per_frame.spread),
       verdict('cpu', cpf, c.fit.comp_ns_per_frame.mean, c.fit.comp_ns_per_frame.spread),
-      verdict('ram', c.fit.known_m_comp, c.fit.peak_private.mean, c.fit.peak_private.spread),
+      verdict('ram', c.fit.m0 + zFits.ram.predict(c), c.fit.m0 + c.fit.ram_os.mean, c.fit.ram_os.spread),
+      verdict('ram_dec', zFits.ram.predictDec(c), c.fit.dec_peak.mean, c.fit.dec_peak.spread),
     ].map((v) => ({ key: c.key, ...v }));
   });
 }
@@ -649,7 +682,7 @@ function predictCells(runlist, z, zf) {
       const cpf = kfit?.identifiable && Number.isFinite(kfit.slope[group]) ? kfit.c0 + kfit.slope[group] * px : NaN;
       return {
         content, status: 'predicted', bytes_per_frame: bpf, bytes_min: bpf * perMin, bytes_rel_unc: unc.bytes,
-        cpu_ns_per_frame: cpf, cpu_s_min: (cpf * perMin) / 1e9, cpu_rel_unc: unc.cpu, ram: sample.fit.m_cctx + sample.fit.bc * px * 3, ram_rel_unc: unc.ram,
+        cpu_ns_per_frame: cpf, cpu_s_min: (cpf * perMin) / 1e9, cpu_rel_unc: unc.cpu, ram: sample.fit.m_cctx + sample.fit.bc * px * 3 + (sample.fit.s_train > 0 ? zf.fits.ram.mu * (sample.fit.s_train / sample.px) * px : 0), ram_rel_unc: unc.ram,
       };
     });
     if (per.length && per.every((p) => p.status !== 'predicted' && p.status === per[0].status)) rows.push({ ...head, content: 'all', folder: `*-${cell.size}`, status: per[0].status });

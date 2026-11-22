@@ -100,7 +100,12 @@ export function bestEquations(fit, c) {
       `- Bytes per minute: B_min = 60 · n_new · ζ · px · 3 = 60 · ${fmt(c.n_new / c.t_s, 3)} · ${fmt(zeta, 6)} · ${c.px} · 3 = ${mb(60 * (c.n_new / c.t_s) * zeta * c.px * 3)} MB/min`,
       `- Quality (eq. 2): Σ |decoded − corpus| = 0 ⇒ SSIM-Y = 1, PSNR-Y = ∞, R = 1`,
       `- CPU (eq. 3): C_comp / N_new = c_0 + px · κ_c, κ_c = ${fmt(kappa, 4)} ns/px, c_0 = ${c0 === undefined ? 'pending: full run (needs two sizes)' : `${fmt(c0, 0)} ns`}; measured with writing: ${fmt(c.cpu_s_min.mean, 4)} s/min`,
-      `- RAM (eq. 4): M_comp = M_0 + M_cctx + B_c · px · 3 = ${mb(f.m0)} + ${mb(f.m_cctx)} + ${f.bc} · ${c.px} · 3 = ${mb(f.known_m_comp)} MB; measured peak ${mb(f.peak_private.mean)} MB`,
+      (() => {
+        const mu = eq.eq4_z_ram.coefficients.mu_train;
+        const train = f.s_train > 0 ? (mu === undefined ? NaN : mu * f.s_train) : 0;
+        const term = f.s_train > 0 ? ` + μ · S_samples (μ = ${mu === undefined ? 'pending: full run' : fmt(mu, 4)}, S_samples = ${f.s_train})` : '';
+        return `- RAM (eq. 4): M_comp = M_0 + (M_cctx + B_c · px · 3, as computed by the run)${term} = ${mb(f.m0)} + ${mb(f.m_eq)}${f.s_train > 0 ? ` + ${Number.isFinite(train) ? mb(train) : 'pending'}` : ''} = ${Number.isFinite(train) ? mb(f.m0 + f.m_eq + train) : 'pending'} MB; measured peak ${mb(f.m0 + f.ram_os.mean)} MB`;
+      })(),
     ];
   }
   const g = c.content;

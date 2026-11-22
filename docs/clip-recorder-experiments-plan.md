@@ -14,9 +14,11 @@ Fixed by the owner earlier, and not experiment factors: f = 20 fps; flashes of 5
 
 "I want to get to x + y. Find me all the ways to get there and log every way. Try all the ways you found and keep those that produce the outcome x + y. Save the equation that does it better than the others."
 
-1. **Target (x + y).** A way reaches the target when all of these hold on the corpus:
+1. **Target (x + y).** Owner, 2026-11-22 21:15: "forget other variables, we are testing all options". Every way is judged by four numbers only: file size, quality, CPU and RAM. Quality is SSIM-Y, PSNR-Y and R, the share of text read identically. "High quality" is the bar that a way must pass:
 
-       O = [R = 1] ∧ [flashes found = flashes scheduled] ∧ [N_lost = 0] ∧ [U_weak ≤ 0.10] ∧ [lines ≥ 480]
+       O = [R = 1]
+
+   Flash presence, lost instants, the 10 % processor limit and the 480-line floor are not checks here. They are still measured where a run gives them, and reported beside the four numbers. Fixed and not tested: f = 20 fps, lossless waiting frames, no cursor in the picture.
 
 2. **All the ways.** Every way to turn the captured frames into a stored clip that an agent can view is listed in `docs/clip-recorder-ways.md`, the ways register. A way is any architecture, coder, encoder, setting, or combination of them. Each row records:
    - the way and its source;
@@ -59,9 +61,9 @@ Measured: p, k, a and b per encoder and content. Check: P and K scale with px (o
     Q_ssim(E, q, c) = 1 − s_E,c · exp(−g_E · q)            SSIM-Y of the decoded frames against the corpus
     Q_psnr(E, q, c) = m_E,c + l_E · q                       PSNR-Y in dB
     R(E, q, c) = text readability: share of text characters read identically from decoded and source frames (Windows OCR on the text regions)
-    q_min(E, px) = the lowest q with R = 1 on every text scenario, and every flash present in the decoded clip
+    q_min(E, px) = the lowest q with R = 1 on every text scenario
 
-Quality constraint: q ≥ q_min. "High quality" means R = 1 and every flash present; SSIM and PSNR are reported beside it.
+Quality constraint: q ≥ q_min. "High quality" means R = 1; SSIM and PSNR are reported beside it.
 
 ### 3. Processor time
 
@@ -111,7 +113,7 @@ The harness first enumerates every Media Foundation video encoder on this PC (`M
 
 Fixed: f = 20; B-frames 0; NV12 input; variable time stamps (only new frames are encoded).
 
-Run design (the full product is 3 × 4 × 11 × 4 × 2 × 4 × 6 × 2 ≈ 25,000 runs, too many for one PC):
+Run design (owner decision, 2026-11-22 21:15: every option runs at every level; encoder × quality × content × size in full; the other options one at a time; the equations predict every other combination and held-out runs prove it). The full product of every option, about 67,000 runs or 90 hours, is not run. Every way of `docs/clip-recorder-ways.md` that can run here enters the grids like an encoder.
 - **Grid A (full):** E × q × c × size at τ_f 20, hint on, latency off: about 4 × 8 × 6 × 4 = 768 encodes per architecture D.
 - **Grid B (one factor at a time)** around the baseline (E = Quick Sync H.264, q = 70, τ_f 20, hint on, 1080p) for F3 β, F4, F5, F8, for every E and c.
 - **Grid C (architecture):** D0, D and L2 at the baseline and at the chosen q of every E, for every c; Z at zstd levels −3, 1, 3 and 9 for every c and every size of F6.
@@ -170,7 +172,6 @@ Symbols as in section "Equations"; t = 20 s, f = 20 fps; w × h = recorded size 
 |---|---|---|
 | meter self-check | SSIM-Y(x, x); PSNR-Y(x, x); R(x, x) | 1; ∞; 1 |
 | known distortion | Y + d on every pixel, no clipping: MSE = d², PSNR = 20 · log10(255 / d) | d = 4: 36.0896 dB within 0.01 dB |
-| flashes in the decoded flash clip | found = scheduled = t · 1 per s | 20 for every q ≥ q_min |
 | Z quality | SSIM-Y; R | 1; 1 (lossless) |
 | quality curve | equation 2 | after the fit, held-out SSIM within ±0.005 |
 
@@ -180,7 +181,7 @@ Symbols as in section "Equations"; t = 20 s, f = 20 fps; w × h = recorded size 
 
 ## Choosing the configuration
 
-1. **Hard constraints:** R = 1 and every flash present (quality); U ≤ 10 % on the weakest-machine estimate; no lost instants.
+1. **Hard constraint:** O, that is R = 1 (section "Method").
 2. Among the configurations that pass: the **Pareto front** of bytes per minute, CPU time per minute and peak RAM.
 3. **Recommendation:** the kept way with the least J (section "Method"). The owner sees the whole front and decides. The product changes only after that decision.
 

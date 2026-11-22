@@ -607,6 +607,8 @@ mod live {
         match recording.response() {
             Ok(response) => {
                 let _ = started.send(Ok(response));
+                // The worker forms segments while the recording goes on.
+                super::super::clip_worker::ClipWorkerHost::global().enqueue(plan.folder.clone());
             }
             Err(error) => {
                 let _ = started.send(Err(error));

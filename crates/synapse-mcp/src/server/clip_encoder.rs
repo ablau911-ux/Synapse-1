@@ -44,6 +44,7 @@ const MAX_TRANSFORMS_PER_STREAM: u32 = 8;
 
 /// What Media Foundation actually granted for this clip.
 #[derive(Clone, Debug)]
+#[expect(dead_code, reason = "package 3b reports the container")]
 pub(super) struct EncoderReadback {
     pub(super) encoder: String,
     pub(super) hardware: bool,
@@ -54,6 +55,137 @@ pub(super) struct EncoderReadback {
     /// Quality level (0..=100) or bits per second, matching the mode.
     pub(super) rate_control_value: u32,
     pub(super) keyframe_interval_frames: u32,
+}
+
+/// One frame of a segment: its raw file (captured BGRA rows), its captured
+/// size, and its time within the segment (B5).
+#[expect(dead_code, reason = "the times are written by package 3b")]
+pub(super) struct SegmentSample {
+    pub(super) raw: std::path::PathBuf,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) instant: u64,
+    pub(super) local_ms: u64,
+    pub(super) duration_ms: u64,
+}
+
+/// What the clip worker hands the encoder for one segment.
+pub(super) struct SegmentInput<'a> {
+    /// Captured size of the segment's canvas (the largest size during a drag).
+    pub(super) canvas_width: u32,
+    pub(super) canvas_height: u32,
+    /// σ: whole-number pixel duplication (A3).
+    pub(super) scale: u32,
+    pub(super) fps: u32,
+    pub(super) samples: &'a [SegmentSample],
+}
+
+/// A finished segment file and what the encoder granted for it.
+pub(super) struct EncodedSegment {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) bound_held: bool,
+    pub(super) keyframe_instants: Vec<u64>,
+    pub(super) encoder: String,
+    pub(super) hardware: bool,
+    pub(super) quality: super::clip_folder::QualityReport,
+}
+
+/// Encodes one segment into `path` (the `.part` file) and finalizes it.
+pub(super) fn encode_segment(path: &Path, input: &SegmentInput) -> Result<EncodedSegment, String> {
+    let width = (input.canvas_width * input.scale).max(2) & !1;
+    let height = (input.canvas_height * input.scale).max(2) & !1;
+    let mut encoder = ClipEncoder::create(path, width, height, input.fps)?;
+    let mut canvas = Nv12Canvas::new(width, height);
+    for sample in input.samples {
+        let bgra = std::fs::read(&sample.raw)
+            .map_err(|error| format!("could not read {}: {error}", sample.raw.display()))?;
+        canvas.draw(&bgra, sample.width, sample.height, input.scale);
+        encoder.write_nv12(&canvas.nv12)?;
+    }
+    let readback = encoder.finish()?;
+    Ok(EncodedSegment {
+        width,
+        height,
+        bound_held: true,
+        keyframe_instants: Vec::new(),
+        encoder: readback.encoder,
+        hardware: readback.hardware,
+        quality: super::clip_folder::QualityReport {
+            mode: readback.rate_control_mode.to_owned(),
+            value: readback.rate_control_value,
+            gop_frames: readback.keyframe_interval_frames,
+            b_frames: 0,
+            screen_content_hint: false,
+            status: "unverified".to_owned(),
+        },
+    })
+}
+
+/// The picture the encoder sees, kept as NV12 (BT.709 limited range). Frames
+/// are placed at the top left, each pixel duplicated σ × σ, never scaled
+/// otherwise (B3, E4); the rest of a larger canvas is black.
+struct Nv12Canvas {
+    width: u32,
+    height: u32,
+    nv12: Vec<u8>,
+}
+
+impl Nv12Canvas {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            nv12: vec![0; width as usize * height as usize * 3 / 2],
+        }
+    }
+
+    /// Draws a BGRA frame of `source_width` × `source_height` duplicated by
+    /// `scale`, converting to NV12 with chroma averaged over each 2 × 2 block.
+    fn draw(&mut self, bgra: &[u8], source_width: u32, source_height: u32, scale: u32) {
+        let (width, height) = (self.width as usize, self.height as usize);
+        let (source_width, source_height) = (source_width as usize, source_height as usize);
+        let scale = scale.max(1) as usize;
+        let rgb_at = |col: usize, row: usize| -> (i32, i32, i32) {
+            let (x, y) = (col / scale, row / scale);
+            if x >= source_width || y >= source_height {
+                return (0, 0, 0);
+            }
+            let offset = (y * source_width + x) * 4;
+            bgra.get(offset..offset + 3).map_or((0, 0, 0), |pixel| {
+                (
+                    i32::from(pixel[2]),
+                    i32::from(pixel[1]),
+                    i32::from(pixel[0]),
+                )
+            })
+        };
+        let (luma, chroma) = self.nv12.split_at_mut(width * height);
+        for row in 0..height {
+            for col in 0..width {
+                let (red, green, blue) = rgb_at(col, row);
+                luma[row * width + col] =
+                    clamp_u8(((47 * red + 157 * green + 16 * blue + 128) >> 8) + 16);
+            }
+        }
+        for row in (0..height).step_by(2) {
+            for col in (0..width).step_by(2) {
+                let mut sum = (0, 0, 0);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (red, green, blue) = rgb_at(col + dx, row + dy);
+                    sum = (sum.0 + red, sum.1 + green, sum.2 + blue);
+                }
+                let (red, green, blue) = (sum.0 / 4, sum.1 / 4, sum.2 / 4);
+                let at = (row / 2) * width + col;
+                chroma[at] = clamp_u8(((-26 * red - 87 * green + 112 * blue + 128) >> 8) + 128);
+                chroma[at + 1] = clamp_u8(((112 * red - 102 * green - 10 * blue + 128) >> 8) + 128);
+            }
+        }
+    }
+}
+
+fn clamp_u8(value: i32) -> u8 {
+    u8::try_from(value.clamp(0, 255)).unwrap_or(u8::MAX)
 }
 
 pub(super) struct ClipEncoder {
@@ -109,6 +241,7 @@ impl ClipEncoder {
         })
     }
 
+    #[expect(dead_code, reason = "package 3b reads the encoder back per segment")]
     pub(super) const fn readback(&self) -> &EncoderReadback {
         &self.readback
     }

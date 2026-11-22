@@ -248,23 +248,17 @@ mod capture_gif;
 #[cfg(windows)]
 mod clip_decoder;
 #[cfg(windows)]
-#[expect(
-    dead_code,
-    reason = "the clip worker (package 3) encodes with it again"
-)]
 mod clip_encoder;
 #[expect(
     dead_code,
-    reason = "segments and recovery are read by the clip worker (package 3)"
+    reason = "the views folder is used by the viewer (package 4)"
 )]
 mod clip_folder;
 #[cfg(windows)]
 mod clip_viewer;
-#[expect(
-    dead_code,
-    reason = "the worker cap is applied by the clip worker (package 3)"
-)]
 mod clip_worker;
+#[cfg(windows)]
+pub(crate) use clip_worker::{recover_clips_on_start, run_clip_worker_from_cli};
 mod data_cleaning;
 mod delegate_errors;
 pub(crate) mod drain;

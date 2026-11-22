@@ -980,7 +980,8 @@ fn close_or_retain_standalone_worker_job(
 }
 
 #[cfg(windows)]
-fn create_worker_kill_on_close_job() -> Result<windows::Win32::Foundation::HANDLE, String> {
+pub(crate) fn create_worker_kill_on_close_job() -> Result<windows::Win32::Foundation::HANDLE, String>
+{
     use windows::{
         Win32::System::JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -1847,7 +1848,7 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, rmcp::ErrorData> {
 }
 
 #[cfg(windows)]
-fn quote_windows_arg(arg: &str) -> String {
+pub(crate) fn quote_windows_arg(arg: &str) -> String {
     let mut quoted = String::with_capacity(arg.len() + 2);
     quoted.push('"');
     let mut backslashes = 0;
@@ -1872,7 +1873,7 @@ fn quote_windows_arg(arg: &str) -> String {
 }
 
 #[cfg(windows)]
-fn wide_null(value: &str) -> Vec<u16> {
+pub(crate) fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 

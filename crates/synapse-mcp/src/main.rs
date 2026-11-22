@@ -108,6 +108,9 @@ enum Mode {
     ApprovalProtocol,
     /// Internal child process bound to a hidden desktop for UIA/PrintWindow work.
     DesktopWorker,
+    /// Internal long-lived clip worker: forms and encodes the segments of one
+    /// clip folder inside a processor-capped job.
+    ClipWorker,
     /// Enumerate/classify synapse-mcp processes; with --kill-stray, clean them.
     Doctor,
     /// Run a registry-backed local model as a Synapse MCP client/agent.
@@ -209,6 +212,8 @@ struct Cli {
     desktop_worker_json: Option<PathBuf>,
     #[arg(long, hide = true)]
     desktop_worker_bgra: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    clip_worker_folder: Option<PathBuf>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_MODEL", value_name = "NAME")]
     local_agent_model: Option<String>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_TASK", value_name = "TEXT")]
@@ -390,6 +395,21 @@ async fn run() -> anyhow::Result<ExitCode> {
         drop(telemetry_guard);
         return Ok(code);
     }
+    if matches!(cli.mode, Mode::ClipWorker) {
+        let folder = cli
+            .clip_worker_folder
+            .clone()
+            .context("--clip-worker-folder is required for --mode clip-worker")?;
+        #[cfg(windows)]
+        let code = server::run_clip_worker_from_cli(&folder);
+        #[cfg(not(windows))]
+        let code = {
+            let _ = folder;
+            1
+        };
+        drop(telemetry_guard);
+        return Ok(ExitCode::from(code));
+    }
     if matches!(cli.mode, Mode::LocalAgent) {
         let result = local_agent::run_from_cli(local_agent::LocalAgentCli {
             model_name: cli.local_agent_model.clone(),
@@ -459,6 +479,10 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
     };
 
+    #[cfg(windows)]
+    if matches!(cli.mode, Mode::Stdio | Mode::Http) {
+        server::recover_clips_on_start();
+    }
     match cli.mode {
         Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,
         Mode::Http => {
@@ -477,6 +501,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         | Mode::ChromeNativeHost
         | Mode::ApprovalProtocol
         | Mode::DesktopWorker
+        | Mode::ClipWorker
         | Mode::Doctor
         | Mode::LocalAgent => {
             unreachable!(

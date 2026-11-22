@@ -215,10 +215,18 @@ pub(super) struct SegmentCheckpoint {
     /// `true` for a transition segment formed during a drag (E4).
     #[serde(default)]
     pub(super) padded: bool,
+    /// `false` when the recorded size had to stay within the encoder bound
+    /// below σ · window size (B3).
+    #[serde(default = "bound_held_default")]
+    pub(super) bound_held: bool,
     pub(super) keyframe_instants: Vec<u64>,
     pub(super) encoder: String,
     pub(super) hardware: bool,
     pub(super) quality: QualityReport,
+}
+
+const fn bound_held_default() -> bool {
+    true
 }
 
 /// The rate control the encoder accepted and read back (B7, condition Q).

@@ -1,31 +1,35 @@
 # Clip viewer D5: the acceptance of the change detection on the proof clips.
 # Spec: docs/clip-recorder-plan.md, "D5 as an equation", item 7 (acceptance) and the findings of
-# Gitea issue #293 (Codex review of ea3e8514 and 3077349b).
+# Gitea issue #293 (Codex reviews of ea3e8514, 3077349b and 8d9af525).
 # Checked by: node scripts/clip-equation/spec/run-spec.mjs d5 <viewer-output.json> <schedule.json>
 #
-# Inputs (written in the verification round; see the header of d5.mjs for every field):
+# Inputs (written in the verification round; the header of d5.mjs lists every field):
 #   viewer-output.json  one object per clip: proof (the ui-events-page.html clip), still, spinner
-#                       (a lone spinner), flash (the flash page clip). Each holds the viewer's
-#                       overview_analysis.json timeline and picks, frame_ms, end_ms, keyframes_ms;
-#                       proof also schedule_start_ms (clip time of the page's schedule start) and
-#                       flash also flashes (the flashes the page showed).
-#   schedule.json       the page's window.schedule, window.actualTiming and window.scheduleBoxFits.
+#                       (a lone spinner), flash (the flash page clip), boundary_below and
+#                       boundary_at (page runs ending 150 ms and exactly 200 ms after the "last
+#                       change" row). Each holds the viewer's overview_analysis.json timeline (and
+#                       picks), fps and frame_ms (= 1000 / fps), and as needed end_ms, keyframes_ms,
+#                       schedule_start_ms, viewport (CSS px to recorded px), shown_ms (flash clip)
+#                       and actual (a boundary run's window.actualTiming).
+#   schedule.json       the proof run's window.schedule, window.actualTiming, window.always and
+#                       window.scheduleBoxFits.
 # Symbols: one instant = frame_ms (50 ms at 20 fps); K_s = SETTLE_MS / frame_ms = 4;
-# an event = a timeline entry of kind change, short_lived or animating.
+# an event = a timeline entry of kind change, short_lived or animating; t = the clip time at which
+# the page presented a row (never its nominal time); region = the row's element box in recorded px.
 
-Feature: The viewer reports each scheduled UI event once, with its type and start, and nothing else
+Feature: The viewer reports each scheduled UI event once, with its type, region and start, and nothing else
 
   # D5 item 7: the acceptance lines.
 
   Scenario: every scheduled event reported
-    Given the proof clip and the page's schedule
-    Then each scheduled row has an event of its expected kind whose start is within one instant of the row's presented start
-    # Equation: |start_ms(event) - (schedule_start_ms + t_presented)| <= frame_ms, kind(event) = expect | Known: every row matched
+    Given the proof clip, the page's schedule with its presentation times and regions, and the spinners running from page load
+    Then each row takes exactly one event of its kind, in its region, starting within one instant of t (typing takes all of its keys), and no event is left over
+    # Equation: one-to-one: kind = expect, bbox meets region, |start_ms - t| <= frame_ms; missed = duplicate = unexpected = 0 | Known: 0, 0, 0
 
   Scenario: still period gives no event
     Given the proof clip
     Then no event starts in the scheduled still period, while the caret blinks
-    # Equation: count(events starting in [19000, 29000]) = 0 | Known: 0
+    # Equation: count(events starting in [t_still, t_still + 10000)) = 0 | Known: 0
 
   Scenario: still clip gives no event
     Given the still clip
@@ -38,48 +42,53 @@ Feature: The viewer reports each scheduled UI event once, with its type and star
     # Equation: count(animating) = 1, count(change) + count(short_lived) = 0 | Known: 1, 0
 
   Scenario: keyframe instants give no event
-    Given the proof and still clips with the keyframe instants of their segments
-    Then no event starts within one instant of a keyframe unless a scheduled row starts there
-    # Equation: count(events at a keyframe instant and at no scheduled row) = 0 | Known: 0
+    Given the proof and still clips with the keyframe instants of their segments, at least one after the first instant
+    Then no event starts within one instant of a keyframe, except a proof event matched to its scheduled row
+    # Equation: count(events at a keyframe instant and not matched to a row) = 0 | Known: 0
 
   Scenario: flash clip gives one FLASH per flash
-    Given the flash clip and the number of flashes its page showed
-    Then the timeline has one short_lived event per flash and no other event
-    # Equation: count(short_lived) = flashes, count(change) = 0 | Known: equal, 0
+    Given the flash clip and the clip time of each presented flash
+    Then each flash has exactly one short_lived event within one instant, and there is no other event of any kind
+    # Equation: per flash count(short_lived, |start_ms - t| <= frame_ms) = 1; other events = 0 | Known: 1, 0
 
   # Issue #293: one scenario per finding.
 
   Scenario: #293-1 a fade is one change from its start
     Given the 300 ms dialog fade of the proof clip
-    Then exactly one change starts in the fade, within one instant of the fade start: undecided steps never move the anchor
-    # Equation: count(change starting in [t, t + 300 + 200]) = 1, |start - t| <= frame_ms | Known: 1, true
+    Then the fade row takes exactly one change, in its region, within one instant of the fade start: undecided steps never move the anchor
+    # Equation: count(matched change of the fade row) = 1 | Known: 1
 
   Scenario: #293-2 an animation that stays SAME to its anchor
     Given the grey square that alternates 100/156 around its grey 128 (SAME to the anchor, DIFF frame to frame)
-    Then one animating event starts within one instant of the alternation start, and no change or short_lived event starts in it
-    # Equation: count(animating at t) = 1, count(change, short_lived in [t, t_end)) = 0 | Known: 1, 0
+    Then its row takes one animating event, and no other event starts in its region during the alternation
+    # Equation: count(matched animating) = 1, count(other events in region in [t, t_end)) = 0 | Known: 1, 0
 
   Scenario: #293-3 a change is pictured at its confirmed settle frame
-    Given every settled change of the proof clip
-    Then its pick "settled frame after change" is at least K_s instants after its last change
-    # Equation: frame(pick) >= end_frame(change) + K_s | Known: every settled change
+    Given every settled change of the proof clip, with the confirmed frame N its timeline text names
+    Then a "settled frame after change" pick lies at N, and N is at least end_frame + K_s (clipped to the last frame) and at most the last frame
+    # Equation: pick.frame = N, min(end_frame + K_s, last) <= N <= last | Known: every settled change
 
-  Scenario: #293-4 quiet for SETTLE_MS before the clip end is settled
-    Given every change the viewer marks as still changing at the clip end
-    Then it was quiet for less than SETTLE_MS before the clip end
-    # Equation: end_ms(clip) - end_ms(change) < 200 | Known: every unsettled change
+  Scenario: #293-4a quiet one instant less than SETTLE_MS before the clip end is not settled
+    Given the boundary_below clip, ending 150 ms after the last change was shown
+    Then that change is quiet 150 ms before the clip end and is reported as still changing when the clip ended
+    # Equation: end_ms(clip) - end_ms(change) = SETTLE_MS - frame_ms, outcome = unsettled | Known: 150, unsettled
+
+  Scenario: #293-4b quiet exactly SETTLE_MS before the clip end is settled
+    Given the boundary_at clip, ending exactly 200 ms after the last change was shown
+    Then that change is quiet 200 ms before the clip end and is reported as settled
+    # Equation: end_ms(clip) - end_ms(change) = SETTLE_MS, outcome = settled | Known: 200, settled
 
   Scenario: #293-5 only the animated stretch is exempt from FLASH
     Given the grey square's alternation and its 50 ms dark flash 400 ms after the alternation ends
-    Then the alternation gives no short_lived event, and the later flash gives one short_lived event within one instant of its start
-    # Equation: count(short_lived in [t_alt, t_alt_end)) = 0, |start(short_lived) - t_flash| <= frame_ms | Known: 0, true
+    Then no short_lived event starts in the square during the alternation, and the dark flash row takes exactly one short_lived event
+    # Equation: count(short_lived in region in [t_alt, t_alt_end)) = 0, count(matched short_lived of the dark flash) = 1 | Known: 0, 1
 
   Scenario: #293-6 flashes are timed from their presentation
-    Given the page's actual timing of every flash
-    Then each flash was presented, and shown for at least FLASH_MS from its presentation
-    # Equation: hidden_ms - shown_ms >= 50 for every flash row | Known: every flash
+    Given the page's actual timing of every flash row
+    Then its times are finite and ordered, and the hide was decided at least FLASH_MS after the presentation
+    # Equation: set_ms <= shown_ms <= hide_ms <= hidden_ms, hide_ms - shown_ms >= 50 | Known: every flash row
 
   Scenario: #293-7 the schedule box shows every row
-    Given the page's schedule box
-    Then its content fits the box and nothing covers it: no row is cut off or hidden
-    # Equation: scroll size <= client size, box bottom <= top of the track card and of the window (window.scheduleBoxFits) | Known: true
+    Given the page's schedule box, measured at load and on every resize
+    Then its content fits the box, the box lies inside every viewport edge, and no card covers it
+    # Equation: scroll size <= client size, 0 <= left, top; right <= innerWidth; bottom <= innerHeight; no card overlaps (window.scheduleBoxFits) | Known: true

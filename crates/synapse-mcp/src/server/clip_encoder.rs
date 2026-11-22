@@ -1,65 +1,70 @@
-//! H.264 clip encoder on the Media Foundation Sink Writer ("Bug clip video"
-//! research, section 5.3, product path).
+//! H.264 segment encoder on the Media Foundation Sink Writer
+//! (docs/clip-recorder-plan.md, version 4.1, section B, operations B3 to B7).
 //!
-//! `ClipEncoder` owns one Sink Writer that turns constant-rate NV12 frames into
-//! an H.264 (High profile, yuv420) stream inside a fragmented MP4. It asks for
-//! a hardware encoder, quality-based rate control and a 1 s keyframe interval,
-//! and reports what Media Foundation actually granted: the encoder's name,
-//! whether it is hardware, the container, and the rate-control mode.
+//! `encode_segment` turns the raw frames of one segment into one H.264
+//! (High profile, yuv420) file:
 //!
-//! All calls must stay on the thread that created the encoder: it initialises
-//! COM (MTA) and Media Foundation for that thread and shuts both down on drop.
+//! - B3: each pixel is duplicated σ × σ and converted to NV12; above the
+//!   encoder bound the largest size within it at the same aspect ratio is used
+//!   (condition G is then not held for the segment).
+//! - B4: hardware transforms are on; on any encoder failure the segment is
+//!   encoded once more with them off; a second failure is the caller's error.
+//! - B5: every sample carries its instant as the time within the segment and
+//!   its duration up to the next new frame; repeated frames are not encoded.
+//! - B6: a keyframe every `GOP_FRAMES` encoded frames, no forced keyframe, no
+//!   B-frames (set and read back), the screen-content hint tried and recorded.
+//! - B7: quality mode at `H264_QUALITY_LEVEL`, read back; if refused, a
+//!   bitrate of β · width · height · f, read back; Q gets an honest status.
+//!
+//! All calls stay on the thread that created the encoder: it initialises COM
+//! (MTA) and Media Foundation for that thread and shuts both down on drop.
 
 use std::path::Path;
 
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQuality,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize, ICodecAPI, IMFAttributes,
-    IMFMediaType, IMFSinkWriter, IMFSinkWriterEx, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE,
-    MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE,
-    MF_VERSION, MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
+    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVScenarioInfo, ICodecAPI, IMFAttributes, IMFMediaType,
+    IMFSinkWriter, IMFSinkWriterEx, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX,
+    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
+    MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
     MFCreateSinkWriterFromURL, MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_LITE,
     MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_HARDWARE_URL_Attribute,
-    MFT_FRIENDLY_NAME_Attribute, MFTranscodeContainerType_FMPEG4, MFTranscodeContainerType_MPEG4,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR,
-    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_High,
+    MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, MFT_FRIENDLY_NAME_Attribute,
+    MFTranscodeContainerType_FMPEG4, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_High,
+    eAVScenarioInfo_DisplayRemoting,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{GUID, HSTRING, Interface};
 
-/// `CODECAPI_AVEncCommonQuality` level (0..=100) for quality-based rate control.
+use super::capture_clip::RECORD_FPS;
+use super::clip_folder::QualityReport;
+
+/// q: `CODECAPI_AVEncCommonQuality` level (0..=100). Condition Q stays
+/// `unverified` until q_min is calibrated for the encoder used (C6).
 const H264_QUALITY_LEVEL: u32 = 70;
 /// β: bits per pixel and frame for the bitrate fallback (equation section 6).
 pub(super) const FALLBACK_BITS_PER_PIXEL_FRAME: f64 = 0.10;
-/// Bitrate used when the encoder refuses quality mode (research section 9).
-const FALLBACK_BITRATE_BPS: u32 = 6_000_000;
-const KEYFRAME_INTERVAL_SECONDS: u32 = 1;
-const HNS_PER_SECOND: i64 = 10_000_000;
+/// τ: the keyframe interval in recorded time.
+const KEYFRAME_INTERVAL_MS: u32 = 1_000;
+/// GOP: τ · f encoded frames between keyframes (S5). Repeats are not encoded,
+/// so keyframes are at least τ apart in time.
+pub(super) const GOP_FRAMES: u32 = KEYFRAME_INTERVAL_MS * RECORD_FPS / 1_000;
+/// The chosen encoder bound (C16): at most this many 16 × 16 macroblocks.
+const MAX_ENCODE_MACROBLOCKS: u64 = 36_864;
+/// The chosen encoder bound (C16): each side at most this many pixels.
+const MAX_ENCODE_SIDE: u32 = 4_096;
+const HNS_PER_MS: i64 = 10_000;
 /// Upper bound on transforms walked when looking for the encoder in the chain.
 const MAX_TRANSFORMS_PER_STREAM: u32 = 8;
 
-/// What Media Foundation actually granted for this clip.
-#[derive(Clone, Debug)]
-#[expect(dead_code, reason = "package 3b reports the container")]
-pub(super) struct EncoderReadback {
-    pub(super) encoder: String,
-    pub(super) hardware: bool,
-    /// `fragmented_mp4`, or `mp4` when fragmented MP4 was refused.
-    pub(super) container: &'static str,
-    /// `quality` or `cbr_bitrate`.
-    pub(super) rate_control_mode: &'static str,
-    /// Quality level (0..=100) or bits per second, matching the mode.
-    pub(super) rate_control_value: u32,
-    pub(super) keyframe_interval_frames: u32,
-}
-
 /// One frame of a segment: its raw file (captured BGRA rows), its captured
 /// size, and its time within the segment (B5).
-#[expect(dead_code, reason = "the times are written by package 3b")]
 pub(super) struct SegmentSample {
     pub(super) raw: std::path::PathBuf,
     pub(super) width: u32,
@@ -88,66 +93,155 @@ pub(super) struct EncodedSegment {
     pub(super) keyframe_instants: Vec<u64>,
     pub(super) encoder: String,
     pub(super) hardware: bool,
-    pub(super) quality: super::clip_folder::QualityReport,
+    pub(super) quality: QualityReport,
 }
 
-/// Encodes one segment into `path` (the `.part` file) and finalizes it.
+/// Encodes one segment into `path` (the `.part` file) and finalizes it. B4:
+/// on any encoder failure the segment is encoded once more from its raw
+/// frames with hardware transforms off.
 pub(super) fn encode_segment(path: &Path, input: &SegmentInput) -> Result<EncodedSegment, String> {
-    let width = (input.canvas_width * input.scale).max(2) & !1;
-    let height = (input.canvas_height * input.scale).max(2) & !1;
-    let mut encoder = ClipEncoder::create(path, width, height, input.fps)?;
-    let mut canvas = Nv12Canvas::new(width, height);
-    for sample in input.samples {
-        let bgra = std::fs::read(&sample.raw)
-            .map_err(|error| format!("could not read {}: {error}", sample.raw.display()))?;
-        canvas.draw(&bgra, sample.width, sample.height, input.scale);
-        encoder.write_nv12(&canvas.nv12)?;
-    }
-    let readback = encoder.finish()?;
-    Ok(EncodedSegment {
-        width,
-        height,
-        bound_held: true,
-        keyframe_instants: Vec::new(),
-        encoder: readback.encoder,
-        hardware: readback.hardware,
-        quality: super::clip_folder::QualityReport {
-            mode: readback.rate_control_mode.to_owned(),
-            value: readback.rate_control_value,
-            gop_frames: readback.keyframe_interval_frames,
-            b_frames: 0,
-            screen_content_hint: false,
-            status: "unverified".to_owned(),
-        },
+    encode_once(path, input, true).or_else(|hardware_error| {
+        tracing::warn!(
+            code = "CLIP_ENCODER_RETRY_SOFTWARE",
+            error = %hardware_error,
+            "segment encode failed; retrying once with hardware transforms off"
+        );
+        let _ = std::fs::remove_file(path);
+        encode_once(path, input, false).map_err(|software_error| {
+            format!("encoder failed twice: {hardware_error}; without hardware transforms: {software_error}")
+        })
     })
 }
 
-/// The picture the encoder sees, kept as NV12 (BT.709 limited range). Frames
-/// are placed at the top left, each pixel duplicated σ × σ, never scaled
-/// otherwise (B3, E4); the rest of a larger canvas is black.
-struct Nv12Canvas {
+fn encode_once(
+    path: &Path,
+    input: &SegmentInput,
+    hardware: bool,
+) -> Result<EncodedSegment, String> {
+    let size = RecordedSize::of(input);
+    let mut encoder = ClipEncoder::create(path, size.width, size.height, input.fps, hardware)?;
+    let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
+    for sample in input.samples {
+        let bgra = std::fs::read(&sample.raw)
+            .map_err(|error| format!("could not read {}: {error}", sample.raw.display()))?;
+        canvas.draw(&bgra, sample.width, sample.height);
+        encoder.write_nv12(
+            &canvas.nv12,
+            ms_to_hns(sample.local_ms),
+            ms_to_hns(sample.duration_ms),
+        )?;
+    }
+    let readback = encoder.finish()?;
+    let keyframe_times = super::clip_decoder::keyframe_times_hns(path)?;
+    let keyframe_instants = keyframe_times
+        .iter()
+        .filter_map(|&time| {
+            input
+                .samples
+                .iter()
+                .rev()
+                .find(|sample| ms_to_hns(sample.local_ms) <= time)
+                .map(|sample| sample.instant)
+        })
+        .collect();
+    Ok(EncodedSegment {
+        width: size.width,
+        height: size.height,
+        bound_held: size.bound_held,
+        keyframe_instants,
+        encoder: readback.encoder,
+        hardware: readback.hardware,
+        quality: readback.quality,
+    })
+}
+
+fn ms_to_hns(ms: u64) -> i64 {
+    i64::try_from(ms)
+        .unwrap_or(i64::MAX / HNS_PER_MS)
+        .saturating_mul(HNS_PER_MS)
+}
+
+/// B3: the recorded size σ · canvas, or the largest size within the encoder
+/// bound at the same aspect ratio; both even.
+struct RecordedSize {
     width: u32,
     height: u32,
+    bound_held: bool,
+}
+
+impl RecordedSize {
+    fn of(input: &SegmentInput) -> Self {
+        let width = u64::from(input.canvas_width.max(1)) * u64::from(input.scale.max(1));
+        let height = u64::from(input.canvas_height.max(1)) * u64::from(input.scale.max(1));
+        let macroblocks = width.div_ceil(16) * height.div_ceil(16);
+        let side = u64::from(MAX_ENCODE_SIDE);
+        if macroblocks <= MAX_ENCODE_MACROBLOCKS && width <= side && height <= side {
+            return Self {
+                width: even(width),
+                height: even(height),
+                bound_held: true,
+            };
+        }
+        let area_factor = (MAX_ENCODE_MACROBLOCKS as f64 * 256.0 / (width * height) as f64).sqrt();
+        let factor = area_factor
+            .min(side as f64 / width as f64)
+            .min(side as f64 / height as f64);
+        Self {
+            width: even((width as f64 * factor).floor() as u64),
+            height: even((height as f64 * factor).floor() as u64),
+            bound_held: false,
+        }
+    }
+}
+
+fn even(value: u64) -> u32 {
+    u32::try_from(value.max(2) & !1).unwrap_or(!1)
+}
+
+/// The picture the encoder sees, kept as NV12 (BT.709 limited range). Frames
+/// are placed at the top left with each pixel duplicated σ × σ, never scaled
+/// otherwise (E4); the rest of a larger canvas is black. Above the encoder
+/// bound the same map picks the nearest source pixel.
+struct Nv12Canvas {
+    width: usize,
+    height: usize,
+    /// Source column and row of each output column and row.
+    column_source: Vec<usize>,
+    row_source: Vec<usize>,
     nv12: Vec<u8>,
 }
 
 impl Nv12Canvas {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(size: &RecordedSize, canvas_width: u32, canvas_height: u32, scale: u32) -> Self {
+        let (width, height) = (size.width as usize, size.height as usize);
+        let map = |out: usize, canvas: u32| -> Vec<usize> {
+            (0..out)
+                .map(|at| {
+                    if size.bound_held {
+                        at / scale.max(1) as usize
+                    } else {
+                        at * canvas as usize / out.max(1)
+                    }
+                })
+                .collect()
+        };
         Self {
             width,
             height,
-            nv12: vec![0; width as usize * height as usize * 3 / 2],
+            column_source: map(width, canvas_width),
+            row_source: map(height, canvas_height),
+            nv12: vec![0; width * height * 3 / 2],
         }
     }
 
-    /// Draws a BGRA frame of `source_width` × `source_height` duplicated by
-    /// `scale`, converting to NV12 with chroma averaged over each 2 × 2 block.
-    fn draw(&mut self, bgra: &[u8], source_width: u32, source_height: u32, scale: u32) {
-        let (width, height) = (self.width as usize, self.height as usize);
+    /// Draws a BGRA frame of `source_width` × `source_height`, converting to
+    /// NV12 with chroma averaged over each 2 × 2 block.
+    fn draw(&mut self, bgra: &[u8], source_width: u32, source_height: u32) {
+        let (width, height) = (self.width, self.height);
         let (source_width, source_height) = (source_width as usize, source_height as usize);
-        let scale = scale.max(1) as usize;
+        let (columns, rows) = (&self.column_source, &self.row_source);
         let rgb_at = |col: usize, row: usize| -> (i32, i32, i32) {
-            let (x, y) = (col / scale, row / scale);
+            let (x, y) = (columns[col.min(width - 1)], rows[row.min(height - 1)]);
             if x >= source_width || y >= source_height {
                 return (0, 0, 0);
             }
@@ -188,13 +282,18 @@ fn clamp_u8(value: i32) -> u8 {
     u8::try_from(value.clamp(0, 255)).unwrap_or(u8::MAX)
 }
 
-pub(super) struct ClipEncoder {
+/// What Media Foundation granted for a segment, read back.
+struct EncoderReadback {
+    encoder: String,
+    hardware: bool,
+    quality: QualityReport,
+}
+
+struct ClipEncoder {
     // Field order matters: the writer must be released before the runtime
     // guard shuts Media Foundation down.
     writer: IMFSinkWriter,
     stream: u32,
-    fps: u32,
-    frames_written: u64,
     readback: EncoderReadback,
     /// `true` once `Finalize` ran; otherwise drop finalizes (error exits).
     finalized: bool,
@@ -202,56 +301,62 @@ pub(super) struct ClipEncoder {
 }
 
 impl ClipEncoder {
-    /// Opens `path` for writing an H.264 clip of fixed `width`x`height` (even)
-    /// at a constant `fps`.
-    pub(super) fn create(path: &Path, width: u32, height: u32, fps: u32) -> Result<Self, String> {
+    /// Opens `path` for one H.264 segment of `width` × `height` (even).
+    fn create(
+        path: &Path,
+        width: u32,
+        height: u32,
+        fps: u32,
+        hardware: bool,
+    ) -> Result<Self, String> {
         let runtime = MediaFoundationRuntime::start()?;
-        let opened = open_writer(path, MFTranscodeContainerType_FMPEG4, width, height, fps)
-            .map(|opened| (opened, "fragmented_mp4"))
-            .or_else(|fragmented_error| {
-                tracing::warn!(
-                    code = "CLIP_ENCODER_FMP4_REFUSED",
-                    error = %fragmented_error,
-                    "fragmented MP4 refused; falling back to normal MP4"
-                );
-                let _ = std::fs::remove_file(path);
-                open_writer(path, MFTranscodeContainerType_MPEG4, width, height, fps)
-                    .map(|opened| (opened, "mp4"))
-                    .map_err(|mp4_error| {
-                        format!("fragmented MP4: {fragmented_error}; MP4: {mp4_error}")
-                    })
-            })?;
-        let ((writer, stream, rate_control_mode, rate_control_value), container) = opened;
-        let (encoder, hardware) = encoder_identity(&writer, stream);
+        let (writer, stream) = open_writer(
+            path,
+            MFTranscodeContainerType_FMPEG4,
+            width,
+            height,
+            fps,
+            hardware,
+        )
+        .or_else(|fragmented_error| {
+            tracing::warn!(
+                code = "CLIP_ENCODER_FMP4_REFUSED",
+                error = %fragmented_error,
+                "fragmented MP4 refused; falling back to normal MP4"
+            );
+            let _ = std::fs::remove_file(path);
+            open_writer(
+                path,
+                MFTranscodeContainerType_MPEG4,
+                width,
+                height,
+                fps,
+                hardware,
+            )
+            .map_err(|mp4_error| format!("fragmented MP4: {fragmented_error}; MP4: {mp4_error}"))
+        })?;
+        let quality = confirm_settings(&writer, stream, width, height, fps)?;
+        // SAFETY: the writer is configured; this starts the session.
+        unsafe { writer.BeginWriting() }.map_err(hr("IMFSinkWriter::BeginWriting"))?;
+        let (encoder, is_hardware) = encoder_identity(&writer, stream);
         Ok(Self {
             writer,
             stream,
-            fps,
-            frames_written: 0,
             readback: EncoderReadback {
                 encoder,
-                hardware,
-                container,
-                rate_control_mode,
-                rate_control_value,
-                keyframe_interval_frames: fps * KEYFRAME_INTERVAL_SECONDS,
+                hardware: is_hardware,
+                quality,
             },
             finalized: false,
             _runtime: runtime,
         })
     }
 
-    #[expect(dead_code, reason = "package 3b reads the encoder back per segment")]
-    pub(super) const fn readback(&self) -> &EncoderReadback {
-        &self.readback
-    }
-
-    /// Encodes one NV12 frame (`width*height*3/2` bytes) as the next frame of
-    /// the constant-rate timeline.
-    pub(super) fn write_nv12(&mut self, nv12: &[u8]) -> Result<(), String> {
+    /// Encodes one NV12 frame (`width*height*3/2` bytes) at `time_hns` within
+    /// the segment, shown for `duration_hns` (B5).
+    fn write_nv12(&mut self, nv12: &[u8], time_hns: i64, duration_hns: i64) -> Result<(), String> {
         let length = u32::try_from(nv12.len()).map_err(|_| "NV12 frame too large".to_owned())?;
-        let start = frame_time_hns(self.frames_written, self.fps);
-        let next = frame_time_hns(self.frames_written + 1, self.fps);
+        // SAFETY: the buffer is locked for exactly `length` bytes while copied.
         unsafe {
             let buffer = MFCreateMemoryBuffer(length).map_err(hr("MFCreateMemoryBuffer"))?;
             let mut data: *mut u8 = std::ptr::null_mut();
@@ -268,24 +373,28 @@ impl ClipEncoder {
                 .AddBuffer(&buffer)
                 .map_err(hr("IMFSample::AddBuffer"))?;
             sample
-                .SetSampleTime(start)
+                .SetSampleTime(time_hns)
                 .map_err(hr("IMFSample::SetSampleTime"))?;
             sample
-                .SetSampleDuration(next - start)
+                .SetSampleDuration(duration_hns.max(1))
                 .map_err(hr("IMFSample::SetSampleDuration"))?;
             self.writer
                 .WriteSample(self.stream, &sample)
                 .map_err(hr("IMFSinkWriter::WriteSample"))?;
         }
-        self.frames_written += 1;
         Ok(())
     }
 
     /// Flushes the encoder and closes the file.
-    pub(super) fn finish(mut self) -> Result<EncoderReadback, String> {
+    fn finish(mut self) -> Result<EncoderReadback, String> {
         self.finalized = true;
+        // SAFETY: the writer is open; Finalize flushes and closes it.
         unsafe { self.writer.Finalize() }.map_err(hr("IMFSinkWriter::Finalize"))?;
-        Ok(self.readback.clone())
+        Ok(EncoderReadback {
+            encoder: std::mem::take(&mut self.readback.encoder),
+            hardware: self.readback.hardware,
+            quality: std::mem::take(&mut self.readback.quality),
+        })
     }
 }
 
@@ -297,6 +406,7 @@ impl Drop for ClipEncoder {
             return;
         }
         self.finalized = true;
+        // SAFETY: the writer is open; Finalize closes it.
         if let Err(error) = unsafe { self.writer.Finalize() } {
             tracing::debug!(
                 code = "CLIP_ENCODER_FINALIZE_ON_DROP_FAILED",
@@ -307,19 +417,25 @@ impl Drop for ClipEncoder {
     }
 }
 
-/// Creates the writer, configures the H.264 stream and begins writing.
-/// Returns the writer, its stream index and the rate control granted.
+/// Creates the writer and configures the H.264 stream. Returns the writer and
+/// its stream index.
 fn open_writer(
     path: &Path,
     container: GUID,
     width: u32,
     height: u32,
     fps: u32,
-) -> Result<(IMFSinkWriter, u32, &'static str, u32), String> {
+    hardware: bool,
+) -> Result<(IMFSinkWriter, u32), String> {
+    // SAFETY: Media Foundation calls on attribute stores and media types this
+    // function owns; every result is checked.
     unsafe {
         let attributes = new_attributes(2)?;
         attributes
-            .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
+            .SetUINT32(
+                &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                u32::from(hardware),
+            )
             .map_err(hr("set MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS"))?;
         attributes
             .SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &container)
@@ -330,7 +446,7 @@ fn open_writer(
 
         let output = video_type(&MFVideoFormat_H264, width, height, fps)?;
         output
-            .SetUINT32(&MF_MT_AVG_BITRATE, FALLBACK_BITRATE_BPS)
+            .SetUINT32(&MF_MT_AVG_BITRATE, fallback_bitrate(width, height, fps))
             .map_err(hr("set MF_MT_AVG_BITRATE"))?;
         output
             .SetUINT32(
@@ -346,29 +462,30 @@ fn open_writer(
         input
             .SetUINT32(&MF_MT_DEFAULT_STRIDE, width)
             .map_err(hr("set MF_MT_DEFAULT_STRIDE"))?;
-        let keyframe_interval = fps * KEYFRAME_INTERVAL_SECONDS;
-        // First ask for quality mode up front (the encoder sees it before its
-        // media types are set); a refusal retries with the keyframe interval only.
-        let quality_params = encoder_params(keyframe_interval, true)?;
+        // The encoder sees the settings before its media types are set; a
+        // refusal retries with the keyframe interval and B-frame count only.
         if writer
-            .SetInputMediaType(stream, &input, &quality_params)
+            .SetInputMediaType(stream, &input, &encoder_params(true)?)
             .is_err()
         {
-            let plain_params = encoder_params(keyframe_interval, false)?;
             writer
-                .SetInputMediaType(stream, &input, &plain_params)
+                .SetInputMediaType(stream, &input, &encoder_params(false)?)
                 .map_err(hr("IMFSinkWriter::SetInputMediaType"))?;
         }
-        let (mode, value) = confirm_rate_control(&writer, stream)?;
-        writer
-            .BeginWriting()
-            .map_err(hr("IMFSinkWriter::BeginWriting"))?;
-        Ok((writer, stream, mode, value))
+        Ok((writer, stream))
     }
+}
+
+/// β · width · height · f, in bits per second (B7).
+fn fallback_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    let bits =
+        FALLBACK_BITS_PER_PIXEL_FRAME * f64::from(width) * f64::from(height) * f64::from(fps);
+    bits.round().clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
 /// Builds a progressive, square-pixel, BT.709 limited-range video media type.
 fn video_type(subtype: &GUID, width: u32, height: u32, fps: u32) -> Result<IMFMediaType, String> {
+    // SAFETY: setters on a media type this function owns.
     unsafe {
         let media_type = MFCreateMediaType().map_err(hr("MFCreateMediaType"))?;
         media_type
@@ -409,14 +526,25 @@ fn video_type(subtype: &GUID, width: u32, height: u32, fps: u32) -> Result<IMFMe
 }
 
 /// Encoder parameters handed to `SetInputMediaType` (applied through
-/// `ICodecAPI` by the Sink Writer).
-fn encoder_params(keyframe_interval: u32, quality: bool) -> Result<IMFAttributes, String> {
+/// `ICodecAPI` by the Sink Writer): GOP in frames and no B-frames always; the
+/// screen-content hint and quality mode when `full`.
+fn encoder_params(full: bool) -> Result<IMFAttributes, String> {
+    // SAFETY: setters on an attribute store this function owns.
     unsafe {
-        let params = new_attributes(3)?;
+        let params = new_attributes(5)?;
         params
-            .SetUINT32(&CODECAPI_AVEncMPVGOPSize, keyframe_interval)
+            .SetUINT32(&CODECAPI_AVEncMPVGOPSize, GOP_FRAMES)
             .map_err(hr("set CODECAPI_AVEncMPVGOPSize"))?;
-        if quality {
+        params
+            .SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0)
+            .map_err(hr("set CODECAPI_AVEncMPVDefaultBPictureCount"))?;
+        if full {
+            params
+                .SetUINT32(
+                    &CODECAPI_AVScenarioInfo,
+                    eAVScenarioInfo_DisplayRemoting.0.cast_unsigned(),
+                )
+                .map_err(hr("set CODECAPI_AVScenarioInfo"))?;
             params
                 .SetUINT32(
                     &CODECAPI_AVEncCommonRateControlMode,
@@ -431,55 +559,71 @@ fn encoder_params(keyframe_interval: u32, quality: bool) -> Result<IMFAttributes
     }
 }
 
-/// Sets quality mode on the live encoder; the encoder's answer is the
-/// readback. On refusal it switches to the 6 Mbps constant-bitrate fallback,
-/// checks both setters and reports the mode and bitrate the encoder reads
-/// back. A fallback that cannot be set or confirmed is an error.
-fn confirm_rate_control(
+/// B6 and B7 on the live encoder: every setting is set and read back. GOP and
+/// zero B-frames must hold (variable time stamps assume no reordering); the
+/// screen-content hint is recorded as accepted or not; quality mode, if
+/// refused, becomes the bitrate fallback, which must read back.
+fn confirm_settings(
     writer: &IMFSinkWriter,
     stream: u32,
-) -> Result<(&'static str, u32), String> {
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<QualityReport, String> {
     let codec = codec_api(writer, stream).ok_or_else(|| {
-        "the encoder exposes no ICodecAPI: rate control cannot be set or read back".to_owned()
+        "the encoder exposes no ICodecAPI: its settings cannot be set or read back".to_owned()
     })?;
+    let gop_frames = set_and_read(&codec, &CODECAPI_AVEncMPVGOPSize, GOP_FRAMES)
+        .ok_or("the encoder did not accept or read back the GOP size")?;
+    let b_frames = set_and_read(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0)
+        .ok_or("the encoder did not accept or read back a B-frame count of 0")?;
+    if b_frames != 0 {
+        return Err(format!(
+            "the encoder reads back {b_frames} B-frames; 0 is required"
+        ));
+    }
+    let hint = eAVScenarioInfo_DisplayRemoting.0.cast_unsigned();
+    let screen_content_hint = set_and_read(&codec, &CODECAPI_AVScenarioInfo, hint) == Some(hint);
+    let quality_mode = eAVEncCommonRateControlMode_Quality.0.cast_unsigned();
+    let quality = set_and_read(&codec, &CODECAPI_AVEncCommonRateControlMode, quality_mode)
+        .filter(|mode| *mode == quality_mode)
+        .and_then(|_| set_and_read(&codec, &CODECAPI_AVEncCommonQuality, H264_QUALITY_LEVEL));
+    if let Some(level) = quality {
+        return Ok(QualityReport {
+            mode: "quality".to_owned(),
+            value: level,
+            gop_frames,
+            b_frames,
+            screen_content_hint,
+            // q_min is not calibrated yet (C6).
+            status: "unverified".to_owned(),
+        });
+    }
     let cbr = eAVEncCommonRateControlMode_CBR.0.cast_unsigned();
+    let bitrate = fallback_bitrate(width, height, fps);
+    let mode = set_and_read(&codec, &CODECAPI_AVEncCommonRateControlMode, cbr);
+    let read_bitrate = set_and_read(&codec, &CODECAPI_AVEncCommonMeanBitRate, bitrate);
+    match (mode, read_bitrate) {
+        (Some(mode), Some(read)) if mode == cbr => Ok(QualityReport {
+            mode: "bitrate".to_owned(),
+            value: read,
+            gop_frames,
+            b_frames,
+            screen_content_hint,
+            status: "not_held".to_owned(),
+        }),
+        (mode, _) => Err(format!(
+            "quality mode was refused and the bitrate fallback did not take effect (mode read back {mode:?})"
+        )),
+    }
+}
+
+/// Sets a `VT_UI4` codec value and returns what the encoder reads back.
+fn set_and_read(codec: &ICodecAPI, key: &GUID, value: u32) -> Option<u32> {
+    // SAFETY: plain ICodecAPI calls with an owned VARIANT.
     unsafe {
-        let quality_accepted = codec
-            .SetValue(
-                &CODECAPI_AVEncCommonRateControlMode,
-                &variant_u32(eAVEncCommonRateControlMode_Quality.0.cast_unsigned()),
-            )
-            .is_ok()
-            && codec
-                .SetValue(
-                    &CODECAPI_AVEncCommonQuality,
-                    &variant_u32(H264_QUALITY_LEVEL),
-                )
-                .is_ok();
-        if quality_accepted {
-            return Ok(("quality", H264_QUALITY_LEVEL));
-        }
-        codec
-            .SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(cbr))
-            .map_err(hr("set CODECAPI_AVEncCommonRateControlMode (CBR fallback)"))?;
-        codec
-            .SetValue(
-                &CODECAPI_AVEncCommonMeanBitRate,
-                &variant_u32(FALLBACK_BITRATE_BPS),
-            )
-            .map_err(hr("set CODECAPI_AVEncCommonMeanBitRate (CBR fallback)"))?;
-        let mode = codec
-            .GetValue(&CODECAPI_AVEncCommonRateControlMode)
-            .map_err(hr("read back CODECAPI_AVEncCommonRateControlMode"))?;
-        let bitrate = codec
-            .GetValue(&CODECAPI_AVEncCommonMeanBitRate)
-            .map_err(hr("read back CODECAPI_AVEncCommonMeanBitRate"))?;
-        match (variant_as_u32(&mode), variant_as_u32(&bitrate)) {
-            (Some(mode), Some(bitrate)) if mode == cbr => Ok(("cbr_bitrate", bitrate)),
-            (mode, _) => Err(format!(
-                "the CBR fallback did not take effect: the encoder reads back rate control mode {mode:?}"
-            )),
-        }
+        codec.SetValue(key, &variant_u32(value)).ok()?;
+        variant_as_u32(&codec.GetValue(key).ok()?)
     }
 }
 
@@ -494,6 +638,7 @@ fn variant_as_u32(variant: &VARIANT) -> Option<u32> {
 
 fn codec_api(writer: &IMFSinkWriter, stream: u32) -> Option<ICodecAPI> {
     let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: an out-parameter for an ICodecAPI pointer the caller then owns.
     unsafe {
         writer
             .GetServiceForStream(stream, &GUID::zeroed(), &ICodecAPI::IID, &raw mut raw)
@@ -506,7 +651,8 @@ fn codec_api(writer: &IMFSinkWriter, stream: u32) -> Option<ICodecAPI> {
 }
 
 /// Finds the video encoder transform the Sink Writer inserted and reports its
-/// friendly name and whether it is a hardware MFT.
+/// name and whether it is a hardware MFT. Hardware encoders often report no
+/// friendly name; their vendor id is reported instead (F8, package 0).
 fn encoder_identity(writer: &IMFSinkWriter, stream: u32) -> (String, bool) {
     let Ok(writer_ex) = writer.cast::<IMFSinkWriterEx>() else {
         return ("unknown".to_owned(), false);
@@ -514,6 +660,7 @@ fn encoder_identity(writer: &IMFSinkWriter, stream: u32) -> (String, bool) {
     for index in 0..MAX_TRANSFORMS_PER_STREAM {
         let mut category = GUID::zeroed();
         let mut transform = None;
+        // SAFETY: two out-parameters.
         let found = unsafe {
             writer_ex.GetTransformForStream(
                 stream,
@@ -531,15 +678,23 @@ fn encoder_identity(writer: &IMFSinkWriter, stream: u32) -> (String, bool) {
         let Some(transform) = transform else {
             continue;
         };
+        // SAFETY: a plain query on the transform.
         let attributes = unsafe { transform.GetAttributes() }.ok();
-        let hardware = attributes.as_ref().is_some_and(|attributes| unsafe {
-            attributes
-                .GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute)
-                .is_ok()
+        let hardware = attributes.as_ref().is_some_and(|attributes| {
+            // SAFETY: a plain attribute query.
+            unsafe { attributes.GetStringLength(&MFT_ENUM_HARDWARE_URL_Attribute) }.is_ok()
         });
         let name = attributes
             .as_ref()
             .and_then(|attributes| attribute_string(attributes, &MFT_FRIENDLY_NAME_Attribute))
+            .or_else(|| {
+                attributes
+                    .as_ref()
+                    .and_then(|attributes| {
+                        attribute_string(attributes, &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute)
+                    })
+                    .map(|vendor| format!("hardware H.264 encoder ({vendor})"))
+            })
             .unwrap_or_else(|| {
                 if hardware {
                     "unnamed hardware H.264 encoder".to_owned()
@@ -553,6 +708,7 @@ fn encoder_identity(writer: &IMFSinkWriter, stream: u32) -> (String, bool) {
 }
 
 fn attribute_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
+    // SAFETY: the buffer is sized from the reported length plus the terminator.
     unsafe {
         let length = attributes.GetStringLength(key).ok()?;
         let mut buffer = vec![0_u16; usize::try_from(length).ok()? + 1];
@@ -564,6 +720,7 @@ fn attribute_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
 
 fn new_attributes(initial_size: u32) -> Result<IMFAttributes, String> {
     let mut attributes = None;
+    // SAFETY: one out-parameter.
     unsafe { MFCreateAttributes(&raw mut attributes, initial_size) }
         .map_err(hr("MFCreateAttributes"))?;
     attributes.ok_or_else(|| "MFCreateAttributes returned no attribute store".to_owned())
@@ -584,13 +741,6 @@ const fn pack_pair(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-fn frame_time_hns(frame: u64, fps: u32) -> i64 {
-    i64::try_from(frame)
-        .unwrap_or(i64::MAX)
-        .saturating_mul(HNS_PER_SECOND)
-        / i64::from(fps.max(1))
-}
-
 pub(super) fn hr(step: &'static str) -> impl Fn(windows::core::Error) -> String {
     move |error| format!("{step} failed: {error}")
 }
@@ -605,9 +755,12 @@ impl MediaFoundationRuntime {
     pub(super) fn start() -> Result<Self, String> {
         // S_OK and S_FALSE both need a matching CoUninitialize; a thread that
         // is already STA (RPC_E_CHANGED_MODE) keeps its apartment.
+        // SAFETY: plain COM and Media Foundation start-up.
         let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        // SAFETY: plain Media Foundation start-up.
         if let Err(error) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) } {
             if com_initialized {
+                // SAFETY: matches the successful CoInitializeEx above.
                 unsafe { CoUninitialize() };
             }
             return Err(format!("MFStartup failed: {error}"));
@@ -618,6 +771,7 @@ impl MediaFoundationRuntime {
 
 impl Drop for MediaFoundationRuntime {
     fn drop(&mut self) {
+        // SAFETY: matches the start-up calls in `start`.
         unsafe {
             let _ = MFShutdown();
             if self.com_initialized {

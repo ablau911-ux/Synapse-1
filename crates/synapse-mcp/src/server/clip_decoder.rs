@@ -15,7 +15,8 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFVideoFormat_RGB32,
+    MFCreateSourceReaderFromURL, MFMediaType_Video, MFSampleExtension_CleanPoint,
+    MFVideoFormat_RGB32,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
@@ -226,6 +227,47 @@ impl ClipDecoder {
         }
         unlocked?;
         Ok(out)
+    }
+}
+
+/// The times (100 ns, within the file) of the keyframes of a finished segment,
+/// read from its compressed samples (B8: keyframe instants come from the
+/// file, not from the settings).
+pub(super) fn keyframe_times_hns(path: &Path) -> Result<Vec<i64>, String> {
+    let _runtime = MediaFoundationRuntime::start()?;
+    let url = HSTRING::from(path.as_os_str());
+    // SAFETY: a reader over the file with its native (compressed) output type.
+    let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }
+        .map_err(hr("MFCreateSourceReaderFromURL"))?;
+    let mut times = Vec::new();
+    loop {
+        let mut flags = 0_u32;
+        let mut timestamp = 0_i64;
+        let mut sample: Option<IMFSample> = None;
+        // SAFETY: three out-parameters.
+        unsafe {
+            reader.ReadSample(
+                video_stream(),
+                0,
+                None,
+                Some(&raw mut flags),
+                Some(&raw mut timestamp),
+                Some(&raw mut sample),
+            )
+        }
+        .map_err(hr("IMFSourceReader::ReadSample"))?;
+        if flags & flag(MF_SOURCE_READERF_ERROR.0) != 0 {
+            return Err("the source reader reported a stream error".to_owned());
+        }
+        if let Some(sample) = sample
+            // SAFETY: a plain attribute query on the sample.
+            && unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0
+        {
+            times.push(timestamp);
+        }
+        if flags & flag(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
+            return Ok(times);
+        }
     }
 }
 

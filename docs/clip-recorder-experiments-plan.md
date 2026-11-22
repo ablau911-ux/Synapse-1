@@ -123,7 +123,8 @@ Run design (owner decision, 2026-11-22 21:15: every option runs at every level; 
 
 1. **Corpus.**
    - Scenario pages under `scripts/clip-equation/` drive themselves by frame count with fixed seeds, never by input to other apps.
-   - Each is captured once for 20 s in a Chrome `--app` window behind the owner's windows, with the occlusion flags. The window is closed by the same script.
+   - Each is rendered once for 20 s by headless Chrome through the DevTools protocol: virtual time advances 50 ms per instant, and one screenshot is taken at each instant at the window size. No window appears on the owner's screen. A frame equal in every pixel to the previous one is a repeat. (Changed 2026-11-22 21:25: a visible Chrome `--app` window took the keyboard focus, against the owner's window rule, and its title bar made repeated captures differ in 50 of 160 new frames.)
+   - The capture path's own costs (c_obs, c_read) come from package 0 and the live tests, not from this corpus.
    - Frames are stored losslessly (zstd) with their instants. Corpus size: about 0.5 to 2 GB.
 2. **Encode.** One probe subprocess per run reads the corpus and encodes with the configuration. It uses a verbatim copy of the product's encoder path (as package 0b copied `Nv12Canvas::draw`), named in the results. The subprocess reports CPU and memory of itself.
 3. **Live option L2.** Replayed from the corpus at the real 20 fps pace through the same GPU path as the observer: upload, convert on the GPU where available, then the hardware encoder. It measures the live process's CPU and memory.
@@ -143,14 +144,15 @@ Symbols as in section "Equations"; t = 20 s, f = 20 fps; w × h = recorded size 
 
 | Action | Equation | Known result |
 |---|---|---|
-| list encoders | count(H.264 encoders) ≥ 1; every entry has a name or vendor id, a hardware flag and a CLSID | ≥ 1, no empty field |
+| list encoders | unique encoders = entries with distinct (codec, name, vendor); each has a name and a hardware flag; each one activates (`IMFActivate::ActivateObject`) | 10 unique (first run, `1e156ca9`: 13 entries, Intel's 3 listed twice); every one activates. 3 have no CLSID (the 2 DX12 encoders and HEVCVideoExtensionEncoder); they are activated from their enumeration object |
 | capture instants | N_inst = t · f | 400 per folder |
 | lost instants | N_lost = N_inst − N_new − N_rep | 0 |
-| frame size | bytes(frame) = w · h · 3 | 1920 × 1080: 6,220,800; 1280 × 720 (also the 640 × 360 window at σ = 2): 2,764,800; 1518 × 999 (the 506 × 333 window at σ = 3): 4,549,446 |
+| frame size | stored at the window size: bytes(frame) = w_win · h_win · 3; σ is recorded and the encode step scales to σ · window, as the product's worker does | 1920 × 1080: 6,220,800; 1280 × 720: 2,764,800; 640 × 360: 691,200; 506 × 333: 505,494 |
+| encoded size | (w, h) = σ · (w_win, h_win) | 640 × 360 at σ = 2: 1280 × 720; 506 × 333 at σ = 3: 1518 × 999 |
 | repeats | stored files = N_new; each repeat line names an earlier stored frame | files = N_new |
 | still page | N_new(still) = 1 | 1 |
 | flash page | flashes = t · 1 per s | 20, each in one or more new frames |
-| repeatability | differing new frames between two captures of typing at 1280 × 720 | 0 (the pages are seeded and driven by frame count) |
+| repeatability | differing frames between two renders of typing at 1280 × 720 | 0 (seeded pages, virtual time, no window). The visible-window run of `d9d11c26` gave 50 of 160, all in the title bar |
 | waiting bytes | D_wait = Σ zstd(L = −3) bytes of the stored frames | equals the folder's file sizes summed, to the byte |
 
 **Step 2, encoding** (per configuration, 3 runs):

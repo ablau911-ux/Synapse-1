@@ -355,7 +355,19 @@ function boundaryCheck(inputs, name, quietMs, outcome) {
   const timing = new RunTiming(clip, inputs.schedule, clip.require('actual'), clock.scheduleStartMs);
   const row = timing.row(ROW.boundary);
   const shown = timing.start(row);
+  // shown_ms is only an upper bound (the next animation frame): the change reached the screen
+  // somewhere in [set_ms, shown_ms]. The onset is exact only when both ends fall to the same
+  // recorder instant; otherwise the run is rejected, never classified.
+  const made = timing.startMs + timing.actualOf(row).set_ms;
+  const onsetMade = Math.ceil(made / clip.frameMs) * clip.frameMs;
   const firstInstantMs = Math.ceil(shown / clip.frameMs) * clip.frameMs;
+  if (onsetMade !== firstInstantMs) {
+    return {
+      value: `quiet ${quietMs} ms, ${outcome.source}`,
+      measured: `ambiguous_onset: the change was made at ${made.toFixed(1)} ms and shown by ${shown.toFixed(1)} ms, across the recorder instant at ${onsetMade} ms; record this boundary run again`,
+      pass: false,
+    };
+  }
   const quiet = clock.stopMs - firstInstantMs;
   const found = timing.near(row, 'change');
   const detector = found.map((e) => `${e.start_ms}-${e.end_ms} "${e.text}"`).join('; ') || 'no change';

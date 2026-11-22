@@ -69,15 +69,21 @@ Feature: The viewer reports each scheduled UI event once, with its type, region 
     Then a "settled frame after change" pick lies at N, and N is at least end_frame + K_s (clipped to the last frame) and at most the last frame
     # Equation: pick.frame = N, min(end_frame + K_s, last) <= N <= last | Known: every settled change
 
+  # Onset rule of the boundary runs (and of any exact-duration check): the page knows only that
+  # the change reached the screen within [set_ms, shown_ms] (shown_ms is the next animation frame,
+  # an upper bound). Both ends, shifted by page_start - s_0, must fall to the same recorder instant
+  # ceil(t / frame_ms); a run whose interval straddles an instant fails as ambiguous_onset, is
+  # never classified, and that boundary run is recorded again.
+
   Scenario: #293-4a quiet one instant less than SETTLE_MS before the clip end is not settled
     Given the boundary_below clip, its page run's timing and the recorder's clip.json and frames.jsonl
     Then the page and the recorder alone give 150 ms of quiet after the last change, and the viewer reports that change as still changing when the clip ended
-    # Equation: quiet = stop(frames.jsonl) - ceil((page_start - s_0 + shown_ms) / frame_ms) * frame_ms = SETTLE_MS - frame_ms; outcome = unsettled | Known: 150, unsettled
+    # Equation: onset = ceil((page_start - s_0 + set_ms) / frame_ms) = ceil((page_start - s_0 + shown_ms) / frame_ms), else ambiguous_onset; quiet = stop(frames.jsonl) - onset * frame_ms = SETTLE_MS - frame_ms; outcome = unsettled | Known: 150, unsettled
 
   Scenario: #293-4b quiet exactly SETTLE_MS before the clip end is settled
     Given the boundary_at clip, its page run's timing and the recorder's clip.json and frames.jsonl
     Then the page and the recorder alone give exactly 200 ms of quiet after the last change, and the viewer reports that change as settled
-    # Equation: quiet = stop(frames.jsonl) - ceil((page_start - s_0 + shown_ms) / frame_ms) * frame_ms = SETTLE_MS; outcome = settled | Known: 200, settled
+    # Equation: onset = ceil((page_start - s_0 + set_ms) / frame_ms) = ceil((page_start - s_0 + shown_ms) / frame_ms), else ambiguous_onset; quiet = stop(frames.jsonl) - onset * frame_ms = SETTLE_MS; outcome = settled | Known: 200, settled
 
   Scenario: #293-5 only the animated stretch is exempt from FLASH
     Given the grey square's alternation and its 50 ms dark flash 400 ms after the alternation ends

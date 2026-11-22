@@ -16,9 +16,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readRuns } from '../spec/step2d.mjs';
-import { plannedKey as zPlannedKey, rowKey as zRowKey } from '../runs/run-z.mjs';
-import { plannedKey as dPlannedKey, rowKey as dRowKey } from '../runs/run-d.mjs';
+import { D_ROW_RULES, readRuns } from '../spec/step2d.mjs';
+import { buildRunList as zBuildRunList, plannedKey as zPlannedKey, rowKey as zRowKey, runListIdentity as zListId } from '../runs/run-z.mjs';
+import { planIdentity as dPlanIdentity, plannedKey as dPlannedKey, rowKey as dRowKey, runListIdentity as dListId } from '../runs/run-d.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -227,6 +227,9 @@ function checkRows(kind, rows, missingRepeats) {
   const blocked = [
     ...(bad.length ? [`${bad.length} of ${rows.length} repeats failed: ${statusOf(kind, bad[0])}${bad[0].error ? `: ${bad[0].error}` : ''}`] : []),
     ...passCols.filter((c) => validity.has(c) && misses(c)).map((c) => `validity ${c} = 0 on ${misses(c)} of ${rows.length} repeats`),
+    // Way D's measurement rules, owned by spec/step2d.mjs (D_ROW_RULES), judged on the runs that finished.
+    ...(CONFIG.checks.validity_rules[kind] ?? []).map((name) => [name, rows.filter((r) => statusOf(kind, r) === 'ok' && !D_ROW_RULES[name](r, CONFIG.corpus_root)).length])
+      .filter(([, n]) => n).map(([name, n]) => `validity ${name} broken on ${n} of ${rows.length} repeats`),
     ...(missingRepeats.length ? [`repeat ${missingRepeats.join(', ')} missing`] : []),
   ];
   const known = passCols.filter((c) => !validity.has(c) && misses(c)).map((c) => `${c} ${misses(c)}/${rows.length}`);
@@ -515,7 +518,7 @@ export function fitDBytes(configs) {
   }
   const ratioAt = new Map();
   for (const s of splits) ratioAt.set(`${s.way}|${s.content}|q${s.q}`, [...(ratioAt.get(`${s.way}|${s.content}|q${s.q}`) ?? []), s.K / s.P]);
-  const coefficients = { a_E: {}, b_E: {}, p_E_c: {}, k_E_c: {}, a_E_folded: {}, p_E_c_folded: {}, K_over_P_at_q: {}, ...(Object.keys(split).length ? { P_K_split: split } : {}) };
+  const coefficients = { model: {}, a_E: {}, b_E: {}, p_E_c: {}, k_E_c: {}, a_E_folded: {}, p_E_c_folded: {}, K_over_P_at_q: {}, ...(Object.keys(split).length ? { P_K_split: split } : {}) };
   const models = {};
   const res = [];
   const pending = [];
@@ -526,7 +529,6 @@ export function fitDBytes(configs) {
     if (fold.identifiable) {
       coefficients.a_E_folded[e] = fold.slope;
       coefficients.p_E_c_folded[e] = Object.fromEntries(Object.entries(fold.intercept).map(([k, v]) => [k.split('|')[1], Math.exp(v)]));
-      res.push(...fold.residuals.map((r) => Math.exp(r) - 1));
     }
     const mine = splits.filter((s) => s.way === e);
     const qs = new Set(mine.map((s) => s.q));
@@ -545,6 +547,9 @@ export function fitDBytes(configs) {
     if (mine.length) coefficients.K_over_P_at_q[e] = Object.fromEntries([...ratioAt].filter(([k]) => k.startsWith(`${e}|`)).map(([k, v]) => [k.slice(e.length + 1), mean(v)]));
     if (!sep) pending.push({ part: mine.length ? `b_E (${e})` : `K/P (${e})`, reason: mine.length ? `GOP swept at q ${[...qs].join(', ')} only: K and P apart there; other q at tau_f != ${baseTau} pending` : `no GOP sweep for ${e}: only tau_f ${baseTau} is predicted, K folded into P` });
     models[e] = { fold, sep };
+    // M5 (round 3): the published model is the one predict() uses.
+    coefficients.model[e] = sep ? 'P and K apart: P = p_E,c * px * exp(a_E * q), K = k_E,c * px * exp(b_E * q)'
+      : `P with K folded in at tau_f ${baseTau} (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)`;
   }
   const predict = (c) => {
     const m = models[c.way];
@@ -569,6 +574,12 @@ export function fitDBytes(configs) {
     const P = folded / ((c.n_new - nk0) + nk0 * r);
     return P * ((c.n_new - nk) + nk * r);
   };
+  // Residuals through the same predictor that predicts the held-out rows (M5, round 3).
+  for (const c of set) {
+    const p = predict(c);
+    if (Number.isFinite(p)) res.push((p - c.fit.bytes.mean) / c.fit.bytes.mean);
+  }
+  fitN = res.length;
   return { coefficients, res, pending, predict, fit_n: fitN };
 }
 
@@ -737,7 +748,7 @@ function parseArgs(argv) {
  * FULL only when the unique run keys match both run plans (#10): Z = (run list cell, folder, repeat)
  * of every cell that runs, D = (D key columns, repeat) of the D run plan. Duplicates never fill a gap.
  */
-export function fitLabel({ pilot, zRows, dRows, runlist, dRunlist }) {
+export function fitLabel({ pilot, zRows, dRows, runlist, dRunlist, planHashes = {} }) {
   if (pilot) return { label: 'PILOT, not final', coverage: null };
   // M1: keys resolved by the runners' own rules (runs/run-z.mjs, runs/run-d.mjs), so a cell id with other options never counts.
   const strip = ({ id: _i, size: _z, cost_s: _c, status: _s, ...o }) => o;
@@ -754,12 +765,20 @@ export function fitLabel({ pilot, zRows, dRows, runlist, dRunlist }) {
   };
   const z = side(zPlanned, zRows, zRowKey);
   const d = side(dPlanned, dRows, dRowKey);
-  const hashCol = CONFIG.runlist_hash_columns.find((h) => [...zRows, ...dRows].some((r) => r[h] !== undefined && r[h] !== ''));
-  const values = (rows) => [...new Set(rows.map((r) => r[hashCol] ?? ''))];
-  const hash = hashCol ? { column: hashCol, z: values(zRows), d: values(dRows) } : null;
-  const oneList = !hash || (hash.z.length <= 1 && hash.d.length <= 1 && (!runlist?.hash || hash.z[0] === runlist.hash) && (!dRunlist?.hash || hash.d[0] === dRunlist.hash));
+  // M1 (round 3): every row carries its list's hash; each list's hash is the hash of its own content and the hash of
+  // the plan the runners build now (planHashes), so neither a row without a hash nor a stale or edited list certifies FULL.
+  const col = CONFIG.runlist_hash_columns[0];
+  const listCheck = (list, rows, own, plan) => ({
+    list: list?.hash ?? null, content: list ? own(list) : null, plan: plan ?? null,
+    rows_without: rows.filter((r) => !r[col]).length, rows_other: rows.filter((r) => r[col] && r[col] !== list?.hash).length,
+  });
+  const hz = listCheck(runlist, zRows, zListId, planHashes?.z);
+  const hd = listCheck(dRunlist, dRows, dListId, planHashes?.d);
+  const listOk = (h) => !!h.list && h.list === h.content && h.list === h.plan && h.rows_without === 0 && h.rows_other === 0;
+  const hash = { column: col, z: hz, d: hd };
+  const oneList = listOk(hz) && listOk(hd);
   const complete = (s) => s.planned > 0 && s.missing === 0 && s.unplanned === 0 && s.duplicates === 0;
-  return { label: complete(z) && complete(d) && oneList ? 'FULL' : 'INCOMPLETE full run, not final', coverage: { z, d, d_plan: dPlanned ? 'given' : 'none', hash: hash ? { ...hash, one_list: oneList } : null } };
+  return { label: complete(z) && complete(d) && oneList ? 'FULL' : 'INCOMPLETE full run, not final', coverage: { z, d, d_plan: dPlanned ? 'given' : 'none', hash: { ...hash, one_list: oneList } } };
 }
 
 /**
@@ -803,14 +822,22 @@ function predictCells(runlist, z, zf) {
 }
 
 /** The fit from CSV rows: splits first, then the fits on training rows only, then validation (M10). */
-export function buildFitFromRows({ zRows = [], dRows = [], runlist = { cells: [], contents: [] }, dRunlist = null, pilot = false, inputs = null }) {
+export function buildFitFromRows({ zRows = [], dRows = [], runlist = { cells: [], contents: [] }, dRunlist = null, pilot = false, inputs = null, planHashes = {} }) {
   KEYS.Z = keyColumns(CONFIG.z_key_columns, zRows);
   KEYS.D = CONFIG.d_key_columns;
   const list = { heldCells: new Set(runlist.cells.filter((c) => c.status === 'held-out').map((c) => String(c.id))), cells: new Map(runlist.cells.map((c) => [String(c.id), c])), repeats: runlist.repeats };
   const z = [...groupRows('Z', zRows)].map(([k, rows]) => zConfiguration(k, rows, list));
   // The D run plan sets the required repeats of a full run; a pilot ran its own plan, so its own repeats are required.
   const reqStatus = requestedCompleteness(dRows, pilot ? null : dRunlist);
-  const d = [...groupRows('D', dRows)].map(([k, rows]) => dConfiguration(k, rows, reqStatus));
+  // H5 (round 3): configurations and their statistics by the requested settings. A run recorded under other
+  // settings (refused) is listed apart under its actual settings and never merged into another configuration.
+  const moved = (r) => keyOf('D', r) !== requestedKey(r);
+  const d = [
+    ...[...groupRows('D', dRows.filter((r) => !moved(r)))].map(([k, rows]) => dConfiguration(k, rows, reqStatus)),
+    ...[...groupRows('D', dRows.filter(moved))].map(([k, rows]) => ({
+      ...dConfiguration(`${k}|refused`, rows, reqStatus), refused: true, refused_from: [...new Set(rows.map(requestedKey))], eligible: false, in_fit: false, O: false,
+    })),
+  ];
   const eligible = d.filter((c) => c.eligible && c.options.tau_f === CONFIG.d_base.tau_f && c.options.hint === CONFIG.d_base.hint && c.options.rate === CONFIG.d_base.rate).map((c) => c.key);
   const heldD = drawHoldOut(eligible);
   for (const c of d) if (heldD.includes(c.key)) { c.held_out = true; c.in_fit = false; }
@@ -818,7 +845,7 @@ export function buildFitFromRows({ zRows = [], dRows = [], runlist = { cells: []
   applyDTarget(d);
   const zf = fitZ(z);
   const df = fitD(d, zf.fits, z);
-  const { label, coverage } = fitLabel({ pilot, zRows, dRows, runlist, dRunlist });
+  const { label, coverage } = fitLabel({ pilot, zRows, dRows, runlist, dRunlist, planHashes });
   const zFailed = zRows.filter((r) => r.error || (r.status !== undefined && r.status !== '' && r.status !== 'ok')).length;
   const { fits: zFits, ...zEquations } = zf;
   const { fits: _df, ...dEquations } = df;
@@ -859,8 +886,11 @@ export function buildFit({ z: zPaths, d: dPaths, runlist: runlistPath, druns: dR
   const json = (p) => (p && fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null);
   const runlist = json(runlistPath) ?? { cells: [], counts: {}, contents: [] };
   const pilot = [...zPaths, ...dPaths].some((p) => /pilot/i.test(path.basename(p)));
+  const dRunlist = json(dRunlistPath);
+  // M1: the plans as the runners build them now (a full run only; a pilot is never FULL).
+  const planHashes = pilot ? {} : { z: zBuildRunList(null, { write: false }).hash, d: dRunlist ? dPlanIdentity(dRunlist.repeats ?? 3) : undefined };
   return buildFitFromRows({
-    zRows: zIn.flatMap((i) => i.rows), dRows: dIn.flatMap((i) => i.rows), runlist, dRunlist: json(dRunlistPath), pilot,
+    zRows: zIn.flatMap((i) => i.rows), dRows: dIn.flatMap((i) => i.rows), runlist, dRunlist, pilot, planHashes,
     inputs: { z: zIn.map((i) => ({ path: i.path, rows: i.rows.length })), d: dIn.map((i) => ({ path: i.path, rows: i.rows.length })), runlist: runlistPath, d_runlist: dRunlistPath, corpus_root: CONFIG.corpus_root },
   });
 }

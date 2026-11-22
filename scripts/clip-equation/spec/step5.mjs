@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRuns } from './step2d.mjs';
 import { relErr, runFeature } from './feature.mjs';
-import { CONFIG, keyOf, loadInputs } from './step4.mjs';
+import { CONFIG, dMoved, keyOf, loadInputs } from './step4.mjs';
 import { Z_TRUTH, sizeFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -39,7 +39,8 @@ function groupInputs(inputs) {
   const groups = new Map();
   // H2: every retained file (bytes_disk) for both ways; a capped Z run scales its payload, not its metadata.
   const add = (kind, r, payload, total, frames) => {
-    const key = keyOf(kind, r);
+    // A D run recorded under settings other than requested is its own configuration, apart (H5 round 3).
+    const key = kind === 'D' && dMoved(r) ? `${keyOf(kind, r)}|refused` : keyOf(kind, r);
     const g = groups.get(key) ?? { key, folder: r.folder, rows: 0, bytes: [], nNew: corpusNNew(r.folder) };
     g.rows += 1;
     const clip = payload * (g.nNew / frames) + (total - payload);

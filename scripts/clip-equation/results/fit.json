@@ -1,5 +1,5 @@
 {
- "created": "2026-11-22T21:20:44.632Z",
+ "created": "2026-11-22T21:36:44.709Z",
  "label": "PILOT, not final",
  "coverage": null,
  "failures": {
@@ -96,6 +96,17 @@
     ],
     "D": [
      "pass_frames"
+    ]
+   },
+   "validity_rules": {
+    "note": "Rules of one D run owned by spec/step2d.mjs D_ROW_RULES (M1 input, M2 CPU of both phases, M3 RAM base and OS peak of both phases, M4 retained bytes, M5 beta > 0, M6 frames mapped by time); a broken rule blocks like a validity pass_* row.",
+    "D": [
+     "two_processes",
+     "ram_base",
+     "ram_os_both",
+     "retained_bytes",
+     "beta_positive",
+     "frames_mapped"
     ]
    }
   },
@@ -8500,6 +8511,10 @@
    }
   },
   "d_bytes": {
+   "model": {
+    "DW2": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)",
+    "DW1": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)"
+   },
    "a_E": {},
    "b_E": {},
    "p_E_c": {},
@@ -37511,8 +37526,12 @@
   "eq7_d_bytes": {
    "title": "D bytes",
    "equation": "bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); P = p_E,c * px * exp(a_E * q); K = (K/P)_E,c * P, K/P from a GOP sweep at one q with every other factor fixed",
-   "fit_n": 10,
+   "fit_n": 9,
    "coefficients": {
+    "model": {
+     "DW2": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)",
+     "DW1": "P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)"
+    },
     "a_E": {},
     "b_E": {},
     "p_E_c": {},
@@ -37530,8 +37549,8 @@
    },
    "residuals": {
     "n": 9,
-    "max_abs_rel": 1.0844699632239836,
-    "rms_rel": 0.5876901129434947
+    "max_abs_rel": 1.3101629884828554,
+    "rms_rel": 0.6214776409025824
    },
    "pending": [
     {

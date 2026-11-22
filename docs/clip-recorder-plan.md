@@ -105,6 +105,8 @@ Package 0b changes no product code. It adds one probe subcommand and appends one
 
 Choice rule: the method with the fewest bytes whose compression keeps the live share within its part of `CPU_LIMIT_PERCENT` on the weakest-machine estimate at the M4 worst rate; when both qualify, the one with the fewer bytes. The owner sees the figures before the choice goes into section A (A8).
 
+Result (commit `a0d02e6e`, `results-package0.md` section "Package 0b"). All 176 runs were lossless. Tiles + zstd made typing and flash frames 800 to 4,600 times smaller. Video content did not compress (1.5 times), and every coder then passed 10 % on the weakest-machine estimate (12.5 to 21 %). Owner decision (2026-11-22): "make it simple", so the whole frame goes through `lz4_flex` with alpha dropped. It needs no tiles, no keyframes and no state between files. Measured: typing 182 times smaller, flash 79, scroll 26, video 1.5. On the weakest-machine estimate this stays within 10 % except for video (12.5 %), where E1 applies: time gives way first, and lost instants are named last.
+
 ### O. Observer, in `synapse-capture` (new, for clips only)
 
 The existing screenshot paths stay as they are. The clip recorder gets its own frame handler and its own capture handle.
@@ -137,7 +139,7 @@ The live part does no scaling and no encoding. It stores every new frame at its 
 | A5 | Start the observer (O1) | Every screen refresh that Windows delivers is seen | C (1) |
 | A6 | For each instant s_k (every 1000 / f ms): ask the observer for the identity of the frame for s_k (O4) | A late recorder cannot miss a flash | C (2) |
 | A7 | If the identity equals the last recorded one: write only its line in `frames.jsonl` | A repeated frame costs nothing | B |
-| A8 | If it is new: check the privacy gate before the write, frame zero included (C12). When the gate pauses, frames composed after the pause instant are discarded, also those already in a slot. Otherwise read the frame back (O4), write it into `waiting/` as one raw frame file at its captured size, then write its line with the frame size and the cursor position (C15) | Nothing private reaches the disk; the only pixel work in the service is one copy | a_rt |
+| A8 | If it is new: check the privacy gate before the write, frame zero included (C12). When the gate pauses, frames composed after the pause instant are discarded, also those already in a slot. Otherwise read the frame back (O4), drop the alpha byte (B, G, R stay), compress the whole frame with `lz4_flex` (`compress_prepend_size`), write it into `waiting/` as one self-contained file at its captured size (`.tmp`, then rename), then write its line with the frame size and the cursor position (C15) | Nothing private reaches the disk; the waiting files are lossless and small (R9) | a_rt |
 | A9 | Measure the live part's processor share every second, disk writes included. Set the worker's cap to `CPU_LIMIT_PERCENT` minus that share (E3). If the live part alone reaches its share of 10 %, it skips the read-back of new frames for the rest of that second; those instants are lost and named (E1) | The sum never exceeds 10 %; time gives way first, frames only last | B |
 | A10 | Count, per clip: proven losses with their cause, the longest hold time against T_r, the live share, and the worker cap given | The clip can state which conditions held | conditions |
 | A11 | Every `DISK_CHECK_MS`, on the volume that holds the clip folder: free space as measured, minus the bytes written since the measurement, minus a reserve for the segment being finalized (C13). Stop when that falls below the storage Level 1 threshold (F7) | The disk keeps the existing reserve | T |
@@ -204,7 +206,7 @@ Contract (O1). `FACADE_TOOL_CONTRACTS` (`tool_profiles.rs:391-396`) gets updated
     frames.jsonl                 one line per instant: instant, time, new or repeated, frame size, cursor position
     segment-0001.mp4 ...         one video file per committed segment
     segment-NNNN.mp4.part        the segment being encoded; deleted on recovery
-    waiting/                     raw frames not yet committed in a segment (empty when ready)
+    waiting/                     frames not yet committed in a segment, each one file: B, G, R compressed with lz4_flex (empty when ready)
     views/                       images the viewer exported
 
 Active clips in folders other than the default one are listed in one registry file under the default clips folder.

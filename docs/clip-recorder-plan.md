@@ -386,6 +386,12 @@ Not provable on this PC: the weakest machine's processor costs; they stay the co
 
 None. E1 to E8 were answered on 2026-11-22. E8 comes back to the owner with package 0's measured write volume.
 
+## Changes on 2026-11-22, 09:20 to 14:30 IST
+
+- Package 0b added and measured: compression of the waiting frames (R9, equation line 249). Research `docs/clip-recorder-waiting-compression-research.md`; figures in `results-package0.md` (`a0d02e6e`, full comparison `ca46079d`).
+- A8 and the clip folder: waiting frames are B, G, R, one self-contained zstd file each at `WAITING_ZSTD_LEVEL` = −3 (owner decision after the full comparison; `lz4_flex` came first and was replaced). Parameter map row added.
+- Built: `5b4ed09d` (lz4), `fc5a061d` (zstd, plus losses named `waiting_unreadable`, segment seed from the last drawn picture, finalize reserve from retained bytes), `f5dd30bb` (missing files named `waiting_missing`; repeats of an unreadable picture are named lost too).
+
 ## Changes in version 4.1 (2026-11-22)
 
 - E9: no cursor in the picture; position still logged. E10: processor limit 10 % (was 5 %); every "5 %" processor reference changed to 10 %.

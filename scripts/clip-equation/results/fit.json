@@ -1,5 +1,5 @@
 {
- "created": "2026-11-22T21:36:44.709Z",
+ "created": "2026-11-22T21:43:55.357Z",
  "label": "PILOT, not final",
  "coverage": null,
  "failures": {
@@ -37525,7 +37525,7 @@
   },
   "eq7_d_bytes": {
    "title": "D bytes",
-   "equation": "bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); P = p_E,c * px * exp(a_E * q); K = (K/P)_E,c * P, K/P from a GOP sweep at one q with every other factor fixed",
+   "equation": "bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); DW2: P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q); DW1: P with K folded in at tau_f 20 (a_E_folded, p_E_c_folded); another tau_f only at a q with a GOP sweep (K_over_P_at_q)",
    "fit_n": 9,
    "coefficients": {
     "model": {

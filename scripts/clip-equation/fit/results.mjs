@@ -114,7 +114,9 @@ export function bestEquations(fit, c) {
   const b = { a_E: apart ? m.a_E[c.way] : m.a_E_folded?.[c.way], 'p_E,c': apart ? m.p_E_c?.[c.way] : m.p_E_c_folded?.[c.way], rho: m.K_over_P_at_q?.[c.way]?.[`${g}|q${c.options.q}`] };
   const s = eq.eq7_d_quality.coefficients.Q_ssim?.[c.way];
   return [
-    `- Bytes (eq. 7): bytes = (n_new − n_key) · P + n_key · K, n_key = ⌈n_new / τ_f⌉ = ${Math.ceil(c.n_new / Number(c.options.tau_f))}; P = p_E,c · px · exp(a_E · q), p = ${fmt(b['p_E,c']?.[g], 6)}, a = ${fmt(b.a_E, 5)}; K / P = ${apart ? `apart: K = k_E,c · px · exp(b_E · q), b_E = ${fmt(m.b_E[c.way], 5)}` : b.rho === undefined ? `pending: full run (no GOP sweep at q ${c.options.q}; P fitted at τ_f ${CONFIG.d_base.tau_f} with K folded in)` : `${fmt(b.rho, 4)} measured at q ${c.options.q}`}; bytes on disk add the metadata ${mb(c.fit.meta ?? NaN)} MB (frames.jsonl, clip.json)`,
+    `- Bytes (eq. 7): bytes = (n_new − n_key) · P + n_key · K, n_key = ⌈n_new / τ_f⌉ = ${Math.ceil(c.n_new / Number(c.options.tau_f))}; ${apart
+      ? `P and K apart: P = p_E,c · px · exp(a_E · q), p = ${fmt(b['p_E,c']?.[g], 6)}, a_E = ${fmt(b.a_E, 5)}; K = k_E,c · px · exp(b_E · q), k = ${fmt(m.k_E_c?.[c.way]?.[g], 6)}, b_E = ${fmt(m.b_E[c.way], 5)}`
+      : `P = p_E,c · px · exp(a_E · q) with K folded in at τ_f ${CONFIG.d_base.tau_f}, p = ${fmt(b['p_E,c']?.[g], 6)}, a = ${fmt(b.a_E, 5)}; K / P = ${b.rho === undefined ? `pending: full run (no GOP sweep at q ${c.options.q}; P fitted at τ_f ${CONFIG.d_base.tau_f} with K folded in)` : `${fmt(b.rho, 4)} measured at q ${c.options.q}`}`}; bytes on disk add the metadata ${mb(c.fit.meta ?? NaN)} MB (frames.jsonl, clip.json)`,
     `- Quality (eq. 7): Q_ssim = 1 − s · exp(−g · q), s = ${fmt(s?.['s_E,c']?.[g], 5)}, g = ${fmt(s?.g_E, 5)}`,
     `- CPU and RAM (eq. 7): see the equations section (${c.way})`,
   ];
@@ -218,7 +220,8 @@ export function buildResults(fit) {
   const js = costJ(metrics);
   const front = paretoFlags(metrics);
   kept.forEach((r, i) => { r.J = js[i]; r.pareto = front[i]; });
-  const best = bestWay(kept.map((r) => ({ cfg: r.c.cfg, folder: r.c.folder, J: r.J })), rows.map((r) => ({ cfg: r.c.cfg, folder: r.c.folder, kept: !!r.c.O })));
+  // A refused run (recorded under settings other than requested) is listed, never a candidate (#295 round 4).
+  const best = bestWay(kept.map((r) => ({ cfg: r.c.cfg, folder: r.c.folder, J: r.J })), rows.filter((r) => !r.c.refused).map((r) => ({ cfg: r.c.cfg, folder: r.c.folder, kept: !!r.c.O })));
   return { rows, best, md: markdown(fit, rows, best), csv: csv(rows, fit.predicted) };
 }
 

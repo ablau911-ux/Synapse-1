@@ -379,7 +379,8 @@ function qMin(dConfigs) {
  */
 function applyDTarget(dConfigs) {
   const textAt = new Map();
-  for (const c of dConfigs.filter((x) => x.text)) {
+  // A refused run is listed, never a candidate: it never stands for a text scenario (round 4).
+  for (const c of dConfigs.filter((x) => x.text && !x.refused)) {
     const k = `${qminGroup(c)}|q${c.options.q}`;
     textAt.set(k, (textAt.get(k) ?? new Map()).set(c.content, c));
   }
@@ -580,7 +581,9 @@ export function fitDBytes(configs) {
     if (Number.isFinite(p)) res.push((p - c.fit.bytes.mean) / c.fit.bytes.mean);
   }
   fitN = res.length;
-  return { coefficients, res, pending, predict, fit_n: fitN };
+  // Round 4: the published equation is the formula of the model that predicts, per encoder.
+  const equation = `bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); ${Object.entries(coefficients.model).map(([e, m]) => `${e}: ${m}`).join('; ') || 'no encoder fitted'}`;
+  return { coefficients, res, pending, predict, fit_n: fitN, equation };
 }
 
 function fitD(d, zFits, z) {
@@ -673,7 +676,7 @@ function fitD(d, zFits, z) {
   return {
     fits: { bytesModel, metaOf, ssim, psnr, cpu, ram },
     eq7_d_bytes: {
-      title: 'D bytes', equation: 'bytes_D = (n_new - n_key) * P + n_key * K, n_key = ceil(n_new / tau_f); P = p_E,c * px * exp(a_E * q); K = (K/P)_E,c * P, K/P from a GOP sweep at one q with every other factor fixed', fit_n: bytesModel.fit_n,
+      title: 'D bytes', equation: bytesModel.equation, fit_n: bytesModel.fit_n,
       coefficients: bytesModel.coefficients, residuals: residualStats(bytesModel.res), pending: bytesModel.pending,
     },
     eq7_d_quality: {
@@ -834,9 +837,12 @@ export function buildFitFromRows({ zRows = [], dRows = [], runlist = { cells: []
   const moved = (r) => keyOf('D', r) !== requestedKey(r);
   const d = [
     ...[...groupRows('D', dRows.filter((r) => !moved(r)))].map(([k, rows]) => dConfiguration(k, rows, reqStatus)),
-    ...[...groupRows('D', dRows.filter(moved))].map(([k, rows]) => ({
-      ...dConfiguration(`${k}|refused`, rows, reqStatus), refused: true, refused_from: [...new Set(rows.map(requestedKey))], eligible: false, in_fit: false, O: false,
-    })),
+    ...[...groupRows('D', dRows.filter(moved))].map(([k, rows]) => {
+      const c = dConfiguration(`${k}|refused`, rows, reqStatus);
+      const from = [...new Set(rows.map(requestedKey))];
+      // Round 4: a cfg of its own, so a refused run never shares a valid configuration's cfg (text verdicts, J, best way).
+      return { ...c, cfg: `${c.cfg}|refused_from=${from.join(',')}`, refused: true, refused_from: from, eligible: false, in_fit: false, O: false };
+    }),
   ];
   const eligible = d.filter((c) => c.eligible && c.options.tau_f === CONFIG.d_base.tau_f && c.options.hint === CONFIG.d_base.hint && c.options.rate === CONFIG.d_base.rate).map((c) => c.key);
   const heldD = drawHoldOut(eligible);

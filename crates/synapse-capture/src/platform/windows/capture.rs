@@ -423,7 +423,7 @@ fn bytes_per_pixel_for_format(format: DxgiFormat) -> Result<u8, CaptureError> {
     }
 }
 
-fn union_dirty_regions(regions: &[DirtyRegion]) -> Option<Rect> {
+pub(super) fn union_dirty_regions(regions: &[DirtyRegion]) -> Option<Rect> {
     let first = regions.first()?;
     let mut left = first.x;
     let mut top = first.y;

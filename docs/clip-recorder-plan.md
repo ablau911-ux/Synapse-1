@@ -131,7 +131,7 @@ Threading rule (C3). Multithread protection is on for the capture device. The ha
 
 Requested interval (C1). `REQUESTED_UPDATE_INTERVAL_MS` starts at 11 ms, because the research measured about 45 fps at a 16.7 ms request and about 60 fps at 11.1 ms on a 60 Hz display (windows-capture issue #190). Package 0 confirms or replaces the value. Where the interval is unsupported (Windows 10 and Windows 11 before 24H2), Windows delivers per composition and the slots absorb rates above 60 per second.
 
-What a clip can and cannot claim (C1). A handler that returns quickly does not prove that nothing was lost: Windows' delivery, scheduling and pool recreation happen outside it. Each clip therefore reports three separate things: proven losses (overflow, privacy discard, disk, load shedding), the longest hold time against T_r, and delivery completeness as "checked only in the proof". Clip frames are not routed through `CapturedFrame` (F17).
+What a clip can and cannot claim (C1). A handler that returns quickly does not prove that nothing was lost: Windows' delivery, scheduling and pool recreation happen outside it. Each clip therefore reports three separate things: proven losses (overflow, disk, load shedding, service restart, unreadable or missing waiting frame), the longest hold time against T_r, and delivery completeness as "checked only in the proof". Clip frames are not routed through `CapturedFrame` (F17).
 
 ### A. Live part, in the Synapse service
 
@@ -222,7 +222,7 @@ Active clips in folders other than the default one are listed in one registry fi
 
 | Condition | Reported | Status |
 |---|---|---|
-| C | proven losses per instant with cause (slot overflow, privacy discard, disk, load shedding, service restart); longest hold time against T_r; delivery completeness | held when no instant was lost; delivery completeness is "checked only in the proof" |
+| C | proven losses per instant with cause (slot overflow, disk, load shedding, service restart, `waiting_unreadable`, `waiting_missing`); longest hold time against T_r; delivery completeness. There is no privacy-discard cause: a privacy pause stops the recording before the instant is handled, so no instant inside the clip is discarded (`185fb5a4`) | held when no instant was lost; delivery completeness is "checked only in the proof" |
 | G | window size, σ, recorded size per segment | held when recorded size = σ · window size; "padded" for transition-segment instants; not held above the encoder bound |
 | Q | quality level q or the bitrate used, encoder name | unverified until q_min is calibrated for the encoder used; held when quality mode at q ≥ q_min was accepted and read back; not held on an uncalibrated bitrate fallback (C6) |
 | B | live share, worker cap given and worker share, against 10 %; time until ready | held when the sum ≤ 10 % in every second |

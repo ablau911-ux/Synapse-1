@@ -406,7 +406,7 @@ fn list_encoders(label: &str, flags: MFT_ENUM_FLAG) {
     println!("M8 {label}_encoders count={count} names={names:?}");
 }
 
-fn attribute_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
+pub(crate) fn attribute_string(attributes: &IMFAttributes, key: &GUID) -> Option<String> {
     // SAFETY: the buffer is one longer than the reported length.
     unsafe {
         let length = attributes.GetStringLength(key).ok()?;
@@ -440,10 +440,10 @@ fn variant_as_u32(variant: &VARIANT) -> Option<u32> {
 }
 
 /// COM (multithreaded) and Media Foundation for this thread, released on drop.
-struct MediaFoundation;
+pub(crate) struct MediaFoundation;
 
 impl MediaFoundation {
-    fn start() -> Result<Self> {
+    pub(crate) fn start() -> Result<Self> {
         // SAFETY: paired with CoUninitialize and MFShutdown in Drop.
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED)

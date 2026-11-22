@@ -12,6 +12,7 @@
 //!   clip-probe lateness    M7  selection lateness, idle and under processor load
 //!   clip-probe encoder     M8  Media Foundation H.264 settings set and read back
 //!   clip-probe compress    M10 to M14 (package 0b) compression of the waiting frames
+//!   clip-probe exp-encoders  experiments step 1a: every H.264, HEVC and AV1 encoder
 //!
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.
@@ -23,6 +24,7 @@ mod compress;
 mod delivery;
 mod disk;
 mod encoder;
+mod exp_encoders;
 mod gpu;
 mod hash_frames;
 mod info;
@@ -68,8 +70,9 @@ fn main() {
         "lateness" => threading::run_lateness(),
         "encoder" => encoder::run(),
         "compress" => compress::run(),
+        "exp-encoders" => exp_encoders::run(),
         _ => Err(format!(
-            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder or compress"
+            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress or exp-encoders"
         )),
     };
     if let Err(error) = outcome {

@@ -98,7 +98,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 4;
+const ANALYSIS_VERSION: u32 = 5;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -527,6 +527,8 @@ struct Episode {
     short_lived: bool,
     reverted: bool,
     settled: bool,
+    /// The resize generation the change happened in (see `Analyzer`).
+    generation: u64,
 }
 
 /// What one block went through (D5): its picture before a change still open,
@@ -589,6 +591,9 @@ struct Analyzer<'a> {
     transients: Vec<Transient>,
     animations: Vec<Animation>,
     resizes: Vec<(u64, usize, usize)>,
+    /// Goes up on every size change; changes are compared and merged only
+    /// within one generation, also when a later resize restores the size.
+    generation: u64,
     previous: u64,
     decoded: u64,
     new_without_change: u64,
@@ -608,6 +613,7 @@ impl<'a> Analyzer<'a> {
             transients: Vec::new(),
             animations: Vec::new(),
             resizes: Vec::new(),
+            generation: 0,
             previous: 0,
             decoded: 0,
             new_without_change: 0,
@@ -643,6 +649,7 @@ impl<'a> Analyzer<'a> {
             }
             self.width = width;
             self.height = height;
+            self.generation += 1;
             self.states =
                 vec![BlockState::default(); width.div_ceil(BLOCK) * height.div_ceil(BLOCK)];
             self.shown = current;
@@ -687,6 +694,7 @@ impl<'a> Analyzer<'a> {
             short_lived: false,
             reverted: false,
             settled: false,
+            generation: self.generation,
         });
         episode.last_change_frame = instant;
         episode.blocks.merge(&episode_blocks);
@@ -857,7 +865,7 @@ impl<'a> Analyzer<'a> {
         if !episode.reverted
             && let Some(previous) = self.done.last_mut()
             && !previous.reverted
-            && (previous.blocks.width, previous.blocks.height) == (width, height)
+            && previous.generation == episode.generation
             && span(self.clip, previous.start_frame, episode.last_change_frame) <= SHORT_LIVED_MS
             && BlockMap::between(&previous.before, &self.shown, width, height).count == 0
         {

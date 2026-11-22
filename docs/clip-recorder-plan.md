@@ -1,6 +1,6 @@
-# Clip recorder: building plan (version 4)
+# Clip recorder: building plan (version 4.1)
 
-Status 2026-11-22 02:45 IST. Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex, read-only.
+Status 2026-11-22 03:40 IST (version 4.1: owner decisions E9 and E10 and the package 0 figures; version 4 was 02:45). Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex, read-only.
 
 This is step 3 of the owner's work order: the equation in `docs/clip-recorder-equation.md` turned into an order of operations, each with its desired real-world result. Step 4 is the code, in which every tunable is a named constant that stands for one symbol of the equation, or is computed from such constants.
 
@@ -22,7 +22,7 @@ The full list is at the end.
 ## Fixed by the owner
 
 - Flashes from 0.050 s on screen are in the clip. 60 Hz is the reference screen.
-- Never above 20 fps and never above 5 % of the processor time, on any machine. A weaker machine takes longer; nothing else gives way except as E1 below states.
+- Never above 20 fps and never above 10 % of the processor time, on any machine (E10, 2026-11-22; it was 5 % until then). A weaker machine takes longer; nothing else gives way except as E1 below states.
 - Every machine from a Core i3 2.2 GHz with two cores, 4 GB memory and Intel graphics. Such a machine runs Windows 10, so every Windows feature used must have a Windows 10 path.
 - 60 s by default, longer on demand. At least 480 lines. The size follows the window. Quality before bytes.
 - Viewers are the existing agents, which see still images. No automated tests (upstream policy #1699; the test surface was removed again in 3f972db5).
@@ -32,14 +32,16 @@ Answered on 2026-11-22 (the owner said "continue" after Fable's recommendations,
 
 | # | Question | Answer (2026-11-22) |
 |---|---|---|
-| E1 | What gives way when a machine cannot meet every condition | Time first (the clip is ready later). Then length: the recording stops at storage pressure Level 1, the existing rule. Only after both, frames for named instants are lost, counted and reported per instant. Never the 5 % processor cap, never the size, never the quality. |
+| E1 | What gives way when a machine cannot meet every condition | Time first (the clip is ready later). Then length: the recording stops at storage pressure Level 1, the existing rule. Only after both, frames for named instants are lost, counted and reported per instant. Never the processor cap (10 % since E10), never the size, never the quality. |
 | E2 | The worker as a separate process | Yes. This overrides the version 1 owner decision "no child processes". A job object is the only hard limit that also covers the encoder's own threads. |
-| E3 | Worker share of the processor | 5 % minus the live part's measured share, recomputed every second. Not a fixed 4 %. |
+| E3 | Worker share of the processor | 10 % minus the live part's measured share, recomputed every second. Not a fixed 4 %. |
 | E4 | Frames captured while a window is dragged to a new size | One transition segment whose canvas is the largest size seen during the drag; frames are placed on it unscaled. G is reported as "padded" for those instants. |
 | E5 | Minimum Windows version | Windows 10 version 1903 (build 18362). Windows capture does not exist before 1803 and windows-capture 2.0.0 needs 1903. On Windows 10 the yellow border always shows. |
 | E6 | Monitor recording while an excluded app is visible but not in front | Recording refuses to start, or stops, when an excluded app is visible anywhere on the recorded monitor, even if it is not in front. |
 | E7 | Go | Packages 0 and 1 may start once version 4 is committed. |
 | E8 | Raw write volume through the disk | Accepted for this build: about 31 MB per second, about 113 GB per hour, at 1920 × 1080 with typical activity (3.8 new frames per second). Decided again after package 0 has measured the real figure. |
+| E9 | The mouse cursor inside the recorded frames (asked after package 0, M4: a drawn cursor makes 20 new frames per second while the mouse moves, 166 MB/s at 1080p) | The cursor is not drawn into the frames (owner, 2026-11-22 03:35). Its position is still logged per instant in `frames.jsonl`. Where Windows cannot leave it out (Windows 10 before 2004, build 19041, has no cursor setting), it stays in the picture and the viewer masks it (D5). |
+| E10 | Processor limit (asked after package 0, M9: on the weakest machine the live part alone is estimated at 5.2 % at 720p and 9.1 % at 1080p) | Up to 10 % on the weakest machine is accepted (owner, 2026-11-22 03:35). `CPU_LIMIT_PERCENT` becomes 10; the worker cap is 10 % minus the live share. A stronger machine uses less for the same work. |
 
 ## What the code had to be corrected on (facts found in the reviews)
 
@@ -67,7 +69,7 @@ These facts decide the shape of packages 0 to 4. Each was read in the code; line
 
 ## The process
 
-The work is split by the 5 % rule. What cannot wait runs in the Synapse service while the screen is recorded (sections O and A). What can wait runs in a worker that Windows itself limits (section B). Package 0 measures the costs of both before either is built.
+The work is split by the 10 % rule. What cannot wait runs in the Synapse service while the screen is recorded (sections O and A). What can wait runs in a worker that Windows itself limits (section B). Package 0 measures the costs of both before either is built.
 
 ### 0. Measurements first (package 0, in `scripts/clip-equation/`)
 
@@ -93,7 +95,7 @@ The existing screenshot paths stay as they are. The clip recorder gets its own f
 
 | # | Operation | Desired result | Equation |
 |---|---|---|---|
-| O1 | Refuse to start below Windows 10 1903 (`MIN_WINDOWS_BUILD`). Build the session settings for the clip: ask for cursor, "no border", secondary windows, the minimum update interval and dirty regions each only where windows-capture reports that setting supported; use Default otherwise. Where the interval is supported, request `REQUESTED_UPDATE_INTERVAL_MS` | Recording starts on Windows 10 1903 and later and on Windows 11. On Windows 10 the yellow border shows and frames arrive per composition, up to the display rate | R10 |
+| O1 | Refuse to start below Windows 10 1903 (`MIN_WINDOWS_BUILD`). Build the session settings for the clip: ask for no cursor in the picture (E9), "no border", secondary windows, the minimum update interval and dirty regions each only where windows-capture reports that setting supported; use Default otherwise. Where the interval is supported, request `REQUESTED_UPDATE_INTERVAL_MS` | Recording starts on Windows 10 1903 and later and on Windows 11. On Windows 10 the yellow border shows and frames arrive per composition, up to the display rate | R10 |
 | O2 | In the frame handler: read the composition time (`Frame::timestamp()`), compute the instant k it belongs to, and copy the frame on the graphics chip into the candidate slot of the open instant. When a frame for a later instant arrives, pin the candidate slot: it is the frame for s_k. Store the composition time and the dirty region when given. Return. The handler only issues GPU copies and never maps | The handler holds the one-buffer pool for as short a time as possible; the chosen frame per instant is fixed by composition time, not by when the reader gets to it | C (2), C (3) |
 | O3 | Measure the longest hold time (composition time to frame release) and count pinned-slot overflows. Each overflow is a lost instant, recorded with its cause | The clip reports proven losses and the hold time against T_r | conditions |
 | O4 | On request for instant s_k: return the identity (composition time) of the pinned frame first. Read back to the processor only when the caller asks for it after its repeat check, on the reader thread | A repeated frame costs no read-back; the only read-back is one per new recorded frame | C (2), a_rt |
@@ -113,14 +115,14 @@ The live part does no scaling and no encoding. It stores every new frame at its 
 | # | Operation | Desired result | Equation |
 |---|---|---|---|
 | A1 | Read the machine: thread count n, Windows build, and the free space of the volume that holds the clip folder | No constant of one PC in the code | R10 |
-| A2 | Refuse to start when: the privacy gate pauses; the target app is excluded; for a monitor, an excluded app is visible anywhere on it (E6); storage pressure on the clip volume is Level 1 or worse; another recording is running; the folder exists; Windows is older than 1903 | Nothing is recorded that must not be; the 5 % rule holds because there is only one recorder | existing rules, B |
+| A2 | Refuse to start when: the privacy gate pauses; the target app is excluded; for a monitor, an excluded app is visible anywhere on it (E6); storage pressure on the clip volume is Level 1 or worse; another recording is running; the folder exists; Windows is older than 1903 | Nothing is recorded that must not be; the 10 % rule holds because there is only one recorder | existing rules, B |
 | A3 | Read the window size, compute σ and the recorded size for the report and for the worker. The live part itself does not scale | The worker knows the size; the live part stays one copy per new frame | G |
 | A4 | Write `clip.json` at once with state `recording` (written to a temporary name, then renamed), list the clip in the active-clip registry when its folder is not the default one, and read the file back for the `record` response | A crash at any point leaves a state to recover from; `record` returns something it has verified (O1) | t_ready, T |
 | A5 | Start the observer (O1) | Every screen refresh that Windows delivers is seen | C (1) |
 | A6 | For each instant s_k (every 1000 / f ms): ask the observer for the identity of the frame for s_k (O4) | A late recorder cannot miss a flash | C (2) |
 | A7 | If the identity equals the last recorded one: write only its line in `frames.jsonl` | A repeated frame costs nothing | B |
 | A8 | If it is new: check the privacy gate before the write, frame zero included (C12). When the gate pauses, frames composed after the pause instant are discarded, also those already in a slot. Otherwise read the frame back (O4), write it into `waiting/` as one raw frame file at its captured size, then write its line with the frame size and the cursor position (C15) | Nothing private reaches the disk; the only pixel work in the service is one copy | a_rt |
-| A9 | Measure the live part's processor share every second, disk writes included. Set the worker's cap to `CPU_LIMIT_PERCENT` minus that share (E3). If the live part alone reaches its share of 5 %, it skips the read-back of new frames for the rest of that second; those instants are lost and named (E1) | The sum never exceeds 5 %; time gives way first, frames only last | B |
+| A9 | Measure the live part's processor share every second, disk writes included. Set the worker's cap to `CPU_LIMIT_PERCENT` minus that share (E3). If the live part alone reaches its share of 10 %, it skips the read-back of new frames for the rest of that second; those instants are lost and named (E1) | The sum never exceeds 10 %; time gives way first, frames only last | B |
 | A10 | Count, per clip: proven losses with their cause, the longest hold time against T_r, the live share, and the worker cap given | The clip can state which conditions held | conditions |
 | A11 | Every `DISK_CHECK_MS`, on the volume that holds the clip folder: free space as measured, minus the bytes written since the measurement, minus a reserve for the segment being finalized (C13). Stop when that falls below the storage Level 1 threshold (F7) | The disk keeps the existing reserve | T |
 | A12 | Stop at the requested length, on a stop call, when the window closes, when privacy pauses, under the disk rule, or on a write failure. `record_extend` moves the end. A write failure is a recoverable stop that keeps committed segments. State becomes `encoding` with a stop reason (C14) | Length is 60 s by default and can be extended; no stop loses committed work | T |
@@ -133,7 +135,7 @@ Segments are not formed live. The worker forms them from `frames.jsonl` (B2), so
 
 The worker is a separate process (E2), started from `current_exe` (`desktop_worker.rs:1619`) inside a job made by `create_worker_kill_on_close_job` (`desktop_worker.rs:983`). It reuses those two primitives only. It does not use the desktop worker's launcher: no hidden desktop, no window handle, no 10 s wait, no one-shot envelope (F10).
 
-The job gets a hard processor limit (`JOB_OBJECT_CPU_RATE_CONTROL_ENABLE` with `HARD_CAP`). The service sets that limit every second to 5 % minus the live share it measured (A9). When the remainder is zero, the worker waits; the clip is ready later. The worker runs at below-normal priority and without a window. The limit also covers the encoder's own threads. Each spawn has its own job (F11), so the cap touches no other worker.
+The job gets a hard processor limit (`JOB_OBJECT_CPU_RATE_CONTROL_ENABLE` with `HARD_CAP`). The service sets that limit every second to 10 % minus the live share it measured (A9). When the remainder is zero, the worker waits; the clip is ready later. The worker runs at below-normal priority and without a window. The limit also covers the encoder's own threads. Each spawn has its own job (F11), so the cap touches no other worker.
 
 One clip worker runs at a time for the whole service, with a first-in first-out queue that recovered clips also enter (C11). The job is kill-on-close, so the worker ends with the service; B10 resumes the work.
 
@@ -198,7 +200,7 @@ Active clips in folders other than the default one are listed in one registry fi
 | C | proven losses per instant with cause (slot overflow, privacy discard, disk, load shedding, service restart); longest hold time against T_r; delivery completeness | held when no instant was lost; delivery completeness is "checked only in the proof" |
 | G | window size, σ, recorded size per segment | held when recorded size = σ · window size; "padded" for transition-segment instants; not held above the encoder bound |
 | Q | quality level q or the bitrate used, encoder name | unverified until q_min is calibrated for the encoder used; held when quality mode at q ≥ q_min was accepted and read back; not held on an uncalibrated bitrate fallback (C6) |
-| B | live share, worker cap given and worker share, against 5 %; time until ready | held when the sum ≤ 5 % in every second |
+| B | live share, worker cap given and worker share, against 10 %; time until ready | held when the sum ≤ 10 % in every second |
 | T | length, bytes, instants lost, stop reason | held when nothing was lost |
 
 For a failed condition, the instants where it failed.
@@ -211,13 +213,13 @@ For a failed condition, the instants where it failed.
 | f_r | `REFERENCE_REFRESH_HZ` | `server/capture_clip.rs` | 60 | base rule |
 | T_r | (computed) | | 1 / f_r = 16.7 ms | C17: period and frequency are separate symbols |
 | d_min | (computed) | | 1 / f = 50 ms | requirement |
-| requested interval | `REQUESTED_UPDATE_INTERVAL_MS` | `synapse-capture` clip observer | 11 until M3 | research: 11.1 ms gave every refresh at 60 Hz; used only where supported |
-| selection lateness | `MAX_SELECTION_LATENESS_INSTANTS` | `synapse-capture` clip observer | from M7 | package 0 |
-| slots | `OBSERVE_SLOTS` (computed) | `synapse-capture` clip observer | lateness + 2 | C2 |
+| requested interval | `REQUESTED_UPDATE_INTERVAL_MS` | `synapse-capture` clip observer | 11 | package 0, M3: 72 frames/s on the 144 Hz development panel, longest gap 13.9 ms (below T_r); used only where supported |
+| selection lateness | `MAX_SELECTION_LATENESS_INSTANTS` | `synapse-capture` clip observer | 2 | package 0, M7: 0 instants late on the development PC under full load; 1 estimated on the weakest machine, plus 1 margin |
+| slots | `OBSERVE_SLOTS` (computed) | `synapse-capture` clip observer | lateness + 3 = 5 | package 0, M7: at most 3 slots in use; lateness + 2 holds only if a slot is freed as soon as it is read and a newer frame is pinned |
 | Windows floor | `MIN_WINDOWS_BUILD` | `synapse-capture` clip observer | 18362 (Windows 10 1903) | E5 |
 | t_def | `DEFAULT_DURATION_MS` | `server/capture_clip.rs` | 60,000 | requirement |
 | segment length | `SEGMENT_MS` | worker | 60,000 | finished segments are viewable while recording goes on; the 30-minute proof case decides whether time segments stay |
-| segment raw budget | `SEGMENT_RAW_BUDGET_BYTES` | worker | from M5 | S6; bounds the raw bytes held for one segment |
+| segment raw budget | `SEGMENT_RAW_BUDGET_BYTES` | worker | 1 GiB | package 0, M4 and M5: a proposal derived from the measured write rates, not itself measured; S6 |
 | resize settle | `RESIZE_SETTLE_MS` | worker | 500 | assumed; checked in the proof |
 | h_min | `MIN_LINES` | `server/capture_clip.rs` | 480 | requirement |
 | encoder bound | `MAX_ENCODE_MACROBLOCKS`, `MAX_ENCODE_SIDE` | `server/clip_encoder.rs` | 36,864 macroblocks, each side at most 4096 | a chosen bound (C16); the encoder's real acceptance is found when it opens, portrait sizes included |
@@ -225,7 +227,7 @@ For a failed condition, the instants where it failed.
 | disk check | `DISK_CHECK_MS` | `server/capture_clip.rs` | 1,000 | F7: the 30 s probe is too slow for raw writes |
 | finalize reserve | (computed) | `server/capture_clip.rs` | raw bytes of the open segment + their estimated encoded size | C13 |
 | excluded-app check | `EXCLUDED_APP_CHECK_MS` | `server/capture_clip.rs` | 1,000 | E6: one window enumeration per second |
-| U_max | `CPU_LIMIT_PERCENT` | clip worker mode | 5 | base rule |
+| U_max | `CPU_LIMIT_PERCENT` | clip worker mode | 10 | E10 (owner, 2026-11-22; was 5) |
 | worker cap | (computed every second) | clip worker mode | `CPU_LIMIT_PERCENT` − measured live share | E3; the approved equation's 0.05 · n − a_rt |
 | q | `H264_QUALITY_LEVEL` | `server/clip_encoder.rs` (today line 35) | 70 until q_min is measured | built value |
 | β | `FALLBACK_BITS_PER_PIXEL_FRAME` | `server/clip_encoder.rs` | 0.10 | equation section 6: 15.0 MB per minute at 1252 × 890, 20 fps, keyframe every 1 s gives 0.090; τ is 1 s again |
@@ -243,6 +245,8 @@ For a failed condition, the instants where it failed.
 | settle, short-lived | `SETTLE_MS`, `SHORT_LIVED_MS` | `server/clip_viewer.rs:64-66` | 200, 500 | kept from version 1; both ≥ d_min |
 | cursor mask | `CURSOR_MASK_PX` | `server/clip_viewer.rs` | 48 | research: a 48 × 48 box at the logged cursor position |
 | caret rule | `CARET_MAX_WIDTH_PX`, `CARET_PERIOD_MS` | `server/clip_viewer.rs` | 3, 500 | research: thin rectangles that toggle about every 500 ms |
+
+Measured mechanisms from package 0 (`scripts/clip-equation/results-package0.md`): the reader maps with "do not wait", sleeps 1 ms and retries (M6: a yield loop burns 2.2 ms of processor per 720p read); multithread protection is on. The H.264 screen hint is `CODECAPI_AVScenarioInfo` = DisplayRemoting (M8: accepted and read back by the software encoder and Quick Sync). `Frame::timestamp()` is about 5.5 ms after the frame arrives (M3, all 3,742 frames), so the hold time (O3) is measured from arrival, and the frame chosen for an instant is the one on screen at that instant. The encoder does not report a friendly name; the hardware vendor id is reported instead (F8).
 
 `MAX_FPS`, `DEFAULT_FPS`, `MAX_DURATION_MS` (`capture_clip.rs:52-54`), `FALLBACK_BITRATE_BPS` and `KEYFRAME_INTERVAL_SECONDS` (`clip_encoder.rs:37-38`) are removed. `WORKER_CPU_PERCENT` and `OBSERVE_RING` from version 3 are removed. `MIN_FLASH_MS` and `OBSERVE_INTERVAL_MS` from version 2 are not constants.
 
@@ -271,9 +275,9 @@ Replaced, not kept: version 1 records into a hidden temporary folder and renames
 
 The order is the owner's (E1): time, then length, then named instants. In detail:
 
-- The worker gets only what the live part leaves of 5 %. A weaker machine, a software encoder or a busy live part makes the clip ready later.
+- The worker gets only what the live part leaves of 10 %. A weaker machine, a software encoder or a busy live part makes the clip ready later.
 - The recording stops when the clip volume reaches storage pressure Level 1 (A11).
-- Only then are frames lost: when the disk cannot take the raw writes, when no slot is free, or when the live part alone would pass 5 % (A9). Each lost instant is counted, named with its cause, and condition C is reported as not held for it.
+- Only then are frames lost: when the disk cannot take the raw writes, when no slot is free, or when the live part alone would pass 10 % (A9). Each lost instant is counted, named with its cause, and condition C is reported as not held for it.
 
 Known limits that stay:
 
@@ -315,7 +319,7 @@ Capture and timing:
 
 Load and disk:
 
-5. The processor share per second: live part including disk writes, worker cap given, worker share, sum at most 5 %.
+5. The processor share per second: live part including disk writes, worker cap given, worker share, sum at most 10 %.
 6. A low-free-space volume: the recording stops by the disk rule, committed segments stay, the stop reason is recorded.
 7. Monitor recording while an excluded app is visible but not in front: refused at start; stopped when the app appears (E6). A privacy pause during recording: no frame composed after the pause instant is on disk (C12).
 
@@ -359,6 +363,11 @@ Not provable on this PC: the weakest machine's processor costs; they stay the co
 ## Owner decisions still open
 
 None. E1 to E8 were answered on 2026-11-22. E8 comes back to the owner with package 0's measured write volume.
+
+## Changes in version 4.1 (2026-11-22)
+
+- E9: no cursor in the picture; position still logged. E10: processor limit 10 % (was 5 %); every "5 %" processor reference changed to 10 %.
+- Parameter map filled from package 0: interval 11, lateness 2, slots lateness + 3 = 5, segment raw budget 1 GiB, Map mechanism, screen hint, time stamp meaning, encoder identity.
 
 ## Changes from version 3
 

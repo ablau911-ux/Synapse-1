@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::clip_folder::{
-    ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, StopReason,
+    ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, RecorderLock, StopReason,
     raw_frame_path, read_frame_lines,
 };
 
@@ -629,6 +629,11 @@ pub(crate) fn recover_clips_on_start() {
         .name("synapse-clip-recovery".to_owned())
         .spawn(|| {
             for folder in ClipRegistry::all_folders() {
+                // A recorder of a running service process (this one or
+                // another) still holds the clip: it is live, not left over.
+                if RecorderLock::held(&folder) {
+                    continue;
+                }
                 let Ok(clip) = ClipJson::read(&folder) else {
                     continue;
                 };

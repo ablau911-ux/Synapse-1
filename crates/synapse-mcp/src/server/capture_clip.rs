@@ -405,9 +405,24 @@ fn run_recorder_thread(
             return;
         }
     };
+    let _claim = RecorderClaim {
+        clip_id: &plan.clip_id,
+    };
     record(&plan, &control, started);
-    super::clip_worker::ProcessorBudget::global().clear_live_share();
-    Recorders::release(&plan.clip_id);
+}
+
+/// Ends the recorder's claim when the recorder thread ends, also by a panic:
+/// the live share is cleared and the one-recording claim released, so a later
+/// `record` is not refused until the service restarts.
+struct RecorderClaim<'a> {
+    clip_id: &'a str,
+}
+
+impl Drop for RecorderClaim<'_> {
+    fn drop(&mut self) {
+        super::clip_worker::ProcessorBudget::global().clear_live_share();
+        Recorders::release(self.clip_id);
+    }
 }
 
 /// A2: applies the start gates (storage pressure on the clip volume, privacy,
@@ -601,7 +616,7 @@ mod live {
     use super::super::clip_folder::{
         CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
         ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
-        ObserverGrant, StopReason, WAITING_DIR, WaitingFrameWriter,
+        ObserverGrant, RecorderLock, StopReason, WAITING_DIR, WaitingFrameWriter,
     };
     use super::super::clip_worker::ProcessorBudget;
     use super::super::{CaptureClipResponse, ErrorData};
@@ -831,6 +846,9 @@ mod live {
     /// The live part of one clip.
     struct Recording<'a> {
         plan: &'a ClipPlan,
+        /// Held for the life of the recording; released when it is dropped,
+        /// after `finish` wrote the stop.
+        _recorder_lock: RecorderLock,
         source: ClipSource,
         machine: Machine,
         observer: ClipObserver,
@@ -866,6 +884,9 @@ mod live {
                     plan.folder.display()
                 ))
             })?;
+            // Taken before `clip.json` exists, so recovery never sees this
+            // clip `recording` without a live recorder.
+            let recorder_lock = RecorderLock::acquire(&plan.folder).map_err(internal_error)?;
             initial_clip_json(plan)
                 .create(&plan.folder)
                 .map_err(internal_error)?;
@@ -889,6 +910,7 @@ mod live {
             let meter = LiveMeter::new(machine.threads, &observer);
             let mut recording = Self {
                 plan,
+                _recorder_lock: recorder_lock,
                 source,
                 machine,
                 observer,
@@ -1263,9 +1285,10 @@ mod live {
             let lost = std::mem::take(&mut self.lost);
             // B4, C14: a clip the worker already marked `failed` stays failed;
             // its failure, not the recorder's stop, is why it ended.
+            // Only a clip still `recording` takes the recorder's stop; a state
+            // set by the worker or by recovery (`encoding`, `ready`) stays too.
             let updated = ClipJson::update(&self.plan.folder, |clip| {
-                let failed = clip.state == ClipState::Failed;
-                if !failed {
+                if clip.state == ClipState::Recording {
                     clip.state = ClipState::Encoding;
                     clip.stop_reason = Some(reason);
                 }

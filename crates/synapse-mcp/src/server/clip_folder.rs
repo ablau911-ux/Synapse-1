@@ -22,6 +22,8 @@ pub(super) const VIEWS_DIR: &str = "views";
 /// stay after the clip is ready or failed.
 const REGISTRY_FILE: &str = "active-clips.json";
 const LOCK_SUFFIX: &str = ".lock";
+/// Held by the recorder for the life of a recording (`RecorderLock`).
+const RECORDER_LOCK_FILE: &str = "recorder.lock";
 const TEMP_SUFFIX: &str = ".tmp";
 const PART_SUFFIX: &str = ".part";
 /// Extension of a waiting frame: B, G, R rows compressed with zstd (A8).
@@ -572,6 +574,56 @@ pub(super) fn write_atomically(path: &Path, value: &impl Serialize) -> Result<()
     drop(file);
     std::fs::rename(&temp, path)
         .map_err(|error| format!("could not replace {}: {error}", path.display()))
+}
+
+/// The recorder's exclusive `recorder.lock` in the clip folder, held for the
+/// life of a recording (the pattern of the clip worker's `worker.lock`).
+/// Windows releases it when the recorder's process ends, also by a crash, so
+/// recovery (B10) in any service process can tell a live clip from one whose
+/// service ended.
+pub(super) struct RecorderLock {
+    file: std::fs::File,
+}
+
+impl RecorderLock {
+    /// Takes the lock of a new clip folder.
+    pub(super) fn acquire(folder: &Path) -> Result<Self, String> {
+        let path = folder.join(RECORDER_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        file.try_lock_exclusive()
+            .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    /// `true` while a recorder holds the lock of this clip folder. Without
+    /// the file (a clip from before the lock) no recorder is alive; when the
+    /// file cannot be opened or locked, the recorder counts as alive, so a
+    /// live clip is never taken for a dead one.
+    pub(super) fn held(folder: &Path) -> bool {
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .open(folder.join(RECORDER_LOCK_FILE))
+        {
+            Ok(file) => file,
+            Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+        };
+        if file.try_lock_exclusive().is_err() {
+            return true;
+        }
+        let _ = FileExt::unlock(&file);
+        false
+    }
+}
+
+impl Drop for RecorderLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 /// Size and SHA-256 (lowercase hex) of a file.

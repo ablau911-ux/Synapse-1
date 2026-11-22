@@ -1244,8 +1244,9 @@ mod live {
                         "delivery_completeness": "checked only in the proof",
                     })),
                 }),
+                // The worker sets the real G from the committed segments (B9).
                 g: Some(ConditionStatus {
-                    status: "held".to_owned(),
+                    status: "pending_worker".to_owned(),
                     failed_instants: Vec::new(),
                     detail: Some(serde_json::json!({
                         "window_width": self.geometry.window_width,

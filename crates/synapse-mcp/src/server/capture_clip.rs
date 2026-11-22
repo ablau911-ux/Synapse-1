@@ -611,7 +611,7 @@ mod live {
         ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
         ObserverGrant, RecorderLock, StopReason, WAITING_DIR, WaitingFrameWriter,
     };
-    use super::super::clip_worker::ProcessorBudget;
+    use super::super::clip_worker::{ProcessorBudget, logical_processors, share_percent};
     use super::super::{CaptureClipResponse, ErrorData};
     use super::{
         CLIP_JSON_FILE, ClipPlan, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS, FIRST_FRAME_TIMEOUT_MS,
@@ -680,9 +680,7 @@ mod live {
     impl Machine {
         fn read() -> Self {
             Self {
-                threads: std::thread::available_parallelism().map_or(1, |threads| {
-                    u32::try_from(threads.get()).unwrap_or(u32::MAX)
-                }),
+                threads: logical_processors(),
             }
         }
     }
@@ -732,8 +730,7 @@ mod live {
                 return;
             }
             let cpu = Self::cpu(observer);
-            let share = (cpu - self.cpu_at_second_start) as f64 * 100.0
-                / (elapsed as f64 * f64::from(self.threads.max(1)));
+            let share = share_percent(cpu - self.cpu_at_second_start, elapsed, self.threads);
             let cap = ProcessorBudget::global().set_live_share(share);
             self.max_share = self.max_share.max(share);
             self.max_worker_cap_given = self.max_worker_cap_given.max(cap);

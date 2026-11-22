@@ -97,7 +97,9 @@ pub(super) fn share_percent(cpu_hns: i64, wall_hns: i64, threads: u32) -> f64 {
     cpu_hns as f64 * 100.0 / (wall_hns.max(1) as f64 * f64::from(threads.max(1)))
 }
 
-fn logical_processors() -> u32 {
+/// n: the machine's logical processors (A1), for every share of the whole
+/// machine.
+pub(super) fn logical_processors() -> u32 {
     std::thread::available_parallelism().map_or(1, |threads| {
         u32::try_from(threads.get()).unwrap_or(u32::MAX)
     })

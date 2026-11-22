@@ -751,6 +751,10 @@ struct Activity {
     /// The last instant of this change at which it animated: the end of its
     /// animated stretch; `None` when it never animated.
     animated_until: Option<u64>,
+    /// After its animated stretch: the first instant it was not SAME as its
+    /// anchor, the start of a later excursion (D5 step 3, owner decision on
+    /// issue #293).
+    left_after_animation: Option<u64>,
     /// The instants at which it was DIFF from its anchor.
     differed: Vec<u64>,
 }
@@ -958,6 +962,7 @@ impl<'a> Analyzer<'a> {
                     start,
                     last_move: instant,
                     animated_until: None,
+                    left_after_animation: None,
                     differed: Vec::new(),
                 });
             }
@@ -972,6 +977,9 @@ impl<'a> Analyzer<'a> {
             }
             if animating {
                 activity.animated_until = Some(instant);
+                activity.left_after_animation = None;
+            } else if activity.animated_until.is_some() && to_anchor != Verdict::Same {
+                activity.left_after_animation = activity.left_after_animation.or(Some(instant));
             }
             state.stable_since = self.recent.stable_since(&picture, b, instant);
         }
@@ -1042,7 +1050,8 @@ impl<'a> Analyzer<'a> {
             footprint: None,
         };
         // A return to the anchor starts at the first instant that was not
-        // SAME, or after an animation at its first DIFF after the stretch.
+        // SAME; after an animation, at the first such instant after the
+        // stretch.
         let mut return_start = activity.start;
         if let Some(animated_until) = activity.animated_until {
             let running = match close {
@@ -1074,9 +1083,9 @@ impl<'a> Analyzer<'a> {
             episode.start = activity.last_move.min(episode.end);
             activity.differed.retain(|at| *at > animated_until);
             return_start = activity
-                .differed
-                .first()
-                .map_or(episode.start, |first| (*first).min(episode.end));
+                .left_after_animation
+                .or(activity.differed.first().copied())
+                .map_or(episode.start, |first| first.min(episode.end));
         }
         match picture.test(&self.anchor, b) {
             Verdict::Diff => {

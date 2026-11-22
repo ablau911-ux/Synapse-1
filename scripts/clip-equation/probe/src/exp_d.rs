@@ -82,10 +82,13 @@ use self::clip_encoder::{MediaFoundationRuntime, SegmentInput, SegmentSample};
 use crate::Result;
 use crate::encoder::attribute_string;
 use crate::exp_cpu::Spent;
+use crate::exp_measure::{CaptureFrame, ClipFiles, RamMeter};
 use crate::exp_meter::{Args, MemorySampler, memory_now};
 use crate::exp_settings::{Codec, EncodeSettings};
 
 const INSTANT_MS: u64 = 50;
+/// Diagnostic lists in the JSON line (keyframe orders, time offsets): first items only.
+const DIAG_ITEMS: usize = 12;
 const SSIM_WINDOW: usize = 8;
 const SSIM_STRIDE: usize = 4;
 const SSIM_C1: f64 = (0.01 * 255.0) * (0.01 * 255.0);
@@ -104,8 +107,16 @@ pub fn run() -> Result<()> {
     if args.text_or("mode", "run") == "meter" {
         return meter_self_check(&args);
     }
+    // M3: the live part and the worker are two processes, as in the product (E2).
+    let phase = args.text_or("phase", "").to_owned();
     let mut out = Json::default();
-    let outcome = run_way_d(&args, &mut out);
+    out.text("phase", &phase);
+    let outcome = match phase.as_str() {
+        "live" => run_live(&args, &mut out),
+        "worker" => run_worker(&args, &mut out),
+        other => Err(format!("phase={other}: give phase=live, then phase=worker on the same scratch folder")),
+    };
+    let failed = outcome.is_err();
     if let Err(error) = outcome {
         if !out.has("status") {
             out.text("status", "error");
@@ -113,7 +124,10 @@ pub fn run() -> Result<()> {
         out.text("error", &error);
     }
     println!("{}", out.finish());
-    if let Ok(scratch) = args.text("scratch") {
+    // The live part leaves the waiting folder for the worker; the worker removes the run folder.
+    if (phase != "live" || failed)
+        && let Ok(scratch) = args.text("scratch")
+    {
         let _ = std::fs::remove_dir_all(scratch);
     }
     Ok(())
@@ -128,6 +142,8 @@ struct Folder {
     sigma: u32,
     /// (instant, corpus frame index) of every new frame, in order.
     new_frames: Vec<(u64, u64)>,
+    /// Every line of frames.jsonl: (instant, stored frame shown, new).
+    lines: Vec<(u64, u64, bool)>,
     instants: u64,
 }
 
@@ -138,12 +154,12 @@ impl Folder {
         let window = json_array(&meta, "window").ok_or("meta.json has no window")?;
         let sigma = json_num(&meta, "sigma").unwrap_or(1.0) as u32;
         let instants = json_num(&meta, "instants").unwrap_or(400.0) as u64;
-        let lines = std::fs::read_to_string(dir.join("frames.jsonl")).map_err(|e| format!("frames.jsonl: {e}"))?;
-        let new_frames = lines
+        let text = std::fs::read_to_string(dir.join("frames.jsonl")).map_err(|e| format!("frames.jsonl: {e}"))?;
+        let lines: Vec<(u64, u64, bool)> = text
             .lines()
-            .filter(|l| l.contains("\"new\":true"))
-            .filter_map(|l| Some((json_num(l, "instant")? as u64, json_num(l, "frame")? as u64)))
+            .filter_map(|l| Some((json_num(l, "instant")? as u64, json_num(l, "frame")? as u64, l.contains("\"new\":true"))))
             .collect();
+        let new_frames = lines.iter().filter(|l| l.2).map(|&(instant, frame, _)| (instant, frame)).collect();
         Ok(Self {
             dir: dir.to_owned(),
             scenario,
@@ -151,8 +167,18 @@ impl Folder {
             height: window[1] as u32,
             sigma: sigma.max(1),
             new_frames,
+            lines,
             instants,
         })
+    }
+
+    fn put(&self, out: &mut Json) {
+        out.text("folder", &self.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        out.text("scenario", &self.scenario);
+        out.num("width", self.width);
+        out.num("height", self.height);
+        out.num("sigma", self.sigma);
+        out.num("n_new", self.new_frames.len());
     }
 
     fn frame_bgr(&self, frame: u64) -> Result<Vec<u8>> {
@@ -163,37 +189,232 @@ impl Folder {
     }
 }
 
-fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
+/// Corpus frames decoded into one reused buffer: input preparation, never
+/// measured (M1), and allocated before M_0 so no corpus buffer is in a reading (M3).
+struct CorpusReader {
+    dctx: zstd::bulk::Decompressor<'static>,
+    packed: Vec<u8>,
+}
+
+impl CorpusReader {
+    fn new(px: usize) -> Result<Self> {
+        let dctx = zstd::bulk::Decompressor::new().map_err(|e| format!("zstd: {e}"))?;
+        // A zstd frame of raw pixels is at most a little larger than the pixels.
+        Ok(Self { dctx, packed: Vec::with_capacity(px * 3 + 65536) })
+    }
+
+    fn frame(&mut self, folder: &Folder, frame: u64, out: &mut [u8]) -> Result<()> {
+        use std::io::Read as _;
+        let path = folder.dir.join(format!("frame-{frame:04}.zst"));
+        self.packed.clear();
+        std::fs::File::open(&path)
+            .and_then(|mut f| f.read_to_end(&mut self.packed))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = self.dctx.decompress_to_buffer(&self.packed, out).map_err(|e| format!("{}: {e}", path.display()))?;
+        if n != out.len() {
+            return Err(format!("{}: {n} bytes, expected {}", path.display(), out.len()));
+        }
+        Ok(())
+    }
+}
+
+/// A fixed text region of a scenario (corpus.json `text_regions`, M7), in window
+/// pixels at σ = 1: insets from the four edges, then an optional cap on the size.
+/// Passed as `regions=left:top:right:bottom:max_width:max_height:max_width_fraction;...`.
+struct TextRegion {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    max_width: u32,
+    max_height: u32,
+    max_width_fraction: f64,
+}
+
+impl TextRegion {
+    fn parse(text: &str) -> Result<Vec<Self>> {
+        text.split(';')
+            .filter(|r| !r.trim().is_empty())
+            .map(|r| {
+                let v: Vec<f64> = r.split(':').map(|x| x.trim().parse::<f64>().map_err(|_| format!("region {r}: bad number {x}"))).collect::<Result<_>>()?;
+                if v.len() != 7 {
+                    return Err(format!("region {r}: 7 numbers expected"));
+                }
+                let px = |x: f64| x.max(0.0) as u32;
+                Ok(Self {
+                    left: px(v[0]),
+                    top: px(v[1]),
+                    right: px(v[2]),
+                    bottom: px(v[3]),
+                    max_width: px(v[4]),
+                    max_height: px(v[5]),
+                    max_width_fraction: v[6],
+                })
+            })
+            .collect()
+    }
+
+    /// (x, y, w, h) in the recorded frame: window pixels × σ, clipped to `rw` × `rh`.
+    fn rect(&self, window_w: u32, window_h: u32, sigma: u32, rw: u32, rh: u32) -> Option<(u32, u32, u32, u32)> {
+        let mut w = window_w.saturating_sub(self.left + self.right);
+        let h = window_h.saturating_sub(self.top + self.bottom);
+        if self.max_width > 0 {
+            w = w.min(self.max_width);
+        }
+        if self.max_width_fraction > 0.0 {
+            w = w.min((f64::from(window_w) * self.max_width_fraction) as u32);
+        }
+        let h = if self.max_height > 0 { h.min(self.max_height) } else { h };
+        let (x, y) = (self.left * sigma, self.top * sigma);
+        let (w, h) = ((w * sigma).min(rw.saturating_sub(x)), (h * sigma).min(rh.saturating_sub(y)));
+        (w >= 8 && h >= 8).then_some((x, y, w, h))
+    }
+}
+
+/// The live process (M1 to M3): every new frame arrives as B, G, R, A and goes
+/// through the copied product `WaitingFrameWriter` (alpha dropped, zstd −3,
+/// written to `scratch/waiting/`). CPU = cycle counter of that work (a_rt), RAM =
+/// OS peak of private bytes above M_0 (M_live). It leaves the waiting folder.
+fn run_live(args: &Args, out: &mut Json) -> Result<()> {
     let folder = Folder::open(Path::new(args.text("folder")?))?;
-    let way = args.text("encoder")?.to_owned();
-    let name = args.text_or("name", "").to_owned();
-    let vendor = args.text_or("vendor", "").to_owned();
-    let hardware = args.flag("hw", !vendor.is_empty());
-    // `rate=` is the cycle-counter rate (`exp-rate`), so the rate mode has its own key.
-    let rate = args.text_or("ratemode", "quality").to_owned();
-    let q: u32 = args.number("q", 70)?;
-    let tau: u32 = args.number("gop", 20)?;
-    let hint = args.flag("hint", true);
-    let beta: f64 = args.number("beta", 0.10)?;
+    let request = Request::from_args(args)?;
     let scratch = PathBuf::from(args.text("scratch")?);
-    // Cycles per second (`clip-probe exp-rate`), shared with way Z (`exp_cpu`).
     let cycle_rate = args.rate()?;
     out.float("cycle_rate", cycle_rate);
-    out.text("folder", &folder.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-    out.text("scenario", &folder.scenario);
-    out.text("encoder", &way);
-    out.num("width", folder.width);
-    out.num("height", folder.height);
-    out.num("sigma", folder.sigma);
-    out.num("q", if rate == "quality" { q } else { 0 });
-    out.num("tau_f", tau);
-    out.num("hint", u32::from(hint));
-    out.text("rate", &rate);
-    out.float("beta", if rate == "bitrate" { beta } else { 0.0 });
-    out.num("n_new", folder.new_frames.len());
+    folder.put(out);
+    out.num("live_pid", std::process::id());
+    crate::exp_settings::install(request.settings(false));
+    std::fs::create_dir_all(scratch.join(clip_folder::WAITING_DIR)).map_err(|e| format!("scratch: {e}"))?;
+
+    // Input preparation before M_0 (M1, M3): the corpus reader, one B,G,R buffer
+    // and one capture frame exist and one frame has been read, like the product's slot.
+    let px = (folder.width * folder.height) as usize;
+    let mut corpus = CorpusReader::new(px)?;
+    let mut bgr = vec![0_u8; px * 3];
+    let mut capture = CaptureFrame::new(px);
+    if let Some(&(_, first)) = folder.new_frames.first() {
+        corpus.frame(&folder, first, &mut bgr)?;
+        capture.fill(&bgr);
+    }
+    let ram = RamMeter::start();
+    let wall = Instant::now();
+    let mut live = Spent::default();
+    let mut writer = live.time(clip_folder::WaitingFrameWriter::new)?;
+    let mut waiting_bytes = 0_u64;
+    for &(instant, frame) in &folder.new_frames {
+        corpus.frame(&folder, frame, &mut bgr)?;
+        capture.fill(&bgr);
+        waiting_bytes += live.time(|| writer.write(&scratch, instant, capture.bgra()))?;
+    }
+    live.time(|| drop(writer));
+    let t_live = wall.elapsed().as_nanos();
+    let reading = ram.read();
+    out.text("input", "bgra");
+    out.num("waiting_bytes", waiting_bytes);
+    out.num("t_live_ns", t_live);
+    out.num("a_rt_ns", live.cpu_from_cycles(cycle_rate));
+    out.num("a_rt_gpt_ns", live.cpu_ns);
+    out.num("live_cycles", live.cycles);
+    out.raw(reading.json("live_"));
+    out.num("m_live", reading.ram);
+    out.text("status", "ok");
+    Ok(())
+}
+
+/// The settings a run asks for (factors D1 to D5), echoed as `<name>_req` (M5).
+struct Request {
+    way: String,
+    name: String,
+    vendor: String,
+    hardware: bool,
+    rate: String,
+    q: u32,
+    tau: u32,
+    hint: bool,
+    beta: f64,
+}
+
+impl Request {
+    fn from_args(args: &Args) -> Result<Self> {
+        let vendor = args.text_or("vendor", "").to_owned();
+        let beta: f64 = args.number("beta", clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME)?;
+        // M5: the bitrate fallback is never 0 (quality mode keeps the product's 0.10).
+        if beta.is_nan() || beta <= 0.0 {
+            return Err(format!("beta={beta}: the bitrate fallback must be above 0 (M5)"));
+        }
+        Ok(Self {
+            way: args.text("encoder")?.to_owned(),
+            name: args.text_or("name", "").to_owned(),
+            hardware: args.flag("hw", !vendor.is_empty()),
+            vendor,
+            // `rate=` is the cycle-counter rate (`exp-rate`), so the rate mode has its own key.
+            rate: args.text_or("ratemode", "quality").to_owned(),
+            q: args.number("q", 70)?,
+            tau: args.number("gop", 20)?,
+            hint: args.flag("hint", true),
+            beta,
+        })
+    }
+
+    /// q as a key: 0 in bitrate mode, where no quality level is set.
+    fn q(&self) -> u32 {
+        if self.rate == "quality" { self.q } else { 0 }
+    }
+
+    /// β · w · h · f in bits per second, as the copied `fallback_bitrate` computes it.
+    fn bitrate(&self, width: u32, height: u32) -> u32 {
+        let bits = self.beta * f64::from(width) * f64::from(height) * f64::from(capture_clip::RECORD_FPS);
+        bits.round().clamp(1.0, f64::from(u32::MAX)) as u32
+    }
+
+    fn settings(&self, hardware: bool) -> EncodeSettings {
+        EncodeSettings {
+            codec: Codec::H264,
+            hardware,
+            adapter_luid: None,
+            quality: (self.rate == "quality").then_some(self.q),
+            bits_per_pixel_frame: self.beta,
+            gop_frames: self.tau,
+            screen_hint: self.hint,
+            low_latency: false,
+            zstd_level: -3,
+            raw_waiting: false,
+        }
+    }
+
+    /// The requested settings, and the key columns until the encoder reads them back.
+    fn put(&self, out: &mut Json) {
+        out.text("encoder", &self.way);
+        out.text("rate_req", &self.rate);
+        out.num("q_req", self.q());
+        out.num("tau_f_req", self.tau);
+        out.num("hint_req", u32::from(self.hint));
+        out.float("beta_req", self.beta);
+        out.text("rate", &self.rate);
+        out.num("q", self.q());
+        out.num("tau_f", self.tau);
+        out.num("hint", u32::from(self.hint));
+        out.float("beta", self.beta);
+    }
+}
+
+/// The worker process (M2 to M4): activation, then the copied product
+/// `encode_once` on the waiting frames (read, decode, σ scale, NV12, encode,
+/// write), the clip's `frames.jsonl` and `clip.json`, the waiting folder deleted
+/// at ready. CPU = cycle counter (a_w), RAM = OS peak above M_0 (M_worker).
+/// Afterwards, outside the measured work: read back, settings, decode, quality.
+fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
+    let folder = Folder::open(Path::new(args.text("folder")?))?;
+    let request = Request::from_args(args)?;
+    let scratch = PathBuf::from(args.text("scratch")?);
+    let cycle_rate = args.rate()?;
+    out.float("cycle_rate", cycle_rate);
+    folder.put(out);
+    out.num("worker_pid", std::process::id());
+    request.put(out);
 
     // 1. Activation from the enumeration object.
-    let activate = find_encoder(&name, &vendor, hardware)?;
+    let activate = find_encoder(&request.name, &request.vendor, request.hardware)?;
     let activation = unsafe { activate.ActivateObject::<IMFTransform>() };
     match &activation {
         Ok(_) => {
@@ -208,7 +429,7 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
         }
     }
     let transform = activation.map_err(|e| e.to_string())?;
-    if vendor == "VEN_1414" {
+    if request.vendor == "VEN_1414" {
         // DW4: no Sink Writer path; confirm whether it takes system-memory NV12.
         let (w, h) = recorded_size(&folder);
         let confirm = confirm_system_nv12(&transform, w, h);
@@ -222,51 +443,11 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
     }
     drop(transform);
     let _ = unsafe { activate.ShutdownObject() };
-
-    // Settings of the run, read by the copied encoder and waiting-frame writer.
-    let manager = if hardware { Some(device_manager(&vendor)?) } else { None };
+    let manager = if request.hardware { Some(device_manager(&request.vendor)?) } else { None };
     crate::exp_settings::set_d3d_manager(manager);
-    crate::exp_settings::install(EncodeSettings {
-        codec: Codec::H264,
-        hardware,
-        adapter_luid: None,
-        quality: (rate == "quality").then_some(q),
-        bits_per_pixel_frame: beta,
-        gop_frames: tau,
-        screen_hint: hint,
-        low_latency: false,
-        zstd_level: -3,
-        raw_waiting: false,
-    });
+    crate::exp_settings::install(request.settings(request.hardware));
 
-    // 2. Live part: zstd −3 of every new frame through the product's writer.
-    std::fs::create_dir_all(scratch.join(clip_folder::WAITING_DIR)).map_err(|e| format!("scratch: {e}"))?;
-    let sampler = MemorySampler::start();
-    let mut writer = clip_folder::WaitingFrameWriter::new()?;
-    let px = (folder.width * folder.height) as usize;
-    let mut bgra = vec![255_u8; px * 4];
-    let live_base = memory_now().1;
-    sampler.take_peaks();
-    let live_wall = Instant::now();
-    let (mut live, mut waiting_bytes) = (Spent::default(), 0_u64);
-    for &(instant, frame) in &folder.new_frames {
-        let bgr = folder.frame_bgr(frame)?;
-        for (pixel, source) in bgra.chunks_exact_mut(4).zip(bgr.chunks_exact(3)) {
-            pixel[..3].copy_from_slice(source);
-        }
-        waiting_bytes += live.time(|| writer.write(&scratch, instant, &bgra))?;
-    }
-    let t_live = live_wall.elapsed().as_nanos();
-    let m_live = sampler.take_peaks().1.saturating_sub(live_base);
-    drop(writer);
-    drop(bgra);
-    out.num("waiting_bytes", waiting_bytes);
-    out.num("t_live_ns", t_live);
-    out.num("a_rt_ns", live.cpu_from_cycles(cycle_rate));
-    out.num("a_rt_gpt_ns", live.cpu_ns);
-    out.num("m_live", m_live);
-
-    // 3. Worker: the copied product encoder on the waiting frames.
+    // 2. The worker's measured work, from M_0 to ready.
     let samples = segment_samples(&folder, &scratch);
     let input = SegmentInput {
         canvas_width: folder.width,
@@ -276,50 +457,133 @@ fn run_way_d(args: &Args, out: &mut Json) -> Result<()> {
         samples: &samples,
         seed: None,
     };
-    let clip = scratch.join("clip.mp4");
-    let worker_base = memory_now().1;
-    sampler.take_peaks();
+    let clip_dir = scratch.join("clip");
+    let mp4 = clip_dir.join("clip.mp4");
+    let ram = RamMeter::start();
     let mut worker = Spent::default();
-    let encoded = worker.time(|| clip_encoder::probe_encode_once(&clip, &input, hardware))?;
-    let (a_w, t_worker) = (worker.cpu_from_cycles(cycle_rate), worker.wall_ns);
+    let mut files = worker.time(|| ClipFiles::create(&clip_dir, folder.width as usize, folder.height as usize))?;
+    let encoded = worker.time(|| clip_encoder::probe_encode_once(&mp4, &input, request.hardware))?;
+    worker.time(|| -> Result<()> {
+        files.count(&mp4)?;
+        for &(instant, frame, new) in &folder.lines {
+            files.line(instant, frame as usize, new)?;
+        }
+        // M4: the waiting files are deleted at ready, so they are not kept or counted.
+        std::fs::remove_dir_all(scratch.join(clip_folder::WAITING_DIR)).map_err(|e| format!("waiting: {e}"))
+    })?;
+    let clip_json = format!(
+        "{{\"way\":\"{}\",\"w\":{},\"h\":{},\"sigma\":{},\"out_w\":{},\"out_h\":{},\"frames\":{},\"segments\":[\"clip.mp4\"]}}",
+        request.way,
+        folder.width,
+        folder.height,
+        folder.sigma,
+        encoded.width,
+        encoded.height,
+        folder.new_frames.len()
+    );
+    let clip_bytes = worker.time(|| files.finish(&clip_json))?;
+    let reading = ram.read();
+    out.num("t_worker_ns", worker.wall_ns);
+    out.num("a_w_ns", worker.cpu_from_cycles(cycle_rate));
     out.num("a_w_gpt_ns", worker.cpu_ns);
-    let m_worker = sampler.take_peaks().1.saturating_sub(worker_base);
+    out.num("worker_cycles", worker.cycles);
+    out.raw(reading.json("worker_"));
+    out.num("m_worker", reading.ram);
+    out.num("bytes", clip_bytes.payload);
+    out.raw(clip_bytes.json());
+    out.num("bytes_disk", clip_bytes.total());
+    out.num("bytes_on_disk", ClipFiles::bytes_on_disk(&clip_dir)?);
+    out.text("clip_hash", &format!("{:016x}", fnv1a(&std::fs::read(&mp4).unwrap_or_default())));
     out.num("out_w", encoded.width);
     out.num("out_h", encoded.height);
     out.text("encoder_used", &encoded.encoder);
     out.num("hardware_used", u32::from(encoded.hardware));
-    out.num("t_worker_ns", t_worker);
-    out.num("a_w_ns", a_w);
-    out.num("m_worker", m_worker);
-    let quality = &encoded.quality;
-    out.num("gop_read", quality.gop_frames);
-    out.num("b_frames_read", quality.b_frames);
-    out.num("hint_accepted", u32::from(quality.screen_content_hint));
-    out.text("rate_read", &quality.mode);
-    out.num("rate_value", quality.value);
     out.num("keyframes_segment", encoded.keyframe_instants.len());
     // With hardware transforms off the Sink Writer can load only a software
     // encoder, and the software H.264 MFT reports no friendly name.
-    let used_matches = encoded.encoder.contains(&name)
-        || (!vendor.is_empty() && encoded.encoder.contains(&vendor))
-        || (!hardware && !encoded.hardware);
+    let used_matches = encoded.encoder.contains(&request.name)
+        || (!request.vendor.is_empty() && encoded.encoder.contains(&request.vendor))
+        || (!request.hardware && !encoded.hardware);
     out.num("encoder_matches", u32::from(used_matches));
 
+    // 3. Settings read back (M5): a differing run is recorded under its actual settings.
+    let report = &encoded.quality;
+    let quality_mode = report.mode == "quality";
+    let q_read = if quality_mode { report.value } else { 0 };
+    let hint_read = u32::from(report.screen_content_hint);
+    let bitrate_req = request.bitrate(encoded.width, encoded.height);
+    let bitrate_read = if quality_mode { 0 } else { report.value };
+    let beta_read = if quality_mode || bitrate_read == bitrate_req {
+        request.beta
+    } else {
+        f64::from(bitrate_read) / (f64::from(encoded.width) * f64::from(encoded.height) * f64::from(capture_clip::RECORD_FPS))
+    };
+    out.text("rate_read", &report.mode);
+    out.num("rate_value", report.value);
+    out.num("q_read", q_read);
+    out.num("tau_f_read", report.gop_frames);
+    out.num("hint_read", hint_read);
+    out.num("bitrate_req", if request.rate == "bitrate" { bitrate_req } else { 0 });
+    out.num("bitrate_read", bitrate_read);
+    out.float("beta_read", beta_read);
+    out.num("b_frames_read", report.b_frames);
+    let refused = [
+        ("rate", request.rate != report.mode),
+        ("q", quality_mode && request.q() != q_read),
+        ("tau_f", request.tau != report.gop_frames),
+        ("hint", u32::from(request.hint) != hint_read),
+        ("beta", !quality_mode && request.rate == "bitrate" && bitrate_read != bitrate_req),
+    ]
+    .into_iter()
+    .find_map(|(name, differs)| differs.then_some(name));
+    out.text("rate", &report.mode);
+    out.num("q", q_read);
+    out.num("tau_f", report.gop_frames);
+    out.num("hint", hint_read);
+    out.float("beta", beta_read);
+
     // 4. Read back from the file.
-    let bytes = std::fs::metadata(&clip).map_err(|e| format!("clip: {e}"))?.len();
-    out.num("bytes", bytes);
-    out.text("clip_hash", &format!("{:016x}", fnv1a(&std::fs::read(&clip).unwrap_or_default())));
-    let back = read_back(&clip)?;
+    let back = read_back(&mp4)?;
     out.num("frames", back.frames);
     out.num("keyframes", back.keyframes);
     out.num("b_frames", back.b_slices);
     out.num("max_gop", back.max_gop);
+    out.text("key_orders", &list(back.key_orders.iter()));
+    out.text("mp4_time_offsets", &time_offsets(&back.times_ms, &samples));
 
-    // 5 and 6. Decode, quality, R and flashes.
-    let quality = measure_quality(&folder, &input, &clip, &sampler, cycle_rate)?;
+    // 5 and 6. Decode, frame mapping by time (M6), quality, R and flashes.
+    let sampler = MemorySampler::start();
+    let regions = TextRegion::parse(args.text_or("regions", ""))?;
+    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions)?;
     quality.put(out);
-    out.text("status", if used_matches { "ok" } else { "wrong_encoder" });
+    let status = if !used_matches {
+        "wrong_encoder".to_owned()
+    } else if let Some(name) = refused {
+        format!("setting_refused:{name}")
+    } else if quality.mapping_failed(folder.new_frames.len()) {
+        "frame_map".to_owned()
+    } else {
+        "ok".to_owned()
+    };
+    out.text("status", &status);
     Ok(())
+}
+
+/// The first values of a list, comma-free (the runner's CSV has no quoting).
+fn list<T: std::fmt::Display>(values: impl Iterator<Item = T>) -> String {
+    values.take(DIAG_ITEMS).map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// Samples whose time differs from the time written for them, as `order:sample_ms>file_ms`.
+fn time_offsets(times_ms: &[u64], samples: &[SegmentSample]) -> String {
+    let off: Vec<String> = times_ms
+        .iter()
+        .zip(samples)
+        .enumerate()
+        .filter(|(_, (t, s))| t.abs_diff(s.local_ms) > INSTANT_MS / 2)
+        .map(|(order, (t, s))| format!("{order}:{}>{t}", s.local_ms))
+        .collect();
+    format!("{} off; {}", off.len(), list(off.iter()))
 }
 
 /// σ · window, even, as the copied `RecordedSize` gives within the bound.
@@ -503,13 +767,17 @@ struct ReadBack {
     keyframes: u64,
     b_slices: u64,
     max_gop: u64,
+    /// Decode order of every keyframe.
+    key_orders: Vec<u64>,
+    /// The time stored for every compressed sample, in milliseconds.
+    times_ms: Vec<u64>,
 }
 
 fn read_back(clip: &Path) -> Result<ReadBack> {
     let url = HSTRING::from(clip.as_os_str());
     let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }.map_err(|e| format!("source reader: {e}"))?;
     let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-    let mut back = ReadBack { frames: 0, keyframes: 0, b_slices: 0, max_gop: 0 };
+    let mut back = ReadBack { frames: 0, keyframes: 0, b_slices: 0, max_gop: 0, key_orders: Vec::new(), times_ms: Vec::new() };
     let mut since_key = 0_u64;
     loop {
         let (mut flags, mut time) = (0_u32, 0_i64);
@@ -522,8 +790,10 @@ fn read_back(clip: &Path) -> Result<ReadBack> {
             return Err("read back: stream error".to_owned());
         }
         if let Some(sample) = sample {
+            back.times_ms.push(u64::try_from((time + 5_000) / 10_000).unwrap_or(0));
             back.frames += 1;
             if unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0 {
+                back.key_orders.push(back.frames - 1);
                 back.keyframes += 1;
                 since_key = 0;
             }
@@ -636,17 +906,35 @@ struct Quality {
     t_ocr: u128,
     ssim: Vec<f64>,
     psnr: Vec<f64>,
-    mse_sum: f64,
+    /// Σ (Y_decoded − Y_corpus)² and the pixels it covers, over the whole clip (M7).
+    squared_error: u64,
+    pixels: u64,
     r: Option<f64>,
     r_note: String,
+    r_regions: usize,
+    r_source_chars: usize,
     flashes: Option<u64>,
-    time_mismatch: u64,
+    /// M6: decoded frames matched to a new frame by time, and the failures.
+    n_new: usize,
+    mapped: usize,
+    extra: u64,
+    mistimed: u64,
+    /// Decoded frames off their decode-order sample's time, as `order:sample_ms>decoded_ms`.
+    offsets: Vec<String>,
 }
 
 impl Quality {
+    fn mapping_failed(&self, n_new: usize) -> bool {
+        self.mapped != n_new || self.extra > 0 || self.mistimed > 0
+    }
+
     fn put(&self, out: &mut Json) {
         out.num("decoded_frames", self.decoded);
-        out.num("time_mismatch", self.time_mismatch);
+        out.num("frames_mapped", self.mapped);
+        out.num("frames_missing", self.n_new.saturating_sub(self.mapped));
+        out.num("frames_extra", self.extra);
+        out.num("frames_mistimed", self.mistimed);
+        out.text("time_offsets", &format!("{} off; {}", self.offsets.len(), list(self.offsets.iter())));
         out.num("t_decode_ns", self.dec.wall_ns);
         out.num("a_dec_ns", self.dec.cpu_from_cycles(self.rate));
         out.num("a_dec_gpt_ns", self.dec.cpu_ns);
@@ -660,13 +948,17 @@ impl Quality {
         out.float("psnr_mean", mean(&finite));
         out.float("psnr_min", self.psnr.iter().copied().fold(f64::INFINITY, f64::min));
         out.num("identical_frames", self.psnr.len() - finite.len());
-        let mse = self.mse_sum / self.psnr.len().max(1) as f64;
+        // M7: PSNR-Y from the clip's total MSE, inf when it is 0.
+        let mse = self.squared_error as f64 / self.pixels.max(1) as f64;
+        out.float("mse_y", mse);
         out.float("psnr_global", if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY });
         match self.r {
             Some(r) => out.float("r", r),
             None => out.text("r", "n/a"),
         }
         out.text("r_note", &self.r_note);
+        out.num("r_regions", self.r_regions);
+        out.num("r_source_chars", self.r_source_chars);
         match self.flashes {
             Some(n) => out.num("flashes", n),
             None => out.text("flashes", "n/a"),
@@ -674,15 +966,25 @@ impl Quality {
     }
 }
 
-/// Decodes the clip with the copied product decoder and measures every frame.
-fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: &MemorySampler, rate: f64) -> Result<Quality> {
-    let mut quality = Quality { rate, ..Quality::default() };
-    let text = TEXT_SCENARIOS.contains(&folder.scenario.as_str());
+/// Decodes the clip with the copied product decoder, maps every decoded frame to
+/// the new frame at its presentation time (M6) and measures it against that frame.
+fn measure_quality(
+    folder: &Folder,
+    input: &SegmentInput,
+    clip: &Path,
+    sampler: &MemorySampler,
+    rate: f64,
+    regions: &[TextRegion],
+) -> Result<Quality> {
     let n = folder.new_frames.len();
+    let mut quality = Quality { rate, n_new: n, ..Quality::default() };
+    let text = TEXT_SCENARIOS.contains(&folder.scenario.as_str());
     let ocr_orders: Vec<usize> = if text { (0..OCR_FRAMES.min(n)).map(|i| i * n / OCR_FRAMES.min(n)).collect() } else { Vec::new() };
     let mut ocr_decoded: Vec<(usize, Vec<u8>, u32, u32)> = Vec::new();
     let flash = (folder.scenario == "flash").then(FlashBox::from_env);
     let (mut flash_on, mut flashes) = (false, 0_u64);
+    let times: Vec<u64> = input.samples.iter().map(|s| s.local_ms).collect();
+    let mut seen = vec![false; n];
     let decode_base = memory_now().1;
     sampler.take_peaks();
     let mut decoder = clip_decoder::ClipDecoder::open(clip)?;
@@ -691,12 +993,29 @@ fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: 
         let Some(frame) = frame else { break };
         quality.decoded += 1;
         let wall = Instant::now();
-        // No B-frames: decode order is the order of the new frames. A frame
-        // whose time is not its sample's instant is counted.
-        let order = (quality.decoded as usize - 1).min(input.samples.len() - 1);
-        if frame.t_ms().abs_diff(input.samples[order].local_ms) > INSTANT_MS / 2 {
-            quality.time_mismatch += 1;
+        let t = frame.t_ms();
+        // Diagnostic: the time of the sample written at this decode order.
+        let in_order = (quality.decoded as usize - 1).min(n.saturating_sub(1));
+        if n > 0 && t.abs_diff(times[in_order]) > INSTANT_MS / 2 {
+            quality.offsets.push(format!("{in_order}:{}>{t}", times[in_order]));
         }
+        // M6: the new frame whose time is within half an instant of the decoded frame's.
+        let next = times.partition_point(|&s| s < t);
+        let order = [next.checked_sub(1), (next < n).then_some(next)]
+            .into_iter()
+            .flatten()
+            .min_by_key(|&k| times[k].abs_diff(t))
+            .filter(|&k| times[k].abs_diff(t) <= INSTANT_MS / 2);
+        let Some(order) = order else {
+            quality.mistimed += 1;
+            continue;
+        };
+        if seen[order] {
+            quality.extra += 1;
+            continue;
+        }
+        seen[order] = true;
+        quality.mapped += 1;
         let (_, corpus_frame) = folder.new_frames[order];
         let bgr = folder.frame_bgr(corpus_frame)?;
         let (rw, rh, reference) = clip_encoder::probe_reference_luma(input, &bgr, folder.width, folder.height);
@@ -705,8 +1024,10 @@ fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: 
             return Err(format!("decoded {}x{} is smaller than {rw}x{rh}", frame.width, frame.height));
         }
         let decoded = luma_of_bgra(&frame.bgra, frame.width as usize, rw, rh);
-        let mse = mse(&reference, &decoded);
-        quality.mse_sum += mse;
+        let squared = squared_error(&reference, &decoded);
+        quality.squared_error += squared;
+        quality.pixels += reference.len() as u64;
+        let mse = squared as f64 / reference.len().max(1) as f64;
         quality.psnr.push(if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY });
         quality.ssim.push(ssim(&reference, &decoded, rw, rh));
         if let Some(flash) = &flash {
@@ -716,7 +1037,7 @@ fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: 
             }
             flash_on = on;
         }
-        if ocr_orders.contains(&order) && !ocr_decoded.iter().any(|d| d.0 == order) {
+        if ocr_orders.contains(&order) {
             ocr_decoded.push((order, crop_bgra(&frame.bgra, frame.width as usize, rw, rh), rw as u32, rh as u32));
         }
         quality.t_quality += wall.elapsed().as_nanos();
@@ -726,37 +1047,64 @@ fn measure_quality(folder: &Folder, input: &SegmentInput, clip: &Path, sampler: 
     if flash.is_some() {
         quality.flashes = Some(flashes);
     }
-    if text {
+    quality.r_regions = if text { regions.len() } else { 0 };
+    if text && !regions.is_empty() {
         let wall = Instant::now();
-        match ocr_share(folder, &ocr_decoded) {
-            Ok((r, note)) => {
-                quality.r = Some(r);
+        match ocr_share(folder, &ocr_decoded, regions) {
+            Ok((r, chars, note)) => {
+                quality.r = r;
+                quality.r_source_chars = chars;
                 quality.r_note = note;
             }
             Err(error) => quality.r_note = format!("OCR failed: {error}"),
         }
         quality.t_ocr = wall.elapsed().as_nanos();
+    } else if text {
+        quality.r_note = "no text regions given (corpus.json text_regions)".to_owned();
     } else {
         quality.r_note = "not a text scenario".to_owned();
     }
     Ok(quality)
 }
 
-/// R = mean over the OCR frames of 1 − edit distance / source length.
-fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)]) -> Result<(f64, String)> {
+/// R on the scenario's fixed text regions (M7): the mean over OCR frames and
+/// regions of 1 − edit distance / source length, counting only pairs whose
+/// source text is not empty. No source text at all gives R = n/a (`None`).
+fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)], regions: &[TextRegion]) -> Result<(Option<f64>, usize, String)> {
     let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| format!("OcrEngine: {e}"))?;
     let mut shares = Vec::new();
     let mut source_chars = 0;
+    let mut per_region = vec![0_usize; regions.len()];
     for (order, bgra, w, h) in decoded {
         let bgr = folder.frame_bgr(folder.new_frames[*order].1)?;
         let source = scaled_bgra(&bgr, folder.width as usize, folder.height as usize, folder.sigma as usize, *w as usize, *h as usize);
-        let source_text = ocr_text(&engine, &source, *w, *h)?;
-        let decoded_text = ocr_text(&engine, bgra, *w, *h)?;
-        source_chars += source_text.chars().count();
-        shares.push(share_read(&source_text, &decoded_text));
+        for (index, region) in regions.iter().enumerate() {
+            let Some((x, y, rw, rh)) = region.rect(folder.width, folder.height, folder.sigma, *w, *h) else { continue };
+            let source_text = ocr_text(&engine, &crop_rect(&source, *w, x, y, rw, rh), rw, rh)?;
+            let chars = source_text.chars().filter(|c| !c.is_whitespace()).count();
+            if chars == 0 {
+                continue;
+            }
+            let decoded_text = ocr_text(&engine, &crop_rect(bgra, *w, x, y, rw, rh), rw, rh)?;
+            source_chars += chars;
+            per_region[index] += chars;
+            shares.push(share_read(&source_text, &decoded_text));
+        }
     }
-    let r = shares.iter().sum::<f64>() / shares.len().max(1) as f64;
-    Ok((r, format!("{} frames, {source_chars} source chars", shares.len())))
+    let r = (!shares.is_empty()).then(|| shares.iter().sum::<f64>() / shares.len() as f64);
+    let note = format!("{} frames, {} region reads, source chars per region {}", decoded.len(), shares.len(), list(per_region.iter()));
+    Ok((r, source_chars, note))
+}
+
+/// A `w` × `h` rectangle at (x, y) of a BGRA image `stride_px` wide.
+fn crop_rect(bgra: &[u8], stride_px: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+    let (stride, x, y, w, h) = (stride_px as usize, x as usize, y as usize, w as usize, h as usize);
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        let start = (row * stride + x) * 4;
+        out.extend_from_slice(&bgra[start..start + w * 4]);
+    }
+    out
 }
 
 fn share_read(source: &str, decoded: &str) -> f64 {
@@ -837,9 +1185,12 @@ fn luma(red: i32, green: i32, blue: i32) -> u8 {
     (((47 * red + 157 * green + 16 * blue + 128) >> 8) + 16).clamp(0, 255) as u8
 }
 
+fn squared_error(a: &[u8], b: &[u8]) -> u64 {
+    a.iter().zip(b).map(|(&x, &y)| u64::from(x.abs_diff(y)).pow(2)).sum()
+}
+
 fn mse(a: &[u8], b: &[u8]) -> f64 {
-    let sum: u64 = a.iter().zip(b).map(|(&x, &y)| u64::from(x.abs_diff(y)).pow(2)).sum();
-    sum as f64 / a.len().max(1) as f64
+    squared_error(a, b) as f64 / a.len().max(1) as f64
 }
 
 /// Mean SSIM over 8 × 8 uniform windows at a stride of 4.
@@ -999,8 +1350,14 @@ impl Json {
         self.set(key, format!("\"{escaped}\""));
     }
 
+    /// Ready-made `"key":value` fields (`RamReading::json`, `ClipBytes::json`).
+    fn raw(&mut self, fields: String) {
+        self.0.push((String::new(), fields));
+    }
+
     fn finish(&self) -> String {
-        let body: Vec<String> = self.0.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+        let body: Vec<String> =
+            self.0.iter().map(|(k, v)| if k.is_empty() { v.clone() } else { format!("\"{k}\":{v}") }).collect();
         format!("{{{}}}", body.join(","))
     }
 }

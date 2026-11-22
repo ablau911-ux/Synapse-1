@@ -1,23 +1,27 @@
 # Clip recorder: building plan (version 4.1)
 
-Status 2026-11-22 03:40 IST (version 4.1: owner decisions E9 and E10 and the package 0 figures; version 4 was 02:45). Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents; review: Codex, read-only.
+Status 2026-11-22 16:30 IST. Branch `feature/clip-capture`. Owner: Adam. Builders: Claude agents. Review: Codex (read-only), plus Fable 5.2 for component logic. Work log: issue #290. The plan is edited in place; there are no new version numbers (owner, 2026-11-22).
 
 This is step 3 of the owner's work order: the equation in `docs/clip-recorder-equation.md` turned into an order of operations, each with its desired real-world result. Step 4 is the code, in which every tunable is a named constant that stands for one symbol of the equation, or is computed from such constants.
 
 History. Version 1 (commit ad0047d1) was built as commits 7709f70c, 7e4cf3eb and be2447f8. Version 2 (f354496d) was reviewed against the code (issue #290). Version 3 (30392a46) folded in that review and was itself reviewed by Codex and Opus, consolidated, and decided by Fable. The full record is in `docs/clip-recorder-review-v3/` (`1-codex-gpt-6-astra.md`, `2-opus-4-8.md`, `3-consolidation-and-jev.md`, `4-fable-decisions.md`; the last one is binding). Decision numbers below (S1 to S9, C1 to C18, O1 to O5, E1 to E8) refer to `4-fable-decisions.md`.
 
-What changed since version 3, in short:
+## Where the build stands (2026-11-22 16:30 IST)
 
-- The owner answered E1 to E8 (2026-11-22). Nothing is open for the owner before packages 0 and 1.
-- A new package 0 measures the real costs before any product code is built.
-- Section O: settings gated one by one, Windows 10 1903 as the floor, frame slots assigned by instant instead of a 4-texture ring, a threading rule, identity before read-back, no claim that a short handler proves no loss.
-- Section A: no scaling in the live part, a privacy check before every raw write, a disk rule on the clip volume, durable clip state from the start, the worker cap computed each second.
-- Section B: a new long-lived worker mode (package 3 split into 3a and 3b), one worker and one queue, raw frames kept until their segment is committed, keyframe interval counted in frames, no forced keyframe.
-- Section D: an image ceiling and a token budget beside the 75 % floor, region-level transients, caret and animation rules, cursor mask.
-- New section "Kept from version 1". Proof rewritten as manual cases.
-- File:line references were checked again with Serena on 2026-11-22; several v3 references were one line off and are corrected.
-
-The full list is at the end.
+- **Built:** packages 0, 0b, 1, 2, 3a, 3b and 4. Package 5 (proof) is partly done: see "Proof results so far" under Proof.
+- **Reviews:** Codex reviewed every fix round; Fable 5.2 reviewed the component logic (`docs/clip-recorder-review-build/fable-5-2-c00ff762.md`) and the new D5 analyzer. The review findings that are accepted are fixed or queued; the rest are listed under "Open items".
+- **Live tests** (release build, a separate stdio instance, the proof page):
+  - Recordings of 30 s and 90 s end `ready` with C, G, B and T held and 0 lost instants.
+  - The processor sum stays at most 8.1 %.
+  - Waiting frames average 37 KB instead of 6.29 MB raw.
+  - A resize gives one segment per stable size.
+  - `record_stop` is idempotent.
+  - After a service kill, the clip is recovered to `ready`.
+- **Owner decisions taken during the build:**
+  - E9: no cursor in the picture.
+  - E10: 10 % processor limit.
+  - E11: waiting frames are compressed with zstd −3 on the whole frame.
+- History of the plan versions and the full change list are at the end.
 
 ## Fixed by the owner
 
@@ -39,13 +43,14 @@ Answered on 2026-11-22 (the owner said "continue" after Fable's recommendations,
 | E5 | Minimum Windows version | Windows 10 version 1903 (build 18362). Windows capture does not exist before 1803 and windows-capture 2.0.0 needs 1903. On Windows 10 the yellow border always shows. |
 | E6 | Monitor recording while an excluded app is visible but not in front | Recording refuses to start, or stops, when an excluded app is visible anywhere on the recorded monitor, even if it is not in front. |
 | E7 | Go | Packages 0 and 1 may start once version 4 is committed. |
-| E8 | Raw write volume through the disk | Accepted for this build: about 31 MB per second, about 113 GB per hour, at 1920 × 1080 with typical activity (3.8 new frames per second). Decided again after package 0 has measured the real figure. |
+| E8 | Raw write volume through the disk | First accepted for this build (about 31 MB/s at 1080p). **Settled by E11:** the owner raised that raw waiting frames break R9, and the waiting frames are now compressed. |
 | E9 | The mouse cursor inside the recorded frames (asked after package 0, M4: a drawn cursor makes 20 new frames per second while the mouse moves, 166 MB/s at 1080p) | The cursor is not drawn into the frames (owner, 2026-11-22 03:35). Its position is still logged per instant in `frames.jsonl`. Where Windows cannot leave it out (Windows 10 before 2004, build 19041, has no cursor setting), it stays in the picture and the viewer masks it (D5). |
 | E10 | Processor limit (asked after package 0, M9: on the weakest machine the live part alone is estimated at 5.2 % at 720p and 9.1 % at 1080p) | Up to 10 % on the weakest machine is accepted (owner, 2026-11-22 03:35). `CPU_LIMIT_PERCENT` becomes 10; the worker cap is 10 % minus the live share. A stronger machine uses less for the same work. |
+| E11 | Form of the waiting frames (R9: files as small as possible; asked after the owner noticed the raw writes) | Lossless compression of each waiting frame: first "make it simple" (whole frame, no tiles), then, after the full comparison of 31 methods (`ca46079d`), **zstd at level −3 on the whole frame, alpha dropped** (owner, 2026-11-22). Video-like content does not compress and passes 10 % with every coder; E1 applies there. |
 
 ## What the code had to be corrected on (facts found in the reviews)
 
-These facts decide the shape of packages 0 to 4. Each was read in the code; line numbers were checked with Serena on 2026-11-22 unless marked "crate".
+These facts decided the shape of packages 0 to 4. Each was read in the code before the build; the line numbers were checked with Serena on 2026-11-22 at 02:45 (unless marked "crate") and refer to the code as it was then. Packages 1 to 4 have changed these files since, so use the symbol names, not the line numbers.
 
 | # | Fact | Where | Consequence |
 |---|---|---|---|
@@ -105,7 +110,7 @@ Package 0b changes no product code. It adds one probe subcommand and appends one
 
 Choice rule: the method with the fewest bytes whose compression keeps the live share within its part of `CPU_LIMIT_PERCENT` on the weakest-machine estimate at the M4 worst rate; when both qualify, the one with the fewer bytes. The owner sees the figures before the choice goes into section A (A8).
 
-Result (commit `a0d02e6e`, `results-package0.md` section "Package 0b"). All 176 runs were lossless. Tiles + zstd made typing and flash frames 800 to 4,600 times smaller. Video content did not compress (1.5 times), and every coder then passed 10 % on the weakest-machine estimate (12.5 to 21 %). Owner decision (2026-11-22): "make it simple", so the whole frame goes through `lz4_flex` with alpha dropped. It needs no tiles, no keyframes and no state between files. Measured: typing 182 times smaller, flash 79, scroll 26, video 1.5. On the weakest-machine estimate this stays within 10 % except for video (12.5 %), where E1 applies: time gives way first, and lost instants are named last.
+Result (commit `a0d02e6e`, `results-package0.md` section "Package 0b"). All 176 runs were lossless. Tiles + zstd made typing and flash frames 800 to 4,600 times smaller. Video content did not compress (1.5 times), and every coder then passed 10 % on the weakest-machine estimate (12.5 to 21 %). First owner decision (2026-11-22; replaced by zstd in the next paragraph, E11): "make it simple", so the whole frame goes through `lz4_flex` with alpha dropped. It needs no tiles, no keyframes and no state between files. Measured: typing 182 times smaller, flash 79, scroll 26, video 1.5. On the weakest-machine estimate this stays within 10 % except for video (12.5 %), where E1 applies: time gives way first, and lost instants are named last.
 
 Full comparison (commit `ca46079d`, 31 methods, 12 scenarios including real 1920 × 1080, all lossless). Whole-frame zstd gives about 3 times fewer bytes than whole-frame lz4 for 0.2 to 1.1 points more processor time. Video passes 10 % with every coder (lz4 14.9 %, zstd −3 15.9 %). Owner decision (2026-11-22): zstd is the coder, at level −3. At 1080p it gives 8.6 KB (typing), 25 KB (flash) and 123 KB (scroll) per frame at 6.8 to 8.7 %. That replaces `lz4_flex`.
 
@@ -182,7 +187,7 @@ Keyframe column. The keyframe flag is not known while recording. The worker read
 
 | Operation | Does | Returns |
 |---|---|---|
-| `record` | Starts a recording (window or monitor, length 60 s unless given) and returns at once; refused while another runs | clip id, folder, and the `clip.json` written at start, read back: path, size, SHA-256 |
+| `record` | Starts a recording (window or monitor; `duration_ms` 60,000 unless given, no upper limit; there is no `fps` parameter, f is `RECORD_FPS`). It returns once frame zero is on disk (at most 3 s; a target that delivers no frame in that time is refused as `CAPTURE_TARGET_INVALID`, and is never restored). Refused while another recording runs | clip id, folder, and the `clip.json` written at start, read back: path, size, SHA-256 |
 | `record_status` | Reads the state | state (`recording`, `encoding`, `ready`, `failed` with reason), stop reason, seconds recorded, frames waiting, committed segments with size and SHA-256, conditions so far |
 | `record_stop` | Ends the recording now; idempotent by clip id | as `record_status` |
 | `record_extend` | Adds time to a running recording | new end time |
@@ -239,7 +244,8 @@ For a failed condition, the instants where it failed.
 | Windows floor | `MIN_WINDOWS_BUILD` | `synapse-capture` clip observer | 18362 (Windows 10 1903) | E5 |
 | t_def | `DEFAULT_DURATION_MS` | `server/capture_clip.rs` | 60,000 | requirement |
 | segment length | `SEGMENT_MS` | worker | 60,000 | finished segments are viewable while recording goes on; the 30-minute proof case decides whether time segments stay |
-| segment raw budget | `SEGMENT_RAW_BUDGET_BYTES` | worker | 1 GiB | package 0, M4 and M5: a proposal derived from the measured write rates, not itself measured; S6 |
+| segment raw budget | `SEGMENT_RAW_BUDGET_BYTES` | worker | 1 GiB of retained waiting files on disk (compressed bytes) | first a proposal from package 0 M4 and M5 (S6). Since `c00ff762` it counts the compressed files on disk: counting decompressed w·h·3 bytes closed segments after 227 frames at 1584 × 992 in the live test. With compression, `SEGMENT_MS` normally closes the segment first |
+| map retry, worker tick, text tokens | `MAP_RETRY_SLEEP_MS`, `WORKER_TICK_MS`, `TEXT_CHARS_PER_TOKEN` | observer, worker, viewer | 1 ms; as built; as built | added by the builder in packages 1 to 4 (reported deviations): the M6 map retry sleep, the worker's control tick, and the characters-per-token estimate for the text budget |
 | waiting-frame compression | `WAITING_ZSTD_LEVEL` | `server/clip_folder.rs` | −3 | package 0b full comparison (`ca46079d`); owner decision 2026-11-22 |
 | resize settle | `RESIZE_SETTLE_MS` | worker | 500 | assumed; checked in the proof |
 | h_min | `MIN_LINES` | `server/capture_clip.rs` | 480 | requirement |
@@ -321,20 +327,42 @@ Other codecs than H.264; choosing an encoder per size (C7: the encoder Media Fou
 
 Each product package is built by one agent from this plan with a time and tool-call limit. It passes `cargo fmt --all` and `cargo clippy -p synapse-mcp -p synapse-capture -p synapse-storage --all-targets -- -D warnings`, is committed and pushed as `claude`, and is then reviewed by Codex, read-only. Findings are fixed before the next package starts. Packages run one at a time, in this order. Packages 0 and 1 may start once version 4 is committed (E7); package 1 does not depend on package 0's figures beyond the named constants it reads.
 
-| # | Package | Contains |
-|---|---|---|
-| 0 | Measurements | M1 to M9 in `scripts/clip-equation/`; one results file; `run_equation.py` with c_obs, the real c_read and c_disk. No product code |
-| 0b | Compression measurements | M10 to M14 in the probe; one section in `results-package0.md`. No product code |
-| 1 | Observer | O1 to O4 in `synapse-capture`: gated settings, Windows floor, slots by instant, threading rule, identity before read-back; existing screenshot paths unchanged |
-| 2 | Live part | A1 to A12; the four `record*` operations; `frames.jsonl` with frame size and cursor position; the waiting folder; `clip.json` at start with state and the registry; the public free-bytes-to-level function in `synapse-storage`; the updated contracts (O1); conditions C, G, T |
-| 3a | Worker lifecycle | The long-lived worker mode, its job and processor cap, the queue, segment forming (B2), commit (B8), ready (B9) and recovery (B10) |
-| 3b | Encoding | B3 to B7: σ, colours, encoder and retry, time stamps with `write_nv12` taking instant and duration, GOP in frames, no B-frames, screen-content hint, quality and Q status |
-| 4 | Viewer | D1 to D7 |
-| 5 | Proof and constants | The proof cases below; README and tool-surface tables |
+| # | Package | Contains | Status (2026-11-22) |
+|---|---|---|---|
+| 0 | Measurements | M1 to M9 in `scripts/clip-equation/`; one results file; `run_equation.py` with c_obs, the real c_read and c_disk. No product code | done (`996dc08d`) |
+| 0b | Compression measurements | M10 to M14 in the probe; one section in `results-package0.md`. No product code | done (`a0d02e6e`, full comparison `ca46079d`) |
+| 1 | Observer | O1 to O4 in `synapse-capture`: gated settings, Windows floor, slots by instant, threading rule, identity before read-back; existing screenshot paths unchanged | built (`7d1b6a34`) |
+| 2 | Live part | A1 to A12; the four `record*` operations; `frames.jsonl` with frame size and cursor position; the waiting folder; `clip.json` at start with state and the registry; the public free-bytes-to-level function in `synapse-storage`; the updated contracts (O1); conditions C, G, T | built (`804644c7`); waiting frames compressed (E11, `fc5a061d`) |
+| 3a | Worker lifecycle | The long-lived worker mode, its job and processor cap, the queue, segment forming (B2), commit (B8), ready (B9) and recovery (B10) | built (`4fd24043`); recovery and worker-outcome fixes from the Fable review in progress |
+| 3b | Encoding | B3 to B7: σ, colours, encoder and retry, time stamps with `write_nv12` taking instant and duration, GOP in frames, no B-frames, screen-content hint, quality and Q status | built (`4f72002a`) |
+| 4 | Viewer | D1 to D7 | built (`31c32615`); D5 reworked (`cb70a9f7`) |
+| 5 | Proof and constants | The proof cases below; README and tool-surface tables | partly: see "Proof results so far"; README and tool-surface tables not done |
 
 ## Proof
 
-After package 4, manual cases run in the real app through Synapse, on the development PC with the new build deployed, plus one Windows 10 virtual machine. Test window: a local HTML page that draws a counter on every screen refresh (requestAnimationFrame) and shows 50 ms flashes at set times (`scripts/clip-equation/flash-page.html`, written in package 0). Each case is read from `clip.json`, `frames.jsonl` and the segment files.
+After package 4, manual cases run in the real app through Synapse, on the development PC with the new build, plus one Windows 10 virtual machine. Test window: a local HTML page that draws a counter on every screen refresh (requestAnimationFrame) and shows a 50 ms flash in a small box once per second, its phase stepping by 5 ms across one recording interval (`scripts/clip-equation/flash-page.html`; it was missing from package 0 and was added in `660f9573`). Each case is read from `clip.json`, `frames.jsonl` and the segment files.
+
+How the live cases run:
+- The release build runs as a separate stdio MCP instance, with its own `--db` and `SYNAPSE_SHELL_JOB_ROOT`, so it does not collide with the running service.
+- The test window is a Chrome `--app` window with `--disable-backgrounding-occluded-windows` and `--disable-renderer-backgrounding`. It is placed behind the owner's windows, and the test script opens and closes it around each recording (owner, 2026-11-22).
+- A brand-new window that is covered before its first paint delivers no frame. `record` then refuses correctly.
+
+### Proof results so far
+
+| Case | Result | Build |
+|---|---|---|
+| 1 flash sweep | 28 of about 30 flashes found as short-lived by the viewer; the counter check per frame is not done yet | `cb70a9f7` (viewer) |
+| 2 local flash during animation | held on the proof page: the counter and the clock are 2 animations; the flash box is reported separately | `cb70a9f7` |
+| 3 hold time, losses | max hold 0.82 to 0.85 ms against 16.67 ms; 0 proven losses | `f5dd30bb`, `c00ff762` |
+| 5 processor share | sum at most 8.1 % (worker at most 7.7 %, live part at most 1.4 %), 0 seconds over 10 % | `f5dd30bb`, `c00ff762` |
+| 8 across a segment boundary | not reached: in the 90 s test the resize closed the segments before 60 s; segment budget now counts compressed bytes (834 frames in one segment) | `c00ff762` |
+| 11 kill and restart | service kill at 12.4 s: recovered to `ready`, `service_restart`, 247 frames encoded from `waiting/`; the instants up to the requested end were not named lost and C was missing (fix in progress) | `c00ff762` |
+| 12 resize | 3 segments at 1584 × 992, 1234 × 868, 1584 × 992; G held | `c00ff762` |
+| 13 GOP | GOP 20, B-frames 0, screen hint accepted (Intel hardware encoder); 13 keyframes per 227 frames | `f5dd30bb` |
+| 22 stop | `record_stop` at 10 s: `ready`, `stop_call`; a second stop returns the same state | `c00ff762` |
+| waiting frames (E11) | 37 KB per frame instead of 6.29 MB; `waiting/` empty at `ready` | `f5dd30bb` |
+
+Not run yet: 4, 6, 7, 9, 10, 14 to 21, 23 to 30.
 
 Capture and timing:
 
@@ -388,7 +416,28 @@ Not provable on this PC: the weakest machine's processor costs; they stay the co
 
 ## Owner decisions still open
 
-None. E1 to E8 were answered on 2026-11-22. E8 comes back to the owner with package 0's measured write volume.
+None. E1 to E11 are answered (2026-11-22); E8 is settled by E11.
+
+## Open items (known, not fixed in this build)
+
+From the Fable 5.2 logic review and the live tests. Each one is either unverified or rare; they are recorded so that they are not lost:
+
+| Item | Why it is open |
+|---|---|
+| A brief file lock (antivirus, indexer) on a rename or a `clip.json` replace fails the clip; no retry | how often it happens is unverified |
+| On a slot overflow the observer drops the newest frame; if the window then goes still, later instants repeat the older picture while only one instant is named lost | rare (needs a recorder stall of 200 ms or more during a burst); the fix is in the hot path |
+| The cursor position is sampled when the instant is handled, 50 ms or more after composition; the mask can miss a drawn cursor | matters only on Windows 10 before 2004 (cursor drawn in) |
+| The viewer uses frame zero's σ for every segment | P3; only after a resize across the 480-line boundary |
+| The worker cap follows the previous second's live share; `GetThreadTimes` may under-count short bursts | unverified; B reports `not_held` honestly when the sum passes 10 % |
+| 28 of about 30 flashes were found as short-lived on the proof clip | under review (start-up absorption and the clip end) |
+| The weakest machine's figures | still computed estimates until a run on a real Core i3 |
+
+## Changes on 2026-11-22, 14:30 to 16:30 IST
+
+- Live tests on the release builds `f5dd30bb` and `c00ff762`: results in "Proof results so far".
+- Segment budget counts compressed waiting bytes (`c00ff762`). D5 reworked: per-region short-lived changes, block-activity animations, keyframe noise, `PIXEL_DELTA` 64 (`cb70a9f7`).
+- Fable 5.2 logic review (`abe511b3`). Accepted findings (worker outcome from `clip.json`, recorder lock, recovery losses and conditions, crash counting, G and B before the worker's verdict, panic guard, one merge for B, one path for lost instants, duplicated types and checks) are being fixed. The rest is under "Open items".
+- Plan edits: "Where the build stands", E8 settled by the new E11, the `record` contract as built, package status, proof results, open items, outdated raw-frame and pre-measurement wording removed.
 
 ## Changes on 2026-11-22, 09:20 to 14:30 IST
 

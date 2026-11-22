@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::clip_folder::{
     ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, StopReason,
-    raw_frame_path, read_frame_lines,
+    WAITING_BYTES_PER_PIXEL, raw_frame_path, read_frame_lines,
 };
 
 /// U_max: the recorder never uses more than this share of the processor time
@@ -25,6 +25,8 @@ pub(super) const CPU_LIMIT_PERCENT: f64 = 10.0;
 /// A segment closes after this much clip time.
 pub(super) const SEGMENT_MS: u64 = 60_000;
 /// A segment closes when its retained raw bytes reach this (package 0, M4/M5; S6).
+/// Counted as decompressed B, G, R bytes, the encoder's input: the compressed
+/// size of a waiting frame is not in `frames.jsonl` and is never larger.
 pub(super) const SEGMENT_RAW_BUDGET_BYTES: u64 = 1 << 30;
 /// A new window size counts as settled once it held this long (E4).
 pub(super) const RESIZE_SETTLE_MS: u64 = 500;
@@ -148,7 +150,7 @@ pub(super) fn next_segment(
         let over_time = line.t_ms.saturating_sub(first.t_ms) >= SEGMENT_MS;
         let resized = line.width != 0 && size(line) != canvas;
         let frame_bytes = if line.new {
-            u64::from(line.width) * u64::from(line.height) * 4
+            u64::from(line.width) * u64::from(line.height) * WAITING_BYTES_PER_PIXEL
         } else {
             0
         };

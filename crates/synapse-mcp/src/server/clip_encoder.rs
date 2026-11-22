@@ -43,7 +43,7 @@ use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::capture_clip::RECORD_FPS;
-use super::clip_folder::QualityReport;
+use super::clip_folder::{QualityReport, WAITING_BYTES_PER_PIXEL, read_waiting_frame};
 
 /// q: `CODECAPI_AVEncCommonQuality` level (0..=100). Condition Q stays
 /// `unverified` until q_min is calibrated for the encoder used (C6).
@@ -63,7 +63,7 @@ const HNS_PER_MS: i64 = 10_000;
 /// Upper bound on transforms walked when looking for the encoder in the chain.
 const MAX_TRANSFORMS_PER_STREAM: u32 = 8;
 
-/// One frame of a segment: its raw file (captured BGRA rows), its captured
+/// One frame of a segment: its raw file (captured B, G, R rows, lz4), its captured
 /// size, and its time within the segment (B5).
 pub(super) struct SegmentSample {
     pub(super) raw: std::path::PathBuf,
@@ -122,9 +122,17 @@ fn encode_once(
     let mut encoder = ClipEncoder::create(path, size.width, size.height, input.fps, hardware)?;
     let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
     for sample in input.samples {
-        let bgra = std::fs::read(&sample.raw)
-            .map_err(|error| format!("could not read {}: {error}", sample.raw.display()))?;
-        canvas.draw(&bgra, sample.width, sample.height);
+        // A bad or short waiting frame counts as missing, as a frame without a
+        // raw file does when the segment is formed: the picture before it stays.
+        match read_waiting_frame(&sample.raw, sample.width, sample.height) {
+            Ok(bgr) => canvas.draw(&bgr, sample.width, sample.height),
+            Err(error) => tracing::warn!(
+                code = "CLIP_WAITING_FRAME_UNREADABLE",
+                instant = sample.instant,
+                error = %error,
+                "the previous picture is kept for this instant"
+            ),
+        }
         encoder.write_nv12(
             &canvas.nv12,
             ms_to_hns(sample.local_ms),
@@ -244,9 +252,10 @@ impl Nv12Canvas {
         }
     }
 
-    /// Draws a BGRA frame of `source_width` × `source_height`, converting to
-    /// NV12 with chroma averaged over each 2 × 2 block.
-    fn draw(&mut self, bgra: &[u8], source_width: u32, source_height: u32) {
+    /// Draws a B, G, R frame (a decompressed waiting frame) of `source_width`
+    /// × `source_height`, converting to NV12 with chroma averaged over each
+    /// 2 × 2 block.
+    fn draw(&mut self, bgr: &[u8], source_width: u32, source_height: u32) {
         let (width, height) = (self.width, self.height);
         let (source_width, source_height) = (source_width as usize, source_height as usize);
         let (columns, rows) = (&self.column_source, &self.row_source);
@@ -255,8 +264,8 @@ impl Nv12Canvas {
             if x >= source_width || y >= source_height {
                 return (0, 0, 0);
             }
-            let offset = (y * source_width + x) * 4;
-            bgra.get(offset..offset + 3).map_or((0, 0, 0), |pixel| {
+            let offset = (y * source_width + x) * WAITING_BYTES_PER_PIXEL as usize;
+            bgr.get(offset..offset + 3).map_or((0, 0, 0), |pixel| {
                 (
                     i32::from(pixel[2]),
                     i32::from(pixel[1]),

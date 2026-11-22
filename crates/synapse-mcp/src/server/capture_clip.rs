@@ -28,7 +28,7 @@ use synapse_core::error_codes;
 
 use super::clip_folder::{
     CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason, WAITING_DIR,
-    clips_root, file_size_and_sha256,
+    clips_root, file_size_and_sha256, is_waiting_frame,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -351,7 +351,11 @@ fn status_of(
         _ => clip.recorded_ms,
     };
     let frames_waiting = std::fs::read_dir(folder.join(WAITING_DIR))
-        .map(|read| read.filter_map(Result::ok).count() as u64)
+        .map(|read| {
+            read.filter_map(Result::ok)
+                .filter(|entry| is_waiting_frame(&entry.path()))
+                .count() as u64
+        })
         .unwrap_or(0);
     Ok(ClipStatusResponse {
         clip_id: clip.clip_id.clone(),
@@ -596,7 +600,7 @@ mod live {
     use super::super::clip_folder::{
         CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
         ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
-        ObserverGrant, StopReason, WAITING_DIR, raw_frame_path,
+        ObserverGrant, StopReason, WAITING_BYTES_PER_PIXEL, WAITING_DIR, write_waiting_frame,
     };
     use super::super::clip_worker::{ProcessorBudget, SEGMENT_RAW_BUDGET_BYTES};
     use super::super::{CaptureClipResponse, ErrorData};
@@ -609,8 +613,9 @@ mod live {
     use crate::m1::mcp_error;
 
     const HNS_PER_SECOND: i64 = 10_000_000;
-    /// Raw frames are 4 bytes (32 bits) per pixel.
-    const RAW_BITS_PER_PIXEL: f64 = 32.0;
+    /// The observer reads frames back at 4 bytes (B, G, R, A) per pixel.
+    const BGRA_BYTES_PER_PIXEL: u64 = 4;
+    const BITS_PER_BYTE: f64 = 8.0;
 
     /// 1 / f in 100 ns units.
     const fn instant_hns() -> i64 {
@@ -739,7 +744,9 @@ mod live {
     struct DiskGuard {
         measured_free: u64,
         written_since: u64,
+        /// Compressed bytes written to `waiting/` (what the disk holds).
         raw_written: u64,
+        pixels_written: u64,
         measured_at: Instant,
     }
 
@@ -749,6 +756,7 @@ mod live {
                 measured_free: Self::measure(folder)?,
                 written_since: 0,
                 raw_written: 0,
+                pixels_written: 0,
                 measured_at: Instant::now(),
             })
         }
@@ -759,15 +767,23 @@ mod live {
             })
         }
 
-        fn wrote(&mut self, bytes: u64) {
+        /// `bytes`: the compressed bytes actually written; `pixels`: the
+        /// pixels of the frame they hold.
+        fn wrote(&mut self, bytes: u64, pixels: u64) {
             self.written_since += bytes;
             self.raw_written += bytes;
+            self.pixels_written += pixels;
         }
 
         /// The raw bytes of the open segment plus their estimated encoded size (C13).
+        /// The segment budget counts decompressed B, G, R bytes (the encoder's
+        /// input), so it caps the pixels; the compressed bytes are never more.
         fn finalize_reserve(&self) -> u64 {
             let open_raw = self.raw_written.min(SEGMENT_RAW_BUDGET_BYTES);
-            let encoded = open_raw as f64 * FALLBACK_BITS_PER_PIXEL_FRAME / RAW_BITS_PER_PIXEL;
+            let open_pixels = self
+                .pixels_written
+                .min(SEGMENT_RAW_BUDGET_BYTES / WAITING_BYTES_PER_PIXEL);
+            let encoded = open_pixels as f64 * FALLBACK_BITS_PER_PIXEL_FRAME / BITS_PER_BYTE;
             open_raw + encoded as u64
         }
 
@@ -1116,12 +1132,12 @@ mod live {
                 .map_err(|error| format!("frames.jsonl write failed: {error}"))
         }
 
-        /// One raw frame file in `waiting/` at its captured size.
+        /// One raw frame file in `waiting/` at its captured size (A8: B, G, R
+        /// compressed with `lz4_flex`).
         fn write_raw(&mut self, k: u64, bgra: &[u8]) -> Result<(), String> {
-            let path = raw_frame_path(&self.plan.folder, k);
-            std::fs::write(&path, bgra)
-                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
-            self.disk.wrote(bgra.len() as u64);
+            let written = write_waiting_frame(&self.plan.folder, k, bgra)?;
+            self.disk
+                .wrote(written, bgra.len() as u64 / BGRA_BYTES_PER_PIXEL);
             Ok(())
         }
 

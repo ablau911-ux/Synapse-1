@@ -42,7 +42,7 @@ use super::ErrorData;
 use super::clip_decoder::{ClipDecoder, DecodedFrame};
 use super::clip_folder::{
     CLIP_JSON_FILE, ClipJson, ClipState, FRAMES_FILE, FrameLine, SegmentCheckpoint, VIEWS_DIR,
-    WAITING_DIR, read_frame_lines,
+    WAITING_DIR, is_waiting_frame, read_frame_lines,
 };
 use crate::m1::clip_view_limits::{MAX_FRAMES_FPS, MIN_CROP_SHORT_SIDE};
 use crate::m1::{
@@ -265,7 +265,11 @@ impl ViewedClip {
     /// D4: the part asked for is not committed yet.
     fn waiting_error(&self, t_ms: u64) -> ErrorData {
         let waiting = std::fs::read_dir(self.folder.join(WAITING_DIR))
-            .map(|read| read.filter_map(Result::ok).count())
+            .map(|read| {
+                read.filter_map(Result::ok)
+                    .filter(|entry| is_waiting_frame(&entry.path()))
+                    .count()
+            })
             .unwrap_or(0);
         params_invalid(format!(
             "{} ms of this clip is not committed yet (state {}, {} committed segments up to {} ms, {waiting} frames waiting); call screenshot operation=record_status and retry when the segment is committed",

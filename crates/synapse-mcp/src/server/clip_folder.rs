@@ -24,6 +24,12 @@ const REGISTRY_FILE: &str = "active-clips.json";
 const LOCK_SUFFIX: &str = ".lock";
 const TEMP_SUFFIX: &str = ".tmp";
 const PART_SUFFIX: &str = ".part";
+/// Extension of a waiting frame: B, G, R rows compressed with `lz4_flex` (A8).
+const WAITING_FRAME_EXTENSION: &str = "lz4";
+/// A waiting frame keeps B, G and R; the alpha byte is dropped (A8).
+pub(super) const WAITING_BYTES_PER_PIXEL: u64 = 3;
+/// The observer reads frames back as B, G, R, A.
+const BGRA_BYTES_PER_PIXEL: usize = 4;
 
 /// Default parent of clip folders.
 pub(super) fn clips_root() -> PathBuf {
@@ -48,12 +54,70 @@ pub(super) fn is_part_file(path: &Path) -> bool {
         .is_some_and(|extension| extension == "part")
 }
 
-/// The raw frame of instant k: tightly packed BGRA rows at the captured size
-/// (the size is in its `frames.jsonl` line).
+/// The raw frame of instant k: tightly packed B, G, R rows at the captured
+/// size (the size is in its `frames.jsonl` line), compressed whole with
+/// `lz4_flex` (A8). Each file stands alone.
 pub(super) fn raw_frame_path(folder: &Path, instant: u64) -> PathBuf {
     folder
         .join(WAITING_DIR)
-        .join(format!("frame-{instant:08}.bgra"))
+        .join(format!("frame-{instant:08}.{WAITING_FRAME_EXTENSION}"))
+}
+
+/// `true` for a finished waiting frame (not a `.tmp` still being written).
+pub(super) fn is_waiting_frame(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == WAITING_FRAME_EXTENSION)
+}
+
+/// A8: drops the alpha byte of a BGRA frame (B, G, R stay), compresses the
+/// whole frame with `lz4_flex::compress_prepend_size`, and writes it as the
+/// waiting frame of instant k (`.tmp`, then rename). Returns the bytes written
+/// to disk.
+pub(super) fn write_waiting_frame(folder: &Path, instant: u64, bgra: &[u8]) -> Result<u64, String> {
+    let bgr: Vec<u8> = bgra
+        .chunks_exact(BGRA_BYTES_PER_PIXEL)
+        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
+    let compressed = lz4_flex::compress_prepend_size(&bgr);
+    let path = raw_frame_path(folder, instant);
+    let temp = path.with_extension(format!("{WAITING_FRAME_EXTENSION}{TEMP_SUFFIX}"));
+    std::fs::write(&temp, &compressed)
+        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+    std::fs::rename(&temp, &path)
+        .map_err(|error| format!("could not rename {}: {error}", temp.display()))?;
+    Ok(compressed.len() as u64)
+}
+
+/// Reads a waiting frame back as B, G, R rows of `width` × `height`. A
+/// missing, short or damaged file, or one of another size, is an error.
+pub(super) fn read_waiting_frame(path: &Path, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let expected = usize::try_from(u64::from(width) * u64::from(height) * WAITING_BYTES_PER_PIXEL)
+        .map_err(|_| format!("{} is too large for this machine", path.display()))?;
+    // The size prepended by `compress_prepend_size` (u32, little endian) is
+    // checked first, so a damaged header never sizes an allocation.
+    let stored = bytes
+        .get(..4)
+        .and_then(|header| <[u8; 4]>::try_from(header).ok())
+        .map(u32::from_le_bytes)
+        .and_then(|size| usize::try_from(size).ok());
+    if stored != Some(expected) {
+        return Err(format!(
+            "{} holds {stored:?} bytes, not the {expected} of a {width}x{height} frame",
+            path.display()
+        ));
+    }
+    let bgr = lz4_flex::decompress(&bytes[4..], expected)
+        .map_err(|error| format!("could not decompress {}: {error}", path.display()))?;
+    if bgr.len() != expected {
+        return Err(format!(
+            "{} decompressed to {} bytes, not {expected}",
+            path.display(),
+            bgr.len()
+        ));
+    }
+    Ok(bgr)
 }
 
 /// How far the clip got (C10).

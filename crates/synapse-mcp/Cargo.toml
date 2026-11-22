@@ -27,6 +27,7 @@ futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
 image.workspace = true
+lz4_flex = "0.14"
 metrics.workspace = true
 notify.workspace = true
 rmcp = { workspace = true, features = [

@@ -61,7 +61,7 @@ pub(super) fn is_part_file(path: &Path) -> bool {
 /// The waiting frame of instant k: tightly packed B, G, R rows at the captured
 /// size (the size is in its `frames.jsonl` line), compressed whole with zstd
 /// (A8). Each file stands alone.
-pub(super) fn raw_frame_path(folder: &Path, instant: u64) -> PathBuf {
+pub(super) fn waiting_frame_path(folder: &Path, instant: u64) -> PathBuf {
     folder
         .join(WAITING_DIR)
         .join(format!("frame-{instant:08}.{WAITING_FRAME_EXTENSION}"))
@@ -113,7 +113,7 @@ impl WaitingFrameWriter {
         self.compressor
             .compress_to_buffer(&self.bgr, &mut self.compressed)
             .map_err(|error| format!("could not compress waiting frame {instant}: {error}"))?;
-        let path = raw_frame_path(folder, instant);
+        let path = waiting_frame_path(folder, instant);
         let temp = path.with_extension(format!("{WAITING_FRAME_EXTENSION}{TEMP_SUFFIX}"));
         std::fs::write(&temp, &self.compressed)
             .map_err(|error| format!("could not write {}: {error}", temp.display()))?;

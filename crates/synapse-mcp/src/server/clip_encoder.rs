@@ -66,7 +66,7 @@ const MAX_TRANSFORMS_PER_STREAM: u32 = 8;
 /// One frame of a segment: its waiting file (captured B, G, R rows, zstd), its captured
 /// size, and its time within the segment (B5).
 pub(super) struct SegmentSample {
-    pub(super) raw: std::path::PathBuf,
+    pub(super) waiting: std::path::PathBuf,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) instant: u64,
@@ -135,10 +135,10 @@ fn encode_once(
     for (order, sample) in input.samples.iter().enumerate() {
         // A missing, bad or short waiting frame: the picture before it stays,
         // and the clip worker names its instants as lost with the cause.
-        match reader.read(&sample.raw, sample.width, sample.height) {
+        match reader.read(&sample.waiting, sample.width, sample.height) {
             Ok(bgr) => {
                 canvas.draw(&bgr, sample.width, sample.height);
-                last_good = Some(sample.raw.clone());
+                last_good = Some(sample.waiting.clone());
             }
             Err(error) => {
                 tracing::warn!(
@@ -152,10 +152,10 @@ fn encode_once(
                 // the last good one of the segment before (the seed).
                 if last_good.is_none()
                     && let Some(seed) = input.seed
-                    && let Ok(bgr) = reader.read(&seed.raw, seed.width, seed.height)
+                    && let Ok(bgr) = reader.read(&seed.waiting, seed.width, seed.height)
                 {
                     canvas.draw(&bgr, seed.width, seed.height);
-                    last_good = Some(seed.raw.clone());
+                    last_good = Some(seed.waiting.clone());
                 }
             }
         }

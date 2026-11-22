@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::clip_folder::{
     BReport, ClipJson, ClipRegistry, ClipState, FrameLine, LossCause, LostInstant, RecorderLock,
-    StopReason, raw_frame_path, read_frame_lines,
+    StopReason, read_frame_lines, waiting_frame_path,
 };
 
 /// U_max: the recorder never uses more than this share of the processor time
@@ -24,7 +24,7 @@ use super::clip_folder::{
 pub(super) const CPU_LIMIT_PERCENT: f64 = 10.0;
 /// A segment closes after this much clip time.
 pub(super) const SEGMENT_MS: u64 = 60_000;
-/// A segment closes when its retained raw bytes reach this (package 0, M4/M5; S6).
+/// A segment closes when its retained waiting bytes reach this (package 0, M4/M5; S6).
 /// Counted as the sizes of its waiting files on disk (compressed).
 pub(super) const SEGMENT_RAW_BUDGET_BYTES: u64 = 1 << 30;
 /// A new window size counts as settled once it held this long (E4).
@@ -158,7 +158,7 @@ pub(super) fn next_segment(
         let over_time = line.t_ms.saturating_sub(first.t_ms) >= SEGMENT_MS;
         let resized = line.width != 0 && size(line) != canvas;
         let frame_bytes = if line.new {
-            std::fs::metadata(raw_frame_path(folder, line.instant)).map_or(0, |file| file.len())
+            std::fs::metadata(waiting_frame_path(folder, line.instant)).map_or(0, |file| file.len())
         } else {
             0
         };
@@ -246,7 +246,7 @@ fn shown_at(lines: &[FrameLine], index: usize) -> Option<usize> {
 fn picture_at(lines: &[FrameLine], folder: &Path, index: usize) -> Option<usize> {
     (0..=index)
         .rev()
-        .find(|&at| lines[at].new && raw_frame_path(folder, lines[at].instant).is_file())
+        .find(|&at| lines[at].new && waiting_frame_path(folder, lines[at].instant).is_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ impl ClipWorker {
             clip.segments.push(checkpoint);
             clip.add_lost(unreadable);
         })?;
-        self.delete_committed_raw(&samples, seed.as_ref(), encoded.last_good.as_ref());
+        self.delete_committed_waiting(&samples, seed.as_ref(), encoded.last_good.as_ref());
         tracing::info!(
             code = "CLIP_SEGMENT_COMMITTED",
             folder = %self.folder.display(),
@@ -454,7 +454,7 @@ impl ClipWorker {
                     .map_or(segment_length, |&(_, next)| next);
                 let line = &lines[index];
                 super::clip_encoder::SegmentSample {
-                    raw: raw_frame_path(&self.folder, line.instant),
+                    waiting: waiting_frame_path(&self.folder, line.instant),
                     width: line.width,
                     height: line.height,
                     instant: if order == 0 {
@@ -479,10 +479,10 @@ impl ClipWorker {
     ) -> Option<super::clip_encoder::SegmentSample> {
         let at = picture_at(lines, &self.folder, range.first.checked_sub(1)?)?;
         let line = &lines[at];
-        let raw = raw_frame_path(&self.folder, line.instant);
-        (samples.first().map(|first| &first.raw) != Some(&raw)).then(|| {
+        let waiting = waiting_frame_path(&self.folder, line.instant);
+        (samples.first().map(|first| &first.waiting) != Some(&waiting)).then(|| {
             super::clip_encoder::SegmentSample {
-                raw,
+                waiting,
                 width: line.width,
                 height: line.height,
                 instant: line.instant,
@@ -496,15 +496,15 @@ impl ClipWorker {
     /// the encoder could draw: it is the picture shown at the start of the
     /// next segment, also when this segment's last frame was unreadable. The
     /// seed is deleted once a newer good picture replaces it.
-    fn delete_committed_raw(
+    fn delete_committed_waiting(
         &self,
         samples: &[super::clip_encoder::SegmentSample],
         seed: Option<&super::clip_encoder::SegmentSample>,
         last_good: Option<&PathBuf>,
     ) {
-        for raw in samples.iter().chain(seed).map(|sample| &sample.raw) {
-            if Some(raw) != last_good {
-                let _ = std::fs::remove_file(raw);
+        for waiting in samples.iter().chain(seed).map(|sample| &sample.waiting) {
+            if Some(waiting) != last_good {
+                let _ = std::fs::remove_file(waiting);
             }
         }
     }
@@ -662,7 +662,7 @@ fn mark_service_restart(folder: &Path) -> Result<(), String> {
             .filter(|line| {
                 committed.is_none_or(|last| line.instant > last)
                     && line.new
-                    && !raw_frame_path(folder, line.instant).is_file()
+                    && !waiting_frame_path(folder, line.instant).is_file()
             })
             .map(|line| LostInstant {
                 instant: line.instant,

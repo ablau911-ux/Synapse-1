@@ -17,18 +17,19 @@
 //! count of frames waiting.
 //!
 //! Frame choice: `frames.jsonl` `new` flags skip repeated frames without
-//! comparing them; new frames are compared with the picture on screen by an
-//! 8 × 8 block test at recorded resolution. D5: the logged cursor is masked
-//! when Windows drew it into the picture; a thin caret that toggles is
-//! ignored; a block that returns to its previous picture within
-//! `SHORT_LIVED_MS` is a short-lived change of its region, also while other
-//! regions animate; a region that keeps changing is one animating interval
-//! with one frame.
+//! comparing them; new frames are compared block by block (8 × 8, recorded
+//! resolution) by the D5 equation: a two-threshold block test set from the
+//! measured encoder noise; each block against its anchor, its last settled
+//! picture; a block back at its anchor within `SHORT_LIVED_MS` is a FLASH, a
+//! block that keeps changing animates; block changes with the same outcome
+//! join into events. The logged cursor is masked when Windows drew it into
+//! the picture, and a blinking caret is ignored.
 //!
 //! Every image is a labelled PNG copy in the clip's `views` folder (the clip
 //! files stay untouched). All decoding and image work runs on a blocking
 //! thread, never on the async worker.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -72,38 +73,48 @@ const CLOSEUP_SCALE: u32 = 2;
 
 /// Side of the change-test blocks, in recorded clip pixels.
 const BLOCK: usize = 8;
-/// Largest R, G or B difference that counts a pixel as changed (above
-/// encoder noise). Measured 2026-11-22 on a 1584 x 992 clip of text (H.264,
-/// quality 70, GOP 20): at keyframes, static text blocks had up to 7 pixels
-/// above 32 and 6 above 48, but at most 1 above 64; blank areas had none.
-const PIXEL_DELTA: u8 = 64;
-/// Changed pixels that mark an 8x8 block as changed. A one-line text edit
-/// changes whole glyph strokes (dozens of high-contrast pixels per block).
-const MIN_CHANGED_PIXELS: u32 = 3;
-/// A change is settled after this long without further change.
+/// δ_lo, δ_hi: a pixel counts at a threshold when its largest R, G or B
+/// difference is above it (D5 step 1).
+const DELTA_LO: u8 = 32;
+const DELTA_HI: u8 = 64;
+/// ν(δ_lo), ν(δ_hi): the most pixels of one 8 × 8 block of static content
+/// above δ_lo and δ_hi between two decoded frames (H.264, quality 70, GOP
+/// 20). Measured on the proof clip (`cb70a9f7`): static text 7 and 1, blank
+/// areas none. The D5 proof clips measure them again; if ν is exceeded, N_hi
+/// and N_lo are recomputed from the two inequalities below.
+const NOISE_LO: u32 = 7;
+const NOISE_HI: u32 = 1;
+/// N_hi > 2 · ν(δ_hi): pixels above δ_hi that make a block differ (text
+/// strokes have dozens).
+const N_HI: u32 = 3;
+/// 2 · ν(δ_lo) < N_lo ≤ 32: pixels above δ_lo that make a block differ, so a
+/// flat fill over half a block is always seen (a list selection #cce8ff or a
+/// grey fill #d0d0d0 on white differs by about 50).
+const N_LO: u32 = 16;
+const _: () =
+    assert!(N_HI > 2 * NOISE_HI && N_LO > 2 * NOISE_LO && N_LO as usize <= BLOCK * BLOCK / 2);
+/// A block has settled after this long the same: K_s = SETTLE_MS · f / 1000.
 const SETTLE_MS: u64 = 200;
-/// A change that returns to the previous picture within this is short-lived.
+/// A block back at its anchor within this is a FLASH, later a REVERTED; also
+/// W_a, the window of a block's activity (D5 steps 2 and 3).
 const SHORT_LIVED_MS: u64 = 500;
-/// A block animates while it changed in at least this share of the frames
-/// of the last `SHORT_LIVED_MS` (D5).
+/// A block animates while it changed against the previous frame in at least
+/// this share of the instants of the last W_a (D5 step 3).
 const ANIMATING_CHANGE_SHARE: f64 = 0.5;
-/// Animating blocks form one animation across at most this many empty
-/// blocks (columns, rows; 8-neighbour connectivity plus the gap).
-const ANIMATION_GAP_BLOCKS: (usize, usize) = (1, 1);
-/// A changed region within this many empty blocks of an animation is a
-/// slower part of it (a digit that changes less often), not a change.
-const ANIMATION_ABSORB_GAP_BLOCKS: (usize, usize) = (2, 2);
-/// Changed blocks form one region across at most this many empty blocks:
-/// wide along a row, so the changed words of one text line (a log line, a
-/// status bar) are one change, and two blocks between rows (the line gap of
-/// a text block).
+/// Block changes with the same outcome and overlapping intervals form one
+/// event across at most this many empty blocks (columns, rows): wide along a
+/// row, so the changed words of one text line are one event, and two blocks
+/// between rows (the line gap of a text block) (D5 step 4).
 const REGION_GAP_BLOCKS: (usize, usize) = (24, 2);
-/// The box masked around the logged cursor, in window pixels (D5).
+/// The box masked around the logged cursor, in window pixels (D5 step 5).
 const CURSOR_MASK_PX: u32 = 48;
-/// A caret is a change at most this wide (window pixels) that toggles about
-/// every `CARET_PERIOD_MS` (D5).
+/// A caret (D5 step 5): a change at most this wide and this tall, in window
+/// pixels, that alternates between two pictures for at least this many
+/// cycles with a half-period in this range (the Windows default is 530 ms).
 const CARET_MAX_WIDTH_PX: u32 = 3;
-const CARET_PERIOD_MS: u64 = 500;
+const CARET_HEIGHT_PX: std::ops::RangeInclusive<u32> = 8..=48;
+const CARET_MIN_CYCLES: usize = 2;
+const CARET_HALF_PERIOD_MS: std::ops::RangeInclusive<u64> = 400..=700;
 /// At least one key frame per this interval.
 const FLOOR_INTERVAL_MS: u64 = 10_000;
 /// Unchanged stretches at least this long are listed in the timeline.
@@ -114,7 +125,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 10;
+const ANALYSIS_VERSION: u32 = 11;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -398,95 +409,199 @@ impl ViewedClip {
 }
 
 // ---------------------------------------------------------------------------
-// Change test
+// Change test (D5 step 1: the block test from the measured noise)
 // ---------------------------------------------------------------------------
 
-/// R, G, B of a BGRA frame, three bytes per pixel: the change test compares
-/// colour, so a hue change with equal luma still counts.
-fn rgb(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4)
-        .flat_map(|px| [px[2], px[1], px[0]])
-        .collect()
+/// The pixel test: the largest R, G or B difference of two pixels.
+fn pixel_delta(a: &[u8], b: &[u8]) -> u8 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.abs_diff(*y))
+        .max()
+        .unwrap_or(0)
 }
 
-/// Which 8x8 blocks differ between two pictures of the same size.
-#[derive(Clone)]
-struct BlockMap {
-    cols: usize,
-    rows: usize,
+/// The block test of two pictures in one block (D5 step 1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Same,
+    Diff,
+    Undecided,
+}
+
+impl Verdict {
+    /// DIFF when n_δhi ≥ N_hi or n_δlo ≥ N_lo; SAME when n_δhi ≤ ν(δ_hi) and
+    /// n_δlo ≤ ν(δ_lo); otherwise undecided. `pairs` are the block's pixels
+    /// in both pictures, three bytes each.
+    fn of<'p>(pairs: impl Iterator<Item = (&'p [u8], &'p [u8])>) -> Self {
+        let (mut above_lo, mut above_hi) = (0_u32, 0_u32);
+        for (a, b) in pairs {
+            let delta = pixel_delta(a, b);
+            above_lo += u32::from(delta > DELTA_LO);
+            above_hi += u32::from(delta > DELTA_HI);
+        }
+        if above_hi >= N_HI || above_lo >= N_LO {
+            Self::Diff
+        } else if above_hi <= NOISE_HI && above_lo <= NOISE_LO {
+            Self::Same
+        } else {
+            Self::Undecided
+        }
+    }
+}
+
+/// The 8 × 8 block layout of a picture of one size.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Grid {
     width: usize,
     height: usize,
+    cols: usize,
+    rows: usize,
+}
+
+impl Grid {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            cols: width.div_ceil(BLOCK),
+            rows: height.div_ceil(BLOCK),
+        }
+    }
+
+    fn blocks(self) -> usize {
+        self.cols * self.rows
+    }
+
+    /// Column and row of block `b`.
+    fn place(self, b: usize) -> (usize, usize) {
+        (b % self.cols.max(1), b / self.cols.max(1))
+    }
+
+    /// The pixels of block `b`: x0, y0 and the exclusive x1, y1.
+    fn span(self, b: usize) -> (usize, usize, usize, usize) {
+        let (col, row) = self.place(b);
+        (
+            col * BLOCK,
+            row * BLOCK,
+            ((col + 1) * BLOCK).min(self.width),
+            ((row + 1) * BLOCK).min(self.height),
+        )
+    }
+
+    /// The byte range of each pixel row of block `b` in an R, G, B picture.
+    fn rows_of(self, b: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+        let (x0, y0, x1, y1) = self.span(b);
+        (y0..y1).map(move |y| (y * self.width + x0) * 3..(y * self.width + x1) * 3)
+    }
+
+    /// `true` when blocks `a` and `b` are 8-neighbours with at most `gap`
+    /// empty blocks between them (columns, rows).
+    fn near(self, a: usize, b: usize, gap: (usize, usize)) -> bool {
+        let ((col_a, row_a), (col_b, row_b)) = (self.place(a), self.place(b));
+        col_a.abs_diff(col_b) <= gap.0 + 1 && row_a.abs_diff(row_b) <= gap.1 + 1
+    }
+
+    /// The bounding box of some blocks, in recorded pixels.
+    fn bbox(self, blocks: impl IntoIterator<Item = usize>) -> Option<Rect> {
+        blocks
+            .into_iter()
+            .map(|b| self.span(b))
+            .reduce(|(a0, b0, a1, b1), (x0, y0, x1, y1)| {
+                (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
+            })
+            .map(|(x0, y0, x1, y1)| rect(x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// `count` blocks as a percentage of the picture, one decimal.
+    fn percent(self, count: u64) -> f64 {
+        (count as f64 * 1_000.0 / self.blocks().max(1) as f64).round() / 10.0
+    }
+}
+
+/// One picture as R, G, B bytes per pixel: the change test compares colour,
+/// so a hue change with equal luma still counts.
+#[derive(Clone)]
+struct Picture {
+    grid: Grid,
+    rgb: Vec<u8>,
+}
+
+impl Picture {
+    fn new(frame: &DecodedFrame) -> Self {
+        Self {
+            grid: Grid::new(frame.width as usize, frame.height as usize),
+            rgb: frame
+                .bgra
+                .chunks_exact(4)
+                .flat_map(|px| [px[2], px[1], px[0]])
+                .collect(),
+        }
+    }
+
+    /// D5 step 1 for block `b` of this picture and of `other` (same size).
+    fn test(&self, other: &Self, b: usize) -> Verdict {
+        Verdict::of(self.grid.rows_of(b).flat_map(|row| {
+            let mine = self.rgb.get(row.clone()).unwrap_or_default();
+            let theirs = other.rgb.get(row).unwrap_or_default();
+            mine.chunks_exact(3).zip(theirs.chunks_exact(3))
+        }))
+    }
+
+    /// A copy of the pixels of block `b`, row after row.
+    fn block(&self, b: usize) -> Vec<u8> {
+        self.grid
+            .rows_of(b)
+            .flat_map(|row| self.rgb.get(row).unwrap_or_default().iter().copied())
+            .collect()
+    }
+
+    /// Copies block `b` from `other` (same size).
+    fn copy_block(&mut self, other: &Self, b: usize) {
+        for row in self.grid.rows_of(b) {
+            if let (Some(to), Some(from)) = (self.rgb.get_mut(row.clone()), other.rgb.get(row)) {
+                to.copy_from_slice(from);
+            }
+        }
+    }
+
+    /// The box of the pixels of block `b` that differ from `other` by more
+    /// than δ_lo: x0, y0, x1, y1 (inclusive, recorded pixels).
+    fn footprint(&self, other: &Self, b: usize) -> Option<(usize, usize, usize, usize)> {
+        let (x0, y0, ..) = self.grid.span(b);
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        for (y, row) in (y0..).zip(self.grid.rows_of(b)) {
+            let mine = self.rgb.get(row.clone()).unwrap_or_default();
+            let theirs = other.rgb.get(row).unwrap_or_default();
+            for (x, (a, c)) in (x0..).zip(mine.chunks_exact(3).zip(theirs.chunks_exact(3))) {
+                if pixel_delta(a, c) > DELTA_LO {
+                    bounds = Some(bounds.map_or((x, y, x, y), |(a0, b0, a1, b1)| {
+                        (a0.min(x), b0.min(y), a1.max(x), b1.max(y))
+                    }));
+                }
+            }
+        }
+        bounds
+    }
+}
+
+/// Which blocks differ between two pictures of the same size (`clip_diff`).
+struct BlockMap {
+    grid: Grid,
     changed: Vec<bool>,
     count: u64,
 }
 
 impl BlockMap {
-    fn empty(width: usize, height: usize) -> Self {
-        let (cols, rows) = (width.div_ceil(BLOCK), height.div_ceil(BLOCK));
+    fn between(before: &Picture, after: &Picture) -> Self {
+        let changed: Vec<bool> = (0..after.grid.blocks())
+            .map(|b| after.test(before, b) == Verdict::Diff)
+            .collect();
+        let count = changed.iter().filter(|flag| **flag).count() as u64;
         Self {
-            cols,
-            rows,
-            width,
-            height,
-            changed: vec![false; cols * rows],
-            count: 0,
-        }
-    }
-
-    fn between(before: &[u8], after: &[u8], width: usize, height: usize) -> Self {
-        let mut map = Self::empty(width, height);
-        let mut counts = vec![0_u32; map.cols * map.rows];
-        let row_bytes = width * 3;
-        for y in 0..height {
-            let row = y * row_bytes;
-            let block_row = (y / BLOCK) * map.cols;
-            let (Some(a), Some(b)) = (
-                before.get(row..row + row_bytes),
-                after.get(row..row + row_bytes),
-            ) else {
-                break;
-            };
-            for (x, (pa, pb)) in a.chunks_exact(3).zip(b.chunks_exact(3)).enumerate() {
-                let delta = pa
-                    .iter()
-                    .zip(pb)
-                    .map(|(ca, cb)| ca.abs_diff(*cb))
-                    .max()
-                    .unwrap_or(0);
-                if delta > PIXEL_DELTA {
-                    counts[block_row + x / BLOCK] += 1;
-                }
-            }
-        }
-        for (flag, count) in map.changed.iter_mut().zip(counts) {
-            *flag = count >= MIN_CHANGED_PIXELS;
-        }
-        map.count = map.changed.iter().filter(|flag| **flag).count() as u64;
-        map
-    }
-
-    fn unset(&mut self, index: usize) {
-        if let Some(flag) = self.changed.get_mut(index)
-            && *flag
-        {
-            *flag = false;
-            self.count -= 1;
-        }
-    }
-
-    fn merge(&mut self, other: &Self) {
-        for (flag, more) in self.changed.iter_mut().zip(&other.changed) {
-            *flag |= *more;
-        }
-        self.count = self.changed.iter().filter(|flag| **flag).count() as u64;
-    }
-
-    fn set(&mut self, index: usize) {
-        if let Some(flag) = self.changed.get_mut(index)
-            && !*flag
-        {
-            *flag = true;
-            self.count += 1;
+            grid: after.grid,
+            changed,
+            count,
         }
     }
 
@@ -498,73 +613,31 @@ impl BlockMap {
             .filter_map(|(index, flag)| flag.then_some(index))
     }
 
-    /// `true` when one of `blocks` is a changed block here or lies within
-    /// `gap` empty blocks of one: (columns, rows), 8-neighbour connectivity
-    /// plus the gap.
-    fn touches(&self, blocks: &[usize], gap: (usize, usize)) -> bool {
-        let (reach_cols, reach_rows) = (gap.0 + 1, gap.1 + 1);
-        let cols = self.cols.max(1);
-        blocks.iter().any(|&index| {
-            let (col, row) = (index % cols, index / cols);
-            (row.saturating_sub(reach_rows)..=(row + reach_rows).min(self.rows.saturating_sub(1)))
-                .any(|near_row| {
-                    (col.saturating_sub(reach_cols)..=(col + reach_cols).min(cols - 1))
-                        .any(|near_col| self.changed[near_row * cols + near_col])
-                })
-        })
-    }
-
     fn percent(&self) -> f64 {
-        (self.count as f64 * 1_000.0 / self.changed.len().max(1) as f64).round() / 10.0
-    }
-
-    fn block_rect(&self, col0: usize, row0: usize, col1: usize, row1: usize) -> Rect {
-        let x = col0 * BLOCK;
-        let y = row0 * BLOCK;
-        let w = ((col1 + 1) * BLOCK).min(self.width) - x;
-        let h = ((row1 + 1) * BLOCK).min(self.height) - y;
-        rect(x, y, w, h)
+        self.grid.percent(self.count)
     }
 
     fn bbox(&self) -> Option<Rect> {
-        let mut bounds: Option<(usize, usize, usize, usize)> = None;
-        for (index, _) in self.changed.iter().enumerate().filter(|(_, flag)| **flag) {
-            let (col, row) = (index % self.cols, index / self.cols);
-            bounds = Some(bounds.map_or((col, row, col, row), |(c0, r0, c1, r1)| {
-                (c0.min(col), r0.min(row), c1.max(col), r1.max(row))
-            }));
-        }
-        bounds.map(|(c0, r0, c1, r1)| self.block_rect(c0, r0, c1, r1))
+        self.grid.bbox(self.indices())
     }
 
-    /// Connected groups of changed blocks (8-neighbour), as block indices.
-    fn block_groups(&self) -> Vec<Vec<usize>> {
-        self.block_groups_within((0, 0))
-    }
-
-    /// Connected groups of changed blocks (8-neighbour, with up to `gap`
-    /// empty blocks between members: columns, rows), as block indices.
-    fn block_groups_within(&self, gap: (usize, usize)) -> Vec<Vec<usize>> {
-        let (reach_cols, reach_rows) = (gap.0 + 1, gap.1 + 1);
+    /// Connected groups of changed blocks (8-neighbour), largest first, as
+    /// rectangles.
+    fn regions(&self) -> Vec<ClipChangedRegion> {
         let mut seen = vec![false; self.changed.len()];
-        let mut groups = Vec::new();
-        for start in 0..self.changed.len() {
-            if !self.changed[start] || seen[start] {
+        let mut regions = Vec::new();
+        for start in self.indices() {
+            if seen[start] {
                 continue;
             }
             seen[start] = true;
-            let mut stack = vec![start];
-            let mut group = Vec::new();
-            while let Some(index) = stack.pop() {
-                group.push(index);
-                let (col, row) = (index % self.cols, index / self.cols);
-                for next_row in
-                    row.saturating_sub(reach_rows)..=(row + reach_rows).min(self.rows - 1)
-                {
-                    for next_col in
-                        col.saturating_sub(reach_cols)..=(col + reach_cols).min(self.cols - 1)
-                    {
-                        let next = next_row * self.cols + next_col;
+            let (mut stack, mut group) = (vec![start], Vec::new());
+            while let Some(b) = stack.pop() {
+                group.push(b);
+                let (col, row) = self.grid.place(b);
+                for near_row in row.saturating_sub(1)..=(row + 1).min(self.grid.rows - 1) {
+                    for near_col in col.saturating_sub(1)..=(col + 1).min(self.grid.cols - 1) {
+                        let next = near_row * self.grid.cols + near_col;
                         if self.changed[next] && !seen[next] {
                             seen[next] = true;
                             stack.push(next);
@@ -572,108 +645,767 @@ impl BlockMap {
                     }
                 }
             }
-            groups.push(group);
+            if let Some(rect) = self.grid.bbox(group.iter().copied()) {
+                regions.push(ClipChangedRegion {
+                    rect,
+                    changed_blocks: group.len() as u64,
+                });
+            }
         }
-        groups
-    }
-
-    /// Connected groups of changed blocks, largest first, as rectangles.
-    fn regions(&self) -> Vec<ClipChangedRegion> {
-        let mut regions: Vec<ClipChangedRegion> = self
-            .block_groups()
-            .iter()
-            .filter_map(|group| {
-                blocks_bbox(group, self.cols, self.width, self.height).map(|rect| {
-                    ClipChangedRegion {
-                        rect,
-                        changed_blocks: group.len() as u64,
-                    }
-                })
-            })
-            .collect();
         regions.sort_by_key(|region| std::cmp::Reverse(region.changed_blocks));
         regions
     }
 }
 
 // ---------------------------------------------------------------------------
-// Overview analysis
+// Overview analysis (D5 steps 2 to 6)
 // ---------------------------------------------------------------------------
 
-/// One changed region (D5): a connected group of changed blocks, tracked on
-/// its own from its first change until it settles.
-struct Episode {
-    start_frame: u64,
-    last_change_frame: u64,
-    blocks: BlockMap,
-    /// RGB of each block before its first change in this region (kept only
-    /// while a return can still follow).
-    baseline: std::collections::HashMap<usize, Vec<u8>>,
-    short_lived: bool,
-    reverted: bool,
-    settled: bool,
-    /// The resize generation the change happened in (see `Analyzer`).
-    generation: u64,
+/// D5's times in instants of the clip (f instants per second).
+#[derive(Clone, Copy)]
+struct Instants {
+    /// K_s = SETTLE_MS · f / 1000.
+    settle: u64,
+    /// W_a = SHORT_LIVED_MS · f / 1000.
+    activity: u64,
+    /// The changes within W_a that make a block animate.
+    animating: usize,
 }
 
-impl Episode {
-    /// Joins a region that touches this one; the earlier baseline of a block
-    /// wins.
-    fn join(mut self, mut other: Self) -> Self {
-        if other.start_frame < self.start_frame {
-            std::mem::swap(&mut self, &mut other);
+impl Instants {
+    fn of(clip: &ViewedClip) -> Self {
+        let per_ms = |ms: u64| (ms * clip.fps() / 1_000).max(1);
+        let activity = per_ms(SHORT_LIVED_MS);
+        Self {
+            settle: per_ms(SETTLE_MS),
+            activity,
+            animating: ((activity as f64 * ANIMATING_CHANGE_SHARE).ceil() as usize).max(1),
         }
-        self.last_change_frame = self.last_change_frame.max(other.last_change_frame);
-        self.blocks.merge(&other.blocks);
-        for (index, pixels) in other.baseline {
-            self.baseline.entry(index).or_insert(pixels);
-        }
-        self
-    }
-
-    /// `true` when every given block shows its baseline again.
-    fn back_to_baseline(&self, blocks: &[usize], shown: &[u8]) -> bool {
-        let (width, height, cols) = (self.blocks.width, self.blocks.height, self.blocks.cols);
-        blocks.iter().all(|index| {
-            self.baseline.get(index).is_some_and(|before| {
-                block_equal(before, &block_pixels(shown, width, height, cols, *index))
-            })
-        })
     }
 }
 
-/// What one block went through (D5): its changes within the last
-/// `SHORT_LIVED_MS`, and when it last looked like a caret.
+/// The pictures shown in the last K_s instants, each with the instant it was
+/// first shown, the newest last: a block settles against them (D5 step 2).
+struct Recent {
+    pictures: VecDeque<(u64, Picture)>,
+    settle: u64,
+}
+
+impl Recent {
+    fn latest(&self) -> Option<&(u64, Picture)> {
+        self.pictures.back()
+    }
+
+    fn restart(&mut self, instant: u64, picture: Picture) {
+        self.pictures.clear();
+        self.pictures.push_back((instant, picture));
+    }
+
+    fn push(&mut self, instant: u64, picture: Picture) {
+        self.pictures.push_back((instant, picture));
+        // The oldest picture stays while it was on screen K_s instants ago.
+        let settle = self.settle;
+        while self
+            .pictures
+            .get(1)
+            .is_some_and(|(next, _)| next + settle <= instant)
+        {
+            self.pictures.pop_front();
+        }
+    }
+
+    /// The first instant since which block `b` has shown only pictures that
+    /// are SAME as `picture` (`now` when the last one is not).
+    fn stable_since(&self, picture: &Picture, b: usize, now: u64) -> u64 {
+        let mut since = now;
+        for (first, earlier) in self.pictures.iter().rev() {
+            if picture.test(earlier, b) != Verdict::Same {
+                break;
+            }
+            since = *first;
+        }
+        since
+    }
+}
+
+/// What a change of a block turned out to be.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Outcome {
+    /// It settled on a new picture.
+    Changed,
+    /// It came back to its anchor within `SHORT_LIVED_MS`.
+    Flash,
+    /// It came back to its anchor later.
+    Reverted,
+    /// It kept changing (D5 step 3).
+    Animation,
+}
+
+/// An open change of one block: from the first instant it was not SAME as
+/// its anchor until it settles.
+#[derive(Clone)]
+struct Activity {
+    start: u64,
+    /// The last instant it changed against the previous frame.
+    last_move: u64,
+    /// It animated at some instant of this change.
+    animated: bool,
+    /// The instants at which it was DIFF from its anchor.
+    differed: Vec<u64>,
+}
+
+/// The live state of one block (D5 steps 2 and 3).
 #[derive(Clone, Default)]
 struct BlockState {
-    recent: std::collections::VecDeque<u64>,
-    animating: bool,
-    last_caret: Option<u64>,
+    /// The instants of its last changes against the previous frame: at most
+    /// as many as make it animate.
+    moves: VecDeque<u64>,
+    /// The first instant of the picture it shows now (SAME since then).
+    stable_since: u64,
+    active: Option<Activity>,
 }
 
-/// A connected group of animating blocks, reported as one interval (D5).
-struct Animation {
+impl BlockState {
+    /// The first instant at which the block no longer animates: fewer than
+    /// `Instants::animating` changes in the W_a that ends there.
+    fn animating_until(&self, instants: Instants) -> u64 {
+        match self.moves.front() {
+            Some(first) if self.moves.len() >= instants.animating => first + instants.activity,
+            _ => 0,
+        }
+    }
+
+    /// When an open change settles if nothing changes any more: SAME for K_s
+    /// instants and not animating.
+    fn settle_at(&self, instants: Instants) -> Option<u64> {
+        self.active.as_ref()?;
+        Some((self.stable_since + instants.settle).max(self.animating_until(instants)))
+    }
+}
+
+/// How a change of one block ended: its outcome and interval, and what the
+/// events, picks and caret test need.
+#[derive(Clone)]
+struct BlockEpisode {
+    outcome: Outcome,
+    block: usize,
+    grid: Grid,
+    generation: u64,
     start: u64,
     end: u64,
-    /// The last instant one of its blocks was animating.
-    seen: u64,
-    /// Its animating blocks: the only blocks that decide a merge.
-    core: BlockMap,
-    /// `core` plus the changed blocks next to it that change less often.
-    area: BlockMap,
-    /// The resize generation of the run (see `Analyzer`).
-    generation: u64,
+    /// Quiet for `SETTLE_MS` when it ended; `false` when the clip end or a
+    /// resize closed it earlier.
+    settled: bool,
+    /// An animation still running when the clip end or a resize closed it.
+    running: bool,
+    /// FLASH, REVERTED: the instants at which the block was DIFF from its
+    /// anchor.
+    differed: Vec<u64>,
+    /// CHANGED: the anchor and the new picture of the block, and the box of
+    /// the pixels that changed.
+    before: Vec<u8>,
+    after: Vec<u8>,
+    footprint: Option<(usize, usize, usize, usize)>,
 }
 
-impl Animation {
-    fn join(mut self, other: Self) -> Self {
-        self.start = self.start.min(other.start);
-        self.end = self.end.max(other.end);
-        self.seen = self.seen.max(other.seen);
-        self.core.merge(&other.core);
-        self.area.merge(&other.area);
-        self
+/// One decode pass over the committed segments (D5 steps 2 and 3): each
+/// block is compared with its anchor, and each change of a block ends as a
+/// `BlockEpisode`; `finish` joins them into events.
+struct Analyzer<'a> {
+    clip: &'a ViewedClip,
+    instants: Instants,
+    /// A_b of every block: its last settled picture.
+    anchor: Picture,
+    recent: Recent,
+    states: Vec<BlockState>,
+    episodes: Vec<BlockEpisode>,
+    resizes: Vec<(u64, usize, usize)>,
+    /// Goes up on every size change; changes are compared and joined only
+    /// within one generation, also when a later resize restores the size.
+    generation: u64,
+    /// Captured size (frames.jsonl) of the picture last decoded.
+    captured: (u32, u32),
+    /// New frames in which no block changed against the previous frame.
+    still_frames: u64,
+}
+
+impl<'a> Analyzer<'a> {
+    fn run(clip: &'a ViewedClip) -> Result<Analysis, ErrorData> {
+        let instants = Instants::of(clip);
+        let mut analyzer = Self {
+            clip,
+            instants,
+            anchor: Picture {
+                grid: Grid::new(0, 0),
+                rgb: Vec::new(),
+            },
+            recent: Recent {
+                pictures: VecDeque::new(),
+                settle: instants.settle,
+            },
+            states: Vec::new(),
+            episodes: Vec::new(),
+            resizes: Vec::new(),
+            generation: 0,
+            captured: (0, 0),
+            still_frames: 0,
+        };
+        for segment in &clip.clip.segments {
+            let mut decoder = clip.open_decoder(segment)?;
+            while let Some(frame) = decoder.next_frame().map_err(decode_error)? {
+                let local = frame.t_ms() * clip.fps() / 1_000;
+                let instant = (segment.first_instant + local).min(segment.last_instant);
+                analyzer.step(instant, &frame);
+            }
+        }
+        analyzer.close_all(clip.last_frame() + 1);
+        Ok(analyzer.finish())
     }
+
+    fn step(&mut self, instant: u64, frame: &DecodedFrame) {
+        let picture = Picture::new(frame);
+        // A resize is a change of the captured size in frames.jsonl: an odd
+        // size padded up to even can decode at the same size as before.
+        let captured = self
+            .clip
+            .line(instant)
+            .filter(|line| line.width != 0 && line.height != 0)
+            .map_or(self.captured, |line| (line.width, line.height));
+        if picture.grid != self.anchor.grid || captured != self.captured {
+            self.captured = captured;
+            if self.recent.latest().is_some() {
+                self.close_all(instant);
+                self.resizes
+                    .push((instant, picture.grid.width, picture.grid.height));
+            }
+            self.generation += 1;
+            self.states = vec![BlockState::default(); picture.grid.blocks()];
+            self.anchor = picture.clone();
+            self.recent.restart(instant, picture);
+            return;
+        }
+        if !self.clip.is_new(instant) {
+            return;
+        }
+        self.settle_due(instant.saturating_sub(1));
+        let masked = self.cursor_blocks(instant);
+        let instants = self.instants;
+        let Some((_, previous)) = self.recent.latest() else {
+            return;
+        };
+        let mut moved_any = false;
+        for (b, state) in self.states.iter_mut().enumerate() {
+            if masked.contains(&b) {
+                // The cursor hides the block: an open change waits for it.
+                if state.active.is_some() {
+                    state.stable_since = instant;
+                }
+                continue;
+            }
+            let moved = picture.test(previous, b) == Verdict::Diff;
+            if moved {
+                moved_any = true;
+                state.moves.push_back(instant);
+                if state.moves.len() > instants.animating {
+                    state.moves.pop_front();
+                }
+            }
+            let to_anchor = picture.test(&self.anchor, b);
+            if state.active.is_none() && to_anchor == Verdict::Same {
+                continue;
+            }
+            // quiet -> active at the first instant that is not SAME.
+            let animating = instant < state.animating_until(instants);
+            let activity = state.active.get_or_insert_with(|| Activity {
+                start: instant,
+                last_move: instant,
+                animated: false,
+                differed: Vec::new(),
+            });
+            if to_anchor == Verdict::Diff {
+                activity.differed.push(instant);
+            }
+            if moved {
+                activity.last_move = instant;
+            }
+            activity.animated |= animating;
+            state.stable_since = self.recent.stable_since(&picture, b, instant);
+        }
+        if !moved_any {
+            self.still_frames += 1;
+        }
+        self.recent.push(instant, picture);
+        self.settle_due(instant);
+    }
+
+    /// Ends the open change of every block that has settled by `now`.
+    fn settle_due(&mut self, now: u64) {
+        for b in 0..self.states.len() {
+            if self.states[b]
+                .settle_at(self.instants)
+                .is_some_and(|at| at <= now)
+            {
+                self.end_change(b, None);
+            }
+        }
+    }
+
+    /// Ends every open change at a resize or at the clip end (`end`, the
+    /// first instant after it); "settled" then means quiet for at least
+    /// `SETTLE_MS`.
+    fn close_all(&mut self, end: u64) {
+        self.settle_due(end.saturating_sub(1));
+        for b in 0..self.states.len() {
+            self.end_change(b, Some(end));
+        }
+    }
+
+    /// D5 steps 2 and 3: block `b` has settled (`closed_at` is `None`) or is
+    /// closed at `closed_at`; its picture is compared with its anchor.
+    fn end_change(&mut self, b: usize, closed_at: Option<u64>) {
+        let Some(mut activity) = self.states[b].active.take() else {
+            return;
+        };
+        let Some((_, picture)) = self.recent.latest() else {
+            return;
+        };
+        let state = &self.states[b];
+        let mut episode = BlockEpisode {
+            outcome: Outcome::Changed,
+            block: b,
+            grid: picture.grid,
+            generation: self.generation,
+            start: activity.start,
+            end: state.stable_since.max(activity.start),
+            settled: closed_at.is_none(),
+            running: false,
+            differed: Vec::new(),
+            before: Vec::new(),
+            after: Vec::new(),
+            footprint: None,
+        };
+        if activity.animated {
+            let running = closed_at.is_some_and(|end| end <= state.animating_until(self.instants));
+            let end = match closed_at {
+                Some(end) if running => end - 1,
+                _ => activity.last_move,
+            };
+            self.episodes.push(BlockEpisode {
+                outcome: Outcome::Animation,
+                end,
+                running,
+                ..episode.clone()
+            });
+            // While it animates, its anchor stays frozen and it makes no event;
+            // once it stops, it is compared like any settling block. That change
+            // starts where the motion stopped, so a checkmark that replaces a
+            // spinner starts at the checkmark. Back at its anchor, it makes no
+            // second event: the animation already reports that interval (a
+            // playhead would otherwise leave a short-lived change in every block
+            // it crossed).
+            if running {
+                return;
+            }
+            episode.start = activity.last_move.min(episode.end);
+            activity.differed.clear();
+        }
+        match picture.test(&self.anchor, b) {
+            Verdict::Diff => {
+                episode.before = self.anchor.block(b);
+                episode.after = picture.block(b);
+                episode.footprint = picture.footprint(&self.anchor, b);
+                self.anchor.copy_block(picture, b);
+                self.episodes.push(episode);
+            }
+            Verdict::Same if !activity.differed.is_empty() => {
+                let span = self.clip.t_of(episode.end) - self.clip.t_of(episode.start);
+                episode.outcome = if span <= SHORT_LIVED_MS {
+                    Outcome::Flash
+                } else {
+                    Outcome::Reverted
+                };
+                episode.differed = activity.differed;
+                self.episodes.push(episode);
+            }
+            Verdict::Same => {}
+            // Drift or noise: the block takes the picture without an event.
+            Verdict::Undecided => self.anchor.copy_block(picture, b),
+        }
+    }
+
+    /// D5 step 5: the blocks under the logged cursor box, now and at the
+    /// last decoded instant, when the cursor is in the picture.
+    fn cursor_blocks(&self, instant: u64) -> Vec<usize> {
+        let grid = self.anchor.grid;
+        let previous = self.recent.latest().map_or(instant, |(at, _)| *at);
+        let to_block = |value: i64| usize::try_from(value).unwrap_or(0) / BLOCK;
+        let mut blocks = Vec::new();
+        for at in [previous, instant] {
+            let Some((x, y)) = self.clip.cursor_at(at) else {
+                continue;
+            };
+            let box_px = i64::from(CURSOR_MASK_PX * self.clip.scale_at(at));
+            let (x0, y0) = ((x - box_px / 2).max(0), (y - box_px / 2).max(0));
+            for row in to_block(y0)..=to_block(y0 + box_px).min(grid.rows.saturating_sub(1)) {
+                for col in to_block(x0)..=to_block(x0 + box_px).min(grid.cols.saturating_sub(1)) {
+                    blocks.push(row * grid.cols + col);
+                }
+            }
+        }
+        blocks
+    }
+
+    fn finish(self) -> Analysis {
+        let clip = self.clip;
+        let mut events = Event::join_all(self.episodes);
+        events.sort_by_key(|event| (event.start, event.end));
+        let (events, carets) = Event::without_carets(events, clip);
+        let first = clip
+            .clip
+            .segments
+            .first()
+            .map_or(0, |segment| segment.first_instant);
+        let mut picks = vec![pick(clip, first, "first frame")];
+        let mut timeline = Vec::new();
+        // D5 step 6: a stable interval that an animation overlaps is not
+        // listed as "no change".
+        let mut quiet_from = first;
+        for event in &events {
+            if clip.t_of(event.start).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
+                timeline.push(static_entry(
+                    clip,
+                    quiet_from,
+                    event.start.saturating_sub(1),
+                ));
+            }
+            quiet_from = quiet_from.max(event.end);
+            picks.extend(event.picks(clip));
+            timeline.push(event.entry(clip, self.generation));
+        }
+        let last = clip.last_frame();
+        if clip.t_of(last).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
+            timeline.push(static_entry(clip, quiet_from, last));
+        }
+        for &(instant, width, height) in &self.resizes {
+            picks.push(pick(clip, instant, "first frame after resize"));
+            timeline.push(region_entry(
+                clip,
+                "change",
+                instant,
+                instant,
+                0,
+                None,
+                &format!("window size changed; recorded size now {width}x{height}"),
+            ));
+        }
+        timeline.extend(minimized_entries(clip));
+        timeline.sort_by_key(|entry| (entry.start_ms, entry.end_ms));
+        picks.push(pick(clip, last, "last frame"));
+        let picks = with_floor(clip, merge_picks(picks));
+
+        let count = |outcome: Outcome| {
+            events
+                .iter()
+                .filter(|event| event.outcome == outcome)
+                .count()
+        };
+        let repeated = clip.lines.iter().filter(|line| !line.new).count();
+        let mut notes = vec![
+            format!(
+                "{} changes, {} short-lived changes, {} changes that returned and {} animations found; {repeated} repeated frames skipped by frames.jsonl flags; {} new frames showed no visible change",
+                count(Outcome::Changed),
+                count(Outcome::Flash),
+                count(Outcome::Reverted),
+                count(Outcome::Animation),
+                self.still_frames
+            ),
+            format!(
+                "change test: {BLOCK}x{BLOCK} blocks at recorded resolution, largest R/G/B difference; a block differs from its last settled picture when {N_HI} pixels differ by more than {DELTA_HI} or {N_LO} by more than {DELTA_LO}; settled after {SETTLE_MS} ms without change; short-lived = back within {SHORT_LIVED_MS} ms"
+            ),
+        ];
+        if clip.clip.observer.cursor_in_picture {
+            notes.push(format!(
+                "the cursor is in the picture on this Windows; a {CURSOR_MASK_PX} px box at its logged position is masked"
+            ));
+        }
+        if carets > 0 {
+            notes.push(format!("{carets} blinking caret toggles ignored"));
+        }
+        let lost = clip.clip.lost.len();
+        if lost > 0 {
+            notes.push(format!(
+                "{lost} instants are lost (clip.json lost lists each with its cause)"
+            ));
+        }
+        if clip.last_frame() + 1 < clip.lines.len() as u64 {
+            notes.push(format!(
+                "only the committed part is shown: {} of {} ms (state {})",
+                clip.duration_ms(),
+                clip.recorded_ms(),
+                clip.clip.state.as_str()
+            ));
+        }
+        let unsettled = events
+            .iter()
+            .filter(|event| event.outcome != Outcome::Animation && !event.settled)
+            .count();
+        if unsettled > 0 {
+            notes.push(format!(
+                "{unsettled} changes had not settled when the clip ended or the window size changed"
+            ));
+        }
+        if let Some(reason) = clip.clip.stop_reason
+            && reason != super::clip_folder::StopReason::Completed
+        {
+            notes.push(format!("the recording stopped: {}", reason.as_str()));
+        }
+        Analysis {
+            version: ANALYSIS_VERSION,
+            inputs: String::new(),
+            timeline,
+            picks,
+            notes,
+        }
+    }
+}
+
+/// One reported change (D5 step 4): block episodes with the same outcome
+/// whose intervals overlap and whose blocks are 8-neighbours, a gap of
+/// `REGION_GAP_BLOCKS` allowed.
+struct Event {
+    outcome: Outcome,
+    grid: Grid,
+    generation: u64,
+    start: u64,
+    end: u64,
+    /// Its blocks, each once, in index order.
+    blocks: Vec<usize>,
+    settled: bool,
+    running: bool,
+    /// FLASH, REVERTED: the instant at which most of its blocks were DIFF
+    /// from their anchors.
+    peak: u64,
+    /// CHANGED: per block (index order) the anchor and the new picture, and
+    /// the box of the pixels that changed.
+    pictures: Vec<(usize, Vec<u8>, Vec<u8>)>,
+    footprint: Option<(usize, usize, usize, usize)>,
+}
+
+impl Event {
+    fn join_all(mut episodes: Vec<BlockEpisode>) -> Vec<Self> {
+        episodes.sort_by_key(|episode| (episode.generation, episode.outcome, episode.start));
+        let mut root: Vec<usize> = (0..episodes.len()).collect();
+        // Episodes of the same kind whose interval still reaches the start
+        // of the next one.
+        let mut open: Vec<usize> = Vec::new();
+        for (index, episode) in episodes.iter().enumerate() {
+            open.retain(|&other| {
+                let other = &episodes[other];
+                (other.generation, other.outcome) == (episode.generation, episode.outcome)
+                    && other.end >= episode.start
+            });
+            for &other in &open {
+                if episode
+                    .grid
+                    .near(episode.block, episodes[other].block, REGION_GAP_BLOCKS)
+                {
+                    let (a, b) = (find_root(&mut root, index), find_root(&mut root, other));
+                    root[a] = b;
+                }
+            }
+            open.push(index);
+        }
+        let mut groups: BTreeMap<usize, Vec<BlockEpisode>> = BTreeMap::new();
+        for (index, episode) in episodes.into_iter().enumerate() {
+            groups
+                .entry(find_root(&mut root, index))
+                .or_default()
+                .push(episode);
+        }
+        groups.into_values().map(Self::from_episodes).collect()
+    }
+
+    fn from_episodes(mut group: Vec<BlockEpisode>) -> Self {
+        group.sort_by_key(|episode| (episode.block, episode.start));
+        let (outcome, grid, generation) = (group[0].outcome, group[0].grid, group[0].generation);
+        let start = group.iter().map(|episode| episode.start).min().unwrap_or(0);
+        let end = group
+            .iter()
+            .map(|episode| episode.end)
+            .max()
+            .unwrap_or(start);
+        let mut differed: BTreeMap<u64, usize> = BTreeMap::new();
+        for at in group.iter().flat_map(|episode| &episode.differed) {
+            *differed.entry(*at).or_default() += 1;
+        }
+        let peak = differed
+            .iter()
+            .max_by_key(|(at, count)| (**count, std::cmp::Reverse(**at)))
+            .map_or(start, |(at, _)| *at);
+        let mut blocks: Vec<usize> = group.iter().map(|episode| episode.block).collect();
+        blocks.dedup();
+        Self {
+            outcome,
+            grid,
+            generation,
+            start,
+            end,
+            blocks,
+            settled: group.iter().all(|episode| episode.settled),
+            running: group.iter().any(|episode| episode.running),
+            peak,
+            footprint: group.iter().filter_map(|episode| episode.footprint).reduce(
+                |(a0, b0, a1, b1), (x0, y0, x1, y1)| {
+                    (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
+                },
+            ),
+            pictures: group
+                .into_iter()
+                .filter(|episode| !episode.after.is_empty())
+                .map(|episode| (episode.block, episode.before, episode.after))
+                .collect(),
+        }
+    }
+
+    /// D5 step 5: removes blinking carets, thin changes in one place that
+    /// alternate between two pictures (one of them the anchor) for at least
+    /// `CARET_MIN_CYCLES` cycles with a half-period in `CARET_HALF_PERIOD_MS`.
+    /// `events` are in start order; returns the rest and the toggles removed.
+    fn without_carets(events: Vec<Self>, clip: &ViewedClip) -> (Vec<Self>, usize) {
+        let mut places: BTreeMap<(u64, &[usize]), Vec<usize>> = BTreeMap::new();
+        for (index, event) in events.iter().enumerate() {
+            if event.caret_shaped(clip.scale_at(event.start) as usize) {
+                places
+                    .entry((event.generation, event.blocks.as_slice()))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut caret = vec![false; events.len()];
+        for toggles in places.values() {
+            let runs = toggles.chunk_by(|&earlier, &later| {
+                let half = clip
+                    .t_of(events[later].start)
+                    .saturating_sub(clip.t_of(events[earlier].start));
+                CARET_HALF_PERIOD_MS.contains(&half) && events[later].undoes(&events[earlier])
+            });
+            for run in runs.filter(|run| run.len() >= 2 * CARET_MIN_CYCLES) {
+                for &index in run {
+                    caret[index] = true;
+                }
+            }
+        }
+        let removed = caret.iter().filter(|caret| **caret).count();
+        let kept = events
+            .into_iter()
+            .zip(caret)
+            .filter_map(|(event, caret)| (!caret).then_some(event))
+            .collect();
+        (kept, removed)
+    }
+
+    /// A CHANGED event at most `CARET_MAX_WIDTH_PX` wide and
+    /// `CARET_HEIGHT_PX` tall, each of its blocks changed once.
+    fn caret_shaped(&self, scale: usize) -> bool {
+        let to_window =
+            |pixels: usize| u32::try_from(pixels.div_ceil(scale.max(1))).unwrap_or(u32::MAX);
+        self.outcome == Outcome::Changed
+            && self.pictures.len() == self.blocks.len()
+            && self.footprint.is_some_and(|(x0, y0, x1, y1)| {
+                to_window(x1 + 1 - x0) <= CARET_MAX_WIDTH_PX
+                    && CARET_HEIGHT_PX.contains(&to_window(y1 + 1 - y0))
+            })
+    }
+
+    /// `true` when this change brings every block back to the picture it
+    /// had before `earlier`.
+    fn undoes(&self, earlier: &Self) -> bool {
+        self.pictures.len() == earlier.pictures.len()
+            && self.pictures.iter().zip(&earlier.pictures).all(
+                |((block, _, after), (earlier_block, before, _))| {
+                    block == earlier_block
+                        && Verdict::of(after.chunks_exact(3).zip(before.chunks_exact(3)))
+                            == Verdict::Same
+                },
+            )
+    }
+
+    /// D5 step 6: one image per event.
+    fn picks(&self, clip: &ViewedClip) -> Vec<Pick> {
+        match self.outcome {
+            Outcome::Changed => vec![pick(clip, self.end, "first settled frame after change")],
+            Outcome::Flash => vec![pick(clip, self.peak, "short-lived change")],
+            Outcome::Reverted => vec![pick(clip, self.peak, "change that returned")],
+            Outcome::Animation if self.running => vec![pick(clip, self.start, "animating region")],
+            Outcome::Animation => vec![
+                pick(clip, self.start, "animating region"),
+                pick(clip, self.end, "animation end"),
+            ],
+        }
+    }
+
+    fn entry(&self, clip: &ViewedClip, last_generation: u64) -> ClipTimelineEntry {
+        let bbox = self.grid.bbox(self.blocks.iter().copied());
+        if self.outcome == Outcome::Animation {
+            return region_entry(
+                clip,
+                "animating",
+                self.start,
+                self.end,
+                self.blocks.len(),
+                bbox,
+                "region kept changing (animation)",
+            );
+        }
+        let (start_ms, end_ms) = (clip.t_of(self.start), clip.t_of(self.end));
+        let area = bbox.map_or_else(String::new, |r| {
+            format!(" in x={} y={} w={} h={}", r.x, r.y, r.w, r.h)
+        });
+        let outcome = match self.outcome {
+            Outcome::Flash => format!(
+                "short-lived: back to the previous picture at {}",
+                fmt_time(end_ms)
+            ),
+            Outcome::Reverted => {
+                format!("returned to the previous picture at {}", fmt_time(end_ms))
+            }
+            _ if self.settled => format!("settled at {} (frame {})", fmt_time(end_ms), self.end),
+            _ if self.generation == last_generation => {
+                "still changing when the clip ended".to_owned()
+            }
+            _ => "still changing when the window size changed".to_owned(),
+        };
+        let count = self.blocks.len() as u64;
+        ClipTimelineEntry {
+            kind: if self.outcome == Outcome::Flash {
+                "short_lived"
+            } else {
+                "change"
+            }
+            .to_owned(),
+            start_ms,
+            end_ms,
+            start_frame: self.start,
+            end_frame: self.end,
+            changed_blocks: count,
+            bbox,
+            text: format!(
+                "{}-{} change: {count} blocks ({}% of the picture){area}; {outcome}",
+                fmt_time(start_ms),
+                fmt_time(end_ms),
+                self.grid.percent(count)
+            ),
+        }
+    }
+}
+
+/// The root of `index` in a union-find forest, halving the path on the way.
+fn find_root(root: &mut [usize], mut index: usize) -> usize {
+    while root[index] != index {
+        root[index] = root[root[index]];
+        index = root[index];
+    }
+    index
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -693,503 +1425,6 @@ struct Analysis {
     timeline: Vec<ClipTimelineEntry>,
     picks: Vec<Pick>,
     notes: Vec<String>,
-}
-
-/// One decode pass over the committed segments that finds the changes.
-struct Analyzer<'a> {
-    clip: &'a ViewedClip,
-    width: usize,
-    height: usize,
-    shown: Vec<u8>,
-    states: Vec<BlockState>,
-    open: Vec<Episode>,
-    done: Vec<Episode>,
-    animations: Vec<Animation>,
-    resizes: Vec<(u64, usize, usize)>,
-    /// Goes up on every size change; changes are compared and merged only
-    /// within one generation, also when a later resize restores the size.
-    generation: u64,
-    /// Captured size (frames.jsonl) of the picture last decoded.
-    captured: (u32, u32),
-    previous: u64,
-    decoded: u64,
-    new_without_change: u64,
-    masked_carets: u64,
-}
-
-impl<'a> Analyzer<'a> {
-    fn run(clip: &'a ViewedClip) -> Result<Analysis, ErrorData> {
-        let mut analyzer = Self {
-            clip,
-            width: 0,
-            height: 0,
-            shown: Vec::new(),
-            states: Vec::new(),
-            open: Vec::new(),
-            done: Vec::new(),
-            animations: Vec::new(),
-            resizes: Vec::new(),
-            generation: 0,
-            captured: (0, 0),
-            previous: 0,
-            decoded: 0,
-            new_without_change: 0,
-            masked_carets: 0,
-        };
-        for segment in &clip.clip.segments {
-            let mut decoder = clip.open_decoder(segment)?;
-            while let Some(frame) = decoder.next_frame().map_err(decode_error)? {
-                analyzer.decoded += 1;
-                let local = frame.t_ms() * clip.fps() / 1_000;
-                let instant = (segment.first_instant + local).min(segment.last_instant);
-                analyzer.step(instant, &frame);
-            }
-        }
-        analyzer.close_open(false);
-        Ok(analyzer.finish())
-    }
-
-    fn step(&mut self, instant: u64, frame: &DecodedFrame) {
-        let (width, height) = (frame.width as usize, frame.height as usize);
-        let current = rgb(&frame.bgra);
-        // A resize is a change of the captured size in frames.jsonl: an odd
-        // size padded up to even can decode at the same size as before.
-        let captured = self
-            .clip
-            .line(instant)
-            .filter(|line| line.width != 0 && line.height != 0)
-            .map_or(self.captured, |line| (line.width, line.height));
-        if (width, height) != (self.width, self.height) || captured != self.captured {
-            self.captured = captured;
-            if self.width != 0 {
-                self.close_open(true);
-                self.resizes.push((instant, width, height));
-            }
-            self.width = width;
-            self.height = height;
-            self.generation += 1;
-            self.states =
-                vec![BlockState::default(); width.div_ceil(BLOCK) * height.div_ceil(BLOCK)];
-            self.shown = current;
-            self.previous = instant;
-            return;
-        }
-        let t_ms = self.clip.t_of(instant);
-        self.close_settled(t_ms);
-        if !self.clip.is_new(instant) {
-            return;
-        }
-        let mut blocks = BlockMap::between(&self.shown, &current, width, height);
-        self.mask_cursor(&mut blocks, instant);
-        self.mask_caret(&mut blocks, &current, instant);
-        self.previous = instant;
-        if blocks.count == 0 {
-            self.new_without_change += 1;
-        }
-        let before = std::mem::replace(&mut self.shown, current);
-        // D5 step 1: which blocks animate now.
-        let core = self.track_activity(&blocks, t_ms, instant);
-        // Step 2: animating blocks leave the change set and form animations;
-        // changed blocks next to an animation are its slower parts.
-        let mut remaining = blocks;
-        for index in 0..core.changed.len() {
-            if core.changed[index] {
-                remaining.unset(index);
-            }
-        }
-        self.track_animations(&core, instant);
-        for group in remaining.block_groups_within(ANIMATION_ABSORB_GAP_BLOCKS) {
-            let generation = self.generation;
-            if let Some(animation) = self.animations.iter_mut().find(|animation| {
-                animation.generation == generation
-                    && animation.seen == instant
-                    && animation.core.touches(&group, ANIMATION_ABSORB_GAP_BLOCKS)
-            }) {
-                for &index in &group {
-                    animation.area.set(index);
-                    remaining.unset(index);
-                }
-            }
-        }
-        // Step 3: every other connected region is tracked on its own.
-        for group in remaining.block_groups_within(REGION_GAP_BLOCKS) {
-            self.track_region(&group, &before, instant);
-        }
-    }
-
-    /// D5: a block animates while it changed in at least
-    /// `ANIMATING_CHANGE_SHARE` of the frames of the last `SHORT_LIVED_MS`.
-    /// Returns the animating blocks.
-    fn track_activity(&mut self, blocks: &BlockMap, t_ms: u64, instant: u64) -> BlockMap {
-        let window_frames = (SHORT_LIVED_MS * self.clip.fps() / 1_000).max(1);
-        let needed = (window_frames as f64 * ANIMATING_CHANGE_SHARE).ceil() as usize;
-        let mut core = BlockMap::empty(self.width, self.height);
-        for (index, state) in self.states.iter_mut().enumerate() {
-            while state
-                .recent
-                .front()
-                .is_some_and(|&at| self.clip.t_of(at) + SHORT_LIVED_MS <= t_ms)
-            {
-                state.recent.pop_front();
-            }
-            if blocks.changed[index] {
-                state.recent.push_back(instant);
-            }
-            state.animating = state.recent.len() >= needed;
-            if state.animating {
-                core.set(index);
-            }
-        }
-        core
-    }
-
-    /// D5: each connected group of animating blocks (one block of gap
-    /// allowed) joins the open animations its blocks touch, or starts one.
-    fn track_animations(&mut self, core: &BlockMap, instant: u64) {
-        let t_ms = self.clip.t_of(instant);
-        for group in core.block_groups_within(ANIMATION_GAP_BLOCKS) {
-            let start = group
-                .iter()
-                .filter_map(|&index| self.states[index].recent.front().copied())
-                .min()
-                .unwrap_or(instant);
-            let end = group
-                .iter()
-                .filter_map(|&index| self.states[index].recent.back().copied())
-                .max()
-                .unwrap_or(instant);
-            let mut joined: Option<Animation> = None;
-            let mut at = self.animations.len();
-            while at > 0 {
-                at -= 1;
-                let animation = &self.animations[at];
-                let open = t_ms.saturating_sub(self.clip.t_of(animation.seen)) <= SETTLE_MS;
-                if animation.generation == self.generation
-                    && open
-                    && animation.core.touches(&group, ANIMATION_GAP_BLOCKS)
-                {
-                    let animation = self.animations.remove(at);
-                    joined = Some(match joined {
-                        Some(joined) => joined.join(animation),
-                        None => animation,
-                    });
-                }
-            }
-            let mut animation = joined.unwrap_or_else(|| Animation {
-                start,
-                end,
-                seen: instant,
-                core: BlockMap::empty(self.width, self.height),
-                area: BlockMap::empty(self.width, self.height),
-                generation: self.generation,
-            });
-            animation.start = animation.start.min(start);
-            animation.end = animation.end.max(end);
-            animation.seen = instant;
-            for &index in &group {
-                animation.core.set(index);
-                animation.area.set(index);
-            }
-            self.animations.push(animation);
-        }
-    }
-
-    /// D5 step 3: a changed region joins the open regions its blocks touch
-    /// (one block of gap allowed), or starts one. Each new block keeps its
-    /// picture from before the change.
-    fn track_region(&mut self, group: &[usize], before: &[u8], instant: u64) {
-        let mut joined: Option<Episode> = None;
-        let mut at = self.open.len();
-        while at > 0 {
-            at -= 1;
-            if self.open[at].blocks.touches(group, REGION_GAP_BLOCKS) {
-                let region = self.open.remove(at);
-                joined = Some(match joined {
-                    Some(joined) => joined.join(region),
-                    None => region,
-                });
-            }
-        }
-        let mut region = joined.unwrap_or_else(|| Episode {
-            start_frame: instant,
-            last_change_frame: instant,
-            blocks: BlockMap::empty(self.width, self.height),
-            baseline: std::collections::HashMap::new(),
-            short_lived: false,
-            reverted: false,
-            settled: false,
-            generation: self.generation,
-        });
-        let (width, height, cols) = (self.width, self.height, region.blocks.cols);
-        for &index in group {
-            region.blocks.set(index);
-            region
-                .baseline
-                .entry(index)
-                .or_insert_with(|| block_pixels(before, width, height, cols, index));
-        }
-        region.last_change_frame = instant;
-        self.open.push(region);
-    }
-
-    /// Closes the open regions that had no change for `SETTLE_MS`.
-    fn close_settled(&mut self, t_ms: u64) {
-        let mut at = self.open.len();
-        while at > 0 {
-            at -= 1;
-            let quiet = t_ms.saturating_sub(self.clip.t_of(self.open[at].last_change_frame));
-            if quiet >= SETTLE_MS {
-                let region = self.open.remove(at);
-                self.close(region, true);
-            }
-        }
-    }
-
-    /// Closes every open region (a resize, or the end of the clip).
-    fn close_open(&mut self, settled: bool) {
-        let mut open = std::mem::take(&mut self.open);
-        open.sort_by_key(|region| region.start_frame);
-        for region in open {
-            self.close(region, settled);
-        }
-    }
-
-    /// D5: the blocks under the logged cursor (now and at the last instant)
-    /// do not count as changed when the cursor is in the picture.
-    fn mask_cursor(&self, blocks: &mut BlockMap, instant: u64) {
-        let box_px = i64::from(CURSOR_MASK_PX * self.clip.scale());
-        for at in [self.previous, instant] {
-            let Some((x, y)) = self.clip.cursor_at(at) else {
-                continue;
-            };
-            let (x0, y0) = ((x - box_px / 2).max(0), (y - box_px / 2).max(0));
-            let to_block = |value: i64| usize::try_from(value).unwrap_or(0) / BLOCK;
-            for row in to_block(y0)..=to_block(y0 + box_px).min(blocks.rows.saturating_sub(1)) {
-                for col in to_block(x0)..=to_block(x0 + box_px).min(blocks.cols.saturating_sub(1)) {
-                    blocks.unset(row * blocks.cols + col);
-                }
-            }
-        }
-    }
-
-    /// D5: a changed region at most `CARET_MAX_WIDTH_PX` wide that changed
-    /// in the same blocks within two caret periods is a blinking caret.
-    fn mask_caret(&mut self, blocks: &mut BlockMap, current: &[u8], instant: u64) {
-        let caret_width =
-            usize::try_from(CARET_MAX_WIDTH_PX * self.clip.scale()).unwrap_or(usize::MAX);
-        let period = 2 * CARET_PERIOD_MS;
-        for region in blocks.block_groups() {
-            let width = pixel_width(
-                &self.shown,
-                current,
-                self.width,
-                self.height,
-                blocks.cols,
-                &region,
-            );
-            if width == 0 || width > caret_width {
-                continue;
-            }
-            let toggled = region.iter().any(|&index| {
-                self.states[index].last_caret.is_some_and(|at| {
-                    self.clip.t_of(instant).saturating_sub(self.clip.t_of(at)) <= period
-                })
-            });
-            for &index in &region {
-                self.states[index].last_caret = Some(instant);
-                if toggled {
-                    blocks.unset(index);
-                }
-            }
-            if toggled {
-                self.masked_carets += 1;
-            }
-        }
-    }
-
-    /// Ends a changed region; marks it short-lived when its blocks show their
-    /// picture from before it again within `SHORT_LIVED_MS`, also when the
-    /// return came as a separate region right after.
-    fn close(&mut self, mut region: Episode, settled: bool) {
-        let span = |clip: &ViewedClip, start: u64, end: u64| clip.t_of(end) - clip.t_of(start);
-        region.settled = settled;
-        let blocks: Vec<usize> = region.blocks.indices().collect();
-        // A region next to an animation that was animating by its end is
-        // that animation's start-up (its blocks change before they count as
-        // animating): part of the animation, not a change.
-        let (generation, started) = (region.generation, region.start_frame);
-        if let Some(animation) = self.animations.iter_mut().find(|animation| {
-            animation.generation == generation
-                && animation.seen >= started
-                && animation.core.touches(&blocks, ANIMATION_ABSORB_GAP_BLOCKS)
-        }) {
-            animation.start = animation.start.min(region.start_frame);
-            for &index in &blocks {
-                animation.area.set(index);
-            }
-            return;
-        }
-        if region.back_to_baseline(&blocks, &self.shown) {
-            region.reverted = true;
-            region.short_lived =
-                span(self.clip, region.start_frame, region.last_change_frame) <= SHORT_LIVED_MS;
-        }
-        // A resize ends comparison continuity: a change before it is never
-        // compared with, or merged into, a picture of another size.
-        if !region.reverted
-            && let Some(previous) = self.done.iter_mut().rev().find(|previous| {
-                !previous.reverted
-                    && !previous.baseline.is_empty()
-                    && previous.generation == region.generation
-                    && previous.blocks.touches(&blocks, REGION_GAP_BLOCKS)
-            })
-            && span(self.clip, previous.start_frame, region.last_change_frame) <= SHORT_LIVED_MS
-        {
-            let previous_blocks: Vec<usize> = previous.blocks.indices().collect();
-            let own: Vec<usize> = blocks
-                .iter()
-                .copied()
-                .filter(|index| !previous.baseline.contains_key(index))
-                .collect();
-            if previous.back_to_baseline(&previous_blocks, &self.shown)
-                && region.back_to_baseline(&own, &self.shown)
-            {
-                previous.reverted = true;
-                previous.short_lived = true;
-                previous.settled = settled;
-                previous.last_change_frame = region.last_change_frame;
-                previous.blocks.merge(&region.blocks);
-                previous.baseline.clear();
-                return;
-            }
-        }
-        // Baselines are kept only while a return can still follow.
-        let now = self.clip.t_of(region.last_change_frame);
-        for previous in &mut self.done {
-            if now.saturating_sub(self.clip.t_of(previous.start_frame)) > SHORT_LIVED_MS {
-                previous.baseline.clear();
-            }
-        }
-        if region.reverted {
-            region.baseline.clear();
-        }
-        self.done.push(region);
-    }
-
-    fn finish(mut self) -> Analysis {
-        self.done.sort_by_key(|region| region.start_frame);
-        let clip = self.clip;
-        let first = clip
-            .clip
-            .segments
-            .first()
-            .map_or(0, |segment| segment.first_instant);
-        let mut picks = vec![pick(clip, first, "first frame")];
-        let mut timeline = Vec::new();
-        let mut quiet_from = first;
-        for episode in &self.done {
-            let start = episode.start_frame;
-            let end = episode.last_change_frame;
-            if clip.t_of(start).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
-                timeline.push(static_entry(clip, quiet_from, start.saturating_sub(1)));
-            }
-            quiet_from = quiet_from.max(end);
-            picks.push(pick(
-                clip,
-                start.saturating_sub(1),
-                "last frame before change",
-            ));
-            if episode.short_lived {
-                picks.push(pick(clip, start, "short-lived change start"));
-            } else {
-                picks.push(pick(clip, end, "first settled frame after change"));
-            }
-            timeline.push(episode_entry(clip, episode));
-        }
-        let last = clip.last_frame();
-        if clip.t_of(last).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
-            timeline.push(static_entry(clip, quiet_from, last));
-        }
-        for animation in &self.animations {
-            let bbox = animation.area.bbox();
-            picks.push(pick(clip, animation.start, "animating region"));
-            timeline.push(region_entry(
-                clip,
-                "animating",
-                animation.start,
-                animation.end,
-                usize::try_from(animation.area.count).unwrap_or(usize::MAX),
-                bbox,
-                "region kept changing (animation); one frame shown",
-            ));
-        }
-        for &(instant, width, height) in &self.resizes {
-            picks.push(pick(clip, instant, "first frame after resize"));
-            timeline.push(region_entry(
-                clip,
-                "change",
-                instant,
-                instant,
-                0,
-                None,
-                &format!("window size changed; recorded size now {width}x{height}"),
-            ));
-        }
-        timeline.extend(minimized_entries(clip));
-        timeline.sort_by_key(|entry| (entry.start_ms, entry.end_ms));
-        picks.push(pick(clip, last, "last frame"));
-        let picks = with_floor(clip, merge_picks(picks));
-
-        let repeated = clip.lines.iter().filter(|line| !line.new).count();
-        let mut notes = vec![
-            format!(
-                "{} changes, {} short-lived region changes and {} animating regions found; {repeated} repeated frames skipped by frames.jsonl flags; {} new frames showed no visible change",
-                self.done.iter().filter(|region| !region.short_lived).count(),
-                self.done.iter().filter(|region| region.short_lived).count(),
-                self.animations.len(),
-                self.new_without_change
-            ),
-            "change test: 8x8 blocks at recorded resolution, largest R/G/B difference; settled after 200 ms, short-lived = back within 500 ms, per region".to_owned(),
-        ];
-        if clip.clip.observer.cursor_in_picture {
-            notes.push("the cursor is in the picture on this Windows; a 48 px box at its logged position is masked".to_owned());
-        }
-        if self.masked_carets > 0 {
-            notes.push(format!(
-                "{} blinking caret toggles ignored",
-                self.masked_carets
-            ));
-        }
-        let lost = clip.clip.lost.len();
-        if lost > 0 {
-            notes.push(format!(
-                "{lost} instants are lost (clip.json lost lists each with its cause)"
-            ));
-        }
-        if clip.last_frame() + 1 < clip.lines.len() as u64 {
-            notes.push(format!(
-                "only the committed part is shown: {} of {} ms (state {})",
-                clip.duration_ms(),
-                clip.recorded_ms(),
-                clip.clip.state.as_str()
-            ));
-        }
-        if self.done.last().is_some_and(|episode| !episode.settled) {
-            notes.push("the last change had not settled when the clip ended".to_owned());
-        }
-        if let Some(reason) = clip.clip.stop_reason
-            && reason != super::clip_folder::StopReason::Completed
-        {
-            notes.push(format!("the recording stopped: {}", reason.as_str()));
-        }
-        Analysis {
-            version: ANALYSIS_VERSION,
-            inputs: String::new(),
-            timeline,
-            picks,
-            notes,
-        }
-    }
 }
 
 /// The `minimized` intervals: consecutive instants marked minimized.
@@ -1260,89 +1495,6 @@ fn region_entry(
     }
 }
 
-/// The bounding box of a set of blocks, in recorded pixels.
-fn blocks_bbox(blocks: &[usize], cols: usize, width: usize, height: usize) -> Option<Rect> {
-    let cols = cols.max(1);
-    let (mut c0, mut r0, mut c1, mut r1) = (usize::MAX, usize::MAX, 0, 0);
-    for &index in blocks {
-        let (col, row) = (index % cols, index / cols);
-        (c0, r0, c1, r1) = (c0.min(col), r0.min(row), c1.max(col), r1.max(row));
-    }
-    (c0 != usize::MAX).then(|| {
-        let x = c0 * BLOCK;
-        let y = r0 * BLOCK;
-        rect(
-            x,
-            y,
-            ((c1 + 1) * BLOCK).min(width) - x,
-            ((r1 + 1) * BLOCK).min(height) - y,
-        )
-    })
-}
-
-/// The RGB pixels of one block.
-fn block_pixels(rgb: &[u8], width: usize, height: usize, cols: usize, index: usize) -> Vec<u8> {
-    let (col, row) = (index % cols.max(1), index / cols.max(1));
-    let mut out = Vec::with_capacity(BLOCK * BLOCK * 3);
-    for y in row * BLOCK..((row + 1) * BLOCK).min(height) {
-        let start = (y * width + col * BLOCK) * 3;
-        let end = (y * width + ((col + 1) * BLOCK).min(width)) * 3;
-        out.extend_from_slice(rgb.get(start..end).unwrap_or_default());
-    }
-    out
-}
-
-/// `true` when two blocks pass the change test as unchanged.
-fn block_equal(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.chunks_exact(3)
-            .zip(b.chunks_exact(3))
-            .filter(|(pa, pb)| {
-                pa.iter()
-                    .zip(pb.iter())
-                    .map(|(ca, cb)| ca.abs_diff(*cb))
-                    .max()
-                    .unwrap_or(0)
-                    > PIXEL_DELTA
-            })
-            .count()
-            < MIN_CHANGED_PIXELS as usize
-}
-
-/// The width in pixels of the changed pixels inside a group of blocks.
-fn pixel_width(
-    before: &[u8],
-    after: &[u8],
-    width: usize,
-    height: usize,
-    cols: usize,
-    region: &[usize],
-) -> usize {
-    let (mut x0, mut x1) = (usize::MAX, 0);
-    for &index in region {
-        let (col, row) = (index % cols.max(1), index / cols.max(1));
-        for y in row * BLOCK..((row + 1) * BLOCK).min(height) {
-            for x in col * BLOCK..((col + 1) * BLOCK).min(width) {
-                let at = (y * width + x) * 3;
-                let (Some(a), Some(b)) = (before.get(at..at + 3), after.get(at..at + 3)) else {
-                    continue;
-                };
-                let delta = a
-                    .iter()
-                    .zip(b)
-                    .map(|(ca, cb)| ca.abs_diff(*cb))
-                    .max()
-                    .unwrap_or(0);
-                if delta > PIXEL_DELTA {
-                    x0 = x0.min(x);
-                    x1 = x1.max(x);
-                }
-            }
-        }
-    }
-    if x0 == usize::MAX { 0 } else { x1 - x0 + 1 }
-}
-
 fn pick(clip: &ViewedClip, frame: u64, reason: &str) -> Pick {
     Pick {
         frame,
@@ -1403,54 +1555,6 @@ fn static_entry(clip: &ViewedClip, from: u64, to: u64) -> ClipTimelineEntry {
             fmt_time(start_ms),
             fmt_time(end_ms),
             (end_ms - start_ms) as f64 / 1_000.0
-        ),
-    }
-}
-
-fn episode_entry(clip: &ViewedClip, episode: &Episode) -> ClipTimelineEntry {
-    let (start_ms, end_ms) = (
-        clip.t_of(episode.start_frame),
-        clip.t_of(episode.last_change_frame),
-    );
-    let bbox = episode.blocks.bbox();
-    let area = bbox.map_or_else(String::new, |r| {
-        format!(" in x={} y={} w={} h={}", r.x, r.y, r.w, r.h)
-    });
-    let outcome = if episode.short_lived {
-        format!(
-            "short-lived: back to the previous picture at {}",
-            fmt_time(end_ms)
-        )
-    } else if episode.reverted {
-        format!("returned to the previous picture at {}", fmt_time(end_ms))
-    } else if episode.settled {
-        format!(
-            "settled at {} (frame {})",
-            fmt_time(end_ms),
-            episode.last_change_frame
-        )
-    } else {
-        "still changing when the clip ended".to_owned()
-    };
-    ClipTimelineEntry {
-        kind: if episode.short_lived {
-            "short_lived"
-        } else {
-            "change"
-        }
-        .to_owned(),
-        start_ms,
-        end_ms,
-        start_frame: episode.start_frame,
-        end_frame: episode.last_change_frame,
-        changed_blocks: episode.blocks.count,
-        bbox,
-        text: format!(
-            "{}-{} change: {} blocks ({}% of the picture){area}; {outcome}",
-            fmt_time(start_ms),
-            fmt_time(end_ms),
-            episode.blocks.count,
-            episode.blocks.percent()
         ),
     }
 }
@@ -1702,8 +1806,7 @@ impl ClipView {
             );
             return Ok(());
         }
-        let (width, height) = (before.width as usize, before.height as usize);
-        let blocks = BlockMap::between(&rgb(&before.bgra), &rgb(&after.bgra), width, height);
+        let blocks = BlockMap::between(&Picture::new(&before), &Picture::new(&after));
         let mut regions = blocks.regions();
         let _ = writeln!(
             self.text,

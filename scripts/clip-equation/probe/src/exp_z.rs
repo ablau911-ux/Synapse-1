@@ -1046,6 +1046,8 @@ pub fn run() -> Result<()> {
     let rep: u32 = args.number("rep", 1)?;
     let rate = args.rate()?;
     let mut corpus = Corpus::open(&folder)?;
+    // `frames=N`: only the first N new frames (pilot of slow levels; v is per byte). D_wait stays the folder's.
+    corpus.new_frames = corpus.new_frames.min(args.number("frames", usize::MAX)?);
     let (w, h) = (corpus.w, corpus.h);
     let px = w * h;
     let way = Way::from_args(&args, px * 3)?;

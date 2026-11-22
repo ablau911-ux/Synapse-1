@@ -48,10 +48,46 @@ class CorpusFolder {
 }
 
 const num = (v) => (v === undefined || v === '' ? NaN : Number(v));
-const configKey = (r) => ['folder', 'way', 'level', 'layout', 'mode', 'tile', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'pred']
+const configKey = (r) => ['folder', 'way', 'level', 'layout', 'mode', 'tile', 'wlog', 'ldm', 'dict', 'workers', 'kz', 'theta', 'drain']
   .map((k) => r[k]).join('|');
 const isIndependent = (r) => INDEPENDENT_WAYS.has(r.way);
 const within = (known, measured, tol) => Math.abs(measured - known) <= tol * Math.abs(measured);
+
+/** The per-row checks of one run: { scenario, known, measured, ok } or { scenario, note }. */
+export function rowChecks(r, folder) {
+  const px = num(r.w) * num(r.h);
+  // A pilot run may cover only the first `frames_cap` new frames: then N_comp = that cap.
+  const cap = num(r.frames_cap);
+  const nKnown = Number.isFinite(cap) && cap > 0 ? Math.min(cap, folder.nNew) : folder.nNew;
+  const out = [];
+  const add = (scenario, known, measured, ok) => out.push({ scenario, known, measured, ok });
+  add('frames', nKnown, num(r.frames), num(r.frames) === nKnown);
+  add('bytes', `Σ out ${r.bytes_out}`, `on disk ${r.bytes_disk}`, num(r.bytes_out) === num(r.bytes_disk) && num(r.bytes_disk) > 0);
+  if (r.way === 'ZW1' && num(r.level) === -3 && num(r.workers) === 0 && r.layout === 'bgr' && nKnown === folder.nNew) {
+    if (num(r.drain || 0) === 0) {
+      // The product's call (one-shot ZSTD_compress2, as zstd::bulk::compress): the row itself.
+      add('baseline', folder.dWait, num(r.bytes_disk), num(r.bytes_disk) === folder.dWait);
+    } else {
+      // The corpus writer's call reproduced (ZSTD_compressStream2, output drained `drain` bytes
+      // at a time, as Node zlib.zstdCompressSync): evidence for the cause of a miss, never a pass.
+      out.push({ scenario: 'baseline', note: `evidence, drain=${r.drain} (corpus writer's call) ${r.folder} rep ${r.rep}: D_wait ${folder.dWait}, bytes ${r.bytes_disk}, ${num(r.bytes_disk) === folder.dWait ? 'equal' : 'differ'}` });
+    }
+  }
+  const mComp = num(r.m0_private) + num(r.m_cctx_est) + num(r.bc) * px * 3;
+  add('ram', Math.round(mComp), num(r.peak_private), within(mComp, num(r.peak_private), RAM_TOLERANCE));
+  add('roundTrip', 0, num(r.diff_sum), num(r.diff_sum) === 0 && num(r.frames_decoded) === nKnown);
+  const kz = r.kz === 'all' ? folder.nNew : num(r.kz);
+  const independent = isIndependent(r);
+  const seekOk = independent ? num(r.n_dec_worst) === 1 : num(r.n_dec_worst) >= 1 && num(r.n_dec_worst) <= kz;
+  add('seek', independent ? 1 : `<= ${kz}`, num(r.n_dec_worst), seekOk);
+  const mDec = num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * px * 3;
+  add('ramDec', Math.round(mDec), num(r.dec_peak_private), within(mDec, num(r.dec_peak_private), RAM_TOLERANCE));
+  const readyMs = num(r.t_ready_ns) / 1e6;
+  add('ready', `<= ${INSTANT_MS} ms`, `${readyMs.toFixed(2)} ms`, readyMs <= INSTANT_MS);
+  return out;
+}
+
+export { CorpusFolder };
 
 /** One Gherkin scenario: its equation and a check per row. */
 class Scenario {
@@ -60,6 +96,7 @@ class Scenario {
     this.equation = equation;
     this.passed = 0;
     this.misses = [];
+    this.notes = [];
     this.pending = null;
   }
 
@@ -79,6 +116,7 @@ class Scenario {
     if (this.passed === 0 && this.misses.length === 0 && this.pending === null) out('        no rows to check');
     for (const miss of this.misses.slice(0, 8)) out(`        miss: ${miss}`);
     if (this.misses.length > 8) out(`        ... ${this.misses.length - 8} more`);
+    for (const note of this.notes.slice(0, 8)) out(`        ${note}`);
   }
 }
 
@@ -104,34 +142,20 @@ export function run(argv = process.argv.slice(2), out = console.log) {
 
   const byConfig = new Map();
   for (const r of rows) {
-    let folder;
+    let checks;
     try {
-      folder = CorpusFolder.of(corpusRoot, r.folder);
+      checks = rowChecks(r, CorpusFolder.of(corpusRoot, r.folder));
     } catch (e) {
       s.frames.check(r, 'corpus folder', `unreadable: ${e.message}`, false);
       continue;
     }
-    const px = num(r.w) * num(r.h);
-    s.frames.check(r, folder.nNew, num(r.frames), num(r.frames) === folder.nNew);
-    s.bytes.check(r, `Σ out ${r.bytes_out}`, `on disk ${r.bytes_disk}`, num(r.bytes_out) === num(r.bytes_disk) && num(r.bytes_disk) > 0);
-    if (r.way === 'ZW1' && num(r.level) === -3 && num(r.workers) === 0) {
-      s.baseline.check(r, folder.dWait, num(r.bytes_disk), num(r.bytes_disk) === folder.dWait);
+    for (const c of checks) {
+      if (c.note) s[c.scenario].notes.push(c.note);
+      else s[c.scenario].check(r, c.known, c.measured, c.ok);
     }
     const key = configKey(r);
     if (!byConfig.has(key)) byConfig.set(key, []);
     byConfig.get(key).push(r);
-
-    const mComp = num(r.m0_private) + num(r.m_cctx_est) + num(r.bc) * px * 3;
-    s.ram.check(r, Math.round(mComp), num(r.peak_private), within(mComp, num(r.peak_private), RAM_TOLERANCE));
-    s.roundTrip.check(r, 0, num(r.diff_sum), num(r.diff_sum) === 0 && num(r.frames_decoded) === folder.nNew);
-    const kz = r.kz === 'all' ? folder.nNew : num(r.kz);
-    const seekKnown = isIndependent(r) ? 1 : `<= ${kz}`;
-    const seekOk = isIndependent(r) ? num(r.n_dec_worst) === 1 : num(r.n_dec_worst) >= 1 && num(r.n_dec_worst) <= kz;
-    s.seek.check(r, seekKnown, num(r.n_dec_worst), seekOk);
-    const mDec = num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * px * 3;
-    s.ramDec.check(r, Math.round(mDec), num(r.dec_peak_private), within(mDec, num(r.dec_peak_private), RAM_TOLERANCE));
-    const readyMs = num(r.t_ready_ns) / 1e6;
-    s.ready.check(r, `<= ${INSTANT_MS} ms`, `${readyMs.toFixed(2)} ms`, readyMs <= INSTANT_MS);
   }
   for (const group of byConfig.values()) {
     if (group.length < 2) continue;

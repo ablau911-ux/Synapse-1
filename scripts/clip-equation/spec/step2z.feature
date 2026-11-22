@@ -30,6 +30,9 @@ Feature: Way Z, every zstd way compresses the corpus losslessly with known bytes
     Given way ZW1, whole frame, L = -3, independent frames, interleaved B,G,R, nbWorkers 0
     When it compresses the folder
     Then bytes = D_wait of the folder, to the byte (same coder, level and frames)
+    # Checked on the product's call (one-shot ZSTD_compress2, drain=0). Rows with drain=16384
+    # reproduce the corpus writer's call (Node zlib.zstdCompressSync) and are printed as
+    # evidence of the cause when the row misses; they never make it pass.
 
   Scenario: determinism
     Given one configuration run 3 times (repeat 1, 2 and 3)

@@ -15,7 +15,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readRuns } from './step2d.mjs';
 import { PENDING, relErr, runFeature } from './feature.mjs';
-import { D_BYTES_TRUTH, dBytesConfigs, sizeFixture, targetFixture, zBytesPerFrame } from './step4.fixtures.mjs';
+import { D_BYTES_TRUTH, RAM_TRUTH, dBytesConfigs, ramFixture, sizeFixture, targetFixture, zBytesPerFrame } from './step4.fixtures.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(HERE, '..');
@@ -253,6 +253,24 @@ function findingChecks(F, inputs) {
       const w = Math.max(...errs);
       return { value: 'bytes at tau_f 100 and 200, K/P and a_E within 1e-6', measured: `worst relative error ${w}`, pass: Number.isFinite(w) && w <= CONFIG.self_test_tolerance };
     }),
+    'eq 4 fitted terms: mu and m_d0 from training rows': need(() => {
+      const { zRows, runlist } = ramFixture();
+      const f = F.buildFitFromRows({ zRows, dRows: [], runlist });
+      const k = f.equations.eq4_z_ram.coefficients;
+      const held = f.validation.z.rows.filter((v) => v.quantity === 'ram' || v.quantity === 'ram_dec');
+      const errs = [relErr(k.mu_train, RAM_TRUTH.mu), relErr(k.m_d0_bytes, RAM_TRUTH.md0), ...held.map((v) => relErr(v.predicted, v.measured))];
+      const w = Math.max(...errs);
+      return { value: `mu ${RAM_TRUTH.mu}, m_d0 ${RAM_TRUTH.md0} B; held-out ZW16 1920x1080 RAM and decoder RAM`, measured: `mu ${k.mu_train}, m_d0 ${k.m_d0_bytes}; ${held.length} held-out rows (${held.map((v) => v.verdict).join(', ')}); worst relative error ${w}`, pass: held.length === 2 && held.every((v) => v.verdict === 'within') && Number.isFinite(w) && w <= CONFIG.self_test_tolerance };
+    }),
+    'eq 4 fitted terms on the input CSVs': need(() => {
+      if (!inputs.z.length) return { value: '-', measured: 'needs the Z input CSVs of fit.json', pass: false };
+      const f = F.buildFitFromRows({ zRows: inputs.z, dRows: [], runlist: { cells: [], contents: [] } });
+      const e = f.equations.eq4_z_ram;
+      const dictRows = inputs.z.filter((r) => Number(r.dict) > 0 && !r.error).length;
+      const muOk = dictRows ? Number.isFinite(e.coefficients.mu_train) : e.coefficients.mu_train === undefined && e.pending.some((p) => p.part === 'mu');
+      const res = `M_comp residuals rms ${(100 * e.residuals.rms_rel).toFixed(2)} %, max ${(100 * e.residuals.max_abs_rel).toFixed(2)} %; M_dec rms ${(100 * e.residuals.dec.rms_rel).toFixed(2)} %, max ${(100 * e.residuals.dec.max_abs_rel).toFixed(2)} %`;
+      return { value: 'mu from the ZW16 rows, m_d0 from every decoder row (training only)', measured: `${dictRows} ZW16 rows: mu ${e.coefficients.mu_train ?? 'pending'}; m_d0 ${e.coefficients.m_d0_bytes} B; ${res}`, pass: muOk && Number.isFinite(e.coefficients.m_d0_bytes) };
+    }),
     '#20 predicted cells appear with status and uncertainty': need(() => {
       const { zRows, runlist } = sizeFixture();
       const f = F.buildFitFromRows({ zRows, dRows: [], runlist });
@@ -305,7 +323,7 @@ function checks(fit, F, fitError, inputs) {
       return { value: 'diff_sum = 0', measured: `${inputs.z.length - bad.length}/${inputs.z.length} runs exact; fit.json says ${listed}`, pass: inputs.z.length > 0 && bad.length === 0 && listed === inputs.z.length };
     }),
     'eq 3 Z CPU': need(() => equation(fit, 'eq3_z_cpu', (p) => p === 'c_0' && !groupsWithSizes())),
-    'eq 4 Z RAM': need(() => equation(fit, 'eq4_z_ram', () => false)),
+    'eq 4 Z RAM': need(() => equation(fit, 'eq4_z_ram', (p) => (p === 'mu' && !inFit('Z').some((c) => c.fit?.s_train > 0)) || (p === 'm_d0' && !inFit('Z').length))),
     'eq 5 Z time until ready': need(() => {
       const limit = CONFIG.t_ready_limit_ms * 1e6;
       const bad = inputs.z.filter((r) => !(Number(r.t_ready_ns) <= limit));
@@ -351,7 +369,7 @@ function checks(fit, F, fitError, inputs) {
     'Z validation': need(() => {
       const held = [...new Set(inputs.z.filter((r) => r.held_out === '1').map((r) => keyOf('Z', r)))];
       if (!held.length) return { value: 'within 10 %', measured: `pending: full run (0 held-out Z rows in the input; held-out cells in the run list: ${fit.validation?.z?.runlist_held_out ?? '?'})`, pass: PENDING };
-      const v = validation(fit, 'Z', held, ['bytes', 'cpu', 'ram']);
+      const v = validation(fit, 'Z', held, ['bytes', 'cpu', 'ram', 'ram_dec']);
       return { value: 'within 10 %', measured: v.text, pass: v.ok ? (v.pending ? PENDING : true) : false };
     }),
     'D validation': need(() => {

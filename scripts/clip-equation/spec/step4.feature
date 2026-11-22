@@ -44,6 +44,16 @@ Feature: Every equation of the plan is fitted, and the held-out runs are predict
     Then K/P and a_E are recovered and held-out configurations at tau_f 100 and 200 are predicted
     # Equation: bytes = (n - n_key) * P + n_key * K, n_key = ceil(n / tau_f) | Known: within 1e-6
 
+  Scenario: eq 4 fitted terms: mu and m_d0 from training rows
+    Given ZW16 rows made with M_train = mu * S_samples and decoder rows with a fixed overhead m_d0, ZW16 1920x1080 held out
+    Then mu and m_d0 are fitted back from the training rows, and the held-out RAM and decoder RAM are predicted with them
+    # Equation: M_comp = M_0 + M_cctx + B_c * px * 3 + mu * N_train * px * 3; M_dec = M_0 + M_dctx + B_d * px * 3 + b_max + m_d0 | Known: mu 1.9, m_d0 800000 B, within 1e-6
+
+  Scenario: eq 4 fitted terms on the input CSVs
+    Given the Z input CSVs of fit.json
+    Then mu is fitted from the ZW16 training rows (pending without one) and m_d0 from the decoder training rows, with residuals
+    # Equation: mu = sum(S * e) / sum(S^2), e = ram_os - (known_m_comp - M_0); m_d0 = mean(dec_peak_private - known_m_dec) | Known: finite coefficients; residuals listed
+
   Scenario: #20 predicted cells appear with status and uncertainty
     Given a run list cell marked predicted
     Then the fit has a row for it per content with its prediction status, predicted values and uncertainty

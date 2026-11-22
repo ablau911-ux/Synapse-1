@@ -48,6 +48,33 @@ export function sizeFixture() {
   return { zRows, runlist };
 }
 
+/** The fitted terms of equation 4 (plan c50439ec): M_train = mu * S_samples and the decoder overhead m_d0. */
+export const RAM_TRUTH = { mu: 1.9, md0: 8e5 };
+
+/** Training rows only: S_samples = min(frames, 20) * px * 3 for a dictionary way. */
+export const sSamples = (frames, px) => Math.min(frames, CONFIG.dict_train_frames) * px * 3;
+
+/**
+ * The equation 4 fixture: ZW16 (dictionary 110 KB) at 640x360 and 1280x720 in the fit and at
+ * 1920x1080 held out, ZW1 at 640x360 in the fit; RAM above M_0 (ram_os) = the run's equation part
+ * + mu * S_samples (ZW16 only); decoder peak = known_m_dec + m_d0. 3 repeats, content typing.
+ */
+export function ramFixture() {
+  const cells = [
+    { id: 11, way: 'ZW16', dict: 110, level: -3, size: '640x360', status: 'run' },
+    { id: 12, way: 'ZW16', dict: 110, level: -3, size: '1280x720', status: 'run' },
+    { id: 13, way: 'ZW16', dict: 110, level: -3, size: '1920x1080', status: 'held-out' },
+    { id: 14, way: 'ZW1', level: -3, size: '640x360', status: 'run' },
+  ];
+  const zRows = cells.flatMap((c) => [1, 2, 3].map((rep) => {
+    const r = zRow({ folder: `typing-${c.size}`, way: c.way, mode: 'whole', wlog: 0, dict: c.dict ?? 0, rep, cell: c.id, held_out: c.status === 'held-out' ? 1 : 0 });
+    const px = Number(r.px);
+    const ramOs = Number(r.known_m_comp) - Number(r.m0_private) + (c.dict ? RAM_TRUTH.mu * sSamples(Number(r.frames), px) : 0);
+    return { ...r, ram_os: String(ramOs), peak_private: String(Number(r.m0_private) + ramOs), dec_peak_private: String(Number(r.known_m_dec) + RAM_TRUTH.md0) };
+  }));
+  return { zRows, runlist: { contents: ['typing'], repeats: 3, counts: { runs: 12 }, cells } };
+}
+
 /** One way D CSV row; `o` overrides any column. */
 export function dRow(o) {
   const n = 100;

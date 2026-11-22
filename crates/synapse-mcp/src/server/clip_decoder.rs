@@ -1,7 +1,7 @@
 //! H.264 clip decoder on the Media Foundation Source Reader ("Bug clip video"
 //! research, section 8; building plan Part 2 "Decoding").
 //!
-//! `ClipDecoder` owns one Source Reader over a clip folder's `clip.mp4`. The
+//! `ClipDecoder` owns one Source Reader over one segment file of a clip. The
 //! reader's own video processing converts the decoded stream to RGB32, so
 //! every frame comes back as top-down BGRA with its sample timestamp.
 //!
@@ -25,9 +25,10 @@ use windows::core::{GUID, HSTRING};
 use super::clip_encoder::{MediaFoundationRuntime, hr};
 
 const HNS_PER_MS: i64 = 10_000;
-/// A target this close ahead of the last decoded frame is reached by reading
-/// on instead of seeking (the recorder writes a keyframe every second).
-const FORWARD_READ_LIMIT_MS: u64 = 1_000;
+/// D7: a target ahead of the last decoded frame is reached by reading on for
+/// at most one GOP of decoded frames; farther targets seek to the keyframe
+/// before them, so seek cost is bounded in frames, not in time.
+const FORWARD_READ_LIMIT_FRAMES: u32 = super::clip_encoder::GOP_FRAMES;
 /// Empty reads (stream ticks) tolerated in a row before giving up.
 const MAX_EMPTY_READS: u32 = 1_000;
 
@@ -122,23 +123,23 @@ impl ClipDecoder {
     }
 
     /// The frame on screen at `t_ms`: the last frame whose time is at most
-    /// `t_ms` plus half a frame (`frame_ms / 2`). Reads on from the previous
-    /// frame when the target is close ahead, otherwise seeks first.
+    /// `t_ms` plus half a frame (`frame_ms / 2`). Frames come at uneven times
+    /// (repeats are not encoded). Reads on from the previous frame for at most
+    /// `FORWARD_READ_LIMIT_FRAMES` frames, otherwise seeks first.
     pub(super) fn frame_at(&mut self, t_ms: u64, frame_ms: u64) -> Result<DecodedFrame, String> {
         let tolerance = frame_ms / 2;
-        let reachable = self.last.as_ref().is_some_and(|last| {
-            last.t_ms() <= t_ms + tolerance && t_ms - last.t_ms().min(t_ms) <= FORWARD_READ_LIMIT_MS
-        });
         if let Some(last) = &self.last
-            && reachable
+            && last.t_ms() <= t_ms + tolerance
             && last.t_ms() + tolerance >= t_ms
         {
             return Ok(last.clone());
         }
-        if !reachable {
+        let mut reading_on = self.last.as_ref().is_some_and(|last| last.t_ms() <= t_ms);
+        if !reading_on {
             self.seek(t_ms)?;
         }
         let mut previous = self.last.take();
+        let mut reads = 0_u32;
         loop {
             let Some(frame) = self.next_frame()? else {
                 // Past the end: the last frame stays on screen.
@@ -151,6 +152,12 @@ impl ClipDecoder {
                 return Ok(frame);
             }
             previous = Some(frame);
+            reads += 1;
+            if reading_on && reads >= FORWARD_READ_LIMIT_FRAMES {
+                self.seek(t_ms)?;
+                previous = None;
+                reading_on = false;
+            }
         }
     }
 

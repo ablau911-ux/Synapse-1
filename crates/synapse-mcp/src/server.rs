@@ -249,10 +249,6 @@ mod capture_gif;
 mod clip_decoder;
 #[cfg(windows)]
 mod clip_encoder;
-#[expect(
-    dead_code,
-    reason = "the views folder is used by the viewer (package 4)"
-)]
 mod clip_folder;
 #[cfg(windows)]
 mod clip_viewer;

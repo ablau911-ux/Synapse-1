@@ -253,6 +253,8 @@ Consequence: a fade of any length is detected once its total contrast passes the
 
 - While a block animates, its anchor is frozen and it makes no event.
 - When it stops, it is compared with its anchor like any settling block. So a checkmark that replaces a spinner is a CHANGED event.
+- As built (`ea3e8514`): that change starts at the block's last motion, not at the start of the animation, so "checkmark replaces spinner" starts within one instant of the replacement.
+- As built (`ea3e8514`): a block that animated and ends back at its anchor makes no FLASH or REVERTED event; the animation event already covers that interval. Without this, a playhead would give a short-lived change in every block it crosses.
 - Connected animating blocks form one animation interval.
 - There is no absorption: a block that is not animating is never swallowed by a neighbour.
 
@@ -354,11 +356,11 @@ For a failed condition, the instants where it failed.
 | N | `MAX_IMAGES_PER_CALL` (upper bound) | `server/clip_viewer.rs:46` | at most 8; per call min(8, budget / tokens per image) | equation: tokens = N · w_v · h_v / 770 + 1500 |
 | close-up factor | `CLOSEUP_SCALE` | `server/clip_viewer.rs` | 2 | whole-number duplication |
 | crop minimum | `MIN_CROP_SHORT_SIDE` | `m1.rs:479` | 200 px | kept from version 1 |
-| change test | `BLOCK`, `PIXEL_DELTA`, `MIN_CHANGED_PIXELS` | `server/clip_viewer.rs` | 8, 64 (largest R, G or B difference), 3 | colour-aware test kept from version 1 (review fix 6). `PIXEL_DELTA` raised from 32 to 64 on 2026-11-22 (`cb70a9f7`) after measuring keyframe noise at quality 70 on the proof clip: static text blocks had at most 7 pixels above 32, 6 above 48 and 1 above 64; blank areas had none. Dark text on a light page changes by about 200 |
-| animation and regions (D5) | `ANIMATING_CHANGE_SHARE`, `ANIMATION_GAP_BLOCKS`, `ANIMATION_ABSORB_GAP_BLOCKS`, `REGION_GAP_BLOCKS` | `server/clip_viewer.rs` | 0.5; (1, 1); (2, 2); (24, 2) | `cb70a9f7`. A block is animating when it changed in at least half of the frames within `SHORT_LIVED_MS`. A change within 2 blocks of an animation belongs to it. Regions join across 24 blocks in a row and 2 between rows, so one log line is one region. Checked on the proof clip: 28 flashes found as short-lived, the counter and clock as 2 animations, no change at the keyframes |
-| settle, short-lived | `SETTLE_MS`, `SHORT_LIVED_MS` | `server/clip_viewer.rs:64-66` | 200, 500 | kept from version 1; both ≥ d_min |
+| block test (D5 step 1) | `BLOCK`, `DELTA_LO`, `DELTA_HI`, `NOISE_LO`, `NOISE_HI`, `N_LO`, `N_HI` | `server/clip_viewer.rs` | 8; 32, 64 (largest R, G or B difference); ν = 7, 1; 16, 3 | `ea3e8514`. ν measured at quality 70 on the proof clip (`cb70a9f7`): static text blocks had at most 7 pixels above 32 and 1 above 64; blank areas had none. N_hi > 2 · ν(δ_hi) and 2 · ν(δ_lo) < N_lo ≤ 32 are checked when the code compiles. The D5 proof clips measure ν again; if ν(32) is 8, N_lo becomes 17 |
+| animation and regions (D5 steps 3, 4) | `ANIMATING_CHANGE_SHARE`, `REGION_GAP_BLOCKS` | `server/clip_viewer.rs` | 0.5; (24, 2) | `ea3e8514`. A block animates while it changed against the previous frame in at least half of the instants of the last `SHORT_LIVED_MS`. No absorption. Events join across 24 blocks in a row and 2 between rows, so one text line is one event |
+| settle, short-lived | `SETTLE_MS`, `SHORT_LIVED_MS` | `server/clip_viewer.rs` | 200, 500 | kept from version 1; both ≥ d_min. K_s = `SETTLE_MS` · f / 1000 = 4; `SHORT_LIVED_MS` is also W_a |
 | cursor mask | `CURSOR_MASK_PX` | `server/clip_viewer.rs` | 48 | research: a 48 × 48 box at the logged cursor position |
-| caret rule | `CARET_MAX_WIDTH_PX`, `CARET_PERIOD_MS` | `server/clip_viewer.rs` | 3, 500 | research: thin rectangles that toggle about every 500 ms |
+| caret rule (D5 step 5) | `CARET_MAX_WIDTH_PX`, `CARET_HEIGHT_PX`, `CARET_MIN_CYCLES`, `CARET_HALF_PERIOD_MS` | `server/clip_viewer.rs` | 3; 8 to 48; 2; 400 to 700 ms | research: thin rectangles that toggle with a half-period of about 530 ms (the Windows default) |
 
 Measured mechanisms from package 0 (`scripts/clip-equation/results-package0.md`): the reader maps with "do not wait", sleeps 1 ms and retries (M6: a yield loop burns 2.2 ms of processor per 720p read); multithread protection is on. The H.264 screen hint is `CODECAPI_AVScenarioInfo` = DisplayRemoting (M8: accepted and read back by the software encoder and Quick Sync). `Frame::timestamp()` is about 5.5 ms after the frame arrives (M3, all 3,742 frames), so the hold time (O3) is measured from arrival, and the frame chosen for an instant is the one on screen at that instant. The encoder does not report a friendly name; the hardware vendor id is reported instead (F8).
 
@@ -421,7 +423,7 @@ Each product package is built by one agent from this plan with a time and tool-c
 | 2 | Live part | A1 to A12; the four `record*` operations; `frames.jsonl` with frame size and cursor position; the waiting folder; `clip.json` at start with state and the registry; the public free-bytes-to-level function in `synapse-storage`; the updated contracts (O1); conditions C, G, T | built (`804644c7`); waiting frames compressed (E11, `fc5a061d`) |
 | 3a | Worker lifecycle | The long-lived worker mode, its job and processor cap, the queue, segment forming (B2), commit (B8), ready (B9) and recovery (B10) | built (`4fd24043`); recovery and worker-outcome fixes from the Fable review in progress |
 | 3b | Encoding | B3 to B7: σ, colours, encoder and retry, time stamps with `write_nv12` taking instant and duration, GOP in frames, no B-frames, screen-content hint, quality and Q status | built (`4f72002a`) |
-| 4 | Viewer | D1 to D7 | built (`31c32615`); D5 reworked (`cb70a9f7`) |
+| 4 | Viewer | D1 to D7 | built (`31c32615`); D5 rebuilt from the equation (`ea3e8514`, proof page `3077349b`), not yet run live |
 | 5 | Proof and constants | The proof cases below; README and tool-surface tables | partly: see "Proof results so far"; README and tool-surface tables not done |
 
 ## Proof
@@ -513,6 +515,12 @@ From the Fable 5.2 logic review and the live tests. Each one is either unverifie
 | The share measurement uses `GetThreadTimes`, which may under-count short bursts | unverified; needs one comparison with `QueryThreadCycleTime` |
 | 28 of about 30 flashes were found as short-lived on the proof clip | likely the page: some flashes lasted 48.6 ms at 144 Hz; the page is fixed (`b608bce4`) and the case is checked again with the D5 rebuild |
 | The weakest machine's figures | still computed estimates until a run on a real Core i3 |
+
+## Changes on 2026-11-22, 18:00 to 20:35 IST
+
+- Last code fixes: the cursor per instant on repeated lines (`7472ea12`), retry on a brief file hold for the waiting-frame rename and the unlocked `clip.json` read (`891c280d`, `7d2cb399`), the worker cap rule in the module doc (`a5e9a801`), recovery keeps the losses named in `frames.jsonl` (`bf5930e1`).
+- D5 rebuilt from the equation (`ea3e8514`) with the proof page (`3077349b`). Two rules added as built, in D5 step 3. The parameter map lists the D5 constants as built.
+- All code fixes are done. Next: the verification round.
 
 ## Changes on 2026-11-22, 16:30 to 18:00 IST
 

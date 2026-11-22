@@ -1,68 +1,60 @@
-//! `screenshot operation=record`: the bug-clip recorder ("Bug clip video"
-//! research, order of work step 2: recording on request).
+//! `screenshot operation=record | record_status | record_stop | record_extend`:
+//! the live part of the clip recorder (docs/clip-recorder-plan.md, version 4.1,
+//! section A, operations A1 to A12, and section C).
 //!
-//! One synchronous call records one window or one monitor for `duration_ms`
-//! into a clip folder:
+//! `record` starts a recording that belongs to the service, not to the MCP
+//! call (C14): the call returns once `clip.json` is written and the first frame
+//! is on disk. The recorder thread then handles one instant s_k every 1 / f:
+//! it asks the clip observer (`synapse_capture::ClipObserver`) for the identity
+//! of the frame shown at s_k, writes only a line for a repeated frame, and for
+//! a new frame checks the privacy gate, reads it back and writes it raw into
+//! `waiting/` at its captured size. The live part does no scaling and no
+//! encoding (C5); the clip worker forms and encodes segments from
+//! `frames.jsonl`.
 //!
-//! - `clip.mp4`: H.264 at a constant frame rate (`ClipEncoder`).
-//! - `frames.jsonl`: one line per encoded frame
-//!   (`{"frame","t_ms","new","key"}`).
-//! - `clip.json`: identity, clock, target, encode settings actually granted,
-//!   and health (`ClipManifest`).
-//!
-//! Frames come from the existing `synapse-capture` loop (Windows.Graphics.
-//! Capture, cursor on). The recorder owns the timeline: a ticker at
-//! `1000 / fps` ms encodes the latest frame on every tick and repeats the last
-//! one when Windows delivered nothing new, recording per frame which it was.
-//! The frame size is fixed at clip start (even dimensions); later frames of a
-//! different size are scaled and letterboxed into it. A minimized window
-//! delivers no frames: those ticks repeat and form `target_minimized`
-//! intervals. The recorder never restores or focuses a window.
-//!
-//! Privacy: the timeline recorder gate (`RecorderControl::suppress_reason`,
-//! the gate the activity recorder uses) is checked before start and on every
-//! tick. Paused or excluded before start: refused. During recording: the clip
-//! stops, keeps what it has, and records the reason. A closed window stops
-//! the clip the same way (`target_lost`). Disk-pressure level 3/4 refuses.
-//!
-//! The clip is written into a hidden temp folder next to the target folder and
-//! renamed into place at the end; on error the temp folder is removed. The
-//! capture loop (this call's own `CaptureHandle`, never the shared M1
-//! controller) is always stopped.
+//! Kept from version 1: a minimized window gives repeat lines marked
+//! `minimized` and is never restored or focused; an all-black first frame is
+//! an error (no PrintWindow fallback); a browser-tab target is refused like
+//! `screenshot capture`; the recorder runs on its own thread; the folder must
+//! not exist; the error codes and their context fields.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rmcp::{RoleServer, service::RequestContext};
-use serde::Serialize;
 use serde_json::json;
 use synapse_core::error_codes;
 
-use super::{CaptureClipParams, CaptureClipResponse, ErrorData, SynapseService};
-use crate::m1::mcp_error;
+use super::clip_folder::{
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, FRAMES_FILE, StopReason, WAITING_DIR, clips_root,
+    file_size_and_sha256,
+};
+use super::{
+    CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
+};
+use crate::m1::{ClipSegmentInfo, mcp_error};
 use crate::m3::SharedM3State;
 use crate::m3::timeline_control::{RecorderControl, SuppressReason};
 
+/// f: recorded instants per second (base rule).
+pub(super) const RECORD_FPS: u32 = 20;
+/// f_r: the reference screen; T_r = 1 / f_r is the hold-time bound (C17).
+pub(super) const REFERENCE_REFRESH_HZ: u32 = 60;
+/// t_def: length of a recording unless the call gives one.
+pub(super) const DEFAULT_DURATION_MS: u64 = 60_000;
+/// Shortest recording a call may ask for.
 pub(super) const MIN_DURATION_MS: u64 = 100;
-pub(super) const MAX_DURATION_MS: u64 = 120_000;
-pub(super) const DEFAULT_FPS: u32 = 20;
-pub(super) const MAX_FPS: u32 = 30;
-/// How long to wait for the first frame, which fixes the clip size.
+/// h_min: recorded frames have at least this many lines (σ duplicates pixels).
+pub(super) const MIN_LINES: u32 = 480;
+/// How often the free space of the clip volume is measured (A11, F7).
+const DISK_CHECK_MS: u64 = 1_000;
+/// How often the windows on a recorded monitor are checked for an excluded app (E6).
+const EXCLUDED_APP_CHECK_MS: u64 = 1_000;
+/// How long to wait for the first frame (kept from version 1).
 const FIRST_FRAME_TIMEOUT_MS: u64 = 3_000;
-/// Longest wait between two checks of the cancellation flag.
-#[cfg(windows)]
-const CANCEL_POLL_MS: u64 = 50;
-pub(super) const CLIP_SCHEMA_VERSION: u32 = 1;
-pub(super) const VIDEO_FILE: &str = "clip.mp4";
-pub(super) const FRAMES_FILE: &str = "frames.jsonl";
-pub(super) const CLIP_JSON_FILE: &str = "clip.json";
 const CLIP_SOURCE_OF_TRUTH: &str =
-    "clip folder files (clip.mp4, frames.jsonl, clip.json) + target metadata";
+    "clip folder files (clip.json, frames.jsonl, waiting/, segment-NNNN.mp4) + target metadata";
 
 /// What to record.
 #[derive(Clone, Copy, Debug)]
@@ -80,17 +72,6 @@ impl ClipTarget {
     }
 }
 
-/// Why the recording ended.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum StopReason {
-    #[default]
-    Completed,
-    TargetLost,
-    PrivacyPaused,
-    PrivacyExcludedApp,
-}
-
 impl StopReason {
     const fn from_privacy(reason: SuppressReason) -> Self {
         match reason {
@@ -98,14 +79,97 @@ impl StopReason {
             SuppressReason::ExcludedApp => Self::PrivacyExcludedApp,
         }
     }
+}
 
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::TargetLost => "target_lost",
-            Self::PrivacyPaused => "privacy_paused",
-            Self::PrivacyExcludedApp => "privacy_excluded_app",
+/// The shared controls of the running recording: stop and the planned end.
+struct RecordingControl {
+    stop: AtomicBool,
+    end_ms: AtomicU64,
+}
+
+/// The one running recording of the service (A2: only one recorder, so the
+/// 10 % rule holds).
+struct ActiveClip {
+    clip_id: String,
+    folder: PathBuf,
+    control: Arc<RecordingControl>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Owns the rule "one recording at a time" for the whole service.
+struct Recorders;
+
+static ACTIVE: Mutex<Option<ActiveClip>> = Mutex::new(None);
+
+impl Recorders {
+    fn active() -> std::sync::MutexGuard<'static, Option<ActiveClip>> {
+        ACTIVE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Claims the recorder for a clip; refused while another recording runs.
+    fn claim(
+        clip_id: &str,
+        folder: &std::path::Path,
+        end_ms: u64,
+    ) -> Result<Arc<RecordingControl>, ErrorData> {
+        let mut active = Self::active();
+        if let Some(running) = active.as_ref() {
+            return Err(mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!(
+                    "screenshot operation=record refused: clip {} is recording into {}",
+                    running.clip_id,
+                    running.folder.display()
+                ),
+            ));
         }
+        let control = Arc::new(RecordingControl {
+            stop: AtomicBool::new(false),
+            end_ms: AtomicU64::new(end_ms),
+        });
+        *active = Some(ActiveClip {
+            clip_id: clip_id.to_owned(),
+            folder: folder.to_path_buf(),
+            control: Arc::clone(&control),
+            thread: None,
+        });
+        Ok(control)
+    }
+
+    fn attach_thread(clip_id: &str, thread: std::thread::JoinHandle<()>) {
+        if let Some(active) = Self::active().as_mut()
+            && active.clip_id == clip_id
+        {
+            active.thread = Some(thread);
+        }
+    }
+
+    fn release(clip_id: &str) {
+        let mut active = Self::active();
+        if active
+            .as_ref()
+            .is_some_and(|running| running.clip_id == clip_id)
+        {
+            *active = None;
+        }
+    }
+
+    /// The controls and folder of the running clip with this id.
+    fn find(clip_id: &str) -> Option<(Arc<RecordingControl>, PathBuf)> {
+        Self::active()
+            .as_ref()
+            .filter(|running| running.clip_id == clip_id)
+            .map(|running| (Arc::clone(&running.control), running.folder.clone()))
+    }
+
+    /// Asks the running clip to stop and hands back its thread to join.
+    fn stop(clip_id: &str) -> Option<std::thread::JoinHandle<()>> {
+        let mut active = Self::active();
+        let running = active
+            .as_mut()
+            .filter(|running| running.clip_id == clip_id)?;
+        running.control.stop.store(true, Ordering::Relaxed);
+        running.thread.take()
     }
 }
 
@@ -114,22 +178,14 @@ struct ClipPlan {
     clip_id: String,
     target: ClipTarget,
     /// The window's process name for the privacy gate; monitors read the
-    /// foreground app on every tick instead.
+    /// foreground app on every instant and every visible window each second.
     app: Option<String>,
-    duration_ms: u64,
-    fps: u32,
     folder: PathBuf,
+    end_ms: u64,
     privacy: Arc<RecorderControl>,
-    /// Set when the MCP call is cancelled: the recorder stops and publishes
-    /// no clip folder.
-    cancel: Arc<AtomicBool>,
 }
 
 impl ClipPlan {
-    fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
-    }
-
     /// The privacy gate's verdict for what the clip shows right now.
     fn privacy_stop(&self) -> Option<StopReason> {
         let foreground_app;
@@ -146,14 +202,28 @@ impl ClipPlan {
             .suppress_reason(app)
             .map(StopReason::from_privacy)
     }
+
+    /// E6: for a monitor, an excluded app visible anywhere on it stops the clip,
+    /// even when it is not in front.
+    fn excluded_app_visible(&self) -> bool {
+        let ClipTarget::Monitor { monitor_index } = self.target else {
+            return false;
+        };
+        synapse_a11y::visible_top_level_window_contexts()
+            .unwrap_or_default()
+            .iter()
+            .filter(|context| context.monitor_index == monitor_index)
+            .any(|context| {
+                self.privacy.suppress_reason(Some(&context.process_name))
+                    == Some(SuppressReason::ExcludedApp)
+            })
+    }
 }
 
 impl SynapseService {
-    /// Records a clip folder. Parameters are bounds-checked by the
-    /// `screenshot` facade before this runs. The start gates (storage, disk
-    /// pressure, privacy) and the recording run on their own named thread,
-    /// never on a tokio worker; this call only awaits its result. Dropping
-    /// this call (cancellation) stops the recorder and joins its thread.
+    /// `record`: starts a recording and returns once `clip.json` and the first
+    /// frame are written. The gates and the recording run on their own named
+    /// thread, never on a tokio worker; the recording outlives this call.
     pub(super) async fn capture_clip(
         &self,
         params: CaptureClipParams,
@@ -164,30 +234,27 @@ impl SynapseService {
             .map_err(|error| with_clip_context(error, "session_target"))?;
         let target_id = target.id();
         let m3_state = self.m3_state_handle();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let thread_cancel = Arc::clone(&cancel);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let thread = std::thread::Builder::new()
             .name("synapse-clip-recorder".to_owned())
-            .spawn(move || {
-                let recorded = capture_clip_plan(&m3_state, target, &params, thread_cancel)
-                    .and_then(|plan| record_clip(&plan));
-                let _ = sender.send(recorded);
-            })
+            .spawn(move || run_recorder_thread(&m3_state, target, &params, sender))
             .map_err(|error| thread_failed(format!("could not start the recorder thread: {error}")))
             .map_err(|error| with_clip_context(error, &target_id))?;
-        let _recorder = RecorderThread {
-            cancel,
-            thread: Some(thread),
-        };
-        receiver
-            .await
-            .unwrap_or_else(|_| {
-                Err(thread_failed(
-                    "the recorder thread ended without a result (panicked)".to_owned(),
-                ))
-            })
-            .map_err(|error| with_clip_context(error, &target_id))
+        let started = receiver.await.unwrap_or_else(|_| {
+            Err(thread_failed(
+                "the recorder thread ended without a result (panicked)".to_owned(),
+            ))
+        });
+        match started {
+            Ok(response) => {
+                Recorders::attach_thread(&response.clip_id, thread);
+                Ok(response)
+            }
+            Err(error) => {
+                let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+                Err(with_clip_context(error, &target_id))
+            }
+        }
     }
 
     /// An explicit monitor or window wins; otherwise the session's window
@@ -216,65 +283,157 @@ impl SynapseService {
     }
 }
 
-/// Owns the recorder thread for the lifetime of one `capture_clip` call. On
-/// drop (call finished or cancelled) it asks the recorder to stop and joins it.
-struct RecorderThread {
-    cancel: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+/// `record_status`: the state of a clip, read from its `clip.json`.
+pub(super) fn clip_status(clip_id: &str) -> Result<ClipStatusResponse, ErrorData> {
+    let folder = Recorders::find(clip_id)
+        .map(|(_, folder)| folder)
+        .or_else(|| ClipRegistry::folder_of(clip_id))
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("no clip with id {clip_id} in the active-clip registry or the default clips folder"),
+            )
+        })?;
+    status_of(&folder)
 }
 
-impl Drop for RecorderThread {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+/// `record_stop`: ends the recording now; idempotent by clip id.
+pub(super) async fn clip_stop(clip_id: &str) -> Result<ClipStatusResponse, ErrorData> {
+    if let Some(thread) = Recorders::stop(clip_id) {
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
     }
+    clip_status(clip_id)
 }
 
-/// Applies the start gates (storage, disk pressure, privacy) and fixes the
-/// folder. Runs on the recorder thread: opening storage may block.
+/// `record_extend`: moves the end of a running recording by `add_ms`.
+pub(super) fn clip_extend(clip_id: &str, add_ms: u64) -> Result<ClipStatusResponse, ErrorData> {
+    let (control, folder) = Recorders::find(clip_id).ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("clip {clip_id} is not recording; only a running recording can be extended"),
+        )
+    })?;
+    let end_ms = control.end_ms.fetch_add(add_ms, Ordering::Relaxed) + add_ms;
+    ClipJson::update(&folder, |clip| clip.end_ms = clip.end_ms.max(end_ms))
+        .map_err(internal_error)?;
+    status_of(&folder)
+}
+
+fn status_of(folder: &std::path::Path) -> Result<ClipStatusResponse, ErrorData> {
+    let clip = ClipJson::read(folder).map_err(internal_error)?;
+    let frames_waiting = std::fs::read_dir(folder.join(WAITING_DIR))
+        .map(|read| read.filter_map(Result::ok).count() as u64)
+        .unwrap_or(0);
+    Ok(ClipStatusResponse {
+        clip_id: clip.clip_id.clone(),
+        folder: folder.to_string_lossy().into_owned(),
+        state: clip.state.as_str().to_owned(),
+        stop_reason: clip.stop_reason.map(|reason| reason.as_str().to_owned()),
+        failure: clip.failure.clone(),
+        seconds_recorded: clip.recorded_ms as f64 / 1_000.0,
+        end_ms: clip.end_ms,
+        frames_waiting,
+        segments: clip
+            .segments
+            .iter()
+            .map(|segment| ClipSegmentInfo {
+                file: segment.file.clone(),
+                bytes: segment.bytes,
+                sha256: segment.sha256.clone(),
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+            })
+            .collect(),
+        conditions: serde_json::to_value(&clip.conditions).unwrap_or_default(),
+    })
+}
+
+type StartSender = tokio::sync::oneshot::Sender<Result<CaptureClipResponse, ErrorData>>;
+
+/// The recorder thread: gates, `clip.json`, the observer, then every instant
+/// until a stop. The start result goes to the `record` call through `started`.
+fn run_recorder_thread(
+    m3_state: &SharedM3State,
+    target: ClipTarget,
+    params: &CaptureClipParams,
+    started: StartSender,
+) {
+    let plan = match capture_clip_plan(m3_state, target, params) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = started.send(Err(error));
+            return;
+        }
+    };
+    let control = match Recorders::claim(&plan.clip_id, &plan.folder, plan.end_ms) {
+        Ok(control) => control,
+        Err(error) => {
+            let _ = started.send(Err(error));
+            return;
+        }
+    };
+    record(&plan, &control, started);
+    super::clip_worker::ProcessorBudget::global().clear_live_share();
+    Recorders::release(&plan.clip_id);
+}
+
+/// A2: applies the start gates (storage pressure on the clip volume, privacy,
+/// Windows build, folder) and fixes the folder. Runs on the recorder thread:
+/// opening storage may block.
 fn capture_clip_plan(
     m3_state: &SharedM3State,
     target: ClipTarget,
     params: &CaptureClipParams,
-    cancel: Arc<AtomicBool>,
 ) -> Result<ClipPlan, ErrorData> {
-    let (db, privacy) = {
+    let privacy = {
         let mut guard = m3_state.lock().map_err(|_poisoned| {
             mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 "M3 service state lock poisoned",
             )
         })?;
-        let db = guard.ensure_storage().map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("open storage for the clip recorder gates: {error}"),
-            )
-        })?;
-        let privacy = guard
+        guard
             .ensure_recorder_control()
-            .map_err(|error| mcp_error(error_codes::TOOL_INTERNAL_ERROR, format!("{error:#}")))?;
-        (db, privacy)
+            .map_err(|error| mcp_error(error_codes::TOOL_INTERNAL_ERROR, format!("{error:#}")))?
     };
-    let pressure_code = match db.pressure_level() {
-        synapse_storage::DiskPressureLevel::Level3 => {
-            Some(error_codes::STORAGE_DISK_PRESSURE_LEVEL_3)
-        }
-        synapse_storage::DiskPressureLevel::Level4 => {
-            Some(error_codes::STORAGE_DISK_PRESSURE_LEVEL_4)
-        }
-        _ => None,
-    };
-    if let Some(code) = pressure_code {
+    let clip_id = uuid::Uuid::new_v4().to_string();
+    let folder = params
+        .folder
+        .as_ref()
+        .map_or_else(|| clips_root().join(&clip_id), PathBuf::from);
+    if folder.exists() {
         return Err(mcp_error(
-            code,
-            format!("screenshot operation=record refused: disk pressure is critical ({code})"),
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "screenshot operation=record folder already exists: {}",
+                folder.display()
+            ),
         ));
     }
-
-    let clip_id = uuid::Uuid::new_v4().to_string();
+    let volume = folder
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(clips_root);
+    let free = synapse_storage::volume_free_bytes(&volume).map_err(|error| {
+        internal_error(format!(
+            "could not read the free space of {}: {error}",
+            volume.display()
+        ))
+    })?;
+    let level = synapse_storage::level_for_free_bytes(free);
+    if level != synapse_storage::DiskPressureLevel::Normal {
+        let code = level
+            .code()
+            .unwrap_or(error_codes::STORAGE_DISK_PRESSURE_LEVEL_1);
+        return Err(mcp_error(
+            code,
+            format!(
+                "screenshot operation=record refused: the clip volume {} has {free} bytes free ({code})",
+                volume.display()
+            ),
+        ));
+    }
     let app = match target {
         ClipTarget::Window { hwnd } => synapse_a11y::foreground_context(hwnd)
             .ok()
@@ -282,186 +441,33 @@ fn capture_clip_plan(
         ClipTarget::Monitor { .. } => None,
     };
     let plan = ClipPlan {
-        folder: params
-            .folder
-            .as_ref()
-            .map_or_else(|| clips_root().join(&clip_id), PathBuf::from),
         clip_id,
         target,
         app,
-        duration_ms: params.duration_ms,
-        fps: params.fps.unwrap_or(DEFAULT_FPS),
+        folder,
+        end_ms: params.duration_ms,
         privacy,
-        cancel,
     };
     if let Some(reason) = plan.privacy_stop() {
         return Err(stop_error(reason));
     }
+    if plan.excluded_app_visible() {
+        return Err(stop_error(StopReason::PrivacyExcludedApp));
+    }
     Ok(plan)
 }
 
-/// Default parent of clip folders (same root as `replay_root()`).
-fn clips_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map_or_else(std::env::temp_dir, PathBuf::from)
-        .join("synapse")
-        .join("clips")
-}
-
-/// Records into a temp folder next to `plan.folder`, then renames it into place.
-fn record_clip(plan: &ClipPlan) -> Result<CaptureClipResponse, ErrorData> {
-    let temp = temp_folder_for(&plan.folder)?;
-    std::fs::create_dir_all(&temp).map_err(|error| {
-        internal_error(format!(
-            "could not create temp clip folder {temp:?}: {error}"
-        ))
-    })?;
-    let recorded = record_into(plan, &temp).and_then(|summary| {
-        if plan.cancelled() {
-            return Err(cancelled_error());
-        }
-        std::fs::rename(&temp, &plan.folder).map_err(|error| {
-            internal_error(format!(
-                "could not move clip into {:?}: {error}",
-                plan.folder
-            ))
-        })?;
-        Ok(summary)
-    });
-    let summary = match recorded {
-        Ok(summary) => summary,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&temp);
-            return Err(error);
-        }
-    };
-    let video_path = plan.folder.join(VIDEO_FILE);
-    let bytes_written = std::fs::metadata(&video_path).map_or(0, |m| m.len());
-    let sha256 = file_sha256(&video_path)
-        .map_err(|error| internal_error(format!("could not hash clip.mp4: {error}")))?;
-    tracing::info!(
-        code = "CAPTURE_CLIP_RECORDED",
-        folder = %plan.folder.display(),
-        frames_new = summary.health.frames_new,
-        frames_repeated = summary.health.frames_repeated,
-        encoder = %summary.encode.encoder,
-        hardware = summary.encode.hardware,
-        stopped_reason = summary.health.stopped_reason.as_str(),
-        bytes_written,
-        "readback=screenshot_record outcome=encoded"
-    );
-    Ok(CaptureClipResponse {
-        clip_id: summary.clip_id,
-        folder: path_string(&plan.folder),
-        video_path: path_string(&video_path),
-        frames_path: path_string(&plan.folder.join(FRAMES_FILE)),
-        clip_json_path: path_string(&plan.folder.join(CLIP_JSON_FILE)),
-        bytes: bytes_written,
-        sha256,
-        duration_ms: summary.health.duration_ms,
-        width: summary.encode.width,
-        height: summary.encode.height,
-        fps: summary.encode.fps,
-        frames_total: summary.health.frames_total,
-        frames_new: summary.health.frames_new,
-        frames_repeated: summary.health.frames_repeated,
-        encoder: summary.encode.encoder,
-        hardware: summary.encode.hardware,
-        container: summary.encode.container.to_owned(),
-        stopped_reason: summary.health.stopped_reason.as_str().to_owned(),
-    })
-}
-
-fn temp_folder_for(folder: &Path) -> Result<PathBuf, ErrorData> {
-    let parent = folder
-        .parent()
-        .ok_or_else(|| internal_error(format!("clip folder {folder:?} has no parent directory")))?;
-    let name = folder
-        .file_name()
-        .map_or_else(|| "clip".into(), |name| name.to_string_lossy());
-    Ok(parent.join(format!(
-        ".{name}.recording-{}",
-        uuid::Uuid::new_v4().simple()
-    )))
-}
-
-fn file_sha256(path: &Path) -> std::io::Result<String> {
-    use sha2::Digest as _;
-    use std::io::Read as _;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
 #[cfg(windows)]
-fn record_into(plan: &ClipPlan, temp: &Path) -> Result<ClipManifest, ErrorData> {
-    let capture = synapse_capture::spawn_capture_loop(synapse_capture::CaptureConfig {
-        target: match plan.target {
-            ClipTarget::Window { hwnd } => synapse_capture::CaptureTarget::Window { hwnd },
-            ClipTarget::Monitor { monitor_index } => {
-                synapse_capture::CaptureTarget::Monitor { monitor_index }
-            }
-        },
-        min_update_interval_ms: 1_000 / u64::from(plan.fps),
-        cursor_visible: true,
-        // Include menus and popups owned by the window: they matter in bug clips.
-        secondary_windows: true,
-        dirty_region_only: false,
-        // Pinned: SYNAPSE_CAPTURE_FORCE_DXGI must not break window clips.
-        backend_preference: synapse_capture::CaptureBackendPreference::GraphicsCaptureApi,
-    })
-    .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!("screenshot operation=record: {error}"),
-        )
-    })?;
-    let recorded = ClipRecorder::new(plan).run(&capture, temp);
-    // The capture loop's own result is its terminal error: a backend failure
-    // during the clip fails the clip instead of leaving a frozen recording.
-    let manifest = match (recorded, capture.stop()) {
-        (recorded, Ok(())) => recorded?,
-        (Ok(_), Err(capture_error)) => {
-            return Err(mcp_error(
-                capture_error.code(),
-                format!("screenshot operation=record: the capture loop failed: {capture_error}"),
-            ));
-        }
-        (Err(mut error), Err(capture_error)) => {
-            error.message = format!(
-                "{}; the capture loop failed: {capture_error}",
-                error.message
-            )
-            .into();
-            return Err(error);
-        }
-    };
-    let json = serde_json::to_vec_pretty(&manifest)
-        .map_err(|error| internal_error(format!("could not serialise clip.json: {error}")))?;
-    std::fs::write(temp.join(CLIP_JSON_FILE), json)
-        .map_err(|error| internal_error(format!("could not write clip.json: {error}")))?;
-    Ok(manifest)
+fn record(plan: &ClipPlan, control: &RecordingControl, started: StartSender) {
+    live::record(plan, control, started);
 }
 
 #[cfg(not(windows))]
-fn record_into(_plan: &ClipPlan, _temp: &Path) -> Result<ClipManifest, ErrorData> {
-    Err(mcp_error(
+fn record(_plan: &ClipPlan, _control: &RecordingControl, started: StartSender) {
+    let _ = started.send(Err(mcp_error(
         error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED,
         "screenshot operation=record requires Windows (Windows.Graphics.Capture + Media Foundation)",
-    ))
+    )));
 }
 
 /// Adds operation, source of truth, target id and a remediation to an error's
@@ -481,13 +487,16 @@ fn with_clip_context(mut error: ErrorData, target_id: &str) -> ErrorData {
             "the target window closed; bind a live window and record again"
         }
         error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED => {
-            "Windows.Graphics.Capture is unavailable for this target; record a monitor or another window"
+            "Windows.Graphics.Capture is unavailable for this target or this Windows is older than 10 1903; record a monitor or another window"
         }
         error_codes::CAPTURE_TARGET_INVALID => {
-            "bind a live, visible window (or pass a valid monitor_index), check the timeline privacy gate, and retry"
+            "bind a live, visible window (or pass a valid monitor_index), check the timeline privacy gate and that no other recording runs, and retry"
         }
-        error_codes::STORAGE_DISK_PRESSURE_LEVEL_3 | error_codes::STORAGE_DISK_PRESSURE_LEVEL_4 => {
-            "free disk space on the Synapse data volume, then retry"
+        error_codes::STORAGE_DISK_PRESSURE_LEVEL_1
+        | error_codes::STORAGE_DISK_PRESSURE_LEVEL_2
+        | error_codes::STORAGE_DISK_PRESSURE_LEVEL_3
+        | error_codes::STORAGE_DISK_PRESSURE_LEVEL_4 => {
+            "free disk space on the clip volume (at least 2 GB), then retry"
         }
         _ => "retry; if it repeats, check the daemon log for CAPTURE_CLIP entries",
     };
@@ -506,477 +515,14 @@ fn with_clip_context(mut error: ErrorData, target_id: &str) -> ErrorData {
     error
 }
 
-/// Runs the constant-rate timeline and writes `clip.mp4` + `frames.jsonl`.
-#[cfg(windows)]
-struct ClipRecorder<'a> {
-    plan: &'a ClipPlan,
-    health: ClipHealth,
-    minimized_since: Option<(u64, u64)>,
-    source_size: (u32, u32),
-}
-
-#[cfg(windows)]
-impl<'a> ClipRecorder<'a> {
-    fn new(plan: &'a ClipPlan) -> Self {
-        Self {
-            plan,
-            health: ClipHealth::default(),
-            minimized_since: None,
-            source_size: (0, 0),
-        }
-    }
-
-    fn run(
-        mut self,
-        capture: &synapse_capture::CaptureHandle,
-        temp: &Path,
-    ) -> Result<ClipManifest, ErrorData> {
-        use std::io::Write as _;
-        use std::time::{Duration, Instant};
-
-        let fps = self.plan.fps;
-        let first = self.first_frame(capture)?;
-        let first = frame_to_bgra(&first)?;
-        if is_all_black(&first.bytes) {
-            return Err(mcp_error(
-                error_codes::CAPTURE_TARGET_INVALID,
-                "screenshot operation=record: the first frame is all black (hidden or secure desktop, or a protected window); no PrintWindow fallback is used",
-            ));
-        }
-        self.source_size = (first.width, first.height);
-        let mut canvas = ClipCanvas::new(first.width, first.height);
-        canvas.draw(&first.bytes, first.width, first.height);
-
-        let mut encoder = super::clip_encoder::ClipEncoder::create(
-            &temp.join(VIDEO_FILE),
-            canvas.width,
-            canvas.height,
-            fps,
-        )
-        .map_err(|error| internal_error(format!("H.264 encoder setup failed: {error}")))?;
-        let keyframe_interval = encoder.readback().keyframe_interval_frames.max(1);
-        let frames_file = std::fs::File::create(temp.join(FRAMES_FILE))
-            .map_err(|error| internal_error(format!("could not create frames.jsonl: {error}")))?;
-        let mut frames_out = std::io::BufWriter::new(frames_file);
-
-        // Encoding is ready: frame 0 is the newest frame Windows delivered
-        // meanwhile, and the clock and the ticker start from it.
-        if let Some(newer) = self.drain_newest(capture)? {
-            self.health.frames_skipped += 1;
-            self.draw_new(&mut canvas, &newer, 0, 0);
-        }
-        let started = Instant::now();
-        let clock = ClipClock::now();
-
-        let planned_frames = (self.plan.duration_ms * u64::from(fps))
-            .div_ceil(1_000)
-            .max(1);
-        let tick = Duration::from_secs(1) / fps;
-        let mut total_frames = 0;
-        for frame in 0..planned_frames {
-            let t_ms = frame * 1_000 / u64::from(fps);
-            if frame > 0 {
-                let deadline = started + tick * u32::try_from(frame).unwrap_or(u32::MAX);
-                self.sleep_until(deadline);
-            }
-            if self.plan.cancelled() {
-                return Err(cancelled_error());
-            }
-            // Every frame, frame 0 included, passes the privacy and target
-            // gate right before it is taken and encoded.
-            if let Some(reason) = self.early_stop() {
-                if frame == 0 {
-                    return Err(stop_error(reason));
-                }
-                self.health.stopped_reason = reason;
-                break;
-            }
-            let is_new = frame == 0 || self.take_latest(capture, &mut canvas, frame, t_ms)?;
-            if is_new {
-                self.health.frames_new += 1;
-            } else {
-                self.health.frames_repeated += 1;
-            }
-            encoder
-                .write_nv12(&canvas.nv12)
-                .map_err(|error| internal_error(format!("H.264 encode failed: {error}")))?;
-            let line = FrameLine {
-                frame,
-                t_ms,
-                new: is_new,
-                key: frame % u64::from(keyframe_interval) == 0,
-            };
-            serde_json::to_writer(&mut frames_out, &line)
-                .map_err(|error| internal_error(format!("frames.jsonl write failed: {error}")))?;
-            frames_out
-                .write_all(b"\n")
-                .map_err(|error| internal_error(format!("frames.jsonl write failed: {error}")))?;
-            total_frames = frame + 1;
-        }
-        let end_ms = total_frames * 1_000 / u64::from(fps);
-        self.close_minimized(total_frames, end_ms);
-        frames_out
-            .flush()
-            .map_err(|error| internal_error(format!("frames.jsonl flush failed: {error}")))?;
-        let readback = encoder
-            .finish()
-            .map_err(|error| internal_error(format!("H.264 finalize failed: {error}")))?;
-
-        let wall_elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.health.frames_total = total_frames;
-        self.health.frames_dropped_by_channel = capture.stats().frames_dropped();
-        self.health.requested_duration_ms = self.plan.duration_ms;
-        self.health.duration_ms = end_ms;
-        self.health.wall_elapsed_ms = wall_elapsed_ms;
-        let seconds = (wall_elapsed_ms.max(1) as f64) / 1_000.0;
-        self.health.achieved_fps = round2(total_frames as f64 / seconds);
-        self.health.new_frame_fps = round2(self.health.frames_new as f64 / seconds);
-
-        Ok(ClipManifest {
-            schema_version: CLIP_SCHEMA_VERSION,
-            clip_id: self.plan.clip_id.clone(),
-            synapse_version: env!("CARGO_PKG_VERSION"),
-            clock,
-            target: ClipTargetInfo::read(self.plan.target, first.width, first.height),
-            encode: ClipEncode {
-                codec: "h264",
-                profile: "high",
-                pixel_format: "yuv420p (nv12)",
-                encoder: readback.encoder,
-                hardware: readback.hardware,
-                container: readback.container,
-                width: canvas.width,
-                height: canvas.height,
-                fps,
-                keyframe_interval_frames: readback.keyframe_interval_frames,
-                keyframe_interval_ms: u64::from(readback.keyframe_interval_frames) * 1_000
-                    / u64::from(fps),
-                rate_control: RateControl {
-                    mode: readback.rate_control_mode,
-                    value: readback.rate_control_value,
-                },
-                cursor: true,
-                resize: "letterbox",
-            },
-            health: self.health,
-        })
-    }
-
-    /// Waits for the first frame, checking for cancellation in between.
-    fn first_frame(
-        &self,
-        capture: &synapse_capture::CaptureHandle,
-    ) -> Result<synapse_capture::CapturedFrame, ErrorData> {
-        use std::time::{Duration, Instant};
-
-        let receiver = capture.receiver();
-        let deadline = Instant::now() + Duration::from_millis(FIRST_FRAME_TIMEOUT_MS);
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            if self.plan.cancelled() {
-                return Err(cancelled_error());
-            }
-            match receiver.recv_timeout(left.min(Duration::from_millis(CANCEL_POLL_MS))) {
-                Ok(frame) => return Ok(frame),
-                Err(error) if error.is_disconnected() => return Err(capture_ended_error()),
-                Err(_) => {}
-            }
-        }
-        if self.target_closed() {
-            return Err(stop_error(StopReason::TargetLost));
-        }
-        Err(mcp_error(
-            error_codes::CAPTURE_TARGET_INVALID,
-            format!(
-                "screenshot operation=record got no frame within {FIRST_FRAME_TIMEOUT_MS} ms; a minimized or non-rendering target cannot start a clip (it is never restored)"
-            ),
-        ))
-    }
-
-    /// Sleeps until `deadline`, waking early when the call is cancelled.
-    fn sleep_until(&self, deadline: std::time::Instant) {
-        while !self.plan.cancelled() {
-            let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return;
-            };
-            std::thread::sleep(wait.min(std::time::Duration::from_millis(CANCEL_POLL_MS)));
-        }
-    }
-
-    /// Drains the capture channel and converts the newest frame. A
-    /// disconnected channel means the capture loop ended: that is an error,
-    /// not a repeat.
-    fn drain_newest(
-        &mut self,
-        capture: &synapse_capture::CaptureHandle,
-    ) -> Result<Option<synapse_capture::CapturedBgraBitmap>, ErrorData> {
-        let receiver = capture.receiver();
-        let mut latest = None;
-        loop {
-            match receiver.try_recv() {
-                Ok(captured) => {
-                    if latest.is_some() {
-                        self.health.frames_skipped += 1;
-                    }
-                    latest = Some(captured);
-                }
-                Err(error) if error.is_disconnected() && latest.is_none() => {
-                    return Err(capture_ended_error());
-                }
-                Err(_) => break,
-            }
-        }
-        Ok(latest.and_then(|captured| match frame_to_bgra(&captured) {
-            Ok(bitmap) => Some(bitmap),
-            Err(error) => {
-                self.health.frames_skipped += 1;
-                tracing::warn!(code = "CAPTURE_CLIP_FRAME_DROPPED", error = %error.message);
-                None
-            }
-        }))
-    }
-
-    /// Drains the capture channel, draws the newest frame and reports whether
-    /// one arrived. With none, notes whether the window is minimized.
-    fn take_latest(
-        &mut self,
-        capture: &synapse_capture::CaptureHandle,
-        canvas: &mut ClipCanvas,
-        frame: u64,
-        t_ms: u64,
-    ) -> Result<bool, ErrorData> {
-        let Some(bitmap) = self.drain_newest(capture)? else {
-            if self.target_minimized() {
-                self.minimized_since.get_or_insert((frame, t_ms));
-            } else {
-                self.close_minimized(frame, t_ms);
-            }
-            return Ok(false);
-        };
-        self.close_minimized(frame, t_ms);
-        self.draw_new(canvas, &bitmap, frame, t_ms);
-        Ok(true)
-    }
-
-    /// Draws a newly delivered frame, recording a size change.
-    fn draw_new(
-        &mut self,
-        canvas: &mut ClipCanvas,
-        bitmap: &synapse_capture::CapturedBgraBitmap,
-        frame: u64,
-        t_ms: u64,
-    ) {
-        if (bitmap.width, bitmap.height) != self.source_size {
-            self.source_size = (bitmap.width, bitmap.height);
-            self.health.resizes.push(ClipResize {
-                frame,
-                t_ms,
-                width: bitmap.width,
-                height: bitmap.height,
-            });
-        }
-        canvas.draw(&bitmap.bytes, bitmap.width, bitmap.height);
-    }
-
-    /// Why the clip must stop before this tick, if it must: the target window
-    /// closed, or the privacy gate now suppresses recording.
-    fn early_stop(&self) -> Option<StopReason> {
-        if self.target_closed() {
-            return Some(StopReason::TargetLost);
-        }
-        self.plan.privacy_stop()
-    }
-
-    fn target_closed(&self) -> bool {
-        match self.plan.target {
-            ClipTarget::Window { hwnd } => !unsafe {
-                windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(window_handle(hwnd)))
-            }
-            .as_bool(),
-            ClipTarget::Monitor { .. } => false,
-        }
-    }
-
-    fn target_minimized(&self) -> bool {
-        match self.plan.target {
-            ClipTarget::Window { hwnd } => unsafe {
-                windows::Win32::UI::WindowsAndMessaging::IsIconic(window_handle(hwnd)).as_bool()
-            },
-            ClipTarget::Monitor { .. } => false,
-        }
-    }
-
-    fn close_minimized(&mut self, end_frame: u64, end_ms: u64) {
-        if let Some((start_frame, start_ms)) = self.minimized_since.take() {
-            self.health.minimized_intervals.push(MinimizedInterval {
-                start_frame,
-                end_frame,
-                start_ms,
-                end_ms,
-            });
-        }
-    }
-}
-
-#[cfg(windows)]
-fn window_handle(hwnd: i64) -> windows::Win32::Foundation::HWND {
-    windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void)
-}
-
-/// `true` when every pixel of a BGRA frame is black (alpha ignored).
-#[cfg(windows)]
-fn is_all_black(bgra: &[u8]) -> bool {
-    bgra.chunks_exact(4).all(|pixel| pixel[..3] == [0, 0, 0])
-}
-
-#[cfg(windows)]
-fn frame_to_bgra(
-    frame: &synapse_capture::CapturedFrame,
-) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
-    let region = synapse_core::Rect {
-        x: 0,
-        y: 0,
-        w: i32::try_from(frame.width).unwrap_or(i32::MAX),
-        h: i32::try_from(frame.height).unwrap_or(i32::MAX),
-    };
-    synapse_capture::captured_frame_region_to_bgra_bitmap(frame, region)
-        .map_err(|error| mcp_error(error.code(), format!("frame conversion failed: {error}")))
-}
-
-/// The fixed-size picture the encoder sees, kept as NV12 (BT.709 limited range).
-#[cfg(windows)]
-struct ClipCanvas {
-    width: u32,
-    height: u32,
-    nv12: Vec<u8>,
-}
-
-#[cfg(windows)]
-impl ClipCanvas {
-    /// Fixes the clip size from the first frame, rounded down to even numbers.
-    fn new(first_width: u32, first_height: u32) -> Self {
-        let width = (first_width & !1).max(2);
-        let height = (first_height & !1).max(2);
-        let pixels = width as usize * height as usize;
-        Self {
-            width,
-            height,
-            nv12: vec![0; pixels * 3 / 2],
-        }
-    }
-
-    /// Draws a BGRA frame: as is when it matches (an odd extra row or column is
-    /// cropped), otherwise scaled to fit and letterboxed with black bars.
-    fn draw(&mut self, bgra: &[u8], width: u32, height: u32) {
-        let fits = width >= self.width
-            && height >= self.height
-            && width - self.width <= 1
-            && height - self.height <= 1;
-        if fits {
-            self.convert(bgra, width as usize);
-            return;
-        }
-        let letterboxed = self.letterbox(bgra, width, height);
-        self.convert(&letterboxed, self.width as usize);
-    }
-
-    fn letterbox(&self, bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
-        let (canvas_w, canvas_h) = (self.width as usize, self.height as usize);
-        let mut out = [0_u8, 0, 0, 255].repeat(canvas_w * canvas_h);
-        let Some(source) = image::RgbaImage::from_raw(
-            width,
-            height,
-            bgra.get(..width as usize * height as usize * 4)
-                .unwrap_or_default()
-                .to_vec(),
-        ) else {
-            return out;
-        };
-        let scale = f64::min(
-            f64::from(self.width) / f64::from(width.max(1)),
-            f64::from(self.height) / f64::from(height.max(1)),
-        );
-        let fit_w = ((f64::from(width) * scale).round() as u32).clamp(1, self.width);
-        let fit_h = ((f64::from(height) * scale).round() as u32).clamp(1, self.height);
-        // Channel order is irrelevant to resizing, so BGRA passes through as is.
-        let scaled =
-            image::imageops::resize(&source, fit_w, fit_h, image::imageops::FilterType::Triangle);
-        let x0 = (canvas_w - fit_w as usize) / 2;
-        let y0 = (canvas_h - fit_h as usize) / 2;
-        let row_bytes = fit_w as usize * 4;
-        for (row, line) in scaled.as_raw().chunks_exact(row_bytes).enumerate() {
-            let start = ((y0 + row) * canvas_w + x0) * 4;
-            out[start..start + row_bytes].copy_from_slice(line);
-        }
-        out
-    }
-
-    /// BGRA (`stride_px` pixels per row) to NV12 over the canvas area,
-    /// BT.709 limited range, chroma averaged over each 2x2 block.
-    fn convert(&mut self, bgra: &[u8], stride_px: usize) {
-        let (width, height) = (self.width as usize, self.height as usize);
-        let rgb_at = |col: usize, row: usize| -> (i32, i32, i32) {
-            let offset = (row * stride_px + col) * 4;
-            bgra.get(offset..offset + 3).map_or((0, 0, 0), |px| {
-                (i32::from(px[2]), i32::from(px[1]), i32::from(px[0]))
-            })
-        };
-        let (luma, chroma) = self.nv12.split_at_mut(width * height);
-        for row in 0..height {
-            for col in 0..width {
-                let (red, green, blue) = rgb_at(col, row);
-                luma[row * width + col] =
-                    clamp_u8(((47 * red + 157 * green + 16 * blue + 128) >> 8) + 16);
-            }
-        }
-        for row in (0..height).step_by(2) {
-            for col in (0..width).step_by(2) {
-                let mut sum = (0, 0, 0);
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let (red, green, blue) = rgb_at(col + dx, row + dy);
-                    sum = (sum.0 + red, sum.1 + green, sum.2 + blue);
-                }
-                let (red, green, blue) = (sum.0 / 4, sum.1 / 4, sum.2 / 4);
-                let at = (row / 2) * width + col;
-                chroma[at] = clamp_u8(((-26 * red - 87 * green + 112 * blue + 128) >> 8) + 128);
-                chroma[at + 1] = clamp_u8(((112 * red - 102 * green - 10 * blue + 128) >> 8) + 128);
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn clamp_u8(value: i32) -> u8 {
-    u8::try_from(value.clamp(0, 255)).unwrap_or(u8::MAX)
-}
-
-#[cfg(windows)]
-fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
-}
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 fn internal_error(message: String) -> ErrorData {
     mcp_error(
-        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+        error_codes::TOOL_INTERNAL_ERROR,
         format!("screenshot operation=record: {message}"),
     )
 }
 
-/// The call was cancelled; no clip folder is published.
-fn cancelled_error() -> ErrorData {
-    internal_error("the call was cancelled; no clip folder was published".to_owned())
-}
-
-/// The capture loop ended while the clip still needed frames.
-#[cfg(windows)]
-fn capture_ended_error() -> ErrorData {
-    thread_failed("the capture loop ended during the recording".to_owned())
-}
-
-/// Refusal for a stop reason that applies before any frame is encoded.
+/// Refusal for a stop reason that applies before the first frame is written.
 fn stop_error(reason: StopReason) -> ErrorData {
     match reason {
         StopReason::TargetLost => mcp_error(
@@ -1002,169 +548,759 @@ fn thread_failed(detail: String) -> ErrorData {
     )
 }
 
-/// One line of `frames.jsonl` (written here, read by the clip viewer).
-#[derive(Serialize, serde::Deserialize)]
-pub(super) struct FrameLine {
-    pub(super) frame: u64,
-    /// Milliseconds from frame 0 on the constant-rate timeline.
-    pub(super) t_ms: u64,
-    /// `true` when Windows delivered a new frame for this tick, `false` when
-    /// the previous frame was repeated.
-    pub(super) new: bool,
-    /// Keyframe by the encoder's configured keyframe interval.
-    pub(super) key: bool,
+/// σ: the smallest whole number that gives at least `MIN_LINES` lines (A3).
+pub(super) fn scale_for_height(height: u32) -> u32 {
+    MIN_LINES.div_ceil(height.max(1)).max(1)
 }
 
-/// `clip.json`.
-#[derive(Serialize)]
-struct ClipManifest {
-    schema_version: u32,
-    clip_id: String,
-    synapse_version: &'static str,
-    clock: ClipClock,
-    target: ClipTargetInfo,
-    encode: ClipEncode,
-    health: ClipHealth,
-}
+#[cfg(windows)]
+mod live {
+    use std::io::Write as _;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-/// Frame 0 is the first frame Windows delivered; `t_ms` values count from it.
-#[derive(Serialize)]
-struct ClipClock {
-    /// `GetTickCount64` (ms since boot, monotonic) at frame 0.
-    monotonic_ms_at_frame0: u64,
-    /// Wall clock (Unix ms) at frame 0, for joining log files.
-    wall_clock_unix_ms_at_frame0: u64,
-}
+    use synapse_capture::{ClipObserver, ClipSource, HNS_PER_MS, ObservedFrame};
+    use synapse_core::error_codes;
 
-impl ClipClock {
-    #[cfg(windows)]
-    fn now() -> Self {
-        Self {
-            monotonic_ms_at_frame0: unsafe {
-                windows::Win32::System::SystemInformation::GetTickCount64()
-            },
-            wall_clock_unix_ms_at_frame0: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| {
-                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-                }),
+    use super::super::clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME;
+    use super::super::clip_folder::{
+        CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
+        ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
+        ObserverGrant, StopReason, WAITING_DIR, raw_frame_path,
+    };
+    use super::super::clip_worker::{ProcessorBudget, SEGMENT_RAW_BUDGET_BYTES};
+    use super::super::{CaptureClipResponse, ErrorData};
+    use super::{
+        CLIP_JSON_FILE, ClipPlan, ClipTarget, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS,
+        FIRST_FRAME_TIMEOUT_MS, FRAMES_FILE, RECORD_FPS, REFERENCE_REFRESH_HZ, RecordingControl,
+        StartSender, file_size_and_sha256, internal_error, scale_for_height, stop_error,
+        thread_failed,
+    };
+    use crate::m1::mcp_error;
+
+    const HNS_PER_SECOND: i64 = 10_000_000;
+    /// Raw frames are 4 bytes (32 bits) per pixel.
+    const RAW_BITS_PER_PIXEL: f64 = 32.0;
+
+    /// 1 / f in 100 ns units.
+    const fn instant_hns() -> i64 {
+        HNS_PER_SECOND / RECORD_FPS as i64
+    }
+
+    /// k / f in milliseconds.
+    const fn instant_ms(instant: u64) -> u64 {
+        instant * 1_000 / RECORD_FPS as u64
+    }
+
+    /// A4 to A12 for one clip. Sends the start result as soon as `clip.json`
+    /// and frame zero are written.
+    pub(super) fn record(plan: &ClipPlan, control: &RecordingControl, started: StartSender) {
+        let mut recording = match Recording::start(plan) {
+            Ok(recording) => recording,
+            Err(error) => {
+                fail_start(plan, &error);
+                let _ = started.send(Err(error));
+                return;
+            }
+        };
+        match recording.response() {
+            Ok(response) => {
+                let _ = started.send(Ok(response));
+            }
+            Err(error) => {
+                let _ = started.send(Err(error));
+                recording.finish(StopReason::WriteFailed);
+                return;
+            }
+        }
+        let reason = recording.run(control);
+        recording.finish(reason);
+    }
+
+    /// The clip could not start: its `clip.json` (if written) says `failed`.
+    fn fail_start(plan: &ClipPlan, error: &ErrorData) {
+        if plan.folder.join(CLIP_JSON_FILE).is_file() {
+            let _ = ClipJson::update(&plan.folder, |clip| {
+                clip.state = ClipState::Failed;
+                clip.failure = Some(error.message.to_string());
+            });
+            let _ = ClipRegistry::remove(&plan.clip_id);
         }
     }
-}
 
-#[derive(Serialize)]
-struct ClipTargetInfo {
-    /// `window` or `monitor`.
-    kind: &'static str,
-    hwnd: Option<i64>,
-    monitor_index: Option<u32>,
-    process_id: Option<u32>,
-    exe: Option<String>,
-    title: Option<String>,
-    /// Size of the first captured frame.
-    width: u32,
-    height: u32,
-}
+    /// A1: what this machine is; no constant of one PC in the code.
+    struct Machine {
+        threads: u32,
+        windows_build: u32,
+    }
 
-impl ClipTargetInfo {
-    #[cfg(windows)]
-    fn read(target: ClipTarget, width: u32, height: u32) -> Self {
+    impl Machine {
+        fn read() -> Self {
+            Self {
+                threads: std::thread::available_parallelism().map_or(1, |threads| {
+                    u32::try_from(threads.get()).unwrap_or(u32::MAX)
+                }),
+                windows_build: synapse_capture::windows_build().unwrap_or(0),
+            }
+        }
+    }
+
+    /// A9: the live part's processor share per second, disk writes included,
+    /// and the load-shedding rule.
+    struct LiveMeter {
+        threads: u32,
+        second_started_hns: i64,
+        cpu_at_second_start: i64,
+        max_share: f64,
+        max_worker_cap_given: f64,
+        seconds_over_limit: u64,
+    }
+
+    impl LiveMeter {
+        fn new(threads: u32, observer: &ClipObserver) -> Self {
+            Self {
+                threads,
+                second_started_hns: synapse_capture::now_hns(),
+                cpu_at_second_start: Self::cpu(observer),
+                max_share: 0.0,
+                max_worker_cap_given: 0.0,
+                seconds_over_limit: 0,
+            }
+        }
+
+        /// Processor time of the recorder thread plus the capture thread.
+        fn cpu(observer: &ClipObserver) -> i64 {
+            synapse_capture::current_thread_cpu_hns() + observer.capture_thread_cpu_hns()
+        }
+
+        /// `true` when the live part alone has used its whole share of 10 %
+        /// within the current second (A9): read-backs are skipped until it ends.
+        fn shedding(&self, observer: &ClipObserver) -> bool {
+            ProcessorBudget::live_alone_reached(
+                Self::cpu(observer) - self.cpu_at_second_start,
+                self.threads,
+            )
+        }
+
+        /// Once a second: the share of the last second, and the worker cap.
+        fn tick(&mut self, observer: &ClipObserver) {
+            let now = synapse_capture::now_hns();
+            let elapsed = now - self.second_started_hns;
+            if elapsed < HNS_PER_SECOND {
+                return;
+            }
+            let cpu = Self::cpu(observer);
+            let share = (cpu - self.cpu_at_second_start) as f64 * 100.0
+                / (elapsed as f64 * f64::from(self.threads.max(1)));
+            let cap = ProcessorBudget::global().set_live_share(share);
+            self.max_share = self.max_share.max(share);
+            self.max_worker_cap_given = self.max_worker_cap_given.max(cap);
+            if share >= super::super::clip_worker::CPU_LIMIT_PERCENT {
+                self.seconds_over_limit += 1;
+            }
+            self.second_started_hns = now;
+            self.cpu_at_second_start = cpu;
+        }
+    }
+
+    /// A11: the disk rule on the clip volume. Free space as measured, minus the
+    /// bytes written since, minus a reserve for the segment being finalized.
+    struct DiskGuard {
+        measured_free: u64,
+        written_since: u64,
+        raw_written: u64,
+        measured_at: Instant,
+    }
+
+    impl DiskGuard {
+        fn new(folder: &Path) -> Result<Self, String> {
+            Ok(Self {
+                measured_free: Self::measure(folder)?,
+                written_since: 0,
+                raw_written: 0,
+                measured_at: Instant::now(),
+            })
+        }
+
+        fn measure(folder: &Path) -> Result<u64, String> {
+            synapse_storage::volume_free_bytes(folder).map_err(|error| {
+                format!("could not read the free space of the clip volume: {error}")
+            })
+        }
+
+        fn wrote(&mut self, bytes: u64) {
+            self.written_since += bytes;
+            self.raw_written += bytes;
+        }
+
+        /// The raw bytes of the open segment plus their estimated encoded size (C13).
+        fn finalize_reserve(&self) -> u64 {
+            let open_raw = self.raw_written.min(SEGMENT_RAW_BUDGET_BYTES);
+            let encoded = open_raw as f64 * FALLBACK_BITS_PER_PIXEL_FRAME / RAW_BITS_PER_PIXEL;
+            open_raw + encoded as u64
+        }
+
+        /// `false` once the clip volume would fall to storage pressure Level 1.
+        fn permits(&mut self, folder: &Path) -> Result<bool, String> {
+            if self.measured_at.elapsed() >= Duration::from_millis(DISK_CHECK_MS) {
+                self.measured_free = Self::measure(folder)?;
+                self.written_since = 0;
+                self.measured_at = Instant::now();
+            }
+            let available = self
+                .measured_free
+                .saturating_sub(self.written_since)
+                .saturating_sub(self.finalize_reserve());
+            Ok(synapse_storage::level_for_free_bytes(available)
+                == synapse_storage::DiskPressureLevel::Normal)
+        }
+    }
+
+    /// The live part of one clip.
+    struct Recording<'a> {
+        plan: &'a ClipPlan,
+        source: ClipSource,
+        machine: Machine,
+        observer: ClipObserver,
+        frames: std::io::BufWriter<std::fs::File>,
+        meter: LiveMeter,
+        disk: DiskGuard,
+        origin_hns: i64,
+        geometry: ClipGeometry,
+        last_recorded: Option<ObservedFrame>,
+        next_instant: u64,
+        lost: Vec<LostInstant>,
+        excluded_checked_at: Instant,
+    }
+
+    impl<'a> Recording<'a> {
+        /// A1, A3 to A5 and frame zero.
+        fn start(plan: &'a ClipPlan) -> Result<Self, ErrorData> {
+            let machine = Machine::read();
+            if machine.windows_build < synapse_capture::MIN_WINDOWS_BUILD {
+                return Err(mcp_error(
+                    error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED,
+                    format!(
+                        "screenshot operation=record needs Windows 10 version 1903 (build {}) or later; this is build {}",
+                        synapse_capture::MIN_WINDOWS_BUILD,
+                        machine.windows_build
+                    ),
+                ));
+            }
+            std::fs::create_dir_all(plan.folder.join(WAITING_DIR)).map_err(|error| {
+                internal_error(format!(
+                    "could not create {}: {error}",
+                    plan.folder.display()
+                ))
+            })?;
+            initial_clip_json(plan)
+                .create(&plan.folder)
+                .map_err(internal_error)?;
+            ClipRegistry::add(&plan.clip_id, &plan.folder).map_err(internal_error)?;
+            let source = match plan.target {
+                ClipTarget::Window { hwnd } => ClipSource::Window { hwnd },
+                ClipTarget::Monitor { monitor_index } => ClipSource::Monitor { monitor_index },
+            };
+            let observer = ClipObserver::start(source, instant_hns()).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("screenshot operation=record: {error}"),
+                )
+            })?;
+            let origin_hns = wait_for_first_frame(&observer, plan)?;
+            let frames_file =
+                std::fs::File::create(plan.folder.join(FRAMES_FILE)).map_err(|error| {
+                    internal_error(format!("could not create frames.jsonl: {error}"))
+                })?;
+            let disk = DiskGuard::new(&plan.folder).map_err(internal_error)?;
+            let meter = LiveMeter::new(machine.threads, &observer);
+            let mut recording = Self {
+                plan,
+                source,
+                machine,
+                observer,
+                frames: std::io::BufWriter::new(frames_file),
+                meter,
+                disk,
+                origin_hns,
+                geometry: ClipGeometry::default(),
+                last_recorded: None,
+                next_instant: 0,
+                lost: Vec::new(),
+                excluded_checked_at: Instant::now(),
+            };
+            recording.write_frame_zero()?;
+            Ok(recording)
+        }
+
+        /// Frame zero passes the privacy gate before it is written (C12); an
+        /// all-black frame zero is an error.
+        fn write_frame_zero(&mut self) -> Result<(), ErrorData> {
+            if let Some(reason) = self.plan.privacy_stop() {
+                return Err(stop_error(reason));
+            }
+            let frame = self.observer.frame_for_instant(0).ok_or_else(|| {
+                thread_failed("the first frame is no longer held by the observer".to_owned())
+            })?;
+            let pixels = self.observer.read_back(&frame).map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("screenshot operation=record: {error}"),
+                )
+            })?;
+            if pixels
+                .bgra
+                .chunks_exact(4)
+                .all(|pixel| pixel[..3] == [0, 0, 0])
+            {
+                return Err(mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    "screenshot operation=record: the first frame is all black (hidden or secure desktop, or a protected window); no PrintWindow fallback is used",
+                ));
+            }
+            let scale = scale_for_height(frame.height);
+            self.geometry = ClipGeometry {
+                window_width: frame.width,
+                window_height: frame.height,
+                scale,
+                recorded_width: frame.width * scale,
+                recorded_height: frame.height * scale,
+            };
+            self.write_raw(0, &pixels.bgra).map_err(internal_error)?;
+            self.write_line(&self.new_line(0, &frame))
+                .map_err(internal_error)?;
+            self.last_recorded = Some(frame);
+            self.next_instant = 1;
+            let clock = ClipClock {
+                monotonic_ms_at_s0: monotonic_ms(),
+                wall_clock_unix_ms_at_s0: wall_clock_ms(),
+                composed_hns_at_s0: self.origin_hns,
+            };
+            let geometry = self.geometry;
+            let settings = self.observer.settings();
+            ClipJson::update(&self.plan.folder, |clip| {
+                clip.clock = clock;
+                clip.geometry = geometry;
+                clip.observer = ObserverGrant {
+                    cursor_in_picture: settings.cursor_in_picture,
+                    border_hidden: settings.border_hidden,
+                    secondary_windows: settings.secondary_windows,
+                    requested_interval_ms: settings.requested_interval_ms,
+                    dirty_regions: settings.dirty_regions,
+                };
+                clip.recorded_ms = instant_ms(1);
+            })
+            .map_err(internal_error)?;
+            Ok(())
+        }
+
+        /// The `record` response: `clip.json` read back from disk (O1).
+        fn response(&self) -> Result<CaptureClipResponse, ErrorData> {
+            let path = self.plan.folder.join(CLIP_JSON_FILE);
+            let clip = ClipJson::read(&self.plan.folder).map_err(internal_error)?;
+            let (bytes, sha256) = file_size_and_sha256(&path).map_err(|error| {
+                internal_error(format!("could not read back clip.json: {error}"))
+            })?;
+            tracing::info!(
+                code = "CAPTURE_CLIP_STARTED",
+                clip_id = %clip.clip_id,
+                folder = %self.plan.folder.display(),
+                width = clip.geometry.window_width,
+                height = clip.geometry.window_height,
+                "readback=screenshot_record outcome=recording"
+            );
+            Ok(CaptureClipResponse {
+                clip_id: clip.clip_id,
+                folder: self.plan.folder.to_string_lossy().into_owned(),
+                state: clip.state.as_str().to_owned(),
+                clip_json_path: path.to_string_lossy().into_owned(),
+                bytes,
+                sha256,
+                frames_path: self
+                    .plan
+                    .folder
+                    .join(FRAMES_FILE)
+                    .to_string_lossy()
+                    .into_owned(),
+                end_ms: clip.end_ms,
+                fps: clip.fps,
+                window_width: clip.geometry.window_width,
+                window_height: clip.geometry.window_height,
+                scale: clip.geometry.scale,
+                recorded_width: clip.geometry.recorded_width,
+                recorded_height: clip.geometry.recorded_height,
+                cursor_in_picture: clip.observer.cursor_in_picture,
+                border_hidden: clip.observer.border_hidden,
+            })
+        }
+
+        /// A6 to A12: one instant every 1 / f until a stop. Returns why it stopped.
+        fn run(&mut self, control: &RecordingControl) -> StopReason {
+            loop {
+                let k = self.next_instant;
+                if control.stop.load(Ordering::Relaxed) {
+                    return StopReason::StopCall;
+                }
+                if instant_ms(k) >= control.end_ms.load(Ordering::Relaxed) {
+                    return StopReason::Completed;
+                }
+                // Instant k is closed once s_{k+1} begins: every frame composed
+                // at or before s_k has then arrived.
+                sleep_until(self.origin_hns + (to_i64(k) + 1) * instant_hns(), control);
+                if control.stop.load(Ordering::Relaxed) {
+                    return StopReason::StopCall;
+                }
+                if let Some(reason) = self.stop_condition() {
+                    return reason;
+                }
+                if let Err(reason) = self.handle_instant(k) {
+                    return reason;
+                }
+                self.next_instant = k + 1;
+                self.meter.tick(&self.observer);
+            }
+        }
+
+        /// The target closed, the privacy gate pauses, an excluded app shows on
+        /// the monitor (E6), or the disk rule stops the clip.
+        fn stop_condition(&mut self) -> Option<StopReason> {
+            if self.observer.closed() || self.window_closed() {
+                return Some(StopReason::TargetLost);
+            }
+            if let Some(reason) = self.plan.privacy_stop() {
+                return Some(reason);
+            }
+            if self.excluded_checked_at.elapsed() >= Duration::from_millis(EXCLUDED_APP_CHECK_MS) {
+                self.excluded_checked_at = Instant::now();
+                if self.plan.excluded_app_visible() {
+                    return Some(StopReason::PrivacyExcludedApp);
+                }
+            }
+            match self.disk.permits(&self.plan.folder) {
+                Ok(true) => None,
+                Ok(false) => Some(StopReason::DiskPressure),
+                Err(error) => {
+                    tracing::warn!(code = "CAPTURE_CLIP_DISK_CHECK_FAILED", error = %error);
+                    Some(StopReason::WriteFailed)
+                }
+            }
+        }
+
+        /// A6 to A8 for instant k.
+        fn handle_instant(&mut self, k: u64) -> Result<(), StopReason> {
+            let Some(frame) = self.observer.frame_for_instant(to_i64(k)) else {
+                return self.write_lost(k, LossCause::SlotOverflow);
+            };
+            let repeated = self
+                .last_recorded
+                .is_some_and(|last| last.composed_hns == frame.composed_hns);
+            if repeated {
+                let mut line = self.repeat_line(k, &frame);
+                line.minimized = self.window_minimized();
+                return self.write_line(&line).map_err(|_| StopReason::WriteFailed);
+            }
+            if self.meter.shedding(&self.observer) {
+                return self.write_lost(k, LossCause::LoadShedding);
+            }
+            let pixels = self.observer.read_back(&frame).map_err(|error| {
+                tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
+                StopReason::CaptureFailed
+            })?;
+            if let Err(error) = self.write_raw(k, &pixels.bgra) {
+                tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
+                self.lost.push(LostInstant {
+                    instant: k,
+                    cause: LossCause::Disk,
+                });
+                return Err(StopReason::WriteFailed);
+            }
+            self.write_line(&self.new_line(k, &frame))
+                .map_err(|_| StopReason::WriteFailed)?;
+            self.last_recorded = Some(frame);
+            Ok(())
+        }
+
+        fn write_lost(&mut self, k: u64, cause: LossCause) -> Result<(), StopReason> {
+            self.lost.push(LostInstant { instant: k, cause });
+            let mut line = match self.last_recorded {
+                Some(last) => self.repeat_line(k, &last),
+                None => self.blank_line(k),
+            };
+            line.lost = Some(cause);
+            self.write_line(&line).map_err(|_| StopReason::WriteFailed)
+        }
+
+        fn blank_line(&self, k: u64) -> FrameLine {
+            FrameLine {
+                instant: k,
+                t_ms: instant_ms(k),
+                new: false,
+                width: 0,
+                height: 0,
+                cursor: self.cursor(),
+                composed_hns: None,
+                lost: None,
+                minimized: false,
+            }
+        }
+
+        fn repeat_line(&self, k: u64, frame: &ObservedFrame) -> FrameLine {
+            FrameLine {
+                width: frame.width,
+                height: frame.height,
+                composed_hns: Some(frame.composed_hns),
+                ..self.blank_line(k)
+            }
+        }
+
+        fn new_line(&self, k: u64, frame: &ObservedFrame) -> FrameLine {
+            FrameLine {
+                new: true,
+                ..self.repeat_line(k, frame)
+            }
+        }
+
+        /// The cursor in frame pixels (E9: logged, not drawn).
+        fn cursor(&self) -> Option<[i32; 2]> {
+            let mut point = windows::Win32::Foundation::POINT::default();
+            // SAFETY: one out-parameter.
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut point) }
+                .ok()?;
+            let (left, top) = self.source.origin()?;
+            Some([point.x - left, point.y - top])
+        }
+
+        fn write_line(&mut self, line: &FrameLine) -> Result<(), String> {
+            serde_json::to_writer(&mut self.frames, line).map_err(|error| error.to_string())?;
+            self.frames
+                .write_all(b"\n")
+                .and_then(|()| self.frames.flush())
+                .map_err(|error| format!("frames.jsonl write failed: {error}"))
+        }
+
+        /// One raw frame file in `waiting/` at its captured size.
+        fn write_raw(&mut self, k: u64, bgra: &[u8]) -> Result<(), String> {
+            let path = raw_frame_path(&self.plan.folder, k);
+            std::fs::write(&path, bgra)
+                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            self.disk.wrote(bgra.len() as u64);
+            Ok(())
+        }
+
+        fn window_closed(&self) -> bool {
+            match self.plan.target {
+                // SAFETY: IsWindow accepts any handle value.
+                ClipTarget::Window { hwnd } => !unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(window_handle(hwnd)))
+                }
+                .as_bool(),
+                ClipTarget::Monitor { .. } => false,
+            }
+        }
+
+        fn window_minimized(&self) -> bool {
+            match self.plan.target {
+                // SAFETY: IsIconic accepts any handle value.
+                ClipTarget::Window { hwnd } => unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::IsIconic(window_handle(hwnd)).as_bool()
+                },
+                ClipTarget::Monitor { .. } => false,
+            }
+        }
+
+        /// A10, A12: state `encoding` with the stop reason and conditions C,
+        /// G and T (B so far: the live share).
+        fn finish(mut self, reason: StopReason) {
+            let _ = self.frames.flush();
+            let stats = self.observer.stop();
+            let recorded_ms = instant_ms(self.next_instant);
+            for overflow in &stats.slot_overflow_instants {
+                if let Ok(instant) = u64::try_from(*overflow)
+                    && instant < self.next_instant
+                    && !self.lost.iter().any(|lost| lost.instant == instant)
+                {
+                    self.lost.push(LostInstant {
+                        instant,
+                        cause: LossCause::SlotOverflow,
+                    });
+                }
+            }
+            self.lost.sort_by_key(|lost| lost.instant);
+            let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
+            let failed: Vec<u64> = self.lost.iter().map(|lost| lost.instant).collect();
+            let held = |ok: bool| if ok { "held" } else { "not_held" }.to_owned();
+            let conditions = Conditions {
+                c: Some(ConditionStatus {
+                    status: held(failed.is_empty()),
+                    failed_instants: failed.clone(),
+                    detail: Some(serde_json::json!({
+                        "max_hold_ms": stats.max_hold_hns as f64 / HNS_PER_MS as f64,
+                        "reference_period_ms": reference_hns as f64 / HNS_PER_MS as f64,
+                        "hold_within_reference": stats.max_hold_hns <= reference_hns,
+                        "frames_delivered": stats.frames_delivered,
+                        "delivery_completeness": "checked only in the proof",
+                    })),
+                }),
+                g: Some(ConditionStatus {
+                    status: "held".to_owned(),
+                    failed_instants: Vec::new(),
+                    detail: Some(serde_json::json!({
+                        "window_width": self.geometry.window_width,
+                        "window_height": self.geometry.window_height,
+                        "scale": self.geometry.scale,
+                        "recorded_width": self.geometry.recorded_width,
+                        "recorded_height": self.geometry.recorded_height,
+                        "per_segment": "set by the clip worker for each committed segment",
+                    })),
+                }),
+                q: None,
+                b: Some(ConditionStatus {
+                    status: if self.meter.seconds_over_limit == 0 {
+                        "pending_worker".to_owned()
+                    } else {
+                        "not_held".to_owned()
+                    },
+                    failed_instants: Vec::new(),
+                    detail: Some(serde_json::json!({
+                        "threads": self.machine.threads,
+                        "max_live_share_percent": self.meter.max_share,
+                        "max_worker_cap_given_percent": self.meter.max_worker_cap_given,
+                        "live_seconds_at_limit": self.meter.seconds_over_limit,
+                    })),
+                }),
+                t: Some(ConditionStatus {
+                    status: held(failed.is_empty()),
+                    failed_instants: failed,
+                    detail: Some(serde_json::json!({
+                        "length_ms": recorded_ms,
+                        "raw_bytes": self.disk.raw_written,
+                        "instants_lost": self.lost.len(),
+                        "stop_reason": reason.as_str(),
+                    })),
+                }),
+            };
+            let lost = std::mem::take(&mut self.lost);
+            let updated = ClipJson::update(&self.plan.folder, |clip| {
+                clip.state = ClipState::Encoding;
+                clip.stop_reason = Some(reason);
+                clip.recorded_ms = recorded_ms;
+                clip.lost = lost;
+                clip.conditions = conditions;
+            });
+            if let Err(error) = updated {
+                tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
+            }
+            tracing::info!(
+                code = "CAPTURE_CLIP_STOPPED",
+                clip_id = %self.plan.clip_id,
+                stop_reason = reason.as_str(),
+                recorded_ms,
+                "readback=screenshot_record outcome=encoding"
+            );
+        }
+    }
+
+    /// `clip.json` at start: state `recording` (A4).
+    fn initial_clip_json(plan: &ClipPlan) -> ClipJson {
+        ClipJson {
+            schema_version: CLIP_SCHEMA_VERSION,
+            clip_id: plan.clip_id.clone(),
+            synapse_version: env!("CARGO_PKG_VERSION").to_owned(),
+            state: ClipState::Recording,
+            failure: None,
+            stop_reason: None,
+            fps: RECORD_FPS,
+            end_ms: plan.end_ms,
+            recorded_ms: 0,
+            target: target_info(plan.target),
+            clock: ClipClock::default(),
+            geometry: ClipGeometry::default(),
+            observer: ObserverGrant::default(),
+            lost: Vec::new(),
+            segments: Vec::new(),
+            conditions: Conditions::default(),
+        }
+    }
+
+    fn target_info(target: ClipTarget) -> ClipTargetInfo {
         match target {
             ClipTarget::Window { hwnd } => {
                 let context = synapse_a11y::foreground_context(hwnd).ok();
-                Self {
-                    kind: "window",
+                ClipTargetInfo {
+                    kind: "window".to_owned(),
                     hwnd: Some(hwnd),
                     monitor_index: context.as_ref().map(|c| c.monitor_index),
                     process_id: context.as_ref().map(|c| c.pid),
                     exe: context.as_ref().map(|c| c.process_path.clone()),
                     title: context.map(|c| c.window_title),
-                    width,
-                    height,
                 }
             }
-            ClipTarget::Monitor { monitor_index } => Self {
-                kind: "monitor",
-                hwnd: None,
+            ClipTarget::Monitor { monitor_index } => ClipTargetInfo {
+                kind: "monitor".to_owned(),
                 monitor_index: Some(monitor_index),
-                process_id: None,
-                exe: None,
-                title: None,
-                width,
-                height,
+                ..ClipTargetInfo::default()
             },
         }
     }
-}
 
-#[derive(Serialize)]
-struct ClipEncode {
-    codec: &'static str,
-    profile: &'static str,
-    pixel_format: &'static str,
-    /// Friendly name of the encoder Media Foundation actually inserted.
-    encoder: String,
-    hardware: bool,
-    /// `fragmented_mp4`, or `mp4` when fragmented MP4 was refused.
-    container: &'static str,
-    width: u32,
-    height: u32,
-    fps: u32,
-    keyframe_interval_frames: u32,
-    keyframe_interval_ms: u64,
-    rate_control: RateControl,
-    cursor: bool,
-    /// How frames of another size are fitted into the fixed clip size.
-    resize: &'static str,
-}
+    /// Waits for the first delivered frame; it is s_0.
+    fn wait_for_first_frame(observer: &ClipObserver, plan: &ClipPlan) -> Result<i64, ErrorData> {
+        let deadline = Instant::now() + Duration::from_millis(FIRST_FRAME_TIMEOUT_MS);
+        while Instant::now() < deadline {
+            if let Some(origin) = observer.origin() {
+                return Ok(origin);
+            }
+            if observer.closed() {
+                return Err(stop_error(StopReason::TargetLost));
+            }
+            std::thread::sleep(Duration::from_millis(instant_ms(1)));
+        }
+        if let ClipTarget::Window { hwnd } = plan.target
+            // SAFETY: IsWindow accepts any handle value.
+            && !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(window_handle(hwnd))) }
+                .as_bool()
+        {
+            return Err(stop_error(StopReason::TargetLost));
+        }
+        Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "screenshot operation=record got no frame within {FIRST_FRAME_TIMEOUT_MS} ms; a minimized or non-rendering target cannot start a clip (it is never restored)"
+            ),
+        ))
+    }
 
-#[derive(Serialize)]
-struct RateControl {
-    /// `quality` (value = quality level 0..=100) or `cbr_bitrate` (value = bits/s).
-    mode: &'static str,
-    value: u32,
-}
+    /// Sleeps until the QPC time `deadline_hns`, waking early on a stop call.
+    fn sleep_until(deadline_hns: i64, control: &RecordingControl) {
+        loop {
+            let left = deadline_hns - synapse_capture::now_hns();
+            if left <= 0 || control.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let left_ns = u64::try_from(left.min(instant_hns())).unwrap_or(0) * 100;
+            std::thread::sleep(Duration::from_nanos(left_ns));
+        }
+    }
 
-#[derive(Default, Serialize)]
-struct ClipHealth {
-    frames_total: u64,
-    frames_new: u64,
-    frames_repeated: u64,
-    /// Frames the capture channel (2 slots, drops the oldest) dropped before
-    /// the recorder could drain them.
-    frames_dropped_by_channel: u64,
-    /// Frames drained but not encoded: superseded by a newer frame within the
-    /// same tick, or failed conversion.
-    frames_skipped: u64,
-    requested_duration_ms: u64,
-    /// Encoded duration (`frames_total / fps`).
-    duration_ms: u64,
-    wall_elapsed_ms: u64,
-    /// Encoded frames per wall-clock second.
-    achieved_fps: f64,
-    /// New (non-repeated) frames per wall-clock second.
-    new_frame_fps: f64,
-    minimized_intervals: Vec<MinimizedInterval>,
-    resizes: Vec<ClipResize>,
-    /// `completed`, or why the clip stopped early.
-    stopped_reason: StopReason,
-}
+    fn to_i64(value: u64) -> i64 {
+        i64::try_from(value).unwrap_or(i64::MAX)
+    }
 
-/// A `target_minimized` interval: ticks that repeated because the window was
-/// minimized. `end_frame` is exclusive.
-#[derive(Serialize)]
-struct MinimizedInterval {
-    start_frame: u64,
-    end_frame: u64,
-    start_ms: u64,
-    end_ms: u64,
-}
+    fn window_handle(hwnd: i64) -> windows::Win32::Foundation::HWND {
+        windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void)
+    }
 
-/// The target's frame size changed at `frame`.
-#[derive(Serialize)]
-struct ClipResize {
-    frame: u64,
-    t_ms: u64,
-    width: u32,
-    height: u32,
+    fn monotonic_ms() -> u64 {
+        // SAFETY: no arguments.
+        unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+    }
+
+    fn wall_clock_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
 }

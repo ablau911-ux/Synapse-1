@@ -33,6 +33,8 @@ use windows::core::{GUID, HSTRING, Interface};
 
 /// `CODECAPI_AVEncCommonQuality` level (0..=100) for quality-based rate control.
 const H264_QUALITY_LEVEL: u32 = 70;
+/// β: bits per pixel and frame for the bitrate fallback (equation section 6).
+pub(super) const FALLBACK_BITS_PER_PIXEL_FRAME: f64 = 0.10;
 /// Bitrate used when the encoder refuses quality mode (research section 9).
 const FALLBACK_BITRATE_BPS: u32 = 6_000_000;
 const KEYFRAME_INTERVAL_SECONDS: u32 = 1;

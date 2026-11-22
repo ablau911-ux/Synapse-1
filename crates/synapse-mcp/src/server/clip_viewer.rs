@@ -32,15 +32,24 @@ use serde_json::json;
 use synapse_core::{Rect, error_codes};
 
 use super::ErrorData;
-use super::capture_clip::{
-    CLIP_JSON_FILE, CLIP_SCHEMA_VERSION, FRAMES_FILE, FrameLine, VIDEO_FILE,
-};
 use super::clip_decoder::{ClipDecoder, DecodedFrame};
+use super::clip_folder::{CLIP_JSON_FILE, FRAMES_FILE};
 use crate::m1::clip_view_limits::{MAX_FRAMES_FPS, MAX_SCALE, MIN_CROP_SHORT_SIDE, MIN_SCALE};
 use crate::m1::{
     ClipChangedRegion, ClipTimelineEntry, ClipViewImage, ClipViewParams, ClipViewResponse,
     ScreenshotOperation, ScreenshotResponse, mcp_error,
 };
+
+/// Version 1 clip files the viewer still reads until package 4 moves it to
+/// segments (docs/clip-recorder-plan.md, section D).
+const VIDEO_FILE: &str = "clip.mp4";
+const CLIP_SCHEMA_VERSION: u32 = 1;
+
+/// One line of a version 1 `frames.jsonl`.
+#[derive(Deserialize)]
+struct FrameLine {
+    new: bool,
+}
 
 /// Images per call: Claude Code caps a tool result near 25,000 tokens.
 const MAX_IMAGES_PER_CALL: usize = 8;
@@ -94,6 +103,7 @@ pub(super) async fn screenshot_clip_view_result(
         capture: None,
         gif: None,
         record: None,
+        record_status: None,
         clip_view: Some(output.response),
     };
     let value = serde_json::to_value(&response)

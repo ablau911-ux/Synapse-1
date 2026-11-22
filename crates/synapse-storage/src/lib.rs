@@ -29,7 +29,10 @@ use synapse_core::{
 pub use codecs::{decode_json, encode_json};
 pub use error::{StorageError, StorageResult};
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
-pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
+pub use pressure::{
+    DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask, level_for_free_bytes,
+    volume_free_bytes,
+};
 
 const MIB: usize = 1024 * 1024;
 const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * MIB;

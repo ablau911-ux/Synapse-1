@@ -30,15 +30,19 @@ use std::time::Duration;
 
 use serde::Serialize;
 use synapse_core::Rect;
+use windows::Win32::Foundation::{FILETIME, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
     ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
 use windows::core::{Interface as _, w};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -178,6 +182,69 @@ pub struct ObserverStats {
     pub max_hold_hns: i64,
     /// Instants lost because no slot was free.
     pub slot_overflow_instants: Vec<i64>,
+}
+
+/// Processor time (kernel plus user) of the calling thread, in 100 ns units.
+#[must_use]
+pub fn current_thread_cpu_hns() -> i64 {
+    let (mut creation, mut exit, mut kernel, mut user) = Default::default();
+    // SAFETY: the pseudo handle of the current thread and four out-parameters.
+    let read = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if read.is_err() {
+        return 0;
+    }
+    filetime_hns(kernel).saturating_add(filetime_hns(user))
+}
+
+fn filetime_hns(time: FILETIME) -> i64 {
+    i64::try_from((u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime))
+        .unwrap_or(i64::MAX)
+}
+
+impl ClipSource {
+    /// The screen position of the frame's top-left pixel: the window's
+    /// extended frame bounds (what Windows Graphics Capture records) or the
+    /// monitor's rectangle. Used to log the cursor in frame pixels (E9).
+    #[must_use]
+    pub fn origin(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Window { hwnd } => {
+                let mut bounds = RECT::default();
+                let size = u32::try_from(std::mem::size_of::<RECT>()).ok()?;
+                // SAFETY: a RECT out-parameter of the given size.
+                unsafe {
+                    DwmGetWindowAttribute(
+                        hwnd_from_i64(hwnd).ok()?,
+                        DWMWA_EXTENDED_FRAME_BOUNDS,
+                        (&raw mut bounds).cast(),
+                        size,
+                    )
+                }
+                .ok()?;
+                Some((bounds.left, bounds.top))
+            }
+            Self::Monitor { monitor_index } => {
+                let index = usize::try_from(monitor_index.saturating_add(1)).ok()?;
+                let monitor = Monitor::from_index(index).ok()?;
+                let mut info = MONITORINFO {
+                    cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).ok()?,
+                    ..Default::default()
+                };
+                // SAFETY: a MONITORINFO with its size set.
+                unsafe { GetMonitorInfoW(HMONITOR(monitor.as_raw_hmonitor()), &raw mut info) }
+                    .as_bool()
+                    .then_some((info.rcMonitor.left, info.rcMonitor.top))
+            }
+        }
+    }
 }
 
 /// The QPC clock that composition times (`SystemRelativeTime`) use, in 100 ns units.
@@ -393,6 +460,9 @@ pub struct Shared {
     closed: AtomicBool,
     frames_delivered: AtomicU64,
     max_hold_hns: AtomicI64,
+    /// Processor time of the capture thread (the handler's thread), for the
+    /// live share (A9).
+    capture_thread_cpu_hns: AtomicI64,
 }
 
 impl Shared {
@@ -479,6 +549,9 @@ impl GraphicsCaptureApiHandler for ClipFrameHandler {
         self.shared
             .max_hold_hns
             .fetch_max(now_hns() - arrived, Ordering::Relaxed);
+        self.shared
+            .capture_thread_cpu_hns
+            .store(current_thread_cpu_hns(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -532,6 +605,7 @@ impl ClipObserver {
             closed: AtomicBool::new(false),
             frames_delivered: AtomicU64::new(0),
             max_hold_hns: AtomicI64::new(0),
+            capture_thread_cpu_hns: AtomicI64::new(0),
         });
         let started = match source {
             ClipSource::Window { hwnd } => {
@@ -673,6 +747,12 @@ impl ClipObserver {
             height,
         });
         Ok(texture)
+    }
+
+    /// Processor time the capture thread has used so far (A9).
+    #[must_use]
+    pub fn capture_thread_cpu_hns(&self) -> i64 {
+        self.shared.capture_thread_cpu_hns.load(Ordering::Relaxed)
     }
 
     /// What the observer proved so far (O3).

@@ -807,7 +807,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public perception artifact facade. operation=capture writes a PNG/JPEG screenshot through the same verified artifact path as capture_screenshot. operation=gif records a bounded target-window GIF through the same artifact path as capture_gif. Both operations require an absolute output path, reject operation-irrelevant parameters, and return the physical artifact readback (path, bytes, dimensions, backend, and hash for still images). operation=record records one window (window_hwnd, default the session's bound window) or one monitor (monitor_index) for duration_ms (100..=120000) at a constant fps (1..=30, default 20) into a new clip folder (folder: absolute, must not exist; default %LOCALAPPDATA%\\\\synapse\\\\clips\\\\<clip_id>): clip.mp4 (H.264, fragmented MP4, cursor shown), frames.jsonl (per frame: frame, t_ms, new or repeated, keyframe) and clip.json (clock, target, encoder actually used and whether hardware, health), and returns the folder and file paths plus clip.mp4 size and SHA-256. It refuses while the timeline recorder is paused, for an excluded app, or at disk-pressure level 3/4, and stops early (keeping the frames so far) on pause, exclusion or a closed window. It never restores or focuses the window; path, region, overwrite, max_pixels, max_long_edge and interval_ms are rejected. Clip viewer operations read an existing clip folder (folder: absolute, required) and return a text timeline plus labelled PNG images (image content, at most 8 per call; each also saved under <folder>\\\\views\\\\ and labelled 'Image k (t=mm:ss.mmm, frame n, reason)'): operation=clip_overview lists changes (8x8 block test; settled after 200 ms; short-lived = back within 500 ms), static stretches and gaps, with key frames (before/after each change, short-lived starts, a 10 s floor, first and last) paged 8 per call (page, default 1; max_long_edge 200..=1920, default 1280); operation=clip_frames returns frames from start_ms to end_ms (at most 8, at most fps 1..=15, repeats skipped; max_long_edge); operation=clip_frame returns the frame at t_ms at native pixels with optional region crop (short side >= 200 px) and scale 1.0..=2.0; operation=clip_diff lists changed regions between start_ms and end_ms and returns one before/after crop."
+        description = "Public perception artifact facade. operation=capture writes a PNG/JPEG screenshot through the same verified artifact path as capture_screenshot. operation=gif records a bounded target-window GIF through the same artifact path as capture_gif. Both operations require an absolute output path, reject operation-irrelevant parameters, and return the physical artifact readback (path, bytes, dimensions, backend, and hash for still images). operation=record starts recording one window (window_hwnd, default the session's bound window) or one monitor (monitor_index) for duration_ms (at least 100, default 60000) at 20 instants per second into a new clip folder (folder: absolute, must not exist; default %LOCALAPPDATA%\\\\synapse\\\\clips\\\\<clip_id>) and returns at once with the clip_id and clip.json read back (path, size, SHA-256). The recording belongs to the service: the cursor is left out of the frames where Windows allows it (its position is logged), new frames are written raw into waiting/, and a clip worker encodes them into segment-NNNN.mp4 files (H.264) within the 10 % processor limit. operation=record_status (clip_id) reports the state (recording, encoding, ready, failed), stop reason, seconds recorded, frames waiting, committed segments with size and SHA-256, and the conditions so far; operation=record_stop (clip_id) ends a recording now (idempotent); operation=record_extend (clip_id, duration_ms to add) moves the end. Recording refuses while the timeline recorder is paused, for an excluded app (on a monitor: visible anywhere), while another recording runs, or when the clip volume is below 2 GB free, and stops (keeping committed work) on pause, exclusion, a closed window or the disk rule. It never restores or focuses the window; path, region, overwrite, max_pixels, max_long_edge, interval_ms and fps are rejected. Clip viewer operations read an existing clip folder (folder: absolute, required) and return a text timeline plus labelled PNG images (image content, at most 8 per call; each also saved under <folder>\\\\views\\\\ and labelled 'Image k (t=mm:ss.mmm, frame n, reason)'): operation=clip_overview lists changes (8x8 block test; settled after 200 ms; short-lived = back within 500 ms), static stretches and gaps, with key frames (before/after each change, short-lived starts, a 10 s floor, first and last) paged 8 per call (page, default 1; max_long_edge 200..=1920, default 1280); operation=clip_frames returns frames from start_ms to end_ms (at most 8, at most fps 1..=15, repeats skipped; max_long_edge); operation=clip_frame returns the frame at t_ms at native pixels with optional region crop (short side >= 200 px) and scale 1.0..=2.0; operation=clip_diff lists changed regions between start_ms and end_ms and returns one before/after crop."
 ,
         output_schema = rmcp::handler::server::tool::schema_for_output::<ScreenshotResponse>()
             .unwrap_or_else(|error| panic!("invalid ScreenshotResponse output schema: {error}"))
@@ -847,6 +847,7 @@ impl SynapseService {
                     capture: Some(capture),
                     gif: None,
                     record: None,
+                    record_status: None,
                     clip_view: None,
                 })
             }
@@ -872,6 +873,7 @@ impl SynapseService {
                     capture: None,
                     gif: Some(gif),
                     record: None,
+                    record_status: None,
                     clip_view: None,
                 })
             }
@@ -884,6 +886,31 @@ impl SynapseService {
                     capture: None,
                     gif: None,
                     record: Some(record),
+                    record_status: None,
+                    clip_view: None,
+                })
+            }
+            ScreenshotOperation::RecordStatus
+            | ScreenshotOperation::RecordStop
+            | ScreenshotOperation::RecordExtend => {
+                let operation = params.operation;
+                let (clip_id, add_ms) = validate_screenshot_record_control_facade_params(params)?;
+                let status = match operation {
+                    ScreenshotOperation::RecordStop => {
+                        super::capture_clip::clip_stop(&clip_id).await
+                    }
+                    ScreenshotOperation::RecordExtend => {
+                        super::capture_clip::clip_extend(&clip_id, add_ms.unwrap_or_default())
+                    }
+                    _ => super::capture_clip::clip_status(&clip_id),
+                }?;
+                screenshot_structured_result(&ScreenshotResponse {
+                    operation,
+                    source_of_truth: SCREENSHOT_SOURCE_OF_TRUTH.to_owned(),
+                    capture: None,
+                    gif: None,
+                    record: None,
+                    record_status: Some(status),
                     clip_view: None,
                 })
             }
@@ -16915,6 +16942,9 @@ pub(super) fn screenshot_operation_name(operation: ScreenshotOperation) -> &'sta
         ScreenshotOperation::Capture => "capture",
         ScreenshotOperation::Gif => "gif",
         ScreenshotOperation::Record => "record",
+        ScreenshotOperation::RecordStatus => "record_status",
+        ScreenshotOperation::RecordStop => "record_stop",
+        ScreenshotOperation::RecordExtend => "record_extend",
         ScreenshotOperation::ClipOverview => "clip_overview",
         ScreenshotOperation::ClipFrames => "clip_frames",
         ScreenshotOperation::ClipFrame => "clip_frame",
@@ -16977,6 +17007,7 @@ fn validate_screenshot_clip_view_facade_params(
     let ranged = is(ScreenshotOperation::ClipFrames) || is(ScreenshotOperation::ClipDiff);
     let fields = [
         ("path", !params.path.is_empty(), false),
+        ("clip_id", params.clip_id.is_some(), false),
         ("overwrite", params.overwrite, false),
         ("max_pixels", params.max_pixels.is_some(), false),
         ("duration_ms", params.duration_ms.is_some(), false),
@@ -17172,11 +17203,13 @@ fn validate_screenshot_record_facade_params(
         ("max_pixels", params.max_pixels.is_some()),
         ("max_long_edge", params.max_long_edge.is_some()),
         ("interval_ms", params.interval_ms.is_some()),
+        ("fps", params.fps.is_some()),
+        ("clip_id", params.clip_id.is_some()),
     ];
     if let Some((field, _)) = rejected.iter().find(|(_, present)| *present) {
         return Err(invalid(
             format!("screenshot operation=record rejects {field}"),
-            "pass only window_hwnd or monitor_index, duration_ms, fps and folder",
+            "pass only window_hwnd or monitor_index, duration_ms and folder",
             field,
         ));
     }
@@ -17187,44 +17220,23 @@ fn validate_screenshot_record_facade_params(
             "monitor_index",
         ));
     }
-    let Some(duration_ms) = params.duration_ms else {
-        return Err(invalid(
-            "screenshot operation=record requires duration_ms".to_owned(),
-            "pass duration_ms between 100 and 120000",
-            "duration_ms",
-        ));
-    };
     let record = CaptureClipParams {
         window_hwnd: params.window_hwnd,
         monitor_index: params.monitor_index,
-        duration_ms,
-        fps: params.fps,
+        duration_ms: params
+            .duration_ms
+            .unwrap_or(super::capture_clip::DEFAULT_DURATION_MS),
         folder: params.folder,
     };
-    let durations = super::capture_clip::MIN_DURATION_MS..=super::capture_clip::MAX_DURATION_MS;
-    if !durations.contains(&record.duration_ms) {
+    if record.duration_ms < super::capture_clip::MIN_DURATION_MS {
         return Err(invalid(
             format!(
-                "screenshot operation=record duration_ms must be {}..={}; got {}",
-                durations.start(),
-                durations.end(),
+                "screenshot operation=record duration_ms must be at least {}; got {}",
+                super::capture_clip::MIN_DURATION_MS,
                 record.duration_ms
             ),
-            "pass duration_ms between 100 and 120000",
+            "pass duration_ms of at least 100, or omit it for the default 60000",
             "duration_ms",
-        ));
-    }
-    let fps_range = 1..=super::capture_clip::MAX_FPS;
-    if let Some(fps) = record.fps
-        && !fps_range.contains(&fps)
-    {
-        return Err(invalid(
-            format!(
-                "screenshot operation=record fps must be 1..={}; got {fps}",
-                fps_range.end()
-            ),
-            "pass fps between 1 and 30, or omit it for the default 20",
-            "fps",
         ));
     }
     let Some(folder) = record.folder.as_deref().map(Path::new) else {
@@ -17247,6 +17259,56 @@ fn validate_screenshot_record_facade_params(
         ));
     }
     Ok(record)
+}
+
+/// `record_status` and `record_stop` take `clip_id`; `record_extend` takes
+/// `clip_id` and `duration_ms` (milliseconds to add). Returns them checked.
+fn validate_screenshot_record_control_facade_params(
+    params: ScreenshotParams,
+) -> Result<(String, Option<u64>), ErrorData> {
+    let operation = params.operation;
+    let name = screenshot_operation_name(operation);
+    let invalid = |message: String, remediation: &'static str, field: &'static str| {
+        screenshot_facade_error(operation, message, remediation, field)
+    };
+    reject_screenshot_clip_view_fields(&params)?;
+    let extend = operation == ScreenshotOperation::RecordExtend;
+    let rejected = [
+        ("path", !params.path.is_empty()),
+        ("region", params.region.is_some()),
+        ("overwrite", params.overwrite),
+        ("max_pixels", params.max_pixels.is_some()),
+        ("max_long_edge", params.max_long_edge.is_some()),
+        ("interval_ms", params.interval_ms.is_some()),
+        ("fps", params.fps.is_some()),
+        ("window_hwnd", params.window_hwnd.is_some()),
+        ("monitor_index", params.monitor_index.is_some()),
+        ("folder", params.folder.is_some()),
+        ("duration_ms", !extend && params.duration_ms.is_some()),
+    ];
+    if let Some((field, _)) = rejected.iter().find(|(_, present)| *present) {
+        return Err(invalid(
+            format!("screenshot operation={name} rejects {field}"),
+            "record_status and record_stop take clip_id; record_extend takes clip_id and duration_ms",
+            field,
+        ));
+    }
+    let Some(clip_id) = params.clip_id.filter(|id| !id.trim().is_empty()) else {
+        return Err(invalid(
+            format!("screenshot operation={name} requires clip_id"),
+            "pass the clip_id returned by screenshot operation=record",
+            "clip_id",
+        ));
+    };
+    if extend && params.duration_ms.is_none_or(|add| add == 0) {
+        return Err(invalid(
+            "screenshot operation=record_extend requires duration_ms above 0 (milliseconds to add)"
+                .to_owned(),
+            "pass duration_ms with the time to add",
+            "duration_ms",
+        ));
+    }
+    Ok((clip_id, params.duration_ms.filter(|_| extend)))
 }
 
 fn validate_screenshot_capture_facade_params(params: &ScreenshotParams) -> Result<(), ErrorData> {

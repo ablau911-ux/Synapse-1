@@ -380,6 +380,9 @@ pub enum ScreenshotOperation {
     Capture,
     Gif,
     Record,
+    RecordStatus,
+    RecordStop,
+    RecordExtend,
     ClipOverview,
     ClipFrames,
     ClipFrame,
@@ -417,7 +420,8 @@ pub struct ScreenshotParams {
     #[serde(default)]
     pub max_long_edge: Option<u32>,
     /// GIF or clip recording duration. Valid only with `operation=gif`
-    /// (bounded by the GIF recorder) or `operation=record` (100..=120000).
+    /// (bounded by the GIF recorder), `operation=record` (at least 100,
+    /// default 60000) or `operation=record_extend` (milliseconds to add).
     #[serde(default)]
     pub duration_ms: Option<u64>,
     /// GIF frame interval. Valid only with `operation=gif`.
@@ -426,8 +430,8 @@ pub struct ScreenshotParams {
     /// Monitor to record instead of a window. Valid only with `operation=record`.
     #[serde(default)]
     pub monitor_index: Option<u32>,
-    /// Clip frame rate (1..=30, default 20) with `operation=record`; sampling
-    /// rate (1..=15) with `operation=clip_frames`.
+    /// Sampling rate (1..=15) with `operation=clip_frames`. Clips are always
+    /// recorded at 20 instants per second.
     #[serde(default)]
     pub fps: Option<u32>,
     /// `record`: absolute path of the clip folder to create; it must not exist
@@ -451,6 +455,10 @@ pub struct ScreenshotParams {
     /// Pixel scale 1.0..=2.0 for `clip_frame` (default 1.0, native pixels).
     #[serde(default)]
     pub scale: Option<f64>,
+    /// Clip id returned by `record`; required by `record_status`,
+    /// `record_stop` and `record_extend`.
+    #[serde(default)]
+    pub clip_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -464,6 +472,9 @@ pub struct ScreenshotResponse {
     pub gif: Option<CaptureGifResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<CaptureClipResponse>,
+    /// Result of `record_status`, `record_stop` or `record_extend`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_status: Option<ClipStatusResponse>,
     /// Result of `clip_overview`, `clip_frames`, `clip_frame` or `clip_diff`.
     /// The PNG images themselves travel as image content next to this JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -611,48 +622,80 @@ pub struct CaptureGifResponse {
 }
 
 /// `screenshot operation=record` request after facade validation: one window
-/// or one monitor, recorded into a clip folder (`clip.mp4`, `frames.jsonl`,
-/// `clip.json`). With neither target, the session's bound window is recorded.
+/// or one monitor, recorded into a clip folder (`clip.json`, `frames.jsonl`,
+/// `waiting/`, then `segment-NNNN.mp4`). With neither target, the session's
+/// bound window is recorded.
 #[derive(Clone, Debug)]
 pub struct CaptureClipParams {
     pub window_hwnd: Option<i64>,
     pub monitor_index: Option<u32>,
-    /// Clip length in milliseconds (100..=120000).
+    /// Clip length in milliseconds (at least 100; default 60000).
     pub duration_ms: u64,
-    /// Constant frame rate (1..=30, default 20).
-    pub fps: Option<u32>,
     /// Absolute clip folder path that does not exist yet.
     pub folder: Option<String>,
 }
 
+/// `record` returns at once: the clip id and the `clip.json` written at start,
+/// read back from disk (path, size, SHA-256).
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureClipResponse {
     pub clip_id: String,
     pub folder: String,
-    pub video_path: String,
-    pub frames_path: String,
+    /// `recording`.
+    pub state: String,
     pub clip_json_path: String,
-    /// Size of `clip.mp4` in bytes.
+    /// Size of `clip.json` in bytes, read back.
     pub bytes: u64,
-    /// SHA-256 (lowercase hex) of `clip.mp4`.
+    /// SHA-256 (lowercase hex) of `clip.json`, read back.
     pub sha256: String,
-    /// Encoded duration (frames / fps).
-    pub duration_ms: u64,
-    pub width: u32,
-    pub height: u32,
+    pub frames_path: String,
+    /// Planned end in ms from the first frame (`record_extend` moves it).
+    pub end_ms: u64,
+    /// Recorded instants per second.
     pub fps: u32,
-    pub frames_total: u64,
-    pub frames_new: u64,
-    pub frames_repeated: u64,
-    /// Friendly name of the H.264 encoder Media Foundation actually used.
-    pub encoder: String,
-    pub hardware: bool,
-    /// `fragmented_mp4`, or `mp4` when fragmented MP4 was refused.
-    pub container: String,
-    /// Why recording ended: `completed`, `target_lost` (window closed),
-    /// `privacy_paused` or `privacy_excluded_app`. Frames up to then are kept.
-    pub stopped_reason: String,
+    pub window_width: u32,
+    pub window_height: u32,
+    /// Whole-number pixel duplication so the recorded frame has at least 480 lines.
+    pub scale: u32,
+    pub recorded_width: u32,
+    pub recorded_height: u32,
+    /// `true` where Windows cannot leave the cursor out of the frames.
+    pub cursor_in_picture: bool,
+    /// `false` where the yellow capture border shows (Windows 10).
+    pub border_hidden: bool,
+}
+
+/// `record_status`, `record_stop` and `record_extend`: the clip state.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClipStatusResponse {
+    pub clip_id: String,
+    pub folder: String,
+    /// `recording`, `encoding`, `ready` or `failed`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    pub seconds_recorded: f64,
+    /// Planned end in ms from the first frame.
+    pub end_ms: u64,
+    /// Raw frames in `waiting/` not yet committed in a segment.
+    pub frames_waiting: u64,
+    pub segments: Vec<ClipSegmentInfo>,
+    /// The `conditions` block of `clip.json` so far (C, G, Q, B, T).
+    pub conditions: serde_json::Value,
+}
+
+/// A committed segment, as read back at commit.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ClipSegmentInfo {
+    pub file: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

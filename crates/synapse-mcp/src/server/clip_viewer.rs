@@ -754,6 +754,16 @@ struct Activity {
     differed: Vec<u64>,
 }
 
+/// How an open change of a block ends.
+#[derive(Clone, Copy)]
+enum Close {
+    /// It settled; the instant its settling was confirmed.
+    Settled(u64),
+    /// The clip end or a resize cut it before it settled; the first instant
+    /// after the boundary.
+    Cut(u64),
+}
+
 /// The live state of one block (D5 steps 2 and 3).
 #[derive(Clone, Default)]
 struct BlockState {
@@ -798,6 +808,10 @@ struct BlockEpisode {
     generation: u64,
     start: u64,
     end: u64,
+    /// The instant its settling was confirmed: quiet for K_s instants and
+    /// not animating (D5 step 2); the last instant before the boundary when
+    /// the clip end or a resize closed it. CHANGED picks it (D5 step 6).
+    settle_frame: u64,
     /// Quiet for `SETTLE_MS` when it ended; `false` when the clip end or a
     /// resize closed it earlier.
     settled: bool,
@@ -968,28 +982,33 @@ impl<'a> Analyzer<'a> {
     /// Ends the open change of every block that has settled by `now`.
     fn settle_due(&mut self, now: u64) {
         for b in 0..self.states.len() {
-            if self.states[b]
+            if let Some(at) = self.states[b]
                 .settle_at(self.instants)
-                .is_some_and(|at| at <= now)
+                .filter(|at| *at <= now)
             {
-                self.end_change(b, None);
+                self.end_change(b, Close::Settled(at));
             }
         }
     }
 
     /// Ends every open change at a resize or at the clip end (`end`, the
-    /// first instant after it); "settled" then means quiet for at least
-    /// `SETTLE_MS`.
+    /// first instant after it). The quiet time is measured at the boundary:
+    /// a block quiet for at least `SETTLE_MS` up to `end` has settled; its
+    /// settle frame is then at most the last instant before `end`.
     fn close_all(&mut self, end: u64) {
-        self.settle_due(end.saturating_sub(1));
+        let last = end.saturating_sub(1);
         for b in 0..self.states.len() {
-            self.end_change(b, Some(end));
+            match self.states[b].settle_at(self.instants) {
+                Some(at) if at <= end => self.end_change(b, Close::Settled(at.min(last))),
+                Some(_) => self.end_change(b, Close::Cut(end)),
+                None => {}
+            }
         }
     }
 
-    /// D5 steps 2 and 3: block `b` has settled (`closed_at` is `None`) or is
-    /// closed at `closed_at`; its picture is compared with its anchor.
-    fn end_change(&mut self, b: usize, closed_at: Option<u64>) {
+    /// D5 steps 2 and 3: block `b` has settled or is closed by the clip end
+    /// or a resize; its picture is compared with its anchor.
+    fn end_change(&mut self, b: usize, close: Close) {
         let Some(mut activity) = self.states[b].active.take() else {
             return;
         };
@@ -997,6 +1016,10 @@ impl<'a> Analyzer<'a> {
             return;
         };
         let state = &self.states[b];
+        let settle_frame = match close {
+            Close::Settled(at) => at,
+            Close::Cut(end) => end.saturating_sub(1),
+        };
         let mut episode = BlockEpisode {
             outcome: Outcome::Changed,
             block: b,
@@ -1004,7 +1027,8 @@ impl<'a> Analyzer<'a> {
             generation: self.generation,
             start: activity.start,
             end: state.stable_since.max(activity.start),
-            settled: closed_at.is_none(),
+            settle_frame: settle_frame.max(activity.start),
+            settled: matches!(close, Close::Settled(_)),
             running: false,
             differed: Vec::new(),
             before: Vec::new(),
@@ -1012,9 +1036,12 @@ impl<'a> Analyzer<'a> {
             footprint: None,
         };
         if activity.animated {
-            let running = closed_at.is_some_and(|end| end <= state.animating_until(self.instants));
-            let end = match closed_at {
-                Some(end) if running => end - 1,
+            let running = match close {
+                Close::Cut(end) => end <= state.animating_until(self.instants),
+                Close::Settled(_) => false,
+            };
+            let end = match close {
+                Close::Cut(end) if running => end.saturating_sub(1),
                 _ => activity.last_move,
             };
             self.episodes.push(BlockEpisode {
@@ -1207,6 +1234,9 @@ struct Event {
     end: u64,
     /// Its blocks, each once, in index order.
     blocks: Vec<usize>,
+    /// CHANGED: the latest settle frame of its blocks, the frame it is
+    /// pictured at (D5 step 6).
+    settle_frame: u64,
     settled: bool,
     running: bool,
     /// FLASH, REVERTED: the instant at which most of its blocks were DIFF
@@ -1269,6 +1299,11 @@ impl Event {
             .iter()
             .max_by_key(|(at, count)| (**count, std::cmp::Reverse(**at)))
             .map_or(start, |(at, _)| *at);
+        let settle_frame = group
+            .iter()
+            .map(|episode| episode.settle_frame)
+            .max()
+            .unwrap_or(end);
         let mut blocks: Vec<usize> = group.iter().map(|episode| episode.block).collect();
         blocks.dedup();
         Self {
@@ -1278,6 +1313,7 @@ impl Event {
             start,
             end,
             blocks,
+            settle_frame,
             settled: group.iter().all(|episode| episode.settled),
             running: group.iter().any(|episode| episode.running),
             peak,
@@ -1360,7 +1396,7 @@ impl Event {
     /// D5 step 6: one image per event.
     fn picks(&self, clip: &ViewedClip) -> Vec<Pick> {
         match self.outcome {
-            Outcome::Changed => vec![pick(clip, self.end, "first settled frame after change")],
+            Outcome::Changed => vec![pick(clip, self.settle_frame, "settled frame after change")],
             Outcome::Flash => vec![pick(clip, self.peak, "short-lived change")],
             Outcome::Reverted => vec![pick(clip, self.peak, "change that returned")],
             Outcome::Animation if self.running => vec![pick(clip, self.start, "animating region")],

@@ -739,7 +739,7 @@ The corpus is at `C:\Users\Adam\clip-corpus` (`scripts/clip-equation/corpus/corp
   - Groups: every group file is one complete zstd frame; records per group ≤ 20; the first record of each group has `offset` 0 and `raw` = 2 + 4 + w · h · 3.
   - Idle: the still scene has exactly 1 record.
   - Rows: on the typing scene, mean `raw` of non-key records < 5 % of one picture.
-  - Size, per scene, measured ≤ the whole-frame stream figure: typing 0.5, ui 6.6, scroll 9.4, flash 2.8 MB/min (`results/test-1080-bigwindow-summary.txt:2`). Changed rows can only be smaller.
+  - Size, per scene (typing, ui, scroll, flash): exact retained bytes must be no greater than the whole-frame stream baseline measured in the same run, with the same compression level, window, group length, and input. The historical rounded MB/min figures are not acceptance limits. When changed rows cover more than `EXACT_WHOLE_FRAME_ROW_PERCENT` of the picture, write one whole-picture band; see Builder notes. Fewer uncompressed bytes do not guarantee fewer compressed bytes.
   - RAM: `ram_peak` ≤ 141 MB + 10 %.
   - The 60 s mixed clip of #290: total ≤ 1.10 × 3.24 MB (plan 4.2 W7). Its folder is not in the repo; take it from issue #290. If it cannot be found, report the scenario as blocked, not as passed.
 - **Done:** `dyn-exact` all passed; red and green outputs saved.
@@ -1007,6 +1007,20 @@ The test passes when every scenario passes and the script exits 0. The run's fol
 Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy gate before every write; the all-black first frame rule; the cursor rule (not drawn, logged per line); `recorder.lock`; the registry; atomic `clip.json`; the disk rule; the 10 % rule; the `record`, `record_status`, `record_stop`, `record_extend` operations and the four viewer operations; D5 items 2, 4, 5 and 6.
 
 ## Builder notes
+
+### 2026-11-23: continuation, measured baseline and broad-row fallback
+
+The owner's continuation replaces the incorrectly rounded absolute size gates with a same-run, per-scene comparison. `dyn-exact.mjs` now runs the existing `exp-z` whole-frame stream baseline with the exact writer's reported level, window log, and group length. It requires the baseline's round trip to pass and saves its measurements beside the exact measurements. The acceptance scope remains the four scenes named in step 1: typing, UI, scroll, and flash. All eight inputs retain the independent round-trip, reader, format, and RAM checks; the mixed clip also retains its separate size gate. Size includes the exact group files and index; the baseline includes all retained files, as the existing harness reports them.
+
+`ExactStream` now owns `EXACT_WHOLE_FRAME_ROW_PERCENT = 75`. Above three quarters of the picture, preserving whole-frame dictionary alignment takes precedence over omitting at most a quarter of the rows. This separates the measured scroll case (about 88% changed rows) from typing and small UI edits, while retaining the specified row-band format, level 1, window log 27, no long-distance matching, and groups of 20. The stored picture is still the exact-layer picture, so any moving box remains frozen. The check reads the constant from the probe and validates that broad records contain one full-height band.
+
+The red run measured scroll at 3,559,626 retained bytes against a same-run baseline of 3,298,546. The requested whole-frame fallback reduces it to 3,329,582 bytes, but this is still 31,036 bytes (about 0.94%) above the baseline. Round trips remain exact. Separate header/pixel flushes and 64-row flush chunks were tried locally; neither met the retained-byte gate, and neither experiment remains in the product. No gate or compression parameter was relaxed. The requested fallback alone is therefore insufficient to establish the corrected size requirement. Section 7 says, "If a check cannot pass, stop and report"; steps 2–9 are not started in this continuation.
+
+Possible next decisions: (1) authorize a measured compression-parameter search while preserving the exact format and the current byte gate (recommended); (2) authorize a different exact record format and repeat the independent reader checks; (3) defer the dynamic build. This continuation is WIP until the same-run byte gate passes. The earlier Builder notes below describe the preceding run; their Git-permission and network limitations are historical.
+
+Final corpus verification: eight of nine scenarios pass; only the size comparison fails. All eight inputs have zero independent-decoder and product-reader byte mismatches. The broad-row rule has zero violations. Peak writer RAM is 160,436,224 bytes, below the unchanged 155.1 MiB allowance; the mixed clip is 2,823,850 bytes, below its unchanged 3.564 MiB allowance. Evidence: `results/dyn-exact-red.txt`, `results/dyn-exact-failed.txt`, `results/dyn-exact-metrics.json`, and `results/dyn-exact-baselines.json`. There is no green result. Only `.runs/dyn-exact-final` remains from these trials. Workspace formatting, separate formatting checks for the changed Rust files, strict workspace clippy, and the final probe release build pass. Synapse health is OK; this is not dynamic-recorder UX verification because the integration remains unbuilt. The YouTube proof was neither written nor run because step 8 was not reached.
+
+The final workspace `cargo build --release -j 4` passed in 7m 30s after clean formatting and strict clippy. It ran alone at Idle priority. The context-mode client response timed out at 300 seconds, but the original build continued; its process exit and final `Finished release` log were checked without starting another build. The earlier ONNX linking failure did not recur. Logs are `results/dyn-continuation-{fmt,clippy,build}.{stdout,stderr}.txt` and `results/dyn-step1-probe-build.{stdout,stderr}.txt`. `REVIEW.md` records the work and remains outside the commit.
 
 ### 2026-11-23: step 1 size gate failed
 

@@ -19,6 +19,9 @@ pub const BGR_BYTES_PER_PIXEL: usize = 3;
 pub const EXACT_COUNT_BYTES: usize = size_of::<u16>();
 pub const EXACT_BAND_BYTES: usize = EXACT_COUNT_BYTES * 2;
 pub const EXACT_KEY_HEADER_BYTES: usize = EXACT_COUNT_BYTES + EXACT_BAND_BYTES;
+/// Broad changes keep whole-frame alignment in the streaming dictionary.
+pub const EXACT_WHOLE_FRAME_ROW_PERCENT: u32 = 75;
+const PERCENT_DENOMINATOR: u32 = 100;
 const STREAM_SLACK: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -177,6 +180,11 @@ impl ExactStream {
         }
         if bands.is_empty() {
             return Ok(None);
+        }
+        let changed_rows: u32 = bands.iter().map(|(_, count)| u32::from(*count)).sum();
+        if changed_rows * PERCENT_DENOMINATOR > self.height * EXACT_WHOLE_FRAME_ROW_PERCENT {
+            bands.clear();
+            bands.push((0, self.height as u16));
         }
         if self.file.is_none() {
             self.group = self.summary.groups;

@@ -159,6 +159,7 @@ fn exact(folder: &Path, out: &Path) -> Result<()> {
             "EXACT_GROUP_PICTURES": clip_exact::EXACT_GROUP_PICTURES,
             "EXACT_ZSTD_LEVEL": clip_exact::EXACT_ZSTD_LEVEL,
             "EXACT_WINDOW_LOG": clip_exact::EXACT_WINDOW_LOG,
+            "EXACT_WHOLE_FRAME_ROW_PERCENT": clip_exact::EXACT_WHOLE_FRAME_ROW_PERCENT,
             "BGR_BYTES_PER_PIXEL": clip_exact::BGR_BYTES_PER_PIXEL,
             "EXACT_COUNT_BYTES": clip_exact::EXACT_COUNT_BYTES,
             "EXACT_BAND_BYTES": clip_exact::EXACT_BAND_BYTES,

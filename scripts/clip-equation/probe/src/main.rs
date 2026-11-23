@@ -39,6 +39,12 @@ mod clip_moving;
 #[allow(dead_code)]
 #[path = "../../../../crates/synapse-mcp/src/server/clip_layers.rs"]
 mod clip_layers;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_folder.rs"]
+mod clip_folder;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_recovery.rs"]
+mod clip_recovery;
 mod clock;
 mod compress;
 mod delivery;

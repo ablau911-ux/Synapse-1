@@ -260,7 +260,7 @@ fn moving(folder: &Path, out: &Path, args: &HashMap<String, String>) -> Result<(
     Ok(())
 }
 
-fn layers(folder: &Path, out: &Path) -> Result<()> {
+fn layers(folder: &Path, out: &Path, args: &HashMap<String, String>) -> Result<()> {
     use crate::clip_layers::ClipLayers;
     let mut corpus = Corpus::open(folder)?;
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
@@ -340,8 +340,36 @@ fn layers(folder: &Path, out: &Path) -> Result<()> {
         "MOVING_HOLD_MS": crate::clip_motion::MOVING_HOLD_MS, "SHORT_LIVED_MS": crate::clip_motion::SHORT_LIVED_MS,
         "ANIMATING_CHANGE_SHARE": crate::clip_motion::ANIMATING_CHANGE_SHARE } });
     serde_json::to_writer(File::create(out.join("layers.json")).map_err(|e| e.to_string())?, &report).map_err(|e| e.to_string())?;
+    if args.get("clipjson").is_some_and(|v| v == "1") { metadata(out, &report)?; }
     println!("{report}");
     Ok(())
+}
+
+fn metadata(folder: &Path, report: &serde_json::Value) -> Result<()> {
+    use crate::clip_folder::{ClipJson, ClipState, ClipClock, ClipTargetInfo, ClipGeometry, ObserverGrant, Conditions, ConditionStatus, MovingInfo, CommittedSegment, LostInstant, LossCause, StopReason, CLIP_SCHEMA_VERSION};
+    let lines = report["lines"].as_array().ok_or("layers report has no lines")?;
+    let first = lines.first().ok_or("layers report is empty")?;
+    let width = first["width"].as_u64().ok_or("missing width")? as u32;
+    let height = first["height"].as_u64().ok_or("missing height")? as u32;
+    let segments = report["segments"].as_array().ok_or("missing segments")?.iter().map(|s| {
+        CommittedSegment::read_back(folder, serde_json::from_value(s.clone()).map_err(|e| e.to_string())?)
+    }).collect::<Result<Vec<_>>>()?;
+    let recorded_ms = lines.len() as u64 * MILLISECONDS_PER_SECOND / u64::from(PROBE_FPS);
+    let mut clip = ClipJson {
+        schema_version: CLIP_SCHEMA_VERSION, way: "DYN1".into(), clip_id: "dynamic-proof".into(),
+        synapse_version: env!("CARGO_PKG_VERSION").into(), state: ClipState::Ready, failure: None,
+        stop_reason: Some(StopReason::Completed), fps: PROBE_FPS, end_ms: recorded_ms, recorded_ms,
+        target: ClipTargetInfo::default(), clock: ClipClock::default(), observer: ObserverGrant::default(),
+        geometry: ClipGeometry { window_width: width, window_height: height, scale: 1, recorded_width: width, recorded_height: height },
+        lost: lines.iter().filter(|l| l["lost"] == "moving_behind").filter_map(|l| l["instant"].as_u64()).map(|instant| LostInstant { instant, cause: LossCause::MovingBehind }).collect(),
+        exact: Some(serde_json::from_value::<crate::clip_exact::ExactSummary>(report["exact"].clone()).map_err(|e| e.to_string())?.into()),
+        moving: MovingInfo { status: if segments.is_empty() { "not_used" } else { "available" }.into(),
+            reason: report["unavailable"].as_str().map(str::to_owned),
+            encoder: serde_json::from_value(report["grant"].clone()).map_err(|e| e.to_string())?, segments },
+        conditions: Conditions { t: Some(ConditionStatus { status: "held".into(), detail: Some(json!({ "bytes": 0, "length_ms": recorded_ms })), ..ConditionStatus::default() }), ..Conditions::default() },
+    };
+    clip.set_total_bytes(folder)?;
+    clip.create(folder)
 }
 
 pub fn run() -> Result<()> {
@@ -357,7 +385,12 @@ pub fn run() -> Result<()> {
     match args.get("mode").map(String::as_str) {
         Some("exact") => exact(folder, out),
         Some("moving") => moving(folder, out, &args),
-        Some("layers") => layers(folder, out),
+        Some("layers") => layers(folder, out, &args),
+        Some("metadata") => {
+            let report = serde_json::from_reader(File::open(folder.join("layers.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            metadata(folder, &report)
+        }
+        Some("recover") => crate::clip_recovery::ClipRecovery::run(folder),
         _ => Err("exp-dyn requires mode=exact, mode=moving or mode=layers".into()),
     }
 }

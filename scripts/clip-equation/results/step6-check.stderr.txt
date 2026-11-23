@@ -1,0 +1,95 @@
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+warning: constant `GOP_FRAMES` is never used
+  --> crates\synapse-mcp\src\server\clip_encoder.rs:29:18
+   |
+29 | pub(super) const GOP_FRAMES: u32 = 20;
+   |                  ^^^^^^^^^^
+   |
+   = note: `-W dead-code` implied by `-W unused`
+   = help: to override `-W unused` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+warning: method `frame_ms` is never used
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:233:8
+    |
+202 | impl ViewedClip {
+    | --------------- method in this implementation
+...
+233 |     fn frame_ms(&self) -> u64 {
+    |        ^^^^^^^^
+
+warning: constant `PERCENT_TENTHS` is never used
+  --> crates\synapse-mcp\src\server\clip_motion.rs:17:7
+   |
+17 | const PERCENT_TENTHS: f64 = 1_000.0;
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `TENTHS` is never used
+  --> crates\synapse-mcp\src\server\clip_motion.rs:18:7
+   |
+18 | const TENTHS: f64 = 10.0;
+   |       ^^^^^^
+
+warning: methods `rows_of`, `near`, `percent`, and `differs` are never used
+   --> crates\synapse-mcp\src\server\clip_motion.rs:123:12
+    |
+113 | impl BlockGrid {
+    | -------------- methods in this implementation
+...
+123 |     pub fn rows_of(self, b: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    |            ^^^^^^^
+...
+127 |     pub fn near(self, a: usize, b: usize, gap: (usize, usize)) -> bool {
+    |            ^^^^
+...
+137 |     pub fn percent(self, count: u64) -> f64 {
+    |            ^^^^^^^
+...
+140 |     pub fn differs(self, a: &[u8], b: &[u8], block: usize, delta: u8) -> bool {
+    |            ^^^^^^^
+
+warning: method `first_move` is never used
+   --> crates\synapse-mcp\src\server\clip_motion.rs:187:12
+    |
+178 | impl MotionWindow {
+    | ----------------- method in this implementation
+...
+187 |     pub fn first_move(&self) -> Option<u64> { self.moves.front().copied() }
+    |            ^^^^^^^^^^
+
+warning: field `creation_ms` is never read
+   --> crates\synapse-mcp\src\server\clip_moving.rs:119:5
+    |
+113 | pub(super) struct MovingCoder {
+    |                   ----------- field in this struct
+...
+119 |     creation_ms: Arc<AtomicUsize>,
+    |     ^^^^^^^^^^^
+
+warning: methods `high_water` and `creation_ms` are never used
+   --> crates\synapse-mcp\src\server\clip_moving.rs:204:12
+    |
+127 | impl MovingCoder {
+    | ---------------- methods in this implementation
+...
+204 |     pub fn high_water(&self) -> usize { self.high_water }
+    |            ^^^^^^^^^^
+205 |     pub fn creation_ms(&self) -> usize { self.creation_ms.load(Ordering::Acquire) }
+    |            ^^^^^^^^^^^
+
+warning: unused return value of `ClipObserver::stop` that must be used
+    --> crates\synapse-mcp\src\server\capture_clip.rs:1114:21
+     |
+1114 |                     self.observer.stop();
+     |                     ^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `-W unused-must-use` implied by `-W unused`
+     = help: to override `-W unused` add `#[allow(unused_must_use)]`
+help: use `let _ = ...` to ignore the resulting value
+     |
+1114 |                     let _ = self.observer.stop();
+     |                     +++++++
+
+warning: `synapse-mcp` (bin "synapse-mcp") generated 9 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 17s

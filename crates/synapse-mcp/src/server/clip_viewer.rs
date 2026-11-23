@@ -41,9 +41,10 @@ use synapse_core::{Rect, error_codes};
 
 use super::ErrorData;
 use super::clip_decoder::{ClipDecoder, DecodedFrame};
+use super::clip_exact::{ExactEntry, ExactReader};
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipState, FRAMES_FILE, FrameLine, SegmentCheckpoint, VIEWS_DIR,
-    WAITING_DIR, is_waiting_frame, read_frame_lines,
+    CLIP_JSON_FILE, ClipJson, ClipState, FRAMES_FILE, FrameLine, VIEWS_DIR,
+    CommittedSegment, read_frame_lines,
 };
 use crate::m1::clip_view_limits::{MAX_FRAMES_FPS, MIN_CROP_SHORT_SIDE};
 use crate::m1::{
@@ -171,7 +172,7 @@ struct ViewOutput {
 
 fn run_view(params: &ClipViewParams) -> Result<ViewOutput, ErrorData> {
     let clip = ViewedClip::open(Path::new(&params.folder))?;
-    let mut view = ClipView::new(clip);
+    let mut view = ClipView::new(clip)?;
     match params.operation {
         ScreenshotOperation::ClipOverview => view.overview(params)?,
         ScreenshotOperation::ClipFrames => view.frames(params)?,
@@ -219,7 +220,7 @@ impl ViewedClip {
             clip,
             lines,
         };
-        if viewed.clip.segments.is_empty() {
+        if viewed.clip.state != ClipState::Ready {
             return Err(viewed.waiting_error(0));
         }
         Ok(viewed)
@@ -234,13 +235,7 @@ impl ViewedClip {
     }
 
     /// The last instant that is in a committed segment.
-    fn last_frame(&self) -> u64 {
-        self.clip
-            .segments
-            .last()
-            .map_or(0, |segment| segment.last_instant)
-            .min(self.lines.len() as u64 - 1)
-    }
+    fn last_frame(&self) -> u64 { self.lines.last().map_or(0, |line| line.instant) }
 
     /// Time of instant k: k / f.
     fn t_of(&self, frame: u64) -> u64 {
@@ -259,7 +254,7 @@ impl ViewedClip {
     }
 
     fn is_new(&self, frame: u64) -> bool {
-        self.line(frame).is_none_or(|line| line.new)
+        self.line(frame).is_some_and(FrameLine::shows_new_picture)
     }
 
     /// `true` when no new frame arrived in `(from, to]`: same picture.
@@ -277,51 +272,10 @@ impl ViewedClip {
         self.t_of(self.lines.len() as u64)
     }
 
-    fn segment_of(&self, frame: u64) -> Option<&SegmentCheckpoint> {
-        self.clip
-            .segments
-            .iter()
-            .find(|segment| (segment.first_instant..=segment.last_instant).contains(&frame))
-    }
+    fn scale_at(&self, _frame: u64) -> u32 { 1 }
 
-    /// σ of the clip: recorded pixels per window pixel.
-    fn scale(&self) -> u32 {
-        self.clip.geometry.scale.max(1)
-    }
-
-    /// σ of a segment: the one the worker stored, or the clip's σ in clips
-    /// from before it was stored per segment.
-    fn segment_scale(&self, segment: &SegmentCheckpoint) -> u32 {
-        segment
-            .scale
-            .map_or_else(|| self.scale(), |scale| scale.max(1))
-    }
-
-    /// σ at instant k: that of its segment (the clip's σ outside one).
-    fn scale_at(&self, frame: u64) -> u32 {
-        self.segment_of(frame)
-            .map_or_else(|| self.scale(), |segment| self.segment_scale(segment))
-    }
-
-    /// D4: the part asked for is not committed yet.
     fn waiting_error(&self, t_ms: u64) -> ErrorData {
-        let waiting = std::fs::read_dir(self.folder.join(WAITING_DIR))
-            .map(|read| {
-                read.filter_map(Result::ok)
-                    .filter(|entry| is_waiting_frame(&entry.path()))
-                    .count()
-            })
-            .unwrap_or(0);
-        params_invalid(format!(
-            "{} ms of this clip is not committed yet (state {}, {} committed segments up to {} ms, {waiting} frames waiting); call screenshot operation=record_status and retry when the segment is committed",
-            t_ms,
-            self.clip.state.as_str(),
-            self.clip.segments.len(),
-            self.clip
-                .segments
-                .last()
-                .map_or(0, |segment| segment.end_ms),
-        ))
+        params_invalid(format!("{t_ms} ms is not viewable: clip state {}; wait for record_status to report ready", self.clip.state.as_str()))
     }
 
     /// Size and modified time of the files the overview is computed from; a
@@ -329,12 +283,9 @@ impl ViewedClip {
     /// segment is committed).
     fn fingerprint(&self) -> String {
         let mut names = vec![FRAMES_FILE.to_owned(), CLIP_JSON_FILE.to_owned()];
-        names.extend(
-            self.clip
-                .segments
-                .iter()
-                .map(|segment| segment.file.clone()),
-        );
+        names.extend(self.clip.moving.segments.iter().map(|segment| segment.segment.file.clone()));
+        let groups: std::collections::BTreeSet<_> = self.lines.iter().filter_map(|line| line.exact.map(|x| x.group)).collect();
+        names.extend(groups.into_iter().map(|group| format!("frames/group-{group:06}.zst")));
         names
             .iter()
             .map(|name| {
@@ -351,10 +302,6 @@ impl ViewedClip {
             .join(";")
     }
 
-    fn open_decoder(&self, segment: &SegmentCheckpoint) -> Result<ClipDecoder, ErrorData> {
-        ClipDecoder::open(&self.folder.join(&segment.file))
-            .map_err(|error| internal(format!("could not open {}: {error}", segment.file)))
-    }
 
     fn views_dir(&self) -> Result<PathBuf, ErrorData> {
         let views = self.folder.join(VIEWS_DIR);
@@ -365,22 +312,15 @@ impl ViewedClip {
 
     /// The largest recorded size among the committed segments.
     fn largest_recorded(&self) -> (u32, u32) {
-        self.clip.segments.iter().fold((0, 0), |(w, h), segment| {
-            (w.max(segment.width), h.max(segment.height))
-        })
+        self.lines.iter().fold((0, 0), |(w, h), line| (w.max(line.width), h.max(line.height)))
     }
 
     /// D2: the long edge of overview and range images: at least
     /// `OVERVIEW_MIN_SCALE` of the window size, at most `VIEW_MAX_LONG_EDGE`.
     /// The second value is `true` when the ceiling cuts below the floor.
     fn view_long_edge(&self, requested: Option<u32>) -> (u32, bool) {
-        let window_long = self
-            .clip
-            .segments
-            .iter()
-            .map(|segment| segment.width.max(segment.height) / self.segment_scale(segment))
-            .max()
-            .unwrap_or(0);
+        let (width, height) = self.largest_recorded();
+        let window_long = width.max(height);
         let floor = (f64::from(window_long) * OVERVIEW_MIN_SCALE).ceil() as u32;
         let wanted = requested.unwrap_or(VIEW_MAX_LONG_EDGE).max(floor);
         (wanted.min(VIEW_MAX_LONG_EDGE), floor > VIEW_MAX_LONG_EDGE)
@@ -405,6 +345,61 @@ impl ViewedClip {
         let [x, y] = self.line(frame)?.cursor?;
         let scale = i64::from(self.scale_at(frame));
         Some((i64::from(x) * scale, i64::from(y) * scale))
+    }
+}
+
+/// Reconstructs exact pixels, then overlays the numbered sample of the same instant.
+struct ClipPictures {
+    folder: PathBuf,
+    exact: ExactReader,
+    lines: Vec<FrameLine>,
+    segments: Vec<CommittedSegment>,
+    lost: std::collections::BTreeSet<u64>,
+    decoder: Option<(u32, ClipDecoder)>,
+    fps: u32,
+}
+impl ClipPictures {
+    fn new(clip: &ViewedClip) -> Result<Self, ErrorData> {
+        let entries = clip.lines.iter().filter_map(|line| {
+            let exact = line.exact?;
+            let size = std::fs::metadata(clip.folder.join(format!("frames/group-{:06}.zst", exact.group))).ok()?.len();
+            (exact.offset + u64::from(exact.bytes) <= size).then_some(ExactEntry {
+                instant: line.instant, exact, width: line.width, height: line.height,
+            })
+        }).collect();
+        Ok(Self { folder: clip.folder.clone(), exact: ExactReader::open(&clip.folder, entries).map_err(decode_error)?,
+            lines: clip.lines.clone(), segments: clip.clip.moving.segments.clone(),
+            lost: clip.clip.lost.iter().map(|l| l.instant).collect(), decoder: None, fps: clip.clip.fps })
+    }
+    fn at(&mut self, instant: u64) -> Result<DecodedFrame, ErrorData> {
+        const BGRA: usize = 4;
+        const BGR: usize = 3;
+        const HNS: u64 = 10_000_000;
+        let line = self.lines.get(instant as usize).ok_or_else(|| params_invalid("instant outside clip".into()))?;
+        let (exact, width, height) = self.exact.picture_at(instant).map_err(decode_error)?;
+        let mut bgra: Vec<u8> = exact.chunks_exact(BGR).flat_map(|p| [p[0], p[1], p[2], u8::MAX]).collect();
+        if !self.lost.contains(&instant) && let Some(reference) = line.moving
+            && let Some(committed) = self.segments.iter().find(|s| s.segment.index == reference.segment && reference.frame < s.segment.frames) {
+            let segment = &committed.segment;
+            if self.folder.join(&segment.file).is_file() {
+                if self.decoder.as_ref().is_none_or(|(index, _)| *index != segment.index) {
+                    self.decoder = Some((segment.index, ClipDecoder::open(&self.folder.join(&segment.file)).map_err(decode_error)?));
+                }
+                let moving = self.decoder.as_mut().ok_or_else(|| internal("decoder unavailable".into()))?.1
+                    .frame_number(reference.frame, &segment.key_frames).map_err(decode_error)?;
+                let rect = segment.rect;
+                if rect.right() > width || rect.bottom() > height || moving.width < rect.w || moving.height < rect.h {
+                    return Err(decode_error("moving rectangle does not fit its pictures".into()));
+                }
+                for row in 0..rect.h as usize {
+                    let source = row * moving.width as usize * BGRA;
+                    let destination = ((row + rect.y as usize) * width as usize + rect.x as usize) * BGRA;
+                    let bytes = rect.w as usize * BGRA;
+                    bgra[destination..destination + bytes].copy_from_slice(&moving.bgra[source..source + bytes]);
+                }
+            }
+        }
+        Ok(DecodedFrame { t_hns: (instant * HNS / u64::from(self.fps)) as i64, width, height, bgra })
     }
 }
 
@@ -874,12 +869,11 @@ impl<'a> Analyzer<'a> {
             captured: (0, 0),
             still_frames: 0,
         };
-        for segment in &clip.clip.segments {
-            let mut decoder = clip.open_decoder(segment)?;
-            while let Some(frame) = decoder.next_frame().map_err(decode_error)? {
-                let local = frame.t_ms() * clip.fps() / 1_000;
-                let instant = (segment.first_instant + local).min(segment.last_instant);
-                analyzer.step(instant, &frame);
+        let mut pictures = ClipPictures::new(clip)?;
+        for line in &clip.lines {
+            if line.shows_new_picture() {
+                let frame = pictures.at(line.instant)?;
+                analyzer.step(line.instant, &frame);
             }
         }
         analyzer.close_all(clip.last_frame() + 1);
@@ -1139,11 +1133,7 @@ impl<'a> Analyzer<'a> {
         let mut events = Event::join_all(self.episodes);
         events.sort_by_key(|event| (event.start, event.end));
         let (events, carets) = Event::without_carets(events, clip);
-        let first = clip
-            .clip
-            .segments
-            .first()
-            .map_or(0, |segment| segment.first_instant);
+        let first = 0;
         let mut picks = vec![pick(clip, first, "first frame")];
         let mut timeline = Vec::new();
         // D5 step 6: a stable interval that an animation overlaps is not
@@ -1660,7 +1650,7 @@ fn static_entry(clip: &ViewedClip, from: u64, to: u64) -> ClipTimelineEntry {
 /// made so far.
 struct ClipView {
     clip: ViewedClip,
-    decoder: Option<(u32, ClipDecoder)>,
+    pictures: ClipPictures,
     images: Vec<ClipViewImage>,
     pngs: Vec<Vec<u8>>,
     timeline: Vec<ClipTimelineEntry>,
@@ -1671,10 +1661,11 @@ struct ClipView {
 }
 
 impl ClipView {
-    fn new(clip: ViewedClip) -> Self {
-        Self {
+    fn new(clip: ViewedClip) -> Result<Self, ErrorData> {
+        let pictures = ClipPictures::new(&clip)?;
+        Ok(Self {
             clip,
-            decoder: None,
+            pictures,
             images: Vec::new(),
             pngs: Vec::new(),
             timeline: Vec::new(),
@@ -1682,7 +1673,7 @@ impl ClipView {
             paging: None,
             notes: Vec::new(),
             text: String::new(),
-        }
+        })
     }
 
     /// D2, D6: key frames shrunk by averaging, never below 75 % of the window
@@ -2002,29 +1993,7 @@ impl ClipView {
     }
 
     /// The picture on screen at instant `frame`, from its committed segment.
-    fn decode(&mut self, frame: u64) -> Result<DecodedFrame, ErrorData> {
-        let segment = self
-            .clip
-            .segment_of(frame)
-            .cloned()
-            .ok_or_else(|| self.clip.waiting_error(self.clip.t_of(frame)))?;
-        if self
-            .decoder
-            .as_ref()
-            .is_none_or(|(index, _)| *index != segment.index)
-        {
-            self.decoder = Some((segment.index, self.clip.open_decoder(&segment)?));
-        }
-        let frame_ms = self.clip.frame_ms();
-        let local_ms = self.clip.t_of(frame).saturating_sub(segment.start_ms);
-        self.decoder
-            .as_mut()
-            .map_or_else(
-                || Err("decoder unavailable".to_owned()),
-                |(_, decoder)| decoder.frame_at(local_ms, frame_ms),
-            )
-            .map_err(decode_error)
-    }
+    fn decode(&mut self, frame: u64) -> Result<DecodedFrame, ErrorData> { self.pictures.at(frame) }
 
     /// Labels the image (text and drawn copy), writes the PNG under `views/`
     /// and keeps it for the result.
@@ -2332,7 +2301,7 @@ fn fmt_time(ms: u64) -> String {
 
 fn source_of_truth(folder: &str) -> String {
     format!(
-        "clip folder {folder} (segment-NNNN.mp4, {FRAMES_FILE}, {CLIP_JSON_FILE}); exported images under {VIEWS_DIR}"
+        "clip folder {folder} (frames/, moving/, {FRAMES_FILE}, {CLIP_JSON_FILE}); exported images under {VIEWS_DIR}"
     )
 }
 

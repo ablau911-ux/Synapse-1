@@ -236,6 +236,59 @@ Source: https://ffmpeg.org/pipermail/ffmpeg-devel/2017-November/219896.html
 - Subject line of the patch: "lavc/libvpxenc: add tune-content option".
 - The values of the option (default, screen, film) were not in the text read. Not proven. Nothing was found on x265 or Kvazaar and screen content.
 
+## Proven in the retry pass (other addresses for the same sources)
+
+### P44. Lossless screen recording sizes (finding 15)
+Source: https://obsproject.com/forum/resources/almost-lossless-local-recoding-using-obs-studio.200/
+- "Data volumes (input is 1900x1200, fps varies): x264 lossless ultrafast (48 fps): 62-70 MB/s x264 lossless veryfast (48 fps): ~52 MB/s Lagarith lossless (20 fps): ~66 MB/s MJPG lossy, 85% quality (30 fps): ~14 MB/s"
+- "It is almost lossless because the conversion from RGB to YUV 4:4:4 is not truly lossless…"
+
+### P45. Intel hardware HEVC with screen content coding in ffmpeg (finding 29)
+Source: https://github.com/FFmpeg/FFmpeg/commit/c4ae6908f28ceacb39b96de9f8761aae1968bf42.patch
+- "Subject: [PATCH] lavc/qsvenc: add encode support for screen content coding extension Enables HEVC Screen Content Coding extension support on ICL+ platform"
+- "Set the encoding profile (scc requires libmfx >= 1.32)."
+
+### P46. Zoom: JPEG pictures, then H.264 (finding 48)
+Source: https://devforum.zoom.us/t/136028.json (a developer's post, citing Zoom's documentation)
+- "For screensharing, we are successfully receiving data, but it is always a sequence of individual JPEG images."
+- "According to the Zoom RTMS documentation, the stream should dynamically switch from JPEG … [when the frame ra]te exceeds a certain threshold (around 5 FPS)."
+
+### P47. AV1 screen content coding in WebRTC (finding 26)
+Source: https://webrtchacks.com/the-hidden-av1-gift-in-google-meet/
+- "…running two AV1 encoders in parallel with the same content – a shared tab with slides that are being paged through slowly. The result is a 25%+ reduction in the frame sizes and hence bitrate."
+
+### P48. JPEG XL against QOI (finding 13)
+Source: https://cloudinary.com/blog/jpeg-xl-and-the-pareto-front
+- "…QOI is indeed quite OK for its speed (and simplicity), though far from Pareto-optimal: low-effort JPEG XL encoding is twice as fast and 31% smaller."
+
+### P49. RDP AVC444 (finding 12)
+Source: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/844018a5-d717-4bc9-bddb-8b4d6be5dd3f
+- "…encapsulates regions of a graphics frame compressed using MPEG-4 AVC/H.264 compression techniques [ITU-H.264-201201] in YUV444 mode."
+
+### P50. UI tree against screenshots, in tokens (finding 34)
+Source: https://byteiota.com/?p=26671 (a blog; its figures are not independently checked)
+- "Accessibility tree snapshots run about 273 tokens each. Screenshot-based computer use runs 1,000 to 1,800."
+
+### P51. PCoIP builds unchanged regions to lossless (finding 36)
+Source: https://docs.omnissa.com/bundle/Horizon-Remote-Desktop-FeaturesVmulti/page/PCoIPGeneralSettings.html
+- "Unchanged regions of the image progressively build to a lossless (perfect) quality regardless of this value."
+
+### P52. Tight encoding against Hextile and raw (finding 18)
+Source: https://www.tightvnc.com/archive/compare.html
+- One test session: "Data size in screen updates, bytes 32,729,254 [Raw] 1,590,721 [Hextile] 652,572 [Zlib] 518,112 [Tight-1.0] 499,140 [Tight-1.1L] 499,140 [Tight-1.1] Bandwidth savings, Tight-1.1 vs. others 98.47% 68.62% 23.51% 3.66%".
+- Another: "111,178,662 [Raw] 2,788,259 [Hextile] … 454,748 [Tight-1.1] … 99.59% 83.69% 75.24% 4.61%".
+
+### P53. Time Travel Debugging trace size (finding 44)
+Source: https://learn.microsoft.com/en-us/archive/blogs/windbg/time-travel-debugging-ttd-file-size
+- "If you record an app or process even just for a few minutes, the trace file may grow to be several gigabytes in size."
+
+### P54. H.264 and blurred coloured text (finding 14)
+Source: https://forums.developer.nvidia.com/t/231994.json (a user's question)
+- "When the text color is Geen(ForeColor)/Black(BackColor)， the text in output.h264 created by NvFBCToGLEnc will blurred."
+- The fix by switching to YUV 4:4:4 was not in the text read. Not proven.
+
+**Still not readable after the retry:** Playwright's video settings (address returned 404), ffmpeg's wiki (no connection), the 47 % YouTube figure (not on the page), WebRTC zero-hertz behaviour (only the bug reference "go/rtc-0hz-present" was readable).
+
 ---
 
 ## NOT PROVEN (claim is in the log; text not found, or page not readable)

@@ -1,0 +1,95 @@
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+error: empty line after outer attribute
+   --> crates\synapse-mcp\src\server\capture_clip.rs:156:1
+    |
+156 | / #[cfg(windows)]
+157 | |
+    | |_^
+158 |   /// A validated recording request.
+159 |   struct ClipPlan {
+    |   --------------- the attribute applies to this struct
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#empty_line_after_outer_attr
+    = note: `-D clippy::empty-line-after-outer-attr` implied by `-D clippy::all`
+    = help: to override `-D clippy::all` add `#[allow(clippy::empty_line_after_outer_attr)]`
+    = help: if the empty line is unintentional, remove it
+
+error: empty line after doc comment
+   --> crates\synapse-mcp\src\server\capture_clip.rs:575:1
+    |
+575 | / /// σ: the smallest whole number that gives at least `MIN_LINES` lines (A3).
+576 | |
+    | |_^
+577 |   #[cfg(windows)]
+578 |   mod live {
+    |   -------- the comment documents this module
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#empty_line_after_doc_comments
+    = note: `-D clippy::empty-line-after-doc-comments` implied by `-D clippy::all`
+    = help: to override `-D clippy::all` add `#[allow(clippy::empty_line_after_doc_comments)]`
+    = help: if the empty line is unintentional, remove it
+
+error: empty line after doc comment
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1986:5
+     |
+1986 | /     /// The picture on screen at instant `frame`, from its committed segment.
+1987 | |
+     | |_^
+...
+1990 |       fn export(
+     |       --------- the comment documents this function
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#empty_line_after_doc_comments
+     = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+     |
+1987 |     ///
+     |
+
+error: consider adding a `;` to the last statement for consistent formatting
+    --> crates\synapse-mcp\src\server\capture_clip.rs:1146:21
+     |
+1146 |                     clip.moving.segments.extend(committed)
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: add a `;` here: `clip.moving.segments.extend(committed);`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#semicolon_if_nothing_returned
+     = note: `-D clippy::semicolon-if-nothing-returned` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::semicolon_if_nothing_returned)]`
+
+error: unnecessary boolean `not` operation
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:896:17
+    |
+896 | /                 if !to_anchor {
+897 | |                     state.pending = None;
+898 | |                 } else {
+899 | |                     state.pending = state.pending.or(Some(instant));
+900 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#if_not_else
+    = note: `-D clippy::if-not-else` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::if_not_else)]`
+help: try
+    |
+896 ~                 if to_anchor {
+897 +                     state.pending = state.pending.or(Some(instant));
+898 +                 } else {
+899 +                     state.pending = None;
+900 +                 }
+    |
+
+error: this parameter is a mutable reference but is not used mutably
+   --> crates\synapse-mcp\src\server\clip_moving.rs:325:27
+    |
+325 |     pub fn take_committed(&mut self) -> Vec<MovingSegment> {
+    |                           ^----^^^^
+    |                            |
+    |                            help: consider removing this `mut`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_pass_by_ref_mut
+    = note: `-D clippy::needless-pass-by-ref-mut` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_pass_by_ref_mut)]`
+
+error: could not compile `synapse-mcp` (bin "synapse-mcp") due to 6 previous errors

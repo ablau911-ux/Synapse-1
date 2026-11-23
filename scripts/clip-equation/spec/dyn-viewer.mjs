@@ -3,7 +3,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { McpServer } from '../live-test/mcp-stdio.mjs';
 
-const [exe, folder, source, out] = process.argv.slice(2);
+const [exe, folder, source, out, scene = 'noise'] = process.argv.slice(2);
 const LABEL_ROWS = 40, CHANNELS = 3, INSTANT_MS = 50, SEEK_LIMIT = 20;
 const SSIM_SIDE = 8, SSIM_STRIDE = 4, SSIM_MIN = 0.95;
 const SSIM_C1 = (0.01 * 255) ** 2, SSIM_C2 = (0.03 * 255) ** 2;
@@ -61,7 +61,7 @@ try {
   server=new McpServer({exe,db:path.join(out,'db'),outDir:out,env:{LOCALAPPDATA:path.join(out,'local'),SYNAPSE_SHELL_JOB_ROOT:path.join(out,'shell')}});
   await server.init('dyn-viewer');
   async function frame(instant,region){const start=performance.now();const r=await server.call({operation:'clip_frame',folder,t_ms:instant*INSTANT_MS,region,scale:1});longest=Math.max(longest,performance.now()-start);if(r.error||r.isError||r.images!==1)throw Error(r.texts.join('\n'));const files=fs.readdirSync(out).filter(n=>/^clip_frame-\d+\.png$/.test(n)).sort((a,b)=>Number(a.match(/\d+/)[0])-Number(b.match(/\d+/)[0]));return png(path.join(out,files.at(-1)));}
-  const instants=[0,10,40,43,44,60,90,120,134,135];
+  const instants=scene==='noise'?[0,10,40,43,44,60,90,120,134,135]:[];
   for(const instant of instants){const region={x:32,y:64,w:256,h:240};const image=await frame(instant,region),line=sources[instant],bgr=zlib.zstdDecompressSync(fs.readFileSync(path.join(source,`frame-${String(line.frame).padStart(4,'0')}.zst`)));let mismatches=0;
     for(let y=LABEL_ROWS;y<region.h;y++)for(let x=0;x<region.w;x++)for(let c=0;c<CHANNELS;c++)if(image.raw[(y*image.width+x)*image.channels+c]!==bgr[((y+region.y)*line.width+x+region.x)*CHANNELS+CHANNELS-1-c])mismatches++;
     check(`exact outside ${instant}`,mismatches===0,mismatches);
@@ -78,14 +78,17 @@ try {
     check(`moving quality ${instant}`,result.ssim>=SSIM_MIN,result.ssim);
   }
   check('moving pictures differ',!rendered[0].raw.equals(rendered[1].raw)&&!rendered[1].raw.equals(rendered[2].raw),rendered.map(p=>p.raw.length));
-  const stopped=compareSource(await frame(135,box),135,box);
-  check('exact after stop',stopped.mismatches===0,stopped.mismatches);
+  const restored=clip.moving.segments.at(-1).last_instant+1;
+  if (restored<lines.length) {
+    const stopped=compareSource(await frame(restored,box),restored,box);
+    check('exact after stop',stopped.mismatches===0,stopped.mismatches);
+  }
   for(let i=0;i<SEEK_LIMIT;i++)await frame((i*73+19)%lines.length,{x:400,y:304,w:320,h:240});
   const metadataPath=path.join(folder,'clip.json'),original=fs.readFileSync(metadataPath);
   try {
     const missing={...clip,moving:{...clip.moving,segments:[]}};
     fs.writeFileSync(metadataPath,JSON.stringify(missing));
-    const fallback=compareSource(await frame(90,box),43,box);
+    const fallback=compareSource(await frame(90,box),clip.moving.segments[0].first_instant-1,box);
     check('missing segment keeps exact pixels',fallback.mismatches===0,fallback.mismatches);
   } finally { fs.writeFileSync(metadataPath,original); }
   console.log(`longest_seek_ms=${longest}`);

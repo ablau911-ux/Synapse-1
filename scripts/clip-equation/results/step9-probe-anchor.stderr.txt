@@ -1,0 +1,54 @@
+   Compiling clip-probe v0.1.0 (C:\Users\Adam\Synapse-clip\scripts\clip-equation\probe)
+warning: struct `Report` is never constructed
+  --> src\exp_meter.rs:79:12
+   |
+79 | pub struct Report(Vec<(String, String)>);
+   |            ^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `put` and `print` are never used
+  --> src\exp_meter.rs:82:12
+   |
+81 | impl Report {
+   | ----------- methods in this implementation
+82 |     pub fn put(&mut self, key: &str, value: impl std::fmt::Display) {
+   |            ^^^
+...
+87 |     pub fn print(&self) {
+   |            ^^^^^
+
+warning: struct `Stage` is never constructed
+   --> src\exp_meter.rs:192:12
+    |
+192 | pub struct Stage {
+    |            ^^^^^
+
+warning: struct `StageFigures` is never constructed
+   --> src\exp_meter.rs:197:12
+    |
+197 | pub struct StageFigures {
+    |            ^^^^^^^^^^^^
+
+warning: associated items `start` and `finish` are never used
+   --> src\exp_meter.rs:206:12
+    |
+204 | impl Stage {
+    | ---------- associated items in this implementation
+205 |     /// Starts a stage; the sampler's peaks are reset to now.
+206 |     pub fn start(sampler: &MemorySampler) -> Self {
+    |            ^^^^^
+...
+214 |     pub fn finish(self, sampler: &MemorySampler) -> StageFigures {
+    |            ^^^^^^
+
+warning: method `put` is never used
+   --> src\exp_meter.rs:226:12
+    |
+225 | impl StageFigures {
+    | ----------------- method in this implementation
+226 |     pub fn put(&self, report: &mut Report, prefix: &str) {
+    |            ^^^
+
+warning: `clip-probe` (bin "clip-probe") generated 6 warnings
+    Finished `release` profile [optimized] target(s) in 12.17s

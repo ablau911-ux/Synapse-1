@@ -14,8 +14,10 @@ const chrome = ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Pro
 if (!chrome) throw Error('Chrome not found');
 fs.mkdirSync(out, { recursive: true });
 const profile = path.join(out, 'chrome-profile');
-const page = path.resolve('scripts/clip-equation', scene === 'ui' ? 'ui-events-page.html' : 'video-page.html');
-const browser = spawn(chrome, [`--app=${pathToFileURL(page).href}`, `--user-data-dir=${profile}`,
+const page = path.resolve('scripts/clip-equation', scene === 'ui' ? 'ui-events-page.html' : scene === 'd5-video' ? 'd5-scenes.html' : 'video-page.html');
+const url = pathToFileURL(page);
+if (scene === 'd5-video') url.searchParams.set('scene', 'video');
+const browser = spawn(chrome, [`--app=${url.href}`, `--user-data-dir=${profile}`,
   `--window-size=${WIDTH},${HEIGHT}`, '--no-first-run', '--no-default-browser-check',
   '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
   '--disable-background-timer-throttling'], { stdio: 'ignore', windowsHide: true });
@@ -24,6 +26,8 @@ const log = { scene, duration_ms: duration };
 const save = () => fs.writeFileSync(path.join(out, 'log.json'), JSON.stringify(log, null, 2));
 const newServer = tag => new McpServer({ exe, db: path.join(out, 'db'), outDir: out, tag,
   env: { LOCALAPPDATA: path.join(out, 'local'), SYNAPSE_SHELL_JOB_ROOT: path.join(out, 'shell') } });
+const processStats = pid => JSON.parse(execFileSync('powershell.exe', ['-NoProfile', '-Command',
+  `$clipProcess=Get-Process -Id ${pid}; @{private_bytes=$clipProcess.PrivateMemorySize64; peak_private_bytes=$clipProcess.PeakPagedMemorySize64; cpu_seconds=$clipProcess.TotalProcessorTime.TotalSeconds; logical_processors=[Environment]::ProcessorCount} | ConvertTo-Json -Compress`], { encoding: 'utf8' }));
 try {
   const end = Date.now() + WINDOW_WAIT_MS;
   let hwnd = 0;
@@ -38,6 +42,7 @@ try {
   User32.sendToBack(hwnd);
   await sleep(1000);
   server = newServer('record'); await server.init('dyn-live');
+  const before = processStats(server.p.pid), measuredStart = Date.now();
   const rec = await server.call({ operation: 'record', window_hwnd: hwnd, duration_ms: duration });
   if (!rec.json?.record?.clip_id) throw Error(rec.texts.join('\n'));
   const { clip_id: clipId } = rec.json.record;
@@ -59,6 +64,13 @@ try {
     await sleep(POLL_MS);
   }
   if (!ready) throw Error(`recorder did not become ready: ${log.state}`);
+  if (!killed) {
+    const after = processStats(server.p.pid);
+    log.ram_peak_increment = Math.max(0, after.peak_private_bytes-before.private_bytes);
+    log.cpu_percent = (after.cpu_seconds-before.cpu_seconds)*100000/((Date.now()-measuredStart)*after.logical_processors);
+    log.ram_within_500_mb = log.ram_peak_increment <= 500000000;
+    log.cpu_within_10_percent = log.cpu_percent <= 10;
+  }
   if (!killAt) {
     const first = await server.call({ operation: 'record_stop', clip_id: clipId });
     const second = await server.call({ operation: 'record_stop', clip_id: clipId });

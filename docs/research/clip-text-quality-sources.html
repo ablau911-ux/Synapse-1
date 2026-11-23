@@ -1,0 +1,160 @@
+<title>איכות טקסט בקידוד וידיאו: 59 מקורות</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+  /* Layout: findings summary first, then one table per claim, each row one source. */
+  :root {
+    --bg: #eef2f5; --surface: #ffffff; --ink: #18222d; --muted: #566270; --line: #d6dee6;
+    --accent: #23686c; --strong: #2c7a4b; --weak: #9a6a12;
+    --f-body: "Heebo", "Segoe UI", Arial, sans-serif; --f-mono: "IBM Plex Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #10161c; --surface: #18212a; --ink: #e4eaf0; --muted: #9aa7b4; --line: #2a3541; --accent: #74bcc0; --strong: #73c492; --weak: #e0b25a; color-scheme: dark; } }
+  :root[data-theme="dark"] { --bg: #10161c; --surface: #18212a; --ink: #e4eaf0; --muted: #9aa7b4; --line: #2a3541; --accent: #74bcc0; --strong: #73c492; --weak: #e0b25a; color-scheme: dark; }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--f-body); }
+  .wrap { max-width: 1100px; margin: 0 auto; padding-block: 28px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 22px; }
+  h1 { margin: 0; font-size: 1.9rem; font-weight: 800; line-height: 1.2; text-wrap: balance; }
+  h2 { margin: 0 0 8px; font-size: 1.2rem; font-weight: 700; }
+  p { margin: 0; max-width: 75ch; }
+  .muted { color: var(--muted); }
+  .find { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 20px; display: grid; gap: 8px; }
+  .find ol { margin: 0; padding-inline-start: 22px; display: grid; gap: 6px; }
+  .tag { font-size: .8rem; font-weight: 700; padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+  .s { color: var(--strong); } .w { color: var(--weak); }
+  section { display: grid; gap: 8px; min-width: 0; }
+  .tbl { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; }
+  th, td { text-align: start; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .85rem; color: var(--muted); font-weight: 600; }
+  td.n { font-family: var(--f-mono); color: var(--muted); width: 2.5em; }
+  td.k { white-space: nowrap; }
+  a { color: var(--accent); }
+  tr:last-child td { border-bottom: 0; }
+</style>
+
+<div class="wrap" dir="rtl">
+  <h1>למה H.264 פוגע בטקסט, ומה עושים: 59 מקורות</h1>
+  <p class="muted">איסוף מ-2026-11-23. כל שורה היא מקור נפרד, עם הטענה שהחיפוש מצא בו. <span class="tag s">רשמי</span> הוא תיעוד של יצרן, מפרט או מאמר. <span class="tag w">קהילה / שיווק</span> הוא פורום, בלוג או חומר שיווקי של ספק, שמשקלו נמוך יותר. לא פתחתי כל עמוד במלואו, והטענות הן כפי שהחיפוש סיכם אותן.</p>
+
+  <div class="find">
+    <h2>מה המקורות מוכיחים</h2>
+    <ol>
+      <li><b>הסיבה:</b> המעבר ל-4:2:0 (מה שאנחנו שולחים למקודד, NV12) מוחק 3/4 ממידע הצבע ומטשטש טקסט, במיוחד טקסט צבעוני על רקע אחיד. מקורות 1–13.</li>
+      <li><b>זו בעיה מוכרת בתעשייה, עם פתרון קבוע:</b> כל מערכות שיתוף המסך המרכזיות מציעות מצב 4:4:4 או "בנייה עד ללא אובדן" במיוחד בשביל טקסט: Microsoft RDP, ‏Citrix, ‏VMware, ‏Parsec, ‏Splashtop, ‏Sunshine ו-Teradici. מקורות 14–30.</li>
+      <li><b>גם 4:4:4 לא מבטיח זהות מלאה:</b> ההמרה מ-RGB ל-YUV מאבדת מעט. רק קידוד RGB ללא אובדן (libx264rgb ב-qp 0) זהה לגמרי. מקורות 31–36.</li>
+      <li><b>המגבלה אצלנו:</b> המקודדים של Media Foundation ו-Quick Sync לא מציעים 4:4:4 ל-H.264. ‏NVIDIA ‏(NVENC) כן מציע, אבל אצלך הוא לא נדלק. מקורות 37–44.</li>
+      <li><b>קודקים לתוכן מסך</b> (HEVC SCC, ‏AV1) חוסכים 40–80% בטקסט וגרפיקה. ל-Intel יש כלי תוכן מסך גם ב-AV1 בחומרה. מקורות 45–51.</li>
+      <li><b>דחיסה פוגעת ב-OCR:</b> ממצאים מדודים וחומר נלווה. מקורות 52–55.</li>
+      <li><b>קודקים ללא אובדן שנבנו למסך</b> מנצלים את זה שרוב המסך לא משתנה. זה הכיוון של zstd עם מה שהשתנה בלבד. מקורות 56–59.</li>
+    </ol>
+    <p class="muted">מה המקורות <b>לא</b> מוכיחים: שאצלנו 4:2:0 הוא הסיבה ל-R &lt; 1. לזה צריך את הניסוי שלנו: מקור → NV12 → חזרה, בלי דחיסה, ואז למדוד R.</p>
+  </div>
+
+  <section>
+    <h2>א. הסיבה: 4:2:0 פוגע בטקסט</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">1</td><td><a href="https://www.rtings.com/tv/learn/chroma-subsampling">RTINGS: Chroma Subsampling</a></td><td class="k"><span class="tag s">רשמי</span></td><td>הנזק הכי בולט בטקסט על צבע אחיד. במחשב שולחני 4:4:4 משפיע "מאוד", ובסרטים לא.</td></tr>
+      <tr><td class="n">2</td><td><a href="https://testufo.com/chroma">TestUFO: Chroma test</a></td><td class="k"><span class="tag s">רשמי</span></td><td>טקסט צבעוני וקווים מיטשטשים ב-4:2:2 וב-4:2:0.</td></tr>
+      <tr><td class="n">3</td><td><a href="https://docs.kernel.org/userspace-api/media/v4l/yuv-formats.html">Linux kernel: YUV formats</a></td><td class="k"><span class="tag s">רשמי</span></td><td>4:2:0 מחלק את רזולוציית הצבע ב-2 לרוחב וב-2 לגובה, כך שבלוק של 2×2 פיקסלים חולק צבע אחד.</td></tr>
+      <tr><td class="n">4</td><td><a href="https://www.red.com/red-101/video-chroma-subsampling">RED: Video chroma subsampling</a></td><td class="k"><span class="tag s">רשמי</span></td><td>שוליים אדומים הם המקום שבו 4:2:0 נראה הכי גרוע.</td></tr>
+      <tr><td class="n">5</td><td><a href="https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/9153017">USPTO 9153017: optimized chroma subsampling</a></td><td class="k"><span class="tag s">רשמי</span></td><td>תת-דגימת צבע יוצרת עיוותים מפריעים בתמונות שיש בהן טקסט.</td></tr>
+      <tr><td class="n">6</td><td><a href="https://projects.blender.org/blender/blender/issues/61569">Blender #61569</a></td><td class="k"><span class="tag w">קהילה</span></td><td>גם H.264 במצב "ללא אובדן" עובר ל-4:2:0, וטקסט מיטשטש. ‏HuffYUV ב-4:4:4 נשאר חד.</td></tr>
+      <tr><td class="n">7</td><td><a href="https://ffmpeg.org/pipermail/ffmpeg-user/2018-June/040281.html">FFmpeg-user 2018: yuv420p blurry text</a></td><td class="k"><span class="tag w">קהילה</span></td><td>טקסט ואייקונים מיטשטשים אחרי ההמרה ל-yuv420p. ‏4:4:4 מתאים להקלטת מסך.</td></tr>
+      <tr><td class="n">8</td><td><a href="https://obsproject.com/forum/threads/color-quality-loss-due-to-chroma-subsampling.123738/">OBS forum: chroma subsampling loss</a></td><td class="k"><span class="tag w">קהילה</span></td><td>איבוד צבע וטקסט רך בהקלטות בגלל 4:2:0.</td></tr>
+      <tr><td class="n">9</td><td><a href="https://docs.citrix.com/en-us/citrix-virtual-apps-desktops/graphics/thinwire/colorspace">Citrix: Thinwire color space</a></td><td class="k"><span class="tag s">רשמי</span></td><td>דחיסת צבע פוגעת בפרטים בניגודיות גבוהה כמו טקסט, שנעשה מטושטש וקשה לקריאה.</td></tr>
+      <tr><td class="n">10</td><td><a href="https://techcommunity.microsoft.com/t5/microsoft-security-and/remote-desktop-protocol-rdp-10-avc-h-264-improvements-in-windows/ba-p/249588">Microsoft: RDP 10 AVC/H.264</a></td><td class="k"><span class="tag s">רשמי</span></td><td>ב-H.264 רגיל יש לטקסט "הילה", כי 4:2:0 זורק מידע צבע.</td></tr>
+      <tr><td class="n">11</td><td><a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2000/07/optfilt.pdf">Microsoft Research: ClearType filtering</a></td><td class="k"><span class="tag s">רשמי</span></td><td>ClearType מצייר טקסט לכל ערוץ צבע בנפרד, ולכן לשולי האותיות יש מידע צבע ש-4:2:0 מוחק.</td></tr>
+      <tr><td class="n">12</td><td><a href="https://www.Wikipedia.org/wiki/BGR_(subpixels)">Wikipedia: Subpixel rendering</a></td><td class="k"><span class="tag w">קהילה</span></td><td>רינדור תת-פיקסלי יוצר שוליים צבעוניים ("color fringing").</td></tr>
+      <tr><td class="n">13</td><td><a href="https://forum.videohelp.com/showthread.php?p=2211745">VideoHelp forum</a></td><td class="k"><span class="tag w">קהילה</span></td><td>דיון באיבוד חדות טקסט בגלל תת-דגימת צבע.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>ב. התעשייה: 4:4:4, ‏AVC444 ו"בנייה עד ללא אובדן" בשביל טקסט</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">14</td><td><a href="https://msdn.microsoft.com/en-us/library/3b337b87-f478-4786-a63b-97794aa72075">MS-RDPEGFX: AVC444v2</a></td><td class="k"><span class="tag s">רשמי</span></td><td>פריים אחד הוא שני זרמי AVC420, אחד לבהירות ואחד לצבע, באותו מקודד ובאותו מפענח.</td></tr>
+      <tr><td class="n">15</td><td><a href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/844018a5-d717-4bc9-bddb-8b4d6be5dd3f">MS-RDPEGFX: YUV444 modes</a></td><td class="k"><span class="tag s">רשמי</span></td><td>שני מצבים: YUV444 (0x000E) ו-YUV444v2 (0x000F).</td></tr>
+      <tr><td class="n">16</td><td><a href="https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding">Azure Virtual Desktop: graphics encoding</a></td><td class="k"><span class="tag s">רשמי</span></td><td>ברירת המחדל היא 4:2:0, ואפשר להגדיר 4:4:4 לאיכות טקסט.</td></tr>
+      <tr><td class="n">17</td><td><a href="https://learn.microsoft.com/bg-bg/azure/virtual-desktop/graphics-chroma-value-increase-4-4-4">Azure Virtual Desktop: chroma 4:4:4</a></td><td class="k"><span class="tag s">רשמי</span></td><td>מפעילים 4:4:4 דרך מדיניות. זה צורך יותר רוחב פס.</td></tr>
+      <tr><td class="n">18</td><td><a href="https://learn.microsoft.com/en-us/windows-365/enterprise/chroma-value-change-default">Windows 365: chroma value</a></td><td class="k"><span class="tag s">רשמי</span></td><td>אותה אפשרות 4:4:4 ב-Windows 365.</td></tr>
+      <tr><td class="n">19</td><td><a href="https://msandbu.org/windows-server-2016-and-introducing-avc-444-mode/">msandbu: AVC 444 mode</a></td><td class="k"><span class="tag w">קהילה</span></td><td>הסבר על AVC444 ב-Windows Server 2016.</td></tr>
+      <tr><td class="n">20</td><td><a href="https://docs.citrix.com/en-us/citrix-virtual-apps-desktops/2402-ltsr/graphics/thinwire.html">Citrix: Thinwire</a></td><td class="k"><span class="tag s">רשמי</span></td><td>H.264 ב-4:2:0 לא מדויק לפיקסל. "Build to lossless" מחדד לתמונה ללא אובדן כשהמסך נרגע.</td></tr>
+      <tr><td class="n">21</td><td><a href="https://docs.citrix.com/en-us/mac-vda/configure/graphics/yuv444-support.html">Citrix: YUV444 support</a></td><td class="k"><span class="tag s">רשמי</span></td><td>YUV444 מייצר בערך פי 1.5–2 מידע לעומת YUV420.</td></tr>
+      <tr><td class="n">22</td><td><a href="https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9884-user-experience-is-key-to-vdi-success-color-accuracy-is-key-to-user-experience.pdf">NVIDIA GTC 2019: color accuracy in VDI</a></td><td class="k"><span class="tag s">רשמי</span></td><td>בבדיקה אחת: Build to lossless כ-195MB, לעומת H.264 YUV444 כ-655MB.</td></tr>
+      <tr><td class="n">23</td><td><a href="https://techzone.vmware.com/resource/vmware-blast-extreme-optimization-guide">VMware: Blast Extreme guide</a></td><td class="k"><span class="tag s">רשמי</span></td><td>4:2:0 גורם לטקסט מטושטש. ‏High Color Accuracy מכבה את 4:2:0 ועובר ל-4:4:4.</td></tr>
+      <tr><td class="n">24</td><td><a href="https://techzone.omnissa.com/resource/omnissa-blast-extreme-optimization-guide">Omnissa: Blast Extreme guide</a></td><td class="k"><span class="tag s">רשמי</span></td><td>הרבה כרטיסי מסך לא מפענחים H.264 ב-4:4:4, ואז הפענוח עובר ל-CPU.</td></tr>
+      <tr><td class="n">25</td><td><a href="https://docs.vmware.com/en/VMware-Horizon/2309/horizon-remote-desktop-features/GUID-220442CF-EA01-470E-A381-1BED9BC0B81C.html">VMware Horizon 2309: Blast policies</a></td><td class="k"><span class="tag s">רשמי</span></td><td>המדיניות "H264 High Color Accuracy", וזה עלול להאט ברזולוציות גבוהות.</td></tr>
+      <tr><td class="n">26</td><td><a href="https://support.parsec.app/hc/en-us/articles/32381785123860-Improve-Stream-Quality-and-Color-Accuracy">Parsec: Improve stream quality</a></td><td class="k"><span class="tag s">רשמי</span></td><td>לטקסט ממליצים על "Prefer 4:4:4 Color".</td></tr>
+      <tr><td class="n">27</td><td><a href="https://support.parsec.app/hc/en-us/articles/32361397075604-Programmers-and-Writers">Parsec: Programmers and Writers</a></td><td class="k"><span class="tag s">רשמי</span></td><td>למתכנתים ולכותבים: H.265, ‏4:4:4 ורוחב פס של 25Mbps ומעלה.</td></tr>
+      <tr><td class="n">28</td><td><a href="https://splashtop.com/blog/superior-color-accuracy-and-image-clarity">Splashtop: color accuracy</a></td><td class="k"><span class="tag w">שיווק</span></td><td>4:4:4 לחדות תמונה וטקסט.</td></tr>
+      <tr><td class="n">29</td><td><a href="https://github.com/orgs/LizardByte/discussions/220">Sunshine (LizardByte) #220</a></td><td class="k"><span class="tag w">קהילה</span></td><td>4:4:4 משפר מאוד את חדות הטקסט. קידוד 4:4:4 ב-Windows נוסף.</td></tr>
+      <tr><td class="n">30</td><td><a href="https://connect.teradici.com/blog/the-importance-of-lossless-support">Teradici: importance of lossless</a></td><td class="k"><span class="tag w">שיווק</span></td><td>קודק לפי סוג התוכן: טקסט וגרפיקה פשוטה נשלחים מיד ללא אובדן.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>ג. ללא אובדן באמת: 4:4:4 לעומת RGB</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">31</td><td><a href="https://trac.ffmpeg.org/wiki/Capture/Desktop?version=22">FFmpeg wiki: Capture/Desktop</a></td><td class="k"><span class="tag s">רשמי</span></td><td>להקלטה ללא אובדן באמת: libx264rgb. ההמרה ל-yuv444p מאבדת מעט.</td></tr>
+      <tr><td class="n">32</td><td><a href="https://obsproject.com/forum/resources/almost-lossless-local-recoding-using-obs-studio.200/">OBS: almost lossless recording</a></td><td class="k"><span class="tag w">קהילה</span></td><td>RGB → YUV 4:4:4 לא זהה ביטים, אבל טוב בהרבה מ-4:2:0.</td></tr>
+      <tr><td class="n">33</td><td><a href="https://obsproject.com/forum/threads/best-color-settings-for-x264-qp-0-lossless-recording.49456/">OBS: x264 qp 0 settings</a></td><td class="k"><span class="tag w">קהילה</span></td><td>qp 0 עם YUV444 כמעט זהה לתמונה.</td></tr>
+      <tr><td class="n">34</td><td><a href="https://ffmpeg.org/pipermail/libav-user/2012-May/002104.html">Libav-user 2012: red text</a></td><td class="k"><span class="tag w">קהילה</span></td><td>טקסט אדום נשאר מטושטש גם ב-qp 0, והסיבה התבררה כצד המפענח.</td></tr>
+      <tr><td class="n">35</td><td><a href="https://gist.github.com/JanTvrdik/8adfb7de7b5d9c2ca0aac43777adf3a1">GitHub gist: gdigrab lossless</a></td><td class="k"><span class="tag w">קהילה</span></td><td>תבנית: libx264 -qp 0 -pix_fmt yuv444p.</td></tr>
+      <tr><td class="n">36</td><td><a href="https://ffmpeg.org/pipermail/ffmpeg-user/2014-November/024217.html">FFmpeg-user 2014: codec for screen</a></td><td class="k"><span class="tag w">קהילה</span></td><td>ל-x264 יש מצב ללא אובדן ב-quantizer 0.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>ד. המגבלה אצלנו: חומרה ו-Media Foundation</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">37</td><td><a href="https://learn.microsoft.com/en-ie/Windows/Win32/medfound/h-264-video-encoder">Microsoft Learn: H.264 encoder</a></td><td class="k"><span class="tag s">רשמי</span></td><td>מקודד ה-H.264 של Media Foundation: רק Baseline, ‏Main ו-High. אין 4:4:4 ואין ללא אובדן.</td></tr>
+      <tr><td class="n">38</td><td><a href="https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-video-encoder">Microsoft Learn: HEVC encoder</a></td><td class="k"><span class="tag s">רשמי</span></td><td>מקודד ה-HEVC של Media Foundation: רק Main.</td></tr>
+      <tr><td class="n">39</td><td><a href="https://www.intel.com/content/www/us/en/support/articles/000057555/graphics.html">Intel: HEVC chroma support</a></td><td class="k"><span class="tag s">רשמי</span></td><td>Quick Sync בדור 10 ומעלה: HEVC ב-4:2:2. לא מוזכר 4:4:4.</td></tr>
+      <tr><td class="n">40</td><td><a href="https://community.intel.com/t5/Media-Intel-Video-Processing/h-264-profiles-supported-by-Quick-Sync/td-p/1029859">Intel community: Quick Sync profiles</a></td><td class="k"><span class="tag w">קהילה</span></td><td>שאלה על Hi444PP ב-Quick Sync, בלי תשובה ברורה. ‏NVENC תומך מאז Maxwell.</td></tr>
+      <tr><td class="n">41</td><td><a href="https://obsproject.com/forum/threads/quicksync-4-4-4-chroma-encoding-not-working.176685/post-651371">OBS: QuickSync 4:4:4 not working</a></td><td class="k"><span class="tag w">קהילה</span></td><td>מקודדי Quick Sync ב-OBS עבדו רק ב-NV12 במשך כ-8 שנים.</td></tr>
+      <tr><td class="n">42</td><td><a href="https://docs.nvidia.com/video-technologies/video-codec-sdk/12.2/nvenc-application-note/index.html">NVIDIA: NVENC application note</a></td><td class="k"><span class="tag s">רשמי</span></td><td>HEVC ב-4:4:4 נתמך בדורות החדשים של NVENC.</td></tr>
+      <tr><td class="n">43</td><td><a href="https://forums.developer.nvidia.com/t/yuv44-hevc-encoding-in-d3d12/197834">NVIDIA forum: YUV444 in D3D12</a></td><td class="k"><span class="tag w">קהילה</span></td><td>444 בפורמט planar לא עובד עם NVENC ב-DX12.</td></tr>
+      <tr><td class="n">44</td><td><a href="https://developer.nvidia.com/blog/nvidia-video-codec-sdk-13-0-powered-by-nvidia-blackwell/">NVIDIA: Video Codec SDK 13</a></td><td class="k"><span class="tag s">רשמי</span></td><td>Blackwell מוסיף 4:2:2, שמשאיר 50% ממידע הצבע.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>ה. קודקים לתוכן מסך</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">45</td><td><a href="https://www.microsoft.com/en-us/research/?p=798757">Microsoft Research: HEVC SCC verification</a></td><td class="k"><span class="tag s">רשמי</span></td><td>בטקסט וגרפיקה: חיסכון של 40–80% לעומת HEVC רגיל, ו-60–90% לעומת AVC.</td></tr>
+      <tr><td class="n">46</td><td><a href="https://www.cambridge.org/core/services/aop-cambridge-core/content/view/E12DCF69B0A59DD269EFE14CD1AFBFBE/S2048770315000116a.pdf/overview-of-hevc-extensions-on-screen-content-coding.pdf">Cambridge: HEVC SCC overview</a></td><td class="k"><span class="tag s">רשמי</span></td><td>הכלים: העתקת בלוק בתוך התמונה, פלטה והמרת צבע מסתגלת. פלטה עובדת גם ללא אובדן.</td></tr>
+      <tr><td class="n">47</td><td><a href="https://aomedia.org/docs/AV1_ToolDescription_v11-clean.pdf">AOMedia: AV1 tool description</a></td><td class="k"><span class="tag s">רשמי</span></td><td>תוכן מסך ב-AV1: העתקת בלוק, פלטה וזיהוי סוג תוכן.</td></tr>
+      <tr><td class="n">48</td><td><a href="https://aomedia.googlesource.com/aom/+show/HEAD/doc/AlgorithmDescription.md">libaom: algorithm description</a></td><td class="k"><span class="tag s">רשמי</span></td><td>כלי תוכן מסך ב-libaom.</td></tr>
+      <tr><td class="n">49</td><td><a href="https://videohelp.com/software/SVT-AV1/version-history">SVT-AV1: version history</a></td><td class="k"><span class="tag w">קהילה</span></td><td>כלי תוכן מסך לתקשורת בזמן אמת: העתקת בלוק ופלטה.</td></tr>
+      <tr><td class="n">50</td><td><a href="https://ffmpeg.org/pipermail/ffmpeg-devel/2024-September/333792.html">FFmpeg-devel: QSV AV1 screen content</a></td><td class="k"><span class="tag s">רשמי</span></td><td>Intel Quick Sync AV1 מציע בחומרה העתקת בלוק ופלטה לתוכן מסך.</td></tr>
+      <tr><td class="n">51</td><td><a href="https://itu.int/en/publications/Documents/tsb/2020-ITU_Journal-ICT_Discoveries/Vol3-No1/files/basic-html/page99.html">ITU Journal 2020</a></td><td class="k"><span class="tag s">רשמי</span></td><td>ב-AV1 יש מקבילה להעתקת בלוק ומצב ללא אובדן.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>ו. דחיסה פוגעת ב-OCR</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">52</td><td><a href="https://blog.gdeltproject.org/?p=22550">GDELT: OCR vs frame quality</a></td><td class="k"><span class="tag w">ניסוי מעשי</span></td><td>דחיסה חזקה יצרה עיוותים באזורי טקסט, ודיוק ה-OCR ירד.</td></tr>
+      <tr><td class="n">53</td><td><a href="https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/8064516">USPTO 8064516: text during compression</a></td><td class="k"><span class="tag s">רשמי</span></td><td>בדחיסה, אזורי טקסט מאבדים חדות, ולפעמים הטקסט לא קריא.</td></tr>
+      <tr><td class="n">54</td><td><a href="https://www.scitepress.org/Papers/2014/46712/">Scitepress 2014: license plates</a></td><td class="k"><span class="tag s">רשמי</span></td><td>זיהוי לוחיות רישוי ב-H.264 וב-HEVC יורד עם האיכות, לפי עקומה לוגיסטית.</td></tr>
+      <tr><td class="n">55</td><td><a href="https://www.forasoft.com/learn/ai-for-video-engineering/articles-ai/paddleocr-text-detection-video">Forasoft: PaddleOCR in video</a></td><td class="k"><span class="tag w">שיווק</span></td><td>רעש קוונטיזציה ובלוקים בקצב נמוך מורידים דיוק זיהוי.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>ז. קודקים ללא אובדן שנבנו למסך</h2>
+    <div class="tbl"><table>
+      <tr><th>#</th><th>מקור</th><th>סוג</th><th>מה הוא אומר</th></tr>
+      <tr><td class="n">56</td><td><a href="https://kb.speeddemosarchive.com/Lossless_Codecs_Comparison">Speed Demos Archive: lossless codecs</a></td><td class="k"><span class="tag w">קהילה</span></td><td>להקלטת מסך עדיף קודק שנבנה לזה: TSCC, ‏ZMBV.</td></tr>
+      <tr><td class="n">57</td><td><a href="https://www.rfc-editor.org/rfc/rfc9043">RFC 9043: FFV1</a></td><td class="k"><span class="tag s">רשמי</span></td><td>FFV1 מיועד גם להקלטת מסך, ללא אובדן.</td></tr>
+      <tr><td class="n">58</td><td><a href="https://ffmpeg.org/pipermail/ffmpeg-devel/2022-June/297414.html">FFmpeg-devel 2022: FFV1 on screen</a></td><td class="k"><span class="tag w">קהילה</span></td><td>כשיותר מ-95% מהמסך לא משתנה, קודק שדוחס כל פריים לבד לא יעיל. צריך לנצל את מה שלא השתנה.</td></tr>
+      <tr><td class="n">59</td><td><a href="https://docs.vmware.com/en/VMware-Horizon/2206/horizon-remote-desktop-features/GUID-FB9598F4-EBBD-4CFF-B24E-CF9D18E729CD.html">VMware Horizon: PCoIP build-to-lossless</a></td><td class="k"><span class="tag s">רשמי</span></td><td>ברשת מקומית PCoIP שולח טקסט ללא אובדן כברירת מחדל.</td></tr>
+    </table></div>
+  </section>
+</div>

@@ -1,0 +1,348 @@
+<title>דחיסת וידיאו להקלטת מסך</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Frank+Ruhl+Libre:wght@500;700;900&family=Heebo:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+  /* Layout: one academic reading column (abstract, numbered sections, tables, references), RTL. */
+  :root {
+    --bg: #f1f3f6; --paper: #ffffff; --ink: #1a2230; --muted: #5a6574; --line: #d7dde5;
+    --accent: #1f5f8b; --quote: #eaf1f7; --good: #2c7a4b; --warn: #9a6a12;
+    --f-display: "Frank Ruhl Libre", "Times New Roman", serif;
+    --f-body: "Heebo", "Segoe UI", Arial, sans-serif;
+    --f-mono: "IBM Plex Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg: #0f141a; --paper: #171e26; --ink: #e3e9ef; --muted: #9ba7b3; --line: #2a3440; --accent: #7fb6dd; --quote: #1d2833; --good: #73c492; --warn: #e0b25a; color-scheme: dark; } }
+  :root[data-theme="dark"] { --bg: #0f141a; --paper: #171e26; --ink: #e3e9ef; --muted: #9ba7b3; --line: #2a3440; --accent: #7fb6dd; --quote: #1d2833; --good: #73c492; --warn: #e0b25a; color-scheme: dark; }
+  body { background: var(--bg); color: var(--ink); font: 16px/1.7 var(--f-body); }
+  .wrap { max-width: 880px; margin: 0 auto; padding-block: 32px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  article { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 40px clamp(18px, 5vw, 56px); display: grid; gap: 18px; min-width: 0; }
+  h1 { font-family: var(--f-display); font-weight: 900; font-size: clamp(1.7rem, 4vw, 2.3rem); line-height: 1.25; margin: 0; text-wrap: balance; }
+  h2 { font-family: var(--f-display); font-weight: 700; font-size: 1.45rem; margin: 18px 0 0; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  h3 { font-family: var(--f-display); font-weight: 700; font-size: 1.15rem; margin: 6px 0 0; }
+  p { margin: 0; }
+  .meta { color: var(--muted); font-size: .92rem; }
+  .abstract { background: var(--quote); border-radius: 6px; padding: 16px 20px; display: grid; gap: 8px; }
+  .abstract b.lbl { font-family: var(--f-display); font-size: 1.05rem; }
+  blockquote { margin: 0; background: var(--quote); border-inline-start: 3px solid var(--accent); padding: 10px 16px; border-radius: 0 4px 4px 0; direction: ltr; text-align: left; font-size: .95rem; }
+  blockquote cite { display: block; direction: rtl; text-align: right; font-style: normal; color: var(--muted); font-size: .85rem; margin-top: 4px; }
+  .eq { font-family: var(--f-mono); direction: ltr; text-align: left; background: var(--quote); padding: 10px 14px; border-radius: 4px; white-space: pre-wrap; font-size: .92rem; overflow-x: auto; }
+  .tbl { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: start; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; background: var(--quote); }
+  td.num { text-align: left; direction: ltr; font-family: var(--f-mono); }
+  caption { caption-side: top; text-align: start; padding: 6px 2px; color: var(--muted); font-size: .88rem; }
+  sup a, a { color: var(--accent); }
+  ol.refs { margin: 0; padding-inline-start: 34px; font-size: .86rem; display: grid; gap: 3px; }
+  ol.refs li { overflow-wrap: anywhere; }
+  ul, ol { margin: 0; padding-inline-start: 22px; display: grid; gap: 4px; }
+  .note { color: var(--muted); font-size: .9rem; }
+  .k { color: var(--good); font-weight: 700; } .x { color: var(--warn); font-weight: 700; }
+</style>
+
+<div class="wrap" dir="rtl"><article>
+
+<h1>דחיסת וידיאו ויצירת קליפים של מסך: איכות טקסט, גודל קובץ ומשאבי מערכת</h1>
+<p class="meta">מחקר. נכתב 2026-11-23. הוא משלב סקירת ספרות (89 מקורות חיצוניים) עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
+
+<div class="abstract">
+  <b class="lbl">תקציר</b>
+  <p>המטרה היא קליפ מסך קטן, באיכות גבוהה, שיצירתו צורכת מינימום RAM ו-CPU. איכות מוגדרת כקריאוּת מלאה של הטקסט: <span dir="ltr">R = 1</span>, כאשר R הוא 1 פחות מרחק העריכה בין טקסט ה-OCR של הקליפ לטקסט ה-OCR של המקור, מחולק באורך טקסט המקור.</p>
+  <p>השווינו שתי דרכים. דרך D: מקודדי H.264 של Windows Media Foundation (Intel Quick Sync ותוכנה של Microsoft). דרך Z: ‏zstd ללא אובדן. כל אחת נבדקה על 24 סצנות: 6 סוגי תוכן כפול 4 רזולוציות.</p>
+  <p>אף הגדרה של H.264 לא הגיעה ל-<span dir="ltr">R = 1</span>; הטוב ביותר היה 0.9996. ‏zstd הגיע ל-<span dir="ltr">R = 1</span> בכל ריצה. המחיר הוא גודל: zstd בפריים שלם גדול פי 2.7–12 מ-H.264 באותה רמת קריאוּת הכי טובה שלו, ובתוכן וידיאו פי אלפים.</p>
+  <p>הספרות מצביעה על סיבה מרכזית לאובדן הטקסט ב-H.264: תת-דגימת צבע 4:2:0. המערכות המקצועיות לשיתוף מסך פותרות אותה ב-4:4:4, ‏AVC444, "בנייה עד ללא אובדן" או קידוד לפי סוג תוכן. גם הנתונים שלנו תואמים את זה: איכות מקסימלית לא הגיעה ל-<span dir="ltr">R = 1</span>, וב-σ = 2 ‏R עלה.</p>
+  <p>מסקנה: לטקסט, zstd ללא אובדן. כדי להקטין את הגודל: פורמט zstd שכותב רק מה שהשתנה (פי 7–12 קטן יותר במדידה החלקית), ובתוכן וידיאו קידוד מאבד מידע. מוצע ניסוי מכריע לאימות הסיבה.</p>
+</div>
+
+<h2>1. מבוא</h2>
+<p>מקליט הקליפים של Synapse מקליט חלון או מסך, כדי שסוכן או אדם יוכלו לראות אחר כך מה קרה. השימוש העיקרי הוא קריאה: מה היה כתוב בחלון, באיזה רגע הופיעה הודעה, מה השתנה. לכן אות שגויה היא כשל, ולא רק פגם אסתטי. "1,243.94" שנקרא "1,248.94" הוא מידע שגוי.</p>
+<p>שאלת המחקר: איזו דרך דחיסה נותנת את הקובץ הקטן ביותר, עם המשאבים הנמוכים ביותר, בתנאי שכל הטקסט נשמר (<span dir="ltr">O = [R = 1]</span>)? פונקציית ההכרעה:</p>
+<div class="eq">J = bytes / bytes* + CPU / CPU* + RAM / RAM*      (over the ways that meet O = [R = 1]; * = the best in the set)</div>
+
+<h2>2. רקע תיאורטי</h2>
+
+<h3>2.1 צילום מסך ופורמט פיקסלים</h3>
+<p>Windows מספק את תמונת המסך תמיד ב-BGRA 8 ביט<sup><a href="#r13">13</a></sup>. ה-Desktop Duplication API מחזיר גם "מלבנים מלוכלכים", אזורים שהשתנו מאז הפריים הקודם, ו"מלבני הזזה" לגלילה<sup><a href="#r10">10</a>,<a href="#r11">11</a>,<a href="#r12">12</a></sup>:</p>
+<blockquote>dirty regions, which are non-overlapping rectangles that indicate the areas of the desktop image that the operating system updated since you processed the previous desktop image.<cite>Microsoft, GetFrameDirtyRects [11]</cite></blockquote>
+<p>מערכת ההפעלה יכולה לאחד אזורים, ולכן המלבנים הם גבול עליון ולא הבדל מדויק<sup><a href="#r13">13</a></sup>. FreeRDP משתמש בדיוק בדפוס הזה: קודם מלבני הזזה, אחר כך מלבנים מלוכלכים<sup><a href="#r14">14</a></sup>. זו הדרך הזולה ביותר לדעת מה השתנה בלי להשוות את כל הפיקסלים.</p>
+
+<h3>2.2 מרחבי צבע: RGB ו-YCbCr</h3>
+<p>מקודדי וידיאו עובדים במרחב YCbCr: בהירות (Y) ושני ערוצי צבע. ההמרה לפי BT.601 או BT.709 דורשת עיגול ב-8 ביט, וגם ההמרה ההפוכה. לכן הסיבוב עצמו מאבד מידע<sup><a href="#r19">19</a></sup>. פורום מדווח שב-8 ביט כ-5/6 מערכי ה-RGB משתנים בסיבוב, אבל אף פעם לא ביותר מ-2 יחידות<sup><a href="#r17">17</a>,<a href="#r18">18</a></sup>. לעומת זאת, YCoCg-R הפיך בדיוק במספרים שלמים<sup><a href="#r15">15</a>,<a href="#r16">16</a></sup>:</p>
+<blockquote>YCoCg-R ... is exactly reversible in integer arithmetic.<cite>Malvar &amp; Sullivan, JVT-I014 [15]</cite></blockquote>
+<p>סטייה של 2 יחידות כמעט לא פוגעת ב-OCR. היא מסבירה למה "ללא אובדן" ב-YUV עדיין לא זהה ביטים, אבל לא את האותיות השגויות.</p>
+
+<h3>2.3 תת-דגימת צבע</h3>
+<p>ב-4:2:0 כל ערוץ צבע נשמר ברזולוציה של חצי לרוחב וחצי לגובה, כך שבלוק של 2×2 פיקסלים חולק צבע אחד<sup><a href="#r20">20</a></sup>:</p>
+<div class="eq">bits per pixel (8-bit):  4:4:4 = 8 + 8 + 8 = 24     4:2:2 = 8 + 2·8/2 = 16     4:2:0 = 8 + 2·8/4 = 12
+chroma samples kept:     4:4:4 = 100 %              4:2:2 = 50 %               4:2:0 = 25 %</div>
+<blockquote>Artifacts from chroma subsampling are at their most noticeable with text atop a flat color.<cite>RTINGS [21]</cite></blockquote>
+<blockquote>Colorful computer text and line graphics can become blurry during reduced color resolution during 4:2:2 or 4:2:0 chroma resolution.<cite>TestUFO [22]</cite></blockquote>
+<blockquote>chroma subsampling will introduce visually disturbing artifacts, such as in images containing text.<cite>US patent 9153017 [24]</cite></blockquote>
+<p>טקסט ב-Windows מצויר עם ClearType, שמשתמש בכל ערוץ צבע בנפרד לשולי האותיות<sup><a href="#r30">30</a>,<a href="#r31">31</a></sup>. ‏4:2:0 מוחק בדיוק את המידע הזה. מקורות נוספים מתעדים את אותה תופעה בהקלטות: ב-H.264 גם "lossless" עובר ל-4:2:0<sup><a href="#r25">25</a></sup>, טקסט מיטשטש ב-yuv420p<sup><a href="#r26">26</a></sup>, ובפורום OBS<sup><a href="#r27">27</a></sup>, אצל RED<sup><a href="#r23">23</a></sup> וב-VideoHelp<sup><a href="#r32">32</a></sup>.</p>
+
+<h3>2.4 קידוד וידיאו היברידי (H.264 ו-HEVC)</h3>
+<p>H.264 ו-HEVC הם מקודדים "היברידיים": חיזוי (בתוך הפריים ובין פריימים), התמרה, כימוי (quantization) וקידוד אנטרופיה<sup><a href="#r1">1</a>,<a href="#r2">2</a></sup>. ‏HEVC כוון לחיסכון של כ-50% בקצב הנתונים לעומת H.264 באותה איכות נתפסת<sup><a href="#r2">2</a></sup>. האובדן נוצר בכימוי, ובקרת הקצב קובעת את ה-QP: ‏CQP קבוע, CRF באיכות קבועה, או קצב סיביות<sup><a href="#r58">58</a>,<a href="#r59">59</a></sup>.</p>
+<blockquote>A constant QP encode at QP=18 will stay at QP=18 regardless of the frame. Constant Rate Factor at CRF=18 will increase the QP to, say, 20, for high motion frames ... and lower it down to 16 for low motion parts.<cite>slhck, CRF guide [59]</cite></blockquote>
+<p>ב-Windows, מקודד ה-H.264 של Media Foundation תומך רק בפרופילים Baseline,‏ Main ו-High<sup><a href="#r60">60</a></sup>, ומקודד ה-HEVC רק ב-Main<sup><a href="#r61">61</a></sup>. אין בהם 4:4:4 ואין מצב ללא אובדן.</p>
+
+<h3>2.5 כלים לתוכן מסך</h3>
+<p>HEVC SCC הוסיף כלים לתוכן מסך: העתקת בלוק בתוך אותה תמונה (IBC), פלטת צבעים, המרת צבע מסתגלת ורזולוציית תנועה מסתגלת<sup><a href="#r69">69</a></sup>. בבדיקת האימות הרשמית:</p>
+<blockquote>For TGM video, the estimated savings were 60–90% relative to the JM and 40–80% relative to the HM.<cite>Verification testing of HEVC SCC, Microsoft Research [68] (מתוך תקציר)</cite></blockquote>
+<p>ל-AV1 יש כלים מקבילים: IBC, פלטה ומצב ללא אובדן<sup><a href="#r70">70</a>,<a href="#r71">71</a>,<a href="#r74">74</a></sup>, והם קיימים גם ב-SVT-AV1<sup><a href="#r72">72</a></sup>. לפי תיקון ב-FFmpeg, גם מקודד ה-AV1 של Intel בחומרה מציע אותם:</p>
+<blockquote>Screen Content Tool provides Intra Block Copy and Palette Mode when encoding.<cite>FFmpeg-devel, QSV AV1 [73]</cite></blockquote>
+
+<h3>2.6 דחיסה ללא אובדן</h3>
+<p>Zstandard מתועד ב-RFC 8878<sup><a href="#r6">6</a></sup>. רמות הדחיסה נעות מ-‎−131072 (הכי מהיר) עד 22, ורמות שליליות מוותרות על יחס דחיסה לטובת מהירות<sup><a href="#r7">7</a>,<a href="#r8">8</a>,<a href="#r9">9</a></sup>. בבנצ'מרק Silesia, ‏zstd 1.5.7 ברמה ‎−3 דחס פי 2.24 במהירות של כ-635MB לשנייה<sup><a href="#r8">8</a></sup>.</p>
+<p>במסך, רוב הפריים לא משתנה. קודק שדוחס כל פריים לבד מפספס את זה:</p>
+<blockquote>In screen captures where &gt; 95% of the frame stays exactly the same, this approach doesn't work well indeed.<cite>FFmpeg-devel 2022 [84]</cite></blockquote>
+<p>לכן קודקים שנבנו להקלטת מסך (TSCC, ‏ZMBV) עדיפים על קודקים כלליים<sup><a href="#r82">82</a></sup>. ‏FFV1 מיועד גם להקלטת מסך<sup><a href="#r83">83</a></sup>, ויש השוואות מקיפות של קודקים ללא אובדן<sup><a href="#r89">89</a></sup>. בתמונות סטטיות, WebP ללא אובדן הקטין צילום מסך יותר מ-JPEG XL ומ-PNG בבדיקה אחת<sup><a href="#r86">86</a></sup>. ‏JPEG XL חזק יותר בצילומים<sup><a href="#r85">85</a>,<a href="#r87">87</a>,<a href="#r88">88</a></sup>.</p>
+
+<h3>2.7 מדדי איכות</h3>
+<p>PSNR מודד שגיאה ממוצעת. ‏SSIM מודד שימור מבנה<sup><a href="#r3">3</a></sup>. ‏VMAF משלב כמה מדדים ומכויל לעיוותי דחיסה והגדלה<sup><a href="#r4">4</a>,<a href="#r5">5</a></sup>. אף אחד מהם לא עונה על השאלה "האם הטקסט נשאר נכון". לכן השתמשנו במדד מבוסס OCR, שהוא המשלים של שיעור שגיאת התווים (CER)<sup><a href="#r79">79</a>,<a href="#r80">80</a></sup>:</p>
+<div class="eq">CER = edit_distance(reference, ocr) / |reference|          R = 1 − CER</div>
+<p>בסולם המקובל לטקסט מודפס, CER של 1–2% נחשב "טוב"<sup><a href="#r81">81</a></sup>. כלומר <span dir="ltr">R = 0.98–0.99</span> נחשב טוב לסריקת מסמכים. אצלנו הדרישה מחמירה יותר: <span dir="ltr">R = 1</span>.</p>
+<p>הספרות מראה שדחיסה פוגעת בזיהוי טקסט: דחיסה חזקה יצרה עיוותים באזורי טקסט והורידה את דיוק ה-OCR<sup><a href="#r75">75</a></sup>. זיהוי לוחיות רישוי יורד עם האיכות לפי עקומה לוגיסטית<sup><a href="#r77">77</a></sup>. ופטנט מתאר:</p>
+<blockquote>during compression, lack of clarity in the text areas is noticeable making the text difficult to discern and in some cases render it unreadable.<cite>US patent 8064516 [76]</cite></blockquote>
+<p>ראו גם<sup><a href="#r78">78</a></sup>.</p>
+
+<h2>3. שיטת המחקר</h2>
+<h3>3.1 הקורפוס</h3>
+<p>24 סצנות: הקלדה, ממשק משתמש, גלילה, הבהובים, מסך סטטי ווידיאו, כל אחת ב-506×333,‏ 640×360,‏ 1280×720 ו-1920×1080. כל סצנה היא 20 שניות ב-400 רגעים של 50 מילישניות. הסצנות צוירו ב-Chrome בלי חלון, עם זמן וירטואלי, כך שכל הרצה נותנת את אותם פיקסלים. הקורפוס שמור כפריימי zstd ברמה ‎−3. המקודד מקבל את הסצנות הקטנות מוגדלות ב-σ, בשכפול פיקסלים:</p>
+<div class="eq">σ(1920×1080) = σ(1280×720) = 1      σ(640×360) = 2 → 1280×720      σ(506×333) = 3 → 1518×1000</div>
+
+<h3>3.2 הדרכים והמשוואות</h3>
+<p><b>דרך D:</b> מקליט חי כותב פריימים, ותהליך נפרד מקודד אותם ל-H.264. נבדקו ארבעה מקודדים: DW1 ‏Intel Quick Sync,‏ DW2 תוכנה של Microsoft,‏ DW3 ‏NVIDIA ו-DW4 ‏MS AVC DX12. הגדרות: q מ-30 עד 100, ‏τ_f (מרווח פריימי מפתח), רמז תוכן, וקצב סיביות β. כל הגדרה רצה 3 פעמים, 2,808 ריצות בסך הכול.</p>
+<p><b>דרך Z:</b> ‏zstd ללא אובדן ב-54 דרכים ממופות: פריים שלם, XOR, אריחים, מלבנים, prefix, זרם, מילון, מספר תהליכונים ופריסות.</p>
+<div class="eq">bytes      B     = Σ frame files + frames.jsonl + clip.json
+quality    Z:    Σ|decoded − source| = 0  ⇒  SSIM = 1, PSNR = ∞, R = 1
+CPU        C     = N_new · (c_0 + px · κ_c)                      (cycle counter, all threads)
+RAM        M     = M_0 + M_cctx(L, W) + B_c · px · 3             (OS peak private bytes − M_0)
+ready      t_ready = t_close ≤ 50 ms</div>
+<p>כללי המדידה: הקלט תמיד BGRA וההמרה נמדדת. ‏CPU נמדד ממונה המחזורים, ו-RAM מהשיא שמערכת ההפעלה מדווחת. הבתים הם כל הקבצים שנשמרים. ‏R נמדד באזורי הטקסט של כל סצנה, על 10 פריימים, עם Windows OCR. כל ריצה נקשרת לרשימת הריצות שלה ב-hash.</p>
+
+<h2>4. תוצאות</h2>
+<h3>4.1 דרך D (H.264)</h3>
+<p>מתוך 2,808 ריצות: 1,428 תקינות, 228 עם כשל במיפוי פריימים (כולן Quick Sync על תוכן עם פערים), 576 שלא רצו כי מקודד NVIDIA לא נדלק (0x8000FFFF), ו-576 שלא רצו כי ל-DX12 אין נתיב מוצר. בשני המקודדים נוסף פריים מפתח עודף. הבדיקות: 17 עברו, 2 נכשלו על החריגות המוכרות האלה.</p>
+<div class="tbl"><table>
+<caption>טבלה 1. כל 24 הסצנות, ב-MiB לדקה. zstd = פריים שלם ברמה ‎−3; תמיד R = 1. ‏R של H.264 בסוגריים.</caption>
+<tr><th>תוכן</th><th>רזולוציה</th><th>zstd</th><th>H.264 הכי קטן (R)</th><th>H.264 הכי גדול (R)</th><th>H.264 ב-R הכי טוב (גודל)</th></tr>
+<tr><td>הקלדה</td><td>506×333</td><td class="num">1.63</td><td class="num">0.45 (0.9730)</td><td class="num">1.32 (0.9959)</td><td class="num">0.9959 (1.07)</td></tr>
+<tr><td>הקלדה</td><td>640×360</td><td class="num">1.67</td><td class="num">0.30 (0.9897)</td><td class="num">0.65 (0.9721)</td><td class="num">0.9984 (0.52)</td></tr>
+<tr><td>הקלדה</td><td>1280×720</td><td class="num">1.82</td><td class="num">0.17 (0.9343)</td><td class="num">0.34 (0.9564)</td><td class="num">0.9918 (0.26)</td></tr>
+<tr><td>הקלדה</td><td>1920×1080</td><td class="num">2.02</td><td class="num">0.25 (0.9343)</td><td class="num">0.42 (0.9564)</td><td class="num">0.9918 (0.34)</td></tr>
+<tr><td>ממשק</td><td>506×333</td><td class="num">24.97</td><td class="num">4.32 (0.9806)</td><td class="num">16.89 (0.9866)</td><td class="num">0.9888 (14.05)</td></tr>
+<tr><td>ממשק</td><td>640×360</td><td class="num">28.53</td><td class="num">2.07 (0.9830)</td><td class="num">24.30 (0.9940)</td><td class="num">0.9958 (7.31)</td></tr>
+<tr><td>ממשק</td><td>1280×720</td><td class="num">36.63</td><td class="num">1.38 (0.9531)</td><td class="num">24.30 (0.9974)</td><td class="num">0.9974 (6.81)</td></tr>
+<tr><td>ממשק</td><td>1920×1080</td><td class="num">38.21</td><td class="num">1.44 (0.9733)</td><td class="num">53.97 (0.9996)</td><td class="num">0.9996 (13.92)</td></tr>
+<tr><td>גלילה</td><td>506×333</td><td class="num">24.07</td><td class="num">10.34 (0.9878)</td><td class="num">97.91 (0.9926)</td><td class="num">0.9929 (22.66)</td></tr>
+<tr><td>גלילה</td><td>640×360</td><td class="num">32.51</td><td class="num">6.88 (0.9892)</td><td class="num">29.17 (0.9959)</td><td class="num">0.9959 (29.17)</td></tr>
+<tr><td>גלילה</td><td>1280×720</td><td class="num">92.23</td><td class="num">6.82 (0.9947)</td><td class="num">50.80 (0.9972)</td><td class="num">0.9978 (12.10)</td></tr>
+<tr><td>גלילה</td><td>1920×1080</td><td class="num">142.13</td><td class="num">9.92 (0.9957)</td><td class="num">76.26 (0.9965)</td><td class="num">0.9976 (17.92)</td></tr>
+<tr><td>הבהובים</td><td>506×333</td><td class="num">4.94</td><td class="num">1.33</td><td class="num">39.66</td><td>n/a</td></tr>
+<tr><td>הבהובים</td><td>640×360</td><td class="num">4.98</td><td class="num">0.82</td><td class="num">24.30</td><td>n/a</td></tr>
+<tr><td>הבהובים</td><td>1280×720</td><td class="num">14.08</td><td class="num">0.92</td><td class="num">24.30</td><td>n/a</td></tr>
+<tr><td>הבהובים</td><td>1920×1080</td><td class="num">14.80</td><td class="num">0.97</td><td class="num">53.97</td><td>n/a</td></tr>
+<tr><td>מסך סטטי</td><td>506×333</td><td class="num">0.03</td><td class="num">0.08</td><td class="num">0.30</td><td>n/a</td></tr>
+<tr><td>מסך סטטי</td><td>640×360</td><td class="num">0.04</td><td class="num">0.06</td><td class="num">0.20</td><td>n/a</td></tr>
+<tr><td>מסך סטטי</td><td>1280×720</td><td class="num">0.04</td><td class="num">0.03</td><td class="num">0.09</td><td>n/a</td></tr>
+<tr><td>מסך סטטי</td><td>1920×1080</td><td class="num">0.05</td><td class="num">0.03</td><td class="num">0.10</td><td>n/a</td></tr>
+<tr><td>וידיאו</td><td>506×333</td><td class="num">570.67</td><td class="num">3.93</td><td class="num">391.37</td><td>n/a</td></tr>
+<tr><td>וידיאו</td><td>640×360</td><td class="num">770.68</td><td class="num">1.95</td><td class="num">232.76</td><td>n/a</td></tr>
+<tr><td>וידיאו</td><td>1280×720</td><td class="num">3,004.82</td><td class="num">1.34</td><td class="num">364.88</td><td>n/a</td></tr>
+<tr><td>וידיאו</td><td>1920×1080</td><td class="num">6,667.54</td><td class="num">2.63</td><td class="num">819.58</td><td>n/a</td></tr>
+</table></div>
+<p class="note">R נמדד רק בסצנות עם טקסט. סצנה = 20 שניות, כפול 3 לדקה. הבתים של H.264 הם קובץ ה-MP4.</p>
+
+<h3>4.2 דרך Z (zstd)</h3>
+<p>כל שורת Z שרצה עברה את בדיקת הסיבוב: <span dir="ltr">Σ|decoded − source| = 0</span>, ‏6,105 מתוך 6,105. הקליפ מוכן תוך 50 מילישניות לכל היותר בכל השורות. ‏RAM של דחיסה בתהליכון אחד תאם את המשוואה בטווח ±10% בכל השורות. 90 ריצות של דחיסה עם מילון נכשלו בסצנה הסטטית, כצפוי: למילון צריך לפחות 7 פריימים.</p>
+<p>הריצה נעצרה אחרי 6,195 מתוך 48,330 שורות, ולכן היא מכסה רק את 506×333:</p>
+<div class="tbl"><table>
+<caption>טבלה 2. פורמט ה-zstd הקטן ביותר שנמצא, ב-506×333 (MiB לדקה)</caption>
+<tr><th>תוכן</th><th>פריים שלם (קורפוס)</th><th>הכי קטן שנמצא</th><th>דרך</th><th>CPU / RAM</th></tr>
+<tr><td>הקלדה</td><td class="num">1.63</td><td class="num">0.22</td><td>ZW12 prefix L3</td><td class="num">0.27 s / 2.8 MB</td></tr>
+<tr><td>ממשק</td><td class="num">24.97</td><td class="num">5.39</td><td>ZW12 prefix L3</td><td class="num">0.80 s / 2.8 MB</td></tr>
+<tr><td>גלילה</td><td class="num">24.07</td><td class="num">2.02</td><td>ZW12 prefix L3</td><td class="num">0.78 s / 2.8 MB</td></tr>
+<tr><td>הבהובים</td><td class="num">4.94</td><td class="num">1.54</td><td>ZW13 stream L4</td><td class="num">0.49 s / 132 MB</td></tr>
+<tr><td>מסך סטטי</td><td class="num">0.03</td><td class="num">0.13</td><td>ZW13 stream L1</td><td class="num">0.02 s / 130 MB</td></tr>
+<tr><td>וידיאו</td><td class="num">570.67</td><td class="num">350.90</td><td>ZW6 L3</td><td class="num">3.66 s / 2.3 MB</td></tr>
+</table></div>
+<p class="note">CPU הוא לכל הסצנה (20 שניות). ‏RAM הוא מעל M_0. בסצנה הסטטית "הכי קטן שנמצא" גדול מהקורפוס, כנראה כי הוא כולל גם את frames.jsonl ואת clip.json. זה לא נבדק.</p>
+
+<h3>4.3 משאבים</h3>
+<p>בבדיקת התחזית של דרך D, ה-worker של המקודד בתוכנה (DW2) על הקלדה ב-1920×1080 צרך כ-700MB של RAM מעל הבסיס, ו-2.2 שניות CPU לכל 20 שניות. דחיסת zstd בפריים שלם צורכת לפי המשוואה <span dir="ltr">M_cctx + px·3</span>, כלומר כ-6.2MB של מאגר פריים ב-1080p, ועוד הקשר הדחיסה.</p>
+
+<h3>4.4 תצפיות</h3>
+<ul>
+<li><b>ת1:</b> גם באיכות המקסימלית (q100) ‏R נשאר מתחת ל-1: הקלדה ב-1920×1080 0.9564, גלילה ב-1920×1080 0.9965. כלומר יש אובדן שהגברת האיכות לא מבטלת.</li>
+<li><b>ת2:</b> ב-σ = 2 (‏640×360, כל פיקסל שוכפל ל-2×2) ‏R בהקלדה היה 0.9984, לעומת 0.9918 ב-σ = 1.</li>
+<li><b>ת3:</b> ‏R לא עולה בצורה עקבית עם q. בהקלדה ב-640×360: ב-q80 0.9984, וב-q100 0.9721.</li>
+<li><b>ת4:</b> בהקלדה, 1280×720 ו-1920×1080 קיבלו בדיוק אותם ערכי R. לא נבדק למה.</li>
+</ul>
+
+<h2>5. דיון</h2>
+<h3>5.1 הסיבה לאובדן הטקסט: שלוש השערות</h3>
+<ul>
+<li><b>ה1, תת-דגימת צבע 4:2:0 (העיקרית):</b> הספרות תומכת<sup><a href="#r21">21</a>–<a href="#r29">29</a></sup>, ות1 תואמת אותה, כי אובדן שלא תלוי ב-q מתאים לשלב שלפני הקידוד. ת2 תואמת גם היא: כש-σ זוגי, בלוק הצבע של 2×2 נופל בדיוק על פיקסל מקור אחד, והדגימה לא מאבדת צבע. זה בתנאי שהמפענח לא מערבב שכנים בהגדלה, וזה לא נבדק.</li>
+<li><b>ה2, עיגול YCbCr ב-8 ביט:</b> קיים, אבל עד 2 יחידות בלבד<sup><a href="#r17">17</a></sup>. לא סביר שהוא מחליף אותיות.</li>
+<li><b>ה3, כימוי:</b> אחראי לחלק מהאובדן ב-q נמוך. בהקלדה ב-1080p ‏R עולה מ-0.9343 ב-q30 ל-0.9918 ב-q70. את התקרה הוא לא מסביר.</li>
+</ul>
+<p>כדי לאשר את ה1 נדרש ניסוי: ממירים את המקור ל-NV12 וחזרה, בלי קידוד, ומודדים R.</p>
+<div class="eq">E1:  R_420 = R(source → NV12 → BGR)      if R_420 &lt; 1 → H1 confirmed;   if R_420 = 1 → the loss is in quantization (H3)</div>
+
+<h3>5.2 איך התעשייה פותרת את זה</h3>
+<p>כל המערכות המקצועיות לשיתוף מסך מציעות מצב מיוחד לטקסט:</p>
+<blockquote>If users are experiencing poor text or image clarity in certain applications with H.264 alone, Blast Extreme can be configured to use High Color Accuracy (HCA). HCA turns off 4:2:0 chroma subsampling, providing a 4:4:4 sample rate instead.<cite>VMware Blast Extreme Optimization Guide [42]</cite></blockquote>
+<blockquote>standard H.264 4:2:0 is not pixel perfect (lossless)<cite>Citrix Thinwire [39]</cite></blockquote>
+<ul>
+<li><b>Microsoft AVC444:</b> שני זרמי H.264 בפורמט 4:2:0, אחד לבהירות ואחד לצבע, מאותו מקודד ואותו מפענח. יחד הם נותנים 4:4:4 על חומרה של 4:2:0<sup><a href="#r29">29</a>,<a href="#r33">33</a>,<a href="#r34">34</a>,<a href="#r38">38</a></sup>. המצב הזה מופעל ב-Azure ‏VD וב-Windows 365<sup><a href="#r35">35</a>–<a href="#r37">37</a></sup>.</li>
+<li><b>Citrix:</b> "Build to lossless" מחדד לתמונה ללא אובדן כשהמסך נרגע. ‏YUV444 מייצר פי 1.5–2 מידע<sup><a href="#r39">39</a>,<a href="#r40">40</a></sup>. בבדיקה אחת: 195MB לעומת 655MB ל-H.264 YUV444<sup><a href="#r41">41</a></sup>.</li>
+<li><b>VMware, ‏Parsec, ‏Splashtop ו-Sunshine</b> מציעים 4:4:4<sup><a href="#r42">42</a>–<a href="#r48">48</a></sup>.</li>
+<li><b>Teradici PCoIP</b> בוחר קודק לפי סוג התוכן ושולח טקסט ללא אובדן<sup><a href="#r49">49</a>–<a href="#r51">51</a></sup>.</li>
+<li><b>RDP 8.1</b> שלח טקסט בקודק ייעודי ותמונות ב-H.264<sup><a href="#r29">29</a></sup>.</li>
+</ul>
+<p>גם 4:4:4 לא זהה ביטים. רק קידוד RGB ללא אובדן הוא כזה:</p>
+<blockquote>the conversion from RGB to YUV 4:4:4 is not truly lossless (you can't get back bitwise identical images), but it is way much better than using 4:2:0.<cite>OBS guide [53]</cite></blockquote>
+<p>ראו גם<sup><a href="#r52">52</a>,<a href="#r54">54</a>–<a href="#r57">57</a></sup>.</p>
+
+<h3>5.3 מה זמין במחשב הזה</h3>
+<p>Media Foundation לא מציע 4:4:4<sup><a href="#r60">60</a>,<a href="#r61">61</a></sup>. ‏Quick Sync עבד ב-OBS רק ב-NV12 במשך כ-8 שנים<sup><a href="#r64">64</a></sup>. ‏HEVC ב-4:2:2 קיים רק מדור 10<sup><a href="#r62">62</a></sup>, והשאלה על 4:4:4 ב-H.264 נשארה בלי תשובה ברורה<sup><a href="#r63">63</a></sup>. ‏NVENC תומך ב-4:4:4<sup><a href="#r65">65</a>–<a href="#r67">67</a></sup>, אבל במחשב הזה מקודד NVIDIA לא נדלק.</p>
+
+<h3>5.4 החלופות למוצר</h3>
+<div class="tbl"><table>
+<caption>טבלה 3. חלופות, לפי הקריטריונים O ו-J</caption>
+<tr><th>חלופה</th><th>R</th><th>גודל</th><th>CPU / RAM</th><th>סיכון</th></tr>
+<tr><td>zstd פריים שלם (תוכנית 4.2)</td><td class="k">1</td><td>גדול (טבלה 1)</td><td>נמוך / כמה MB</td><td>וידיאו: 6.5GB לדקה ב-1080p</td></tr>
+<tr><td>zstd שכותב רק מה שהשתנה (prefix, XOR, מלבנים)</td><td class="k">1</td><td>פי 7–12 קטן מפריים שלם (506×333)</td><td>נמוך / 2.8MB</td><td>נמדד רק ב-506×333</td></tr>
+<tr><td>zstd לטקסט, H.264 לווידיאו (לפי תוכן)</td><td class="k">1 בטקסט</td><td>קטן גם בווידיאו</td><td>H.264 ב-worker צרך כ-700MB</td><td>זיהוי תוכן; שני נתיבים</td></tr>
+<tr><td>AVC444 על Quick Sync</td><td class="x">לא ידוע</td><td>פי 1.5–2 מ-4:2:0</td><td>פי 2 זמן קידוד</td><td>מימוש עצמאי; כנראה לא R = 1</td></tr>
+<tr><td>AV1 עם כלי תוכן מסך (Intel QSV)</td><td class="x">לא ידוע</td><td>חיסכון גדול בטקסט</td><td>חומרה, אם קיימת</td><td>לא ידוע אם המעבד כאן תומך</td></tr>
+<tr><td>H.264 ‏RGB ללא אובדן (x264 בתוכנה)</td><td class="k">1</td><td>בינוני</td><td>CPU גבוה</td><td>תלות חדשה ורישוי GPL</td></tr>
+</table></div>
+
+<h2>6. מגבלות</h2>
+<ul>
+<li>ריצת Z חלקית: רק 506×333.</li>
+<li>ה-OCR הוא Windows OCR. מנוע אחר ייתן ערכי R אחרים, אבל השוואה על אותו מנוע הוגנת.</li>
+<li>הקורפוס סינתטי, ממחשב אחד וכרטיס מסך אחד.</li>
+<li>הציטוטים כאן נלקחו מקטעים שהחיפוש החזיר. לפני פרסום חיצוני צריך לאמת כל ציטוט מול המקור המלא.</li>
+<li>חלק מהמקורות הם פורומים או חומר שיווקי, ומשקלם נמוך יותר. מסומנים בתיאור.</li>
+</ul>
+
+<h2>7. מסקנות והמלצות</h2>
+<ol>
+<li>H.264 עם Media Foundation במחשב הזה לא עומד בדרישה <span dir="ltr">R = 1</span> בשום הגדרה (2,808 ריצות).</li>
+<li>zstd עומד בה תמיד. לטקסט ולממשק הוא הבחירה הנכונה.</li>
+<li>כדי להקטין גודל: להשלים את ריצת Z, ולבחור את פורמט ה-zstd החסכוני ביותר לכל רזולוציה.</li>
+<li>תוכן וידיאו על המסך דורש קידוד מאבד מידע, אחרת הגודל לא סביר. זו החלטה למוצר: לפי תוכן, או מגבלה מתועדת.</li>
+<li>ניסויים הבאים:
+  <ul>
+    <li><b>E1:</b> ‏NV12 הלוך וחזור, לאימות ה1.</li>
+    <li><b>E2:</b> השלמת ריצת Z.</li>
+    <li><b>E3:</b> מלבנים מלוכלכים מ-Desktop Duplication כדי לחסוך CPU<sup><a href="#r10">10</a>–<a href="#r14">14</a></sup>.</li>
+    <li><b>E4:</b> בדיקה אם ה-GPU כאן תומך ב-AV1 עם כלי תוכן מסך<sup><a href="#r73">73</a></sup>.</li>
+  </ul>
+</li>
+</ol>
+
+<h2>מקורות</h2>
+<ol class="refs">
+<li id="r1">Wiegand, Sullivan, Bjøntegaard, Luthra (2003). Overview of the H.264/AVC video coding standard. IEEE TCSVT 13(7):560–576. <a href="https://iphome.hhi.de/wiegand/assets/pdfs/csvt_overview_0305.pdf">pdf</a></li>
+<li id="r2">Sullivan, Ohm, Han, Wiegand (2012). Overview of the HEVC standard. IEEE TCSVT 22(12):1649–1668. <a href="https://www.microsoft.com/en-us/research/?p=798934">link</a></li>
+<li id="r3">Wang, Bovik, Sheikh, Simoncelli (2004). Image quality assessment: from error visibility to structural similarity. IEEE TIP 13(4):600–612. <a href="https://ece.uwaterloo.ca/~z70wang/publications/ssim.html">link</a></li>
+<li id="r4">Netflix. VMAF. <a href="https://github.com/Netflix/vmaf">github.com/Netflix/vmaf</a></li>
+<li id="r5">Bampis et al. SpatioTemporal feature integration and model fusion for FR-VQA. <a href="https://arxiv.org/pdf/1804.04813">arXiv:1804.04813</a></li>
+<li id="r6">Collet, Kucherawy (2021). RFC 8878: Zstandard compression and application/zstd. <a href="https://rfc-editor.org/rfc/rfc8878.html">link</a></li>
+<li id="r7">Zstandard project. <a href="https://facebook.github.io/zstd">facebook.github.io/zstd</a></li>
+<li id="r8">zstd docs: compression levels. <a href="https://www.mintlify.com/facebook/zstd/concepts/compression-levels">link</a></li>
+<li id="r9">LKML: btrfs zstd negative compression levels (2025). <a href="https://lkml.indiana.edu/hypermail/linux/kernel/2501.3/06350.html">link</a></li>
+<li id="r10">Microsoft Learn. Desktop Duplication API. <a href="https://learn.microsoft.com/en-ie/Windows/Win32/direct3ddxgi/desktop-dup-api">link</a></li>
+<li id="r11">Microsoft Learn. IDXGIOutputDuplication::GetFrameDirtyRects. <a href="https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-getframedirtyrects">link</a></li>
+<li id="r12">Microsoft Learn. IDXGIOutputDuplication::GetFrameMoveRects. <a href="https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-getframemoverects">link</a></li>
+<li id="r13">Microsoft Learn. DXGI_OUTDUPL_FRAME_INFO. <a href="https://learn.microsoft.com/windows/win32/api/dxgi1_2/ns-dxgi1_2-dxgi_outdupl_frame_info">link</a></li>
+<li id="r14">FreeRDP. server/Windows/wf_dxgi.c. <a href="https://git.stg.centos.org/source-git/freerdp/blob/5a9772fdc85fecb7337184707f474e5788ebd87e/f/server/Windows/wf_dxgi.c">link</a></li>
+<li id="r15">Malvar, Sullivan. YCoCg-R: a color space with RGB reversibility (JVT-I014r3). <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/06/Malvar_Sullivan_YCoCg-R_JVT-I014r3-2.pdf">pdf</a></li>
+<li id="r16">Microsoft Research. Lifting-based reversible color transformations for image compression. <a href="https://www.microsoft.com/en-us/research/?p=158074">link</a></li>
+<li id="r17">VideoHelp forum: RGB↔YUV round trip at 8 bit. <a href="https://forum.videohelp.com/showthread.php?p=2476477">link</a></li>
+<li id="r18">Gist: BT.709/BT.601 round-trip simulation. <a href="https://gist.github.com/linrock/5be4f365c9c9e61eee9e8984ba13cb25">link</a></li>
+<li id="r19">JVT-J020 (2003). <a href="https://www.itu.int/wftp3/av-arch/jvt-site/2003_12_Waikoloa/JVT-J020r1.DOC">link</a></li>
+<li id="r20">Linux kernel docs. YUV formats. <a href="https://docs.kernel.org/userspace-api/media/v4l/yuv-formats.html">link</a></li>
+<li id="r21">RTINGS. Chroma subsampling. <a href="https://www.rtings.com/tv/learn/chroma-subsampling">link</a></li>
+<li id="r22">TestUFO. Chroma subsampling test. <a href="https://testufo.com/chroma">link</a></li>
+<li id="r23">RED. Video chroma subsampling. <a href="https://www.red.com/red-101/video-chroma-subsampling">link</a></li>
+<li id="r24">US patent 9153017. System and method for optimized chroma subsampling. <a href="https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/9153017">link</a></li>
+<li id="r25">Blender #61569. Lossless H.264 not lossless because of 4:2:0. <a href="https://projects.blender.org/blender/blender/issues/61569">link</a></li>
+<li id="r26">FFmpeg-user (2018). Text blurry after rgb→yuv420p. <a href="https://ffmpeg.org/pipermail/ffmpeg-user/2018-June/040281.html">link</a></li>
+<li id="r27">OBS forum. Color quality loss due to chroma subsampling. <a href="https://obsproject.com/forum/threads/color-quality-loss-due-to-chroma-subsampling.123738/">link</a></li>
+<li id="r28">Citrix. Thinwire color space. <a href="https://docs.citrix.com/en-us/citrix-virtual-apps-desktops/graphics/thinwire/colorspace">link</a></li>
+<li id="r29">Microsoft (2016). RDP 10 AVC/H.264 improvements. <a href="https://techcommunity.microsoft.com/t5/microsoft-security-and/remote-desktop-protocol-rdp-10-avc-h-264-improvements-in-windows/ba-p/249588">link</a></li>
+<li id="r30">Microsoft Research. Optimal filtering for patterned displays (ClearType). <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2000/07/optfilt.pdf">pdf</a></li>
+<li id="r31">Wikipedia. Subpixel rendering. <a href="https://www.Wikipedia.org/wiki/BGR_(subpixels)">link</a></li>
+<li id="r32">VideoHelp forum: chroma and text sharpness. <a href="https://forum.videohelp.com/showthread.php?p=2211745">link</a></li>
+<li id="r33">MS-RDPEGFX. RFX_AVC444V2_BITMAP_STREAM. <a href="https://msdn.microsoft.com/en-us/library/3b337b87-f478-4786-a63b-97794aa72075">link</a></li>
+<li id="r34">MS-RDPEGFX. YUV444 modes. <a href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/844018a5-d717-4bc9-bddb-8b4d6be5dd3f">link</a></li>
+<li id="r35">Azure Virtual Desktop. Graphics encoding. <a href="https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding">link</a></li>
+<li id="r36">Azure Virtual Desktop. Increase chroma to 4:4:4. <a href="https://learn.microsoft.com/bg-bg/azure/virtual-desktop/graphics-chroma-value-increase-4-4-4">link</a></li>
+<li id="r37">Windows 365. Chroma value. <a href="https://learn.microsoft.com/en-us/windows-365/enterprise/chroma-value-change-default">link</a></li>
+<li id="r38">msandbu. Windows Server 2016 and AVC 444 mode. <a href="https://msandbu.org/windows-server-2016-and-introducing-avc-444-mode/">link</a></li>
+<li id="r39">Citrix. Thinwire (2402 LTSR). <a href="https://docs.citrix.com/en-us/citrix-virtual-apps-desktops/2402-ltsr/graphics/thinwire.html">link</a></li>
+<li id="r40">Citrix. YUV444 support (Mac VDA). <a href="https://docs.citrix.com/en-us/mac-vda/configure/graphics/yuv444-support.html">link</a></li>
+<li id="r41">NVIDIA GTC 2019 S9884. Color accuracy in VDI. <a href="https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9884-user-experience-is-key-to-vdi-success-color-accuracy-is-key-to-user-experience.pdf">pdf</a></li>
+<li id="r42">VMware. Blast Extreme optimization guide. <a href="https://techzone.vmware.com/resource/vmware-blast-extreme-optimization-guide">link</a></li>
+<li id="r43">Omnissa. Blast Extreme optimization guide. <a href="https://techzone.omnissa.com/resource/omnissa-blast-extreme-optimization-guide">link</a></li>
+<li id="r44">VMware Horizon 2309. Blast policy settings. <a href="https://docs.vmware.com/en/VMware-Horizon/2309/horizon-remote-desktop-features/GUID-220442CF-EA01-470E-A381-1BED9BC0B81C.html">link</a></li>
+<li id="r45">Parsec. Improve stream quality and color accuracy. <a href="https://support.parsec.app/hc/en-us/articles/32381785123860-Improve-Stream-Quality-and-Color-Accuracy">link</a></li>
+<li id="r46">Parsec. Programmers and writers. <a href="https://support.parsec.app/hc/en-us/articles/32361397075604-Programmers-and-Writers">link</a></li>
+<li id="r47">Splashtop. Superior color accuracy and image clarity (vendor). <a href="https://splashtop.com/blog/superior-color-accuracy-and-image-clarity">link</a></li>
+<li id="r48">LizardByte (Sunshine) discussion #220: 4:4:4. <a href="https://github.com/orgs/LizardByte/discussions/220">link</a></li>
+<li id="r49">Teradici. The importance of lossless support (vendor). <a href="https://connect.teradici.com/blog/the-importance-of-lossless-support">link</a></li>
+<li id="r50">Teradici. What is PCoIP (vendor). <a href="https://teradici.com/what-is-pcoip">link</a></li>
+<li id="r51">VMware Horizon 2206. PCoIP build-to-lossless. <a href="https://docs.vmware.com/en/VMware-Horizon/2206/horizon-remote-desktop-features/GUID-FB9598F4-EBBD-4CFF-B24E-CF9D18E729CD.html">link</a></li>
+<li id="r52">FFmpeg wiki. Capture/Desktop. <a href="https://trac.ffmpeg.org/wiki/Capture/Desktop?version=22">link</a></li>
+<li id="r53">OBS. Almost lossless local recording. <a href="https://obsproject.com/forum/resources/almost-lossless-local-recoding-using-obs-studio.200/">link</a></li>
+<li id="r54">OBS forum. Best color settings for x264 qp=0. <a href="https://obsproject.com/forum/threads/best-color-settings-for-x264-qp-0-lossless-recording.49456/">link</a></li>
+<li id="r55">Libav-user (2012). Lossless encoding: red color sharpness. <a href="https://ffmpeg.org/pipermail/libav-user/2012-May/002104.html">link</a></li>
+<li id="r56">GitHub gist. gdigrab lossless recording. <a href="https://gist.github.com/JanTvrdik/8adfb7de7b5d9c2ca0aac43777adf3a1">link</a></li>
+<li id="r57">FFmpeg-user (2014). Best codec for screen recording. <a href="https://ffmpeg.org/pipermail/ffmpeg-user/2014-November/024217.html">link</a></li>
+<li id="r58">FFmpeg wiki. Encode/H.264. <a href="https://trac.ffmpeg.org/wiki/Encode/H.264?version=87">link</a></li>
+<li id="r59">Robitza (2017). CRF guide. <a href="https://slhck.info/video/2017/02/24/crf-guide.html">link</a></li>
+<li id="r60">Microsoft Learn. H.264 video encoder. <a href="https://learn.microsoft.com/en-ie/Windows/Win32/medfound/h-264-video-encoder">link</a></li>
+<li id="r61">Microsoft Learn. H.265/HEVC video encoder. <a href="https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-video-encoder">link</a></li>
+<li id="r62">Intel. HEVC chroma support. <a href="https://www.intel.com/content/www/us/en/support/articles/000057555/graphics.html">link</a></li>
+<li id="r63">Intel community. H.264 profiles supported by Quick Sync. <a href="https://community.intel.com/t5/Media-Intel-Video-Processing/h-264-profiles-supported-by-Quick-Sync/td-p/1029859">link</a></li>
+<li id="r64">OBS forum. QuickSync 4:4:4 chroma encoding not working. <a href="https://obsproject.com/forum/threads/quicksync-4-4-4-chroma-encoding-not-working.176685/post-651371">link</a></li>
+<li id="r65">NVIDIA. NVENC application note (SDK 12.2). <a href="https://docs.nvidia.com/video-technologies/video-codec-sdk/12.2/nvenc-application-note/index.html">link</a></li>
+<li id="r66">NVIDIA forum. YUV444 HEVC encoding in D3D12. <a href="https://forums.developer.nvidia.com/t/yuv44-hevc-encoding-in-d3d12/197834">link</a></li>
+<li id="r67">NVIDIA. Video Codec SDK 13.0 (Blackwell). <a href="https://developer.nvidia.com/blog/nvidia-video-codec-sdk-13-0-powered-by-nvidia-blackwell/">link</a></li>
+<li id="r68">Microsoft Research. Verification testing of the compression performance of HEVC SCC. <a href="https://www.microsoft.com/en-us/research/?p=798757">link</a></li>
+<li id="r69">Overview of HEVC extensions on screen content coding (APSIPA). <a href="https://www.cambridge.org/core/services/aop-cambridge-core/content/view/E12DCF69B0A59DD269EFE14CD1AFBFBE/S2048770315000116a.pdf/overview-of-hevc-extensions-on-screen-content-coding.pdf">pdf</a></li>
+<li id="r70">AOMedia. AV1 tool description v11. <a href="https://aomedia.org/docs/AV1_ToolDescription_v11-clean.pdf">pdf</a></li>
+<li id="r71">libaom. Algorithm description. <a href="https://aomedia.googlesource.com/aom/+show/HEAD/doc/AlgorithmDescription.md">link</a></li>
+<li id="r72">SVT-AV1. Version history. <a href="https://videohelp.com/software/SVT-AV1/version-history">link</a></li>
+<li id="r73">FFmpeg-devel (2024). libavcodec/qsvenc: Screen Content Tool for AV1. <a href="https://ffmpeg.org/pipermail/ffmpeg-devel/2024-September/333792.html">link</a></li>
+<li id="r74">ITU Journal ICT Discoveries 3(1), 2020. <a href="https://itu.int/en/publications/Documents/tsb/2020-ITU_Journal-ICT_Discoveries/Vol3-No1/files/basic-html/page99.html">link</a></li>
+<li id="r75">GDELT. At-scale OCR of TV news: frame quality levels. <a href="https://blog.gdeltproject.org/?p=22550">link</a></li>
+<li id="r76">US patent 8064516. Text recognition during video compression. <a href="https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/8064516">link</a></li>
+<li id="r77">Scitepress (2014). Quality assessment of compressed video for ALPR. <a href="https://www.scitepress.org/Papers/2014/46712/">link</a></li>
+<li id="r78">Forasoft. PaddleOCR text detection in video (vendor). <a href="https://www.forasoft.com/learn/ai-for-video-engineering/articles-ai/paddleocr-text-detection-video">link</a></li>
+<li id="r79">OCR-D. Quality assurance (CER definition). <a href="https://ocr-d.de/en/spec/ocrd_eval">link</a></li>
+<li id="r80">Towards Data Science. Evaluating OCR with CER and WER. <a href="https://towardsdatascience.com/evaluating-ocr-output-quality-with-character-error-rate-cer-and-word-error-rate-wer-853175297510">link</a></li>
+<li id="r81">OCR improves MT for low-resource languages (Holley scale). <a href="https://arxiv.org/pdf/2202.13274">arXiv:2202.13274</a></li>
+<li id="r82">Speed Demos Archive. Lossless codecs comparison. <a href="https://kb.speeddemosarchive.com/Lossless_Codecs_Comparison">link</a></li>
+<li id="r83">RFC 9043 (2021). FFV1 video coding format. <a href="https://www.rfc-editor.org/rfc/rfc9043">link</a></li>
+<li id="r84">FFmpeg-devel (2022). FFV1 on screen content. <a href="https://ffmpeg.org/pipermail/ffmpeg-devel/2022-June/297414.html">link</a></li>
+<li id="r85">Google Research. Benchmarking JPEG XL lossy/lossless image compression. <a href="https://research.google/pubs/benchmarking-jpeg-xl-lossylossless-image-compression/">link</a></li>
+<li id="r86">LogRocket. Image format comparison (screenshot test). <a href="https://blog.logrocket.com/?p=215712">link</a></li>
+<li id="r87">The JPEG XL image coding system. <a href="https://arxiv.org/pdf/2506.05987">arXiv:2506.05987</a></li>
+<li id="r88">Analysis and enhancement of lossless image compression in JPEG XL. <a href="https://arxiv.org/pdf/2404.19755">arXiv:2404.19755</a></li>
+<li id="r89">MSU (2007). Lossless video codecs comparison. <a href="https://www.compression.ru/video/codec_comparison/pdf/msu_lossless_codecs_comparison_2007_eng.pdf">pdf</a></li>
+</ol>
+<p class="note">מקורות פנימיים:</p>
+<ul class="note">
+<li><span dir="ltr">docs/clip-recorder-experiments-plan.md</span></li>
+<li><span dir="ltr">docs/clip-recorder-experiments-results.md</span></li>
+<li><span dir="ltr">scripts/clip-equation/results/d-runs.csv</span>, <span dir="ltr">z-runs.csv</span> (commit <span dir="ltr">2ff3db5a</span>)</li>
+<li><span dir="ltr">docs/clip-recorder-plan-4.2.md</span> (<span dir="ltr">a25eb968</span>)</li>
+<li>Gitea adam/synapse #290</li>
+</ul>
+
+</article></div>

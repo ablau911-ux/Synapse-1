@@ -2,6 +2,12 @@
 
 **Task (the only thing given):** record a clip of an application window on Windows so that an AI model can read back what happened. Goals: maximum quality, small files, low CPU, low RAM. No earlier design, numbers or decisions are used.
 
+> **STATUS OF THIS FILE (2026-11-23, owner's rule: all research must be proven from text).**
+> This log is working notes. Its findings were taken from search-result summaries; Claude had not opened the pages when it wrote them. They are NOT proven facts.
+> - Proven facts, each with a verbatim quote from a page Claude read, are in `proof.md`.
+> - `proof.md` also lists the claims that failed the check, one claim that came from memory and is withdrawn, and two corrections to this log (findings 18 and 36).
+> - Every "Meaning" line and the "What the evidence says" and "Candidate methods" sections below are Claude's reading, not proof.
+
 **Rules of this log:** every finding is written here with its source, as found. "Not found" results are logged too. A finding marked UNVERIFIED comes from a search summary or secondary source and was not checked against the primary page.
 
 Started 2026-11-23, by Claude, searching directly (no agents).
@@ -298,6 +304,32 @@ Started 2026-11-23, by Claude, searching directly (no agents).
 ### 44. Recording the program's execution (replay)
 - WinDbg Time Travel Debugging records a process so it can be replayed exactly. Trace files run from hundreds of megabytes to gigabytes, index files about twice the trace; recording has "large overhead" and needs an elevated debugger. Sources: https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/time-travel-debugging-overview , https://learn.microsoft.com/en-us/archive/blogs/windbg/time-travel-debugging-ttd-file-size , https://wiki.mozilla.org/Time_Travel_Debugging
 - **Meaning:** the most complete record possible, and the worst on size, CPU and RAM. Out for this task.
+
+## Batch 12 (searches 45–48): encoder start, other capture routes, seeking, conferencing screen codecs
+
+### 45. How long encoders take to start
+- No published start-up times found for NVIDIA or Intel hardware encoders, nor for waking a second graphics processor. NVIDIA's guide only gives the order of calls: create the graphics device, then open an encode session. Source: https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide
+- A forum user reports that an NVIDIA encode session that has encoded nothing still holds a lot of graphics memory. Source: https://forums.developer.nvidia.com/t/reducing-nvenc-memory-usage/165325
+- **Meaning:** start-up time is not documented anywhere found. It must be measured per candidate on the real PC. A method with no hardware encoder has no such start-up at all.
+
+### 46. Other ways to capture a window on Windows
+- `BitBlt` reads what is on screen: it cannot capture a covered or minimized window. Sources: https://learn.microsoft.com/en-us/answers/questions/801244/capturing-a-window , Stack Overflow answers mirrored there.
+- `PrintWindow` with the undocumented flag `PW_RENDERFULLCONTENT` (since Windows 8.1) captures covered and hardware-drawn windows. Sources: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-printwindow , forum reports. UNVERIFIED flag behaviour (undocumented).
+- Windows.Graphics.Capture is Microsoft's recommended route for new programs. Same Microsoft Q&A source.
+- Not found: usable capture through DWM thumbnails or the Magnification interface; speed comparisons.
+- **Meaning:** no better pixel source than the two modern interfaces turned up. `PrintWindow` is a pull-on-demand alternative for single stills.
+
+### 47. Reading one exact moment from a video
+- A frame in the middle of a group depends on earlier frames; reaching it means decoding from the previous key frame, so the cost grows with the key-frame distance. Sources: https://shop.zimaspace.com/blogs/tech-ai-hub/long-gop-video-slow-seeking-home-media-server , https://forum.videohelp.com/showthread.php?p=2509795
+- All-intra video gives constant seek time and much larger files; shorter key-frame distances seek faster and cost bitrate. Sources: https://josephnilo.com/blog/long-gop-vs-all-intra/ , https://bugs.webkit.org/show_bug.cgi?id=200949
+- Not found: figures for intra refresh.
+- **Meaning:** small files want long distances between key frames; fast exact read-back wants short ones. Exact stills taken when the screen settles would serve as cheap extra entry points for reading back. To design and measure.
+
+### 48. Screen sharing inside conferencing products
+- **Teams** moved screen sharing from H.264 to AV1 in 2024: about 63 % less bandwidth in its tests; still content needs under 200 kbit/s (1.5 MB per minute), scrolling about 1.2 Mbit/s (9 MB per minute). Sources: https://techcommunity.microsoft.com/blog/microsoftteamsblog/enhancing-screen-sharing-with-av1-in-microsoft-teams/4096056 , https://aomedia.org/av1-adoption-showcase/microsoft-story
+- **Zoom** (developer interface): a shared screen is sent as JPEG pictures and switches to H.264 when the frame rate passes about 5 frames per second. Source: https://devforum.zoom.us/t/zoom-rtms-consistently-receiving-jpegs-for-screenshare-unable-to-trigger-video-stream-h-264/136028
+- **Webex:** content sharing is H.264 only, 1080p at 3 frames per second needing 3 Mbit/s or more; falls to 1024 × 768 at 5 frames per second on weak links. Source: https://help.webex.com/en-us/gw8u4j/Known-Issues-and-Limitations-for-Webex-Video
+- **Meaning:** Microsoft's own product measured a 63 % saving from AV1's screen tools against H.264 on real screen sharing. Zoom is another two-part method: stills when little changes, video when a lot changes.
 
 ---
 

@@ -78,27 +78,194 @@ Source: https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encodin
 - "Mixed-mode : separates text, image and video encoding using different codecs to provide the best quality and lowest encoding cost for each type of detected content. Mixed-mode is only available with software encoding."
 - "By default, graphics data is separated depending on its content. Text, images, and videos are encoded using a mix of codecs to achieve optimal encoding performance across different content types when using software encoding only."
 
+### P12. Microsoft Recall: snapshots only while the screen differs
+Source: https://learn.microsoft.com/en-us/windows/client-management/manage-recall
+- "Snapshots are taken periodically while content on the screen is different from the previous snapshot."
+
+### P13. screenpipe: event-driven screenshots with accessibility data
+Source: https://docs.screenpi.pe/architecture
+- Page heading: "Screenpipe architecture: event-driven capture and storage".
+- "…it listens for meaningful OS events and captures only when something actually changes — pairing each screenshot with accessibility tree data for maximum quality at minimal cost."
+- "How Screenpipe uses event-driven capture, accessibility tree extraction, OCR fallback, and SQLite storage to build a searchable local memory of your screen."
+
+### P14. W3C content hints for screen content
+Source: https://www.w3.org/TR/mst-content-hint/
+- "Screencast content of presentations or webpages with a lot of text content is completely unintelligible if the quantization levels are too high or if the content is downscaled or otherwise blurry."
+- "\"detail\" The track should be treated as if video details are extra important."
+
+### P15. Playwright trace
+Source: https://playwright.dev/docs/trace-viewer
+- "Hover over each action of your test and visually see the change in the DOM snapshot."
+- "When tracing with the screenshots option turned on (default), each trace records a screencast and renders it as a film strip."
+
+### P16. Lossless WebP against PNG
+Source: https://developers.google.com/speed/webp/docs/webp_lossless_alpha_study
+- "WebP lossless compression is shown to be 23% better than ZopfliPNG and 42% better than libpng."
+
+### P17. QOI and lossless WebP on non-photographic images
+Source: https://cloudinary.com/blog/jpeg-xl-and-the-pareto-front
+- "Not shown on the chart is QOI, which clocked in at 154 Mpx/s to achieve 17 bpp, which may be \"quite OK\" but is quite far from Pareto-optimal…"
+- "For these images, lossless AVIF is not useful — it compresses worse than PNG, and reaches about the same density as QOI but is much slower. Lossless WebP on the other hand achieves very good compression for such images."
+
+### P18. Lossless x264 screen recording is feasible on an old CPU
+Source: https://obsproject.com/forum/resources/almost-lossless-local-recoding-using-obs-studio.200/
+- "My CPU is Intel i7-3770 @ 3.40GHz. It handles x264 lossless @ 48fps effortlessly."
+- The size figure in the log (62–70 MB per second) was not in the text read. Not proven.
+
+### P19. The H.264 encoder that ships with Windows: quality setting
+Source: https://learn.microsoft.com/en-us/windows/win32/medfound/h-264-video-encoder
+- "CODECAPI_AVEncCommonQuality Sets the quality level. This property applies when the rate control mode is quality-based VBR ( eAVEncCommonRateControlMode_Quality )."
+- "The default mode is unconstrained variable bit rate (VBR)."
+
+### P20. Codecs made for screens
+- TSCC, source https://wiki.multimedia.cx/index.php/TSCC : "TSCC combines run length encoding (RLE) with standard zlib compression. The algorithm can operate in 24-bit RGB, 16-bit RGB, and palettized 8-bit RGB modes."
+- ZMBV, source https://wiki.multimedia.cx/index.php/ZMBV : "This codec employs ZLIB compression and has intraframes and delta frames. Delta frames seem to have blocks either copied from the previous frame or XOR'ed with som…" (sentence cut by the reader).
+- Windows Media Video 9 Screen, source https://learn.microsoft.com/en-us/windows/win32/medfound/windowsmediavideo9screenencoder : "The Windows Media Video 9 Screen encoder is optimized for encoding sequentia…" (sentence cut by the reader).
+
+### P21. rrweb
+Source: https://raw.githubusercontent.com/rrweb-io/rrweb/HEAD/docs/observer.md
+- "After completing a full snapshot, we need to record events that change the state."
+- "Fortunately, modern browsers have provided us with a very powerful API which can do exactly this: [MutationObserver]…"
+
+### P22. OpenH264 screen content mode is slow
+Source: https://bugzilla.mozilla.org/show_bug.cgi?id=1942245
+- "Frames from screen capture are often large and with OpenH264 in screen content mode, encoding them takes several times longer than encoding non-screen content."
+
+### P23. YouTube at 1080p
+Source: https://streaminglearningcenter.com/codecs/which-codec-does-youtube-use-part-iii.html
+- "However, the savings over AVC really kicked in at 1080p which, at ~3.6 Mbps, are probably viewed by a significant chunk of viewers."
+- The 47 % figure in the log was not in the text read. Not proven.
+
+### P24. AV1 in Chrome and in Google Meet
+Source: https://developer.chrome.com/blog/av1
+- "The 3.6.0 release of libaom also includes improvements targeting screen sharing. Compared to VP9 speed 7, AV1 Speed 10 provides 45% better compression while running 35% faster."
+- "Google Meet has tested AV1 successfully in extremely low bandwidth conditions—down to 40 kbps…"
+
+Source: https://webrtchacks.com/the-hidden-av1-gift-in-google-meet/
+- Section heading on the page: "AV1 screen content coding is better". The 25 % figure in the log was not in the text read. Not proven.
+
+### P25. Parsec's settings for colour accuracy
+Source: https://support.parsec.app/hc/en-us/articles/32381785123860-Improve-Stream-Quality-and-Color-Accuracy
+- "Settings H.265 encoding/decoding 4:4:4 color Constant FPS".
+- "If you require greater color accuracy than enabling 4:4:4 color can provide, you can try enabling 10-bit color."
+
+### P26. Direct3D 12 video encoding in Windows 11
+Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/display/video-encoding-d3d12
+- "…the supported codecs are H.264 and HEVC, although the D3D12 video encoding framework provides open extensibility for newer codecs such as AV1."
+- "Support for AV1 Encode is added in Windows 11, version 24H2 (WDDM 3.2)."
+
+### P27. AV2
+Source: https://aomedia.org/press%20releases/Alliance-for-Open-Media-Releases-AV2-Codec/
+- "Wakefield, Mass. – June 9, 2026 - The Alliance for Open Media (AOMedia) today announced the release of the AV2 specification."
+- "Developed under AOMedia's royalty-free patent policy, AV2 is the next-generation video compression standard…"
+
+### P28. NVIDIA hardware AV1
+Source: https://blogs.nvidia.com/blog/av1-obs29-youtube (vendor's own claim)
+- "All GeForce RTX 40 Series GPUs — including laptop GPUs and the recently launched GeForce RTX 4070 — support real-time AV1 hardware encoding, providing 40% more efficient encoding on average…"
+
+### P29. Neural codec DCVC-RT
+Source: https://arxiv.org/html/2502.20762v2
+- "…it enables 1080p coding on consumer GPUs like the NVIDIA RTX 2080Ti with an average speed of 40 fps for encoding and 34 fps for decoding. On an NVIDIA A100 GPU, it reaches an impressive 125 fps for encoding…"
+
+### P30. VVC screen tools against HEVC
+Source: https://www.microsoft.com/en-us/research/publication/overview-of-the-screen-content-support-in-vvc-applications-coding-tools-and-performance/
+- "…enables the VVC reference software implementation (VTM) to achieve average bit-rate savings of about 41% to 61% relative to the HEVC test model (HM) reference software implementation using the Main 10 profile for 4:2:0 screen conte…" (cut by the reader)
+- "Compared to the HM using the Screen-Extended Main 10 profile and the same 4:2:0 test sequences, the VTM provides about 19% to 25% bit-rate savings. The same comparison with 4:4:4 test sequences revealed bit-rate savings of about 13% to 27% for Y'CBCR and of about 6% to 14% for R'G'B'…"
+
+### P31. Webex content sharing
+Source: https://help.webex.com/en-us/gw8u4j/Known-Issues-and-Limitations-for-Webex-Video
+- "Content sharing is only supported using H.264 video codec."
+- "Although the Meeting Client can receive 1440p5, 1080p12, or 720p30, the cascade link between the device and the client limits content to 10 fps."
+
+### P32. Time Travel Debugging
+Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/time-travel-debugging-overview
+- "TTD is efficient and works to add as little overhead as possible as it captures code execution in trace files."
+- The trace sizes in the log (hundreds of megabytes to gigabytes) were not in the text read. Not proven.
+
+### P33. Windows.Graphics.Capture has change-related properties
+Source: https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.graphicscapturesession
+- The property table lists "DirtyRegionMode" and "MinUpdateInterval". The page gives no description for either. What they do is not proven.
+
+### P34. Citrix's older "Build to lossless" setting works on the whole screen
+Source: https://docs.citrix.com/en-us/citrix-virtual-apps-desktops/2203-ltsr/graphics/thinwire
+- "Build to lossless compresses the screen using H.264 (or H.265) during screen activity and sharpens to pixel perfect (lossless) when activity stops."
+- Compare P1: the newer default, "Intelligent Build to Lossless", uses the video codec "on large, actively changing screen regions".
+
+### P35. Desktop Duplication returns nothing new while the desktop is still
+Source: https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-acquirenextframe
+- "The time-out interval, in milliseconds. This interval specifies the amount of time that this method waits for a new frame before it returns to the caller."
+- "DXGI_ERROR_WAIT_TIMEOUT if the time-out interval elapsed before the next desktop frame was available."
+
+### P36. Compression damages text for OCR
+Source: https://arxiv.org/html/2503.19495v2
+- "Compression techniques, especially at low bitrates, can introduce significant distortions, such as blurring, blocking artifacts, and loss of fine details, which can severely impact text readability."
+
+### P37. RenderDoc sits between the application and the graphics interface
+Source: https://renderdoc.org/docs/behind_scenes/how_works.html
+- "After this point all accesses to the API remain wrapped and the driver essentially sets itself up as a \"man-in-the-middle\" between the application and the real API."
+
+### P38. Order of calls for NVIDIA's hardware encoder
+Source: https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide/index.html
+- "After loading the NVENC Interface, the client should first call NvEncOpenEncodeSessionEx to open an encoding session."
+- No start-up time is given on the page.
+
+### P39. PrintWindow
+Source: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-printwindow
+- "The PrintWindow function copies a visual window into the specified device context (DC), typically a printer DC."
+- The only flag the page documents is "PW_CLIENTONLY". The flag `PW_RENDERFULLCONTENT` is not on the page. Not proven.
+
+### P40. RDP: images and frequently changing content
+Source: https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding
+- "The rest of the content is separated to images and video: Images are software encoded with either AVC/H.264 or RemoteFX graphics, depending on the capabilities of the local device."
+
 ---
 
 ## NOT PROVEN (claim is in the log; text not found, or page not readable)
 
 | Claim in `research-log.md` | What happened when Claude read the page |
 |---|---|
-| Recall takes snapshots only when the screen differs from the previous one (finding 2) | Not found on https://support.microsoft.com/en-us/topic/2c35b596-5a96-4090-b791-c27fae75f660 or on the "Retrace your steps with Recall" page. |
 | Steps Recorder saves a ZIP holding an MHT file (finding 21) | Not found on the Microsoft page read. |
-| Intel's hardware HEVC encoder supports screen content coding from Ice Lake on (finding 29) | The two ffmpeg pages returned almost no text (876 characters); the claim was not read. |
-| Zoom sends a shared screen as JPEG and switches to H.264 above about 5 frames per second (finding 48) | Page not read yet. |
+| Intel's hardware HEVC encoder supports screen content coding from Ice Lake on (finding 29) | The two ffmpeg pages returned almost no text (876 characters). Intel's own page failed to load (certificate error). Not read. |
+| Zoom sends a shared screen as JPEG and switches to H.264 above about 5 frames per second (finding 48) | Only the thread title was readable: "Zoom RTMS: Consistently Receiving JPEGs for Screenshare, Unable to Trigger Video Stream (h.264)". The 5 frames per second detail was not read. |
 | The baseline of the 66 %, 63 %, 61 % screen-content figures (finding 3) | Not stated in the sentence read (P5). |
+| CRF ±6 halves or doubles the size; lossless output "will likely be huge"; only libx264rgb is truly lossless (findings 5, 15) | ffmpeg's wiki pages returned almost no text (876 characters). Not read. |
+| Lossless x264 at 1900 × 1200 is 62–70 MB per second (finding 15) | Figure not in the text read (P18). |
+| JPEG XL at low effort is twice as fast as QOI and 31 % smaller (finding 13) | Not in the text read (P17). |
+| Playwright's video is VP8 at a fixed 1 Mbit/s (finding 11) | GitHub page text was navigation only. Not read. |
+| H.264 blurred text until switched to 4:4:4 (NVIDIA forum, finding 14) | Forum page text was not readable. Not read. |
+| AV1 saves 47 % against H.264 on YouTube at 1080p (finding 25) | Figure not in the text read (P23). |
+| AV1 screen content coding makes frames 25 % smaller (finding 26) | Figure not in the text read (P24). |
+| PCoIP sends text lossless and "builds to lossless" (finding 36) | The VMware page returned 3,933 characters with no match. Not read. |
+| WebRTC zero-hertz mode lets capture fall to zero (finding 38) | Only the bug title was readable: "Enable libwebrtc's ZeroHertzAdapterMode in FrameCadenceAdapter". The behaviour was not read. |
+| VVenC ran at 6.6 frames per second at 1080p (finding 42) | The page shows the benchmark command; the result figure was not in the text read. |
+| Time Travel Debugging traces run to gigabytes with large overhead (finding 44) | Not in the text read; the page read says the opposite about overhead (P32). |
+| RDP AVC444 sends full colour resolution (finding 12) | Only the structure name was readable. Not read. |
+| Tight encoding saves 52–98 % against Hextile (finding 18) | Only the page preface was read; the figures were not. |
+| A PDF source for AV1's screen tools and for mixed raster content (findings 6, 20) | PDFs were not read. |
+| A UI-tree snapshot costs about 273 tokens against 1,000–1,800 for a screenshot (finding 34) | The page timed out. A second page (Greptile) was readable only as headings. Not read. |
+| libaom real-time speed 10 runs 140–170 frames per second at 1080p (finding 37) | The page did not load. Not read. |
+| Lagarith best for capture, FFV1 most balanced; lossless codecs reach about 2:1 (finding 39) | The page read lists the tested codecs only; the conclusions and sizes were not in the text read. |
+| Desktop Duplication dates from Windows 8 and Windows.Graphics.Capture from Windows 10 version 1803 (finding 22) | Forum page text was navigation only. Not read. |
+| `PrintWindow` with `PW_RENDERFULLCONTENT` captures covered windows (finding 46) | The flag is not on Microsoft's page (P39). |
+| Long distances between key frames slow exact seeking (finding 47) | Page text was navigation only. Not read. |
+| apitrace and GFXReconstruct details (finding 43) | Only RenderDoc's page was read (P37). |
 
 ## REMOVED (was from memory, not from a source)
 - "Older integrated Intel graphics decode AV1 but cannot encode it" (finding 8). Claude wrote this from memory. It is withdrawn.
 
 ## CORRECTIONS to the log
-- **Finding 36 was wrong in one point.** The log says Citrix "made the whole-screen version its default, in place of selecting regions". The page says the default "uses a video codec on large, actively changing screen regions" (P1). It selects regions; it is not whole-screen.
+- **Finding 36 was wrong in one point.** The log says Citrix "made the whole-screen version its default, in place of selecting regions". The pages say the reverse: the older setting "compresses the screen" (P34), and the new default "uses a video codec on large, actively changing screen regions" (P1). The default selects regions.
 - **Finding 18 used wording that is not on the page.** The log quotes "for most workloads, TurboVNC does a much better job of compression than H.264". Those words are not there. The page's own words are in P3.
+- **Finding 1 was wrong about screenpipe.** The log says it records MP4 video at 1 frame per second. The architecture page read says it "captures only when something actually changes — pairing each screenshot with accessibility tree data" (P13). The 1 frame per second and MP4 claims were not found there.
+- **Finding 24 was wrong about OpenH264.** The log says its screen mode "runs on one thread". On the page, "Its use is single threaded" is about a different thing (a data lock in Firefox's code), not about OpenH264. Only the "several times longer" statement is proven (P22).
+- **Finding 35 had the wrong date.** The log says the AV2 specification was released about 28 May 2026. The press release read is dated 9 June 2026 (P27).
+- **Finding 44 was contradicted.** The log says Time Travel Debugging has "large overhead". The page read says "TTD is efficient and works to add as little overhead as possible" (P32).
 
-## SUMMARY ONLY (from search summaries; pages not read yet; not findings until proven)
-Findings 1, 4, 5, 6, 7, 10, 11, 13, 14, 15, 16, 17, 19, 20, 22, 24, 25, 26, 28, 30, 31, 32, 34, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, and the Webex part of 48. Each will be opened and either moved to PROVEN with its quote or listed under NOT PROVEN.
+## STATUS OF THE 48 FINDINGS IN THE LOG (second pass, 2026-11-23)
+- 39 source pages were opened in this pass, 11 in the first.
+- Proven with a verbatim quote: P1–P33 above.
+- Failed, unreadable or not yet opened: the table under NOT PROVEN.
+- Wrong and corrected: findings 1, 18, 24, 35, 36, 44. Withdrawn: one claim in finding 8.
 
 ---
 

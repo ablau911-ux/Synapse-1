@@ -103,7 +103,7 @@ const LIMITS = {
   mb: 1024 * 1024,
   minWidth: 1900,
   minHeight: 1000,
-  ramMb: 500,
+  ramMb: 700,             // owner decision 2026-11-23: RAM limit raised from 500 to 700 MB
   cpuPercent: 10,          // CPU_LIMIT_PERCENT
   qualityLevel: 90,
   firstMs: 1000,           // scenarios 7 and 9 start here

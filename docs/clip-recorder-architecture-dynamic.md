@@ -112,7 +112,7 @@ px = 2,073,600. One B,G,R picture = 6.2 MB. One B,G,R,A picture = 8.3 MB. RAM is
 | NV12 box, worst case | `Nv12Box` | 3.1 | px × 1.5 |
 | Media Foundation + Quick Sync encoder | `ClipEncoder` | 172 | measured for the whole H.264 worker at full 1080p: `results/test-1080-summary.txt:11` |
 | `frames.jsonl` writer, `clip.json`, lost list | recorder | 1 | |
-| **Sum** | | **473.5** | ≤ 500 |
+| **Sum** | | **473.5** | ≤ 700 (owner raised the limit from 500 to 700 MB on 2026-11-23) |
 
 Both measured figures (141 and 172) are whole-process figures that already contain frame buffers, so the sum counts some bytes twice. It is an upper bound.
 
@@ -588,7 +588,7 @@ An extra keyframe (#297) does no harm: `key_frames` comes from the file, not fro
 
 "Unavailable" means any of: no hardware H.264 encoder is granted (`encoder_identity` reports `hardware == false`, `clip_encoder.rs:703-760`); quality mode or level 90 is not read back (`clip_encoder.rs:634-648`); GOP or zero B-frames are not read back; creating the writer fails; writing a sample fails.
 
-There is no software fallback. The Microsoft software encoder measured about 671 MB of RAM (`docs/research/consultations-2026-11-23/brief.md:11`), which breaks the 500 MB limit, and a bitrate fallback breaks quality 90. Any hardware H.264 encoder is accepted, not only Intel's; its name and vendor are stored in `moving.encoder`.
+**Changed 2026-11-23:** the owner raised the RAM limit to 700 MB and approved a software fallback. Its plan comes after the R1 fix (see Builder notes). The text below is the earlier rule. There is no software fallback. The Microsoft software encoder measured about 671 MB of RAM (`docs/research/consultations-2026-11-23/brief.md:11`), which breaks the 500 MB limit, and a bitrate fallback breaks quality 90. Any hardware H.264 encoder is accepted, not only Intel's; its name and vendor are stored in `moving.encoder`.
 
 What happens:
 
@@ -928,7 +928,7 @@ Times are clip times. f = 20. V is the video's box in picture pixels before the 
 | 1 | The clip is complete | `state` = ready; `stop_reason` = completed; `recorded_ms` = 60,000; lines = 1,200 | as stated |
 | 2 | Nothing was lost | `lost` is empty; C and T held | 0 |
 | 3 | The test ran at 1080p | captured width ≥ 1,900 and height ≥ 1,000; otherwise scenarios 4 and 5 are reported as blocked, not passed | as stated |
-| 4 | RAM | max(private bytes) − M_0 ≤ 500 MB | 500 MB |
+| 4 | RAM | max(private bytes) − M_0 ≤ 700 MB | 700 MB (owner decision 2026-11-23; was 500) |
 | 5 | CPU | process CPU share ≤ `CPU_LIMIT_PERCENT`; B held | 10 % |
 | 6 | The encoder | `moving.status` = available; `hardware` = true; `quality_level` = 90; Q held | as stated |
 | 7 | The video moves | of the instants in [1,000 ms, `scrollAtMs`), at least 95 % have `mv` | ≥ 95 % |
@@ -1015,7 +1015,7 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 - F2. `final-dyn-motion-3.txt`: noise SSIM 0.692. About 28 of the 91 noise instants are `moving_behind` repeats that score near 0 against new noise. 63 × 0.97 / 91 ≈ 0.67, which matches.
 - F3. `MovingCoder::start(folder, fps)` needs no picture size (`clip_moving.rs`). It is called inside `ClipLayers::start` (`clip_layers.rs:79`), which runs after the first captured frame (`capture_clip.rs:860`). Creating the encoder there would block the recorder thread.
 - F4. Encoder creation = `MFCreateSinkWriterFromURL` with hardware transforms enabled, plus the media types (`clip_encoder.rs` `open_writer`). Each case of the probe is a new process, so each one pays any one-time start cost.
-- F5. RAM: the budget (section 1.5) has 26.5 MB of headroom against 500 MB, as an upper bound. Each queue frame at 1080p B,G,R = 6.2 MB.
+- F5. RAM: on 2026-11-23 the owner raised the limit from 500 to 700 MB for every recording. The budget (section 1.5) now has 226.5 MB of headroom, as an upper bound. Each queue frame at 1080p B,G,R = 6.2 MB.
 - F6. There is no software fallback (section 5, line 591: the Microsoft software encoder measured about 671 MB). The owner confirmed on 2026-11-23: Quick Sync, or any hardware H.264 encoder, only.
 
 **Owner decision (2026-11-23):** both parts. (A) Warm the encoder once at record start, before capture starts. (B) Size `MOVING_QUEUE_FRAMES` from the measured warm start time, within the RAM budget.
@@ -1041,7 +1041,7 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
    - The warm file is never left behind: it is deleted on `finish`, and recovery deletes a stale `moving/warm.mp4.part`.
 3. **B: queue size.**
    - `MOVING_QUEUE_FRAMES` = max(8, ⌈W × `RECORD_FPS` / 1000⌉ + 2).
-   - RAM check: (Q + 1) × 6.2 MB replaces the 56 MB row of section 1.5, and the new sum must stay ≤ 500. Also measure the real peak with dyn-live `video` at 1080p (rule M3) and report it.
+   - RAM check: (Q + 1) × 6.2 MB replaces the 56 MB row of section 1.5, and the new sum must stay ≤ 700. Also measure the real peak with dyn-live `video` at 1080p (rule M3) and report it.
    - If Q does not fit the budget, STOP and report to Claude with the numbers. Do not change the queue's picture format and do not lower any gate.
 4. **Bug: silent probe crash.** In dyn-motion run 3, scene `slow`, `clip-probe exp-dyn` exited non-zero with empty stderr, and the spec printed `FAIL slow: undefined` (Gitea #290, comment 1369).
    - First make `dyn-motion.mjs` print `run.status`, `run.signal` and stdout's last line when a probe fails.
@@ -1055,7 +1055,7 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 - `r1-start-*.txt` committed. Section 1.5's RAM table updated with the measured peak.
 - No gate, threshold, timeout or assertion is loosened. A check that stays red is reported red, with its output.
 
-**Out of scope:** a software encoder, a different queue picture format, any change to quality 90, the GOP, or the segment length.
+**Out of scope here:** a software encoder (the owner approved one on 2026-11-23; it gets its own plan after this fix lands), a different queue picture format, any change to quality 90, the GOP, or the segment length.
 
 ### 2026-11-23: step 9, decoder seek and recovery edges
 

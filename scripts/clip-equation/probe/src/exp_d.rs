@@ -566,7 +566,7 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     // 5 and 6. Decode, frame mapping by time (M6), quality, R and flashes.
     let sampler = MemorySampler::start();
     let regions = TextRegion::parse(args.text_or("regions", ""))?;
-    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions, args.flag("ocr_fail", false))?;
+    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions, args.flag("ocr_fail", false), args.flag("e1_nv12", false))?;
     quality.put(out);
     let status = if !used_matches {
         "wrong_encoder".to_owned()
@@ -994,6 +994,7 @@ fn measure_quality(
     rate: f64,
     regions: &[TextRegion],
     inject_ocr_failure: bool,
+    nv12_only: bool,
 ) -> Result<Quality> {
     let n = folder.new_frames.len();
     let mut quality = Quality { rate, n_new: n, ..Quality::default() };
@@ -1057,7 +1058,15 @@ fn measure_quality(
             flash_on = on;
         }
         if ocr_orders.contains(&order) {
-            ocr_decoded.push((order, crop_bgra(&frame.bgra, frame.width as usize, rw, rh), rw as u32, rh as u32));
+            // Experiment E1 (`e1_nv12=1`): OCR reads the source after the NV12 conversion alone,
+            // with no encoding, so R measures what 4:2:0 and the BT.709 rounding lose.
+            let picture = if nv12_only {
+                let (w, h, nv12) = clip_encoder::probe_reference_nv12(input, &bgr, folder.width, folder.height);
+                crop_bgra(&nv12_to_bgra(&nv12, w as usize, h as usize), w as usize, rw, rh)
+            } else {
+                crop_bgra(&frame.bgra, frame.width as usize, rw, rh)
+            };
+            ocr_decoded.push((order, picture, rw as u32, rh as u32));
         }
         quality.t_quality += wall.elapsed().as_nanos();
     }
@@ -1119,6 +1128,33 @@ fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)], regions: &
     let r = (!shares.is_empty()).then(|| shares.iter().sum::<f64>() / shares.len() as f64);
     let note = format!("{} frames, {} region reads, source chars per region {}", decoded.len(), shares.len(), list(per_region.iter()));
     Ok((r, source_chars, note))
+}
+
+/// Experiment E1: NV12 (BT.709 limited range, the inverse of `Nv12Canvas::draw`) back to
+/// B, G, R, A. Each 2 × 2 block takes its own Cb, Cr (nearest, no interpolation), so the
+/// only losses are the 4:2:0 averaging and the integer rounding.
+fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
+    const Y_SCALE: f64 = 255.0 / 219.0;
+    const CR_TO_R: f64 = 1.5748 * 255.0 / 224.0;
+    const CB_TO_G: f64 = 0.1873 * 255.0 / 224.0;
+    const CR_TO_G: f64 = 0.4681 * 255.0 / 224.0;
+    const CB_TO_B: f64 = 1.8556 * 255.0 / 224.0;
+    let (luma, chroma) = nv12.split_at(width * height);
+    let mut out = vec![255_u8; width * height * 4];
+    let to_u8 = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+    for row in 0..height {
+        for col in 0..width {
+            let at = (row / 2) * width + (col / 2) * 2;
+            let y = (f64::from(luma[row * width + col]) - 16.0) * Y_SCALE;
+            let cb = f64::from(chroma[at]) - 128.0;
+            let cr = f64::from(chroma[at + 1]) - 128.0;
+            let px = (row * width + col) * 4;
+            out[px] = to_u8(y + CB_TO_B * cb);
+            out[px + 1] = to_u8(y - CB_TO_G * cb - CR_TO_G * cr);
+            out[px + 2] = to_u8(y + CR_TO_R * cr);
+        }
+    }
+    out
 }
 
 /// A `w` × `h` rectangle at (x, y) of a BGRA image `stride_px` wide.

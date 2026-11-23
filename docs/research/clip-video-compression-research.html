@@ -43,7 +43,7 @@
 <div class="wrap" dir="rtl"><article>
 
 <h1>דחיסת וידיאו ויצירת קליפים של מסך: איכות טקסט, גודל קובץ ומשאבי מערכת</h1>
-<p class="meta">מחקר. נכתב 2026-11-23. מכסה גם דחיסה וגם יצירת וידיאו: לכידה, חותמות זמן, מכולה, קפיצה בזמן וקידוד. הוא משלב סקירת ספרות (109 מקורות חיצוניים) עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
+<p class="meta">מחקר. נכתב 2026-11-23. מכסה גם דחיסה וגם יצירת וידיאו: לכידה, חותמות זמן, מכולה, קפיצה בזמן, קידוד, שרשרת הפקה, הפצה, סנכרון ו-HDR. הוא משלב סקירת ספרות (126 מקורות חיצוניים, 17 ציטוטים שאומתו), ניסוי E1 עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
 
 <div class="abstract">
   <b class="lbl">תקציר</b>
@@ -51,7 +51,8 @@
   <p>השווינו שתי דרכים. דרך D: מקודדי H.264 של Windows Media Foundation (Intel Quick Sync ותוכנה של Microsoft). דרך Z: ‏zstd ללא אובדן. כל אחת נבדקה על 24 סצנות: 6 סוגי תוכן כפול 4 רזולוציות.</p>
   <p>אף הגדרה של H.264 לא הגיעה ל-<span dir="ltr">R = 1</span>; הטוב ביותר היה 0.9996. ‏zstd הגיע ל-<span dir="ltr">R = 1</span> בכל ריצה. המחיר הוא גודל: zstd בפריים שלם גדול פי 2.7–12 מ-H.264 באותה רמת קריאוּת הכי טובה שלו, ובתוכן וידיאו פי אלפים.</p>
   <p>הספרות מצביעה על סיבה מרכזית לאובדן הטקסט ב-H.264: תת-דגימת צבע 4:2:0. המערכות המקצועיות לשיתוף מסך פותרות אותה ב-4:4:4, ‏AVC444, "בנייה עד ללא אובדן" או קידוד לפי סוג תוכן. גם הנתונים שלנו תואמים את זה: איכות מקסימלית לא הגיעה ל-<span dir="ltr">R = 1</span>, וב-σ = 2 ‏R עלה.</p>
-  <p>מסקנה: לטקסט, zstd ללא אובדן. כדי להקטין את הגודל: פורמט zstd שכותב רק מה שהשתנה (פי 7–12 קטן יותר במדידה החלקית), ובתוכן וידיאו קידוד מאבד מידע. מוצע ניסוי מכריע לאימות הסיבה.</p>
+  <p>ניסוי E1 בדק את ההמרה ל-NV12 לבדה, בלי H.264. כבר היא הורידה את R מתחת ל-1 ב-8 מתוך 12 סצנות. בהקלדה ברזולוציה מלאה R ירד ל-0.965, ובגלילה ובממשק ה-R של ההמרה לבדה כמעט זהה ל-R הטוב ביותר של H.264. כלומר הגבול נוצר בהמרה ל-YUV ולא בדחיסה, וגם 4:4:4 לא יבטיח <span dir="ltr">R = 1</span>.</p>
+  <p>מסקנה: לטקסט, zstd ללא אובדן על RGB. כדי להקטין את הגודל: פורמט zstd שכותב רק מה שהשתנה (פי 7–12 קטן יותר במדידה החלקית). בתוכן וידיאו, קידוד מאבד מידע.</p>
 </div>
 
 <h2>1. מבוא</h2>
@@ -67,7 +68,8 @@
 <p>לפי התיעוד, המלבנים לא חופפים ומסמנים את מה שהשתנה מאז הפריים הקודם. מערכת ההפעלה יכולה לאחד אזורים, ולכן המלבנים הם גבול עליון ולא הבדל מדויק<sup><a href="#r13">13</a></sup>. FreeRDP משתמש בדיוק בדפוס הזה: קודם מלבני הזזה, אחר כך מלבנים מלוכלכים<sup><a href="#r14">14</a></sup>. זו הדרך הזולה ביותר לדעת מה השתנה בלי להשוות את כל הפיקסלים.</p>
 
 <h3>2.2 מרחבי צבע: RGB ו-YCbCr</h3>
-<p>מקודדי וידיאו עובדים במרחב YCbCr: בהירות (Y) ושני ערוצי צבע. ההמרה לפי BT.601 או BT.709 דורשת עיגול ב-8 ביט, וגם ההמרה ההפוכה. לכן הסיבוב עצמו מאבד מידע<sup><a href="#r19">19</a></sup>. פורום מדווח שב-8 ביט כ-5/6 מערכי ה-RGB משתנים בסיבוב, אבל אף פעם לא ביותר מ-2 יחידות<sup><a href="#r17">17</a>,<a href="#r18">18</a></sup>. לעומת זאת, YCoCg-R הפיך בדיוק במספרים שלמים, במחיר של ביט אחד נוסף בכל ערוץ צבע<sup><a href="#r15">15</a>,<a href="#r16">16</a></sup>. זו פרפרזה: את ה-PDF לא היה אפשר לקרוא כדי לאמת ציטוט.</p>
+<p>מקודדי וידיאו עובדים במרחב YCbCr: בהירות (Y) ושני ערוצי צבע. ההמרה לפי BT.601 או BT.709 דורשת עיגול ב-8 ביט, וגם ההמרה ההפוכה. לכן הסיבוב עצמו מאבד מידע<sup><a href="#r19">19</a></sup>. פורום מדווח שב-8 ביט כ-5/6 מערכי ה-RGB משתנים בסיבוב, אבל אף פעם לא ביותר מ-2 יחידות<sup><a href="#r17">17</a>,<a href="#r18">18</a></sup>. לעומת זאת, YCoCg-R הפיך בדיוק במספרים שלמים, במחיר של ביט אחד נוסף בכל ערוץ צבע<sup><a href="#r15">15</a>,<a href="#r16">16</a></sup>:</p>
+<blockquote>The scaled version uses a lifting scheme to make it exactly invertible<cite>Wikipedia, YCoCg [112] ✓ אומת</cite></blockquote>
 <p>סטייה של 2 יחידות כמעט לא פוגעת ב-OCR. היא מסבירה למה "ללא אובדן" ב-YUV עדיין לא זהה ביטים, אבל לא את האותיות השגויות.</p>
 
 <h3>2.3 תת-דגימת צבע</h3>
@@ -75,7 +77,8 @@
 <div class="eq">bits per pixel (8-bit):  4:4:4 = 8 + 8 + 8 = 24     4:2:2 = 8 + 2·8/2 = 16     4:2:0 = 8 + 2·8/4 = 12
 chroma samples kept:     4:4:4 = 100 %              4:2:2 = 50 %               4:2:0 = 25 %</div>
 <blockquote>Colorful computer text and line graphics can become blurry during reduced color resolution during 4:2:2 or 4:2:0 chroma resolution.<cite>TestUFO [22] ✓ אומת</cite></blockquote>
-<p>לפי RTINGS, העיוותים בולטים במיוחד בטקסט על רקע בצבע אחיד, ובשימוש שולחני 4:4:4 משפיע "מאוד"<sup><a href="#r21">21</a></sup>. פטנט 9153017 מציין שתת-דגימת צבע יוצרת עיוותים מפריעים בתמונות עם טקסט<sup><a href="#r24">24</a></sup>. שתי אלה פרפרזות, כי העמודים לא נטענו לאימות.</p>
+<p>לפי RTINGS, העיוותים בולטים במיוחד בטקסט על רקע בצבע אחיד, ובשימוש שולחני 4:4:4 משפיע "מאוד"<sup><a href="#r21">21</a></sup>. זו פרפרזה, כי העמוד לא נטען לאימות.</p>
+<blockquote>chroma subsampling will introduce visually disturbing artifacts, such as in images containing text<cite>US patent 9153017 [24, 110] ✓ אומת</cite></blockquote>
 <p>טקסט ב-Windows מצויר עם ClearType, שמשתמש בכל ערוץ צבע בנפרד לשולי האותיות<sup><a href="#r30">30</a>,<a href="#r31">31</a></sup>. ‏4:2:0 מוחק בדיוק את המידע הזה. מקורות נוספים מתעדים את אותה תופעה בהקלטות: ב-H.264 גם "lossless" עובר ל-4:2:0<sup><a href="#r25">25</a></sup>, טקסט מיטשטש ב-yuv420p<sup><a href="#r26">26</a></sup>, ובפורום OBS<sup><a href="#r27">27</a></sup>, אצל RED<sup><a href="#r23">23</a></sup> וב-VideoHelp<sup><a href="#r32">32</a></sup>.</p>
 
 <h3>2.4 קידוד וידיאו היברידי (H.264 ו-HEVC)</h3>
@@ -101,18 +104,39 @@ chroma samples kept:     4:4:4 = 100 %              4:2:2 = 50 %               4
 <p>בסולם המקובל לטקסט מודפס, CER של 1–2% נחשב "טוב"<sup><a href="#r81">81</a></sup>. כלומר <span dir="ltr">R = 0.98–0.99</span> נחשב טוב לסריקת מסמכים. אצלנו הדרישה מחמירה יותר: <span dir="ltr">R = 1</span>.</p>
 <p>הספרות מראה שדחיסה פוגעת בזיהוי טקסט:</p>
 <blockquote>harmful compression artifacts in textual regions that reduced OCR accuracy<cite>GDELT [75] ✓ אומת</cite></blockquote>
-<p>זיהוי לוחיות רישוי יורד עם האיכות לפי עקומה לוגיסטית<sup><a href="#r77">77</a></sup>. פטנט 8064516 מתאר טקסט שמאבד חדות בדחיסה, ולפעמים הופך לבלתי קריא<sup><a href="#r76">76</a></sup>. זו פרפרזה שלא אומתה. ראו גם<sup><a href="#r78">78</a></sup>.</p>
+<p>זיהוי לוחיות רישוי יורד עם האיכות לפי עקומה לוגיסטית<sup><a href="#r77">77</a></sup>. ראו גם<sup><a href="#r78">78</a></sup>.</p>
+<blockquote>lack of clarity in the text areas is noticeable making the text difficult to discern and in some cases render it unreadable<cite>US patent 8064516 [76, 111] ✓ אומת</cite></blockquote>
 
 <h3>2.8 יצירת וידיאו: מהמסך לקובץ</h3>
-<p><b>לכידה.</b> Windows.Graphics.Capture מספק פריימים דרך מאגר (Direct3D11CaptureFramePool) ואירוע FrameArrived, שנורה כשפריים חדש נשמר במאגר<sup><a href="#r90">90</a>,<a href="#r91">91</a></sup>. לכל פריים יש SystemRelativeTime, זמן ה-QPC שבו המרכיב צייר אותו, וזה הבסיס לחותמות זמן מדויקות ולסנכרון<sup><a href="#r92">92</a>,<a href="#r93">93</a></sup>. ה-API נשלח רק כשהמסך משתנה, ולכן הקצב בפועל משתנה מעצמו. Desktop Duplication (סעיף 2.1) מוסיף מידע על האזורים שהשתנו.</p>
-<p><b>חותמות זמן וקצב פריימים.</b> ב-Media Foundation כל דגימה מקבלת זמן ומשך לפני הכתיבה ל-Sink Writer<sup><a href="#r94">94</a>,<a href="#r95">95</a></sup>. כשיש B-frames, ה-MP4 sink צריך גם זמן הצגה וגם זמן פענוח, אחרת פריימים עלולים ליפול<sup><a href="#r96">96</a></sup>. דווח גם על MP4 פגום כשמזינים דגימות מהר מדי<sup><a href="#r97">97</a></sup>.</p>
+<p><b>לכידה.</b> Windows.Graphics.Capture מספק פריימים דרך מאגר (Direct3D11CaptureFramePool) ואירוע FrameArrived, שנורה כשפריים חדש נשמר במאגר<sup><a href="#r90">90</a>,<a href="#r91">91</a></sup>. לכל פריים יש SystemRelativeTime, וזה הבסיס לחותמות זמן מדויקות ולסנכרון<sup><a href="#r92">92</a>,<a href="#r93">93</a></sup>:</p>
+<blockquote>The QPC (Query Performance Counter) time at which the compositor rendered the frame.<cite>Microsoft, SystemRelativeTime [92] ✓ אומת</cite></blockquote>
+<p> ה-API נשלח רק כשהמסך משתנה, ולכן הקצב בפועל משתנה מעצמו. Desktop Duplication (סעיף 2.1) מוסיף מידע על האזורים שהשתנו.</p>
+<p><b>חותמות זמן וקצב פריימים.</b> ב-Media Foundation כל דגימה מקבלת זמן ומשך לפני הכתיבה ל-Sink Writer<sup><a href="#r94">94</a>,<a href="#r95">95</a></sup>. כשיש B-frames, ה-MP4 sink צריך גם זמן הצגה וגם זמן פענוח:</p>
+<blockquote>When writing B-frames into an MP4 file, you must set both the presentation time stamp and the decode time stamp.<cite>Microsoft, MPEG-4 File Sink [96] ✓ אומת</cite></blockquote>
+<p> דווח גם על MP4 פגום כשמזינים דגימות מהר מדי<sup><a href="#r97">97</a></sup>.</p>
 <p>הקלטות מסך הן לרוב בקצב משתנה (VFR). עורכים כמו Premiere עובדים טוב יותר בקצב קבוע (CFR), ו-VFR גורם לגמגום ולחוסר סנכרון שמע<sup><a href="#r102">102</a>,<a href="#r103">103</a></sup>.</p>
 <p>במקליט שלנו הפתרון שונה: הפריימים נשמרים רק כשהתמונה משתנה, כלומר VFR. קובץ frames.jsonl נותן ציר זמן קבוע של 50 מילישניות לכל רגע, ומפנה לפריים שמוצג בו. כך יש CFR בציר הזמן בלי לשכפל פריימים.</p>
-<p><b>מכולה ועמידות לקריסה.</b> ב-MP4 רגיל האינדקס (moov) נכתב רק בסוף ההקלטה, ולכן קריסה עלולה להשאיר קובץ שלא ניתן לנגן<sup><a href="#r98">98</a>,<a href="#r101">101</a></sup>. ‏MKV ו-MP4 מקוטע מאבדים בקריסה רק את הקטע האחרון. ‏OBS 30.2 כותב "Hybrid MP4": מקוטע בזמן ההקלטה, ומקבל אינדקס מלא בסיום<sup><a href="#r98">98</a>,<a href="#r99">99</a>,<a href="#r100">100</a></sup>.</p>
+<p><b>מכולה ועמידות לקריסה.</b> ב-MP4 רגיל האינדקס (moov) נכתב רק בסוף ההקלטה, ולכן קריסה עלולה להשאיר קובץ שלא ניתן לנגן<sup><a href="#r98">98</a>,<a href="#r101">101</a></sup>. ‏MKV ו-MP4 מקוטע מאבדים בקריסה רק את הקטע האחרון. ‏OBS 30.2 כותב "Hybrid MP4": מקוטע בזמן ההקלטה, ומקבל אינדקס מלא בסיום<sup><a href="#r98">98</a>,<a href="#r99">99</a>,<a href="#r100">100</a></sup>:</p>
+<blockquote>It remains recoverable even if writing the file is aborted, e.g. due to system crashes or power outages<cite>OBS knowledge base, Hybrid MP4 [99] ✓ אומת</cite></blockquote>
 <p>בקליפ של zstd כל פריים הוא קובץ נפרד, והאינדקס (frames.jsonl) נכתב שורה אחרי שורה. קריסה מאבדת לכל היותר את הרגע האחרון, וזה הבסיס לשחזור (B10).</p>
 <p><b>פריימי מפתח וקפיצה בזמן.</b> קפיצה לנקודה בקליפ נוחתת על פריים מפתח ומפענחת קדימה עד הפריים המבוקש. ‏GOP ארוך דוחס טוב יותר אבל מאט את הקפיצה. בפועל מקובל GOP של 0.5 עד 2 שניות<sup><a href="#r104">104</a>,<a href="#r105">105</a>,<a href="#r106">106</a></sup>. בפריים שלם של zstd כל פריים עומד בפני עצמו, ולכן מספר הפריימים לפענוח בקפיצה הוא <span dir="ltr">N_dec = 1</span>. בפורמטי zstd ששומרים רק הבדלים, ‏N_dec ≤ K_z.</p>
-<p><b>קידוד בחומרה מול תוכנה.</b> OBS ממליץ על מקודדי חומרה כדי להוריד עומס מה-CPU<sup><a href="#r107">107</a></sup>. בבדיקה של Wowza, עומס ה-CPU ירד מכ-50% עם x264 לכ-20% עם NVENC, ו-Quick Sync פינה CPU באופן דומה<sup><a href="#r108">108</a></sup>. ‏x264 נותן איכות טובה יותר לכל ביט, במחיר CPU<sup><a href="#r109">109</a></sup>.</p>
+<p><b>קידוד בחומרה מול תוכנה.</b></p>
+<blockquote>Hardware encoders ... are generally recommended for best performance as they take the workload off the CPU<cite>OBS knowledge base, Hardware Encoding [107] ✓ אומת</cite></blockquote>
+<p> בבדיקה של Wowza, עומס ה-CPU ירד מכ-50% עם x264 לכ-20% עם NVENC, ו-Quick Sync פינה CPU באופן דומה<sup><a href="#r108">108</a></sup>. ‏x264 נותן איכות טובה יותר לכל ביט, במחיר CPU<sup><a href="#r109">109</a></sup>.</p>
 <p>אצלנו המקודד בתוכנה (DW2) צרך כ-2.2 שניות CPU וכ-700MB RAM לכל 20 שניות הקלדה ב-1080p. דחיסת zstd ‏‎−3 היא סדרי גודל זולה יותר: zstd מגיע לכ-635MB לשנייה<sup><a href="#r8">8</a></sup>.</p>
+
+<h3>2.9 יצירת וידיאו באופן כללי: מצילום עד צפייה</h3>
+<p><b>שרשרת ההפקה.</b> בהפקת וידיאו מקובלים שלושה תפקידים לקודקים:</p>
+<ul>
+  <li><b>קודק לכידה:</b> במצלמה.</li>
+  <li><b>קודק ביניים (mezzanine):</b> לעריכה. ProRes ו-DNxHR שומרים איכות גבוהה ועמידות לעריכות חוזרות, והם בנויים בדרגות: 4444 ו-444 לגימור, ‏422 HQ לביניים, ו-Proxy לעריכה קלה<sup><a href="#r113">113</a>–<a href="#r116">116</a></sup>. קודק ביניים לא משפר את התמונה, אבל בחירה לא נכונה יכולה לפגוע בה<sup><a href="#r115">115</a></sup>.</li>
+  <li><b>קודק הפצה:</b> לצפייה. H.264, ‏HEVC, ‏AV1 ו-VVC, שנבנו לגודל קטן ולנגינה.</li>
+</ul>
+<p>הקליפ שלנו הוא מקרה מיוחד: הוא גם הלכידה וגם הארכיון, ונקרא על ידי מכונה (OCR) ולא רק על ידי עין. לכן הוא קרוב יותר לקודק ביניים ללא אובדן מאשר לקודק הפצה.</p>
+<p><b>הפצה וקצב סיביות.</b> במקום סולם קצבים קבוע, Netflix מקודד כל כותר בכמה רזולוציות וקצבים, ובוחר את הנקודות על "הקמור" של עקומת קצב-איכות<sup><a href="#r117">117</a>,<a href="#r119">119</a></sup>. לפי Mux, החיסכון שמוזכר הוא כ-20% לכל כותר וכ-30% לכל סצנה<sup><a href="#r118">118</a></sup>. זה אותו עיקרון כמו J אצלנו: מודדים את כל האפשרויות ובוחרים לפי החזית האופטימלית.</p>
+<p><b>קודקים חדשים.</b> VVC (H.266) הושלם ב-2020, עם כ-50% חיסכון לעומת HEVC לפי התקן עצמו<sup><a href="#r120">120</a></sup>. בדיקות עצמאיות מצאו 31–40%, עם קידוד מורכב פי 8 לפחות ופענוח פי 1.5<sup><a href="#r121">121</a></sup>. ככל שהקודק יעיל יותר, הקידוד יקר יותר ב-CPU, וזה בדיוק המשאב שאנחנו רוצים לחסוך.</p>
+<p><b>סנכרון שמע ותמונה.</b> לפי ITU-R BT.1359, ההבדל מורגש מ-+45 עד ‎−125 מילישניות, ומקובל עד +90/‎−185 (פלוס = הקול לפני התמונה)<sup><a href="#r122">122</a></sup>. מקורות אחרים מצטטים את אותם מספרים בסימן הפוך<sup><a href="#r123">123</a></sup>. בקליפ שלנו אין שמע. אם יתווסף, חותמת ה-QPC של כל פריים (סעיף 2.8) היא הבסיס לסנכרון.</p>
+<p><b>צבע וטווח דינמי.</b> HDR מוגדר ב-BT.2100 עם עקומות PQ או HLG, צבעי BT.2020 ועומק 10 או 12 ביט<sup><a href="#r124">124</a>–<a href="#r126">126</a></sup>. מסך Windows נלכד ב-BGRA 8 ביט ב-SDR (סעיף 2.1), ולכן הקליפ שלנו נשאר ב-8 ביט RGB. מסך HDR ידרוש החלטה נפרדת.</p>
 
 <h2>3. שיטת המחקר</h2>
 <h3>3.1 הקורפוס</h3>
@@ -188,6 +212,32 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li><b>ת4:</b> בהקלדה, 1280×720 ו-1920×1080 קיבלו בדיוק אותם ערכי R. לא נבדק למה.</li>
 </ul>
 
+<h3>4.5 ניסוי E1: ההמרה ל-NV12 לבדה</h3>
+<p>שיטה: אותו probe ואותו ממיר שהמקודד מקבל (<span dir="ltr">Nv12Canvas::draw</span>, ‏BT.709 בטווח מוגבל, צבע ממוצע על 2×2). ההמרה ההפוכה נעשית ל-BGRA לפי BT.709, וכל בלוק 2×2 מקבל את הצבע שלו, בלי אינטרפולציה. ה-OCR קורא את התמונה הזו במקום את הפריים המפוענח, באותם 10 פריימים ובאותם אזורים.</p>
+<div class="eq">R_420 = R(source → NV12 → BGRA)          no H.264 at all          probe flag e1_nv12=1 (commit below)</div>
+<div class="tbl"><table>
+<caption>טבלה 4. ‏R של ההמרה לבדה, מול R הכי טוב של H.264 (טבלה 1)</caption>
+<tr><th>סצנה</th><th>σ</th><th>R_420 (המרה בלבד)</th><th>H.264, ‏R הכי טוב</th></tr>
+<tr><td>הקלדה 1920×1080</td><td class="num">1</td><td class="num">0.9652</td><td class="num">0.9918</td></tr>
+<tr><td>הקלדה 1280×720</td><td class="num">1</td><td class="num">0.9652</td><td class="num">0.9918</td></tr>
+<tr><td>הקלדה 640×360</td><td class="num">2</td><td class="num">1</td><td class="num">0.9984</td></tr>
+<tr><td>הקלדה 506×333</td><td class="num">3</td><td class="num">1</td><td class="num">0.9959</td></tr>
+<tr><td>גלילה 1920×1080</td><td class="num">1</td><td class="num">0.9975</td><td class="num">0.9976</td></tr>
+<tr><td>גלילה 1280×720</td><td class="num">1</td><td class="num">0.9976</td><td class="num">0.9978</td></tr>
+<tr><td>גלילה 640×360</td><td class="num">2</td><td class="num">0.9960</td><td class="num">0.9959</td></tr>
+<tr><td>גלילה 506×333</td><td class="num">3</td><td class="num">0.9955</td><td class="num">0.9929</td></tr>
+<tr><td>ממשק 1920×1080</td><td class="num">1</td><td class="num">1</td><td class="num">0.9996</td></tr>
+<tr><td>ממשק 1280×720</td><td class="num">1</td><td class="num">0.9969</td><td class="num">0.9974</td></tr>
+<tr><td>ממשק 640×360</td><td class="num">2</td><td class="num">0.9972</td><td class="num">0.9958</td></tr>
+<tr><td>ממשק 506×333</td><td class="num">3</td><td class="num">0.9898</td><td class="num">0.9888</td></tr>
+</table></div>
+<ul>
+<li><b>E1-א:</b> ההמרה לבדה מורידה את R מתחת ל-1 ב-8 מתוך 12 סצנות.</li>
+<li><b>E1-ב:</b> בגלילה ובממשק, ‏R_420 כמעט שווה ל-R הטוב ביותר של H.264, בהפרש של עד 0.003. כלומר בהגדרות הטובות הדחיסה עצמה מוסיפה מעט מאוד, ורוב האובדן כבר קרה בהמרה.</li>
+<li><b>E1-ג:</b> בהקלדה ב-σ = 1 ההמרה לבדה נותנת 0.965, נמוך יותר מ-H.264 (0.9918). המפענח של H.264 מגדיל את הצבע באינטרפולציה ולא בבלוקים, וזה כנראה מסתדר טוב יותר עם ה-OCR. מכאן ש-R רגיש לשינויים קטנים מאוד בפיקסלים.</li>
+<li><b>E1-ד:</b> ב-σ = 2 בלוק הצבע 2×2 נופל בדיוק על פיקסל מקור משוכפל, כך שתת-הדגימה לא מאבדת צבע. נשאר רק עיגול של עד 2 יחידות. ובכל זאת, בגלילה <span dir="ltr">R = 0.9960</span> ובממשק 0.9972. כלומר אפילו עיגול שהעין לא רואה משנה את קריאת ה-OCR.</li>
+</ul>
+
 <h2>5. דיון</h2>
 <h3>5.1 הסיבה לאובדן הטקסט: שלוש השערות</h3>
 <ul>
@@ -195,8 +245,8 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li><b>ה2, עיגול YCbCr ב-8 ביט:</b> קיים, אבל עד 2 יחידות בלבד<sup><a href="#r17">17</a></sup>. לא סביר שהוא מחליף אותיות.</li>
 <li><b>ה3, כימוי:</b> אחראי לחלק מהאובדן ב-q נמוך. בהקלדה ב-1080p ‏R עולה מ-0.9343 ב-q30 ל-0.9918 ב-q70. את התקרה הוא לא מסביר.</li>
 </ul>
-<p>כדי לאשר את ה1 נדרש ניסוי: ממירים את המקור ל-NV12 וחזרה, בלי קידוד, ומודדים R.</p>
-<div class="eq">E1:  R_420 = R(source → NV12 → BGR)      if R_420 &lt; 1 → H1 confirmed;   if R_420 = 1 → the loss is in quantization (H3)</div>
+<p><b>תוצאת E1 (סעיף 4.5):</b> ה1 מאושרת חלקית. ‏4:2:0 ב-σ = 1 מוריד את R בהקלדה ל-0.965. אבל E1-ד מראה שגם בלי תת-דגימה, העיגול של ה2 מספיק כדי להוריד את R מתחת ל-1. ה3, הכימוי, הוא הגורם הקטן ביותר בהגדרות הטובות (E1-ב).</p>
+<p>המסקנה החשובה: כל נתיב שעובר דרך YUV ב-8 ביט לא יבטיח <span dir="ltr">R = 1</span>, כי ה-OCR מגיב גם לשינויים שהעין לא רואה. זה כולל 4:4:4, ‏AVC444 ו-H.264 ללא אובדן ב-yuv444. רק נתיב RGB ללא אובדן מבטיח <span dir="ltr">R = 1</span>: ‏zstd, או x264rgb ב-qp 0.</p>
 
 <h3>5.2 איך התעשייה פותרת את זה</h3>
 <p>כל המערכות המקצועיות לשיתוף מסך מציעות מצב מיוחד לטקסט:</p>
@@ -224,7 +274,7 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <tr><td>zstd פריים שלם (תוכנית 4.2)</td><td class="k">1</td><td>גדול (טבלה 1)</td><td>נמוך / כמה MB</td><td>וידיאו: 6.5GB לדקה ב-1080p</td></tr>
 <tr><td>zstd שכותב רק מה שהשתנה (prefix, XOR, מלבנים)</td><td class="k">1</td><td>פי 7–12 קטן מפריים שלם (506×333)</td><td>נמוך / 2.8MB</td><td>נמדד רק ב-506×333</td></tr>
 <tr><td>zstd לטקסט, H.264 לווידיאו (לפי תוכן)</td><td class="k">1 בטקסט</td><td>קטן גם בווידיאו</td><td>H.264 ב-worker צרך כ-700MB</td><td>זיהוי תוכן; שני נתיבים</td></tr>
-<tr><td>AVC444 על Quick Sync</td><td class="x">לא ידוע</td><td>פי 1.5–2 מ-4:2:0</td><td>פי 2 זמן קידוד</td><td>מימוש עצמאי; כנראה לא R = 1</td></tr>
+<tr><td>AVC444 על Quick Sync</td><td class="x">&lt; 1 לפי E1</td><td>פי 1.5–2 מ-4:2:0</td><td>פי 2 זמן קידוד</td><td>מימוש עצמאי; כנראה לא R = 1</td></tr>
 <tr><td>AV1 עם כלי תוכן מסך (Intel QSV)</td><td class="x">לא ידוע</td><td>חיסכון גדול בטקסט</td><td>חומרה, אם קיימת</td><td>לא ידוע אם המעבד כאן תומך</td></tr>
 <tr><td>H.264 ‏RGB ללא אובדן (x264 בתוכנה)</td><td class="k">1</td><td>בינוני</td><td>CPU גבוה</td><td>תלות חדשה ורישוי GPL</td></tr>
 </table></div>
@@ -234,7 +284,8 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li>ריצת Z חלקית: רק 506×333.</li>
 <li>ה-OCR הוא Windows OCR. מנוע אחר ייתן ערכי R אחרים, אבל השוואה על אותו מנוע הוגנת.</li>
 <li>הקורפוס סינתטי, ממחשב אחד וכרטיס מסך אחד.</li>
-<li>כל הציטוטים במסמך נבדקו מול העמוד המלא ב-2026-11-23. מסומנים ✓ אלה שנמצאו בעמוד, מילה במילה או עם הבדל קטן שתוקן. ציטוטים שהעמוד שלהם לא נטען (RTINGS, ‏VMware, ‏Blender, ‏YCoCg-R PDF, הפטנטים, FFmpeg wiki) הוחלפו בפרפרזה מסומנת. שאר הטענות במסמך הן פרפרזות מהמקורות, ולא כל עמוד נקרא במלואו.</li>
+<li>כל ציטוט ישיר במסמך (בתוך מסגרת ציטוט) נבדק מול העמוד המלא ב-2026-11-23 ומסומן ✓. שתי בדיקות, 26 עמודים, 17 ציטוטים אומתו. ארבעה עמודים לא נטענו, וטענותיהם מופיעות כפרפרזה מסומנת ולא כציטוט: RTINGS (תוכן לא נטען), ‏VMware/Omnissa (DNS, 403), ‏Blender (403), ‏FFmpeg wiki (הגנה מבוטים). שאר הטענות הן פרפרזות מהמקורות.</li>
+<li>ב-E1 ההמרה ההפוכה מ-NV12 משתמשת בצבע של כל בלוק בלי אינטרפולציה. מפענחים אמיתיים מבצעים אינטרפולציה, וזה מסביר את E1-ג.</li>
 <li>חלק מהמקורות הם פורומים או חומר שיווקי, ומשקלם נמוך יותר. מסומנים בתיאור.</li>
 </ul>
 
@@ -244,10 +295,10 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li>zstd עומד בה תמיד. לטקסט ולממשק הוא הבחירה הנכונה.</li>
 <li>כדי להקטין גודל: להשלים את ריצת Z, ולבחור את פורמט ה-zstd החסכוני ביותר לכל רזולוציה.</li>
 <li>תוכן וידיאו על המסך דורש קידוד מאבד מידע, אחרת הגודל לא סביר. זו החלטה למוצר: לפי תוכן, או מגבלה מתועדת.</li>
+<li>E1 בוצע. ההמרה ל-YUV ב-8 ביט לבדה מונעת <span dir="ltr">R = 1</span>, ולכן גם פתרונות 4:4:4 ו-AVC444 לא יעמדו בדרישה. רק RGB ללא אובדן עומד בה.</li>
 <li>ניסויים הבאים:
   <ul>
-    <li><b>E1:</b> ‏NV12 הלוך וחזור, לאימות ה1.</li>
-    <li><b>E2:</b> השלמת ריצת Z.</li>
+    <li><b>E2:</b> השלמת ריצת Z, כשהבעלים יחליט, אחרי הבנייה לפי תוכנית 4.2.</li>
     <li><b>E3:</b> מלבנים מלוכלכים מ-Desktop Duplication כדי לחסוך CPU<sup><a href="#r10">10</a>–<a href="#r14">14</a></sup>.</li>
     <li><b>E4:</b> בדיקה אם ה-GPU כאן תומך ב-AV1 עם כלי תוכן מסך<sup><a href="#r73">73</a></sup>.</li>
   </ul>
@@ -365,6 +416,23 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li id="r107">OBS knowledge base. Hardware encoding. <a href="https://obsproject.com/kb/Hardware-Encoding">link</a></li>
 <li id="r108">Wowza. Hardware vs software streaming encoders. <a href="https://www.wowza.com/?p=23557">link</a></li>
 <li id="r109">OBS forum. NVENC vs x264 for local recording. <a href="https://obsproject.com/forum/threads/nvenc-vs-x264-for-local-recording-some-thoughts.56737/latest">link</a></li>
+<li id="r110">Google Patents. US9153017B1, system and method for optimized chroma subsampling. <a href="https://patents.google.com/patent/US9153017B1/en">link</a></li>
+<li id="r111">Google Patents. US8064516B2, text recognition during video compression. <a href="https://patents.google.com/patent/US8064516B2/en">link</a></li>
+<li id="r112">Wikipedia. YCoCg. <a href="https://en.wikipedia.org/wiki/YCoCg">link</a></li>
+<li id="r113">Frame.io workflow guide. Mezzanine workflow. <a href="https://workflow.frame.io/guide/mezzanine-workflow">link</a></li>
+<li id="r114">Lowepost. The ultimate DNxHR and ProRes guide. <a href="https://lowepost.com/finishing/insights/dnxhr-vs-prores-r4/">link</a></li>
+<li id="r115">OWC. Video editing codecs explained. <a href="https://www.owc.com/blog/video-editing-codecs-explained">link</a></li>
+<li id="r116">ProVideo Coalition. Why ProRes. <a href="https://www.provideocoalition.com/why-prores/">link</a></li>
+<li id="r117">Streaming Media. How Netflix pioneered per-title video encoding optimization. <a href="https://streamingmedia.com/Articles/Editorial/Featured-Articles/How-Netflix-Pioneered-Per-Title-Video-Encoding-Optimization-108547.aspx">link</a></li>
+<li id="r118">Mux (2018). Instant per-title encoding (webinar). <a href="https://www.mux.com/webinars/instant-per-title-encoding">link</a></li>
+<li id="r119">Convex hull prediction methods for bitrate ladder construction. <a href="https://arxiv.org/html/2310.15163v3">arXiv:2310.15163</a></li>
+<li id="r120">Bross et al. (2021). Overview of the Versatile Video Coding (VVC) standard and its applications. IEEE TCSVT 31(10):3736–3764. <a href="https://www.microsoft.com/en-us/research/?p=798226">link</a></li>
+<li id="r121">Amestoy et al. (2023). Video quality assessment and coding complexity of VVC. <a href="https://arxiv.org/pdf/2310.13093">arXiv:2310.13093</a></li>
+<li id="r122">ITU-R BT.1359-1 (1998). Relative timing of sound and vision for broadcasting. <a href="https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.1359-1-199811-I!!PDF-E.pdf">pdf</a></li>
+<li id="r123">NTIA report 11-474. Audio-video synchronization. <a href="https://its.ntia.gov/publications/download/11-474.pdf">pdf</a></li>
+<li id="r124">ITU-R Report BT.2390-8 (2020). High dynamic range television. <a href="https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BT.2390-8-2020-PDF-E.pdf">pdf</a></li>
+<li id="r125">AJA (2019). High dynamic range broadcasting. <a href="https://www.aja.com/pdf/2019/High_Dynamic_Range_Broadcasting.pdf">pdf</a></li>
+<li id="r126">Wikipedia. Hybrid log–gamma. <a href="https://wikipedia.com/wiki/HLG10">link</a></li>
 </ol>
 <p class="note">מקורות פנימיים:</p>
 <ul class="note">

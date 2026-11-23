@@ -222,6 +222,15 @@ pub(super) fn probe_reference_luma(input: &SegmentInput, bgr: &[u8], width: u32,
     (size.width, size.height, canvas.nv12)
 }
 
+/// probe (experiment E1): the whole NV12 picture the encoder is given (Y then
+/// interleaved Cb, Cr), from the same converter, before any encoding.
+pub(super) fn probe_reference_nv12(input: &SegmentInput, bgr: &[u8], width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+    let size = RecordedSize::of(input);
+    let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
+    canvas.draw(bgr, width, height);
+    (size.width, size.height, canvas.nv12)
+}
+
 fn ms_to_hns(ms: u64) -> i64 {
     i64::try_from(ms)
         .unwrap_or(i64::MAX / HNS_PER_MS)

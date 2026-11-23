@@ -8,6 +8,12 @@ Created 2026-11-23 06:28 IST. This plan replaces `docs/clip-recorder-plan.md` fo
 - **2026-11-23 06:10, owner:** the format is the one the live recorder already writes, zstd level −3, one whole frame per file (old plan E11). These frames become the clip, and the H.264 worker leaves the clip path.
 - **Follow-up:** the Z run resumes after the build. It stopped at 6,195 of 48,330 rows and covers 506×333 only. If it finds a better zstd format, the format is swapped then. No pluggable format layer is built now.
 
+- **2026-11-23 11:10, owner: the recorder is dynamic.** It watches what is shown and picks the way per region: exact (lossless zstd) for text, UI and anything that settles; high-quality lossy video only where the screen keeps moving (video, animation). This supersedes the whole-frame format above; section 12 is the design. Basis:
+  - OCR noise test (`75ca1363`): R < 1 is OCR noise, so H.264 is not ruled out by quality.
+  - 1080p decision test (`cb60f432`, `1447d5f6`) and the 60 s mixed clip (#290): zstd stream L1 W27 is about 7× smaller than whole frames, pixel-exact, same CPU.
+  - Video scene: whole-frame lossless stays enormous; Quick Sync q90 keeps SSIM 0.968 at about 9 % of the lossless size.
+  - Literature study `docs/research/screen-clip-compression-from-scratch.md` and the three consultations (`6847b3e0`).
+
 ## 2. Architecture
 
     capture (WGC) → live recorder → waiting/frame-NNNNNNNN.zst (zstd −3, whole frame) → recording ends → clip folder → viewer
@@ -93,6 +99,57 @@ Code rules: one type owns one rule, no pass-through layers, named constants only
 
 - #292 (worker), #296 (Quick Sync time stamps) and #297 (extra keyframe) are H.264 only. Proposal: close them as superseded by way Z.
 - #293 (D5) stays open: W4 and the live proof.
+
+## 12. Dynamic recorder (owner decision 2026-11-23 11:10)
+
+The recorder decides, frame by frame, how each part of the window is stored. One rule owns the decision; two coders do the storing.
+
+### 12.1 What is decided
+
+    block b (D5 BLOCK grid) is MOVING  ⇔  share of the last W_a frames in which b changed ≥ ANIMATING_CHANGE_SHARE
+    moving area M(t) = bounding box of the connected MOVING blocks (D5 item 3, the animation interval)
+    everything outside M(t) = EXACT area
+
+The test reuses the viewer's D5 animation rule (old plan "D5 as an equation", item 3) with ν = 0. Recorder and viewer use one shared type, not two copies of the rule.
+
+### 12.2 How each area is stored
+
+| Area | Coder | Why |
+|---|---|---|
+| EXACT | zstd stream, level 1, window 2^27, keyframe every K_z new pictures, only the changed rows coded | pixel-exact; about 7× smaller than whole frames at the same CPU (#290, 60 s mixed clip) |
+| MOVING | H.264 Quick Sync, quality 90, cropped to M(t), 4:2:0 | about 9 % of the lossless size at SSIM 0.968 on the video scene |
+| M(t) ends (the area stops moving) | one exact zstd picture of the former M | what settles on screen is always exact |
+| nothing changes | nothing written (frames.jsonl points at the last picture) | idle costs nothing |
+
+### 12.3 Clip folder additions
+
+- `frames/`: the EXACT stream (zstd chunks per keyframe group).
+- `moving/seg-NNNN.mp4`: one H.264 segment per moving interval, with its rectangle and its instants in `clip.json`.
+- `frames.jsonl`: each instant also names its moving segment and its rectangle, if any.
+
+### 12.4 Viewer
+
+Draw the EXACT picture, then overlay the H.264 frame of the same instant inside M(t). Seek decodes at most K_z EXACT chunks plus the H.264 frames of its moving segment from that segment's last keyframe.
+
+### 12.5 Parameters (values to be confirmed by the proof)
+
+| Name | Start value | Source |
+|---|---|---|
+| ANIMATING_CHANGE_SHARE, W_a | as in D5 | old plan D5 item 3 |
+| zstd level, window, K_z | 1, 2^27, 20 | 1080p test `1447d5f6` |
+| H.264 quality | 90 | d-runs video-1920x1080, DW1 q90 |
+| minimum moving area | open: an area smaller than one D5 block group stays EXACT | open item O2 |
+
+### 12.6 Work packages added
+
+| Id | What | Proof |
+|---|---|---|
+| W6 | Shared moving-area rule (D5 item 3) used by the recorder | check script: the video scene gives one moving area; typing, UI and scroll give none |
+| W7 | EXACT coder: zstd stream L1 W27, changed rows, keyframes | pixel-exact round trip; size on the 60 s mixed clip within 10 % of 3.24 MB |
+| W8 | MOVING coder: Quick Sync q90 on the cropped area, segments | SSIM on the area ≥ 0.95; frame timing exact (the #296 frame-mapping fix is part of W8) |
+| W9 | Viewer composition and seek | live view of a clip with a video next to text |
+
+Proof data: the corpus scenes, the 60 s mixed clip, and one real recording with a playing video next to text.
 
 ## 11. Open items for the owner
 

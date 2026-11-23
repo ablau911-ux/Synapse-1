@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { D_ROW_RULES, readRuns } from '../spec/step2d.mjs';
+import { dctxBase, ramDecKnown } from '../spec/step2z.mjs';
 import { buildRunList as zBuildRunList, plannedKey as zPlannedKey, rowKey as zRowKey, runListIdentity as zListId } from '../runs/run-z.mjs';
 import { planIdentity as dPlanIdentity, plannedKey as dPlannedKey, rowKey as dRowKey, runListIdentity as dListId } from '../runs/run-d.mjs';
 
@@ -893,6 +894,12 @@ export function buildFitFromRows({ zRows = [], dRows = [], runlist = { cells: []
 export function buildFit({ z: zPaths, d: dPaths, runlist: runlistPath, druns: dRunlistPath }) {
   const read = (paths) => paths.map((p) => ({ path: p, rows: readRuns(p).rows }));
   const zIn = read(zPaths);
+  // Equation 4's decoder term counts the prefix DDict only when a frame was decoded against a prefix
+  // (step2z dctxKnown); the runner saved known_m_dec with the probe's estimate, so it is computed again here.
+  for (const z of zIn) {
+    const base = dctxBase(z.rows);
+    for (const r of z.rows) if (!r.error) r.known_m_dec = ramDecKnown(r, base);
+  }
   const dIn = read(dPaths);
   const json = (p) => (p && fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null);
   const runlist = json(runlistPath) ?? { cells: [], counts: {}, contents: [] };

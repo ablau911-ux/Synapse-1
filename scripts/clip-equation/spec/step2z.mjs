@@ -20,6 +20,14 @@ const INSTANT_MS = 50;
 const RAM_TOLERANCE = 0.10;
 // Dictionary training uses the first 20 new frames (plan factor Z4; exp_z.rs DICT_TRAIN_FRAMES).
 const DICT_TRAIN_FRAMES = 20;
+// zstd 1.5.7 ZDICT_trainFromBuffer = fastCover with splitPoint 0.75 (FASTCOVER_DEFAULT_SPLITPOINT). FASTCOVER_ctx_init
+// needs floor(0.75 · N) >= 5 training and N − floor(0.75 · N) >= 1 test samples, else ERROR(srcSize_wrong),
+// "Src size is incorrect" (lib/dictBuilder/fastcover.c): a dictionary needs N_train >= 7 new frames.
+const ZDICT_SPLIT = 0.75;
+const ZDICT_MIN_TRAIN = 5;
+const ZDICT_MIN_TEST = 1;
+const ZDICT_REFUSED = /Src size is incorrect/;
+const canTrainDictionary = (n) => Math.floor(n * ZDICT_SPLIT) >= ZDICT_MIN_TRAIN && n - Math.floor(n * ZDICT_SPLIT) >= ZDICT_MIN_TEST;
 // Ways with independent frames (seek 1); every other way keeps the previous frame or a stream.
 const INDEPENDENT_WAYS = new Set(['ZW0', 'ZW1', 'ZW2', 'ZW3', 'ZW4', 'ZW5', 'ZW6', 'ZW16', 'ZW17']);
 
@@ -89,22 +97,55 @@ export function ramKnown(r) {
 }
 
 /**
- * The known decoder RAM of one row before the fitted m_d0 (equation 4): M_0 + M_dctx + B_d · px · 3 + b_max.
- * M_dctx is the probe's estimate (single-pass DCtx for one stream with K_z = 1). One calculation for the
- * checks and the runner's saved `known_m_dec`.
+ * ZSTD_estimateDCtxSize of the probe that wrote `rows`: the decoder estimate of every whole-frame row
+ * without a dictionary (one value; undefined if the rows give none or disagree).
  */
-export function ramDecKnown(r) {
-  return num(r.m0_private) + num(r.m_dctx_est) + num(r.bd) * num(r.w) * num(r.h) * 3 + (num(r.b_max) || 0);
+export function dctxBase(rows) {
+  const values = new Set(rows.filter((r) => !r.error && r.mode === 'whole' && num(r.dict) === 0).map((r) => num(r.m_dctx_est)));
+  return values.size === 1 ? [...values][0] : undefined;
+}
+
+/**
+ * The known decoder context of one row (equation 4): the probe's estimate, except that a prefix way whose clip
+ * has no frame decoded against a prefix (N_prefixed = N_comp − ceil(N_comp / K_z) = 0, e.g. a one-frame clip)
+ * never calls ZSTD_DCtx_refPrefix, so zstd builds no prefix DDict: M_dctx = ZSTD_estimateDCtxSize (`base`).
+ * Without `base` the probe's estimate stands.
+ */
+export function dctxKnown(r, base = num(r.m_dctx_est)) {
+  const frames = num(r.frames);
+  const kz = r.kz === 'all' ? frames : num(r.kz);
+  const prefixed = frames - Math.ceil(frames / kz);
+  return r.mode === 'prefix' && prefixed === 0 ? base : num(r.m_dctx_est);
+}
+
+/**
+ * The known decoder RAM of one row before the fitted m_d0 (equation 4): M_0 + M_dctx + B_d · px · 3 + b_max,
+ * M_dctx as dctxKnown. One calculation for the checks, the runner's saved `known_m_dec` and the fit.
+ */
+export function ramDecKnown(r, base) {
+  return num(r.m0_private) + dctxKnown(r, base) + num(r.bd) * num(r.w) * num(r.h) * 3 + (num(r.b_max) || 0);
 }
 
 /** The per-row checks of one run: { scenario, known, measured, ok }, { scenario, note } or { scenario, known, measured, fit: true }. */
-export function rowChecks(r, folder) {
+export function rowChecks(r, folder, ctx = {}) {
   const px = num(r.w) * num(r.h);
   // A pilot run may cover only the first `frames_cap` new frames: then N_comp = that cap.
   const cap = num(r.frames_cap);
   const nKnown = Number.isFinite(cap) && cap > 0 ? Math.min(cap, folder.nNew) : folder.nNew;
   const out = [];
   const add = (scenario, known, measured, ok) => out.push({ scenario, known, measured, ok });
+  // A run the equations say cannot run must end in zstd's refusal; any other error is a failure. A run that
+  // ended in an error has no measurements to check.
+  if (num(r.dict) > 0) {
+    const n = Math.min(DICT_TRAIN_FRAMES, nKnown);
+    const train = Math.floor(n * ZDICT_SPLIT);
+    const can = canTrainDictionary(n);
+    add('runs', can ? `trains: N_train ${n}, ${train} training + ${n - train} test samples` : `zstd refuses: N_train ${n} gives ${train} training samples (< ${ZDICT_MIN_TRAIN}): Src size is incorrect`,
+      r.error || 'ran', can ? !r.error : ZDICT_REFUSED.test(r.error ?? ''));
+  } else if (r.error) {
+    add('runs', 'ran', r.error, false);
+  }
+  if (r.error) return out;
   add('frames', nKnown, num(r.frames), num(r.frames) === nKnown);
   add('bytes', `Σ out ${r.bytes_out}`, `on disk ${r.bytes_disk}`, num(r.bytes_out) === num(r.bytes_disk) && num(r.bytes_disk) > 0);
   // M4: every retained file counts: the frame files, frames.jsonl (one line per instant) and clip.json.
@@ -151,7 +192,7 @@ export function rowChecks(r, folder) {
     add(ram.scenario, ram.label, num(r.peak_private), within(ram.known, num(r.peak_private), RAM_TOLERANCE));
   }
   // The decoder context zstd allocated equals its estimate (one stream with K_z = 1: single pass, no window).
-  if (r.mode !== 'raw') add('dctx', num(r.m_dctx_est), num(r.dctx_sizeof), num(r.dctx_sizeof) === num(r.m_dctx_est));
+  if (r.mode !== 'raw') add('dctx', dctxKnown(r, ctx.dctxBase), num(r.dctx_sizeof), num(r.dctx_sizeof) === dctxKnown(r, ctx.dctxBase));
   if (r.known_m_comp !== undefined) add('ramShared', Math.round(ram.known), num(r.known_m_comp), num(r.known_m_comp) === ram.known);
   const rate = num(r.rate);
   if (rate > 0) {
@@ -169,7 +210,7 @@ export function rowChecks(r, folder) {
   add('seek', independent ? 1 : `<= ${kz}`, num(r.n_dec_worst), seekOk);
   // + b_max: the compressed frame the viewer reads is held too (largest clip file, known after compressing).
   // M_dec gains m_d0, fitted in step 4: known after the fit.
-  out.push({ scenario: 'ramDec', fit: true, known: `${Math.round(ramDecKnown(r))} + m_d0`, measured: num(r.dec_peak_private) });
+  out.push({ scenario: 'ramDec', fit: true, known: `${Math.round(ramDecKnown(r, ctx.dctxBase))} + m_d0`, measured: num(r.dec_peak_private) });
   const readyMs = num(r.t_ready_ns) / 1e6;
   add('ready', `<= ${INSTANT_MS} ms`, `${readyMs.toFixed(2)} ms`, readyMs <= INSTANT_MS);
   return out;
@@ -328,7 +369,8 @@ export function run(argv = process.argv.slice(2), out = console.log) {
     seek: new Scenario('seek cost', 'N_dec(worst) = 1 independent; <= K_z otherwise'),
     ramDec: new Scenario('decoder RAM', 'M_dec = M_0 + M_dctx + B_d · px · 3 + b_max + m_d0 (m_d0 fitted) within ±10 % of decode peak private bytes'),
     ramDict: new Scenario('RAM with a trained dictionary', 'M_comp(ZW16) = M_0 + M_cctx + B_c · px · 3 + μ · S_samples (μ fitted), S_samples = N_train · px · 3'),
-    dctx: new Scenario('decoder context', 'M_dctx (zstd estimate; one stream with K_z = 1: ZSTD_estimateDCtxSize, single pass) = ZSTD_sizeof_DCtx after the last frame'),
+    dctx: new Scenario('decoder context', 'M_dctx (zstd estimate; one stream with K_z = 1: ZSTD_estimateDCtxSize, single pass; a prefix way with N_prefixed = 0: no prefix DDict) = ZSTD_sizeof_DCtx after the last frame'),
+    runs: new Scenario('runs that can run', 'every run ends without an error, except ZW16 with N_train = min(20, N_new) < 7, which zstd refuses (fastCover: floor(0.75 · N_train) >= 5 training + 1 test sample)'),
     ready: new Scenario('time until ready', `t_ready = t_close <= ${INSTANT_MS} ms`),
     samplerFree: new Scenario('no memory sampler in the measured work', 'memory samplers running during the way\'s measured work = 0 (RAM is the OS peak; CPU measured as in way D)'),
     listId: new Scenario('run list identity', 'z-runlist.json hash = hash of its plan = hash of the plan rebuilt now (budget, factors, hold-out seed); every full-run row names it'),
@@ -343,10 +385,11 @@ export function run(argv = process.argv.slice(2), out = console.log) {
 
   const configKey = (r) => runner.rowKey({ ...r, rep: '' });
   const byConfig = new Map();
+  const ctx = { dctxBase: dctxBase(rows) };
   for (const r of rows) {
     let checks;
     try {
-      checks = rowChecks(r, CorpusFolder.of(corpusRoot, r.folder));
+      checks = rowChecks(r, CorpusFolder.of(corpusRoot, r.folder), ctx);
     } catch (e) {
       s.frames.check(r, 'corpus folder', `unreadable: ${e.message}`, false);
       continue;
@@ -356,6 +399,8 @@ export function run(argv = process.argv.slice(2), out = console.log) {
       else if (c.fit) s[c.scenario].fitRow(r, c.known, c.measured);
       else s[c.scenario].check(r, c.known, c.measured, c.ok);
     }
+    // A run that ended in an error wrote no clip: it has no size to repeat (the `runs` check judged it).
+    if (r.error) continue;
     const key = configKey(r);
     if (!byConfig.has(key)) byConfig.set(key, []);
     byConfig.get(key).push(r);

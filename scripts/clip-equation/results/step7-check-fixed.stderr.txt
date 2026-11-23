@@ -1,0 +1,14 @@
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+warning: constant `GOP_FRAMES` is never used
+  --> crates\synapse-mcp\src\server\clip_encoder.rs:29:18
+   |
+29 | pub(super) const GOP_FRAMES: u32 = 20;
+   |                  ^^^^^^^^^^
+   |
+   = note: `-W dead-code` implied by `-W unused`
+   = help: to override `-W unused` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+warning: `synapse-mcp` (bin "synapse-mcp") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 08s

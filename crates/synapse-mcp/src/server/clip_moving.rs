@@ -101,6 +101,8 @@ pub(super) struct MovingSummary {
     pub short: Vec<ShortSegment>,
     pub grant: Option<EncoderGrant>,
     pub unavailable: Option<String>,
+    pub creation_ms: usize,
+    pub high_water: usize,
 }
 enum MovingJob {
     Begin { segment: u32, rect: PixelRect, first_instant: u64 },
@@ -204,12 +206,16 @@ impl MovingCoder {
     pub fn high_water(&self) -> usize { self.high_water }
     pub fn creation_ms(&self) -> usize { self.creation_ms.load(Ordering::Acquire) }
     pub fn finish(mut self) -> MovingSummary {
+        let creation_ms = self.creation_ms();
+        let high_water = self.high_water();
         drop(self.jobs);
         let mut summary = match self.thread.take().map(JoinHandle::join) {
             Some(Ok(summary)) => summary,
             _ => { MovingAvailability::set_unavailable("moving thread panicked".into()); MovingSummary::default() }
         };
         summary.committed.extend(self.committed.try_iter());
+        summary.creation_ms = creation_ms;
+        summary.high_water = high_water;
         if let MovingAvailability::Unavailable(reason) = MovingAvailability::get() { summary.unavailable = Some(reason); }
         summary
     }

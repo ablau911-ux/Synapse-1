@@ -1008,6 +1008,12 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: continuation 3, viewer and live verification
+
+The composed viewer builds with the recorder and recovery code. Viewer PNGs retain their existing top-left labels; independent pixel checks compare rows below the 40-row label area. The D5 moving-stop check uses the last instant of the stored moving interval as "last recorded motion", consistent with treating the rectangle as moving by record through its hold interval.
+
+Live-driver files are untouched under the latest owner instruction. `dyn-folder`, `dyn-recovery`, `dyn-viewer`, and D5 must not be called green until their live evidence exists. The red scripts and per-step Cargo diagnostics are retained even where the numbered order temporarily required later modules to compile.
+
 ### 2026-11-23: continuation 3, step 3 acceptance gaps
 
 The first combined-layer run passed the exact-byte and geometry checks: scene 1 opened at 44, ended at 134, restored exact rows at 135, and wrote no exact record while the box stayed open. The minimum size, minimum side, flat-colour cost, slow-change share, largest-group, odd alignment, corner clamp, typing and UI checks passed.

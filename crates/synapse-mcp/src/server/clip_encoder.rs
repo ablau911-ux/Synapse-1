@@ -28,8 +28,7 @@ use windows::core::{GUID, HSTRING, Interface};
 pub(super) const H264_QUALITY_LEVEL: u32 = 90;
 pub(super) const GOP_FRAMES: u32 = 20;
 const NOMINAL_BITS_PER_PIXEL_FRAME: f64 = 0.10;
-const KEYFRAME_INTERVAL_MS: u32 = 1_000;
-const MILLIS_PER_SECOND: u32 = 1_000;
+const GOP_REFERENCE_FPS: u32 = 20;
 const MAX_ENCODE_MACROBLOCKS: u64 = 36_864;
 const MAX_ENCODE_SIDE: u32 = 4_096;
 const MACROBLOCK_SIDE: u32 = 16;
@@ -147,7 +146,7 @@ const fn even_up(value: u32) -> u32 {
 }
 
 const fn gop_frames(fps: u32) -> u32 {
-    KEYFRAME_INTERVAL_MS * fps / MILLIS_PER_SECOND
+    GOP_FRAMES * fps / GOP_REFERENCE_FPS
 }
 
 /// The grant read from the actual hardware transform.

@@ -1,0 +1,19 @@
+d5: viewer output (none given), schedule (none given)
+action | equation | known | equation value | measured | result
+a moving area is one animation | count(animating) = 1; bbox = stored rect; inner changes = 0 | true | - | error: no input: viewer output (none given) | FAIL
+a moving area that stops gives one change | count(change at moving end +/- one instant) = 1 | true | - | error: no input: viewer output (none given) | FAIL
+every scheduled event reported | one-to-one: kind = expect, bbox meets region, |start_ms - t| <= frame_ms; missed = duplicate = key problems = unexpected = 0 | 0, 0, 0, 0 | - | error: no input: viewer output (none given) | FAIL
+still period gives no event | count(events starting in [t_still, t_still + 10000)) = 0 | 0 | - | error: no input: viewer output (none given) | FAIL
+still clip gives no event | count(events) = 0 | 0 | - | error: no input: viewer output (none given) | FAIL
+lone spinner gives exactly one animation | count(animating) = 1, count(change) + count(short_lived) = 0 | 1, 0 | - | error: no input: viewer output (none given) | FAIL
+keyframe instants give no event | keyframes_ms = sorted(segments.keyframe_instants) * frame_ms; encoded > GOP_FRAMES => some keyframe > frame_ms; count(events at a keyframe instant and not matched to a row) = 0 | 0 | - | error: no input: viewer output (none given) | FAIL
+flash clip gives one FLASH per flash | per flash count(short_lived, |start_ms - t| <= frame_ms) = 1; other events = 0 | 1, 0 | - | error: no input: viewer output (none given) | FAIL
+#293-1 a fade is one change from its start | count(matched change of the fade row) = 1 | 1 | - | error: no input: viewer output (none given) | FAIL
+#293-2 an animation that stays SAME to its anchor | count(matched animating) = 1, count(other events in region in [t, t_end)) = 0 | 1, 0 | - | error: no input: viewer output (none given) | FAIL
+#293-3 a change is pictured at its confirmed settle frame | pick.frame = N, min(end_frame + K_s, last) <= N <= last | every settled change | - | error: no input: viewer output (none given) | FAIL
+#293-4a quiet one instant less than SETTLE_MS before the clip end is not settled | onset = ceil((page_start - s_0 + set_ms) / frame_ms) = ceil((page_start - s_0 + shown_ms) / frame_ms), else ambiguous_onset; quiet = stop(frames.jsonl) - onset * frame_ms = SETTLE_MS - frame_ms; outcome = unsettled | 150, unsettled | - | error: no input: viewer output (none given) | FAIL
+#293-4b quiet exactly SETTLE_MS before the clip end is settled | onset = ceil((page_start - s_0 + set_ms) / frame_ms) = ceil((page_start - s_0 + shown_ms) / frame_ms), else ambiguous_onset; quiet = stop(frames.jsonl) - onset * frame_ms = SETTLE_MS; outcome = settled | 200, settled | - | error: no input: viewer output (none given) | FAIL
+#293-5 only the animated stretch is exempt from FLASH | count(short_lived in region in [t_alt, t_alt_end)) = 0, count(matched short_lived of the dark flash) = 1 | 0, 1 | - | error: no input: viewer output (none given) | FAIL
+#293-6 flashes are timed from their presentation | set_ms <= shown_ms <= hide_ms <= hidden_ms, hide_ms - shown_ms >= 50 | every flash row | - | error: no input: schedule in (none given) | FAIL
+#293-7 the schedule box shows every row | scroll size <= client size, 0 <= left, top; right <= innerWidth; bottom <= innerHeight; no card overlaps (window.scheduleBoxFits) | true | - | error: no input: schedule in (none given) | FAIL
+d5: 16 failed, 0 pending

@@ -42,6 +42,7 @@
 <div class="scene" id="still"><div class="card" id="note">Clip D5 still scene: nothing on this page changes.</div></div>
 <div class="scene" id="spinner"><div class="card" id="lonecard"><div class="spinner" id="spinnerA"></div></div></div>
 <div class="scene" id="flash"><div class="card" id="flashcard"><div id="flashbox"></div></div></div>
+<div class="scene" id="video"><div class="card" style="left:720px;top:80px;width:300px;padding:16px">Static text beside the moving canvas stays exact.</div><canvas id="videoCanvas" width="640" height="360" style="position:absolute;left:48px;top:80px"></canvas></div>
 <script>
   const FLASH_MS = 50;           // d_min: one recorded instant
   const FLASH_PERIOD_MS = 1000;  // one flash per second
@@ -63,6 +64,29 @@
   const due = (n) => FIRST_FLASH_MS + n * FLASH_PERIOD_MS + (n * PHASE_STEP_MS) % INSTANT_MS;
   window.flashCount = FLASH_COUNT;
   window.flashEndMs = due(FLASH_COUNT - 1) + FLASH_MS;
+
+  if (scene.id === 'video') {
+    const VIDEO_MS = 20000, VIDEO_STEP_MS = 50, CHANNELS = 4, ALPHA = 255;
+    const canvas = document.getElementById('videoCanvas'), context = canvas.getContext('2d');
+    const picture = context.createImageData(canvas.width, canvas.height);
+    let previous = -1;
+    window.videoTiming = { start, end: start + VIDEO_MS, rect: canvas.getBoundingClientRect().toJSON() };
+    const draw = (timestamp) => {
+      const elapsed = performance.timeOrigin + timestamp - start;
+      const number = Math.floor(elapsed / VIDEO_STEP_MS);
+      if (elapsed >= 0 && elapsed < VIDEO_MS && number !== previous) {
+        previous = number;
+        for (let pixel = 0; pixel < canvas.width * canvas.height; pixel++) {
+          const x = pixel % canvas.width, y = Math.floor(pixel / canvas.width), at = pixel * CHANNELS;
+          const value = (Math.imul(x + number, 1103515245) ^ Math.imul(y + number, 12345)) >>> 16;
+          picture.data[at] = value & 255; picture.data[at+1] = (value * 3) & 255; picture.data[at+2] = (value * 7) & 255; picture.data[at+3] = ALPHA;
+        }
+        context.putImageData(picture,0,0);
+      }
+      if (elapsed < VIDEO_MS) requestAnimationFrame(draw);
+    };
+    requestAnimationFrame(draw);
+  }
 
   if (scene.id === 'flash') {
     const box = document.getElementById('flashbox');

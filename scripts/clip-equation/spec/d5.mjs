@@ -141,13 +141,14 @@ class RecorderFiles {
 
   /** Every keyframe instant of the segments, in clip ms, ascending. */
   keyframesMs(frameMs) {
-    const instants = new Set((this.meta.segments ?? []).flatMap((s) => s.keyframe_instants ?? []));
+    const instants = new Set(this.lines.filter(l => l.x?.[1] === 0).map(l => l.instant));
+    for (const s of this.meta.moving?.segments ?? []) for (const [frame] of s.key_frames) instants.add(s.first_instant + frame);
     return [...instants].sort((a, b) => a - b).map((k) => k * frameMs);
   }
 
   /** The frames the encoder received: instants with a new frame (repeats are not encoded). */
   get encodedFrames() {
-    return this.lines.filter((l) => l.new === true).length;
+    return this.lines.filter(l => l.x || l.mv).length;
   }
 }
 
@@ -452,6 +453,24 @@ function checks(inputs) {
       };
       const found = [...atKeyframe(proof.clip, match.used), ...atKeyframe(still, new Set())];
       return { value: 0, measured: `${found.length} unscheduled events at keyframes: ${list(found)}`, pass: found.length === 0 };
+    },
+
+    'a moving area is one animation'() {
+      const video = inputs.clip('video'), files = new RecorderFiles(video);
+      const segments = files.meta.moving?.segments || [];
+      const box = segments[0]?.rect;
+      const events = video.events.filter(e => e.kind === 'animating');
+      const inside = video.events.filter(e => e.kind !== 'animating' && segments.some(s =>
+        e.start_frame >= s.first_instant && e.start_frame <= s.last_instant &&
+        ViewedClip.meets(e, { x:s.rect[0], y:s.rect[1], w:s.rect[2], h:s.rect[3] })));
+      return { value:true, measured:JSON.stringify({events,inside,box}), pass:segments.length > 0 && events.length === 1 &&
+        JSON.stringify(events[0].bbox) === JSON.stringify({x:box[0],y:box[1],w:box[2],h:box[3]}) && inside.length === 0 };
+    },
+    'a moving area that stops gives one change'() {
+      const video = inputs.clip('video'), files = new RecorderFiles(video);
+      const end = files.meta.moving?.segments?.at(-1)?.last_instant;
+      const changes = video.events.filter(e => e.kind === 'change' && Math.abs(e.start_frame-end) <= 1);
+      return { value:true, measured:JSON.stringify(changes), pass:Number.isFinite(end) && changes.length === 1 };
     },
 
     'flash clip gives one FLASH per flash'() {

@@ -1111,7 +1111,7 @@ mod live {
                 Ok(summary) => summary,
                 Err(error) => {
                     let _ = ClipJson::update(&self.plan.folder, |clip| { clip.state = ClipState::Failed; clip.failure = Some(error); });
-                    self.observer.stop();
+                    let _ = self.observer.stop();
                     return;
                 }
             };

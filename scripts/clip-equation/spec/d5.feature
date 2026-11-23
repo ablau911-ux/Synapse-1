@@ -20,6 +20,16 @@
 
 Feature: The viewer reports each scheduled UI event once, with its type, region and start, and nothing else
 
+  Scenario: a moving area is one animation
+    Given the video clip with its stored moving rectangle
+    Then one animation has that rectangle and no pixel-noise event lies inside it while moving
+    # Equation: count(animating) = 1; bbox = stored rect; inner changes = 0 | Known: true
+
+  Scenario: a moving area that stops gives one change
+    Given the video clip after its moving interval ends
+    Then one change begins within one instant of its last recorded motion
+    # Equation: count(change at moving end +/- one instant) = 1 | Known: true
+
   # D5 item 7: the acceptance lines.
 
   Scenario: every scheduled event reported

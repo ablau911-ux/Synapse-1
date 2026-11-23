@@ -42,6 +42,7 @@ use synapse_core::{Rect, error_codes};
 use super::ErrorData;
 use super::clip_decoder::{ClipDecoder, DecodedFrame};
 use super::clip_exact::{ExactEntry, ExactReader};
+use super::clip_motion::{BlockGrid as Grid, BLOCK, MotionTiming, MotionWindow, PixelRect, SHORT_LIVED_MS};
 use super::clip_folder::{
     CLIP_JSON_FILE, ClipJson, ClipState, FRAMES_FILE, FrameLine, VIEWS_DIR,
     CommittedSegment, read_frame_lines,
@@ -72,36 +73,10 @@ const TEXT_CHARS_PER_TOKEN: usize = 4;
 /// Close-ups enlarge by whole-number duplication (D3).
 const CLOSEUP_SCALE: u32 = 2;
 
-/// Side of the change-test blocks, in recorded clip pixels.
-const BLOCK: usize = 8;
-/// δ_lo, δ_hi: a pixel counts at a threshold when its largest R, G or B
-/// difference is above it (D5 step 1).
+/// Exact pixels need only the retained viewer threshold.
 const DELTA_LO: u8 = 32;
-const DELTA_HI: u8 = 64;
-/// ν(δ_lo), ν(δ_hi): the most pixels of one 8 × 8 block of static content
-/// above δ_lo and δ_hi between two decoded frames (H.264, quality 70, GOP
-/// 20). Measured on the proof clip (`cb70a9f7`): static text 7 and 1, blank
-/// areas none. The D5 proof clips measure them again; if ν is exceeded, N_hi
-/// and N_lo are recomputed from the two inequalities below.
-const NOISE_LO: u32 = 7;
-const NOISE_HI: u32 = 1;
-/// N_hi > 2 · ν(δ_hi): pixels above δ_hi that make a block differ (text
-/// strokes have dozens).
-const N_HI: u32 = 3;
-/// 2 · ν(δ_lo) < N_lo ≤ 32: pixels above δ_lo that make a block differ, so a
-/// flat fill over half a block is always seen (a list selection #cce8ff or a
-/// grey fill #d0d0d0 on white differs by about 50).
-const N_LO: u32 = 16;
-const _: () =
-    assert!(N_HI > 2 * NOISE_HI && N_LO > 2 * NOISE_LO && N_LO as usize <= BLOCK * BLOCK / 2);
 /// A block has settled after this long the same: K_s = SETTLE_MS · f / 1000.
 const SETTLE_MS: u64 = 200;
-/// A block back at its anchor within this is a FLASH, later a REVERTED; also
-/// W_a, the window of a block's activity (D5 steps 2 and 3).
-const SHORT_LIVED_MS: u64 = 500;
-/// A block animates while it changed against the previous frame in at least
-/// this share of the instants of the last W_a (D5 step 3).
-const ANIMATING_CHANGE_SHARE: f64 = 0.5;
 /// Block changes with the same outcome and overlapping intervals form one
 /// event across at most this many empty blocks (columns, rows): wide along a
 /// row, so the changed words of one text line are one event, and two blocks
@@ -126,7 +101,7 @@ const MAX_DIFF_REGIONS: usize = 20;
 
 /// Cached overview analysis, so later pages skip the full decode.
 const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 13;
+const ANALYSIS_VERSION: u32 = 14;
 
 /// Runs a `clip_*` operation and builds the tool result: the response JSON as
 /// structured content, then a text timeline, then `Image k` label + PNG pairs.
@@ -230,9 +205,6 @@ impl ViewedClip {
         u64::from(self.clip.fps)
     }
 
-    fn frame_ms(&self) -> u64 {
-        (1_000 / self.fps()).max(1)
-    }
 
     /// The last instant that is in a committed segment.
     fn last_frame(&self) -> u64 { self.lines.last().map_or(0, |line| line.instant) }
@@ -416,106 +388,6 @@ fn pixel_delta(a: &[u8], b: &[u8]) -> u8 {
         .unwrap_or(0)
 }
 
-/// The block test of two pictures in one block (D5 step 1).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    Same,
-    Diff,
-    Undecided,
-}
-
-impl Verdict {
-    /// DIFF when n_δhi ≥ N_hi or n_δlo ≥ N_lo; SAME when n_δhi ≤ ν(δ_hi) and
-    /// n_δlo ≤ ν(δ_lo); otherwise undecided. `pairs` are the block's pixels
-    /// in both pictures, three bytes each.
-    fn of<'p>(pairs: impl Iterator<Item = (&'p [u8], &'p [u8])>) -> Self {
-        let (mut above_lo, mut above_hi) = (0_u32, 0_u32);
-        for (a, b) in pairs {
-            let delta = pixel_delta(a, b);
-            above_lo += u32::from(delta > DELTA_LO);
-            above_hi += u32::from(delta > DELTA_HI);
-        }
-        if above_hi >= N_HI || above_lo >= N_LO {
-            Self::Diff
-        } else if above_hi <= NOISE_HI && above_lo <= NOISE_LO {
-            Self::Same
-        } else {
-            Self::Undecided
-        }
-    }
-}
-
-/// The 8 × 8 block layout of a picture of one size.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Grid {
-    width: usize,
-    height: usize,
-    cols: usize,
-    rows: usize,
-}
-
-impl Grid {
-    fn new(width: usize, height: usize) -> Self {
-        Self {
-            width,
-            height,
-            cols: width.div_ceil(BLOCK),
-            rows: height.div_ceil(BLOCK),
-        }
-    }
-
-    fn blocks(self) -> usize {
-        self.cols * self.rows
-    }
-
-    /// Column and row of block `b`.
-    fn place(self, b: usize) -> (usize, usize) {
-        (b % self.cols.max(1), b / self.cols.max(1))
-    }
-
-    /// The pixels of block `b`: x0, y0 and the exclusive x1, y1.
-    fn span(self, b: usize) -> (usize, usize, usize, usize) {
-        let (col, row) = self.place(b);
-        (
-            col * BLOCK,
-            row * BLOCK,
-            ((col + 1) * BLOCK).min(self.width),
-            ((row + 1) * BLOCK).min(self.height),
-        )
-    }
-
-    /// The byte range of each pixel row of block `b` in an R, G, B picture.
-    fn rows_of(self, b: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
-        let (x0, y0, x1, y1) = self.span(b);
-        (y0..y1).map(move |y| (y * self.width + x0) * 3..(y * self.width + x1) * 3)
-    }
-
-    /// `true` when blocks `a` and `b` are 8-neighbours with at most `gap`
-    /// empty blocks between them (columns, rows).
-    fn near(self, a: usize, b: usize, gap: (usize, usize)) -> bool {
-        let ((col_a, row_a), (col_b, row_b)) = (self.place(a), self.place(b));
-        col_a.abs_diff(col_b) <= gap.0 + 1 && row_a.abs_diff(row_b) <= gap.1 + 1
-    }
-
-    /// The bounding box of some blocks, in recorded pixels.
-    fn bbox(self, blocks: impl IntoIterator<Item = usize>) -> Option<Rect> {
-        blocks
-            .into_iter()
-            .map(|b| self.span(b))
-            .reduce(|(a0, b0, a1, b1), (x0, y0, x1, y1)| {
-                (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
-            })
-            .map(|(x0, y0, x1, y1)| rect(x0, y0, x1 - x0, y1 - y0))
-    }
-
-    /// `count` blocks as a percentage of the picture, one decimal.
-    fn percent(self, count: u64) -> f64 {
-        (count as f64 * 1_000.0 / self.blocks().max(1) as f64).round() / 10.0
-    }
-}
-
-/// One picture as R, G, B bytes per pixel: the change test compares colour,
-/// so a hue change with equal luma still counts.
 #[derive(Clone)]
 struct Picture {
     grid: Grid,
@@ -535,12 +407,8 @@ impl Picture {
     }
 
     /// D5 step 1 for block `b` of this picture and of `other` (same size).
-    fn test(&self, other: &Self, b: usize) -> Verdict {
-        Verdict::of(self.grid.rows_of(b).flat_map(|row| {
-            let mine = self.rgb.get(row.clone()).unwrap_or_default();
-            let theirs = other.rgb.get(row).unwrap_or_default();
-            mine.chunks_exact(3).zip(theirs.chunks_exact(3))
-        }))
+    fn test(&self, other: &Self, b: usize) -> bool {
+        self.grid.differs(&self.rgb, &other.rgb, b, DELTA_LO)
     }
 
     /// A copy of the pixels of block `b`, row after row.
@@ -590,7 +458,7 @@ struct BlockMap {
 impl BlockMap {
     fn between(before: &Picture, after: &Picture) -> Self {
         let changed: Vec<bool> = (0..after.grid.blocks())
-            .map(|b| after.test(before, b) == Verdict::Diff)
+            .map(|b| after.test(before, b))
             .collect();
         let count = changed.iter().filter(|flag| **flag).count() as u64;
         Self {
@@ -613,7 +481,7 @@ impl BlockMap {
     }
 
     fn bbox(&self) -> Option<Rect> {
-        self.grid.bbox(self.indices())
+        self.grid.bbox(self.indices()).map(view_rect)
     }
 
     /// Connected groups of changed blocks (8-neighbour), largest first, as
@@ -641,6 +509,7 @@ impl BlockMap {
                 }
             }
             if let Some(rect) = self.grid.bbox(group.iter().copied()) {
+                let rect = view_rect(rect);
                 regions.push(ClipChangedRegion {
                     rect,
                     changed_blocks: group.len() as u64,
@@ -661,21 +530,13 @@ impl BlockMap {
 struct Instants {
     /// K_s = SETTLE_MS · f / 1000.
     settle: u64,
-    /// W_a = SHORT_LIVED_MS · f / 1000.
-    activity: u64,
-    /// The changes within W_a that make a block animate.
-    animating: usize,
+    motion: MotionTiming,
 }
 
 impl Instants {
     fn of(clip: &ViewedClip) -> Self {
         let per_ms = |ms: u64| (ms * clip.fps() / 1_000).max(1);
-        let activity = per_ms(SHORT_LIVED_MS);
-        Self {
-            settle: per_ms(SETTLE_MS),
-            activity,
-            animating: ((activity as f64 * ANIMATING_CHANGE_SHARE).ceil() as usize).max(1),
-        }
+        Self { settle: per_ms(SETTLE_MS), motion: MotionTiming::of(clip.clip.fps) }
     }
 }
 
@@ -714,7 +575,7 @@ impl Recent {
     fn stable_since(&self, picture: &Picture, b: usize, now: u64) -> u64 {
         let mut since = now;
         for (first, earlier) in self.pictures.iter().rev() {
-            if picture.test(earlier, b) != Verdict::Same {
+            if picture.test(earlier, b) {
                 break;
             }
             since = *first;
@@ -769,7 +630,8 @@ enum Close {
 struct BlockState {
     /// The instants of its last changes against the previous frame: at most
     /// as many as make it animate.
-    moves: VecDeque<u64>,
+    moves: MotionWindow,
+    recorded_until: Option<u64>,
     /// The first instant of the picture it shows now (SAME since then).
     stable_since: u64,
     /// While quiet: the first instant of its current run of pictures that
@@ -784,10 +646,7 @@ impl BlockState {
     /// The first instant at which the block no longer animates: fewer than
     /// `Instants::animating` changes in the W_a that ends there.
     fn animating_until(&self, instants: Instants) -> u64 {
-        match self.moves.front() {
-            Some(first) if self.moves.len() >= instants.animating => first + instants.activity,
-            _ => 0,
-        }
+        self.moves.animating_until(&instants.motion).max(self.recorded_until.unwrap_or(0))
     }
 
     /// When an open change settles if nothing changes any more: SAME for K_s
@@ -907,6 +766,7 @@ impl<'a> Analyzer<'a> {
         }
         self.settle_due(instant.saturating_sub(1));
         let masked = self.cursor_blocks(instant);
+        let recorded = self.clip.line(instant).and_then(|line| line.moving).and_then(|reference| self.clip.clip.moving.segments.iter().find(|s| s.segment.index == reference.segment)).map(|s| (s.segment.rect, s.segment.last_instant + 1));
         let instants = self.instants;
         let Some((_, previous)) = self.recent.latest() else {
             return;
@@ -920,31 +780,30 @@ impl<'a> Analyzer<'a> {
                 }
                 continue;
             }
-            let moved = picture.test(previous, b) == Verdict::Diff;
+            let stored_moving = recorded.is_some_and(|(rect, _)| picture.grid.bbox([b]).is_some_and(|block| rect.intersect(&block).is_some()));
+            let moved = stored_moving || picture.test(previous, b);
             if moved {
                 moved_any = true;
-                state.moves.push_back(instant);
-                if state.moves.len() > instants.animating {
-                    state.moves.pop_front();
-                }
+                state.moves.moved(instant, &instants.motion);
+                if stored_moving { state.recorded_until = recorded.map(|(_, until)| until); }
             }
             // D5 step 3 from the frame-to-frame test alone: a block can
             // animate while every picture stays SAME as its anchor.
-            let animating = instant < state.animating_until(instants);
-            let to_anchor = picture.test(&self.anchor, b);
+            let animating = stored_moving || instant < state.animating_until(instants);
+            let to_anchor = !stored_moving && picture.test(&self.anchor, b);
             if state.active.is_none() {
-                if to_anchor == Verdict::Same {
+                if !to_anchor {
                     state.pending = None;
                 } else {
                     state.pending = state.pending.or(Some(instant));
                 }
-                if to_anchor != Verdict::Diff && !animating {
+                if !to_anchor && !animating {
                     continue;
                 }
                 // quiet -> active on DIFF, or once it animates; the start is
                 // the first instant that was not SAME, or the first motion
                 // of the animation when that is earlier.
-                let first_move = state.moves.front().copied().filter(|_| animating);
+                let first_move = state.moves.first_move().filter(|_| animating);
                 let start = state
                     .pending
                     .take()
@@ -963,7 +822,7 @@ impl<'a> Analyzer<'a> {
             let Some(activity) = state.active.as_mut() else {
                 continue;
             };
-            if to_anchor == Verdict::Diff {
+            if to_anchor {
                 activity.differed.push(instant);
             }
             if moved {
@@ -972,10 +831,10 @@ impl<'a> Analyzer<'a> {
             if animating {
                 activity.animated_until = Some(instant);
                 activity.left_after_animation = None;
-            } else if activity.animated_until.is_some() && to_anchor != Verdict::Same {
+            } else if activity.animated_until.is_some() && to_anchor {
                 activity.left_after_animation = activity.left_after_animation.or(Some(instant));
             }
-            state.stable_since = self.recent.stable_since(&picture, b, instant);
+            state.stable_since = if stored_moving { instant } else { self.recent.stable_since(&picture, b, instant) };
         }
         if !moved_any {
             self.still_frames += 1;
@@ -1082,14 +941,14 @@ impl<'a> Analyzer<'a> {
                 .map_or(episode.start, |first| first.min(episode.end));
         }
         match picture.test(&self.anchor, b) {
-            Verdict::Diff => {
+            true => {
                 episode.before = self.anchor.block(b);
                 episode.after = picture.block(b);
                 episode.footprint = picture.footprint(&self.anchor, b);
                 self.anchor.copy_block(picture, b);
                 self.episodes.push(episode);
             }
-            Verdict::Same if !activity.differed.is_empty() => {
+            false if !activity.differed.is_empty() => {
                 episode.start = return_start;
                 let span = self.clip.t_of(episode.end) - self.clip.t_of(episode.start);
                 episode.outcome = if span <= SHORT_LIVED_MS {
@@ -1100,9 +959,8 @@ impl<'a> Analyzer<'a> {
                 episode.differed = activity.differed;
                 self.episodes.push(episode);
             }
-            Verdict::Same => {}
+            false => {}
             // Drift or noise: the block takes the picture without an event.
-            Verdict::Undecided => self.anchor.copy_block(picture, b),
         }
     }
 
@@ -1189,7 +1047,7 @@ impl<'a> Analyzer<'a> {
                 self.still_frames
             ),
             format!(
-                "change test: {BLOCK}x{BLOCK} blocks at recorded resolution, largest R/G/B difference; a block differs from its last settled picture when {N_HI} pixels differ by more than {DELTA_HI} or {N_LO} by more than {DELTA_LO}; settled after {SETTLE_MS} ms without change; short-lived = back within {SHORT_LIVED_MS} ms"
+                "change test: {BLOCK}x{BLOCK} exact blocks differ when any R/G/B byte differs by more than {DELTA_LO}; stored moving areas animate without pixel-noise tests; settled after {SETTLE_MS} ms without change; short-lived = back within {SHORT_LIVED_MS} ms"
             ),
         ];
         if clip.clip.observer.cursor_in_picture {
@@ -1402,8 +1260,7 @@ impl Event {
             && self.pictures.iter().zip(&earlier.pictures).all(
                 |((block, _, after), (earlier_block, before, _))| {
                     block == earlier_block
-                        && Verdict::of(after.chunks_exact(3).zip(before.chunks_exact(3)))
-                            == Verdict::Same
+                        && after.iter().zip(before).all(|(a, b)| a.abs_diff(*b) <= DELTA_LO)
                 },
             )
     }
@@ -1423,7 +1280,7 @@ impl Event {
     }
 
     fn entry(&self, clip: &ViewedClip, last_generation: u64) -> ClipTimelineEntry {
-        let bbox = self.grid.bbox(self.blocks.iter().copied());
+        let bbox = self.grid.bbox(self.blocks.iter().copied()).map(view_rect);
         if self.outcome == Outcome::Animation {
             return region_entry(
                 clip,
@@ -1732,7 +1589,7 @@ impl ClipView {
         }
         for (offset, pick) in picks.iter().enumerate() {
             let index = u32::try_from(first + offset + 1).unwrap_or(u32::MAX);
-            let frame = self.decode(pick.frame)?;
+            let frame = self.pictures.at(pick.frame)?;
             let image = fit(to_rgba(&frame), long_edge);
             let stem = format!("overview_{index:02}_f{}", pick.frame);
             self.export(image, index, pick.frame, &pick.reason, &stem)?;
@@ -1787,7 +1644,7 @@ impl ClipView {
                 }
             }
             let index = u32::try_from(self.images.len() + 1).unwrap_or(u32::MAX);
-            let frame = self.decode(number)?;
+            let frame = self.pictures.at(number)?;
             let image = fit(to_rgba(&frame), long_edge);
             let stem = format!("frames_{start}-{end}_{index:02}_f{number}");
             self.export(image, index, number, "range sample", &stem)?;
@@ -1802,7 +1659,7 @@ impl ClipView {
         let t_ms = params.t_ms.unwrap_or(0);
         self.check_committed(t_ms)?;
         let number = self.clip.frame_at_ms(t_ms);
-        let frame = self.decode(number)?;
+        let frame = self.pictures.at(number)?;
         let mut image = to_rgba(&frame);
         let mut stem = format!("frame_f{number}");
         if let Some(region) = params.region {
@@ -1880,8 +1737,8 @@ impl ClipView {
             let _ = writeln!(self.text, "- no new frame between the two times: no change");
             return Ok(());
         }
-        let before = self.decode(from)?;
-        let after = self.decode(to)?;
+        let before = self.pictures.at(from)?;
+        let after = self.pictures.at(to)?;
         if (before.width, before.height) != (after.width, after.height) {
             let _ = writeln!(
                 self.text,
@@ -1890,7 +1747,18 @@ impl ClipView {
             );
             return Ok(());
         }
-        let blocks = BlockMap::between(&Picture::new(&before), &Picture::new(&after));
+        let mut blocks = BlockMap::between(&Picture::new(&before), &Picture::new(&after));
+        for instant in [from, to] {
+            let moving = self.clip.line(instant).and_then(|line| line.moving)
+                .and_then(|reference| self.clip.clip.moving.segments.iter().find(|s| s.segment.index == reference.segment));
+            if let Some(moving) = moving {
+                for b in 0..blocks.grid.blocks() {
+                    if !blocks.changed[b] && blocks.grid.bbox([b]).is_some_and(|r| moving.segment.rect.intersect(&r).is_some()) {
+                        blocks.changed[b] = true; blocks.count += 1;
+                    }
+                }
+            }
+        }
         let mut regions = blocks.regions();
         let _ = writeln!(
             self.text,
@@ -1993,7 +1861,6 @@ impl ClipView {
     }
 
     /// The picture on screen at instant `frame`, from its committed segment.
-    fn decode(&mut self, frame: u64) -> Result<DecodedFrame, ErrorData> { self.pictures.at(frame) }
 
     /// Labels the image (text and drawn copy), writes the PNG under `views/`
     /// and keeps it for the result.
@@ -2123,6 +1990,9 @@ fn scaled(value: u32, scale: f64) -> u32 {
     ((f64::from(value) * scale).round() as u32).max(1)
 }
 
+fn view_rect(rectangle: PixelRect) -> Rect {
+    rect(rectangle.x as usize, rectangle.y as usize, rectangle.w as usize, rectangle.h as usize)
+}
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
     let to_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
     Rect {

@@ -307,4 +307,5 @@ else if (process.argv[2] === 'step2d') process.exitCode = (await import('./step2
 else if (process.argv[2] === 'step4') process.exitCode = await (await import('./step4.mjs')).main(process.argv[3]);
 else if (process.argv[2] === 'step5') process.exitCode = await (await import('./step5.mjs')).main(process.argv[3]);
 else if (process.argv[2] === 'd5') process.exitCode = (await import('./d5.mjs')).main(process.argv[3], process.argv[4]);
+else if (process.argv[2] === 'dyn-exact') await import('./dyn-exact.mjs');
 else main();

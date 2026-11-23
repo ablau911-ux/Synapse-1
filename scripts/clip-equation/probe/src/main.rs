@@ -21,6 +21,12 @@
 
 mod block_coders;
 mod chrome_window;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_exact.rs"]
+mod clip_exact;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_motion.rs"]
+mod clip_motion;
 mod clock;
 mod compress;
 mod delivery;
@@ -29,12 +35,13 @@ mod encoder;
 mod exp_corpus;
 mod exp_cpu;
 mod exp_d;
-#[allow(dead_code)]
-mod exp_settings;
+mod exp_dyn;
 mod exp_encoders;
 #[allow(dead_code)]
 mod exp_measure;
 mod exp_meter;
+#[allow(dead_code)]
+mod exp_settings;
 mod exp_z;
 mod gpu;
 mod hash_frames;
@@ -85,6 +92,7 @@ fn main() {
         "exp-corpus" => exp_corpus::run(),
         "exp-z" => exp_z::run(),
         "exp-d" => exp_d::run(),
+        "exp-dyn" => exp_dyn::run(),
         "exp-rate" => exp_meter::run_rate(),
         _ => Err(format!(
             "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus or exp-z"

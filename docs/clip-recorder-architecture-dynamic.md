@@ -1005,3 +1005,30 @@ The test passes when every scenario passes and the script exits 0. The run's fol
 ### 9.3 What this document does not change
 
 Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy gate before every write; the all-black first frame rule; the cursor rule (not drawn, logged per line); `recorder.lock`; the registry; atomic `clip.json`; the disk rule; the 10 % rule; the `record`, `record_status`, `record_stop`, `record_extend` operations and the four viewer operations; D5 items 2, 4, 5 and 6.
+
+## Builder notes
+
+### 2026-11-23: step 1 size gate failed
+
+The owner approved the cost term, one moving area, and exact initial pictures. The build follows the numbered steps, uses check scripts before product edits, commits locally, and does not push. The owner's explicit instruction also excludes running the YouTube proof.
+
+Step 1 adds `clip_exact.rs`, the `PixelRect` part of `clip_motion.rs`, and the `exp-dyn mode=exact` probe. The files are included directly by the probe and are not yet wired into the server, as section 7 requires. The check is available through `node scripts/clip-equation/spec/run-spec.mjs dyn-exact out=<fresh directory>`.
+
+Readings used to resolve small ambiguities:
+
+- The measurements cited as MB in this document use MiB in their CSV and runner (`test-1080-bigwindow.csv`, `run-1080.mjs`). The checks therefore use 1,048,576 bytes per unit. The acceptance numbers themselves are unchanged.
+- The safe zstd crate has no `EndDirective` export. The code aliases `zstd::zstd_safe::zstd_sys::ZSTD_EndDirective` and passes its flush/end variants to the safe streaming API. It uses no experimental API and no unsafe block.
+- Corpus lines omit `t_ms`; the probe computes it from `instant` and `meta.json`'s `instant_ms`. The mixed input was located at `C:\Users\Adam\clip-corpus\mix-1920x1080`, confirmed by issue #290 comment 1355.
+- A finished exact writer rejects later writes/resizes; repeated `finish` returns the existing summary. Group creation uses `create_new` so a previous recording cannot be overwritten.
+
+The first complete run passed round trips, product-reader seeks, group format, idle, changed-row size, RAM, and mixed-clip size. All eight inputs have zero mismatching bytes, including `typing-506x333` and the 60 s mixed clip. Typing non-key records average 1.383% of a 1080p picture (4.532% at 506×333). The mixed clip occupies 2,912,626 bytes (2.778 MiB), below 3.564 MiB. Maximum measured writer RAM was 160,432,128 bytes (153.000 MiB), below 155.1 MiB.
+
+The remaining failure is scroll size: **10.1841716766 MiB/min versus the required 9.4**. Its group files alone contain 3,517,163 bytes, or 10.0626840591 MiB/min, so index overhead does not explain the failure. A fresh run of the existing whole-frame `exp-z` baseline with level 1, window log 27, no long-distance matching, and groups of 20 gives **9.4372158051 MiB/min**, zero mismatches, and a 20-record seek bound (`results/dyn-scroll-baseline.json`). That agrees with the rounded historical 9.4 figure. Removing unchanged rows changes the byte sequence presented to zstd; a smaller uncompressed input does not guarantee a smaller compressed output. The sentence “Changed rows can only be smaller” is therefore not established by this implementation's measured output.
+
+No compression level, window, group length, row-band format, or acceptance threshold was changed to get green. Section 7's instruction “If a check cannot pass, stop and report” blocks progression to step 2. Options for the architect/owner are: (1) retain the specified format and revise the scroll budget using these measurements; (2) retain 9.4 and revise the exact coding format/parameters, then repeat step 1; (3) defer DYN1 and keep the existing recorder. Recommendation: option 1 if the measured 8.34% increase over the stated scroll limit is acceptable, otherwise option 2. This is a WIP, not a completed step, and there is no green result file.
+
+Commit is independently blocked by the session's filesystem permissions: `git add` cannot create `C:/Users/Adam/Synapse/.git/worktrees/Synapse-clip/index.lock` (`Permission denied`). This checkout's Git metadata lies outside the writable `C:/Users/Adam/Synapse-clip` root; approval is unavailable in this run. No commit or push was made. The changes remain in the checkout, and `REVIEW.md` remains uncommitted as requested.
+
+Verification: workspace `cargo fmt --all -- --check` and `cargo clippy -j 4 --offline -- -D warnings` passed. The probe entry point and all new Rust modules pass formatting. Probe strict clippy reports 11 findings in existing `exp_corpus.rs`, `exp_meter.rs`, the old copied `clip_encoder.rs`, `exp_d.rs`, and `exp_z.rs`; none are in the added modules. The probe release build passed. The workspace `cargo build --release -j 4`, run after formatting and clean workspace clippy at Idle priority, failed at link time: `OrtGetApiBase` is undefined because ONNX Runtime is not linked. There is no ONNX Runtime library in this checkout's target directory; no unrelated build configuration was changed. Logs are in `scripts/clip-equation/results/dyn-*.txt`.
+
+The final check through `run-spec.mjs dyn-exact` again gives seven passes and the same scroll-size failure (`dyn-exact-failed.txt`); per-scene metrics are in `dyn-exact-metrics.json`. No green file exists. Steps 2–9, dead-worker removal, server integration, recovery, viewer/D5, and `youtube-proof.mjs` are not implemented. Synapse's health check passed, but no live UX verification of DYN1 was possible because its recorder integration has not been built. The YouTube live test was not run.

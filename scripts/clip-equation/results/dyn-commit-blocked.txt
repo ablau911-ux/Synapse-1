@@ -1,0 +1,13 @@
+Branch: feature/clip-capture
+git rev-parse --git-dir:
+C:/Users/Adam/Synapse/.git/worktrees/Synapse-clip
+git rev-parse --git-common-dir:
+C:/Users/Adam/Synapse/.git
+
+Attempt: rtk git add <step-1 source, probe, spec, and architecture files>
+Exit: 1
+FAILED: git add
+fatal: Unable to create 'C:/Users/Adam/Synapse/.git/worktrees/Synapse-clip/index.lock': Permission denied
+
+No commit was made. No push was attempted. Approval is unavailable in this run.
+The session permits writes only inside C:/Users/Adam/Synapse-clip.

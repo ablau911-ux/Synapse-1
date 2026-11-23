@@ -1,0 +1,8 @@
+Step 1 exact storage | crates/synapse-mcp/src/server/clip_exact.rs:1 | Added changed-row zstd groups, frozen moving rectangles, resize boundaries, streaming reads, and bounded backward seeks; not wired into the server yet.
+Step 1 geometry | crates/synapse-mcp/src/server/clip_motion.rs:1 | Added the shared PixelRect representation and geometry operations required by the exact format.
+Step 1 probe | scripts/clip-equation/probe/src/exp_dyn.rs:1 | Added exp-dyn mode=exact using product files directly, with corpus round trips, backward seeks, CPU/RAM counters, and JSON constants.
+Step 1 checks | scripts/clip-equation/spec/dyn-exact.mjs:1 | Added independent Node decoding and the unchanged architecture acceptance gates; red evidence precedes product code.
+Step 1 blocker | docs/clip-recorder-architecture-dynamic.md:1009 | Recorded the scroll-size failure, baseline rerun, API/unit interpretations, and options; no green result and no later build step claimed complete.
+Verification | scripts/clip-equation/results/dyn-exact-failed.txt:1 | Final check passed 7 of 8 scenarios; scroll is 10.184 MiB/min against 9.4, with zero byte mismatches on all eight inputs.
+Build limitations | scripts/clip-equation/results/dyn-root-build.stderr.txt:1 | Workspace formatting and strict clippy passed; release linking failed on missing ONNX Runtime, and probe strict clippy found 11 existing findings outside new modules.
+Commit limitation | scripts/clip-equation/results/dyn-commit-blocked.txt:1 | Git staging was denied because this checkout's Git metadata is outside the writable repo; no commit or push was made.

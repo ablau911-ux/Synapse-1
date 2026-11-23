@@ -43,7 +43,7 @@
 <div class="wrap" dir="rtl"><article>
 
 <h1>דחיסת וידיאו ויצירת קליפים של מסך: איכות טקסט, גודל קובץ ומשאבי מערכת</h1>
-<p class="meta">מחקר. נכתב 2026-11-23. הוא משלב סקירת ספרות (89 מקורות חיצוניים) עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
+<p class="meta">מחקר. נכתב 2026-11-23. מכסה גם דחיסה וגם יצירת וידיאו: לכידה, חותמות זמן, מכולה, קפיצה בזמן וקידוד. הוא משלב סקירת ספרות (109 מקורות חיצוניים) עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
 
 <div class="abstract">
   <b class="lbl">תקציר</b>
@@ -63,47 +63,56 @@
 
 <h3>2.1 צילום מסך ופורמט פיקסלים</h3>
 <p>Windows מספק את תמונת המסך תמיד ב-BGRA 8 ביט<sup><a href="#r13">13</a></sup>. ה-Desktop Duplication API מחזיר גם "מלבנים מלוכלכים", אזורים שהשתנו מאז הפריים הקודם, ו"מלבני הזזה" לגלילה<sup><a href="#r10">10</a>,<a href="#r11">11</a>,<a href="#r12">12</a></sup>:</p>
-<blockquote>dirty regions, which are non-overlapping rectangles that indicate the areas of the desktop image that the operating system updated since you processed the previous desktop image.<cite>Microsoft, GetFrameDirtyRects [11]</cite></blockquote>
-<p>מערכת ההפעלה יכולה לאחד אזורים, ולכן המלבנים הם גבול עליון ולא הבדל מדויק<sup><a href="#r13">13</a></sup>. FreeRDP משתמש בדיוק בדפוס הזה: קודם מלבני הזזה, אחר כך מלבנים מלוכלכים<sup><a href="#r14">14</a></sup>. זו הדרך הזולה ביותר לדעת מה השתנה בלי להשוות את כל הפיקסלים.</p>
+<blockquote>Gets information about dirty rectangles for the current desktop frame.<cite>Microsoft, GetFrameDirtyRects [11] ✓ אומת</cite></blockquote>
+<p>לפי התיעוד, המלבנים לא חופפים ומסמנים את מה שהשתנה מאז הפריים הקודם. מערכת ההפעלה יכולה לאחד אזורים, ולכן המלבנים הם גבול עליון ולא הבדל מדויק<sup><a href="#r13">13</a></sup>. FreeRDP משתמש בדיוק בדפוס הזה: קודם מלבני הזזה, אחר כך מלבנים מלוכלכים<sup><a href="#r14">14</a></sup>. זו הדרך הזולה ביותר לדעת מה השתנה בלי להשוות את כל הפיקסלים.</p>
 
 <h3>2.2 מרחבי צבע: RGB ו-YCbCr</h3>
-<p>מקודדי וידיאו עובדים במרחב YCbCr: בהירות (Y) ושני ערוצי צבע. ההמרה לפי BT.601 או BT.709 דורשת עיגול ב-8 ביט, וגם ההמרה ההפוכה. לכן הסיבוב עצמו מאבד מידע<sup><a href="#r19">19</a></sup>. פורום מדווח שב-8 ביט כ-5/6 מערכי ה-RGB משתנים בסיבוב, אבל אף פעם לא ביותר מ-2 יחידות<sup><a href="#r17">17</a>,<a href="#r18">18</a></sup>. לעומת זאת, YCoCg-R הפיך בדיוק במספרים שלמים<sup><a href="#r15">15</a>,<a href="#r16">16</a></sup>:</p>
-<blockquote>YCoCg-R ... is exactly reversible in integer arithmetic.<cite>Malvar &amp; Sullivan, JVT-I014 [15]</cite></blockquote>
+<p>מקודדי וידיאו עובדים במרחב YCbCr: בהירות (Y) ושני ערוצי צבע. ההמרה לפי BT.601 או BT.709 דורשת עיגול ב-8 ביט, וגם ההמרה ההפוכה. לכן הסיבוב עצמו מאבד מידע<sup><a href="#r19">19</a></sup>. פורום מדווח שב-8 ביט כ-5/6 מערכי ה-RGB משתנים בסיבוב, אבל אף פעם לא ביותר מ-2 יחידות<sup><a href="#r17">17</a>,<a href="#r18">18</a></sup>. לעומת זאת, YCoCg-R הפיך בדיוק במספרים שלמים, במחיר של ביט אחד נוסף בכל ערוץ צבע<sup><a href="#r15">15</a>,<a href="#r16">16</a></sup>. זו פרפרזה: את ה-PDF לא היה אפשר לקרוא כדי לאמת ציטוט.</p>
 <p>סטייה של 2 יחידות כמעט לא פוגעת ב-OCR. היא מסבירה למה "ללא אובדן" ב-YUV עדיין לא זהה ביטים, אבל לא את האותיות השגויות.</p>
 
 <h3>2.3 תת-דגימת צבע</h3>
 <p>ב-4:2:0 כל ערוץ צבע נשמר ברזולוציה של חצי לרוחב וחצי לגובה, כך שבלוק של 2×2 פיקסלים חולק צבע אחד<sup><a href="#r20">20</a></sup>:</p>
 <div class="eq">bits per pixel (8-bit):  4:4:4 = 8 + 8 + 8 = 24     4:2:2 = 8 + 2·8/2 = 16     4:2:0 = 8 + 2·8/4 = 12
 chroma samples kept:     4:4:4 = 100 %              4:2:2 = 50 %               4:2:0 = 25 %</div>
-<blockquote>Artifacts from chroma subsampling are at their most noticeable with text atop a flat color.<cite>RTINGS [21]</cite></blockquote>
-<blockquote>Colorful computer text and line graphics can become blurry during reduced color resolution during 4:2:2 or 4:2:0 chroma resolution.<cite>TestUFO [22]</cite></blockquote>
-<blockquote>chroma subsampling will introduce visually disturbing artifacts, such as in images containing text.<cite>US patent 9153017 [24]</cite></blockquote>
+<blockquote>Colorful computer text and line graphics can become blurry during reduced color resolution during 4:2:2 or 4:2:0 chroma resolution.<cite>TestUFO [22] ✓ אומת</cite></blockquote>
+<p>לפי RTINGS, העיוותים בולטים במיוחד בטקסט על רקע בצבע אחיד, ובשימוש שולחני 4:4:4 משפיע "מאוד"<sup><a href="#r21">21</a></sup>. פטנט 9153017 מציין שתת-דגימת צבע יוצרת עיוותים מפריעים בתמונות עם טקסט<sup><a href="#r24">24</a></sup>. שתי אלה פרפרזות, כי העמודים לא נטענו לאימות.</p>
 <p>טקסט ב-Windows מצויר עם ClearType, שמשתמש בכל ערוץ צבע בנפרד לשולי האותיות<sup><a href="#r30">30</a>,<a href="#r31">31</a></sup>. ‏4:2:0 מוחק בדיוק את המידע הזה. מקורות נוספים מתעדים את אותה תופעה בהקלטות: ב-H.264 גם "lossless" עובר ל-4:2:0<sup><a href="#r25">25</a></sup>, טקסט מיטשטש ב-yuv420p<sup><a href="#r26">26</a></sup>, ובפורום OBS<sup><a href="#r27">27</a></sup>, אצל RED<sup><a href="#r23">23</a></sup> וב-VideoHelp<sup><a href="#r32">32</a></sup>.</p>
 
 <h3>2.4 קידוד וידיאו היברידי (H.264 ו-HEVC)</h3>
 <p>H.264 ו-HEVC הם מקודדים "היברידיים": חיזוי (בתוך הפריים ובין פריימים), התמרה, כימוי (quantization) וקידוד אנטרופיה<sup><a href="#r1">1</a>,<a href="#r2">2</a></sup>. ‏HEVC כוון לחיסכון של כ-50% בקצב הנתונים לעומת H.264 באותה איכות נתפסת<sup><a href="#r2">2</a></sup>. האובדן נוצר בכימוי, ובקרת הקצב קובעת את ה-QP: ‏CQP קבוע, CRF באיכות קבועה, או קצב סיביות<sup><a href="#r58">58</a>,<a href="#r59">59</a></sup>.</p>
-<blockquote>A constant QP encode at QP=18 will stay at QP=18 regardless of the frame. Constant Rate Factor at CRF=18 will increase the QP to, say, 20, for high motion frames ... and lower it down to 16 for low motion parts.<cite>slhck, CRF guide [59]</cite></blockquote>
+<blockquote>A constant QP encode at QP=18 will stay at QP=18 regardless of the frame (there is some small offset for different frame types, but it is negligible here). Constant Rate Factor at CRF=18 will increase the QP to, say, 20, for high motion frames ...<cite>slhck, CRF guide [59] ✓ אומת</cite></blockquote>
 <p>ב-Windows, מקודד ה-H.264 של Media Foundation תומך רק בפרופילים Baseline,‏ Main ו-High<sup><a href="#r60">60</a></sup>, ומקודד ה-HEVC רק ב-Main<sup><a href="#r61">61</a></sup>. אין בהם 4:4:4 ואין מצב ללא אובדן.</p>
 
 <h3>2.5 כלים לתוכן מסך</h3>
 <p>HEVC SCC הוסיף כלים לתוכן מסך: העתקת בלוק בתוך אותה תמונה (IBC), פלטת צבעים, המרת צבע מסתגלת ורזולוציית תנועה מסתגלת<sup><a href="#r69">69</a></sup>. בבדיקת האימות הרשמית:</p>
-<blockquote>For TGM video, the estimated savings were 60–90% relative to the JM and 40–80% relative to the HM.<cite>Verification testing of HEVC SCC, Microsoft Research [68] (מתוך תקציר)</cite></blockquote>
+<blockquote>For TGM video, the estimated bit-rate savings ranged from 60–90% relative to the JM and 40–80% relative to the HM<cite>Verification testing of HEVC SCC, Microsoft Research [68] ✓ אומת</cite></blockquote>
 <p>ל-AV1 יש כלים מקבילים: IBC, פלטה ומצב ללא אובדן<sup><a href="#r70">70</a>,<a href="#r71">71</a>,<a href="#r74">74</a></sup>, והם קיימים גם ב-SVT-AV1<sup><a href="#r72">72</a></sup>. לפי תיקון ב-FFmpeg, גם מקודד ה-AV1 של Intel בחומרה מציע אותם:</p>
-<blockquote>Screen Content Tool provides Intra Block Copy and Palette Mode when encoding.<cite>FFmpeg-devel, QSV AV1 [73]</cite></blockquote>
+<blockquote>Use palette mode in Screen Content Tool. ... Use intra block copy in Screen Content Tool.<cite>FFmpeg-devel, QSV AV1 [73] ✓ אומת</cite></blockquote>
 
 <h3>2.6 דחיסה ללא אובדן</h3>
 <p>Zstandard מתועד ב-RFC 8878<sup><a href="#r6">6</a></sup>. רמות הדחיסה נעות מ-‎−131072 (הכי מהיר) עד 22, ורמות שליליות מוותרות על יחס דחיסה לטובת מהירות<sup><a href="#r7">7</a>,<a href="#r8">8</a>,<a href="#r9">9</a></sup>. בבנצ'מרק Silesia, ‏zstd 1.5.7 ברמה ‎−3 דחס פי 2.24 במהירות של כ-635MB לשנייה<sup><a href="#r8">8</a></sup>.</p>
 <p>במסך, רוב הפריים לא משתנה. קודק שדוחס כל פריים לבד מפספס את זה:</p>
-<blockquote>In screen captures where &gt; 95% of the frame stays exactly the same, this approach doesn't work well indeed.<cite>FFmpeg-devel 2022 [84]</cite></blockquote>
+<blockquote>In screen captures where &gt; 95% of the frame stays exactly the same, this approach doesn't work well indeed.<cite>FFmpeg-devel 2022 [84] ✓ אומת</cite></blockquote>
 <p>לכן קודקים שנבנו להקלטת מסך (TSCC, ‏ZMBV) עדיפים על קודקים כלליים<sup><a href="#r82">82</a></sup>. ‏FFV1 מיועד גם להקלטת מסך<sup><a href="#r83">83</a></sup>, ויש השוואות מקיפות של קודקים ללא אובדן<sup><a href="#r89">89</a></sup>. בתמונות סטטיות, WebP ללא אובדן הקטין צילום מסך יותר מ-JPEG XL ומ-PNG בבדיקה אחת<sup><a href="#r86">86</a></sup>. ‏JPEG XL חזק יותר בצילומים<sup><a href="#r85">85</a>,<a href="#r87">87</a>,<a href="#r88">88</a></sup>.</p>
 
 <h3>2.7 מדדי איכות</h3>
 <p>PSNR מודד שגיאה ממוצעת. ‏SSIM מודד שימור מבנה<sup><a href="#r3">3</a></sup>. ‏VMAF משלב כמה מדדים ומכויל לעיוותי דחיסה והגדלה<sup><a href="#r4">4</a>,<a href="#r5">5</a></sup>. אף אחד מהם לא עונה על השאלה "האם הטקסט נשאר נכון". לכן השתמשנו במדד מבוסס OCR, שהוא המשלים של שיעור שגיאת התווים (CER)<sup><a href="#r79">79</a>,<a href="#r80">80</a></sup>:</p>
 <div class="eq">CER = edit_distance(reference, ocr) / |reference|          R = 1 − CER</div>
 <p>בסולם המקובל לטקסט מודפס, CER של 1–2% נחשב "טוב"<sup><a href="#r81">81</a></sup>. כלומר <span dir="ltr">R = 0.98–0.99</span> נחשב טוב לסריקת מסמכים. אצלנו הדרישה מחמירה יותר: <span dir="ltr">R = 1</span>.</p>
-<p>הספרות מראה שדחיסה פוגעת בזיהוי טקסט: דחיסה חזקה יצרה עיוותים באזורי טקסט והורידה את דיוק ה-OCR<sup><a href="#r75">75</a></sup>. זיהוי לוחיות רישוי יורד עם האיכות לפי עקומה לוגיסטית<sup><a href="#r77">77</a></sup>. ופטנט מתאר:</p>
-<blockquote>during compression, lack of clarity in the text areas is noticeable making the text difficult to discern and in some cases render it unreadable.<cite>US patent 8064516 [76]</cite></blockquote>
-<p>ראו גם<sup><a href="#r78">78</a></sup>.</p>
+<p>הספרות מראה שדחיסה פוגעת בזיהוי טקסט:</p>
+<blockquote>harmful compression artifacts in textual regions that reduced OCR accuracy<cite>GDELT [75] ✓ אומת</cite></blockquote>
+<p>זיהוי לוחיות רישוי יורד עם האיכות לפי עקומה לוגיסטית<sup><a href="#r77">77</a></sup>. פטנט 8064516 מתאר טקסט שמאבד חדות בדחיסה, ולפעמים הופך לבלתי קריא<sup><a href="#r76">76</a></sup>. זו פרפרזה שלא אומתה. ראו גם<sup><a href="#r78">78</a></sup>.</p>
+
+<h3>2.8 יצירת וידיאו: מהמסך לקובץ</h3>
+<p><b>לכידה.</b> Windows.Graphics.Capture מספק פריימים דרך מאגר (Direct3D11CaptureFramePool) ואירוע FrameArrived, שנורה כשפריים חדש נשמר במאגר<sup><a href="#r90">90</a>,<a href="#r91">91</a></sup>. לכל פריים יש SystemRelativeTime, זמן ה-QPC שבו המרכיב צייר אותו, וזה הבסיס לחותמות זמן מדויקות ולסנכרון<sup><a href="#r92">92</a>,<a href="#r93">93</a></sup>. ה-API נשלח רק כשהמסך משתנה, ולכן הקצב בפועל משתנה מעצמו. Desktop Duplication (סעיף 2.1) מוסיף מידע על האזורים שהשתנו.</p>
+<p><b>חותמות זמן וקצב פריימים.</b> ב-Media Foundation כל דגימה מקבלת זמן ומשך לפני הכתיבה ל-Sink Writer<sup><a href="#r94">94</a>,<a href="#r95">95</a></sup>. כשיש B-frames, ה-MP4 sink צריך גם זמן הצגה וגם זמן פענוח, אחרת פריימים עלולים ליפול<sup><a href="#r96">96</a></sup>. דווח גם על MP4 פגום כשמזינים דגימות מהר מדי<sup><a href="#r97">97</a></sup>.</p>
+<p>הקלטות מסך הן לרוב בקצב משתנה (VFR). עורכים כמו Premiere עובדים טוב יותר בקצב קבוע (CFR), ו-VFR גורם לגמגום ולחוסר סנכרון שמע<sup><a href="#r102">102</a>,<a href="#r103">103</a></sup>.</p>
+<p>במקליט שלנו הפתרון שונה: הפריימים נשמרים רק כשהתמונה משתנה, כלומר VFR. קובץ frames.jsonl נותן ציר זמן קבוע של 50 מילישניות לכל רגע, ומפנה לפריים שמוצג בו. כך יש CFR בציר הזמן בלי לשכפל פריימים.</p>
+<p><b>מכולה ועמידות לקריסה.</b> ב-MP4 רגיל האינדקס (moov) נכתב רק בסוף ההקלטה, ולכן קריסה עלולה להשאיר קובץ שלא ניתן לנגן<sup><a href="#r98">98</a>,<a href="#r101">101</a></sup>. ‏MKV ו-MP4 מקוטע מאבדים בקריסה רק את הקטע האחרון. ‏OBS 30.2 כותב "Hybrid MP4": מקוטע בזמן ההקלטה, ומקבל אינדקס מלא בסיום<sup><a href="#r98">98</a>,<a href="#r99">99</a>,<a href="#r100">100</a></sup>.</p>
+<p>בקליפ של zstd כל פריים הוא קובץ נפרד, והאינדקס (frames.jsonl) נכתב שורה אחרי שורה. קריסה מאבדת לכל היותר את הרגע האחרון, וזה הבסיס לשחזור (B10).</p>
+<p><b>פריימי מפתח וקפיצה בזמן.</b> קפיצה לנקודה בקליפ נוחתת על פריים מפתח ומפענחת קדימה עד הפריים המבוקש. ‏GOP ארוך דוחס טוב יותר אבל מאט את הקפיצה. בפועל מקובל GOP של 0.5 עד 2 שניות<sup><a href="#r104">104</a>,<a href="#r105">105</a>,<a href="#r106">106</a></sup>. בפריים שלם של zstd כל פריים עומד בפני עצמו, ולכן מספר הפריימים לפענוח בקפיצה הוא <span dir="ltr">N_dec = 1</span>. בפורמטי zstd ששומרים רק הבדלים, ‏N_dec ≤ K_z.</p>
+<p><b>קידוד בחומרה מול תוכנה.</b> OBS ממליץ על מקודדי חומרה כדי להוריד עומס מה-CPU<sup><a href="#r107">107</a></sup>. בבדיקה של Wowza, עומס ה-CPU ירד מכ-50% עם x264 לכ-20% עם NVENC, ו-Quick Sync פינה CPU באופן דומה<sup><a href="#r108">108</a></sup>. ‏x264 נותן איכות טובה יותר לכל ביט, במחיר CPU<sup><a href="#r109">109</a></sup>.</p>
+<p>אצלנו המקודד בתוכנה (DW2) צרך כ-2.2 שניות CPU וכ-700MB RAM לכל 20 שניות הקלדה ב-1080p. דחיסת zstd ‏‎−3 היא סדרי גודל זולה יותר: zstd מגיע לכ-635MB לשנייה<sup><a href="#r8">8</a></sup>.</p>
 
 <h2>3. שיטת המחקר</h2>
 <h3>3.1 הקורפוס</h3>
@@ -191,8 +200,9 @@ ready      t_ready = t_close ≤ 50 ms</div>
 
 <h3>5.2 איך התעשייה פותרת את זה</h3>
 <p>כל המערכות המקצועיות לשיתוף מסך מציעות מצב מיוחד לטקסט:</p>
-<blockquote>If users are experiencing poor text or image clarity in certain applications with H.264 alone, Blast Extreme can be configured to use High Color Accuracy (HCA). HCA turns off 4:2:0 chroma subsampling, providing a 4:4:4 sample rate instead.<cite>VMware Blast Extreme Optimization Guide [42]</cite></blockquote>
-<blockquote>standard H.264 4:2:0 is not pixel perfect (lossless)<cite>Citrix Thinwire [39]</cite></blockquote>
+<blockquote>In the case of H.264 4:2:0 (the Visually lossless policy is disabled), the final image is not pixel perfect (lossless)<cite>Citrix Thinwire [39] ✓ אומת</cite></blockquote>
+<blockquote>YUV444 produces approximately 1.5–2 times more data than YUV420 for the same frame.<cite>Citrix YUV444 support [40] ✓ אומת</cite></blockquote>
+<p>לפי מדריך VMware Blast Extreme, ‏High Color Accuracy מכבה את 4:2:0 ועובר ל-4:4:4 כשטקסט לא חד<sup><a href="#r42">42</a>,<a href="#r43">43</a></sup>. זו פרפרזה: האתר לא היה זמין לאימות.</p>
 <ul>
 <li><b>Microsoft AVC444:</b> שני זרמי H.264 בפורמט 4:2:0, אחד לבהירות ואחד לצבע, מאותו מקודד ואותו מפענח. יחד הם נותנים 4:4:4 על חומרה של 4:2:0<sup><a href="#r29">29</a>,<a href="#r33">33</a>,<a href="#r34">34</a>,<a href="#r38">38</a></sup>. המצב הזה מופעל ב-Azure ‏VD וב-Windows 365<sup><a href="#r35">35</a>–<a href="#r37">37</a></sup>.</li>
 <li><b>Citrix:</b> "Build to lossless" מחדד לתמונה ללא אובדן כשהמסך נרגע. ‏YUV444 מייצר פי 1.5–2 מידע<sup><a href="#r39">39</a>,<a href="#r40">40</a></sup>. בבדיקה אחת: 195MB לעומת 655MB ל-H.264 YUV444<sup><a href="#r41">41</a></sup>.</li>
@@ -201,7 +211,7 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li><b>RDP 8.1</b> שלח טקסט בקודק ייעודי ותמונות ב-H.264<sup><a href="#r29">29</a></sup>.</li>
 </ul>
 <p>גם 4:4:4 לא זהה ביטים. רק קידוד RGB ללא אובדן הוא כזה:</p>
-<blockquote>the conversion from RGB to YUV 4:4:4 is not truly lossless (you can't get back bitwise identical images), but it is way much better than using 4:2:0.<cite>OBS guide [53]</cite></blockquote>
+<blockquote>the conversion from RGB to YUV 4:4:4 is not truly lossless (you can't get back bitwise identical images), but it is way much better than using 4:2:0<cite>OBS guide [53] ✓ אומת</cite></blockquote>
 <p>ראו גם<sup><a href="#r52">52</a>,<a href="#r54">54</a>–<a href="#r57">57</a></sup>.</p>
 
 <h3>5.3 מה זמין במחשב הזה</h3>
@@ -224,7 +234,7 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li>ריצת Z חלקית: רק 506×333.</li>
 <li>ה-OCR הוא Windows OCR. מנוע אחר ייתן ערכי R אחרים, אבל השוואה על אותו מנוע הוגנת.</li>
 <li>הקורפוס סינתטי, ממחשב אחד וכרטיס מסך אחד.</li>
-<li>הציטוטים כאן נלקחו מקטעים שהחיפוש החזיר. לפני פרסום חיצוני צריך לאמת כל ציטוט מול המקור המלא.</li>
+<li>כל הציטוטים במסמך נבדקו מול העמוד המלא ב-2026-11-23. מסומנים ✓ אלה שנמצאו בעמוד, מילה במילה או עם הבדל קטן שתוקן. ציטוטים שהעמוד שלהם לא נטען (RTINGS, ‏VMware, ‏Blender, ‏YCoCg-R PDF, הפטנטים, FFmpeg wiki) הוחלפו בפרפרזה מסומנת. שאר הטענות במסמך הן פרפרזות מהמקורות, ולא כל עמוד נקרא במלואו.</li>
 <li>חלק מהמקורות הם פורומים או חומר שיווקי, ומשקלם נמוך יותר. מסומנים בתיאור.</li>
 </ul>
 
@@ -335,6 +345,26 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li id="r87">The JPEG XL image coding system. <a href="https://arxiv.org/pdf/2506.05987">arXiv:2506.05987</a></li>
 <li id="r88">Analysis and enhancement of lossless image compression in JPEG XL. <a href="https://arxiv.org/pdf/2404.19755">arXiv:2404.19755</a></li>
 <li id="r89">MSU (2007). Lossless video codecs comparison. <a href="https://www.compression.ru/video/codec_comparison/pdf/msu_lossless_codecs_comparison_2007_eng.pdf">pdf</a></li>
+<li id="r90">Microsoft Learn. Direct3D11CaptureFramePool class. <a href="https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframepool">link</a></li>
+<li id="r91">Microsoft Learn. Direct3D11CaptureFramePool.FrameArrived event. <a href="https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframepool.framearrived">link</a></li>
+<li id="r92">Microsoft Learn. Direct3D11CaptureFrame.SystemRelativeTime. <a href="https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.direct3d11captureframe.systemrelativetime?view=winrt-26100">link</a></li>
+<li id="r93">Microsoft Learn. Screen capture (Windows.Graphics.Capture). <a href="https://learn.microsoft.com/en-us/windows/uwp/audio-video-camera/screen-capture">link</a></li>
+<li id="r94">Microsoft Learn. Tutorial: using the Sink Writer to encode video. <a href="https://learn.microsoft.com/en-gb/windows/win32/medfound/tutorial--using-the-sink-writer-to-encode-video">link</a></li>
+<li id="r95">Microsoft Learn. Time stamps and durations. <a href="https://learn.microsoft.com/en-ie/Windows/Win32/medfound/time-stamps-and-durations">link</a></li>
+<li id="r96">Microsoft Learn. MPEG-4 file sink. <a href="https://learn.microsoft.com/en-ie/Windows/Win32/medfound/mpeg-4-file-sink">link</a></li>
+<li id="r97">Microsoft Q&amp;A. Media Foundation generates a bad MP4 when fed frames too quickly. <a href="https://docs.microsoft.com/answers/questions/349726/media-foundation-generates-a-bad-mp4-video-when-it.html">link</a></li>
+<li id="r98">OBS blog. Writing an MP4 muxer for fun and profit (hybrid MP4). <a href="https://obsproject.com/cs/blog/obs-studio-hybrid-mp4">link</a></li>
+<li id="r99">OBS knowledge base. Hybrid MP4 format. <a href="https://obsproject.com/kb/hybrid-mp4">link</a></li>
+<li id="r100">OBS forum. How to fix MP4/MOV files corrupting when OBS crashes. <a href="https://obsproject.com/forum/resources/how-to-fix-mp4-mov-files-corrupting-when-obs-studio-crashes.1293">link</a></li>
+<li id="r101">OneStream. MKV vs MP4 for pre-recorded streaming. <a href="https://onestream.live/blog/mkv-vs-mp4-for-pre-recorded-streaming/">link</a></li>
+<li id="r102">Adobe community. FAQ: issues with screen-recorded footage in Premiere Pro (VFR). <a href="https://community.adobe.com/t5/premiere-pro-discussions/faq-issues-with-screen-recorded-footage-in-premiere-pro/td-p/10874355">link</a></li>
+<li id="r103">VideoHelp forum. VFR recordings and audio sync. <a href="https://forum.videohelp.com/showthread.php?p=2586137">link</a></li>
+<li id="r104">AWS Media blog. Back to basics: GOPs explained. <a href="https://aws.amazon.com/blogs/media/part-1-back-to-basics-gops-explained">link</a></li>
+<li id="r105">ZimaSpace. Why long-GOP video slows seeking. <a href="https://shop.zimaspace.com/blogs/tech-ai-hub/long-gop-video-slow-seeking-home-media-server">link</a></li>
+<li id="r106">Transloadit. Keyframe interval. <a href="https://transloadit.com/glossary/keyframe-interval/">link</a></li>
+<li id="r107">OBS knowledge base. Hardware encoding. <a href="https://obsproject.com/kb/Hardware-Encoding">link</a></li>
+<li id="r108">Wowza. Hardware vs software streaming encoders. <a href="https://www.wowza.com/?p=23557">link</a></li>
+<li id="r109">OBS forum. NVENC vs x264 for local recording. <a href="https://obsproject.com/forum/threads/nvenc-vs-x264-for-local-recording-some-thoughts.56737/latest">link</a></li>
 </ol>
 <p class="note">מקורות פנימיים:</p>
 <ul class="note">

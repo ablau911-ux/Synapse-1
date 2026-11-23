@@ -67,7 +67,7 @@ Against today's recorder, the recommended method needs about 5–9 % of the file
 
 - **Other PCs.** Everything was measured on one PC (Intel plus NVIDIA graphics). AMD graphics and older PCs were not tested.
 - **A recorder written for the product.** The figures come from ffmpeg standing in for the recorder. A purpose-built one may use less memory; that can only be measured once it exists, which is the suggested first step below.
-- **HEVC licence.** The patent pool says "A royalty is due upon the Sale of a Consumer HEVC Product…" (P61) and that it licenses encoders "in devices, software, or through Cloud Based Services" (P55). It does not say who pays when a program only uses the encoder already in the PC's graphics chip. That needs a legal answer, not more reading. The fallback (Windows' own H.264) avoids the question at about four times the size.
+- **HEVC licence.** The patent pool says "A royalty is due upon the Sale of a Consumer HEVC Product…" (P61) and that it licenses encoders "in devices, software, or through Cloud Based Services" (P55). It does not say who pays when a program only uses the encoder already in the PC's graphics chip. A trade article on the pool's policy says, for decoders: "If the software uses an existing hardware decoder, of course, there's no royalty, since a royalty on that hardware should have already been paid." (P66) That points the same way for a hardware encoder but does not state it, and it is not the pool's current text. A legal answer is still needed. The fallback (Windows' own H.264) avoids the question at about four times the size.
 - **HEVC on the reading PC.** This PC has Microsoft's HEVC extension installed; others may not.
 
 ## Suggested first step

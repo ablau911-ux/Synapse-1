@@ -321,11 +321,36 @@ Source: https://videoprocessing.ai/codecs/lossless-codecs-comparison-2007.html
 Source: https://accessadvance.com/topic-where-and-when-is-a-royalty-due/
 - "A royalty is due upon the Sale of a Consumer HEVC Product or HEVC Content on Digital Media Storage for which an HEVC Standard Essential Patent (listed on the HEVC Advance Patent Lis[t]…" (cut by the reader)
 
+### P62. ffmpeg's guide on quality and lossless H.264 (findings 5, 15; read from an archived copy)
+Source: https://web.archive.org/web/2025/https://trac.ffmpeg.org/wiki/Encode/H.264
+- "The range is exponential, so increasing the CRF value +6 results in roughly half the bitrate / file size, while -6 leads to roughly twice the bitrate."
+- "Note that lossless output files will likely be huge, and most non-FFmpeg based players will not be able to decode lossless."
+
+### P63. ffmpeg's guide on lossless desktop capture (finding 15; archived copy)
+Source: https://web.archive.org/web/2025/https://trac.ffmpeg.org/wiki/Capture/Desktop
+- "…you can use lossless encoding and disable advanced encoder options, e.g.: ffmpeg -video_size 1920x1080 -framerate 30 -f x11grab -i :0.0 -c:v libx264rgb -crf 0 -preset ultrafast -color_range 2 output.mkv -crf 0 tells x264 to encode in lossless mode…"
+
+### P64. Steps Recorder saves a .zip file (finding 21; archived copy of Microsoft's page)
+Source: https://web.archive.org/web/2022/https://support.microsoft.com/en-us/windows/record-steps-to-reproduce-a-problem-46582a9b-620f-2e36-00c9-04e25d784e47
+- "Select Save, name the .zip file, choose where to save it, and then select Save. Now you can attach and send this .zip file to the person helping you troubleshoot the problem on your PC."
+- That the .zip holds an MHT file was not in the text read. Withdrawn.
+
+### P65. Windows.Graphics.Capture came with Windows 10 version 1803 (finding 22)
+Source: https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.graphicscapturesession
+- "Device family Windows 10, version 1803 (introduced in 10.0.17134.0)"
+
+### P66. HEVC royalty when software uses hardware that is already in the device
+Source: https://www.streamingmedia.com/Articles/News/Online-Video-News/HEVC-Advance-Makes-Some-Software-Royalty-Free-114938.aspx (a trade article describing the patent pool's policy; it speaks of decoders, and it is not the pool's own current text)
+- "If the software uses an existing hardware decoder, of course, there's no royalty, since a royalty on that hardware should have already been paid."
+- "The intent here is to impose a royalty on any software that unlocks HEVC hardware decode previously unavailable on the system for which a royalty would not have been paid."
+- "The language also excludes … operating systems updates altogether, as well as drivers, libraries, and firmware updates that unlock HEVC decode hardware already on the system."
+- Not in the text: the same statement for a hardware **encoder**, and the pool's current wording. The question for the recorder stays a legal one.
+
 ---
 
 ## FINAL STATUS OF THE LEDGER (2026-11-23, end of the proof work)
 
-- **Proven with a verbatim quote from a page Claude read: P1–P61.**
+- **Proven with a verbatim quote from a page Claude read: P1–P66.**
 - **Everything in the table below is WITHDRAWN.** These claims were written into `research-log.md` from search summaries. Claude tried to read their sources, some twice through other addresses, and could not find or read the text. They are not findings and must not be used. Nothing in `recommendation.md` rests on them.
 - `research-log.md` is kept only as a record of what was searched. Its "Meaning" lines and summaries are Claude's notes, not proof.
 
@@ -337,7 +362,9 @@ Rows later proven are noted in the right-hand column with their P-number; all ot
 
 Updates after the retry passes: Intel hardware screen content coding → proven (P45) and measured. Zoom JPEG then H.264 → proven (P46). Lossless x264 sizes → proven (P44). JPEG XL against QOI → proven (P48). AV1 screen content 25 % → proven (P47). PCoIP → proven (P51). RDP AVC444 → proven (P49). Tight against Hextile → proven (P52). UI tree tokens → proven (P50). Time Travel Debugging trace size → proven (P53). Playwright 1 Mbit/s → proven (P58). WebRTC zero-hertz → proven (P59). Lagarith and FFV1 conclusions → proven (P60).
 
-Still withdrawn after all passes: Steps Recorder ZIP/MHT; the baseline of the 66/63/61 % figures; ffmpeg wiki statements on CRF and lossless; Playwright's codec being VP8; the 4:4:4 fix in the NVIDIA forum thread; AV1 saving 47 % on YouTube; VVenC at 6.6 frames per second; libaom at 140–170 frames per second; lossless codecs reaching about 2:1; the Windows versions that introduced the two capture interfaces; `PW_RENDERFULLCONTENT`; long key distances slowing seeks (measured instead, see `measurements.md`); apitrace and GFXReconstruct details; the two PDF sources (AV1 tool description, mixed raster content); screenpipe's 1 frame per second and MP4; OpenH264 running on one thread; the one claim from memory about Intel AV1 (measured instead: not usable on this PC).
+Proven in the last pass, from archived copies and Microsoft's page: ffmpeg's statements on CRF and lossless (P62, P63); Steps Recorder saving a .zip file (P64); Windows.Graphics.Capture arriving with Windows 10 version 1803 (P65).
+
+Still withdrawn after all passes (each was tried at least twice; the text could not be found or the page could not be read): that Steps Recorder's .zip holds an MHT file; the baseline of the 66/63/61 % figures; Playwright's codec being VP8; the 4:4:4 fix in the NVIDIA forum thread; AV1 saving 47 % on YouTube; VVenC at 6.6 frames per second; libaom at 140–170 frames per second; lossless codecs reaching about 2:1; the Windows version that introduced Desktop Duplication; `PW_RENDERFULLCONTENT`; long key distances slowing seeks (measured instead, see `measurements.md`); apitrace and GFXReconstruct details; the two PDF sources (AV1 tool description, mixed raster content); screenpipe's 1 frame per second and MP4; OpenH264 running on one thread; the one claim from memory about Intel AV1 (measured instead: not usable on this PC).
 
 | Claim in `research-log.md` | What happened when Claude read the page |
 |---|---|

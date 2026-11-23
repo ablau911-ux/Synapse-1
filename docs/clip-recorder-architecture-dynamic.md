@@ -1008,7 +1008,38 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
-### 2026-11-23: R1 plan, no frame lost while the encoder starts (written by Claude 2026-11-23 18:20 IST; this section is the spec; the two R1 plans below are stopped)
+### 2026-11-23: plan, three faults from the live test (written by Claude 2026-11-23 21:40 IST; this section is the spec for the debug agent)
+
+**Source:** two live rounds through the real server on a YouTube window, 40 s each: an agent's (Gitea #290 comment 1374, `.runs/agent-live/`) and Claude's (comment 1375, `.runs/claude-live/clip2/`). The recorder is a tool for AI agents: an agent records a window and reads the clip back through the viewer operations. A wrong picture without a warning misleads the agent.
+
+**Facts:**
+- L1. 27 of 802 instants were lost in Claude's clip and 31 of 802 in the agent's, all with cause `moving_behind`. In Claude's clip all 27 lie in instants 187–259, where the moving rectangle changed 20 times. `frames.jsonl` line 222 is lost on frame 0 of a new segment (`"mv":[24,0]`).
+- L2. `MovingCoder::follow` ends the open segment and begins the next in the same instant when the rectangle changes or the 60 s limit is reached (`replaces` in `clip_moving.rs`). The worker then finalizes one encoder and creates the next while new frames queue; the queue holds 8 frames. `f8745e41` made only a start with no open segment wait for a ready encoder.
+- L3. `clip_frame` at a lost instant (11,100 ms) answers `"reason":"recorded pixels"` and `"notes":[]`; the picture is a wrong mix (`.runs/claude-live/clip2/views/frame_f222.png`). The line in `frames.jsonl` carries `"lost":"moving_behind"` and `clip.json` lists the instant in `lost`.
+- L4. A `record` call that fails with `CAPTURE_TARGET_INVALID` (no frame in 3,000 ms) leaves the clip folder behind (`clip.json`, `clip.json.lock`, `recorder.lock`). A retry with the same folder is refused: "folder already exists".
+
+**Fixes, in this order. Each gets a check that is red before the fix and green after it:**
+1. **The viewer names a lost instant.** Every viewer operation that returns the picture of an instant marked `lost` says so, in the image's `reason` or label and in `notes`, with the cause. It never calls that picture "recorded pixels". Trace first where the viewer reads `lost` and why it is dropped. Red fixture: the clip in `.runs/claude-live/clip2/` at 11,100 ms.
+2. **No instant is lost when the rectangle changes.** One rule replaces `replaces`: a segment begins only with a ready encoder.
+   - When the wanted rectangle differs from the open segment's, or the 60 s limit is reached, the open segment keeps running with its own rectangle while the worker prepares the next encoder. On the first instant after that encoder is ready, the old segment ends and the new one begins.
+   - `follow` then returns the rectangle of the segment it really wrote. `ClipLayers::write` gives that rectangle to the exact layer, so pixels outside it stay exact.
+   - When the wanted rectangle becomes none, the open segment ends at once, as today.
+   - Measure, do not assume: whether finalizing the old encoder inside the worker still overflows the queue, and the RAM peak with two encoders alive (limit 700 MB, section 1.5).
+   - Red check: a new `dyn-moving` case whose rectangle changes every 5 instants for the 20 s corpus video; today `behind` > 0. Green: `behind` = 0 and every instant is either a sample of a segment or counted in `waited`.
+3. **A failed `record` leaves nothing behind.** When `record` fails before the first frame, the folder it created is removed; a folder that existed before the call is never touched. Trace where the folder is created and where the failure returns.
+
+**Not in this plan:** the size of the moving rectangle on pages with a glow around the video. That needs the owner's decision between exact text with larger files and H.264 text; it is open. Also not here: `clip_overview` paging and speed, the tool surface, the black frames at 12.75–13.05 s of the agent's clip.
+
+**Rules for the builder:**
+- Root cause before any edit; no guessed fix.
+- One cargo build at a time, `-j 4`, priority Idle, `--offline`.
+- Each check runs one round. A failed run is read once in full and its cause fixed; no rerun until green.
+- No gate, threshold, timeout or assertion is loosened.
+- No visible test window. No network. No commit or push; Claude reviews, runs the proof itself and commits.
+
+**Proof (Claude runs it):** the three red-to-green checks; `dyn-moving`, `dyn-motion`, `dyn-exact`, one round each; fmt; clippy `-D warnings`; then one live round through the release server: lost instants = 0, or every lost instant named by the viewer.
+
+### 2026-11-23: R1 plan, no frame lost while the encoder starts (written by Claude 2026-11-23 18:20 IST; done in `f8745e41` and `6192973c`; the two R1 plans below are stopped)
 
 **Owner decision (2026-11-23):** no frame may be lost. While the H.264 encoder starts, the moving area stays in the exact layer. When the encoder is ready, the area switches to H.264. No waiting at record start, no larger queue. The Snipping Tool prototypes are stopped and parked on branch `wip/r1-proto`; the warm-up is parked on `wip/r1-warmup`. Neither was verified.
 

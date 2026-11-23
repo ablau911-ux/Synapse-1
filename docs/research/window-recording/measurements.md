@@ -387,3 +387,8 @@ At closeness 0.98 on the real page, read off between the measured points: NVIDIA
 | av1_nvenc | after 150 s with no encoder use | D3 | 1707 ms | 194 ms |
 
 After 150 s without use the NVIDIA chip was in power state D3 (off). The first encoder start then took about 1.7 s; the next one, with the chip awake, took 157–194 ms. So waking the NVIDIA chip costs about 1.5 s on this PC. The Intel encoder through Direct3D 12 started in 113–141 ms whether or not anything had been idle.
+
+
+## Start-up of software AV1 (added after the fifth measurement)
+
+libaom AV1 in realtime screen mode, program start to one encoded 1920 × 1080 picture, two starts back to back: 70 ms and 74 ms (starting ffmpeg itself is about 35 ms of that).

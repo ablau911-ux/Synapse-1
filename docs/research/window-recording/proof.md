@@ -346,11 +346,18 @@ Source: https://www.streamingmedia.com/Articles/News/Online-Video-News/HEVC-Adva
 - "The language also excludes … operating systems updates altogether, as well as drivers, libraries, and firmware updates that unlock HEVC decode hardware already on the system."
 - Not in the text: the same statement for a hardware **encoder**, and the pool's current wording. The question for the recorder stays a legal one.
 
+### P67. AV1 is licensed royalty-free, and its encoder library may be redistributed
+Source: https://aomedia.org/license/patent-license/
+- "…each Licensor, on behalf of itself and successors in interest and assigns, grants Licensee a non-sublicensable, perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable (except as expressly stated in this License) patent license to its Necessary Claims to make, use, sell, offer for sale…"
+
+Source: https://aomedia.org/license/software-license/ (the licence of the libaom encoder)
+- "Copyright (c) 2016, Alliance for Open Media All rights reserved. Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met…"
+
 ---
 
 ## FINAL STATUS OF THE LEDGER (2026-11-23, end of the proof work)
 
-- **Proven with a verbatim quote from a page Claude read: P1–P66.**
+- **Proven with a verbatim quote from a page Claude read: P1–P67.**
 - **Everything in the table below is WITHDRAWN.** These claims were written into `research-log.md` from search summaries. Claude tried to read their sources, some twice through other addresses, and could not find or read the text. They are not findings and must not be used. Nothing in `recommendation.md` rests on them.
 - `research-log.md` is kept only as a record of what was searched. Its "Meaning" lines and summaries are Claude's notes, not proof.
 

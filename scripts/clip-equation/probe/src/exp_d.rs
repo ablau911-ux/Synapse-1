@@ -566,7 +566,8 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     // 5 and 6. Decode, frame mapping by time (M6), quality, R and flashes.
     let sampler = MemorySampler::start();
     let regions = TextRegion::parse(args.text_or("regions", ""))?;
-    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions, args.flag("ocr_fail", false), args.flag("e1_nv12", false))?;
+    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions, args.flag("ocr_fail", false), args.flag("e1_nv12", false),
+        args.text_or("e1_noise", "").parse::<u8>().ok())?;
     quality.put(out);
     let status = if !used_matches {
         "wrong_encoder".to_owned()
@@ -995,6 +996,7 @@ fn measure_quality(
     regions: &[TextRegion],
     inject_ocr_failure: bool,
     nv12_only: bool,
+    source_noise: Option<u8>,
 ) -> Result<Quality> {
     let n = folder.new_frames.len();
     let mut quality = Quality { rate, n_new: n, ..Quality::default() };
@@ -1060,7 +1062,12 @@ fn measure_quality(
         if ocr_orders.contains(&order) {
             // Experiment E1 (`e1_nv12=1`): OCR reads the source after the NV12 conversion alone,
             // with no encoding, so R measures what 4:2:0 and the BT.709 rounding lose.
-            let picture = if nv12_only {
+            // Noise test (`e1_noise=N`): OCR reads the source itself with ±N levels of
+            // deterministic noise per channel, to measure how stable the OCR is (N = 0: control).
+            let picture = if let Some(amplitude) = source_noise {
+                let clean = scaled_bgra(&bgr, folder.width as usize, folder.height as usize, folder.sigma as usize, rw, rh);
+                with_noise(&clean, amplitude, order as u64)
+            } else if nv12_only {
                 let (w, h, nv12) = clip_encoder::probe_reference_nv12(input, &bgr, folder.width, folder.height);
                 crop_bgra(&nv12_to_bgra(&nv12, w as usize, h as usize), w as usize, rw, rh)
             } else {
@@ -1128,6 +1135,24 @@ fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)], regions: &
     let r = (!shares.is_empty()).then(|| shares.iter().sum::<f64>() / shares.len() as f64);
     let note = format!("{} frames, {} region reads, source chars per region {}", decoded.len(), shares.len(), list(per_region.iter()));
     Ok((r, source_chars, note))
+}
+
+/// Noise test: each B, G, R value moved by a uniform integer in [−amplitude, amplitude]
+/// (clamped to 0..255) from a fixed-seed generator, alpha kept, so runs repeat exactly.
+fn with_noise(bgra: &[u8], amplitude: u8, seed: u64) -> Vec<u8> {
+    let span = 2 * u64::from(amplitude) + 1;
+    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+    bgra.iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            if i % 4 == 3 || amplitude == 0 {
+                return value;
+            }
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let offset = i32::try_from((state >> 33) % span).unwrap_or(0) - i32::from(amplitude);
+            u8::try_from((i32::from(value) + offset).clamp(0, 255)).unwrap_or(u8::MAX)
+        })
+        .collect()
 }
 
 /// Experiment E1: NV12 (BT.709 limited range, the inverse of `Nv12Canvas::draw`) back to

@@ -36,6 +36,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const CORPUS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(CORPUS_DIR, '..');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(CORPUS_DIR, 'corpus.json'), 'utf8'));
+// A side corpus for quick tests, without touching corpus.json: CLIP_CORPUS_T_S (seconds) and
+// CLIP_CORPUS_SIZES ("800x600x1,1280x720x1": width x height x sigma) replace the configured ones.
+if (process.env.CLIP_CORPUS_T_S) CONFIG.t_s = Number(process.env.CLIP_CORPUS_T_S);
+if (process.env.CLIP_CORPUS_SIZES) {
+  CONFIG.sizes = process.env.CLIP_CORPUS_SIZES.split(',').map((s) => {
+    const [width, height, sigma] = s.split('x').map(Number);
+    return { width, height, sigma };
+  });
+}
 const ROOT = process.env.CLIP_CORPUS || CONFIG.root;
 const STEP_TIMEOUT_MS = 60000;
 /**
@@ -371,7 +380,8 @@ function writeSummary() {
     }),
     '',
   ].join('\n');
-  const file = path.join(BASE_DIR, 'results', 'corpus.md');
+  // A side corpus (CLIP_CORPUS) keeps its summary beside its folders, never over results/corpus.md.
+  const file = process.env.CLIP_CORPUS ? path.join(ROOT, 'corpus.md') : path.join(BASE_DIR, 'results', 'corpus.md');
   fs.writeFileSync(file, text);
   console.log(`render summary=${file} total_bytes=${total}`);
 }

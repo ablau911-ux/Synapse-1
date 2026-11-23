@@ -102,7 +102,7 @@ pub(super) struct FrameLine {
     pub(super) instant: u64,
     /// k / f in milliseconds from s_0.
     pub(super) t_ms: u64,
-    /// `true` when a new frame was written to `waiting/` for this instant.
+    /// `true` when a new source picture was captured for this instant.
     pub(super) new: bool,
     /// Captured size of the frame shown at this instant.
     pub(super) width: u32,
@@ -126,7 +126,9 @@ pub(super) struct FrameLine {
 }
 
 impl FrameLine {
-    pub(super) fn shows_new_picture(&self) -> bool { self.new || self.exact.is_some() }
+    pub(super) fn shows_new_picture(&self) -> bool {
+        self.new || self.exact.is_some()
+    }
 }
 
 /// Reads every complete line of `frames.jsonl` (a torn last line is skipped).
@@ -199,9 +201,17 @@ pub(super) struct CommittedSegment {
     pub(super) sha256: String,
 }
 impl CommittedSegment {
-    pub(super) fn read_back(folder: &Path, segment: super::clip_moving::MovingSegment) -> Result<Self, String> {
-        let (bytes, sha256) = file_size_and_sha256(&folder.join(&segment.file)).map_err(|e| e.to_string())?;
-        Ok(Self { segment, bytes, sha256 })
+    pub(super) fn read_back(
+        folder: &Path,
+        segment: super::clip_moving::MovingSegment,
+    ) -> Result<Self, String> {
+        let (bytes, sha256) =
+            file_size_and_sha256(&folder.join(&segment.file)).map_err(|e| e.to_string())?;
+        Ok(Self {
+            segment,
+            bytes,
+            sha256,
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,8 +224,12 @@ pub(super) struct ExactInfo {
 }
 impl From<super::clip_exact::ExactSummary> for ExactInfo {
     fn from(totals: super::clip_exact::ExactSummary) -> Self {
-        Self { level: super::clip_exact::EXACT_ZSTD_LEVEL, window_log: super::clip_exact::EXACT_WINDOW_LOG,
-            group_pictures: super::clip_exact::EXACT_GROUP_PICTURES, totals }
+        Self {
+            level: super::clip_exact::EXACT_ZSTD_LEVEL,
+            window_log: super::clip_exact::EXACT_WINDOW_LOG,
+            group_pictures: super::clip_exact::EXACT_GROUP_PICTURES,
+            totals,
+        }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -228,7 +242,14 @@ pub(super) struct MovingInfo {
     pub(super) segments: Vec<CommittedSegment>,
 }
 impl Default for MovingInfo {
-    fn default() -> Self { Self { status: "not_used".into(), reason: None, encoder: None, segments: Vec::new() } }
+    fn default() -> Self {
+        Self {
+            status: "not_used".into(),
+            reason: None,
+            encoder: None,
+            segments: Vec::new(),
+        }
+    }
 }
 
 /// One condition: its status and the instants where it failed.
@@ -297,7 +318,9 @@ pub(super) struct ClipJson {
 impl ClipJson {
     /// Include only format files, including the final metadata's own byte length.
     pub(super) fn set_total_bytes(&mut self, folder: &Path) -> Result<(), String> {
-        let mut other = std::fs::metadata(folder.join(FRAMES_FILE)).map_err(|e| e.to_string())?.len();
+        let mut other = std::fs::metadata(folder.join(FRAMES_FILE))
+            .map_err(|e| e.to_string())?
+            .len();
         for directory in ["frames", "moving"] {
             if let Ok(entries) = std::fs::read_dir(folder.join(directory)) {
                 for entry in entries {
@@ -309,9 +332,19 @@ impl ClipJson {
             }
         }
         loop {
-            let bytes = other + serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?.len() as u64;
-            let detail = self.conditions.t.as_mut().and_then(|t| t.detail.as_mut()).ok_or("missing T detail")?;
-            if detail["bytes"].as_u64() == Some(bytes) { return Ok(()); }
+            let bytes = other
+                + serde_json::to_vec_pretty(self)
+                    .map_err(|e| e.to_string())?
+                    .len() as u64;
+            let detail = self
+                .conditions
+                .t
+                .as_mut()
+                .and_then(|t| t.detail.as_mut())
+                .ok_or("missing T detail")?;
+            if detail["bytes"].as_u64() == Some(bytes) {
+                return Ok(());
+            }
             detail["bytes"] = serde_json::json!(bytes);
         }
     }

@@ -70,7 +70,12 @@ const SCENARIOS: [(&str, &str, &str); 6] = [
 ];
 
 /// F6: window width, height and σ (recorded size = σ · window size).
-const SIZES: [(u32, u32, u32); 4] = [(1920, 1080, 1), (1280, 720, 1), (640, 360, 2), (506, 333, 3)];
+const SIZES: [(u32, u32, u32); 4] = [
+    (1920, 1080, 1),
+    (1280, 720, 1),
+    (640, 360, 2),
+    (506, 333, 3),
+];
 
 /// A Chrome `--app` window has no invisible resize borders: Windows Graphics
 /// Capture delivers its outer size (measured: 1280 x 720 outer gave 1280 x 720
@@ -95,7 +100,14 @@ pub fn run() -> Result<()> {
                 continue;
             }
             let folder = Path::new(CORPUS_ROOT).join(format!("{name}{suffix}"));
-            let capture = Capture { scenario, page, title, width, height, sigma };
+            let capture = Capture {
+                scenario,
+                page,
+                title,
+                width,
+                height,
+                sigma,
+            };
             match capture.run(&pages, &folder) {
                 Ok(row) => println!("exp-corpus {row}"),
                 Err(error) => println!("exp-corpus {name}{suffix} error={error}"),
@@ -161,7 +173,8 @@ impl Capture {
         let (sender, receiver) = channel();
         let folder_for_writer = folder.to_path_buf();
         let flash_test = self.scenario == "flash";
-        let writer = std::thread::spawn(move || write_frames(&receiver, &folder_for_writer, flash_test));
+        let writer =
+            std::thread::spawn(move || write_frames(&receiver, &folder_for_writer, flash_test));
         let control = observer::start_with_cursor::<CorpusFrames>(
             window.raw_hwnd(),
             Interval::Millis(REQUESTED_INTERVAL_MS),
@@ -176,7 +189,9 @@ impl Capture {
             handler.finish();
             handler.delivered
         };
-        let stored = writer.join().map_err(|_| "writer thread panicked".to_owned())??;
+        let stored = writer
+            .join()
+            .map_err(|_| "writer thread panicked".to_owned())??;
         self.write_index(folder, &stored, delivered)
     }
 
@@ -211,14 +226,22 @@ impl Capture {
                     );
                 }
                 None => {
-                    let _ = writeln!(lines, "{{\"instant\": {instant}, \"frame\": null, \"new\": false, \"lost\": true}}");
+                    let _ = writeln!(
+                        lines,
+                        "{{\"instant\": {instant}, \"frame\": null, \"new\": false, \"lost\": true}}"
+                    );
                 }
             }
         }
-        std::fs::write(folder.join("frames.jsonl"), lines).map_err(|e| format!("write frames.jsonl: {e}"))?;
+        std::fs::write(folder.join("frames.jsonl"), lines)
+            .map_err(|e| format!("write frames.jsonl: {e}"))?;
         let recorded = stored.first().map_or((0, 0), |s| (s.width, s.height));
         let total: u64 = stored.iter().map(|s| s.bytes).sum();
-        let per_frame = if stored.is_empty() { 0.0 } else { total as f64 / stored.len() as f64 };
+        let per_frame = if stored.is_empty() {
+            0.0
+        } else {
+            total as f64 / stored.len() as f64
+        };
         let seconds = INSTANTS as f64 / 20.0;
         let flashes = if self.scenario == "flash" {
             // One flash per run of consecutive new frames with the box lit.
@@ -254,8 +277,11 @@ impl Capture {
             flashes,
             delivered
         );
-        let name = folder.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-        std::fs::write(folder.join("row.md"), format!("{name}\t{row}\n")).map_err(|e| format!("write row.md: {e}"))?;
+        let name = folder
+            .file_name()
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        std::fs::write(folder.join("row.md"), format!("{name}\t{row}\n"))
+            .map_err(|e| format!("write row.md: {e}"))?;
         Ok(format!("{name} {row}"))
     }
 }
@@ -263,9 +289,15 @@ impl Capture {
 /// Empties a corpus folder of this probe's own files (frames, index, row).
 fn prepare_folder(folder: &Path) -> Result<()> {
     std::fs::create_dir_all(folder).map_err(|e| format!("create {}: {e}", folder.display()))?;
-    for entry in std::fs::read_dir(folder).map_err(|e| e.to_string())?.flatten() {
+    for entry in std::fs::read_dir(folder)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if (name.starts_with("frame-") && name.ends_with(".zst")) || name == "frames.jsonl" || name == "row.md" {
+        if (name.starts_with("frame-") && name.ends_with(".zst"))
+            || name == "frames.jsonl"
+            || name == "row.md"
+        {
             std::fs::remove_file(entry.path()).map_err(|e| format!("remove {name}: {e}"))?;
         }
     }
@@ -328,7 +360,10 @@ fn write_summary() -> Result<()> {
          |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for row in rows {
-        let (name, cells) = row.trim_end().split_once('\t').unwrap_or(("", row.trim_end()));
+        let (name, cells) = row
+            .trim_end()
+            .split_once('\t')
+            .unwrap_or(("", row.trim_end()));
         let _ = writeln!(text, "| {name} {cells}");
     }
     let path = results_folder()?.join("corpus.md");
@@ -351,13 +386,20 @@ pub struct CorpusFrames {
 
 impl CorpusFrames {
     fn keep_held(&mut self) {
-        let (Some(instant), Some(readback), Some(sender)) =
-            (self.held.take(), self.readback.as_ref(), self.sender.as_ref())
-        else {
+        let (Some(instant), Some(readback), Some(sender)) = (
+            self.held.take(),
+            self.readback.as_ref(),
+            self.sender.as_ref(),
+        ) else {
             return;
         };
         let (width, height) = readback.size();
-        let _ = sender.send(Kept { instant, width, height, bgra: readback.pixels().to_vec() });
+        let _ = sender.send(Kept {
+            instant,
+            width,
+            height,
+            bgra: readback.pixels().to_vec(),
+        });
     }
 
     /// Keeps the last held frame and ends the writer's input.
@@ -384,11 +426,16 @@ impl GraphicsCaptureApiHandler for CorpusFrames {
         })
     }
 
-    fn on_frame_arrived(&mut self, frame: &mut Frame, _control: InternalCaptureControl) -> Result<()> {
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        _control: InternalCaptureControl,
+    ) -> Result<()> {
         self.delivered += 1;
         // Instant of a composition time: the first s_j at or after it.
         let composed = composition_time(frame);
-        let absolute = composed.div_euclid(INSTANT_HNS) + i64::from(composed.rem_euclid(INSTANT_HNS) != 0);
+        let absolute =
+            composed.div_euclid(INSTANT_HNS) + i64::from(composed.rem_euclid(INSTANT_HNS) != 0);
         let instant = (absolute - self.k0).max(0);
         if self.held.is_some_and(|held| instant > held) {
             self.keep_held();

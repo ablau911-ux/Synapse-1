@@ -31,12 +31,18 @@ pub struct CaptureFrame {
 
 impl CaptureFrame {
     pub fn new(px: usize) -> Self {
-        Self { bgra: vec![255; px * BGRA_BYTES_PER_PIXEL] }
+        Self {
+            bgra: vec![255; px * BGRA_BYTES_PER_PIXEL],
+        }
     }
 
     /// The corpus frame (B,G,R rows) expanded to B,G,R,A. Input preparation: never timed.
     pub fn fill(&mut self, bgr: &[u8]) {
-        for (pixel, source) in self.bgra.chunks_exact_mut(BGRA_BYTES_PER_PIXEL).zip(bgr.chunks_exact(3)) {
+        for (pixel, source) in self
+            .bgra
+            .chunks_exact_mut(BGRA_BYTES_PER_PIXEL)
+            .zip(bgr.chunks_exact(3))
+        {
             pixel[..3].copy_from_slice(source);
         }
     }
@@ -50,7 +56,10 @@ impl CaptureFrame {
 /// dropped, B, G and R stay. Part of the way's timed work.
 pub fn bgra_to_bgr(bgra: &[u8], bgr: &mut Vec<u8>) {
     bgr.clear();
-    bgr.extend(bgra.chunks_exact(BGRA_BYTES_PER_PIXEL).flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]));
+    bgr.extend(
+        bgra.chunks_exact(BGRA_BYTES_PER_PIXEL)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]),
+    );
 }
 
 /// The operating system's peak of private bytes (`PeakPagefileUsage`) of this process.
@@ -82,12 +91,20 @@ pub struct RamReading {
 impl RamMeter {
     /// Takes M_0 = private bytes now. Call it after the input is prepared.
     pub fn start() -> Self {
-        Self { m0: memory_now().1, peak_at_m0: os_peak_private() }
+        Self {
+            m0: memory_now().1,
+            peak_at_m0: os_peak_private(),
+        }
     }
 
     pub fn read(&self) -> RamReading {
         let peak = os_peak_private();
-        RamReading { m0: self.m0, peak_at_m0: self.peak_at_m0, peak, ram: peak.saturating_sub(self.m0) }
+        RamReading {
+            m0: self.m0,
+            peak_at_m0: self.peak_at_m0,
+            peak,
+            ram: peak.saturating_sub(self.m0),
+        }
     }
 }
 
@@ -141,8 +158,18 @@ impl ClipFiles {
     /// Creates the clip folder and its `frames.jsonl`. Frames are `width` × `height`.
     pub fn create(dir: &Path, width: usize, height: usize) -> Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let index = std::fs::File::create(dir.join("frames.jsonl")).map_err(|e| format!("frames.jsonl: {e}"))?;
-        Ok(Self { dir: dir.to_owned(), index, width, height, payload: 0, index_bytes: 0, lines: 0, files: 2 })
+        let index = std::fs::File::create(dir.join("frames.jsonl"))
+            .map_err(|e| format!("frames.jsonl: {e}"))?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            index,
+            width,
+            height,
+            payload: 0,
+            index_bytes: 0,
+            lines: 0,
+            files: 2,
+        })
     }
 
     /// A file the viewer decodes (frame, segment or dictionary); returns its bytes.
@@ -156,7 +183,9 @@ impl ClipFiles {
 
     /// A file another writer made in the clip folder (way D: an MP4 segment), counted from its size on disk.
     pub fn count(&mut self, path: &Path) -> Result<u64> {
-        let bytes = std::fs::metadata(path).map_err(|e| format!("size of {}: {e}", path.display()))?.len();
+        let bytes = std::fs::metadata(path)
+            .map_err(|e| format!("size of {}: {e}", path.display()))?
+            .len();
         self.payload += bytes;
         self.files += 1;
         Ok(bytes)
@@ -172,7 +201,9 @@ impl ClipFiles {
             self.width,
             self.height
         );
-        self.index.write_all(line.as_bytes()).map_err(|e| format!("frames.jsonl: {e}"))?;
+        self.index
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("frames.jsonl: {e}"))?;
         self.index_bytes += line.len() as u64;
         self.lines += 1;
         Ok(())
@@ -181,7 +212,8 @@ impl ClipFiles {
     /// Closes `frames.jsonl` and writes `clip.json`; returns the bytes of every file.
     pub fn finish(self, clip_json: &str) -> Result<ClipBytes> {
         drop(self.index);
-        std::fs::write(self.dir.join("clip.json"), clip_json).map_err(|e| format!("clip.json: {e}"))?;
+        std::fs::write(self.dir.join("clip.json"), clip_json)
+            .map_err(|e| format!("clip.json: {e}"))?;
         Ok(ClipBytes {
             payload: self.payload,
             index: self.index_bytes,

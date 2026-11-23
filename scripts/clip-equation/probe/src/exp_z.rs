@@ -94,7 +94,11 @@ impl Layout {
 
     /// The frame as an image of rows × row bytes, and bytes per pixel in a row.
     fn grid(self, w: usize, h: usize) -> (usize, usize, usize) {
-        if self.planar() { (3 * h, w, 1) } else { (h, w * self.bytes_per_pixel(), self.bytes_per_pixel()) }
+        if self.planar() {
+            (3 * h, w, 1)
+        } else {
+            (h, w * self.bytes_per_pixel(), self.bytes_per_pixel())
+        }
     }
 
     /// The capture's B,G,R,A to this layout (M1: the way's own, timed conversion).
@@ -307,7 +311,9 @@ impl Way {
             "ZW18" => ("bgr", "switch"),
             "ZW19" => ("planar", "xor"),
             "ZW10" | "ZW11" | "ZW20" => {
-                return Err(format!("{id} is not run: see docs/clip-recorder-ways.md section 4"));
+                return Err(format!(
+                    "{id} is not run: see docs/clip-recorder-ways.md section 4"
+                ));
             }
             _ => return Err(format!("unknown way {id}")),
         })
@@ -321,7 +327,9 @@ impl Way {
         let reach = (2 * frame_bytes).next_power_of_two().trailing_zeros();
         let kz = match args.text_or("kz", "20") {
             "all" => usize::MAX,
-            text => text.parse().map_err(|_| format!("kz={text} is not a number"))?,
+            text => text
+                .parse()
+                .map_err(|_| format!("kz={text} is not a number"))?,
         };
         Ok(Self {
             layout: Layout::parse(args.text_or("layout", layout))?,
@@ -329,7 +337,14 @@ impl Way {
             level: args.number("level", -3)?,
             tile: args.number("tile", 32)?,
             gap: args.number("gap", 0)?,
-            window_log: args.number("wlog", if matches!(mode, Mode::Prefix | Mode::Stream) { reach } else { 0 })?,
+            window_log: args.number(
+                "wlog",
+                if matches!(mode, Mode::Prefix | Mode::Stream) {
+                    reach
+                } else {
+                    0
+                },
+            )?,
             ldm: args.flag("ldm", id == "ZW14" || id == "ZW15"),
             dict_kb: args.number("dict", if id == "ZW16" { 110 } else { 0 })?,
             workers: args.number("workers", 0)?,
@@ -354,7 +369,10 @@ impl Way {
     /// hashLog = W − 7, minMatch 64, bucketSizeLog 4, hashRateLog 7 ([I], ways register ZW14).
     fn ldm_params(&self) -> [(sys::ZSTD_cParameter, u32); 4] {
         [
-            (sys::ZSTD_cParameter::ZSTD_c_ldmHashLog, self.window_log.saturating_sub(7).max(6)),
+            (
+                sys::ZSTD_cParameter::ZSTD_c_ldmHashLog,
+                self.window_log.saturating_sub(7).max(6),
+            ),
             (sys::ZSTD_cParameter::ZSTD_c_ldmMinMatch, 64),
             (sys::ZSTD_cParameter::ZSTD_c_ldmBucketSizeLog, 4),
             (sys::ZSTD_cParameter::ZSTD_c_ldmHashRateLog, 7),
@@ -384,7 +402,11 @@ impl Way {
     }
 
     fn json(&self) -> String {
-        let kz = if self.kz == usize::MAX { "\"all\"".to_owned() } else { self.kz.to_string() };
+        let kz = if self.kz == usize::MAX {
+            "\"all\"".to_owned()
+        } else {
+            self.kz.to_string()
+        };
         format!(
             "\"way\":\"{}\",\"layout\":\"{}\",\"mode\":\"{}\",\"level\":{},\"tile\":{},\"gap\":{},\"wlog\":{},\"ldm\":{},\"dict\":{},\"workers\":{},\"kz\":{kz},\"theta\":{},\"drain\":{}",
             self.id,
@@ -414,7 +436,11 @@ impl Estimate {
         unsafe {
             let cp = sys::ZSTD_getCParams(way.level, src as u64, dict);
             let params = sys::ZSTD_createCCtxParams();
-            let window = if way.window_log > 0 { way.window_log } else { cp.windowLog };
+            let window = if way.window_log > 0 {
+                way.window_log
+            } else {
+                cp.windowLog
+            };
             let set = |p, v: u32| sys::ZSTD_CCtxParams_setParameter(params, p, v as i32);
             set(sys::ZSTD_cParameter::ZSTD_c_windowLog, window);
             set(sys::ZSTD_cParameter::ZSTD_c_chainLog, cp.chainLog);
@@ -423,7 +449,10 @@ impl Estimate {
             set(sys::ZSTD_cParameter::ZSTD_c_minMatch, cp.minMatch);
             set(sys::ZSTD_cParameter::ZSTD_c_targetLength, cp.targetLength);
             set(sys::ZSTD_cParameter::ZSTD_c_strategy, cp.strategy as u32);
-            set(sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, if way.ldm { 1 } else { 2 });
+            set(
+                sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching,
+                if way.ldm { 1 } else { 2 },
+            );
             if way.ldm {
                 for (param, value) in way.ldm_params() {
                     set(param, value);
@@ -436,8 +465,16 @@ impl Estimate {
                 sys::ZSTD_estimateCCtxSize_usingCCtxParams(params)
             };
             sys::ZSTD_freeCCtxParams(params);
-            let cdict = if dict > 0 { sys::ZSTD_estimateCDictSize(dict, way.level) } else { 0 };
-            if sys::ZSTD_isError(size) != 0 { 0 } else { size + cdict }
+            let cdict = if dict > 0 {
+                sys::ZSTD_estimateCDictSize(dict, way.level)
+            } else {
+                0
+            };
+            if sys::ZSTD_isError(size) != 0 {
+                0
+            } else {
+                size + cdict
+            }
         }
     }
 
@@ -475,16 +512,25 @@ struct Packer {
 impl Packer {
     fn new(way: &Way, dict: &[u8]) -> Result<Self> {
         // SAFETY: a new context, freed in Drop.
-        let packer = Self { cctx: unsafe { sys::ZSTD_createCCtx() }, drain: way.drain };
+        let packer = Self {
+            cctx: unsafe { sys::ZSTD_createCCtx() },
+            drain: way.drain,
+        };
         if packer.cctx.is_null() {
             return Err("ZSTD_createCCtx returned null".into());
         }
         packer.set(sys::ZSTD_cParameter::ZSTD_c_compressionLevel, way.level)?;
         if way.window_log > 0 {
-            packer.set(sys::ZSTD_cParameter::ZSTD_c_windowLog, way.window_log as i32)?;
+            packer.set(
+                sys::ZSTD_cParameter::ZSTD_c_windowLog,
+                way.window_log as i32,
+            )?;
         }
         // M8: ldm always set, 1 enabled or 2 disabled; unset (0) lets zstd enable it itself at W >= 27 and btopt or slower.
-        packer.set(sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, if way.ldm { 1 } else { 2 })?;
+        packer.set(
+            sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching,
+            if way.ldm { 1 } else { 2 },
+        )?;
         if way.ldm {
             for (param, value) in way.ldm_params() {
                 packer.set(param, value as i32)?;
@@ -496,7 +542,9 @@ impl Packer {
         if !dict.is_empty() {
             // SAFETY: the dictionary is copied by zstd.
             zstd_check(
-                unsafe { sys::ZSTD_CCtx_loadDictionary(packer.cctx, dict.as_ptr().cast(), dict.len()) },
+                unsafe {
+                    sys::ZSTD_CCtx_loadDictionary(packer.cctx, dict.as_ptr().cast(), dict.len())
+                },
                 "ZSTD_CCtx_loadDictionary",
             )?;
         }
@@ -505,8 +553,11 @@ impl Packer {
 
     fn set(&self, param: sys::ZSTD_cParameter, value: i32) -> Result<()> {
         // SAFETY: a live context.
-        zstd_check(unsafe { sys::ZSTD_CCtx_setParameter(self.cctx, param, value) }, "ZSTD_CCtx_setParameter")
-            .map(|_| ())
+        zstd_check(
+            unsafe { sys::ZSTD_CCtx_setParameter(self.cctx, param, value) },
+            "ZSTD_CCtx_setParameter",
+        )
+        .map(|_| ())
     }
 
     /// One independent zstd frame of `src` (with the previous frame as prefix when given), into `out`.
@@ -514,7 +565,10 @@ impl Packer {
         // SAFETY: `out` has the capacity passed; the prefix outlives this one call, which is all zstd keeps it for.
         unsafe {
             if let Some(prefix) = prefix {
-                zstd_check(sys::ZSTD_CCtx_refPrefix(self.cctx, prefix.as_ptr().cast(), prefix.len()), "refPrefix")?;
+                zstd_check(
+                    sys::ZSTD_CCtx_refPrefix(self.cctx, prefix.as_ptr().cast(), prefix.len()),
+                    "refPrefix",
+                )?;
             }
             // Slack for the tile bitmap or rectangle header put in front later: no reallocation.
             let bound = sys::ZSTD_compressBound(src.len()) + 65536;
@@ -524,7 +578,13 @@ impl Packer {
                 return self.drained(src, out);
             }
             let n = zstd_check(
-                sys::ZSTD_compress2(self.cctx, out.as_mut_ptr().cast(), out.capacity(), src.as_ptr().cast(), src.len()),
+                sys::ZSTD_compress2(
+                    self.cctx,
+                    out.as_mut_ptr().cast(),
+                    out.capacity(),
+                    src.as_ptr().cast(),
+                    src.len(),
+                ),
                 "ZSTD_compress2",
             )?;
             out.set_len(n);
@@ -537,7 +597,11 @@ impl Packer {
     /// time. An output window below the bound puts zstd in buffered mode, whose
     /// blocks differ from one-shot `ZSTD_compress2` (same level, same frame).
     fn drained(&mut self, src: &[u8], out: &mut Vec<u8>) -> Result<()> {
-        let mut input = sys::ZSTD_inBuffer { src: src.as_ptr().cast(), size: src.len(), pos: 0 };
+        let mut input = sys::ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: src.len(),
+            pos: 0,
+        };
         loop {
             if out.capacity() - out.len() < self.drain {
                 out.reserve(self.drain);
@@ -550,7 +614,12 @@ impl Packer {
                     pos: 0,
                 };
                 let left = zstd_check(
-                    sys::ZSTD_compressStream2(self.cctx, &raw mut output, &raw mut input, sys::ZSTD_EndDirective::ZSTD_e_end),
+                    sys::ZSTD_compressStream2(
+                        self.cctx,
+                        &raw mut output,
+                        &raw mut input,
+                        sys::ZSTD_EndDirective::ZSTD_e_end,
+                    ),
                     "ZSTD_compressStream2",
                 )?;
                 out.set_len(out.len() + output.pos);
@@ -567,8 +636,16 @@ impl Packer {
         // SAFETY: zstd writes into the spare capacity, which grows before each call.
         unsafe {
             out.reserve(sys::ZSTD_compressBound(src.len()) + 1024);
-            let mut input = sys::ZSTD_inBuffer { src: src.as_ptr().cast(), size: src.len(), pos: 0 };
-            let directive = if end { sys::ZSTD_EndDirective::ZSTD_e_end } else { sys::ZSTD_EndDirective::ZSTD_e_flush };
+            let mut input = sys::ZSTD_inBuffer {
+                src: src.as_ptr().cast(),
+                size: src.len(),
+                pos: 0,
+            };
+            let directive = if end {
+                sys::ZSTD_EndDirective::ZSTD_e_end
+            } else {
+                sys::ZSTD_EndDirective::ZSTD_e_flush
+            };
             loop {
                 if out.capacity() - out.len() < 1024 {
                     out.reserve(64 * 1024);
@@ -579,7 +656,12 @@ impl Packer {
                     pos: 0,
                 };
                 let left = zstd_check(
-                    sys::ZSTD_compressStream2(self.cctx, &raw mut output, &raw mut input, directive),
+                    sys::ZSTD_compressStream2(
+                        self.cctx,
+                        &raw mut output,
+                        &raw mut input,
+                        directive,
+                    ),
                     "ZSTD_compressStream2",
                 )?;
                 out.set_len(out.len() + output.pos);
@@ -601,7 +683,11 @@ impl Packer {
         // SAFETY: a live context and an out-parameter.
         let code = unsafe { sys::ZSTD_CCtx_getParameter(self.cctx, param, &raw mut value) };
         // SAFETY: pure function on an error code.
-        if unsafe { sys::ZSTD_isError(code) } != 0 { -1 } else { value }
+        if unsafe { sys::ZSTD_isError(code) } != 0 {
+            -1
+        } else {
+            value
+        }
     }
 }
 
@@ -620,14 +706,18 @@ struct Unpacker {
 impl Unpacker {
     fn new(dict: &[u8]) -> Result<Self> {
         // SAFETY: a new context, freed in Drop.
-        let unpacker = Self { dctx: unsafe { sys::ZSTD_createDCtx() } };
+        let unpacker = Self {
+            dctx: unsafe { sys::ZSTD_createDCtx() },
+        };
         if unpacker.dctx.is_null() {
             return Err("ZSTD_createDCtx returned null".into());
         }
         if !dict.is_empty() {
             // SAFETY: the dictionary is copied by zstd.
             zstd_check(
-                unsafe { sys::ZSTD_DCtx_loadDictionary(unpacker.dctx, dict.as_ptr().cast(), dict.len()) },
+                unsafe {
+                    sys::ZSTD_DCtx_loadDictionary(unpacker.dctx, dict.as_ptr().cast(), dict.len())
+                },
                 "ZSTD_DCtx_loadDictionary",
             )?;
         }
@@ -639,10 +729,19 @@ impl Unpacker {
         // SAFETY: sizes passed with their buffers; the prefix outlives the call.
         unsafe {
             if let Some(prefix) = prefix {
-                zstd_check(sys::ZSTD_DCtx_refPrefix(self.dctx, prefix.as_ptr().cast(), prefix.len()), "DCtx refPrefix")?;
+                zstd_check(
+                    sys::ZSTD_DCtx_refPrefix(self.dctx, prefix.as_ptr().cast(), prefix.len()),
+                    "DCtx refPrefix",
+                )?;
             }
             zstd_check(
-                sys::ZSTD_decompressDCtx(self.dctx, out.as_mut_ptr().cast(), out.len(), src.as_ptr().cast(), src.len()),
+                sys::ZSTD_decompressDCtx(
+                    self.dctx,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                    src.as_ptr().cast(),
+                    src.len(),
+                ),
                 "ZSTD_decompressDCtx",
             )
         }
@@ -650,8 +749,16 @@ impl Unpacker {
 
     /// One chunk of the stream; returns the bytes written.
     fn chunk(&mut self, src: &[u8], out: &mut [u8]) -> Result<usize> {
-        let mut input = sys::ZSTD_inBuffer { src: src.as_ptr().cast(), size: src.len(), pos: 0 };
-        let mut output = sys::ZSTD_outBuffer { dst: out.as_mut_ptr().cast(), size: out.len(), pos: 0 };
+        let mut input = sys::ZSTD_inBuffer {
+            src: src.as_ptr().cast(),
+            size: src.len(),
+            pos: 0,
+        };
+        let mut output = sys::ZSTD_outBuffer {
+            dst: out.as_mut_ptr().cast(),
+            size: out.len(),
+            pos: 0,
+        };
         loop {
             let before = (input.pos, output.pos);
             // SAFETY: both buffers live for the call.
@@ -664,7 +771,10 @@ impl Unpacker {
                 return Ok(output.pos);
             }
             if stalled {
-                return Err(format!("ZSTD_decompressStream made no progress at {} of {} bytes", input.pos, input.size));
+                return Err(format!(
+                    "ZSTD_decompressStream made no progress at {} of {} bytes",
+                    input.pos, input.size
+                ));
             }
         }
     }
@@ -709,7 +819,12 @@ impl TileGrid {
     fn span(&self, t: usize) -> (usize, usize, usize, usize) {
         let (ty, tx) = (t / self.across, t % self.across);
         let (r0, c0) = (ty * self.tile_rows, tx * self.tile_bytes);
-        (r0, (r0 + self.tile_rows).min(self.rows), c0, (c0 + self.tile_bytes).min(self.row_bytes))
+        (
+            r0,
+            (r0 + self.tile_rows).min(self.rows),
+            c0,
+            (c0 + self.tile_bytes).min(self.row_bytes),
+        )
     }
 
     /// One bit per tile, set when the tile changed; returns the changed count.
@@ -748,7 +863,8 @@ impl TileGrid {
             let (r0, r1, c0, c1) = self.span(t);
             for r in r0..r1 {
                 let n = c1 - c0;
-                cur[r * self.row_bytes + c0..r * self.row_bytes + c1].copy_from_slice(&rows[at..at + n]);
+                cur[r * self.row_bytes + c0..r * self.row_bytes + c1]
+                    .copy_from_slice(&rows[at..at + n]);
                 at += n;
             }
         }
@@ -758,7 +874,10 @@ impl TileGrid {
     fn bounds(&self, cur: &[u8], prev: &[u8], bpp: usize) -> (usize, usize, usize, usize) {
         let (mut top, mut bottom, mut left, mut right) = (usize::MAX, 0, usize::MAX, 0);
         for r in 0..self.rows {
-            let (a, b) = (&cur[r * self.row_bytes..(r + 1) * self.row_bytes], &prev[r * self.row_bytes..(r + 1) * self.row_bytes]);
+            let (a, b) = (
+                &cur[r * self.row_bytes..(r + 1) * self.row_bytes],
+                &prev[r * self.row_bytes..(r + 1) * self.row_bytes],
+            );
             if a == b {
                 continue;
             }
@@ -768,7 +887,11 @@ impl TileGrid {
             left = left.min(first / bpp * bpp);
             right = right.max((last / bpp + 1) * bpp);
         }
-        if top == usize::MAX { (0, 0, 0, 0) } else { (top, left, bottom - top, right - left) }
+        if top == usize::MAX {
+            (0, 0, 0, 0)
+        } else {
+            (top, left, bottom - top, right - left)
+        }
     }
 
     /// ZW9 (ways register): the changed tiles merged into rectangles, each as (row, byte, rows, bytes).
@@ -793,7 +916,10 @@ impl TileGrid {
             rects.extend(run);
         }
         let near = |a: &[usize; 4], b: &[usize; 4]| {
-            a[0] <= b[2] + gap + 1 && b[0] <= a[2] + gap + 1 && a[1] <= b[3] + gap + 1 && b[1] <= a[3] + gap + 1
+            a[0] <= b[2] + gap + 1
+                && b[0] <= a[2] + gap + 1
+                && a[1] <= b[3] + gap + 1
+                && b[1] <= a[3] + gap + 1
         };
         let mut i = 0;
         while i < rects.len() {
@@ -801,7 +927,12 @@ impl TileGrid {
             if let Some(j) = found {
                 let b = rects.swap_remove(j);
                 let a = &mut rects[i];
-                *a = [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
+                *a = [
+                    a[0].min(b[0]),
+                    a[1].min(b[1]),
+                    a[2].max(b[2]),
+                    a[3].max(b[3]),
+                ];
                 // The grown rectangle may now be near one already passed: start again.
                 i = 0;
             } else {
@@ -812,7 +943,10 @@ impl TileGrid {
             .into_iter()
             .map(|[x0, y0, x1, y1]| {
                 let (r0, c0) = (y0 * self.tile_rows, x0 * self.tile_bytes);
-                let (r1, c1) = (((y1 + 1) * self.tile_rows).min(self.rows), ((x1 + 1) * self.tile_bytes).min(self.row_bytes));
+                let (r1, c1) = (
+                    ((y1 + 1) * self.tile_rows).min(self.rows),
+                    ((x1 + 1) * self.tile_bytes).min(self.row_bytes),
+                );
                 (r0, c0, r1 - r0, c1 - c0)
             })
             .collect()
@@ -837,9 +971,16 @@ struct WayEncoder {
 
 impl WayEncoder {
     fn new(way: &Way, w: usize, h: usize, dict: &[u8]) -> Result<Self> {
-        let packer = if way.mode == Mode::Raw { None } else { Some(Packer::new(way, dict)?) };
+        let packer = if way.mode == Mode::Raw {
+            None
+        } else {
+            Some(Packer::new(way, dict)?)
+        };
         let size = w * h * way.layout.bytes_per_pixel();
-        let gathers = matches!(way.mode, Mode::Tiles | Mode::Rect | Mode::Box | Mode::Switch);
+        let gathers = matches!(
+            way.mode,
+            Mode::Tiles | Mode::Rect | Mode::Box | Mode::Switch
+        );
         Ok(Self {
             grid: TileGrid::new(way.layout, w, h, way.tile),
             way: way.clone(),
@@ -864,7 +1005,11 @@ impl WayEncoder {
 
     /// Frame `k` (the B,G,R,A capture frame, after `convert`) to its clip payload, left in `self.out`.
     fn encode(&mut self, k: usize, bgra: &[u8]) -> Result<()> {
-        let src: &[u8] = if self.way.layout == Layout::Bgra { bgra } else { &self.view };
+        let src: &[u8] = if self.way.layout == Layout::Bgra {
+            bgra
+        } else {
+            &self.view
+        };
         let key = self.way.is_key(k);
         let Some(packer) = self.packer.as_mut() else {
             self.out.clear();
@@ -893,7 +1038,11 @@ impl WayEncoder {
                 } else {
                     self.grid.gather(src, &self.bits, &mut self.gather);
                     packer.frame(&self.gather, None, &mut self.out)?;
-                    let head: Vec<u8> = (self.way.mode == Mode::Switch).then_some(1).into_iter().chain(self.bits.iter().copied()).collect();
+                    let head: Vec<u8> = (self.way.mode == Mode::Switch)
+                        .then_some(1)
+                        .into_iter()
+                        .chain(self.bits.iter().copied())
+                        .collect();
                     self.out.splice(0..0, head);
                 }
             }
@@ -905,7 +1054,11 @@ impl WayEncoder {
                 } else {
                     let bpp = self.way.layout.grid(self.w, 1).2;
                     let rect = self.grid.bounds(src, &self.prev, bpp);
-                    if rect.2 * rect.3 == 0 { Vec::new() } else { vec![rect] }
+                    if rect.2 * rect.3 == 0 {
+                        Vec::new()
+                    } else {
+                        vec![rect]
+                    }
                 };
                 self.gather.clear();
                 for &(row, byte, rows, bytes) in &rects {
@@ -970,12 +1123,18 @@ impl WayDecoder {
             way: way.clone(),
             w,
             cur: vec![0; size],
-            tmp: if way.mode == Mode::Switch || (way.mode.keeps_previous() && way.mode != Mode::Stream && way.kz > 1) {
+            tmp: if way.mode == Mode::Switch
+                || (way.mode.keeps_previous() && way.mode != Mode::Stream && way.kz > 1)
+            {
                 vec![0; size]
             } else {
                 Vec::new()
             },
-            bgr: if way.layout == Layout::Bgr { Vec::new() } else { vec![0; w * h * 3] },
+            bgr: if way.layout == Layout::Bgr {
+                Vec::new()
+            } else {
+                vec![0; w * h * 3]
+            },
             chain: 0,
             listed: 0,
         })
@@ -1014,11 +1173,16 @@ impl WayDecoder {
             }
             Mode::Prefix => {
                 self.tmp.resize(size, 0);
-                self.unpacker.frame(payload, Some(&self.cur), &mut self.tmp)?;
+                self.unpacker
+                    .frame(payload, Some(&self.cur), &mut self.tmp)?;
                 std::mem::swap(&mut self.cur, &mut self.tmp);
             }
             Mode::Tiles | Mode::Switch => {
-                let body = if self.way.mode == Mode::Switch { &payload[1..] } else { payload };
+                let body = if self.way.mode == Mode::Switch {
+                    &payload[1..]
+                } else {
+                    payload
+                };
                 let nbits = self.grid.count().div_ceil(8);
                 let (bits, packed) = body.split_at(nbits);
                 self.tmp.resize(size, 0);
@@ -1026,16 +1190,35 @@ impl WayDecoder {
                 self.grid.scatter(&self.tmp[..n], bits, &mut self.cur);
             }
             Mode::Rect | Mode::Box => {
-                let field = |i: usize| u32::from_le_bytes([payload[4 * i], payload[4 * i + 1], payload[4 * i + 2], payload[4 * i + 3]]) as usize;
+                let field = |i: usize| {
+                    u32::from_le_bytes([
+                        payload[4 * i],
+                        payload[4 * i + 1],
+                        payload[4 * i + 2],
+                        payload[4 * i + 3],
+                    ]) as usize
+                };
                 let count = field(0);
-                let rects: Vec<(usize, usize, usize, usize)> =
-                    (0..count).map(|i| (field(1 + 4 * i), field(2 + 4 * i), field(3 + 4 * i), field(4 + 4 * i))).collect();
+                let rects: Vec<(usize, usize, usize, usize)> = (0..count)
+                    .map(|i| {
+                        (
+                            field(1 + 4 * i),
+                            field(2 + 4 * i),
+                            field(3 + 4 * i),
+                            field(4 + 4 * i),
+                        )
+                    })
+                    .collect();
                 let listed: usize = rects.iter().map(|r| r.2 * r.3).sum();
                 self.listed += listed as u64;
                 self.tmp.resize(size, 0);
-                let n = self.unpacker.frame(&payload[4 + 16 * count..], None, &mut self.tmp)?;
+                let n = self
+                    .unpacker
+                    .frame(&payload[4 + 16 * count..], None, &mut self.tmp)?;
                 if n != listed {
-                    return Err(format!("rectangles of frame {k}: {n} bytes, listed {listed}"));
+                    return Err(format!(
+                        "rectangles of frame {k}: {n} bytes, listed {listed}"
+                    ));
                 }
                 let mut at_tmp = 0;
                 for (row, byte, rows, bytes) in rects {
@@ -1047,7 +1230,11 @@ impl WayDecoder {
                 }
             }
         }
-        self.chain = if standalone || !self.way.mode.keeps_previous() { 1 } else { self.chain + 1 };
+        self.chain = if standalone || !self.way.mode.keeps_previous() {
+            1
+        } else {
+            self.chain + 1
+        };
         if self.way.layout != Layout::Bgr {
             self.way.layout.inverse(&self.cur, self.w, &mut self.bgr);
         }
@@ -1056,7 +1243,11 @@ impl WayDecoder {
 
     /// The last decoded frame as B,G,R.
     fn frame(&self) -> &[u8] {
-        if self.way.layout == Layout::Bgr { &self.cur } else { &self.bgr }
+        if self.way.layout == Layout::Bgr {
+            &self.cur
+        } else {
+            &self.bgr
+        }
     }
 }
 
@@ -1076,24 +1267,42 @@ struct Corpus {
 
 impl Corpus {
     fn open(folder: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(folder.join("frames.jsonl")).map_err(|e| format!("frames.jsonl: {e}"))?;
+        let text = std::fs::read_to_string(folder.join("frames.jsonl"))
+            .map_err(|e| format!("frames.jsonl: {e}"))?;
         let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         let first = lines.first().ok_or("frames.jsonl is empty")?;
         let number = |line: &str, key: &str| -> Result<usize> {
-            let at = line.find(&format!("\"{key}\":")).ok_or(format!("no {key} in frames.jsonl"))? + key.len() + 3;
-            line[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().map_err(|_| format!("bad {key}"))
+            let at = line
+                .find(&format!("\"{key}\":"))
+                .ok_or(format!("no {key} in frames.jsonl"))?
+                + key.len()
+                + 3;
+            line[at..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .map_err(|_| format!("bad {key}"))
         };
         let (w, h) = (number(first, "width")?, number(first, "height")?);
         let new_frames = lines.iter().filter(|l| l.contains("\"new\":true")).count();
         // A lost instant names no frame: it has no line in the clip either.
         let instants = lines
             .iter()
-            .filter_map(|l| Some((number(l, "instant").ok()? as u64, number(l, "frame").ok()?, l.contains("\"new\":true"))))
+            .filter_map(|l| {
+                Some((
+                    number(l, "instant").ok()? as u64,
+                    number(l, "frame").ok()?,
+                    l.contains("\"new\":true"),
+                ))
+            })
             .collect();
         let mut d_wait = 0;
         let mut largest = 0;
         for k in 0..new_frames {
-            let size = std::fs::metadata(Self::path_in(folder, k)).map_err(|e| format!("frame {k}: {e}"))?.len();
+            let size = std::fs::metadata(Self::path_in(folder, k))
+                .map_err(|e| format!("frame {k}: {e}"))?
+                .len();
             d_wait += size;
             largest = largest.max(size);
         }
@@ -1119,9 +1328,15 @@ impl Corpus {
         std::fs::File::open(Self::path_in(&self.folder, k))
             .and_then(|mut f| f.read_to_end(&mut self.packed))
             .map_err(|e| format!("corpus frame {k}: {e}"))?;
-        let n = self.dctx.decompress_to_buffer(&self.packed, out).map_err(|e| format!("corpus frame {k}: {e}"))?;
+        let n = self
+            .dctx
+            .decompress_to_buffer(&self.packed, out)
+            .map_err(|e| format!("corpus frame {k}: {e}"))?;
         if n != out.len() {
-            return Err(format!("corpus frame {k}: {n} bytes, expected {}", out.len()));
+            return Err(format!(
+                "corpus frame {k}: {n} bytes, expected {}",
+                out.len()
+            ));
         }
         Ok(())
     }
@@ -1143,7 +1358,8 @@ fn train_dictionary(
     let w = corpus.w;
     let count = corpus.new_frames.min(DICT_TRAIN_FRAMES);
     // Allocated once at its final size, so no reallocation doubles it for a moment.
-    let mut samples = train.time(|| Vec::with_capacity(count * w * corpus.h * way.layout.bytes_per_pixel()));
+    let mut samples =
+        train.time(|| Vec::with_capacity(count * w * corpus.h * way.layout.bytes_per_pixel()));
     let mut sizes = Vec::new();
     let mut view = Vec::new();
     for k in 0..corpus.new_frames.min(DICT_TRAIN_FRAMES) {
@@ -1172,7 +1388,15 @@ pub fn run() -> Result<()> {
     let (w, h) = (corpus.w, corpus.h);
     let px = w * h;
     let way = Way::from_args(&args, px * 3)?;
-    let clip = scratch.join(format!("{}-{}-{}-{rep}", folder.file_name().and_then(|n| n.to_str()).unwrap_or("folder"), way.id, std::process::id()));
+    let clip = scratch.join(format!(
+        "{}-{}-{}-{rep}",
+        folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("folder"),
+        way.id,
+        std::process::id()
+    ));
 
     // Input preparation (M1, M3): the corpus reader, its B,G,R frame and the capture's B,G,R,A
     // frame exist and have read one frame before M_0, like the product's slot.
@@ -1188,12 +1412,26 @@ pub fn run() -> Result<()> {
     let ram = RamMeter::start();
 
     // The way's work (M2): conversion, context and compression, writing, dictionary training.
-    let (mut convert, mut comp, mut write, mut train) = (Spent::default(), Spent::default(), Spent::default(), Spent::default());
+    let (mut convert, mut comp, mut write, mut train) = (
+        Spent::default(),
+        Spent::default(),
+        Spent::default(),
+        Spent::default(),
+    );
     let wall_start = wall_ns();
-    let dict = train_dictionary(&way, &mut corpus, &mut bgr, &mut capture, &mut corpus_spent, &mut train)?;
+    let dict = train_dictionary(
+        &way,
+        &mut corpus,
+        &mut bgr,
+        &mut capture,
+        &mut corpus_spent,
+        &mut train,
+    )?;
     let mut files = write.time(|| ClipFiles::create(&clip, w, h))?;
     let mut encoder = comp.time(|| WayEncoder::new(&way, w, h, &dict))?;
-    let ldm_read = encoder.packer.as_ref().map_or(0, |p| p.get(sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching));
+    let ldm_read = encoder.packer.as_ref().map_or(0, |p| {
+        p.get(sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching)
+    });
     if !dict.is_empty() {
         write.time(|| files.frame("dictionary.bin", &dict))?;
     }
@@ -1224,7 +1462,11 @@ pub fn run() -> Result<()> {
     if let Some(tail) = comp.time(|| encoder.finish(corpus.new_frames))? {
         write.time(|| files.frame("f-end.bin", &tail))?;
     }
-    let clip_json = format!("{{{},\"w\":{w},\"h\":{h},\"frames\":{}}}", way.json(), corpus.new_frames);
+    let clip_json = format!(
+        "{{{},\"w\":{w},\"h\":{h},\"frames\":{}}}",
+        way.json(),
+        corpus.new_frames
+    );
     let clip_bytes = write.time(|| files.finish(&clip_json))?;
     let t_ready_ns = wall_ns().saturating_sub(last_comp_end);
     let wall_comp_total = wall_ns().saturating_sub(wall_start);
@@ -1249,15 +1491,24 @@ pub fn run() -> Result<()> {
     let mut decoder = dec.time(|| WayDecoder::new(&way, w, h, &dict))?;
     let mut payload = Vec::with_capacity(b_max);
     let tail = clip.join("f-end.bin");
-    let (mut diff_sum, mut diff_frames, mut n_dec_worst, mut decoded) = (0u64, 0u64, 0usize, 0usize);
+    let (mut diff_sum, mut diff_frames, mut n_dec_worst, mut decoded) =
+        (0u64, 0u64, 0usize, 0usize);
     for k in 0..corpus.new_frames {
         payload.clear();
-        read.time(|| std::fs::File::open(clip.join(format!("f-{k:04}.bin"))).and_then(|mut f| f.read_to_end(&mut payload)))
-            .map_err(|e| format!("read clip frame {k}: {e}"))?;
+        read.time(|| {
+            std::fs::File::open(clip.join(format!("f-{k:04}.bin")))
+                .and_then(|mut f| f.read_to_end(&mut payload))
+        })
+        .map_err(|e| format!("read clip frame {k}: {e}"))?;
         dec.time(|| decoder.decode(k, &payload))?;
         n_dec_worst = n_dec_worst.max(decoder.chain);
         corpus_dec.time(|| corpus.frame(k, &mut bgr))?;
-        let diff: u64 = decoder.frame().iter().zip(&bgr).map(|(a, b)| u64::from(a.abs_diff(*b))).sum();
+        let diff: u64 = decoder
+            .frame()
+            .iter()
+            .zip(&bgr)
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
         diff_sum += diff;
         diff_frames += u64::from(diff > 0);
         decoded += 1;
@@ -1303,8 +1554,16 @@ pub fn run() -> Result<()> {
         dict.len(),
         format_args!("\"px\":{px}"),
         ram_read.json(""),
-        if way.mode == Mode::Raw { 0 } else { Estimate::cctx(&way, px * way.layout.bytes_per_pixel(), dict.len()) },
-        if way.mode == Mode::Raw { 0 } else { Estimate::dctx(&way, dict.len()) },
+        if way.mode == Mode::Raw {
+            0
+        } else {
+            Estimate::cctx(&way, px * way.layout.bytes_per_pixel(), dict.len())
+        },
+        if way.mode == Mode::Raw {
+            0
+        } else {
+            Estimate::dctx(&way, dict.len())
+        },
         dec.json("dec", rate),
         read.json("read", rate),
         corpus_dec.json("corpus_dec", rate),

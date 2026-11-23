@@ -11,8 +11,8 @@ use synapse_capture::ClipSource;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason,
-    clips_root, file_size_and_sha256,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason, clips_root,
+    file_size_and_sha256,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -149,11 +149,6 @@ impl Recorders {
         running.thread.take()
     }
 }
-
-/// B4, C14: the clip worker marked this clip `failed` (the encoder failed
-/// twice); a recording that still runs into it stops, keeping its committed
-/// segments. The recorder never overwrites `failed` when it finishes.
-#[cfg(windows)]
 
 /// A validated recording request.
 struct ClipPlan {
@@ -326,7 +321,8 @@ fn status_of(
         end_ms: clip.end_ms,
         exact_bytes: clip.exact.as_ref().map_or(0, |exact| exact.totals.bytes),
         segments: clip
-            .moving.segments
+            .moving
+            .segments
             .iter()
             .map(|segment| ClipSegmentInfo {
                 file: segment.segment.file.clone(),
@@ -571,8 +567,6 @@ fn thread_failed(detail: String) -> ErrorData {
     )
 }
 
-/// σ: the smallest whole number that gives at least `MIN_LINES` lines (A3).
-
 #[cfg(windows)]
 mod live {
     use std::io::Write as _;
@@ -585,8 +579,8 @@ mod live {
 
     use super::super::clip_folder::{
         CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
-        ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
-        ObserverGrant, RecorderLock, StopReason, CommittedSegment, MovingInfo,
+        ClipTargetInfo, CommittedSegment, ConditionStatus, Conditions, FrameLine, LossCause,
+        LostInstant, MovingInfo, ObserverGrant, RecorderLock, StopReason,
     };
     use super::super::clip_layers::{ClipLayers, Written};
     use super::super::{CaptureClipResponse, ErrorData};
@@ -655,7 +649,8 @@ mod live {
     impl Machine {
         fn read() -> Self {
             Self {
-                threads: std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX)),
+                threads: std::thread::available_parallelism()
+                    .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX)),
             }
         }
     }
@@ -683,13 +678,19 @@ mod live {
 
         /// Processor time of the recorder thread plus the capture thread.
         fn cpu(observer: &ClipObserver, moving_hns: i64) -> i64 {
-            synapse_capture::current_thread_cpu_hns() + observer.capture_thread_cpu_hns() + moving_hns
+            synapse_capture::current_thread_cpu_hns()
+                + observer.capture_thread_cpu_hns()
+                + moving_hns
         }
 
         /// `true` when the live part alone has used its whole share of 10 %
         /// within the current second (A9): read-backs are skipped until it ends.
         fn shedding(&self, observer: &ClipObserver, moving_hns: i64) -> bool {
-            Self::share_percent(Self::cpu(observer, moving_hns) - self.cpu_at_second_start, HNS_PER_SECOND, self.threads) >= CPU_LIMIT_PERCENT
+            Self::share_percent(
+                Self::cpu(observer, moving_hns) - self.cpu_at_second_start,
+                HNS_PER_SECOND,
+                self.threads,
+            ) >= CPU_LIMIT_PERCENT
         }
         fn share_percent(cpu_hns: i64, wall_hns: i64, threads: u32) -> f64 {
             cpu_hns as f64 * PERCENT / (wall_hns.max(1) as f64 * f64::from(threads.max(1)))
@@ -714,22 +715,34 @@ mod live {
     }
 
     /// Free space on the clip volume, including writes since the last measurement.
-    struct DiskGuard { measured_free: u64, written_since: u64, measured_at: Instant }
+    struct DiskGuard {
+        measured_free: u64,
+        written_since: u64,
+        measured_at: Instant,
+    }
     impl DiskGuard {
         fn new(folder: &Path) -> Result<Self, String> {
-            Ok(Self { measured_free: Self::measure(folder)?, written_since: 0, measured_at: Instant::now() })
+            Ok(Self {
+                measured_free: Self::measure(folder)?,
+                written_since: 0,
+                measured_at: Instant::now(),
+            })
         }
         fn measure(folder: &Path) -> Result<u64, String> {
             synapse_storage::volume_free_bytes(folder).map_err(|e| e.to_string())
         }
-        fn wrote(&mut self, bytes: u64) { self.written_since += bytes; }
+        fn wrote(&mut self, bytes: u64) {
+            self.written_since += bytes;
+        }
         fn permits(&mut self, folder: &Path) -> Result<bool, String> {
             if self.measured_at.elapsed() >= Duration::from_millis(DISK_CHECK_MS) {
                 self.measured_free = Self::measure(folder)?;
                 self.written_since = 0;
                 self.measured_at = Instant::now();
             }
-            Ok(synapse_storage::level_for_free_bytes(self.measured_free.saturating_sub(self.written_since)) == synapse_storage::DiskPressureLevel::Normal)
+            Ok(synapse_storage::level_for_free_bytes(
+                self.measured_free.saturating_sub(self.written_since),
+            ) == synapse_storage::DiskPressureLevel::Normal)
         }
     }
 
@@ -844,10 +857,15 @@ mod live {
                 recorded_width: frame.width * scale,
                 recorded_height: frame.height * scale,
             };
-            let mut layers = ClipLayers::start(&self.plan.folder, frame.width, frame.height, RECORD_FPS).map_err(internal_error)?;
-            let written = layers.picture(0, &pixels.bgra, frame.width, frame.height).map_err(internal_error)?;
+            let mut layers =
+                ClipLayers::start(&self.plan.folder, frame.width, frame.height, RECORD_FPS)
+                    .map_err(internal_error)?;
+            let written = layers
+                .picture(0, &pixels.bgra, frame.width, frame.height)
+                .map_err(internal_error)?;
             self.layers = Some(layers);
-            self.write_line(self.new_line(0, &frame), written).map_err(internal_error)?;
+            self.write_line(self.new_line(0, &frame), written)
+                .map_err(internal_error)?;
             self.last_recorded = Some(frame);
             self.next_instant = 1;
             let clock = ClipClock {
@@ -943,7 +961,10 @@ mod live {
                 control
                     .recorded_ms
                     .store(instant_ms(self.next_instant), Ordering::Relaxed);
-                self.meter.tick(&self.observer, self.layers.as_ref().map_or(0, ClipLayers::cpu_hns));
+                self.meter.tick(
+                    &self.observer,
+                    self.layers.as_ref().map_or(0, ClipLayers::cpu_hns),
+                );
             }
         }
 
@@ -983,23 +1004,41 @@ mod live {
             if repeated {
                 let mut line = self.repeat_line(k, &frame);
                 line.minimized = self.window_minimized();
-                let written = self.layers.as_mut().ok_or(StopReason::WriteFailed)?.repeat(k).map_err(|_| StopReason::WriteFailed)?;
-                return self.write_line(line, written).map_err(|_| StopReason::WriteFailed);
+                let written = self
+                    .layers
+                    .as_mut()
+                    .ok_or(StopReason::WriteFailed)?
+                    .repeat(k)
+                    .map_err(|_| StopReason::WriteFailed)?;
+                return self
+                    .write_line(line, written)
+                    .map_err(|_| StopReason::WriteFailed);
             }
-            if self.meter.shedding(&self.observer, self.layers.as_ref().map_or(0, ClipLayers::cpu_hns)) {
+            if self.meter.shedding(
+                &self.observer,
+                self.layers.as_ref().map_or(0, ClipLayers::cpu_hns),
+            ) {
                 return self.write_lost(k, LossCause::LoadShedding);
             }
             let pixels = self.observer.read_back(&frame).map_err(|error| {
                 tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
                 StopReason::CaptureFailed
             })?;
-            let written = self.layers.as_mut().ok_or(StopReason::WriteFailed)?
-                .picture(k, &pixels.bgra, frame.width, frame.height).map_err(|error| {
+            let written = self
+                .layers
+                .as_mut()
+                .ok_or(StopReason::WriteFailed)?
+                .picture(k, &pixels.bgra, frame.width, frame.height)
+                .map_err(|error| {
                     tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
-                    self.lost.push(LostInstant { instant: k, cause: LossCause::Disk });
+                    self.lost.push(LostInstant {
+                        instant: k,
+                        cause: LossCause::Disk,
+                    });
                     StopReason::WriteFailed
                 })?;
-            self.write_line(self.new_line(k, &frame), written).map_err(|_| StopReason::WriteFailed)?;
+            self.write_line(self.new_line(k, &frame), written)
+                .map_err(|_| StopReason::WriteFailed)?;
             self.last_recorded = Some(frame);
             Ok(())
         }
@@ -1011,8 +1050,14 @@ mod live {
                 None => self.blank_line(k),
             };
             line.lost = Some(cause);
-            let written = self.layers.as_mut().ok_or(StopReason::WriteFailed)?.repeat(k).map_err(|_| StopReason::WriteFailed)?;
-            self.write_line(line, written).map_err(|_| StopReason::WriteFailed)
+            let written = self
+                .layers
+                .as_mut()
+                .ok_or(StopReason::WriteFailed)?
+                .repeat(k)
+                .map_err(|_| StopReason::WriteFailed)?;
+            self.write_line(line, written)
+                .map_err(|_| StopReason::WriteFailed)
         }
 
         fn blank_line(&self, k: u64) -> FrameLine {
@@ -1026,7 +1071,9 @@ mod live {
                 composed_hns: None,
                 lost: None,
                 minimized: false,
-                exact: None, moving: None, moving_rect: None,
+                exact: None,
+                moving: None,
+                moving_rect: None,
             }
         }
 
@@ -1070,15 +1117,27 @@ mod live {
             line.moving = written.moving;
             line.moving_rect = written.moving_rect;
             if written.moving_behind {
-                self.lost.push(LostInstant { instant: line.instant, cause: LossCause::MovingBehind });
+                self.lost.push(LostInstant {
+                    instant: line.instant,
+                    cause: LossCause::MovingBehind,
+                });
                 line.lost = Some(LossCause::MovingBehind);
             }
             self.disk.wrote(written.bytes);
             serde_json::to_writer(&mut self.frames, &line).map_err(|e| e.to_string())?;
-            self.frames.write_all(b"\n").and_then(|()| self.frames.flush()).map_err(|e| e.to_string())?;
+            self.frames
+                .write_all(b"\n")
+                .and_then(|()| self.frames.flush())
+                .map_err(|e| e.to_string())?;
             if !written.committed.is_empty() {
-                let committed = written.committed.into_iter().map(|s| CommittedSegment::read_back(&self.plan.folder, s)).collect::<Result<Vec<_>, _>>()?;
-                ClipJson::update(&self.plan.folder, |clip| clip.moving.segments.extend(committed))?;
+                let committed = written
+                    .committed
+                    .into_iter()
+                    .map(|s| CommittedSegment::read_back(&self.plan.folder, s))
+                    .collect::<Result<Vec<_>, _>>()?;
+                ClipJson::update(&self.plan.folder, |clip| {
+                    clip.moving.segments.extend(committed);
+                })?;
             }
             Ok(())
         }
@@ -1106,11 +1165,18 @@ mod live {
 
         /// Join both layers and publish ready only after all format files are complete.
         fn finish(mut self, reason: StopReason) {
-            let result = self.layers.take().ok_or("recorder layers absent".to_owned()).and_then(ClipLayers::finish);
+            let result = self
+                .layers
+                .take()
+                .ok_or("recorder layers absent".to_owned())
+                .and_then(ClipLayers::finish);
             let summary = match result {
                 Ok(summary) => summary,
                 Err(error) => {
-                    let _ = ClipJson::update(&self.plan.folder, |clip| { clip.state = ClipState::Failed; clip.failure = Some(error); });
+                    let _ = ClipJson::update(&self.plan.folder, |clip| {
+                        clip.state = ClipState::Failed;
+                        clip.failure = Some(error);
+                    });
                     let _ = self.observer.stop();
                     return;
                 }
@@ -1119,13 +1185,33 @@ mod live {
             let stats = self.observer.stop();
             let recorded_ms = instant_ms(self.next_instant);
             let mut lost = std::mem::take(&mut self.lost);
-            lost.extend(stats.slot_overflow_instants.iter().filter_map(|&k| u64::try_from(k).ok())
-                .filter(|&k| k < self.next_instant).map(|instant| LostInstant { instant, cause: LossCause::SlotOverflow }));
+            lost.extend(
+                stats
+                    .slot_overflow_instants
+                    .iter()
+                    .filter_map(|&k| u64::try_from(k).ok())
+                    .filter(|&k| k < self.next_instant)
+                    .map(|instant| LostInstant {
+                        instant,
+                        cause: LossCause::SlotOverflow,
+                    }),
+            );
             for short in &summary.moving.short {
-                lost.extend((short.first_instant + u64::from(short.held)..short.first_instant + u64::from(short.expected))
-                    .map(|instant| LostInstant { instant, cause: LossCause::MovingFailed }));
+                lost.extend(
+                    (short.first_instant + u64::from(short.held)
+                        ..short.first_instant + u64::from(short.expected))
+                        .map(|instant| LostInstant {
+                            instant,
+                            cause: LossCause::MovingFailed,
+                        }),
+                );
             }
-            let committed = summary.moving.committed.into_iter().map(|s| CommittedSegment::read_back(&self.plan.folder, s)).collect::<Result<Vec<_>, _>>();
+            let committed = summary
+                .moving
+                .committed
+                .into_iter()
+                .map(|s| CommittedSegment::read_back(&self.plan.folder, s))
+                .collect::<Result<Vec<_>, _>>();
             let updated = ClipJson::update(&self.plan.folder, |clip| -> Result<(), String> {
                 clip.moving.segments.extend(committed?);
                 clip.moving.encoder = summary.moving.grant;
@@ -1162,7 +1248,10 @@ mod live {
             }).and_then(|(_, result)| result);
             if let Err(error) = updated {
                 tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
-                let _ = ClipJson::update(&self.plan.folder, |clip| { clip.state = ClipState::Failed; clip.failure = Some(error); });
+                let _ = ClipJson::update(&self.plan.folder, |clip| {
+                    clip.state = ClipState::Failed;
+                    clip.failure = Some(error);
+                });
             }
         }
     }

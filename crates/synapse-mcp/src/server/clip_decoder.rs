@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_FRAME_RATE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    IMFAttributes, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MFCreateAttributes, MFCreateMediaType,
     MFCreateSourceReaderFromURL, MFMediaType_Video, MFSampleExtension_CleanPoint,
@@ -140,40 +140,57 @@ impl ClipDecoder {
     }
 
     /// D6 maps instants by sample count. File times are used only to land on a keyframe.
-    pub(super) fn frame_number(&mut self, number: u32, keys: &[KeyFrame]) -> Result<DecodedFrame, String> {
+    pub(super) fn frame_number(
+        &mut self,
+        number: u32,
+        keys: &[KeyFrame],
+    ) -> Result<DecodedFrame, String> {
         if let Some((last_number, last)) = &self.last
             && *last_number == number
         {
             return Ok(last.clone());
         }
-        let key = keys.iter().rev().find(|key| key.frame <= number)
-            .ok_or_else(|| format!("{} has no keyframe before frame {number}", self.path.display()))?;
-        let reading_on = self.last.as_ref().filter(|(last_number, _)| {
-            *last_number + 1 == number || (key.frame <= *last_number && *last_number < number)
-        }).map(|(last_number, _)| *last_number + 1);
+        let key = keys
+            .iter()
+            .rev()
+            .find(|key| key.frame <= number)
+            .ok_or_else(|| {
+                format!(
+                    "{} has no keyframe before frame {number}",
+                    self.path.display()
+                )
+            })?;
+        let reading_on = self
+            .last
+            .as_ref()
+            .filter(|(last_number, _)| {
+                *last_number + 1 == number || (key.frame <= *last_number && *last_number < number)
+            })
+            .map(|(last_number, _)| *last_number + 1);
         let first = match reading_on {
             Some(next) => next,
             None => {
-                self.seek(key.t_hns)?;
+                // Seek inside the key sample. Seeking its exact boundary can
+                // select the previous fragment in the Windows MP4 source.
+                let position = key.t_hns.saturating_add(self.half_sample_hns);
+                self.seek(position)?;
                 key.frame
             }
         };
         for current in first..=number {
-            let frame = self.next_frame()?.ok_or_else(|| {
-                format!("{} has no decoded frame {current}", self.path.display())
-            })?;
-            if reading_on.is_none() && current == first
-                && frame.t_hns.abs_diff(key.t_hns) > self.half_sample_hns as u64
-            {
-                self.last = None;
-                return Err(format!(
-                    "{} seek to keyframe {} at {} hns landed at {} hns",
-                    self.path.display(), key.frame, key.t_hns, frame.t_hns,
-                ));
-            }
+            let frame = self
+                .next_frame()?
+                .ok_or_else(|| format!("{} has no decoded frame {current}", self.path.display()))?;
+            tracing::trace!(
+                frame = current,
+                sample_time_hns = frame.t_hns,
+                "decoded moving sample"
+            );
             self.last = Some((current, frame));
         }
-        self.last.as_ref().map(|(_, frame)| frame.clone())
+        self.last
+            .as_ref()
+            .map(|(_, frame)| frame.clone())
             .ok_or_else(|| format!("{} has no decoded frame {number}", self.path.display()))
     }
 
@@ -184,6 +201,9 @@ impl ClipDecoder {
             let inner = &mut *position.Anonymous.Anonymous;
             inner.vt = VT_I8;
             inner.Anonymous.hVal = t_hns;
+            self.reader
+                .Flush(video_stream())
+                .map_err(hr("IMFSourceReader::Flush"))?;
             self.reader
                 .SetCurrentPosition(&GUID::zeroed(), &raw const position)
                 .map_err(hr("IMFSourceReader::SetCurrentPosition"))?;
@@ -206,8 +226,8 @@ impl ClipDecoder {
             ));
         }
         // The file's rate defines the tolerance for validating a keyframe seek.
-        let rate = unsafe { current.GetUINT64(&MF_MT_FRAME_RATE) }
-            .map_err(hr("MF_MT_FRAME_RATE"))?;
+        let rate =
+            unsafe { current.GetUINT64(&MF_MT_FRAME_RATE) }.map_err(hr("MF_MT_FRAME_RATE"))?;
         let numerator = rate >> PACKED_SHIFT;
         let denominator = rate & PACKED_LOW_MASK;
         if numerator == 0 || denominator == 0 {
@@ -280,10 +300,15 @@ impl SampleTable {
             // SAFETY: the three out-parameters live through the call.
             unsafe {
                 reader.ReadSample(
-                    video_stream(), 0, None, Some(&raw mut flags),
-                    Some(&raw mut timestamp), Some(&raw mut sample),
+                    video_stream(),
+                    0,
+                    None,
+                    Some(&raw mut flags),
+                    Some(&raw mut timestamp),
+                    Some(&raw mut sample),
                 )
-            }.map_err(hr("IMFSourceReader::ReadSample"))?;
+            }
+            .map_err(hr("IMFSourceReader::ReadSample"))?;
             if flags & flag(MF_SOURCE_READERF_ERROR.0) != 0 {
                 return Err("the source reader reported a stream error".to_owned());
             }
@@ -292,8 +317,8 @@ impl SampleTable {
                     return Err("sample table exceeds the frame-number range".into());
                 }
                 // SAFETY: a plain query on the compressed sample.
-                let key = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }
-                    .unwrap_or(0) != 0;
+                let key =
+                    unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
                 samples.push((timestamp, key));
                 empty_reads = 0;
             } else {
@@ -303,7 +328,9 @@ impl SampleTable {
                 return Ok(Self { samples });
             }
             if empty_reads >= MAX_EMPTY_READS {
-                return Err(format!("sample table returned {MAX_EMPTY_READS} empty reads in a row"));
+                return Err(format!(
+                    "sample table returned {MAX_EMPTY_READS} empty reads in a row"
+                ));
             }
         }
     }
@@ -313,9 +340,16 @@ impl SampleTable {
     }
 
     pub(super) fn key_frames(&self) -> Vec<KeyFrame> {
-        self.samples.iter().enumerate().filter_map(|(frame, &(t_hns, key))| {
-            key.then_some(KeyFrame { frame: frame as u32, t_hns })
-        }).collect()
+        self.samples
+            .iter()
+            .enumerate()
+            .filter_map(|(frame, &(t_hns, key))| {
+                key.then_some(KeyFrame {
+                    frame: frame as u32,
+                    t_hns,
+                })
+            })
+            .collect()
     }
 }
 

@@ -118,11 +118,19 @@ impl Method {
         let mut methods = Vec::new();
         for keep_alpha in [true, false] {
             for &coder in &coders {
-                methods.push(Self { coder, tile: 0, keep_alpha });
+                methods.push(Self {
+                    coder,
+                    tile: 0,
+                    keep_alpha,
+                });
             }
             for block in [Block::Lz4, Block::Zstd(-1), Block::Zstd(1)] {
                 for tile in [32, 64, 128] {
-                    methods.push(Self { coder: Coder::Tiles(block), tile, keep_alpha });
+                    methods.push(Self {
+                        coder: Coder::Tiles(block),
+                        tile,
+                        keep_alpha,
+                    });
                 }
             }
         }
@@ -137,7 +145,11 @@ impl Method {
     }
 
     pub fn name(&self) -> String {
-        let alpha = if self.keep_alpha { "alpha kept" } else { "alpha dropped" };
+        let alpha = if self.keep_alpha {
+            "alpha kept"
+        } else {
+            "alpha dropped"
+        };
         if self.coder.uses_tiles() {
             format!("{} tile {} {alpha}", self.coder.name(), self.tile)
         } else {
@@ -212,7 +224,8 @@ impl Grid {
     }
 
     fn changed(&self, index: usize, picture: &[u8], previous: &[u8]) -> bool {
-        self.rows_of(index).any(|range| previous[range.clone()] != picture[range])
+        self.rows_of(index)
+            .any(|range| previous[range.clone()] != picture[range])
     }
 }
 
@@ -265,9 +278,16 @@ fn push_xor(target: &mut Vec<u8>, current: &[u8], previous: &[u8], keep_alpha: b
     const CHUNK_PIXELS: usize = 1024;
     let mut buffer = [0_u8; CHUNK_PIXELS * 3];
     target.reserve(current.len() / 4 * 3);
-    for (chunk, before) in current.chunks(CHUNK_PIXELS * 4).zip(previous.chunks(CHUNK_PIXELS * 4)) {
+    for (chunk, before) in current
+        .chunks(CHUNK_PIXELS * 4)
+        .zip(previous.chunks(CHUNK_PIXELS * 4))
+    {
         let pixels = chunk.len() / 4;
-        for ((bgr, pixel), old) in buffer.chunks_exact_mut(3).zip(chunk.chunks_exact(4)).zip(before.chunks_exact(4)) {
+        for ((bgr, pixel), old) in buffer
+            .chunks_exact_mut(3)
+            .zip(chunk.chunks_exact(4))
+            .zip(before.chunks_exact(4))
+        {
             bgr[0] = pixel[0] ^ old[0];
             bgr[1] = pixel[1] ^ old[1];
             bgr[2] = pixel[2] ^ old[2];
@@ -337,9 +357,16 @@ impl Encoder {
 
     /// Encodes `picture` into `out` (replacing its content); `previous` is the
     /// source frame encoded just before it, if any.
-    pub fn encode(&mut self, picture: &Picture, previous: Option<&Picture>, out: &mut Vec<u8>) -> Result<()> {
+    pub fn encode(
+        &mut self,
+        picture: &Picture,
+        previous: Option<&Picture>,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let size = (picture.width, picture.height);
-        let previous = previous.filter(|p| (p.width, p.height) == size).map(|p| p.bgra.as_slice());
+        let previous = previous
+            .filter(|p| (p.width, p.height) == size)
+            .map(|p| p.bgra.as_slice());
         let due = previous.is_none() || self.since_keyframe.is_multiple_of(WAITING_KEYFRAME_FRAMES);
         let keep_alpha = self.method.keep_alpha;
         out.clear();
@@ -394,9 +421,19 @@ impl Encoder {
             Coder::Tiles(_) => {
                 let grid = Grid::new(size.0, size.1, self.method.tile);
                 let mut rows = std::mem::take(&mut self.rows);
-                let bitmap = gather_changed_tiles(&grid, &picture.bgra, previous.filter(|_| !due), keep_alpha, &mut rows);
+                let bitmap = gather_changed_tiles(
+                    &grid,
+                    &picture.bgra,
+                    previous.filter(|_| !due),
+                    keep_alpha,
+                    &mut rows,
+                );
                 out.extend_from_slice(&bitmap);
-                let result = if rows.is_empty() { Ok(()) } else { self.block_coder()?.compress(&rows, out) };
+                let result = if rows.is_empty() {
+                    Ok(())
+                } else {
+                    self.block_coder()?.compress(&rows, out)
+                };
                 self.rows = rows;
                 result?;
                 due
@@ -404,14 +441,26 @@ impl Encoder {
             Coder::Adaptive(percent) => {
                 let grid = Grid::new(size.0, size.1, self.method.tile);
                 let tiles = previous.filter(|_| !due).filter(|previous| {
-                    let changed = (0..grid.count()).filter(|&i| grid.changed(i, &picture.bgra, previous)).count();
+                    let changed = (0..grid.count())
+                        .filter(|&i| grid.changed(i, &picture.bgra, previous))
+                        .count();
                     changed * 100 < usize::from(percent) * grid.count()
                 });
                 if let Some(previous) = tiles {
                     let mut rows = std::mem::take(&mut self.rows);
-                    let bitmap = gather_changed_tiles(&grid, &picture.bgra, Some(previous), false, &mut rows);
+                    let bitmap = gather_changed_tiles(
+                        &grid,
+                        &picture.bgra,
+                        Some(previous),
+                        false,
+                        &mut rows,
+                    );
                     out.extend_from_slice(&bitmap);
-                    let result = if rows.is_empty() { Ok(()) } else { self.block_coder()?.compress(&rows, out) };
+                    let result = if rows.is_empty() {
+                        Ok(())
+                    } else {
+                        self.block_coder()?.compress(&rows, out)
+                    };
                     self.rows = rows;
                     result?;
                     self.tile_path_frames += 1;
@@ -458,18 +507,30 @@ impl Encoder {
     }
 
     fn block_coder(&mut self) -> Result<&mut BlockCoder> {
-        self.block.as_mut().ok_or_else(|| "byte coder missing".to_owned())
+        self.block
+            .as_mut()
+            .ok_or_else(|| "byte coder missing".to_owned())
     }
 }
 
 fn encode_png(input: &[u8], size: (u32, u32), keep_alpha: bool, out: &mut Vec<u8>) -> Result<()> {
     let mut encoder = png::Encoder::new(&mut *out, size.0, size.1);
-    encoder.set_color(if keep_alpha { png::ColorType::Rgba } else { png::ColorType::Rgb });
+    encoder.set_color(if keep_alpha {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    });
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
-    let mut writer = encoder.write_header().map_err(|error| format!("png header: {error}"))?;
-    writer.write_image_data(input).map_err(|error| format!("png write: {error}"))?;
-    writer.finish().map_err(|error| format!("png finish: {error}"))
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("png header: {error}"))?;
+    writer
+        .write_image_data(input)
+        .map_err(|error| format!("png write: {error}"))?;
+    writer
+        .finish()
+        .map_err(|error| format!("png finish: {error}"))
 }
 
 /// The decompressing side: owns the BGRA canvas that dependent files update.
@@ -498,15 +559,26 @@ impl Decoder {
 
     /// Decodes one file into the canvas; returns the frame size.
     pub fn decode(&mut self, file: &[u8]) -> Result<(u32, u32)> {
-        let header = file.get(..HEADER_BYTES).ok_or("file shorter than its header")?;
-        let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+        let header = file
+            .get(..HEADER_BYTES)
+            .ok_or("file shorter than its header")?;
+        let word = |at: usize| {
+            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+        };
         let size = (word(0), word(4));
         let tile = u32::from(u16::from_le_bytes([header[8], header[9]]));
         let flags = header[10];
-        let (keyframe, keep_alpha, tile_path) =
-            (flags & FLAG_KEYFRAME != 0, flags & FLAG_ALPHA != 0, flags & FLAG_TILE_PATH != 0);
+        let (keyframe, keep_alpha, tile_path) = (
+            flags & FLAG_KEYFRAME != 0,
+            flags & FLAG_ALPHA != 0,
+            flags & FLAG_TILE_PATH != 0,
+        );
         if header[11] != self.method.coder.id() {
-            return Err(format!("coder {} in a {} file", header[11], self.method.name()));
+            return Err(format!(
+                "coder {} in a {} file",
+                header[11],
+                self.method.name()
+            ));
         }
         let payload = file
             .get(HEADER_BYTES..HEADER_BYTES + word(12) as usize)
@@ -527,14 +599,19 @@ impl Decoder {
             }
             Coder::Png => {
                 let decoder = png::Decoder::new(std::io::Cursor::new(payload));
-                let mut reader = decoder.read_info().map_err(|error| format!("png header: {error}"))?;
+                let mut reader = decoder
+                    .read_info()
+                    .map_err(|error| format!("png header: {error}"))?;
                 self.staging.resize(stored, 0);
-                reader.next_frame(&mut self.staging).map_err(|error| format!("png decode: {error}"))?;
+                reader
+                    .next_frame(&mut self.staging)
+                    .map_err(|error| format!("png decode: {error}"))?;
                 put_pixels(&mut self.canvas, &self.staging, keep_alpha);
             }
             Coder::Qoi => {
                 self.staging.resize(stored, 0);
-                qoi::decode_to_buf(&mut self.staging, payload).map_err(|error| format!("qoi decode: {error}"))?;
+                qoi::decode_to_buf(&mut self.staging, payload)
+                    .map_err(|error| format!("qoi decode: {error}"))?;
                 put_pixels(&mut self.canvas, &self.staging, keep_alpha);
             }
             Coder::Xor(_) => {
@@ -557,9 +634,17 @@ impl Decoder {
         block.decompress(payload, expected, &mut self.staging)
     }
 
-    fn decode_tiles(&mut self, payload: &[u8], size: (u32, u32), tile: u32, keep_alpha: bool) -> Result<()> {
+    fn decode_tiles(
+        &mut self,
+        payload: &[u8],
+        size: (u32, u32),
+        tile: u32,
+        keep_alpha: bool,
+    ) -> Result<()> {
         let grid = Grid::new(size.0, size.1, tile);
-        let (bitmap, packed) = payload.split_at_checked(grid.count().div_ceil(8)).ok_or("tile bitmap missing")?;
+        let (bitmap, packed) = payload
+            .split_at_checked(grid.count().div_ceil(8))
+            .ok_or("tile bitmap missing")?;
         let changed = |index: usize| bitmap[index / 8] & (1 << (index % 8)) != 0;
         let pixel_bytes = if keep_alpha { 4 } else { 3 };
         let stored: usize = (0..grid.count())
@@ -574,7 +659,11 @@ impl Decoder {
         for index in (0..grid.count()).filter(|&index| changed(index)) {
             for range in grid.rows_of(index) {
                 let length = range.len() / 4 * pixel_bytes;
-                put_pixels(&mut self.canvas[range], &self.staging[at..at + length], keep_alpha);
+                put_pixels(
+                    &mut self.canvas[range],
+                    &self.staging[at..at + length],
+                    keep_alpha,
+                );
                 at += length;
             }
         }
@@ -588,5 +677,8 @@ pub fn same_picture(decoded: &[u8], source: &[u8], keep_alpha: bool) -> bool {
         return decoded == source;
     }
     decoded.len() == source.len()
-        && decoded.chunks_exact(4).zip(source.chunks_exact(4)).all(|(a, b)| a[..3] == b[..3])
+        && decoded
+            .chunks_exact(4)
+            .zip(source.chunks_exact(4))
+            .all(|(a, b)| a[..3] == b[..3])
 }

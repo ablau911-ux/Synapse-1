@@ -109,7 +109,9 @@ impl ChromeWindow {
                     foreground_after = unsafe { GetForegroundWindow() }.0 as isize;
                 }
                 if foreground_after == hwnd || foreground_after != foreground_before {
-                    println!("chrome_window note=foreground changed (before {foreground_before:#x}, after {foreground_after:#x}, probe window {hwnd:#x})");
+                    println!(
+                        "chrome_window note=foreground changed (before {foreground_before:#x}, after {foreground_after:#x}, probe window {hwnd:#x})"
+                    );
                 }
                 return Ok(window);
             }

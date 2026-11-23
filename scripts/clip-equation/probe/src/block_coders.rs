@@ -90,7 +90,10 @@ impl BlockCoder {
     pub fn compress(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<()> {
         match self.block {
             Block::Lz4 => {
-                grow(&mut self.packed, lz4_flex::block::get_maximum_output_size(input.len()));
+                grow(
+                    &mut self.packed,
+                    lz4_flex::block::get_maximum_output_size(input.len()),
+                );
                 let n = lz4_flex::block::compress_into(input, &mut self.packed)
                     .map_err(|error| format!("lz4 compress: {error}"))?;
                 out.extend_from_slice(&self.packed[..n]);
@@ -113,7 +116,8 @@ impl BlockCoder {
                     return Err("zstd compressor missing".to_owned());
                 };
                 self.packed.clear();
-                self.packed.reserve(zstd::zstd_safe::compress_bound(input.len()));
+                self.packed
+                    .reserve(zstd::zstd_safe::compress_bound(input.len()));
                 zstd.compress_to_buffer(input, &mut self.packed)
                     .map_err(|error| format!("zstd compress: {error}"))?;
                 out.extend_from_slice(&self.packed);
@@ -130,7 +134,11 @@ impl BlockCoder {
                 self.packed.reserve(input.len() + input.len() / 8 + 1024);
                 loop {
                     let status = zlib
-                        .compress_vec(&input[zlib.total_in() as usize..], &mut self.packed, FlushCompress::Finish)
+                        .compress_vec(
+                            &input[zlib.total_in() as usize..],
+                            &mut self.packed,
+                            FlushCompress::Finish,
+                        )
                         .map_err(|error| format!("deflate compress: {error}"))?;
                     if status == Status::StreamEnd {
                         break;
@@ -195,7 +203,11 @@ impl BlockCoder {
             }
         }
         if out.len() != expected {
-            return Err(format!("{} decoded {} bytes, {expected} expected", self.block.name(), out.len()));
+            return Err(format!(
+                "{} decoded {} bytes, {expected} expected",
+                self.block.name(),
+                out.len()
+            ));
         }
         Ok(())
     }

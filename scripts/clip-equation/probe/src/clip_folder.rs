@@ -69,11 +69,11 @@ impl WaitingFrameWriter {
             // probe: architecture D0, raw waiting frames (no zstd)
             std::mem::swap(&mut self.compressed, &mut self.bgr); // probe
         } else {
-        self.compressed
-            .reserve(zstd::zstd_safe::compress_bound(self.bgr.len()));
-        self.compressor
-            .compress_to_buffer(&self.bgr, &mut self.compressed)
-            .map_err(|error| format!("could not compress waiting frame {instant}: {error}"))?;
+            self.compressed
+                .reserve(zstd::zstd_safe::compress_bound(self.bgr.len()));
+            self.compressor
+                .compress_to_buffer(&self.bgr, &mut self.compressed)
+                .map_err(|error| format!("could not compress waiting frame {instant}: {error}"))?;
         } // probe
         let path = raw_frame_path(folder, instant);
         let temp = path.with_extension(format!("{WAITING_FRAME_EXTENSION}{TEMP_SUFFIX}"));
@@ -140,7 +140,9 @@ impl WaitingFrameReader {
                 .map_err(|_| format!("{} is too large for this machine", path.display()))?;
         if crate::exp_settings::settings().raw_waiting {
             // probe: architecture D0, the file is the B, G, R rows
-            return (bytes.len() == expected).then(|| bytes.to_vec()).ok_or_else(|| format!("{} is not {expected} bytes", path.display())); // probe
+            return (bytes.len() == expected)
+                .then(|| bytes.to_vec())
+                .ok_or_else(|| format!("{} is not {expected} bytes", path.display())); // probe
         }
         // The content size in the zstd frame header is checked first, so a
         // damaged header never sizes an allocation.

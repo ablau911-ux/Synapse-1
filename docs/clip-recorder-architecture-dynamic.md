@@ -1008,6 +1008,16 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: step 9, decoder seek and recovery edges
+
+The Windows fragmented MP4 source did not reliably land on the requested stored keyframe. A reverse pixel-hash check failed at frame 79 and returned the pixels of frame 59; the initial strict timestamp check had already failed at keyframe 80 (40,000,000 hns requested, 39,000,000 hns returned). Flushing and seeking inside the key sample still failed at the scene-cut keyframe 6. Native compressed reads also returned shifted timestamps, so using their times did not establish the landing frame.
+
+The moving encoder now uses ordinary MP4, the existing fallback container, for all intervals. With that container, all 91 reverse seeks through the noise fixture matched sequential decode byte for byte. The decoder flushes before a seek and seeks inside the stored key sample; mapping remains by sample count. This is a container deviation from the previous preference for fragmented MP4. An unfinalized ordinary MP4 may have no recoverable moving samples; step 5 explicitly permits that outcome with every affected instant named as lost. Exact records remain independently recoverable.
+
+Recovery now creates an empty frame index when a crash precedes the first picture. The added check changed from exit 1 (missing file, despite 200 losses already published) to exit 0, ready/service_restart, with all 200 planned instants named. A salvaged uncommitted moving interval is marked incomplete even when all indexed samples survive.
+
+The reviewer owns `live-test/` in this continuation. Builder checks and the local UI/video/restart driver live under `spec/`; no file under `live-test/` was changed or executed for YouTube.
+
 ### 2026-11-23: continuation 3, viewer and live verification
 
 The composed viewer builds with the recorder and recovery code. Viewer PNGs retain their existing top-left labels; independent pixel checks compare rows below the 40-row label area. The D5 moving-stop check uses the last instant of the stored moving interval as "last recorded motion", consistent with treating the rectangle as moving by record through its hold interval.

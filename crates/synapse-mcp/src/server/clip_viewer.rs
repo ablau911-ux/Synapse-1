@@ -42,10 +42,12 @@ use synapse_core::{Rect, error_codes};
 use super::ErrorData;
 use super::clip_decoder::{ClipDecoder, DecodedFrame};
 use super::clip_exact::{ExactEntry, ExactReader};
-use super::clip_motion::{BlockGrid as Grid, BLOCK, MotionTiming, MotionWindow, PixelRect, SHORT_LIVED_MS};
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipState, FRAMES_FILE, FrameLine, VIEWS_DIR,
-    CommittedSegment, read_frame_lines,
+    CLIP_JSON_FILE, ClipJson, ClipState, CommittedSegment, FRAMES_FILE, FrameLine, VIEWS_DIR,
+    read_frame_lines,
+};
+use super::clip_motion::{
+    BLOCK, BlockGrid as Grid, MotionTiming, MotionWindow, PixelRect, SHORT_LIVED_MS,
 };
 use crate::m1::clip_view_limits::{MAX_FRAMES_FPS, MIN_CROP_SHORT_SIDE};
 use crate::m1::{
@@ -205,9 +207,10 @@ impl ViewedClip {
         u64::from(self.clip.fps)
     }
 
-
     /// The last instant that is in a committed segment.
-    fn last_frame(&self) -> u64 { self.lines.last().map_or(0, |line| line.instant) }
+    fn last_frame(&self) -> u64 {
+        self.lines.last().map_or(0, |line| line.instant)
+    }
 
     /// Time of instant k: k / f.
     fn t_of(&self, frame: u64) -> u64 {
@@ -244,10 +247,15 @@ impl ViewedClip {
         self.t_of(self.lines.len() as u64)
     }
 
-    fn scale_at(&self, _frame: u64) -> u32 { 1 }
+    fn scale_at(&self, _frame: u64) -> u32 {
+        1
+    }
 
     fn waiting_error(&self, t_ms: u64) -> ErrorData {
-        params_invalid(format!("{t_ms} ms is not viewable: clip state {}; wait for record_status to report ready", self.clip.state.as_str()))
+        params_invalid(format!(
+            "{t_ms} ms is not viewable: clip state {}; wait for record_status to report ready",
+            self.clip.state.as_str()
+        ))
     }
 
     /// Size and modified time of the files the overview is computed from; a
@@ -255,9 +263,23 @@ impl ViewedClip {
     /// segment is committed).
     fn fingerprint(&self) -> String {
         let mut names = vec![FRAMES_FILE.to_owned(), CLIP_JSON_FILE.to_owned()];
-        names.extend(self.clip.moving.segments.iter().map(|segment| segment.segment.file.clone()));
-        let groups: std::collections::BTreeSet<_> = self.lines.iter().filter_map(|line| line.exact.map(|x| x.group)).collect();
-        names.extend(groups.into_iter().map(|group| format!("frames/group-{group:06}.zst")));
+        names.extend(
+            self.clip
+                .moving
+                .segments
+                .iter()
+                .map(|segment| segment.segment.file.clone()),
+        );
+        let groups: std::collections::BTreeSet<_> = self
+            .lines
+            .iter()
+            .filter_map(|line| line.exact.map(|x| x.group))
+            .collect();
+        names.extend(
+            groups
+                .into_iter()
+                .map(|group| format!("frames/group-{group:06}.zst")),
+        );
         names
             .iter()
             .map(|name| {
@@ -274,7 +296,6 @@ impl ViewedClip {
             .join(";")
     }
 
-
     fn views_dir(&self) -> Result<PathBuf, ErrorData> {
         let views = self.folder.join(VIEWS_DIR);
         std::fs::create_dir_all(&views)
@@ -284,7 +305,9 @@ impl ViewedClip {
 
     /// The largest recorded size among the committed segments.
     fn largest_recorded(&self) -> (u32, u32) {
-        self.lines.iter().fold((0, 0), |(w, h), line| (w.max(line.width), h.max(line.height)))
+        self.lines.iter().fold((0, 0), |(w, h), line| {
+            (w.max(line.width), h.max(line.height))
+        })
     }
 
     /// D2: the long edge of overview and range images: at least
@@ -332,46 +355,100 @@ struct ClipPictures {
 }
 impl ClipPictures {
     fn new(clip: &ViewedClip) -> Result<Self, ErrorData> {
-        let entries = clip.lines.iter().filter_map(|line| {
-            let exact = line.exact?;
-            let size = std::fs::metadata(clip.folder.join(format!("frames/group-{:06}.zst", exact.group))).ok()?.len();
-            (exact.offset + u64::from(exact.bytes) <= size).then_some(ExactEntry {
-                instant: line.instant, exact, width: line.width, height: line.height,
+        let entries = clip
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let exact = line.exact?;
+                let size = std::fs::metadata(
+                    clip.folder
+                        .join(format!("frames/group-{:06}.zst", exact.group)),
+                )
+                .ok()?
+                .len();
+                (exact.offset + u64::from(exact.bytes) <= size).then_some(ExactEntry {
+                    instant: line.instant,
+                    exact,
+                    width: line.width,
+                    height: line.height,
+                })
             })
-        }).collect();
-        Ok(Self { folder: clip.folder.clone(), exact: ExactReader::open(&clip.folder, entries).map_err(decode_error)?,
-            lines: clip.lines.clone(), segments: clip.clip.moving.segments.clone(),
-            lost: clip.clip.lost.iter().map(|l| l.instant).collect(), decoder: None, fps: clip.clip.fps })
+            .collect();
+        Ok(Self {
+            folder: clip.folder.clone(),
+            exact: ExactReader::open(&clip.folder, entries).map_err(decode_error)?,
+            lines: clip.lines.clone(),
+            segments: clip.clip.moving.segments.clone(),
+            lost: clip.clip.lost.iter().map(|l| l.instant).collect(),
+            decoder: None,
+            fps: clip.clip.fps,
+        })
     }
     fn at(&mut self, instant: u64) -> Result<DecodedFrame, ErrorData> {
         const BGRA: usize = 4;
         const BGR: usize = 3;
         const HNS: u64 = 10_000_000;
-        let line = self.lines.get(instant as usize).ok_or_else(|| params_invalid("instant outside clip".into()))?;
+        let line = self
+            .lines
+            .get(instant as usize)
+            .ok_or_else(|| params_invalid("instant outside clip".into()))?;
         let (exact, width, height) = self.exact.picture_at(instant).map_err(decode_error)?;
-        let mut bgra: Vec<u8> = exact.chunks_exact(BGR).flat_map(|p| [p[0], p[1], p[2], u8::MAX]).collect();
-        if !self.lost.contains(&instant) && let Some(reference) = line.moving
-            && let Some(committed) = self.segments.iter().find(|s| s.segment.index == reference.segment && reference.frame < s.segment.frames) {
+        let mut bgra: Vec<u8> = exact
+            .chunks_exact(BGR)
+            .flat_map(|p| [p[0], p[1], p[2], u8::MAX])
+            .collect();
+        if !self.lost.contains(&instant)
+            && let Some(reference) = line.moving
+            && let Some(committed) = self.segments.iter().find(|s| {
+                s.segment.index == reference.segment && reference.frame < s.segment.frames
+            })
+        {
             let segment = &committed.segment;
             if self.folder.join(&segment.file).is_file() {
-                if self.decoder.as_ref().is_none_or(|(index, _)| *index != segment.index) {
-                    self.decoder = Some((segment.index, ClipDecoder::open(&self.folder.join(&segment.file)).map_err(decode_error)?));
+                if self
+                    .decoder
+                    .as_ref()
+                    .is_none_or(|(index, _)| *index != segment.index)
+                {
+                    self.decoder = Some((
+                        segment.index,
+                        ClipDecoder::open(&self.folder.join(&segment.file))
+                            .map_err(decode_error)?,
+                    ));
                 }
-                let moving = self.decoder.as_mut().ok_or_else(|| internal("decoder unavailable".into()))?.1
-                    .frame_number(reference.frame, &segment.key_frames).map_err(decode_error)?;
+                let moving = self
+                    .decoder
+                    .as_mut()
+                    .ok_or_else(|| internal("decoder unavailable".into()))?
+                    .1
+                    .frame_number(reference.frame, &segment.key_frames)
+                    .map_err(decode_error)?;
                 let rect = segment.rect;
-                if rect.right() > width || rect.bottom() > height || moving.width < rect.w || moving.height < rect.h {
-                    return Err(decode_error("moving rectangle does not fit its pictures".into()));
+                if rect.right() > width
+                    || rect.bottom() > height
+                    || moving.width < rect.w
+                    || moving.height < rect.h
+                {
+                    return Err(decode_error(
+                        "moving rectangle does not fit its pictures".into(),
+                    ));
                 }
                 for row in 0..rect.h as usize {
                     let source = row * moving.width as usize * BGRA;
-                    let destination = ((row + rect.y as usize) * width as usize + rect.x as usize) * BGRA;
+                    let destination =
+                        ((row + rect.y as usize) * width as usize + rect.x as usize) * BGRA;
                     let bytes = rect.w as usize * BGRA;
-                    bgra[destination..destination + bytes].copy_from_slice(&moving.bgra[source..source + bytes]);
+                    bgra[destination..destination + bytes]
+                        .copy_from_slice(&moving.bgra[source..source + bytes]);
                 }
             }
         }
-        Ok(DecodedFrame { t_hns: (instant * HNS / u64::from(self.fps)) as i64, width, height, bgra })
+        Ok(DecodedFrame {
+            t_hns: (instant * HNS / u64::from(self.fps)) as i64,
+            width,
+            height,
+            bgra,
+        })
     }
 }
 
@@ -536,7 +613,10 @@ struct Instants {
 impl Instants {
     fn of(clip: &ViewedClip) -> Self {
         let per_ms = |ms: u64| (ms * clip.fps() / 1_000).max(1);
-        Self { settle: per_ms(SETTLE_MS), motion: MotionTiming::of(clip.clip.fps) }
+        Self {
+            settle: per_ms(SETTLE_MS),
+            motion: MotionTiming::of(clip.clip.fps),
+        }
     }
 }
 
@@ -646,7 +726,9 @@ impl BlockState {
     /// The first instant at which the block no longer animates: fewer than
     /// `Instants::animating` changes in the W_a that ends there.
     fn animating_until(&self, instants: Instants) -> u64 {
-        self.moves.animating_until(&instants.motion).max(self.recorded_until.unwrap_or(0))
+        self.moves
+            .animating_until(&instants.motion)
+            .max(self.recorded_until.unwrap_or(0))
     }
 
     /// When an open change settles if nothing changes any more: SAME for K_s
@@ -766,7 +848,19 @@ impl<'a> Analyzer<'a> {
         }
         self.settle_due(instant.saturating_sub(1));
         let masked = self.cursor_blocks(instant);
-        let recorded = self.clip.line(instant).and_then(|line| line.moving).and_then(|reference| self.clip.clip.moving.segments.iter().find(|s| s.segment.index == reference.segment)).map(|s| (s.segment.rect, s.segment.last_instant + 1));
+        let recorded = self
+            .clip
+            .line(instant)
+            .and_then(|line| line.moving)
+            .and_then(|reference| {
+                self.clip
+                    .clip
+                    .moving
+                    .segments
+                    .iter()
+                    .find(|s| s.segment.index == reference.segment)
+            })
+            .map(|s| (s.segment.rect, s.segment.last_instant + 1));
         let instants = self.instants;
         let Some((_, previous)) = self.recent.latest() else {
             return;
@@ -780,22 +874,29 @@ impl<'a> Analyzer<'a> {
                 }
                 continue;
             }
-            let stored_moving = recorded.is_some_and(|(rect, _)| picture.grid.bbox([b]).is_some_and(|block| rect.intersect(&block).is_some()));
+            let stored_moving = recorded.is_some_and(|(rect, _)| {
+                picture
+                    .grid
+                    .bbox([b])
+                    .is_some_and(|block| rect.intersect(&block).is_some())
+            });
             let moved = stored_moving || picture.test(previous, b);
             if moved {
                 moved_any = true;
                 state.moves.moved(instant, &instants.motion);
-                if stored_moving { state.recorded_until = recorded.map(|(_, until)| until); }
+                if stored_moving {
+                    state.recorded_until = recorded.map(|(_, until)| until);
+                }
             }
             // D5 step 3 from the frame-to-frame test alone: a block can
             // animate while every picture stays SAME as its anchor.
             let animating = stored_moving || instant < state.animating_until(instants);
             let to_anchor = !stored_moving && picture.test(&self.anchor, b);
             if state.active.is_none() {
-                if !to_anchor {
-                    state.pending = None;
-                } else {
+                if to_anchor {
                     state.pending = state.pending.or(Some(instant));
+                } else {
+                    state.pending = None;
                 }
                 if !to_anchor && !animating {
                     continue;
@@ -834,7 +935,11 @@ impl<'a> Analyzer<'a> {
             } else if activity.animated_until.is_some() && to_anchor {
                 activity.left_after_animation = activity.left_after_animation.or(Some(instant));
             }
-            state.stable_since = if stored_moving { instant } else { self.recent.stable_since(&picture, b, instant) };
+            state.stable_since = if stored_moving {
+                instant
+            } else {
+                self.recent.stable_since(&picture, b, instant)
+            };
         }
         if !moved_any {
             self.still_frames += 1;
@@ -959,8 +1064,7 @@ impl<'a> Analyzer<'a> {
                 episode.differed = activity.differed;
                 self.episodes.push(episode);
             }
-            false => {}
-            // Drift or noise: the block takes the picture without an event.
+            false => {} // Drift or noise: the block takes the picture without an event.
         }
     }
 
@@ -1260,7 +1364,10 @@ impl Event {
             && self.pictures.iter().zip(&earlier.pictures).all(
                 |((block, _, after), (earlier_block, before, _))| {
                     block == earlier_block
-                        && after.iter().zip(before).all(|(a, b)| a.abs_diff(*b) <= DELTA_LO)
+                        && after
+                            .iter()
+                            .zip(before)
+                            .all(|(a, b)| a.abs_diff(*b) <= DELTA_LO)
                 },
             )
     }
@@ -1749,12 +1856,28 @@ impl ClipView {
         }
         let mut blocks = BlockMap::between(&Picture::new(&before), &Picture::new(&after));
         for instant in [from, to] {
-            let moving = self.clip.line(instant).and_then(|line| line.moving)
-                .and_then(|reference| self.clip.clip.moving.segments.iter().find(|s| s.segment.index == reference.segment));
+            let moving = self
+                .clip
+                .line(instant)
+                .and_then(|line| line.moving)
+                .and_then(|reference| {
+                    self.clip
+                        .clip
+                        .moving
+                        .segments
+                        .iter()
+                        .find(|s| s.segment.index == reference.segment)
+                });
             if let Some(moving) = moving {
                 for b in 0..blocks.grid.blocks() {
-                    if !blocks.changed[b] && blocks.grid.bbox([b]).is_some_and(|r| moving.segment.rect.intersect(&r).is_some()) {
-                        blocks.changed[b] = true; blocks.count += 1;
+                    if !blocks.changed[b]
+                        && blocks
+                            .grid
+                            .bbox([b])
+                            .is_some_and(|r| moving.segment.rect.intersect(&r).is_some())
+                    {
+                        blocks.changed[b] = true;
+                        blocks.count += 1;
                     }
                 }
             }
@@ -1859,8 +1982,6 @@ impl ClipView {
         }
         Ok(analysis)
     }
-
-    /// The picture on screen at instant `frame`, from its committed segment.
 
     /// Labels the image (text and drawn copy), writes the PNG under `views/`
     /// and keeps it for the result.
@@ -1991,7 +2112,12 @@ fn scaled(value: u32, scale: f64) -> u32 {
 }
 
 fn view_rect(rectangle: PixelRect) -> Rect {
-    rect(rectangle.x as usize, rectangle.y as usize, rectangle.w as usize, rectangle.h as usize)
+    rect(
+        rectangle.x as usize,
+        rectangle.y as usize,
+        rectangle.w as usize,
+        rectangle.h as usize,
+    )
 }
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
     let to_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);

@@ -23,7 +23,7 @@ const rows = [];
 function check(name, ok, measured) { console.log(`${ok ? 'PASS' : 'FAIL'} ${name}: ${JSON.stringify(measured)}`); if (!ok) failed++; }
 for (const scene of [...SCENES, ...['video', 'typing', 'ui', 'scroll', 'flash'].map(name => ({ name, corpus: true }))]) {
   const folder = scene.corpus ? path.join(root, `${scene.name}-1920x1080`) : path.join(scenes, scene.name);
-  const run = spawnSync(probe, ['exp-dyn', 'mode=layers', `folder=${folder}`, `out=${path.join(out, scene.name)}`], { encoding: 'utf8' });
+  const run = spawnSync(probe, ['exp-dyn', 'mode=layers', 'clipjson=1', `folder=${folder}`, `out=${path.join(out, scene.name)}`], { encoding: 'utf8' });
   if (run.status !== 0) { check(scene.name, false, run.stderr || run.error?.message); continue; }
   const r = JSON.parse(run.stdout.trim().split(/\r?\n/).at(-1)); rows.push({ name: scene.name, ...r });
   const moving = r.lines.filter(l => l.mv);

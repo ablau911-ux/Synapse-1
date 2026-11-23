@@ -22,26 +22,26 @@
 mod block_coders;
 mod chrome_window;
 #[allow(dead_code)]
-#[path = "../../../../crates/synapse-mcp/src/server/clip_exact.rs"]
-mod clip_exact;
-#[allow(dead_code)]
-#[path = "../../../../crates/synapse-mcp/src/server/clip_motion.rs"]
-mod clip_motion;
+#[path = "../../../../crates/synapse-mcp/src/server/clip_decoder.rs"]
+mod clip_decoder;
 #[allow(dead_code)]
 #[path = "../../../../crates/synapse-mcp/src/server/clip_encoder.rs"]
 mod clip_encoder;
 #[allow(dead_code)]
-#[path = "../../../../crates/synapse-mcp/src/server/clip_decoder.rs"]
-mod clip_decoder;
+#[path = "../../../../crates/synapse-mcp/src/server/clip_exact.rs"]
+mod clip_exact;
 #[allow(dead_code)]
-#[path = "../../../../crates/synapse-mcp/src/server/clip_moving.rs"]
-mod clip_moving;
+#[path = "../../../../crates/synapse-mcp/src/server/clip_folder.rs"]
+mod clip_folder;
 #[allow(dead_code)]
 #[path = "../../../../crates/synapse-mcp/src/server/clip_layers.rs"]
 mod clip_layers;
 #[allow(dead_code)]
-#[path = "../../../../crates/synapse-mcp/src/server/clip_folder.rs"]
-mod clip_folder;
+#[path = "../../../../crates/synapse-mcp/src/server/clip_motion.rs"]
+mod clip_motion;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_moving.rs"]
+mod clip_moving;
 #[allow(dead_code)]
 #[path = "../../../../crates/synapse-mcp/src/server/clip_recovery.rs"]
 mod clip_recovery;

@@ -54,9 +54,11 @@ use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::capture_clip::RECORD_FPS;
-use crate::exp_settings::{d3d_manager, settings}; // probe: the run's factors
-use windows::Win32::Media::MediaFoundation::{CODECAPI_AVLowLatencyMode, MF_LOW_LATENCY, MF_SINK_WRITER_D3D_MANAGER}; // probe
 use super::clip_folder::{LossCause, QualityReport, WAITING_BYTES_PER_PIXEL, WaitingFrameReader};
+use crate::exp_settings::{d3d_manager, settings}; // probe: the run's factors
+use windows::Win32::Media::MediaFoundation::{
+    CODECAPI_AVLowLatencyMode, MF_LOW_LATENCY, MF_SINK_WRITER_D3D_MANAGER,
+}; // probe
 
 /// q: `CODECAPI_AVEncCommonQuality` level (0..=100). Condition Q stays
 /// `unverified` until q_min is calibrated for the encoder used (C6).
@@ -153,7 +155,10 @@ fn encode_once(
             Ok(bgr) => {
                 let probe_read = crate::clock::thread_cycles(); // probe
                 canvas.draw(&bgr, sample.width, sample.height);
-                crate::exp_meter::add_worker_cycles(probe_read - probe_start, crate::clock::thread_cycles() - probe_read); // probe
+                crate::exp_meter::add_worker_cycles(
+                    probe_read - probe_start,
+                    crate::clock::thread_cycles() - probe_read,
+                ); // probe
                 last_good = Some(sample.raw.clone());
             }
             Err(error) => {
@@ -208,13 +213,22 @@ fn encode_once(
 }
 
 /// probe: the experiment calls one named encoder; no software retry.
-pub(super) fn probe_encode_once(path: &Path, input: &SegmentInput, hardware: bool) -> Result<EncodedSegment, String> {
+pub(super) fn probe_encode_once(
+    path: &Path,
+    input: &SegmentInput,
+    hardware: bool,
+) -> Result<EncodedSegment, String> {
     encode_once(path, input, hardware)
 }
 
 /// probe: the copied NV12 converter, for the quality reference (the luma the
 /// encoder was given) and the size the encoder records.
-pub(super) fn probe_reference_luma(input: &SegmentInput, bgr: &[u8], width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+pub(super) fn probe_reference_luma(
+    input: &SegmentInput,
+    bgr: &[u8],
+    width: u32,
+    height: u32,
+) -> (u32, u32, Vec<u8>) {
     let size = RecordedSize::of(input);
     let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
     canvas.draw(bgr, width, height);
@@ -224,7 +238,12 @@ pub(super) fn probe_reference_luma(input: &SegmentInput, bgr: &[u8], width: u32,
 
 /// probe (experiment E1): the whole NV12 picture the encoder is given (Y then
 /// interleaved Cb, Cr), from the same converter, before any encoding.
-pub(super) fn probe_reference_nv12(input: &SegmentInput, bgr: &[u8], width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+pub(super) fn probe_reference_nv12(
+    input: &SegmentInput,
+    bgr: &[u8],
+    width: u32,
+    height: u32,
+) -> (u32, u32, Vec<u8>) {
     let size = RecordedSize::of(input);
     let mut canvas = Nv12Canvas::new(&size, input.canvas_width, input.canvas_height, input.scale);
     canvas.draw(bgr, width, height);
@@ -529,10 +548,14 @@ fn open_writer(
             .map_err(hr("set MF_TRANSCODE_CONTAINERTYPE"))?;
         if let Some(manager) = d3d_manager() {
             // probe: the adapter's device manager, so its encoder is used
-            attributes.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &manager).map_err(hr("set MF_SINK_WRITER_D3D_MANAGER"))?; // probe
+            attributes
+                .SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &manager)
+                .map_err(hr("set MF_SINK_WRITER_D3D_MANAGER"))?; // probe
         }
         if settings().low_latency {
-            attributes.SetUINT32(&MF_LOW_LATENCY, 1).map_err(hr("set MF_LOW_LATENCY"))?; // probe
+            attributes
+                .SetUINT32(&MF_LOW_LATENCY, 1)
+                .map_err(hr("set MF_LOW_LATENCY"))?; // probe
         }
         let url = HSTRING::from(path.as_os_str());
         let writer = MFCreateSinkWriterFromURL(&url, None, &attributes)
@@ -688,12 +711,18 @@ fn confirm_settings(
     let screen_content_hint = if settings().screen_hint {
         set_and_read(&codec, &CODECAPI_AVScenarioInfo, hint) == Some(hint)
     } else {
-        unsafe { codec.GetValue(&CODECAPI_AVScenarioInfo) }.ok().as_ref().and_then(variant_as_u32) == Some(hint) // probe
+        unsafe { codec.GetValue(&CODECAPI_AVScenarioInfo) }
+            .ok()
+            .as_ref()
+            .and_then(variant_as_u32)
+            == Some(hint) // probe
     };
     if settings().low_latency {
         // probe: F8, VT_BOOL as the property requires
-        let set = unsafe { codec.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true)) }.is_ok(); // probe
-        crate::exp_settings::LOW_LATENCY_ACCEPTED.store(i8::from(set), std::sync::atomic::Ordering::Relaxed); // probe
+        let set =
+            unsafe { codec.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true)) }.is_ok(); // probe
+        crate::exp_settings::LOW_LATENCY_ACCEPTED
+            .store(i8::from(set), std::sync::atomic::Ordering::Relaxed); // probe
     }
     let quality_mode = eAVEncCommonRateControlMode_Quality.0.cast_unsigned();
     let quality = settings().quality.and_then(|level| {

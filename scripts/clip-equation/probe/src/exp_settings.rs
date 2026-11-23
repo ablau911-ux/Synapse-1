@@ -88,11 +88,17 @@ impl EncodeSettings {
         let codec = args.text_or("codec", "h264");
         let quality = match args.text_or("q", "70") {
             "none" => None,
-            text => Some(text.parse().map_err(|_| format!("q={text} is not a number"))?),
+            text => Some(
+                text.parse()
+                    .map_err(|_| format!("q={text} is not a number"))?,
+            ),
         };
         let adapter_luid = match args.text_or("adapter", "none") {
             "none" => None,
-            text => Some(text.parse().map_err(|_| format!("adapter={text} is not a LUID"))?),
+            text => Some(
+                text.parse()
+                    .map_err(|_| format!("adapter={text} is not a LUID"))?,
+            ),
         };
         Ok(Self {
             codec: Codec::parse(codec).ok_or_else(|| format!("unknown codec={codec}"))?,

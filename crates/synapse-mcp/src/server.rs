@@ -249,14 +249,14 @@ mod capture_gif;
 mod clip_decoder;
 #[cfg(windows)]
 mod clip_encoder;
-mod clip_folder;
-#[cfg(windows)]
-mod clip_viewer;
 mod clip_exact;
-mod clip_motion;
+mod clip_folder;
 mod clip_layers;
+mod clip_motion;
 mod clip_moving;
 mod clip_recovery;
+#[cfg(windows)]
+mod clip_viewer;
 #[cfg(windows)]
 pub(crate) use clip_recovery::recover_clips_on_start;
 mod data_cleaning;

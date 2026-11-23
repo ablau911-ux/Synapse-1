@@ -197,11 +197,17 @@ struct Row {
 pub fn run() -> Result<()> {
     let mut wanted: Vec<String> = std::env::args().skip(2).collect();
     // `--capture-only`: M10 delivery figures only, no method runs.
-    let capture_only = wanted.first().is_some_and(|first| first == "--capture-only");
+    let capture_only = wanted
+        .first()
+        .is_some_and(|first| first == "--capture-only");
     if capture_only {
         wanted.remove(0);
     }
-    let methods = if capture_only { Vec::new() } else { Method::all() };
+    let methods = if capture_only {
+        Vec::new()
+    } else {
+        Method::all()
+    };
     // With the display asleep (owner away), Windows composes only a few
     // frames per second; keep the display on for this run, as a video player
     // does. No input is sent anywhere. Cleared when `_awake` drops.
@@ -233,7 +239,9 @@ pub(crate) struct DisplayAwake;
 impl DisplayAwake {
     pub(crate) fn request() -> Self {
         // SAFETY: a power request for this thread; no pointers.
-        unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+        };
         Self
     }
 }
@@ -251,7 +259,11 @@ fn capture(scenario: &Scenario, pages: &std::path::Path) -> Result<(Vec<Picture>
         &pages.join(scenario.page),
         scenario.query,
         scenario.title,
-        if scenario.size == FULL_HD_OUTER { FULL_HD_POSITION } else { (40, 40) },
+        if scenario.size == FULL_HD_OUTER {
+            FULL_HD_POSITION
+        } else {
+            (40, 40)
+        },
         scenario.size,
     )?;
     std::thread::sleep(SETTLE);
@@ -466,9 +478,14 @@ fn write_cost(files: &[Vec<u8>], rate: CycleRate) -> Result<(f64, usize)> {
 /// Pareto front of mean bytes against mean compress time.
 fn report_live_share(rows: &[Row]) {
     // Write cost per file = a + b · bytes, least squares over every M12 point.
-    let points: Vec<(f64, f64)> = rows.iter().map(|r| (r.bytes_per_frame, r.write_us_frame)).collect();
+    let points: Vec<(f64, f64)> = rows
+        .iter()
+        .map(|r| (r.bytes_per_frame, r.write_us_frame))
+        .collect();
     let n = points.len() as f64;
-    let (sx, sy) = points.iter().fold((0.0, 0.0), |(sx, sy), (x, y)| (sx + x, sy + y));
+    let (sx, sy) = points
+        .iter()
+        .fold((0.0, 0.0), |(sx, sy), (x, y)| (sx + x, sy + y));
     let (mx, my) = (sx / n, sy / n);
     let sxx: f64 = points.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();
     let sxy: f64 = points.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
@@ -486,7 +503,10 @@ fn report_live_share(rows: &[Row]) {
         ratio * (delivered * C_OBS_MS * 1e-3 + NEW_PER_SECOND * per_frame_s) / threads * 100.0
     };
 
-    let counted: Vec<&Row> = rows.iter().filter(|r| r.frames >= MIN_FRAMES_FOR_WORST).collect();
+    let counted: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.frames >= MIN_FRAMES_FOR_WORST)
+        .collect();
     let mut scenarios: Vec<&str> = Vec::new();
     let mut methods: Vec<Method> = Vec::new();
     for row in &counted {
@@ -504,13 +524,18 @@ fn report_live_share(rows: &[Row]) {
         "| method | mean bytes/px | mean compress ns/px | {} | max weakest | max weakest without video | max dev PC |",
         scenarios.join(" | ")
     );
-    println!("|---|---|---|{}---|---|---|", "---|".repeat(scenarios.len()));
+    println!(
+        "|---|---|---|{}---|---|---|",
+        "---|".repeat(scenarios.len())
+    );
     // (method, mean bytes/px, mean compress ns/px, max weakest, max weakest without video)
     let mut summary: Vec<(Method, f64, f64, f64, f64)> = Vec::new();
     for method in methods {
         let of_method: Vec<&&Row> = counted.iter().filter(|r| r.method == method).collect();
-        let mean_bytes = of_method.iter().map(|r| r.bytes_per_px).sum::<f64>() / of_method.len() as f64;
-        let mean_compress = of_method.iter().map(|r| r.compress_ns_px).sum::<f64>() / of_method.len() as f64;
+        let mean_bytes =
+            of_method.iter().map(|r| r.bytes_per_px).sum::<f64>() / of_method.len() as f64;
+        let mean_compress =
+            of_method.iter().map(|r| r.compress_ns_px).sum::<f64>() / of_method.len() as f64;
         let cells: Vec<String> = scenarios
             .iter()
             .map(|name| {
@@ -542,12 +567,19 @@ fn report_live_share(rows: &[Row]) {
             .filter(|entry| worst(entry) <= CPU_LIMIT_PERCENT)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map_or("none".to_owned(), |entry| {
-                format!("{} ({:.4} bytes/px mean, {:.2} % weakest)", entry.0.name(), entry.1, worst(entry))
+                format!(
+                    "{} ({:.4} bytes/px mean, {:.2} % weakest)",
+                    entry.0.name(),
+                    entry.1,
+                    worst(entry)
+                )
             })
     };
     println!("\nM14 choice, every scenario: {}", pick(|entry| entry.3));
     println!("M14 choice, video left out: {}", pick(|entry| entry.4));
-    println!("\nPareto front (mean bytes/px against mean compress ns/px; no other method is better on both):");
+    println!(
+        "\nPareto front (mean bytes/px against mean compress ns/px; no other method is better on both):"
+    );
     let mut front: Vec<&(Method, f64, f64, f64, f64)> = summary
         .iter()
         .filter(|a| {

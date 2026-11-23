@@ -105,7 +105,11 @@ pub fn run() -> Result<()> {
     let args = Args::from_env();
     let phase = args.text_or("phase", "").to_owned();
     // The worker starts Media Foundation inside its measured work (H3).
-    let _runtime = if phase == "worker" { None } else { Some(MediaFoundationRuntime::start()?) };
+    let _runtime = if phase == "worker" {
+        None
+    } else {
+        Some(MediaFoundationRuntime::start()?)
+    };
     if args.text_or("mode", "run") == "meter" {
         return meter_self_check(&args);
     }
@@ -115,7 +119,9 @@ pub fn run() -> Result<()> {
     let outcome = match phase.as_str() {
         "live" => run_live(&args, &mut out),
         "worker" => run_worker(&args, &mut out),
-        other => Err(format!("phase={other}: give phase=live, then phase=worker on the same scratch folder")),
+        other => Err(format!(
+            "phase={other}: give phase=live, then phase=worker on the same scratch folder"
+        )),
     };
     let failed = outcome.is_err();
     if let Err(error) = outcome {
@@ -150,17 +156,29 @@ struct Folder {
 
 impl Folder {
     fn open(dir: &Path) -> Result<Self> {
-        let meta = std::fs::read_to_string(dir.join("meta.json")).map_err(|e| format!("meta.json: {e}"))?;
+        let meta = std::fs::read_to_string(dir.join("meta.json"))
+            .map_err(|e| format!("meta.json: {e}"))?;
         let scenario = json_str(&meta, "scenario").ok_or("meta.json has no scenario")?;
         let window = json_array(&meta, "window").ok_or("meta.json has no window")?;
         let sigma = json_num(&meta, "sigma").unwrap_or(1.0) as u32;
         let instants = json_num(&meta, "instants").unwrap_or(400.0) as u64;
-        let text = std::fs::read_to_string(dir.join("frames.jsonl")).map_err(|e| format!("frames.jsonl: {e}"))?;
+        let text = std::fs::read_to_string(dir.join("frames.jsonl"))
+            .map_err(|e| format!("frames.jsonl: {e}"))?;
         let lines: Vec<(u64, u64, bool)> = text
             .lines()
-            .filter_map(|l| Some((json_num(l, "instant")? as u64, json_num(l, "frame")? as u64, l.contains("\"new\":true"))))
+            .filter_map(|l| {
+                Some((
+                    json_num(l, "instant")? as u64,
+                    json_num(l, "frame")? as u64,
+                    l.contains("\"new\":true"),
+                ))
+            })
             .collect();
-        let new_frames = lines.iter().filter(|l| l.2).map(|&(instant, frame, _)| (instant, frame)).collect();
+        let new_frames = lines
+            .iter()
+            .filter(|l| l.2)
+            .map(|&(instant, frame, _)| (instant, frame))
+            .collect();
         Ok(Self {
             dir: dir.to_owned(),
             scenario,
@@ -174,7 +192,14 @@ impl Folder {
     }
 
     fn put(&self, out: &mut Json) {
-        out.text("folder", &self.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        out.text(
+            "folder",
+            &self
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
         out.text("scenario", &self.scenario);
         out.num("width", self.width);
         out.num("height", self.height);
@@ -201,7 +226,10 @@ impl CorpusReader {
     fn new(px: usize) -> Result<Self> {
         let dctx = zstd::bulk::Decompressor::new().map_err(|e| format!("zstd: {e}"))?;
         // A zstd frame of raw pixels is at most a little larger than the pixels.
-        Ok(Self { dctx, packed: Vec::with_capacity(px * 3 + 65536) })
+        Ok(Self {
+            dctx,
+            packed: Vec::with_capacity(px * 3 + 65536),
+        })
     }
 
     fn frame(&mut self, folder: &Folder, frame: u64, out: &mut [u8]) -> Result<()> {
@@ -211,9 +239,16 @@ impl CorpusReader {
         std::fs::File::open(&path)
             .and_then(|mut f| f.read_to_end(&mut self.packed))
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        let n = self.dctx.decompress_to_buffer(&self.packed, out).map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = self
+            .dctx
+            .decompress_to_buffer(&self.packed, out)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         if n != out.len() {
-            return Err(format!("{}: {n} bytes, expected {}", path.display(), out.len()));
+            return Err(format!(
+                "{}: {n} bytes, expected {}",
+                path.display(),
+                out.len()
+            ));
         }
         Ok(())
     }
@@ -237,7 +272,14 @@ impl TextRegion {
         text.split(';')
             .filter(|r| !r.trim().is_empty())
             .map(|r| {
-                let v: Vec<f64> = r.split(':').map(|x| x.trim().parse::<f64>().map_err(|_| format!("region {r}: bad number {x}"))).collect::<Result<_>>()?;
+                let v: Vec<f64> = r
+                    .split(':')
+                    .map(|x| {
+                        x.trim()
+                            .parse::<f64>()
+                            .map_err(|_| format!("region {r}: bad number {x}"))
+                    })
+                    .collect::<Result<_>>()?;
                 if v.len() != 7 {
                     return Err(format!("region {r}: 7 numbers expected"));
                 }
@@ -256,7 +298,14 @@ impl TextRegion {
     }
 
     /// (x, y, w, h) in the recorded frame: window pixels × σ, clipped to `rw` × `rh`.
-    fn rect(&self, window_w: u32, window_h: u32, sigma: u32, rw: u32, rh: u32) -> Option<(u32, u32, u32, u32)> {
+    fn rect(
+        &self,
+        window_w: u32,
+        window_h: u32,
+        sigma: u32,
+        rw: u32,
+        rh: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
         let mut w = window_w.saturating_sub(self.left + self.right);
         let h = window_h.saturating_sub(self.top + self.bottom);
         if self.max_width > 0 {
@@ -265,9 +314,16 @@ impl TextRegion {
         if self.max_width_fraction > 0.0 {
             w = w.min((f64::from(window_w) * self.max_width_fraction) as u32);
         }
-        let h = if self.max_height > 0 { h.min(self.max_height) } else { h };
+        let h = if self.max_height > 0 {
+            h.min(self.max_height)
+        } else {
+            h
+        };
         let (x, y) = (self.left * sigma, self.top * sigma);
-        let (w, h) = ((w * sigma).min(rw.saturating_sub(x)), (h * sigma).min(rh.saturating_sub(y)));
+        let (w, h) = (
+            (w * sigma).min(rw.saturating_sub(x)),
+            (h * sigma).min(rh.saturating_sub(y)),
+        );
         (w >= 8 && h >= 8).then_some((x, y, w, h))
     }
 }
@@ -286,7 +342,8 @@ fn run_live(args: &Args, out: &mut Json) -> Result<()> {
     out.num("live_pid", std::process::id());
     request.put(out);
     crate::exp_settings::install(request.settings(false));
-    std::fs::create_dir_all(scratch.join(clip_folder::WAITING_DIR)).map_err(|e| format!("scratch: {e}"))?;
+    std::fs::create_dir_all(scratch.join(clip_folder::WAITING_DIR))
+        .map_err(|e| format!("scratch: {e}"))?;
 
     // Input preparation before M_0 (M1, M3): the corpus reader, one B,G,R buffer
     // and one capture frame exist and one frame has been read, like the product's slot.
@@ -349,7 +406,10 @@ fn check_activation(request: &Request, folder: &Folder, out: &mut Json) -> Resul
         let (w, h) = recorded_size(folder);
         let confirm = confirm_system_nv12(&transform, w, h);
         let _ = unsafe { activate.ShutdownObject() };
-        out.text("dw4_system_nv12", &confirm.clone().unwrap_or_else(|e| format!("no: {e}")));
+        out.text(
+            "dw4_system_nv12",
+            &confirm.clone().unwrap_or_else(|e| format!("no: {e}")),
+        );
         out.text("status", "no_product_path");
         return Err(format!(
             "DW4 activates; system-memory NV12: {}; the product's Sink Writer cannot select it",
@@ -380,7 +440,9 @@ impl Request {
         let beta: f64 = args.number("beta", clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME)?;
         // M5: the bitrate fallback is never 0 (quality mode keeps the product's 0.10).
         if beta.is_nan() || beta <= 0.0 {
-            return Err(format!("beta={beta}: the bitrate fallback must be above 0 (M5)"));
+            return Err(format!(
+                "beta={beta}: the bitrate fallback must be above 0 (M5)"
+            ));
         }
         Ok(Self {
             way: args.text("encoder")?.to_owned(),
@@ -403,7 +465,8 @@ impl Request {
 
     /// β · w · h · f in bits per second, as the copied `fallback_bitrate` computes it.
     fn bitrate(&self, width: u32, height: u32) -> u32 {
-        let bits = self.beta * f64::from(width) * f64::from(height) * f64::from(capture_clip::RECORD_FPS);
+        let bits =
+            self.beta * f64::from(width) * f64::from(height) * f64::from(capture_clip::RECORD_FPS);
         bits.round().clamp(1.0, f64::from(u32::MAX)) as u32
     }
 
@@ -471,17 +534,26 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     // H3: every setup the worker needs is part of its measured work: Media Foundation and,
     // for a hardware encoder, the D3D11 device and its DXGI device manager.
     let _runtime = worker.time(MediaFoundationRuntime::start)?;
-    let manager = worker.time(|| if request.hardware { device_manager(&request.vendor).map(Some) } else { Ok(None) })?;
+    let manager = worker.time(|| {
+        if request.hardware {
+            device_manager(&request.vendor).map(Some)
+        } else {
+            Ok(None)
+        }
+    })?;
     crate::exp_settings::set_d3d_manager(manager);
-    let mut files = worker.time(|| ClipFiles::create(&clip_dir, folder.width as usize, folder.height as usize))?;
-    let encoded = worker.time(|| clip_encoder::probe_encode_once(&mp4, &input, request.hardware))?;
+    let mut files = worker
+        .time(|| ClipFiles::create(&clip_dir, folder.width as usize, folder.height as usize))?;
+    let encoded =
+        worker.time(|| clip_encoder::probe_encode_once(&mp4, &input, request.hardware))?;
     worker.time(|| -> Result<()> {
         files.count(&mp4)?;
         for &(instant, frame, new) in &folder.lines {
             files.line(instant, frame as usize, new)?;
         }
         // M4: the waiting files are deleted at ready, so they are not kept or counted.
-        std::fs::remove_dir_all(scratch.join(clip_folder::WAITING_DIR)).map_err(|e| format!("waiting: {e}"))
+        std::fs::remove_dir_all(scratch.join(clip_folder::WAITING_DIR))
+            .map_err(|e| format!("waiting: {e}"))
     })?;
     let clip_json = format!(
         "{{\"way\":\"{}\",\"w\":{},\"h\":{},\"sigma\":{},\"out_w\":{},\"out_h\":{},\"frames\":{},\"segments\":[\"clip.mp4\"]}}",
@@ -505,7 +577,10 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     out.raw(clip_bytes.json());
     out.num("bytes_disk", clip_bytes.total());
     out.num("bytes_on_disk", ClipFiles::bytes_on_disk(&clip_dir)?);
-    out.text("clip_hash", &format!("{:016x}", fnv1a(&std::fs::read(&mp4).unwrap_or_default())));
+    out.text(
+        "clip_hash",
+        &format!("{:016x}", fnv1a(&std::fs::read(&mp4).unwrap_or_default())),
+    );
     out.num("out_w", encoded.width);
     out.num("out_h", encoded.height);
     out.text("encoder_used", &encoded.encoder);
@@ -528,14 +603,24 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     let beta_read = if quality_mode || bitrate_read == bitrate_req {
         request.beta
     } else {
-        f64::from(bitrate_read) / (f64::from(encoded.width) * f64::from(encoded.height) * f64::from(capture_clip::RECORD_FPS))
+        f64::from(bitrate_read)
+            / (f64::from(encoded.width)
+                * f64::from(encoded.height)
+                * f64::from(capture_clip::RECORD_FPS))
     };
     out.text("rate_read", &report.mode);
     out.num("rate_value", report.value);
     out.num("q_read", q_read);
     out.num("tau_f_read", report.gop_frames);
     out.num("hint_read", hint_read);
-    out.num("bitrate_req", if request.rate == "bitrate" { bitrate_req } else { 0 });
+    out.num(
+        "bitrate_req",
+        if request.rate == "bitrate" {
+            bitrate_req
+        } else {
+            0
+        },
+    );
     out.num("bitrate_read", bitrate_read);
     out.float("beta_read", beta_read);
     out.num("b_frames_read", report.b_frames);
@@ -544,7 +629,10 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
         ("q", quality_mode && request.q() != q_read),
         ("tau_f", request.tau != report.gop_frames),
         ("hint", u32::from(request.hint) != hint_read),
-        ("beta", !quality_mode && request.rate == "bitrate" && bitrate_read != bitrate_req),
+        (
+            "beta",
+            !quality_mode && request.rate == "bitrate" && bitrate_read != bitrate_req,
+        ),
     ]
     .into_iter()
     .find_map(|(name, differs)| differs.then_some(name));
@@ -566,8 +654,17 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
     // 5 and 6. Decode, frame mapping by time (M6), quality, R and flashes.
     let sampler = MemorySampler::start();
     let regions = TextRegion::parse(args.text_or("regions", ""))?;
-    let quality = measure_quality(&folder, &input, &mp4, &sampler, cycle_rate, &regions, args.flag("ocr_fail", false), args.flag("e1_nv12", false),
-        args.text_or("e1_noise", "").parse::<u8>().ok())?;
+    let quality = measure_quality(
+        &folder,
+        &input,
+        &mp4,
+        &sampler,
+        cycle_rate,
+        &regions,
+        args.flag("ocr_fail", false),
+        args.flag("e1_nv12", false),
+        args.text_or("e1_noise", "").parse::<u8>().ok(),
+    )?;
     quality.put(out);
     let status = if !used_matches {
         "wrong_encoder".to_owned()
@@ -587,7 +684,11 @@ fn run_worker(args: &Args, out: &mut Json) -> Result<()> {
 
 /// The first values of a list, comma-free (the runner's CSV has no quoting).
 fn list<T: std::fmt::Display>(values: impl Iterator<Item = T>) -> String {
-    values.take(DIAG_ITEMS).map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
+    values
+        .take(DIAG_ITEMS)
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Samples whose time differs from the time written for them, as `order:sample_ms>file_ms`.
@@ -605,7 +706,10 @@ fn time_offsets(times_ms: &[u64], samples: &[SegmentSample]) -> String {
 /// σ · window, even, as the copied `RecordedSize` gives within the bound.
 fn recorded_size(folder: &Folder) -> (u32, u32) {
     let even = |v: u32| (v + 1) & !1;
-    (even(folder.width * folder.sigma), even(folder.height * folder.sigma))
+    (
+        even(folder.width * folder.sigma),
+        even(folder.height * folder.sigma),
+    )
 }
 
 /// The segment samples of the whole folder: instants within the clip and the
@@ -617,7 +721,10 @@ fn segment_samples(folder: &Folder, scratch: &Path) -> Vec<SegmentSample> {
         .iter()
         .enumerate()
         .map(|(order, &(instant, _))| {
-            let next = folder.new_frames.get(order + 1).map_or(folder.instants, |f| f.0);
+            let next = folder
+                .new_frames
+                .get(order + 1)
+                .map_or(folder.instants, |f| f.0);
             SegmentSample {
                 raw: clip_folder::raw_frame_path(scratch, instant),
                 width: folder.width,
@@ -658,22 +765,32 @@ fn find_encoder(name: &str, vendor: &str, hardware: bool) -> Result<IMFActivate>
     let wanted = ascii(name);
     let mut found = None;
     for activate in list.iter_mut().filter_map(Option::take) {
-        let friendly = attribute_string(&activate, &MFT_FRIENDLY_NAME_Attribute).unwrap_or_default();
-        let id = attribute_string(&activate, &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute).unwrap_or_default();
+        let friendly =
+            attribute_string(&activate, &MFT_FRIENDLY_NAME_Attribute).unwrap_or_default();
+        let id =
+            attribute_string(&activate, &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute).unwrap_or_default();
         let flags = unsafe { activate.GetUINT32(&MF_TRANSFORM_FLAGS_Attribute) }.unwrap_or(0);
         let is_hardware = flags & MFT_ENUM_FLAG_HARDWARE.0 as u32 != 0;
-        if found.is_none() && ascii(&friendly).contains(&wanted) && id == vendor && is_hardware == hardware {
+        if found.is_none()
+            && ascii(&friendly).contains(&wanted)
+            && id == vendor
+            && is_hardware == hardware
+        {
             found = Some(activate);
         }
     }
     unsafe { CoTaskMemFree(Some(activates.cast::<c_void>().cast_const())) };
-    found.ok_or_else(|| format!("no H.264 encoder named '{name}' with vendor '{vendor}' (hardware {hardware})"))
+    found.ok_or_else(|| {
+        format!("no H.264 encoder named '{name}' with vendor '{vendor}' (hardware {hardware})")
+    })
 }
 
 /// A DXGI device manager on the first adapter of `vendor` (`VEN_8086`).
 fn device_manager(vendor: &str) -> Result<IMFDXGIDeviceManager> {
-    let id = u32::from_str_radix(vendor.trim_start_matches("VEN_"), 16).map_err(|_| format!("vendor {vendor}"))?;
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
+    let id = u32::from_str_radix(vendor.trim_start_matches("VEN_"), 16)
+        .map_err(|_| format!("vendor {vendor}"))?;
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
     for index in 0.. {
         let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
             break;
@@ -716,42 +833,84 @@ fn device_manager(vendor: &str) -> Result<IMFDXGIDeviceManager> {
 /// a D3D device manager? Returns the step reached, or the failing step and
 /// its HRESULT.
 fn confirm_system_nv12(transform: &IMFTransform, width: u32, height: u32) -> Result<String> {
-    let step = |name: &'static str| move |e: windows::core::Error| format!("{name} {:#010x}", e.code().0);
+    let step =
+        |name: &'static str| move |e: windows::core::Error| format!("{name} {:#010x}", e.code().0);
     unsafe {
         let attributes = transform.GetAttributes().map_err(step("GetAttributes"))?;
-        attributes.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).map_err(step("MF_TRANSFORM_ASYNC_UNLOCK"))?;
+        attributes
+            .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
+            .map_err(step("MF_TRANSFORM_ASYNC_UNLOCK"))?;
         let output = media_type(&MFVideoFormat_H264, width, height)?;
-        output.SetUINT32(&MF_MT_AVG_BITRATE, (0.10 * f64::from(width * height) * 20.0) as u32).map_err(step("AVG_BITRATE"))?;
-        output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32).map_err(step("PROFILE"))?;
-        transform.SetOutputType(0, &output, 0).map_err(step("SetOutputType"))?;
+        output
+            .SetUINT32(
+                &MF_MT_AVG_BITRATE,
+                (0.10 * f64::from(width * height) * 20.0) as u32,
+            )
+            .map_err(step("AVG_BITRATE"))?;
+        output
+            .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)
+            .map_err(step("PROFILE"))?;
+        transform
+            .SetOutputType(0, &output, 0)
+            .map_err(step("SetOutputType"))?;
         let input = media_type(&MFVideoFormat_NV12, width, height)?;
-        transform.SetInputType(0, &input, 0).map_err(step("SetInputType(NV12)"))?;
-        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(step("BEGIN_STREAMING"))?;
-        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).map_err(step("START_OF_STREAM"))?;
-        let events: IMFMediaEventGenerator = transform.cast().map_err(step("IMFMediaEventGenerator"))?;
+        transform
+            .SetInputType(0, &input, 0)
+            .map_err(step("SetInputType(NV12)"))?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+            .map_err(step("BEGIN_STREAMING"))?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+            .map_err(step("START_OF_STREAM"))?;
+        let events: IMFMediaEventGenerator =
+            transform.cast().map_err(step("IMFMediaEventGenerator"))?;
         wait_event(&events, METransformNeedInput.0 as u32)?;
         let length = width * height * 3 / 2;
         let buffer = MFCreateMemoryBuffer(length).map_err(step("MFCreateMemoryBuffer"))?;
-        buffer.SetCurrentLength(length).map_err(step("SetCurrentLength"))?;
+        buffer
+            .SetCurrentLength(length)
+            .map_err(step("SetCurrentLength"))?;
         let sample: IMFSample = MFCreateSample().map_err(step("MFCreateSample"))?;
         sample.AddBuffer(&buffer).map_err(step("AddBuffer"))?;
         sample.SetSampleTime(0).map_err(step("SetSampleTime"))?;
-        sample.SetSampleDuration(500_000).map_err(step("SetSampleDuration"))?;
-        transform.ProcessInput(0, &sample, 0).map_err(step("ProcessInput(system NV12)"))?;
-        transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).map_err(step("DRAIN"))?;
+        sample
+            .SetSampleDuration(500_000)
+            .map_err(step("SetSampleDuration"))?;
+        transform
+            .ProcessInput(0, &sample, 0)
+            .map_err(step("ProcessInput(system NV12)"))?;
+        transform
+            .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
+            .map_err(step("DRAIN"))?;
         wait_event(&events, METransformHaveOutput.0 as u32)?;
     }
-    Ok("yes: ProcessInput accepted a system-memory NV12 sample and the encoder signalled output".to_owned())
+    Ok(
+        "yes: ProcessInput accepted a system-memory NV12 sample and the encoder signalled output"
+            .to_owned(),
+    )
 }
 
 fn media_type(subtype: &windows::core::GUID, width: u32, height: u32) -> Result<IMFMediaType> {
-    let step = |name: &'static str| move |e: windows::core::Error| format!("{name} {:#010x}", e.code().0);
+    let step =
+        |name: &'static str| move |e: windows::core::Error| format!("{name} {:#010x}", e.code().0);
     unsafe {
         let media = MFCreateMediaType().map_err(step("MFCreateMediaType"))?;
-        media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(step("MAJOR_TYPE"))?;
-        media.SetGUID(&MF_MT_SUBTYPE, subtype).map_err(step("SUBTYPE"))?;
-        media.SetUINT64(&MF_MT_FRAME_SIZE, (u64::from(width) << 32) | u64::from(height)).map_err(step("FRAME_SIZE"))?;
-        media.SetUINT64(&MF_MT_FRAME_RATE, (20_u64 << 32) | 1).map_err(step("FRAME_RATE"))?;
+        media
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(step("MAJOR_TYPE"))?;
+        media
+            .SetGUID(&MF_MT_SUBTYPE, subtype)
+            .map_err(step("SUBTYPE"))?;
+        media
+            .SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                (u64::from(width) << 32) | u64::from(height),
+            )
+            .map_err(step("FRAME_SIZE"))?;
+        media
+            .SetUINT64(&MF_MT_FRAME_RATE, (20_u64 << 32) | 1)
+            .map_err(step("FRAME_RATE"))?;
         media
             .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             .map_err(step("INTERLACE_MODE"))?;
@@ -774,7 +933,9 @@ fn wait_event(events: &IMFMediaEventGenerator, wanted: u32) -> Result<()> {
             Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
-    Err(format!("event {wanted} not signalled within {EVENT_WAIT:?} (seen {seen:?})"))
+    Err(format!(
+        "event {wanted} not signalled within {EVENT_WAIT:?} (seen {seen:?})"
+    ))
 }
 
 /// What the clip file holds, read from its compressed samples.
@@ -791,22 +952,38 @@ struct ReadBack {
 
 fn read_back(clip: &Path) -> Result<ReadBack> {
     let url = HSTRING::from(clip.as_os_str());
-    let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }.map_err(|e| format!("source reader: {e}"))?;
+    let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }
+        .map_err(|e| format!("source reader: {e}"))?;
     let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-    let mut back = ReadBack { frames: 0, keyframes: 0, b_slices: 0, max_gop: 0, key_orders: Vec::new(), times_ms: Vec::new() };
+    let mut back = ReadBack {
+        frames: 0,
+        keyframes: 0,
+        b_slices: 0,
+        max_gop: 0,
+        key_orders: Vec::new(),
+        times_ms: Vec::new(),
+    };
     let mut since_key = 0_u64;
     loop {
         let (mut flags, mut time) = (0_u32, 0_i64);
         let mut sample: Option<IMFSample> = None;
         unsafe {
-            reader.ReadSample(stream, 0, None, Some(&raw mut flags), Some(&raw mut time), Some(&raw mut sample))
+            reader.ReadSample(
+                stream,
+                0,
+                None,
+                Some(&raw mut flags),
+                Some(&raw mut time),
+                Some(&raw mut sample),
+            )
         }
         .map_err(|e| format!("ReadSample: {e}"))?;
         if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
             return Err("read back: stream error".to_owned());
         }
         if let Some(sample) = sample {
-            back.times_ms.push(u64::try_from((time + 5_000) / 10_000).unwrap_or(0));
+            back.times_ms
+                .push(u64::try_from((time + 5_000) / 10_000).unwrap_or(0));
             back.frames += 1;
             if unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0 {
                 back.key_orders.push(back.frames - 1);
@@ -826,10 +1003,18 @@ fn read_back(clip: &Path) -> Result<ReadBack> {
 
 fn sample_bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     unsafe {
-        let buffer = sample.ConvertToContiguousBuffer().map_err(|e| format!("buffer: {e}"))?;
+        let buffer = sample
+            .ConvertToContiguousBuffer()
+            .map_err(|e| format!("buffer: {e}"))?;
         let (mut data, mut length) = (std::ptr::null_mut::<u8>(), 0_u32);
-        buffer.Lock(&raw mut data, None, Some(&raw mut length)).map_err(|e| format!("Lock: {e}"))?;
-        let bytes = if data.is_null() { Vec::new() } else { std::slice::from_raw_parts(data, length as usize).to_vec() };
+        buffer
+            .Lock(&raw mut data, None, Some(&raw mut length))
+            .map_err(|e| format!("Lock: {e}"))?;
+        let bytes = if data.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(data, length as usize).to_vec()
+        };
         let _ = buffer.Unlock();
         Ok(bytes)
     }
@@ -952,7 +1137,10 @@ impl Quality {
         out.num("frames_missing", self.n_new.saturating_sub(self.mapped));
         out.num("frames_extra", self.extra);
         out.num("frames_mistimed", self.mistimed);
-        out.text("time_offsets", &format!("{} off; {}", self.offsets.len(), list(self.offsets.iter())));
+        out.text(
+            "time_offsets",
+            &format!("{} off; {}", self.offsets.len(), list(self.offsets.iter())),
+        );
         out.num("t_decode_ns", self.dec.wall_ns);
         out.num("a_dec_ns", self.dec.cpu_from_cycles(self.rate));
         out.num("a_dec_gpt_ns", self.dec.cpu_ns);
@@ -960,16 +1148,34 @@ impl Quality {
         out.num("t_quality_ns", self.t_quality);
         out.num("t_ocr_ns", self.t_ocr);
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-        let finite: Vec<f64> = self.psnr.iter().copied().filter(|p| p.is_finite()).collect();
+        let finite: Vec<f64> = self
+            .psnr
+            .iter()
+            .copied()
+            .filter(|p| p.is_finite())
+            .collect();
         out.float("ssim_mean", mean(&self.ssim));
-        out.float("ssim_min", self.ssim.iter().copied().fold(f64::INFINITY, f64::min));
+        out.float(
+            "ssim_min",
+            self.ssim.iter().copied().fold(f64::INFINITY, f64::min),
+        );
         out.float("psnr_mean", mean(&finite));
-        out.float("psnr_min", self.psnr.iter().copied().fold(f64::INFINITY, f64::min));
+        out.float(
+            "psnr_min",
+            self.psnr.iter().copied().fold(f64::INFINITY, f64::min),
+        );
         out.num("identical_frames", self.psnr.len() - finite.len());
         // M7: PSNR-Y from the clip's total MSE, inf when it is 0.
         let mse = self.squared_error as f64 / self.pixels.max(1) as f64;
         out.float("mse_y", mse);
-        out.float("psnr_global", if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY });
+        out.float(
+            "psnr_global",
+            if mse > 0.0 {
+                10.0 * (255.0 * 255.0 / mse).log10()
+            } else {
+                f64::INFINITY
+            },
+        );
         match self.r {
             Some(r) => out.float("r", r),
             None if self.ocr_failed => out.text("r", "error"),
@@ -999,9 +1205,19 @@ fn measure_quality(
     source_noise: Option<u8>,
 ) -> Result<Quality> {
     let n = folder.new_frames.len();
-    let mut quality = Quality { rate, n_new: n, ..Quality::default() };
+    let mut quality = Quality {
+        rate,
+        n_new: n,
+        ..Quality::default()
+    };
     let text = TEXT_SCENARIOS.contains(&folder.scenario.as_str());
-    let ocr_orders: Vec<usize> = if text { (0..OCR_FRAMES.min(n)).map(|i| i * n / OCR_FRAMES.min(n)).collect() } else { Vec::new() };
+    let ocr_orders: Vec<usize> = if text {
+        (0..OCR_FRAMES.min(n))
+            .map(|i| i * n / OCR_FRAMES.min(n))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut ocr_decoded: Vec<(usize, Vec<u8>, u32, u32)> = Vec::new();
     let flash = (folder.scenario == "flash").then(FlashBox::from_env);
     let (mut flash_on, mut flashes) = (false, 0_u64);
@@ -1019,7 +1235,9 @@ fn measure_quality(
         // Diagnostic: the time of the sample written at this decode order.
         let in_order = (quality.decoded as usize - 1).min(n.saturating_sub(1));
         if n > 0 && t.abs_diff(times[in_order]) > INSTANT_MS / 2 {
-            quality.offsets.push(format!("{in_order}:{}>{t}", times[in_order]));
+            quality
+                .offsets
+                .push(format!("{in_order}:{}>{t}", times[in_order]));
         }
         // M6: the new frame whose time is within half an instant of the decoded frame's.
         let next = times.partition_point(|&s| s < t);
@@ -1040,17 +1258,25 @@ fn measure_quality(
         quality.mapped += 1;
         let (_, corpus_frame) = folder.new_frames[order];
         let bgr = folder.frame_bgr(corpus_frame)?;
-        let (rw, rh, reference) = clip_encoder::probe_reference_luma(input, &bgr, folder.width, folder.height);
+        let (rw, rh, reference) =
+            clip_encoder::probe_reference_luma(input, &bgr, folder.width, folder.height);
         let (rw, rh) = (rw as usize, rh as usize);
         if (frame.width as usize) < rw || (frame.height as usize) < rh {
-            return Err(format!("decoded {}x{} is smaller than {rw}x{rh}", frame.width, frame.height));
+            return Err(format!(
+                "decoded {}x{} is smaller than {rw}x{rh}",
+                frame.width, frame.height
+            ));
         }
         let decoded = luma_of_bgra(&frame.bgra, frame.width as usize, rw, rh);
         let squared = squared_error(&reference, &decoded);
         quality.squared_error += squared;
         quality.pixels += reference.len() as u64;
         let mse = squared as f64 / reference.len().max(1) as f64;
-        quality.psnr.push(if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY });
+        quality.psnr.push(if mse > 0.0 {
+            10.0 * (255.0 * 255.0 / mse).log10()
+        } else {
+            f64::INFINITY
+        });
         quality.ssim.push(ssim(&reference, &decoded, rw, rh));
         if let Some(flash) = &flash {
             let on = flash.lit(&frame.bgra, frame.width as usize, folder.sigma as usize);
@@ -1065,11 +1291,24 @@ fn measure_quality(
             // Noise test (`e1_noise=N`): OCR reads the source itself with ±N levels of
             // deterministic noise per channel, to measure how stable the OCR is (N = 0: control).
             let picture = if let Some(amplitude) = source_noise {
-                let clean = scaled_bgra(&bgr, folder.width as usize, folder.height as usize, folder.sigma as usize, rw, rh);
+                let clean = scaled_bgra(
+                    &bgr,
+                    folder.width as usize,
+                    folder.height as usize,
+                    folder.sigma as usize,
+                    rw,
+                    rh,
+                );
                 with_noise(&clean, amplitude, order as u64)
             } else if nv12_only {
-                let (w, h, nv12) = clip_encoder::probe_reference_nv12(input, &bgr, folder.width, folder.height);
-                crop_bgra(&nv12_to_bgra(&nv12, w as usize, h as usize), w as usize, rw, rh)
+                let (w, h, nv12) =
+                    clip_encoder::probe_reference_nv12(input, &bgr, folder.width, folder.height);
+                crop_bgra(
+                    &nv12_to_bgra(&nv12, w as usize, h as usize),
+                    w as usize,
+                    rw,
+                    rh,
+                )
             } else {
                 crop_bgra(&frame.bgra, frame.width as usize, rw, rh)
             };
@@ -1086,7 +1325,11 @@ fn measure_quality(
     if text && !regions.is_empty() {
         let wall = Instant::now();
         // `ocr_fail=1`: the step2d check of the error path makes OCR fail on purpose.
-        let read = if inject_ocr_failure { Err("injected OCR failure (ocr_fail=1)".to_owned()) } else { ocr_share(folder, &ocr_decoded, regions) };
+        let read = if inject_ocr_failure {
+            Err("injected OCR failure (ocr_fail=1)".to_owned())
+        } else {
+            ocr_share(folder, &ocr_decoded, regions)
+        };
         match read {
             Ok((r, chars, note)) => {
                 quality.r = r;
@@ -1111,16 +1354,32 @@ fn measure_quality(
 /// R on the scenario's fixed text regions (M7): the mean over OCR frames and
 /// regions of 1 − edit distance / source length, counting only pairs whose
 /// source text is not empty. No source text at all gives R = n/a (`None`).
-fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)], regions: &[TextRegion]) -> Result<(Option<f64>, usize, String)> {
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| format!("OcrEngine: {e}"))?;
+fn ocr_share(
+    folder: &Folder,
+    decoded: &[(usize, Vec<u8>, u32, u32)],
+    regions: &[TextRegion],
+) -> Result<(Option<f64>, usize, String)> {
+    let engine =
+        OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| format!("OcrEngine: {e}"))?;
     let mut shares = Vec::new();
     let mut source_chars = 0;
     let mut per_region = vec![0_usize; regions.len()];
     for (order, bgra, w, h) in decoded {
         let bgr = folder.frame_bgr(folder.new_frames[*order].1)?;
-        let source = scaled_bgra(&bgr, folder.width as usize, folder.height as usize, folder.sigma as usize, *w as usize, *h as usize);
+        let source = scaled_bgra(
+            &bgr,
+            folder.width as usize,
+            folder.height as usize,
+            folder.sigma as usize,
+            *w as usize,
+            *h as usize,
+        );
         for (index, region) in regions.iter().enumerate() {
-            let Some((x, y, rw, rh)) = region.rect(folder.width, folder.height, folder.sigma, *w, *h) else { continue };
+            let Some((x, y, rw, rh)) =
+                region.rect(folder.width, folder.height, folder.sigma, *w, *h)
+            else {
+                continue;
+            };
             let source_text = ocr_text(&engine, &crop_rect(&source, *w, x, y, rw, rh), rw, rh)?;
             let chars = source_text.chars().filter(|c| !c.is_whitespace()).count();
             if chars == 0 {
@@ -1133,7 +1392,12 @@ fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)], regions: &
         }
     }
     let r = (!shares.is_empty()).then(|| shares.iter().sum::<f64>() / shares.len() as f64);
-    let note = format!("{} frames, {} region reads, source chars per region {}", decoded.len(), shares.len(), list(per_region.iter()));
+    let note = format!(
+        "{} frames, {} region reads, source chars per region {}",
+        decoded.len(),
+        shares.len(),
+        list(per_region.iter())
+    );
     Ok((r, source_chars, note))
 }
 
@@ -1141,14 +1405,18 @@ fn ocr_share(folder: &Folder, decoded: &[(usize, Vec<u8>, u32, u32)], regions: &
 /// (clamped to 0..255) from a fixed-seed generator, alpha kept, so runs repeat exactly.
 fn with_noise(bgra: &[u8], amplitude: u8, seed: u64) -> Vec<u8> {
     let span = 2 * u64::from(amplitude) + 1;
-    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+    let mut state = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
     bgra.iter()
         .enumerate()
         .map(|(i, &value)| {
             if i % 4 == 3 || amplitude == 0 {
                 return value;
             }
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let offset = i32::try_from((state >> 33) % span).unwrap_or(0) - i32::from(amplitude);
             u8::try_from((i32::from(value) + offset).clamp(0, 255)).unwrap_or(u8::MAX)
         })
@@ -1184,7 +1452,13 @@ fn nv12_to_bgra(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
 
 /// A `w` × `h` rectangle at (x, y) of a BGRA image `stride_px` wide.
 fn crop_rect(bgra: &[u8], stride_px: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
-    let (stride, x, y, w, h) = (stride_px as usize, x as usize, y as usize, w as usize, h as usize);
+    let (stride, x, y, w, h) = (
+        stride_px as usize,
+        x as usize,
+        y as usize,
+        w as usize,
+        h as usize,
+    );
     let mut out = Vec::with_capacity(w * h * 4);
     for row in y..y + h {
         let start = (row * stride + x) * 4;
@@ -1216,20 +1490,36 @@ fn edit_distance(a: &[char], b: &[char]) -> usize {
 }
 
 fn ocr_text(engine: &OcrEngine, bgra: &[u8], width: u32, height: u32) -> Result<String> {
-    let buffer = CryptographicBuffer::CreateFromByteArray(bgra).map_err(|e| format!("buffer: {e}"))?;
-    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Bgra8, width as i32, height as i32)
-        .map_err(|e| format!("SoftwareBitmap: {e}"))?;
+    let buffer =
+        CryptographicBuffer::CreateFromByteArray(bgra).map_err(|e| format!("buffer: {e}"))?;
+    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Bgra8,
+        width as i32,
+        height as i32,
+    )
+    .map_err(|e| format!("SoftwareBitmap: {e}"))?;
     let result = engine
         .RecognizeAsync(&bitmap)
         .map_err(|e| format!("RecognizeAsync: {e}"))?
         .join()
         .map_err(|e| format!("OCR: {e}"))?;
-    Ok(result.Text().map_err(|e| format!("Text: {e}"))?.to_string_lossy())
+    Ok(result
+        .Text()
+        .map_err(|e| format!("Text: {e}"))?
+        .to_string_lossy())
 }
 
 /// The corpus frame duplicated σ × σ into a `width` × `height` BGRA image
 /// (black outside), as the encoder's canvas places it.
-fn scaled_bgra(bgr: &[u8], sw: usize, sh: usize, sigma: usize, width: usize, height: usize) -> Vec<u8> {
+fn scaled_bgra(
+    bgr: &[u8],
+    sw: usize,
+    sh: usize,
+    sigma: usize,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
     let mut out = vec![0_u8; width * height * 4];
     for row in 0..height {
         for col in 0..width {
@@ -1262,7 +1552,10 @@ pub(crate) fn luma_of_bgra(bgra: &[u8], stride_px: usize, width: usize, height: 
     let mut out = Vec::with_capacity(width * height);
     for row in 0..height {
         let line = &bgra[row * stride_px * 4..row * stride_px * 4 + width * 4];
-        out.extend(line.chunks_exact(4).map(|p| luma(i32::from(p[2]), i32::from(p[1]), i32::from(p[0]))));
+        out.extend(
+            line.chunks_exact(4)
+                .map(|p| luma(i32::from(p[2]), i32::from(p[1]), i32::from(p[0]))),
+        );
     }
     out
 }
@@ -1272,7 +1565,10 @@ pub(crate) fn luma(red: i32, green: i32, blue: i32) -> u8 {
 }
 
 fn squared_error(a: &[u8], b: &[u8]) -> u64 {
-    a.iter().zip(b).map(|(&x, &y)| u64::from(x.abs_diff(y)).pow(2)).sum()
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| u64::from(x.abs_diff(y)).pow(2))
+        .sum()
 }
 
 fn mse(a: &[u8], b: &[u8]) -> f64 {
@@ -1290,7 +1586,10 @@ pub(crate) fn ssim(a: &[u8], b: &[u8], width: usize, height: usize) -> f64 {
             let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
             for row in y..y + SSIM_WINDOW {
                 let base = row * width + x;
-                for (&p, &q) in a[base..base + SSIM_WINDOW].iter().zip(&b[base..base + SSIM_WINDOW]) {
+                for (&p, &q) in a[base..base + SSIM_WINDOW]
+                    .iter()
+                    .zip(&b[base..base + SSIM_WINDOW])
+                {
                     let (p, q) = (u64::from(p), u64::from(q));
                     sa += p;
                     sb += q;
@@ -1303,13 +1602,18 @@ pub(crate) fn ssim(a: &[u8], b: &[u8], width: usize, height: usize) -> f64 {
             let va = saa as f64 / n - ma * ma;
             let vb = sbb as f64 / n - mb * mb;
             let cov = sab as f64 / n - ma * mb;
-            total += ((2.0 * ma * mb + SSIM_C1) * (2.0 * cov + SSIM_C2)) / ((ma * ma + mb * mb + SSIM_C1) * (va + vb + SSIM_C2));
+            total += ((2.0 * ma * mb + SSIM_C1) * (2.0 * cov + SSIM_C2))
+                / ((ma * ma + mb * mb + SSIM_C1) * (va + vb + SSIM_C2));
             count += 1;
             x += SSIM_STRIDE;
         }
         y += SSIM_STRIDE;
     }
-    if count == 0 { 1.0 } else { total / count as f64 }
+    if count == 0 {
+        1.0
+    } else {
+        total / count as f64
+    }
 }
 
 /// The flash box of the flash page (corpus.json "flash"), passed as
@@ -1334,7 +1638,11 @@ impl FlashBox {
             .collect();
         let get = |i: usize, d: f64| parts.get(i).copied().unwrap_or(d);
         Self {
-            bgr: [get(0, 80.0) as i32, get(1, 32.0) as i32, get(2, 255.0) as i32],
+            bgr: [
+                get(0, 80.0) as i32,
+                get(1, 32.0) as i32,
+                get(2, 255.0) as i32,
+            ],
             left_fraction: get(3, 0.6),
             top: get(4, 40.0) as usize,
             width: get(5, 160.0) as usize,
@@ -1346,14 +1654,20 @@ impl FlashBox {
 
     /// Whether the box holds at least `min_pixels · σ²` flash-coloured pixels.
     fn lit(&self, bgra: &[u8], stride_px: usize, sigma: usize) -> bool {
-        let window = if self.window_width > 0 { self.window_width } else { stride_px / sigma };
+        let window = if self.window_width > 0 {
+            self.window_width
+        } else {
+            stride_px / sigma
+        };
         let left = (self.left_fraction * window as f64).round() as usize * sigma;
         let (top, w, h) = (self.top * sigma, self.width * sigma, self.height * sigma);
         let mut count = 0;
         for row in top..top + h {
             for col in left..(left + w).min(stride_px) {
                 let at = (row * stride_px + col) * 4;
-                let Some(p) = bgra.get(at..at + 3) else { continue };
+                let Some(p) = bgra.get(at..at + 3) else {
+                    continue;
+                };
                 if (0..3).all(|c| (i32::from(p[c]) - self.bgr[c]).abs() <= FLASH_TOLERANCE) {
                     count += 1;
                 }
@@ -1370,15 +1684,22 @@ fn meter_self_check(args: &Args) -> Result<()> {
     let (_, frame) = folder.new_frames[folder.new_frames.len() / 2];
     let bgr = folder.frame_bgr(frame)?;
     let (w, h) = (folder.width as usize, folder.height as usize);
-    let y: Vec<u8> = bgr.chunks_exact(3).map(|p| luma(i32::from(p[2]), i32::from(p[1]), i32::from(p[0]))).collect();
+    let y: Vec<u8> = bgr
+        .chunks_exact(3)
+        .map(|p| luma(i32::from(p[2]), i32::from(p[1]), i32::from(p[0])))
+        .collect();
     let ssim_xx = ssim(&y, &y, w, h);
     let mse_xx = mse(&y, &y);
     let clipped = y.iter().filter(|&&v| v > 255 - DISTORTION_D).count();
     let shifted: Vec<u8> = y.iter().map(|&v| v.saturating_add(DISTORTION_D)).collect();
     let mse_d4 = mse(&y, &shifted);
     let bgra = scaled_bgra(&bgr, w, h, 1, w, h);
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| format!("OcrEngine: {e}"))?;
-    let (first, second) = (ocr_text(&engine, &bgra, w as u32, h as u32)?, ocr_text(&engine, &bgra, w as u32, h as u32)?);
+    let engine =
+        OcrEngine::TryCreateFromUserProfileLanguages().map_err(|e| format!("OcrEngine: {e}"))?;
+    let (first, second) = (
+        ocr_text(&engine, &bgra, w as u32, h as u32)?,
+        ocr_text(&engine, &bgra, w as u32, h as u32)?,
+    );
     let mut out = Json::default();
     out.text("mode", "meter");
     out.float("ssim_xx", ssim_xx);
@@ -1397,7 +1718,9 @@ fn meter_self_check(args: &Args) -> Result<()> {
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
+        (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// The one JSON line a run prints (no serde in this probe).
@@ -1419,7 +1742,13 @@ impl Json {
     }
 
     fn float(&mut self, key: &str, value: f64) {
-        let text = if value.is_finite() { format!("{value}") } else if value > 0.0 { "\"inf\"".to_owned() } else { "null".to_owned() };
+        let text = if value.is_finite() {
+            format!("{value}")
+        } else if value > 0.0 {
+            "\"inf\"".to_owned()
+        } else {
+            "null".to_owned()
+        };
         self.set(key, text);
     }
 
@@ -1442,8 +1771,17 @@ impl Json {
     }
 
     fn finish(&self) -> String {
-        let body: Vec<String> =
-            self.0.iter().map(|(k, v)| if k.is_empty() { v.clone() } else { format!("\"{k}\":{v}") }).collect();
+        let body: Vec<String> = self
+            .0
+            .iter()
+            .map(|(k, v)| {
+                if k.is_empty() {
+                    v.clone()
+                } else {
+                    format!("\"{k}\":{v}")
+                }
+            })
+            .collect();
         format!("{{{}}}", body.join(","))
     }
 }
@@ -1456,7 +1794,9 @@ fn json_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 
 fn json_num(text: &str, key: &str) -> Option<f64> {
     let rest = json_field(text, key)?;
-    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -1468,5 +1808,9 @@ fn json_str(text: &str, key: &str) -> Option<String> {
 fn json_array(text: &str, key: &str) -> Option<Vec<f64>> {
     let rest = json_field(text, key)?.strip_prefix('[')?;
     let body = &rest[..rest.find(']')?];
-    Some(body.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+    Some(
+        body.split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect(),
+    )
 }

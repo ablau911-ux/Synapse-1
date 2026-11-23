@@ -32,7 +32,11 @@ impl Spent {
 
     /// M2: the cost of two parts of one way's work together (the way's CPU is the sum of all its parts).
     pub fn plus(self, other: Self) -> Self {
-        Self { cpu_ns: self.cpu_ns + other.cpu_ns, cycles: self.cycles + other.cycles, wall_ns: self.wall_ns + other.wall_ns }
+        Self {
+            cpu_ns: self.cpu_ns + other.cpu_ns,
+            cycles: self.cycles + other.cycles,
+            wall_ns: self.wall_ns + other.wall_ns,
+        }
     }
 
     /// Process CPU in ns from the cycle counter at `rate` cycles per second.

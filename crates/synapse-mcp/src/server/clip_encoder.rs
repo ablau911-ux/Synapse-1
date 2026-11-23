@@ -5,21 +5,19 @@
 use std::path::Path;
 
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonQuality,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVScenarioInfo, ICodecAPI, IMFAttributes, IMFMediaType,
-    IMFSinkWriter, IMFSinkWriterEx, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX,
-    MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_TRANSCODE_CONTAINERTYPE, MF_VERSION,
-    MFCreateAttributes, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFCreateSinkWriterFromURL, MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_LITE,
-    MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_HARDWARE_URL_Attribute,
-    MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, MFT_FRIENDLY_NAME_Attribute,
-    MFTranscodeContainerType_FMPEG4, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
+    CODECAPI_AVEncCommonQuality, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVScenarioInfo,
+    ICodecAPI, IMFAttributes, IMFMediaType, IMFSinkWriter, IMFSinkWriterEx, MF_MT_AVG_BITRATE,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFCreateAttributes, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFCreateSinkWriterFromURL, MFMediaType_Video,
+    MFNominalRange_16_235, MFSTARTUP_LITE, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_HARDWARE_URL_Attribute, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
+    MFT_FRIENDLY_NAME_Attribute, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
     MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
-    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_High,
-    eAVScenarioInfo_DisplayRemoting,
+    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_High, eAVScenarioInfo_DisplayRemoting,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Variant::{VARIANT, VT_UI4};
@@ -101,7 +99,8 @@ impl Nv12Box {
                 let red = i32::from(bgr[at + RED]);
                 luma[row * self.width + col] = clamp_u8(
                     ((Y_RED * red + Y_GREEN * green + Y_BLUE * blue + COLOR_ROUNDING)
-                        >> COLOR_SHIFT) + Y_OFFSET,
+                        >> COLOR_SHIFT)
+                        + Y_OFFSET,
                 );
             }
         }
@@ -126,11 +125,13 @@ impl Nv12Box {
                 let at = (row / CHROMA_SIDE) * self.width + col;
                 chroma[at] = clamp_u8(
                     ((U_RED * red + U_GREEN * green + U_BLUE * blue + COLOR_ROUNDING)
-                        >> COLOR_SHIFT) + UV_OFFSET,
+                        >> COLOR_SHIFT)
+                        + UV_OFFSET,
                 );
                 chroma[at + UV_V_OFFSET] = clamp_u8(
                     ((V_RED * red + V_GREEN * green + V_BLUE * blue + COLOR_ROUNDING)
-                        >> COLOR_SHIFT) + UV_OFFSET,
+                        >> COLOR_SHIFT)
+                        + UV_OFFSET,
                 );
             }
         }
@@ -170,51 +171,72 @@ pub(super) struct ClipEncoder {
 
 impl ClipEncoder {
     pub(super) fn accepts(width: u32, height: u32) -> bool {
-        width > 0 && height > 0 && width <= MAX_ENCODE_SIDE && height <= MAX_ENCODE_SIDE
+        width > 0
+            && height > 0
+            && width <= MAX_ENCODE_SIDE
+            && height <= MAX_ENCODE_SIDE
             && width.is_multiple_of(CHROMA_SIDE as u32)
             && height.is_multiple_of(CHROMA_SIDE as u32)
             && u64::from(width.div_ceil(MACROBLOCK_SIDE))
-                * u64::from(height.div_ceil(MACROBLOCK_SIDE)) <= MAX_ENCODE_MACROBLOCKS
+                * u64::from(height.div_ceil(MACROBLOCK_SIDE))
+                <= MAX_ENCODE_MACROBLOCKS
     }
 
     pub(super) fn create(path: &Path, width: u32, height: u32, fps: u32) -> Result<Self, String> {
         if !Self::accepts(width, height) || fps == 0 {
-            return Err(format!("unsupported H.264 size or rate: {width}x{height} at {fps} fps"));
+            return Err(format!(
+                "unsupported H.264 size or rate: {width}x{height} at {fps} fps"
+            ));
         }
-        let (writer, stream) = open_writer(
-            path, MFTranscodeContainerType_FMPEG4, width, height, fps,
-        ).or_else(|fragmented_error| {
-            tracing::warn!(code = "CLIP_ENCODER_FMP4_REFUSED", error = %fragmented_error,
-                "fragmented MP4 refused; trying normal MP4");
-            let _ = std::fs::remove_file(path);
-            open_writer(path, MFTranscodeContainerType_MPEG4, width, height, fps)
-                .map_err(|mp4_error| format!("fragmented MP4: {fragmented_error}; MP4: {mp4_error}"))
-        })?;
+        let (writer, stream) =
+            open_writer(path, MFTranscodeContainerType_MPEG4, width, height, fps)?;
         let grant = confirm_settings(&writer, stream, fps)?;
         // SAFETY: the writer is configured; this starts the session.
         unsafe { writer.BeginWriting() }.map_err(hr("IMFSinkWriter::BeginWriting"))?;
-        Ok(Self { writer, stream, grant, finalized: false })
+        Ok(Self {
+            writer,
+            stream,
+            grant,
+            finalized: false,
+        })
     }
 
     pub(super) fn grant(&self) -> &EncoderGrant {
         &self.grant
     }
 
-    pub(super) fn write_nv12(&mut self, nv12: &[u8], time_hns: i64, duration_hns: i64) -> Result<(), String> {
+    pub(super) fn write_nv12(
+        &mut self,
+        nv12: &[u8],
+        time_hns: i64,
+        duration_hns: i64,
+    ) -> Result<(), String> {
         let length = u32::try_from(nv12.len()).map_err(|_| "NV12 frame too large".to_owned())?;
         // SAFETY: the buffer is locked for exactly length bytes while copied.
         unsafe {
             let buffer = MFCreateMemoryBuffer(length).map_err(hr("MFCreateMemoryBuffer"))?;
             let mut data: *mut u8 = std::ptr::null_mut();
-            buffer.Lock(&raw mut data, None, None).map_err(hr("IMFMediaBuffer::Lock"))?;
+            buffer
+                .Lock(&raw mut data, None, None)
+                .map_err(hr("IMFMediaBuffer::Lock"))?;
             std::ptr::copy_nonoverlapping(nv12.as_ptr(), data, nv12.len());
             buffer.Unlock().map_err(hr("IMFMediaBuffer::Unlock"))?;
-            buffer.SetCurrentLength(length).map_err(hr("IMFMediaBuffer::SetCurrentLength"))?;
+            buffer
+                .SetCurrentLength(length)
+                .map_err(hr("IMFMediaBuffer::SetCurrentLength"))?;
             let sample = MFCreateSample().map_err(hr("MFCreateSample"))?;
-            sample.AddBuffer(&buffer).map_err(hr("IMFSample::AddBuffer"))?;
-            sample.SetSampleTime(time_hns).map_err(hr("IMFSample::SetSampleTime"))?;
-            sample.SetSampleDuration(duration_hns).map_err(hr("IMFSample::SetSampleDuration"))?;
-            self.writer.WriteSample(self.stream, &sample).map_err(hr("IMFSinkWriter::WriteSample"))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(hr("IMFSample::AddBuffer"))?;
+            sample
+                .SetSampleTime(time_hns)
+                .map_err(hr("IMFSample::SetSampleTime"))?;
+            sample
+                .SetSampleDuration(duration_hns)
+                .map_err(hr("IMFSample::SetSampleDuration"))?;
+            self.writer
+                .WriteSample(self.stream, &sample)
+                .map_err(hr("IMFSinkWriter::WriteSample"))?;
         }
         Ok(())
     }
@@ -228,7 +250,9 @@ impl ClipEncoder {
 
 impl Drop for ClipEncoder {
     fn drop(&mut self) {
-        if self.finalized { return; }
+        if self.finalized {
+            return;
+        }
         self.finalized = true;
         // SAFETY: an unfinished writer is finalized once before release.
         if let Err(error) = unsafe { self.writer.Finalize() } {
@@ -298,8 +322,7 @@ fn open_writer(
 
 /// β · width · height · f, in bits per second (B7).
 fn nominal_bitrate(width: u32, height: u32, fps: u32) -> u32 {
-    let bits =
-        NOMINAL_BITS_PER_PIXEL_FRAME * f64::from(width) * f64::from(height) * f64::from(fps);
+    let bits = NOMINAL_BITS_PER_PIXEL_FRAME * f64::from(width) * f64::from(height) * f64::from(fps);
     bits.round().clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
@@ -380,11 +403,7 @@ fn encoder_params(fps: u32, full: bool) -> Result<IMFAttributes, String> {
 }
 
 /// Required encoder settings are read back exactly; refusal is an error.
-fn confirm_settings(
-    writer: &IMFSinkWriter,
-    stream: u32,
-    fps: u32,
-) -> Result<EncoderGrant, String> {
+fn confirm_settings(writer: &IMFSinkWriter, stream: u32, fps: u32) -> Result<EncoderGrant, String> {
     let codec = codec_api(writer, stream).ok_or_else(|| {
         "the encoder exposes no ICodecAPI: its settings cannot be set or read back".to_owned()
     })?;
@@ -405,9 +424,18 @@ fn confirm_settings(
         .ok_or("the encoder did not read back quality mode at level 90")?;
     let (name, hardware) = encoder_identity(writer, stream);
     if !hardware {
-        return Err(format!("hardware H.264 is required; Media Foundation granted {name}"));
+        return Err(format!(
+            "hardware H.264 is required; Media Foundation granted {name}"
+        ));
     }
-    Ok(EncoderGrant { name, hardware, quality_level, gop_frames, b_frames, screen_content_hint })
+    Ok(EncoderGrant {
+        name,
+        hardware,
+        quality_level,
+        gop_frames,
+        b_frames,
+        screen_content_hint,
+    })
 }
 
 /// Sets a `VT_UI4` codec value and returns what the encoder reads back.

@@ -9,11 +9,11 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, MF_TRANSFORM_FLAGS_Attribute, MFT_ENUM_ADAPTER_LUID, MFMediaType_Video, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_HARDWARE_URL_Attribute,
-    MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO,
-    MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_AV1, MFVideoFormat_H264,
-    MFVideoFormat_HEVC,
+    IMFActivate, MF_TRANSFORM_FLAGS_Attribute, MFMediaType_Video, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_HARDWARE_URL_Attribute, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
+    MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx,
+    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::GUID;
@@ -57,8 +57,13 @@ pub fn run() -> Result<()> {
         );
     }
     let path = results_folder()?.join("encoders.json");
-    std::fs::write(&path, to_json(&entries)).map_err(|error| format!("write {}: {error}", path.display()))?;
-    println!("exp-encoders count={} written={}", entries.len(), path.display());
+    std::fs::write(&path, to_json(&entries))
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    println!(
+        "exp-encoders count={} written={}",
+        entries.len(),
+        path.display()
+    );
     Ok(())
 }
 
@@ -68,7 +73,8 @@ pub(crate) fn results_folder() -> Result<PathBuf> {
         .parent()
         .ok_or("no scripts/clip-equation folder")?
         .join("results");
-    std::fs::create_dir_all(&folder).map_err(|error| format!("create {}: {error}", folder.display()))?;
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("create {}: {error}", folder.display()))?;
     Ok(folder)
 }
 

@@ -95,10 +95,8 @@ pub fn memory_now() -> (u64, u64) {
     let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
     let size = u32::try_from(std::mem::size_of_val(&counters)).unwrap_or(u32::MAX);
     // SAFETY: the pseudo handle of this process and a sized out-parameter.
-    let ok = unsafe {
-        GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), size)
-    }
-    .is_ok();
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), size) }
+        .is_ok();
     if ok {
         (counters.WorkingSetSize as u64, counters.PrivateUsage as u64)
     } else {
@@ -111,9 +109,7 @@ pub fn os_peak_working_set() -> u64 {
     let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
     let size = u32::try_from(std::mem::size_of_val(&counters)).unwrap_or(u32::MAX);
     // SAFETY: as in `memory_now`.
-    let _ = unsafe {
-        GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), size)
-    };
+    let _ = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut counters).cast(), size) };
     counters.PeakWorkingSetSize as u64
 }
 
@@ -173,7 +169,10 @@ impl MemorySampler {
     pub fn take_peaks(&self) -> (u64, u64) {
         let (ws, private) = memory_now();
         let peak_ws = self.peak_ws.swap(ws, Ordering::Relaxed).max(ws);
-        let peak_private = self.peak_private.swap(private, Ordering::Relaxed).max(private);
+        let peak_private = self
+            .peak_private
+            .swap(private, Ordering::Relaxed)
+            .max(private);
         (peak_ws, peak_private)
     }
 }
@@ -243,6 +242,9 @@ pub fn add_worker_cycles(read: u64, draw: u64) {
 
 /// `clip-probe rate`: the cycle-counter rate, for `rate=` of every run.
 pub fn run_rate() -> Result<()> {
-    println!("RESULT rate={:.0}", clock::CycleRate::calibrate().per_second());
+    println!(
+        "RESULT rate={:.0}",
+        clock::CycleRate::calibrate().per_second()
+    );
     Ok(())
 }

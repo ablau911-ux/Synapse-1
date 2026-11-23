@@ -176,3 +176,64 @@ Limits: one model, two crops, dark text of about 16–18 pixels on a light page.
 - 4:4:4 against 4:2:0 in x264: closer to the source on every scene except video, at 5–20 % more size and more RAM.
 
 Not measured here: stills taken only on change with changed rectangles; a real application under real use; a recorder that keeps frames on the graphics chip; small or coloured text; the NVIDIA encoders; matched quality between encoders.
+
+
+# Second measurement: real application scene, equal closeness, stills, Intel screen profile
+
+Measured by Claude on 2026-11-23, one run each (scripts `real-capture.mjs`, `measure2.py` in `.runs/measure/`).
+
+**New input, a real application:** a Chrome window on a YouTube watch page, captured without loss by ffmpeg through Windows.Graphics.Capture (`gfxcapture`) at 20 pictures per second for 40 s, 1902 × 1010. The video plays, the page is scrolled once at 8 s, "hello test 123" is typed into the search box from 15 s, and the video is paused at 36 s. This is the scenario in which the current Synapse recorder produced 125 MB in 40 s (187 MB per minute).
+
+**Method:** each encoder ran at three quality levels. "Size at closeness" is read off between the measured points (straight line on the logarithm of the size). "Outside the measured range" means none of the three levels bracketed that closeness. Each cell shows MB per minute and, in brackets, the closeness (SSIM in RGB).
+
+### real-youtube-even
+
+| encoder | low | middle | high | size at closeness 0.98 | CPU |
+|---|---|---|---|---|---|
+| x264 4:2:0 | 2.7 MB (0.9655) | 5.2 MB (0.9773) | 10.1 MB (0.9837) | 6.9 MB | 0.42–0.51 |
+| x264 4:4:4 | 2.6 MB (0.9697) | 4.9 MB (0.9829) | 9.6 MB (0.9899) | 4.3 MB | 0.55–0.61 |
+| Intel H.264 hw | 3.6 MB (0.9686) | 6.5 MB (0.9791) | 10.6 MB (0.9832) | 7.2 MB | 0.10–0.18 |
+| Intel HEVC hw | 1.7 MB (0.9623) | 3.2 MB (0.9777) | 6.4 MB (0.9845) | 4.0 MB | 0.13–0.15 |
+| libaom AV1 rt screen | 1.9 MB (0.9551) | 3.4 MB (0.9703) | 6.8 MB (0.9796) | outside the measured range | 0.43–0.48 |
+| SVT-AV1 screen | 2.1 MB (0.9649) | 3.9 MB (0.9742) | 7.3 MB (0.9800) | 7.3 MB | 0.48–0.50 |
+| VP9 rt screen | 2.8 MB (0.9508) | 6.1 MB (0.9730) | 13.0 MB (0.9819) | 11.1 MB | 0.43–0.51 |
+
+### scroll-1920x1080
+
+| encoder | low | middle | high | size at closeness 0.985 | CPU |
+|---|---|---|---|---|---|
+| x264 4:2:0 | 6.0 MB (0.9781) | 8.9 MB (0.9813) | 14.3 MB (0.9842) | outside the measured range | 0.40–0.45 |
+| x264 4:4:4 | 6.7 MB (0.9886) | 9.3 MB (0.9935) | 12.3 MB (0.9965) | outside the measured range | 0.60–0.62 |
+| Intel H.264 hw | 3.5 MB (0.9781) | 5.4 MB (0.9827) | 7.2 MB (0.9847) | outside the measured range | 0.14–0.17 |
+| Intel HEVC hw | 1.8 MB (0.9819) | 2.7 MB (0.9865) | 3.8 MB (0.9882) | 2.3 MB | 0.10–0.13 |
+| libaom AV1 rt screen | 1.9 MB (0.9822) | 2.5 MB (0.9823) | 3.4 MB (0.9845) | outside the measured range | 0.37–0.45 |
+| SVT-AV1 screen | 6.5 MB (0.9812) | 8.2 MB (0.9828) | 13.0 MB (0.9853) | 12.4 MB | 0.51–0.59 |
+| VP9 rt screen | 3.7 MB (0.9710) | 6.2 MB (0.9792) | 10.8 MB (0.9829) | outside the measured range | 0.43–0.50 |
+
+### mix-1920x1080
+
+| encoder | low | middle | high | size at closeness 0.997 | CPU |
+|---|---|---|---|---|---|
+| x264 4:2:0 | 0.9 MB (0.9966) | 1.2 MB (0.9972) | 1.8 MB (0.9976) | 1.1 MB | 0.32–0.34 |
+| x264 4:4:4 | 1.0 MB (0.9980) | 1.3 MB (0.9988) | 1.8 MB (0.9994) | outside the measured range | 0.45–0.46 |
+| Intel H.264 hw | 0.8 MB (0.9961) | 1.1 MB (0.9971) | 1.6 MB (0.9975) | 1.0 MB | 0.15–0.15 |
+| Intel HEVC hw | 0.4 MB (0.9965) | 0.6 MB (0.9976) | 0.9 MB (0.9981) | 0.5 MB | 0.09–0.14 |
+| libaom AV1 rt screen | 0.4 MB (0.9964) | 0.5 MB (0.9969) | 0.7 MB (0.9975) | 0.5 MB | 0.33–0.35 |
+| SVT-AV1 screen | 0.6 MB (0.9966) | 1.2 MB (0.9970) | 2.2 MB (0.9974) | 1.3 MB | 0.39–0.41 |
+| VP9 rt screen | 0.7 MB (0.9944) | 1.1 MB (0.9962) | 1.6 MB (0.9973) | 1.5 MB | 0.27–0.29 |
+
+### Stills
+
+| scene | pictures that changed | all changed pictures as lossless WebP stills | average still | settle points | exact stills at settle points only | time to encode the stills |
+|---|---|---|---|---|---|---|
+| real-youtube-even | 742 of 800 | 790.2 MB per minute | 727 KB | 4 | 4.26 MB per minute | 361 s for 40 s of recording |
+| mix-1920x1080 | 686 of 1200 | 10.0 MB per minute | 15 KB | 4 | 0.06 MB per minute | 28 s for 60 s of recording |
+| typing-1920x1080 | 143 of 400 | 1.1 MB per minute | 3 KB | 2 | 0.02 MB per minute | 4 s for 20 s of recording |
+| scroll-1920x1080 | 400 of 400 | 54.0 MB per minute | 46 KB | 0 | 0.00 MB per minute | 28 s for 20 s of recording |
+
+- Stills were written as full-window lossless WebP pictures, one for every picture that differs from the one before it. A recorder that stores only the changed rectangle would write less; that was not measured.
+- A settle point is a picture that then stays unchanged for at least 0.5 s.
+
+### Intel HEVC screen profile: the file is good, ffmpeg's software decoder is not
+
+One file of the typing scene, encoded with `hevc_qsv -profile:v scc`: ffprobe reports profile "Scc". Decoded with ffmpeg's software decoder the closeness to the source is 0.2699; decoded with the Intel hardware decoder (`-c:v hevc_qsv`) it is 0.9995. So the earlier "broken picture" came from the software decoder, not from the encoder. At the one setting compared, the screen profile was not smaller than the plain profile (typing 0.1 against 0.1, ui 1.1 against 1.0, scroll 3.0 against 2.7, mix 0.7 against 0.6 MB per minute).

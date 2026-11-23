@@ -623,7 +623,7 @@ pub struct CaptureGifResponse {
 
 /// `screenshot operation=record` request after facade validation: one window
 /// or one monitor, recorded into a clip folder (`clip.json`, `frames.jsonl`,
-/// `waiting/`, then `segment-NNNN.mp4`). With neither target, the session's
+/// `frames/` and cropped `moving/` segments). With neither target, the session's
 /// bound window is recorded.
 #[derive(Clone, Debug)]
 pub struct CaptureClipParams {
@@ -656,7 +656,7 @@ pub struct CaptureClipResponse {
     pub fps: u32,
     pub window_width: u32,
     pub window_height: u32,
-    /// Whole-number pixel duplication so the recorded frame has at least 480 lines.
+    /// Recorded pixels per source pixel; DYN1 always stores one.
     pub scale: u32,
     pub recorded_width: u32,
     pub recorded_height: u32,
@@ -672,7 +672,7 @@ pub struct CaptureClipResponse {
 pub struct ClipStatusResponse {
     pub clip_id: String,
     pub folder: String,
-    /// `recording`, `encoding`, `ready` or `failed`.
+    /// `recording`, `ready` or `failed`.
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
@@ -681,8 +681,8 @@ pub struct ClipStatusResponse {
     pub seconds_recorded: f64,
     /// Planned end in ms from the first frame.
     pub end_ms: u64,
-    /// Raw frames in `waiting/` not yet committed in a segment.
-    pub frames_waiting: u64,
+    /// Bytes held in exact frame groups.
+    pub exact_bytes: u64,
     pub segments: Vec<ClipSegmentInfo>,
     /// The `conditions` block of `clip.json` so far (C, G, Q, B, T).
     pub conditions: serde_json::Value,
@@ -691,6 +691,8 @@ pub struct ClipStatusResponse {
 /// A committed segment, as read back at commit.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ClipSegmentInfo {
+    pub rect: [u32; 4],
+    pub frames: u32,
     pub file: String,
     pub bytes: u64,
     pub sha256: String,

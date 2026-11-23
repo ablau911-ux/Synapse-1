@@ -1,11 +1,4 @@
-//! The clip folder (docs/clip-recorder-plan.md, version 4.1, "Clip folder"):
-//! its file names, `clip.json` with the clip state, `frames.jsonl` lines, the
-//! waiting frames in `waiting/`, and the active-clip registry.
-//!
-//! The live part (`capture_clip`), the clip worker and the viewer all read and
-//! write a clip only through this module. `clip.json` is always replaced
-//! atomically (temporary name, then rename) under an exclusive lock file, so the
-//! service and the worker process never lose each other's updates.
+//! DYN1 clip metadata, atomic publication, and the active recording registry.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,10 +6,9 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-pub(super) const CLIP_SCHEMA_VERSION: u32 = 2;
+pub(super) const CLIP_SCHEMA_VERSION: u32 = 3;
 pub(super) const CLIP_JSON_FILE: &str = "clip.json";
 pub(super) const FRAMES_FILE: &str = "frames.jsonl";
-pub(super) const WAITING_DIR: &str = "waiting";
 pub(super) const VIEWS_DIR: &str = "views";
 /// Lists clips whose folder is not under the default clips folder; entries
 /// stay after the clip is ready or failed.
@@ -25,7 +17,6 @@ const LOCK_SUFFIX: &str = ".lock";
 /// Held by the recorder for the life of a recording (`RecorderLock`).
 const RECORDER_LOCK_FILE: &str = "recorder.lock";
 const TEMP_SUFFIX: &str = ".tmp";
-const PART_SUFFIX: &str = ".part";
 /// A rename of `clip.json`, a segment `.part` file or a waiting frame, and
 /// a read of `clip.json`, is tried this many times in all while another
 /// program holds the file for a moment.
@@ -35,15 +26,6 @@ const BRIEF_HOLD_RETRY_SLEEP_MS: u64 = 100;
 /// Windows errors of a file another program holds for a moment: access
 /// denied (5), sharing violation (32), lock violation (33).
 const BRIEF_HOLD_OS_ERRORS: [i32; 3] = [5, 32, 33];
-/// Extension of a waiting frame: B, G, R rows compressed with zstd (A8).
-const WAITING_FRAME_EXTENSION: &str = "zst";
-/// zstd level of the waiting frames (package 0b full comparison, `ca46079d`).
-const WAITING_ZSTD_LEVEL: i32 = -3;
-/// A waiting frame keeps B, G and R; the alpha byte is dropped (A8).
-pub(super) const WAITING_BYTES_PER_PIXEL: u64 = 3;
-/// The observer reads frames back as B, G, R, A.
-const BGRA_BYTES_PER_PIXEL: usize = 4;
-
 /// Default parent of clip folders.
 pub(super) fn clips_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -52,172 +34,11 @@ pub(super) fn clips_root() -> PathBuf {
         .join("clips")
 }
 
-/// `segment-NNNN.mp4`.
-pub(super) fn segment_file_name(index: u32) -> String {
-    format!("segment-{index:04}.mp4")
-}
-
-/// `segment-NNNN.mp4.part`: the segment being encoded.
-pub(super) fn segment_part_name(index: u32) -> String {
-    format!("{}{PART_SUFFIX}", segment_file_name(index))
-}
-
-pub(super) fn is_part_file(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == "part")
-}
-
-/// The waiting frame of instant k: tightly packed B, G, R rows at the captured
-/// size (the size is in its `frames.jsonl` line), compressed whole with zstd
-/// (A8). Each file stands alone.
-pub(super) fn waiting_frame_path(folder: &Path, instant: u64) -> PathBuf {
-    folder
-        .join(WAITING_DIR)
-        .join(format!("frame-{instant:08}.{WAITING_FRAME_EXTENSION}"))
-}
-
-/// `true` for a finished waiting frame (not a `.tmp` still being written).
-pub(super) fn is_waiting_frame(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension == WAITING_FRAME_EXTENSION)
-}
-
-/// A8: writes the waiting frames of one recording through one reused zstd
-/// context.
-pub(super) struct WaitingFrameWriter {
-    compressor: zstd::bulk::Compressor<'static>,
-    bgr: Vec<u8>,
-    compressed: Vec<u8>,
-}
-
-impl WaitingFrameWriter {
-    pub(super) fn new() -> Result<Self, String> {
-        let compressor = zstd::bulk::Compressor::new(WAITING_ZSTD_LEVEL)
-            .map_err(|error| format!("could not open the zstd compressor: {error}"))?;
-        Ok(Self {
-            compressor,
-            bgr: Vec::new(),
-            compressed: Vec::new(),
-        })
-    }
-
-    /// Drops the alpha byte of a BGRA frame (B, G, R stay), compresses the
-    /// whole frame with zstd at `WAITING_ZSTD_LEVEL`, and writes it as the
-    /// waiting frame of instant k (`.tmp`, then rename). Returns the bytes
-    /// written to disk.
-    pub(super) fn write(
-        &mut self,
-        folder: &Path,
-        instant: u64,
-        bgra: &[u8],
-    ) -> Result<u64, String> {
-        self.bgr.clear();
-        self.bgr.extend(
-            bgra.chunks_exact(BGRA_BYTES_PER_PIXEL)
-                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]),
-        );
-        self.compressed.clear();
-        self.compressed
-            .reserve(zstd::zstd_safe::compress_bound(self.bgr.len()));
-        self.compressor
-            .compress_to_buffer(&self.bgr, &mut self.compressed)
-            .map_err(|error| format!("could not compress waiting frame {instant}: {error}"))?;
-        let path = waiting_frame_path(folder, instant);
-        let temp = path.with_extension(format!("{WAITING_FRAME_EXTENSION}{TEMP_SUFFIX}"));
-        std::fs::write(&temp, &self.compressed)
-            .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
-        retry_brief_hold(|| std::fs::rename(&temp, &path))
-            .map_err(|error| format!("could not rename {}: {error}", temp.display()))?;
-        Ok(self.compressed.len() as u64)
-    }
-}
-
-/// Why a waiting frame could not be read back: the loss cause its instants
-/// get, and the detail for the log.
-pub(super) struct WaitingReadError {
-    pub(super) cause: LossCause,
-    pub(super) message: String,
-}
-
-/// Reads waiting frames back through one reused zstd context.
-pub(super) struct WaitingFrameReader {
-    decompressor: zstd::bulk::Decompressor<'static>,
-}
-
-impl WaitingFrameReader {
-    pub(super) fn new() -> Result<Self, String> {
-        let decompressor = zstd::bulk::Decompressor::new()
-            .map_err(|error| format!("could not open the zstd decompressor: {error}"))?;
-        Ok(Self { decompressor })
-    }
-
-    /// A waiting frame as B, G, R rows of `width` × `height`. A missing file
-    /// is `waiting_missing`; a short or damaged file, or one of another size,
-    /// is `waiting_unreadable`.
-    pub(super) fn read(
-        &mut self,
-        path: &Path,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, WaitingReadError> {
-        let bytes = std::fs::read(path).map_err(|error| WaitingReadError {
-            cause: if error.kind() == std::io::ErrorKind::NotFound {
-                LossCause::WaitingMissing
-            } else {
-                LossCause::WaitingUnreadable
-            },
-            message: format!("could not read {}: {error}", path.display()),
-        })?;
-        self.decode(path, &bytes, width, height)
-            .map_err(|message| WaitingReadError {
-                cause: LossCause::WaitingUnreadable,
-                message,
-            })
-    }
-
-    fn decode(
-        &mut self,
-        path: &Path,
-        bytes: &[u8],
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, String> {
-        let expected =
-            usize::try_from(u64::from(width) * u64::from(height) * WAITING_BYTES_PER_PIXEL)
-                .map_err(|_| format!("{} is too large for this machine", path.display()))?;
-        // The content size in the zstd frame header is checked first, so a
-        // damaged header never sizes an allocation.
-        let stored = zstd::zstd_safe::get_frame_content_size(bytes)
-            .ok()
-            .flatten()
-            .and_then(|size| usize::try_from(size).ok());
-        if stored != Some(expected) {
-            return Err(format!(
-                "{} holds {stored:?} bytes, not the {expected} of a {width}x{height} frame",
-                path.display()
-            ));
-        }
-        let bgr = self
-            .decompressor
-            .decompress(bytes, expected)
-            .map_err(|error| format!("could not decompress {}: {error}", path.display()))?;
-        if bgr.len() != expected {
-            return Err(format!(
-                "{} decompressed to {} bytes, not {expected}",
-                path.display(),
-                bgr.len()
-            ));
-        }
-        Ok(bgr)
-    }
-}
-
 /// How far the clip got (C10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ClipState {
     Recording,
-    Encoding,
     Ready,
     Failed,
 }
@@ -226,7 +47,6 @@ impl ClipState {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Recording => "recording",
-            Self::Encoding => "encoding",
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
@@ -272,12 +92,8 @@ pub(super) enum LossCause {
     Disk,
     LoadShedding,
     ServiceRestart,
-    /// The clip worker could not read the waiting frame back (damaged or
-    /// short file); the picture before it was kept in the segment.
-    WaitingUnreadable,
-    /// The waiting frame of a new picture was not on disk when the clip
-    /// worker encoded its segment; the picture before it was kept.
-    WaitingMissing,
+    MovingBehind,
+    MovingFailed,
 }
 
 /// One line of `frames.jsonl`: one per instant s_k.
@@ -301,6 +117,16 @@ pub(super) struct FrameLine {
     pub(super) lost: Option<LossCause>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) minimized: bool,
+    #[serde(default, rename = "x", skip_serializing_if = "Option::is_none")]
+    pub(super) exact: Option<super::clip_exact::ExactRef>,
+    #[serde(default, rename = "mv", skip_serializing_if = "Option::is_none")]
+    pub(super) moving: Option<super::clip_moving::MovingRef>,
+    #[serde(default, rename = "mv_rect", skip_serializing_if = "Option::is_none")]
+    pub(super) moving_rect: Option<super::clip_motion::PixelRect>,
+}
+
+impl FrameLine {
+    pub(super) fn shows_new_picture(&self) -> bool { self.new || self.exact.is_some() }
 }
 
 /// Reads every complete line of `frames.jsonl` (a torn last line is skipped).
@@ -364,53 +190,45 @@ pub(super) struct ObserverGrant {
     pub(super) dirty_regions: bool,
 }
 
-/// A committed segment (B8).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(super) struct SegmentCheckpoint {
-    pub(super) index: u32,
-    pub(super) file: String,
+/// A moving segment verified against its actual file before publication.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct CommittedSegment {
+    #[serde(flatten)]
+    pub(super) segment: super::clip_moving::MovingSegment,
     pub(super) bytes: u64,
     pub(super) sha256: String,
-    pub(super) first_instant: u64,
-    pub(super) last_instant: u64,
-    /// Segment-local time 0 is `start_ms` on the clip timeline.
-    pub(super) start_ms: u64,
-    pub(super) end_ms: u64,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    /// `true` for a transition segment formed during a drag (E4).
-    #[serde(default)]
-    pub(super) padded: bool,
-    /// `false` when the recorded size had to stay within the encoder bound
-    /// below σ · window size (B3).
-    #[serde(default = "bound_held_default")]
-    pub(super) bound_held: bool,
-    /// σ of this segment (A3), written by the clip worker at commit; `None`
-    /// in clips from before it was stored, which use the clip's σ.
-    #[serde(default)]
-    pub(super) scale: Option<u32>,
-    pub(super) keyframe_instants: Vec<u64>,
-    pub(super) encoder: String,
-    pub(super) hardware: bool,
-    pub(super) quality: QualityReport,
 }
-
-const fn bound_held_default() -> bool {
-    true
+impl CommittedSegment {
+    pub(super) fn read_back(folder: &Path, segment: super::clip_moving::MovingSegment) -> Result<Self, String> {
+        let (bytes, sha256) = file_size_and_sha256(&folder.join(&segment.file)).map_err(|e| e.to_string())?;
+        Ok(Self { segment, bytes, sha256 })
+    }
 }
-
-/// The rate control the encoder accepted and read back (B7, condition Q).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(super) struct QualityReport {
-    /// `quality` or `bitrate`.
-    pub(super) mode: String,
-    /// Quality level q, or bits per second.
-    pub(super) value: u32,
-    pub(super) gop_frames: u32,
-    pub(super) b_frames: u32,
-    pub(super) screen_content_hint: bool,
-    /// `held`, `unverified` or `not_held` (C6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct ExactInfo {
+    pub(super) level: i32,
+    pub(super) window_log: u32,
+    pub(super) group_pictures: u32,
+    #[serde(flatten)]
+    pub(super) totals: super::clip_exact::ExactSummary,
+}
+impl From<super::clip_exact::ExactSummary> for ExactInfo {
+    fn from(totals: super::clip_exact::ExactSummary) -> Self {
+        Self { level: super::clip_exact::EXACT_ZSTD_LEVEL, window_log: super::clip_exact::EXACT_WINDOW_LOG,
+            group_pictures: super::clip_exact::EXACT_GROUP_PICTURES, totals }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct MovingInfo {
     pub(super) status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) encoder: Option<super::clip_encoder::EncoderGrant>,
+    pub(super) segments: Vec<CommittedSegment>,
+}
+impl Default for MovingInfo {
+    fn default() -> Self { Self { status: "not_used".into(), reason: None, encoder: None, segments: Vec::new() } }
 }
 
 /// One condition: its status and the instants where it failed.
@@ -438,155 +256,6 @@ pub(super) struct Conditions {
     pub(super) t: Option<ConditionStatus>,
 }
 
-/// One part's figures for condition B.
-pub(super) enum BReport {
-    /// The live part, once when the recording stops (A9, A10).
-    Live {
-        threads: u32,
-        max_live_share_percent: f64,
-        max_worker_cap_given_percent: f64,
-        live_seconds_at_limit: u64,
-    },
-    /// The host, after every clip worker run.
-    Worker {
-        max_worker_share_percent: f64,
-        max_sum_percent: f64,
-        seconds_over_limit: u64,
-        worker_seconds: f64,
-        limit_percent: f64,
-    },
-}
-
-/// The verdict of condition B; `clip.json` keeps it as its status string.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BStatus {
-    Held,
-    NotHeld,
-    /// The live part reported; the clip worker has not yet.
-    PendingWorker,
-    /// The clip worker reported without a live figure (the service ended
-    /// during the recording).
-    Unverified,
-}
-
-impl BStatus {
-    fn parse(status: &str) -> Option<Self> {
-        match status {
-            "held" => Some(Self::Held),
-            "not_held" => Some(Self::NotHeld),
-            "pending_worker" => Some(Self::PendingWorker),
-            "unverified" => Some(Self::Unverified),
-            _ => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Held => "held",
-            Self::NotHeld => "not_held",
-            Self::PendingWorker => "pending_worker",
-            Self::Unverified => "unverified",
-        }
-    }
-}
-
-impl Conditions {
-    /// The one merge of condition B. Two parts measure it at different times:
-    /// the live part when the recording stops, and the host after every clip
-    /// worker run (possibly before the recording stops). Each report adds its
-    /// figures to the detail; a `not_held` verdict and the other part's figures
-    /// are never erased. The worker's figures cover all of its runs: the
-    /// maxima and the worker time over every run, the seconds over the limit
-    /// summed.
-    pub(super) fn merge_b(&mut self, report: BReport) {
-        let stored = self.b.take();
-        let stored_status = stored
-            .as_ref()
-            .and_then(|condition| BStatus::parse(&condition.status));
-        let mut detail = stored
-            .and_then(|condition| condition.detail)
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        let live_reported = detail.contains_key("max_live_share_percent");
-        let worker_reported = detail.contains_key("seconds_over_limit");
-        let was_not_held = stored_status == Some(BStatus::NotHeld);
-        let status = match report {
-            BReport::Live {
-                threads,
-                max_live_share_percent,
-                max_worker_cap_given_percent,
-                live_seconds_at_limit,
-            } => {
-                detail.insert("threads".to_owned(), serde_json::json!(threads));
-                detail.insert(
-                    "max_live_share_percent".to_owned(),
-                    serde_json::json!(max_live_share_percent),
-                );
-                detail.insert(
-                    "max_worker_cap_given_percent".to_owned(),
-                    serde_json::json!(max_worker_cap_given_percent),
-                );
-                detail.insert(
-                    "live_seconds_at_limit".to_owned(),
-                    serde_json::json!(live_seconds_at_limit),
-                );
-                if was_not_held || live_seconds_at_limit > 0 {
-                    BStatus::NotHeld
-                } else if worker_reported {
-                    stored_status.unwrap_or(BStatus::PendingWorker)
-                } else {
-                    BStatus::PendingWorker
-                }
-            }
-            BReport::Worker {
-                max_worker_share_percent,
-                max_sum_percent,
-                seconds_over_limit,
-                worker_seconds,
-                limit_percent,
-            } => {
-                let previous = |key: &str| {
-                    detail
-                        .get(key)
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(0.0)
-                };
-                let over = detail
-                    .get("seconds_over_limit")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-                    + seconds_over_limit;
-                let worker_share =
-                    max_worker_share_percent.max(previous("max_worker_share_percent"));
-                let max_sum = max_sum_percent.max(previous("max_sum_percent"));
-                let seconds = worker_seconds + previous("worker_seconds");
-                detail.insert(
-                    "max_worker_share_percent".to_owned(),
-                    serde_json::json!(worker_share),
-                );
-                detail.insert("max_sum_percent".to_owned(), serde_json::json!(max_sum));
-                detail.insert("seconds_over_limit".to_owned(), serde_json::json!(over));
-                detail.insert("worker_seconds".to_owned(), serde_json::json!(seconds));
-                detail.insert("limit_percent".to_owned(), serde_json::json!(limit_percent));
-                if was_not_held || over > 0 {
-                    BStatus::NotHeld
-                } else if live_reported {
-                    BStatus::Held
-                } else {
-                    // No live figure: the sum cannot be shown to stay within
-                    // the limit.
-                    BStatus::Unverified
-                }
-            }
-        };
-        self.b = Some(ConditionStatus {
-            status: status.as_str().to_owned(),
-            failed_instants: Vec::new(),
-            detail: Some(serde_json::Value::Object(detail)),
-        });
-    }
-}
-
 /// A lost instant with its cause.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(super) struct LostInstant {
@@ -598,6 +267,7 @@ pub(super) struct LostInstant {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ClipJson {
     pub(super) schema_version: u32,
+    pub(super) way: String,
     pub(super) clip_id: String,
     pub(super) synapse_version: String,
     pub(super) state: ClipState,
@@ -617,12 +287,35 @@ pub(super) struct ClipJson {
     #[serde(default)]
     pub(super) lost: Vec<LostInstant>,
     #[serde(default)]
-    pub(super) segments: Vec<SegmentCheckpoint>,
+    pub(super) moving: MovingInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) exact: Option<ExactInfo>,
     #[serde(default)]
     pub(super) conditions: Conditions,
 }
 
 impl ClipJson {
+    /// Include only format files, including the final metadata's own byte length.
+    pub(super) fn set_total_bytes(&mut self, folder: &Path) -> Result<(), String> {
+        let mut other = std::fs::metadata(folder.join(FRAMES_FILE)).map_err(|e| e.to_string())?.len();
+        for directory in ["frames", "moving"] {
+            if let Ok(entries) = std::fs::read_dir(folder.join(directory)) {
+                for entry in entries {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    if entry.file_type().map_err(|e| e.to_string())?.is_file() {
+                        other += entry.metadata().map_err(|e| e.to_string())?.len();
+                    }
+                }
+            }
+        }
+        loop {
+            let bytes = other + serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?.len() as u64;
+            let detail = self.conditions.t.as_mut().and_then(|t| t.detail.as_mut()).ok_or("missing T detail")?;
+            if detail["bytes"].as_u64() == Some(bytes) { return Ok(()); }
+            detail["bytes"] = serde_json::json!(bytes);
+        }
+    }
+
     /// Reads `clip.json` of a clip folder.
     pub(super) fn read(folder: &Path) -> Result<Self, String> {
         let path = folder.join(CLIP_JSON_FILE);

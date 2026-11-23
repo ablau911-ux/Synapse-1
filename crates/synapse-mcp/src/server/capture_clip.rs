@@ -1,22 +1,5 @@
-//! `screenshot operation=record | record_status | record_stop | record_extend`:
-//! the live part of the clip recorder (docs/clip-recorder-plan.md, version 4.1,
-//! section A, operations A1 to A12, and section C).
-//!
-//! `record` starts a recording that belongs to the service, not to the MCP
-//! call (C14): the call returns once `clip.json` is written and the first frame
-//! is on disk. The recorder thread then handles one instant s_k every 1 / f:
-//! it asks the clip observer (`synapse_capture::ClipObserver`) for the identity
-//! of the frame shown at s_k, writes only a line for a repeated frame, and for
-//! a new frame checks the privacy gate, reads it back and writes it into
-//! `waiting/` at its captured size (B, G, R compressed with zstd). The live part does no scaling and no
-//! encoding (C5); the clip worker forms and encodes segments from
-//! `frames.jsonl`.
-//!
-//! Kept from version 1: a minimized window gives repeat lines marked
-//! `minimized` and is never restored or focused; an all-black first frame is
-//! an error (no PrintWindow fallback); a browser-tab target is refused like
-//! `screenshot capture`; the recorder runs on its own thread; the folder must
-//! not exist; the error codes and their context fields.
+//! Instant-clock recording with an exact layer and bounded moving encoder.
+//! Privacy gates and the capture observer remain on the recorder path.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,8 +11,8 @@ use synapse_capture::ClipSource;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason, WAITING_DIR,
-    clips_root, file_size_and_sha256, is_waiting_frame,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason,
+    clips_root, file_size_and_sha256,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -46,8 +29,6 @@ pub(super) const REFERENCE_REFRESH_HZ: u32 = 60;
 pub(super) const DEFAULT_DURATION_MS: u64 = 60_000;
 /// Shortest recording a call may ask for.
 pub(super) const MIN_DURATION_MS: u64 = 100;
-/// h_min: recorded frames have at least this many lines (σ duplicates pixels).
-pub(super) const MIN_LINES: u32 = 480;
 /// How often the free space of the clip volume is measured (A11, F7).
 const DISK_CHECK_MS: u64 = 1_000;
 /// How often the windows on a recorded monitor are checked for an excluded app (E6).
@@ -55,7 +36,7 @@ const EXCLUDED_APP_CHECK_MS: u64 = 1_000;
 /// How long to wait for the first frame (kept from version 1).
 const FIRST_FRAME_TIMEOUT_MS: u64 = 3_000;
 const CLIP_SOURCE_OF_TRUTH: &str =
-    "clip folder files (clip.json, frames.jsonl, waiting/, segment-NNNN.mp4) + target metadata";
+    "clip folder files (clip.json, frames.jsonl, frames/, moving/) + target metadata";
 
 /// The target id in error data: `window:0x…` or `monitor:N`.
 fn target_id(target: ClipSource) -> String {
@@ -173,14 +154,6 @@ impl Recorders {
 /// twice); a recording that still runs into it stops, keeping its committed
 /// segments. The recorder never overwrites `failed` when it finishes.
 #[cfg(windows)]
-pub(super) fn stop_failed_recording(folder: &std::path::Path) {
-    if let Some(running) = Recorders::active()
-        .as_ref()
-        .filter(|running| running.folder == folder)
-    {
-        running.control.stop.store(true, Ordering::Relaxed);
-    }
-}
 
 /// A validated recording request.
 struct ClipPlan {
@@ -343,13 +316,6 @@ fn status_of(
             .max(control.recorded_ms.load(Ordering::Relaxed)),
         _ => clip.recorded_ms,
     };
-    let frames_waiting = std::fs::read_dir(folder.join(WAITING_DIR))
-        .map(|read| {
-            read.filter_map(Result::ok)
-                .filter(|entry| is_waiting_frame(&entry.path()))
-                .count() as u64
-        })
-        .unwrap_or(0);
     Ok(ClipStatusResponse {
         clip_id: clip.clip_id.clone(),
         folder: folder.to_string_lossy().into_owned(),
@@ -358,16 +324,18 @@ fn status_of(
         failure: clip.failure.clone(),
         seconds_recorded: recorded_ms as f64 / 1_000.0,
         end_ms: clip.end_ms,
-        frames_waiting,
+        exact_bytes: clip.exact.as_ref().map_or(0, |exact| exact.totals.bytes),
         segments: clip
-            .segments
+            .moving.segments
             .iter()
             .map(|segment| ClipSegmentInfo {
-                file: segment.file.clone(),
+                file: segment.segment.file.clone(),
                 bytes: segment.bytes,
                 sha256: segment.sha256.clone(),
-                start_ms: segment.start_ms,
-                end_ms: segment.end_ms,
+                start_ms: segment.segment.first_instant * 1_000 / u64::from(clip.fps),
+                end_ms: (segment.segment.last_instant + 1) * 1_000 / u64::from(clip.fps),
+                rect: segment.segment.rect.into(),
+                frames: segment.segment.frames,
             })
             .collect(),
         conditions: serde_json::to_value(&clip.conditions).unwrap_or_default(),
@@ -428,7 +396,6 @@ impl Drop for RecorderClaim<'_> {
                 }
             });
         }
-        super::clip_worker::ProcessorBudget::global().clear_live_share();
         Recorders::release(self.clip_id);
     }
 }
@@ -605,13 +572,9 @@ fn thread_failed(detail: String) -> ErrorData {
 }
 
 /// σ: the smallest whole number that gives at least `MIN_LINES` lines (A3).
-pub(super) fn scale_for_height(height: u32) -> u32 {
-    MIN_LINES.div_ceil(height.max(1)).max(1)
-}
 
 #[cfg(windows)]
 mod live {
-    use std::collections::VecDeque;
     use std::io::Write as _;
     use std::path::Path;
     use std::sync::atomic::Ordering;
@@ -620,25 +583,24 @@ mod live {
     use synapse_capture::{ClipObserver, ClipSource, HNS_PER_MS, ObservedFrame};
     use synapse_core::error_codes;
 
-    use super::super::clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME;
     use super::super::clip_folder::{
-        BReport, CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
+        CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry, ClipState,
         ClipTargetInfo, ConditionStatus, Conditions, FrameLine, LossCause, LostInstant,
-        ObserverGrant, RecorderLock, StopReason, WAITING_DIR, WaitingFrameWriter,
+        ObserverGrant, RecorderLock, StopReason, CommittedSegment, MovingInfo,
     };
-    use super::super::clip_worker::{ProcessorBudget, logical_processors, share_percent};
+    use super::super::clip_layers::{ClipLayers, Written};
     use super::super::{CaptureClipResponse, ErrorData};
     use super::{
         CLIP_JSON_FILE, ClipPlan, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS, FIRST_FRAME_TIMEOUT_MS,
         FRAMES_FILE, RECORD_FPS, REFERENCE_REFRESH_HZ, RecordingControl, StartSender,
-        file_size_and_sha256, internal_error, scale_for_height, stop_error, thread_failed,
+        file_size_and_sha256, internal_error, stop_error, thread_failed,
     };
     use crate::m1::mcp_error;
 
     const HNS_PER_SECOND: i64 = 10_000_000;
-    /// The observer reads frames back at 4 bytes (B, G, R, A) per pixel.
-    const BGRA_BYTES_PER_PIXEL: u64 = 4;
-    const BITS_PER_BYTE: f64 = 8.0;
+    const CPU_LIMIT_PERCENT: f64 = 10.0;
+    const PERCENT: f64 = 100.0;
+    const PIXEL_SCALE: u32 = 1;
 
     /// 1 / f in 100 ns units.
     const fn instant_hns() -> i64 {
@@ -664,8 +626,6 @@ mod live {
         match recording.response() {
             Ok(response) => {
                 let _ = started.send(Ok(response));
-                // The worker forms segments while the recording goes on.
-                super::super::clip_worker::ClipWorkerHost::global().enqueue(plan.folder.clone());
             }
             Err(error) => {
                 let _ = started.send(Err(error));
@@ -695,7 +655,7 @@ mod live {
     impl Machine {
         fn read() -> Self {
             Self {
-                threads: logical_processors(),
+                threads: std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX)),
             }
         }
     }
@@ -707,7 +667,6 @@ mod live {
         second_started_hns: i64,
         cpu_at_second_start: i64,
         max_share: f64,
-        max_worker_cap_given: f64,
         seconds_over_limit: u64,
     }
 
@@ -716,40 +675,37 @@ mod live {
             Self {
                 threads,
                 second_started_hns: synapse_capture::now_hns(),
-                cpu_at_second_start: Self::cpu(observer),
+                cpu_at_second_start: Self::cpu(observer, 0),
                 max_share: 0.0,
-                max_worker_cap_given: 0.0,
                 seconds_over_limit: 0,
             }
         }
 
         /// Processor time of the recorder thread plus the capture thread.
-        fn cpu(observer: &ClipObserver) -> i64 {
-            synapse_capture::current_thread_cpu_hns() + observer.capture_thread_cpu_hns()
+        fn cpu(observer: &ClipObserver, moving_hns: i64) -> i64 {
+            synapse_capture::current_thread_cpu_hns() + observer.capture_thread_cpu_hns() + moving_hns
         }
 
         /// `true` when the live part alone has used its whole share of 10 %
         /// within the current second (A9): read-backs are skipped until it ends.
-        fn shedding(&self, observer: &ClipObserver) -> bool {
-            ProcessorBudget::live_alone_reached(
-                Self::cpu(observer) - self.cpu_at_second_start,
-                self.threads,
-            )
+        fn shedding(&self, observer: &ClipObserver, moving_hns: i64) -> bool {
+            Self::share_percent(Self::cpu(observer, moving_hns) - self.cpu_at_second_start, HNS_PER_SECOND, self.threads) >= CPU_LIMIT_PERCENT
+        }
+        fn share_percent(cpu_hns: i64, wall_hns: i64, threads: u32) -> f64 {
+            cpu_hns as f64 * PERCENT / (wall_hns.max(1) as f64 * f64::from(threads.max(1)))
         }
 
         /// Once a second: the share of the last second, and the worker cap.
-        fn tick(&mut self, observer: &ClipObserver) {
+        fn tick(&mut self, observer: &ClipObserver, moving_hns: i64) {
             let now = synapse_capture::now_hns();
             let elapsed = now - self.second_started_hns;
             if elapsed < HNS_PER_SECOND {
                 return;
             }
-            let cpu = Self::cpu(observer);
-            let share = share_percent(cpu - self.cpu_at_second_start, elapsed, self.threads);
-            let cap = ProcessorBudget::global().set_live_share(share);
+            let cpu = Self::cpu(observer, moving_hns);
+            let share = Self::share_percent(cpu - self.cpu_at_second_start, elapsed, self.threads);
             self.max_share = self.max_share.max(share);
-            self.max_worker_cap_given = self.max_worker_cap_given.max(cap);
-            if share >= super::super::clip_worker::CPU_LIMIT_PERCENT {
+            if share >= CPU_LIMIT_PERCENT {
                 self.seconds_over_limit += 1;
             }
             self.second_started_hns = now;
@@ -757,91 +713,23 @@ mod live {
         }
     }
 
-    /// A11: the disk rule on the clip volume. Free space as measured, minus the
-    /// bytes written since, minus a reserve for the segment being finalized.
-    struct DiskGuard {
-        measured_free: u64,
-        written_since: u64,
-        /// Compressed bytes written to `waiting/` over the whole clip (T).
-        raw_written: u64,
-        /// Frames written and not yet in a committed segment: instant,
-        /// compressed bytes, pixels.
-        retained: VecDeque<(u64, u64, u64)>,
-        retained_bytes: u64,
-        retained_pixels: u64,
-        measured_at: Instant,
-    }
-
+    /// Free space on the clip volume, including writes since the last measurement.
+    struct DiskGuard { measured_free: u64, written_since: u64, measured_at: Instant }
     impl DiskGuard {
         fn new(folder: &Path) -> Result<Self, String> {
-            Ok(Self {
-                measured_free: Self::measure(folder)?,
-                written_since: 0,
-                raw_written: 0,
-                retained: VecDeque::new(),
-                retained_bytes: 0,
-                retained_pixels: 0,
-                measured_at: Instant::now(),
-            })
+            Ok(Self { measured_free: Self::measure(folder)?, written_since: 0, measured_at: Instant::now() })
         }
-
         fn measure(folder: &Path) -> Result<u64, String> {
-            synapse_storage::volume_free_bytes(folder).map_err(|error| {
-                format!("could not read the free space of the clip volume: {error}")
-            })
+            synapse_storage::volume_free_bytes(folder).map_err(|e| e.to_string())
         }
-
-        /// Instant k's waiting frame: `bytes` compressed bytes actually
-        /// written, holding `pixels` pixels.
-        fn wrote(&mut self, instant: u64, bytes: u64, pixels: u64) {
-            self.written_since += bytes;
-            self.raw_written += bytes;
-            self.retained.push_back((instant, bytes, pixels));
-            self.retained_bytes += bytes;
-            self.retained_pixels += pixels;
-        }
-
-        /// Frames up to the last committed segment are no longer retained
-        /// (the worker deletes their files).
-        fn forget_committed(&mut self, folder: &Path) {
-            let Some(last) = ClipJson::read(folder)
-                .ok()
-                .and_then(|clip| clip.segments.last().map(|segment| segment.last_instant))
-            else {
-                return;
-            };
-            while let Some(&(instant, bytes, pixels)) = self.retained.front()
-                && instant <= last
-            {
-                self.retained.pop_front();
-                self.retained_bytes -= bytes;
-                self.retained_pixels -= pixels;
-            }
-        }
-
-        /// The raw bytes of the open segment plus their estimated encoded size (C13).
-        /// The raw bytes are the compressed bytes actually retained in
-        /// `waiting/`, never clamped (incompressible frames can grow).
-        fn finalize_reserve(&self) -> u64 {
-            let encoded =
-                self.retained_pixels as f64 * FALLBACK_BITS_PER_PIXEL_FRAME / BITS_PER_BYTE;
-            self.retained_bytes + encoded as u64
-        }
-
-        /// `false` once the clip volume would fall to storage pressure Level 1.
+        fn wrote(&mut self, bytes: u64) { self.written_since += bytes; }
         fn permits(&mut self, folder: &Path) -> Result<bool, String> {
             if self.measured_at.elapsed() >= Duration::from_millis(DISK_CHECK_MS) {
                 self.measured_free = Self::measure(folder)?;
                 self.written_since = 0;
                 self.measured_at = Instant::now();
-                self.forget_committed(folder);
             }
-            let available = self
-                .measured_free
-                .saturating_sub(self.written_since)
-                .saturating_sub(self.finalize_reserve());
-            Ok(synapse_storage::level_for_free_bytes(available)
-                == synapse_storage::DiskPressureLevel::Normal)
+            Ok(synapse_storage::level_for_free_bytes(self.measured_free.saturating_sub(self.written_since)) == synapse_storage::DiskPressureLevel::Normal)
         }
     }
 
@@ -854,7 +742,7 @@ mod live {
         machine: Machine,
         observer: ClipObserver,
         frames: std::io::BufWriter<std::fs::File>,
-        waiting: WaitingFrameWriter,
+        layers: Option<ClipLayers>,
         meter: LiveMeter,
         disk: DiskGuard,
         origin_hns: i64,
@@ -877,7 +765,7 @@ mod live {
                     format!("screenshot operation=record: {error}"),
                 )
             })?;
-            std::fs::create_dir_all(plan.folder.join(WAITING_DIR)).map_err(|error| {
+            std::fs::create_dir_all(&plan.folder).map_err(|error| {
                 internal_error(format!(
                     "could not create {}: {error}",
                     plan.folder.display()
@@ -909,7 +797,7 @@ mod live {
                 machine,
                 observer,
                 frames: std::io::BufWriter::new(frames_file),
-                waiting: WaitingFrameWriter::new().map_err(internal_error)?,
+                layers: None,
                 meter,
                 disk,
                 origin_hns,
@@ -948,7 +836,7 @@ mod live {
                     "screenshot operation=record: the first frame is all black (hidden or secure desktop, or a protected window); no PrintWindow fallback is used",
                 ));
             }
-            let scale = scale_for_height(frame.height);
+            let scale = PIXEL_SCALE;
             self.geometry = ClipGeometry {
                 window_width: frame.width,
                 window_height: frame.height,
@@ -956,10 +844,10 @@ mod live {
                 recorded_width: frame.width * scale,
                 recorded_height: frame.height * scale,
             };
-            self.write_waiting(0, &pixels.bgra)
-                .map_err(internal_error)?;
-            self.write_line(&self.new_line(0, &frame))
-                .map_err(internal_error)?;
+            let mut layers = ClipLayers::start(&self.plan.folder, frame.width, frame.height, RECORD_FPS).map_err(internal_error)?;
+            let written = layers.picture(0, &pixels.bgra, frame.width, frame.height).map_err(internal_error)?;
+            self.layers = Some(layers);
+            self.write_line(self.new_line(0, &frame), written).map_err(internal_error)?;
             self.last_recorded = Some(frame);
             self.next_instant = 1;
             let clock = ClipClock {
@@ -1055,7 +943,7 @@ mod live {
                 control
                     .recorded_ms
                     .store(instant_ms(self.next_instant), Ordering::Relaxed);
-                self.meter.tick(&self.observer);
+                self.meter.tick(&self.observer, self.layers.as_ref().map_or(0, ClipLayers::cpu_hns));
             }
         }
 
@@ -1095,25 +983,23 @@ mod live {
             if repeated {
                 let mut line = self.repeat_line(k, &frame);
                 line.minimized = self.window_minimized();
-                return self.write_line(&line).map_err(|_| StopReason::WriteFailed);
+                let written = self.layers.as_mut().ok_or(StopReason::WriteFailed)?.repeat(k).map_err(|_| StopReason::WriteFailed)?;
+                return self.write_line(line, written).map_err(|_| StopReason::WriteFailed);
             }
-            if self.meter.shedding(&self.observer) {
+            if self.meter.shedding(&self.observer, self.layers.as_ref().map_or(0, ClipLayers::cpu_hns)) {
                 return self.write_lost(k, LossCause::LoadShedding);
             }
             let pixels = self.observer.read_back(&frame).map_err(|error| {
                 tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
                 StopReason::CaptureFailed
             })?;
-            if let Err(error) = self.write_waiting(k, &pixels.bgra) {
-                tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
-                self.lost.push(LostInstant {
-                    instant: k,
-                    cause: LossCause::Disk,
-                });
-                return Err(StopReason::WriteFailed);
-            }
-            self.write_line(&self.new_line(k, &frame))
-                .map_err(|_| StopReason::WriteFailed)?;
+            let written = self.layers.as_mut().ok_or(StopReason::WriteFailed)?
+                .picture(k, &pixels.bgra, frame.width, frame.height).map_err(|error| {
+                    tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
+                    self.lost.push(LostInstant { instant: k, cause: LossCause::Disk });
+                    StopReason::WriteFailed
+                })?;
+            self.write_line(self.new_line(k, &frame), written).map_err(|_| StopReason::WriteFailed)?;
             self.last_recorded = Some(frame);
             Ok(())
         }
@@ -1125,7 +1011,8 @@ mod live {
                 None => self.blank_line(k),
             };
             line.lost = Some(cause);
-            self.write_line(&line).map_err(|_| StopReason::WriteFailed)
+            let written = self.layers.as_mut().ok_or(StopReason::WriteFailed)?.repeat(k).map_err(|_| StopReason::WriteFailed)?;
+            self.write_line(line, written).map_err(|_| StopReason::WriteFailed)
         }
 
         fn blank_line(&self, k: u64) -> FrameLine {
@@ -1139,6 +1026,7 @@ mod live {
                 composed_hns: None,
                 lost: None,
                 minimized: false,
+                exact: None, moving: None, moving_rect: None,
             }
         }
 
@@ -1177,20 +1065,21 @@ mod live {
             Some([x - left, y - top])
         }
 
-        fn write_line(&mut self, line: &FrameLine) -> Result<(), String> {
-            serde_json::to_writer(&mut self.frames, line).map_err(|error| error.to_string())?;
-            self.frames
-                .write_all(b"\n")
-                .and_then(|()| self.frames.flush())
-                .map_err(|error| format!("frames.jsonl write failed: {error}"))
-        }
-
-        /// One waiting frame in `waiting/` at its captured size (A8: B, G, R
-        /// compressed with zstd through the recording's one context).
-        fn write_waiting(&mut self, k: u64, bgra: &[u8]) -> Result<(), String> {
-            let written = self.waiting.write(&self.plan.folder, k, bgra)?;
-            self.disk
-                .wrote(k, written, bgra.len() as u64 / BGRA_BYTES_PER_PIXEL);
+        fn write_line(&mut self, mut line: FrameLine, written: Written) -> Result<(), String> {
+            line.exact = written.exact;
+            line.moving = written.moving;
+            line.moving_rect = written.moving_rect;
+            if written.moving_behind {
+                self.lost.push(LostInstant { instant: line.instant, cause: LossCause::MovingBehind });
+                line.lost = Some(LossCause::MovingBehind);
+            }
+            self.disk.wrote(written.bytes);
+            serde_json::to_writer(&mut self.frames, &line).map_err(|e| e.to_string())?;
+            self.frames.write_all(b"\n").and_then(|()| self.frames.flush()).map_err(|e| e.to_string())?;
+            if !written.committed.is_empty() {
+                let committed = written.committed.into_iter().map(|s| CommittedSegment::read_back(&self.plan.folder, s)).collect::<Result<Vec<_>, _>>()?;
+                ClipJson::update(&self.plan.folder, |clip| clip.moving.segments.extend(committed))?;
+            }
             Ok(())
         }
 
@@ -1215,116 +1104,66 @@ mod live {
             }
         }
 
-        /// A10, A12: state `encoding` with the stop reason and conditions C,
-        /// G and T (B so far: the live share).
+        /// Join both layers and publish ready only after all format files are complete.
         fn finish(mut self, reason: StopReason) {
+            let result = self.layers.take().ok_or("recorder layers absent".to_owned()).and_then(ClipLayers::finish);
+            let summary = match result {
+                Ok(summary) => summary,
+                Err(error) => {
+                    let _ = ClipJson::update(&self.plan.folder, |clip| { clip.state = ClipState::Failed; clip.failure = Some(error); });
+                    self.observer.stop();
+                    return;
+                }
+            };
             let _ = self.frames.flush();
             let stats = self.observer.stop();
             let recorded_ms = instant_ms(self.next_instant);
-            // The recorder's own losses first, so an instant it named keeps
-            // its cause; then the slot overflows the observer counted.
-            let next_instant = self.next_instant;
-            let overflow = stats
-                .slot_overflow_instants
-                .iter()
-                .filter_map(|&instant| u64::try_from(instant).ok())
-                .filter(|&instant| instant < next_instant)
-                .map(|instant| LostInstant {
-                    instant,
-                    cause: LossCause::SlotOverflow,
-                });
-            let lost: Vec<LostInstant> = std::mem::take(&mut self.lost)
-                .into_iter()
-                .chain(overflow)
-                .collect();
-            let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
-            // C and T start held; `add_lost` names every loss in them.
-            let conditions = Conditions {
-                c: Some(ConditionStatus {
-                    status: "held".to_owned(),
-                    failed_instants: Vec::new(),
-                    detail: Some(serde_json::json!({
+            let mut lost = std::mem::take(&mut self.lost);
+            lost.extend(stats.slot_overflow_instants.iter().filter_map(|&k| u64::try_from(k).ok())
+                .filter(|&k| k < self.next_instant).map(|instant| LostInstant { instant, cause: LossCause::SlotOverflow }));
+            for short in &summary.moving.short {
+                lost.extend((short.first_instant + u64::from(short.held)..short.first_instant + u64::from(short.expected))
+                    .map(|instant| LostInstant { instant, cause: LossCause::MovingFailed }));
+            }
+            let committed = summary.moving.committed.into_iter().map(|s| CommittedSegment::read_back(&self.plan.folder, s)).collect::<Result<Vec<_>, _>>();
+            let updated = ClipJson::update(&self.plan.folder, |clip| -> Result<(), String> {
+                clip.moving.segments.extend(committed?);
+                clip.moving.encoder = summary.moving.grant;
+                clip.moving.reason = summary.moving.unavailable;
+                clip.moving.status = if clip.moving.reason.is_some() { "unavailable" } else if clip.moving.segments.is_empty() { "not_used" } else { "available" }.into();
+                clip.exact = Some(summary.exact.into());
+                clip.recorded_ms = recorded_ms;
+                clip.stop_reason = Some(reason);
+                let status = |name: &str, detail| ConditionStatus { status: name.into(), failed_instants: Vec::new(), detail: Some(detail) };
+                let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
+                clip.conditions = Conditions {
+                    c: Some(status("held", serde_json::json!({
                         "max_hold_ms": stats.max_hold_hns as f64 / HNS_PER_MS as f64,
                         "reference_period_ms": reference_hns as f64 / HNS_PER_MS as f64,
                         "hold_within_reference": stats.max_hold_hns <= reference_hns,
-                        "frames_delivered": stats.frames_delivered,
-                        "delivery_completeness": "checked only in the proof",
-                    })),
-                }),
-                // The worker sets the real G from the committed segments (B9).
-                g: Some(ConditionStatus {
-                    status: "pending_worker".to_owned(),
-                    failed_instants: Vec::new(),
-                    detail: Some(serde_json::json!({
-                        "window_width": self.geometry.window_width,
-                        "window_height": self.geometry.window_height,
-                        "scale": self.geometry.scale,
-                        "recorded_width": self.geometry.recorded_width,
-                        "recorded_height": self.geometry.recorded_height,
-                        "per_segment": "set by the clip worker for each committed segment",
-                    })),
-                }),
-                q: None,
-                b: None,
-                t: Some(ConditionStatus {
-                    status: "held".to_owned(),
-                    failed_instants: Vec::new(),
-                    detail: Some(serde_json::json!({
-                        "length_ms": recorded_ms,
-                        "raw_bytes": self.disk.raw_written,
-                        "instants_lost": 0,
-                        "stop_reason": reason.as_str(),
-                    })),
-                }),
-            };
-            let live_b = BReport::Live {
-                threads: self.machine.threads,
-                max_live_share_percent: self.meter.max_share,
-                max_worker_cap_given_percent: self.meter.max_worker_cap_given,
-                live_seconds_at_limit: self.meter.seconds_over_limit,
-            };
-            // B4, C14: a clip the worker already marked `failed` stays failed;
-            // its failure, not the recorder's stop, is why it ended.
-            // Only a clip still `recording` takes the recorder's stop; a state
-            // set by the worker or by recovery (`encoding`, `ready`) stays too.
-            let updated = ClipJson::update(&self.plan.folder, |clip| {
-                if clip.state == ClipState::Recording {
-                    clip.state = ClipState::Encoding;
-                    clip.stop_reason = Some(reason);
-                }
-                clip.recorded_ms = recorded_ms;
-                // Losses the worker already named (unreadable waiting frames
-                // of committed segments) stay, in the list and in C and T.
-                let worker_lost = std::mem::take(&mut clip.lost);
-                // The recorder owns C, G, T and the live part of B; the
-                // worker's B measurements and Q already in `clip.json` stay.
-                let mut conditions = conditions;
-                conditions.q = clip.conditions.q.take();
-                conditions.b = clip.conditions.b.take();
-                conditions.merge_b(live_b);
-                clip.conditions = conditions;
+                        "frames_delivered": stats.frames_delivered, "delivery_completeness": "checked only in the proof"
+                    }))),
+                    g: Some(status("held", serde_json::json!({ "window_width": self.geometry.window_width, "window_height": self.geometry.window_height, "scale": PIXEL_SCALE }))),
+                    q: Some(status(if clip.moving.segments.is_empty() { "exact" } else { "held" }, serde_json::json!({
+                        "quality_level": super::super::clip_encoder::H264_QUALITY_LEVEL,
+                        "encoder": clip.moving.encoder, "moving_segments": clip.moving.segments.len(),
+                        "moving_instants": clip.moving.segments.iter().map(|s| u64::from(s.segment.frames)).sum::<u64>(),
+                        "moving_unavailable": clip.moving.reason
+                    }))),
+                    b: Some(status(if self.meter.seconds_over_limit == 0 { "held" } else { "not_held" }, serde_json::json!({
+                        "threads": self.machine.threads, "max_live_share_percent": self.meter.max_share,
+                        "live_seconds_at_limit": self.meter.seconds_over_limit, "limit_percent": CPU_LIMIT_PERCENT
+                    }))),
+                    t: Some(status("held", serde_json::json!({ "length_ms": recorded_ms, "bytes": 0, "instants_lost": 0, "stop_reason": reason.as_str() }))),
+                };
                 clip.add_lost(lost);
-                clip.add_lost(worker_lost);
-                clip.state
-            });
-            let outcome = match updated {
-                Ok((_, state)) => state.as_str(),
-                Err(error) => {
-                    tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
-                    ClipState::Encoding.as_str()
-                }
-            };
-            tracing::info!(
-                code = "CAPTURE_CLIP_STOPPED",
-                clip_id = %self.plan.clip_id,
-                stop_reason = reason.as_str(),
-                recorded_ms,
-                outcome,
-                "readback=screenshot_record"
-            );
-            // The clip enters the worker queue (once): a worker that ended
-            // during the recording no longer leaves it in `encoding`.
-            super::super::clip_worker::ClipWorkerHost::global().enqueue(self.plan.folder.clone());
+                if clip.state == ClipState::Recording { clip.state = ClipState::Ready; }
+                clip.set_total_bytes(&self.plan.folder)
+            }).and_then(|(_, result)| result);
+            if let Err(error) = updated {
+                tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
+                let _ = ClipJson::update(&self.plan.folder, |clip| { clip.state = ClipState::Failed; clip.failure = Some(error); });
+            }
         }
     }
 
@@ -1332,6 +1171,7 @@ mod live {
     fn initial_clip_json(plan: &ClipPlan) -> ClipJson {
         ClipJson {
             schema_version: CLIP_SCHEMA_VERSION,
+            way: "DYN1".into(),
             clip_id: plan.clip_id.clone(),
             synapse_version: env!("CARGO_PKG_VERSION").to_owned(),
             state: ClipState::Recording,
@@ -1345,7 +1185,8 @@ mod live {
             geometry: ClipGeometry::default(),
             observer: ObserverGrant::default(),
             lost: Vec::new(),
-            segments: Vec::new(),
+            exact: None,
+            moving: MovingInfo::default(),
             conditions: Conditions::default(),
         }
     }

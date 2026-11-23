@@ -20,3 +20,7 @@ Step 2 evidence | scripts/clip-equation/results/dyn-moving-cont3-fixed.txt:1 | A
 Step 3 motion rule | crates/synapse-mcp/src/server/clip_motion.rs:1 | Added shared block geometry, temporal windows, measured exact-cost admission, largest connected group, alignment, and hold rules.
 Step 3 split | crates/synapse-mcp/src/server/clip_layers.rs:1 | Orders source conversion, motion, cropped coding, frozen exact writes, cost feedback, and repeat restoration.
 Step 3 proof | scripts/clip-equation/spec/dyn-motion.mjs:1 | Added eight deterministic scenes and corpus checks; red rejects absent layers mode; first run passes geometry/exactness but misses noise/video quality with named queue losses.
+Step 4 recorder | crates/synapse-mcp/src/server/capture_clip.rs:1 | Writes both layers at each instant, counts moving CPU, publishes ready after joining, names queue/sample losses, and records exact stored bytes.
+Step 4 format | crates/synapse-mcp/src/server/clip_folder.rs:1 | Introduced schema 3, exact/moving metadata, file hashes, per-instant references, and metadata-inclusive byte totals; removed waiting-frame storage and worker state.
+Step 4 worker removal | crates/synapse-mcp/src/main.rs:1 | Deleted the old H.264 worker module, launch mode, folder option, queue calls, and worker budget plumbing.
+Step 4 verification | scripts/clip-equation/results/dyn-folder-red.txt:1 | Folder checker is red; workspace integration requires the step-5 recovery module and step-6 viewer, as the build order anticipates; live acceptance awaits the final release executable.

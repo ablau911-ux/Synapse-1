@@ -252,9 +252,13 @@ mod clip_encoder;
 mod clip_folder;
 #[cfg(windows)]
 mod clip_viewer;
-mod clip_worker;
+mod clip_exact;
+mod clip_motion;
+mod clip_layers;
+mod clip_moving;
+mod clip_recovery;
 #[cfg(windows)]
-pub(crate) use clip_worker::{recover_clips_on_start, run_clip_worker_from_cli};
+pub(crate) use clip_recovery::recover_clips_on_start;
 mod data_cleaning;
 mod delegate_errors;
 pub(crate) mod drain;

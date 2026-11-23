@@ -392,7 +392,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "record",
                 false,
                 true,
-                "clip folder files (clip.json, frames.jsonl, waiting/, segment-NNNN.mp4) + target metadata",
+                "clip folder files (clip.json, frames.jsonl, frames/, moving/) + target metadata",
                 Some(
                     "clip.json path + size + SHA-256 read back at start; per-segment size + SHA-256 at commit",
                 ),

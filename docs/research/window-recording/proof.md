@@ -218,6 +218,24 @@ Source: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-p
 Source: https://learn.microsoft.com/en-us/azure/virtual-desktop/graphics-encoding
 - "The rest of the content is separated to images and video: Images are software encoded with either AVC/H.264 or RemoteFX graphics, depending on the capabilities of the local device."
 
+### P41. UI Automation events (batch 13)
+Source: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-eventsforclients
+- "Microsoft UI Automation allows clients to subscribe to events of interest. This capability improves performance by eliminating the need to continually poll the UI elements in the system to see if any information, structure, or state has changed."
+- No cost figures are given on the page.
+
+### P42. Models reading recordings of user interfaces (batch 13)
+Source: https://arxiv.org/html/2406.10819v2 (GUI-World)
+- "Empirical results suggest that enhancing vision perception, such as more keyframes and higher resolution, can lead to substantial performance improvements in GUI tasks."
+- The benchmark covers "nine mainstream MLLMs", "five keyframe selection strategies" and "six GUI scenarios".
+
+Source: https://arxiv.org/html/2512.19107v1 (FC-MIR)
+- "We propose an adaptive, training-free keyframe sampling and stitching algorithm for video sequences, which significantly reduces frame redundancy while preserving critical trajectory information…"
+
+### P43. VP9 has a content setting in ffmpeg's libvpx wrapper (batch 13)
+Source: https://ffmpeg.org/pipermail/ffmpeg-devel/2017-November/219896.html
+- Subject line of the patch: "lavc/libvpxenc: add tune-content option".
+- The values of the option (default, screen, film) were not in the text read. Not proven. Nothing was found on x265 or Kvazaar and screen content.
+
 ---
 
 ## NOT PROVEN (claim is in the log; text not found, or page not readable)

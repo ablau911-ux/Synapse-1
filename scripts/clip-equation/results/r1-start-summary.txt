@@ -1,0 +1,9 @@
+R1 M1: all nine processes exited 0; six encoders and three frames per encoder.
+keep=0/thread=same W=96.347 ms
+keep=1/thread=same W=74.652 ms
+keep=0/thread=other W=100.620 ms
+Chosen: keep=0/thread=same; difference=21.695 ms, within 100 ms preference.
+Build: release --offline -j 4; cargo process priority Idle; exit=0.
+Initial build launch deferred because another cargo process was present; no overlapping build started.
+CIM process-detail query failed: Access denied. Subsequent Get-Process found no cargo/rustc.
+Limitation: M1 probe used FPS=30; product RECORD_FPS=20. Choice is provisional until the rate mismatch is resolved. Formula at product rate gives Q=max(8,ceil(96.347*20/1000)+2)=8; part 3 not performed.

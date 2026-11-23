@@ -1008,6 +1008,12 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: R1 M1 measured; commit blocked
+
+The probe-only measurement completed all nine processes: `keep=0/thread=same` W = 96.347 ms, `keep=1/thread=same` W = 74.652 ms, and `keep=0/thread=other` W = 100.620 ms. The provisional choice is `keep=0/thread=same`, within 21.695 ms of keep=1. These measurements used 30 fps; the product's RECORD_FPS is 20, so this rate mismatch must be resolved before using W as product proof. At 20 fps the queue formula gives Q = max(8, ceil(96.347 × 20 / 1000) + 2) = 8; this is arithmetic only, not completion of part 3. No RAM peak was measured and section 1.5 remains unchanged. The slow crash was not investigated; the 20-run loop was not run and no fix is claimed.
+
+The release probe build passed with `--offline -j 4` and Idle priority. Evidence is in `scripts/clip-equation/results/r1-start-*.txt` and `r1-m1-build.*.txt`. Git could not create the worktree's `index.lock` (Permission denied), and push authentication also failed; no commit or push succeeded. Parts 2–4 and the final proof suite remain unstarted. See `results/r1-commit-blocked.txt`. No product code, gate, threshold, timeout, or assertion changed.
+
 ### 2026-11-23: R1 fix plan, encoder start (written by Claude 2026-11-23 16:30 IST; this section is the builder's spec)
 
 **Facts (sources):**

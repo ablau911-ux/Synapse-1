@@ -37,3 +37,8 @@ Step 9 recovery edges | crates/synapse-mcp/src/server/clip_recovery.rs:1 | Creat
 Step 9 contract cleanup | crates/synapse-mcp/src/server/m1_tools/mod.rs:809 | Replaces the obsolete waiting/worker description with the DYN1 storage and status contract.
 Step 9 verification scripts | scripts/clip-equation/spec/dyn-final.mjs:1 | Adds sequential three-repeat orchestration, local UI/video/restart checks, reverse-seek hashing, and viewer SSIM/restoration/missing-metadata assertions without touching live-test/.
 Step 9 lint | scripts/clip-equation/results/final-clippy-green.stderr.txt:1 | Workspace cargo fmt and strict clippy pass; final release build and complete acceptance round are running.
+
+R1 encoder start | scripts/clip-equation/results/r1-blocked.txt:1 | Recorded Serena write rejection; parts 1–4 and all proof checks remain unperformed.
+R1 M1 measurements | scripts/clip-equation/probe/src/main.rs:93 | Added exp-encoder-start; all nine processes passed; selected keep=0/thread=same with W=96.347 ms.
+R1 commit blocker | scripts/clip-equation/results/r1-commit-blocked.txt:1 | Git index.lock permission denied and push authentication failed; no commit created; parts 2-4 and final proof checks remain unperformed.
+R1 Builder note | docs/clip-recorder-architecture-dynamic.md:1 | Recorded provisional W and variant, calculated Q=8, unmeasured RAM, uninvestigated slow crash, FPS mismatch, and Git blocker.

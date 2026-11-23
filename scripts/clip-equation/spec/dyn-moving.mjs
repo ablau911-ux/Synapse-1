@@ -38,8 +38,9 @@ const report = (pass, measured) => ({ pass: !errors.length && rows.length === ca
 const all = fn => normal.length === cases.length - 1 && normal.every(fn);
 const table = {
   'hardware quality grant': () => report(all(r => r.grant?.hardware && r.grant.quality_level === 90 && r.grant.b_frames === 0 && r.grant.gop_frames === r.constants.GOP_FRAMES), JSON.stringify(normal.map(r => r.grant))),
-  'one sample per instant': () => report(all(r => r.segments.reduce((n, s) => n + s.frames, 0) === r.instants), JSON.stringify(normal.map(r => [r.name, r.instants, r.segments]))),
-  'mapping including repeated instants': () => report(all(r => r.scores.length === r.instants && r.scores.every(s => s.current >= s.previous && s.current >= s.next)), JSON.stringify(normal.map(r => [r.name, r.scores?.filter(s => s.current < s.previous || s.current < s.next).length]))),
+  'one sample per instant': () => report(all(r => r.segments.reduce((n, s) => n + s.frames, 0) + r.waited === r.instants), JSON.stringify(normal.map(r => [r.name, r.instants, r.waited, r.segments]))),
+  'start stays exact': () => report(all(r => r.waited === (r.segments[0]?.first_instant ?? r.instants) && r.behind === 0), JSON.stringify(normal.map(r => [r.name, r.waited, r.segments[0]?.first_instant, r.behind, r.creation_ms]))),
+  'mapping including repeated instants': () => report(all(r => r.scores.length === r.instants - r.waited && r.scores.every(s => s.current >= s.previous && s.current >= s.next)), JSON.stringify(normal.map(r => [r.name, r.scores?.filter(s => s.current < s.previous || s.current < s.next).length]))),
   'box quality': () => report(all(r => r.scores.reduce((sum, s) => sum + s.current, 0) / r.scores.length >= QUALITY_MIN), JSON.stringify(normal.map(r => [r.name, r.scores?.reduce((sum, s) => sum + s.current, 0) / r.scores?.length]))),
   'odd dimensions': () => report(rows.find(r => r.name === 'odd')?.segments.every(s => s.coded_width === 506 && s.coded_height === 334 && s.rect[2] === 506 && s.rect[3] === 333), JSON.stringify(rows.find(r => r.name === 'odd')?.segments)),
   'keyframe spacing': () => report(all(r => r.segments.every(s => s.key_frames[0]?.[0] === 0 && s.key_frames.every((k, i) => (s.key_frames[i + 1]?.[0] ?? s.frames) - k[0] <= r.constants.GOP_FRAMES))), 'verified sample table'),

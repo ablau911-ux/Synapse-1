@@ -1,7 +1,7 @@
 //! One bounded moving encoder thread, with one sample for every interval instant.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -141,8 +141,19 @@ pub(super) struct MovingSummary {
     pub unavailable: Option<String>,
     pub creation_ms: usize,
     pub high_water: usize,
+    /// Instants kept in the exact layer while an encoder was starting.
+    pub waited: u32,
 }
 enum MovingJob {
+    /// Create the encoder of a segment that has not begun. Until the worker
+    /// reports `ticket`, the area stays in the exact layer, so no frame waits.
+    Prepare {
+        ticket: u64,
+        segment: u32,
+        rect: PixelRect,
+    },
+    /// Discard a prepared encoder that will not be used.
+    Unprepare,
     Begin {
         segment: u32,
         rect: PixelRect,
@@ -159,6 +170,11 @@ struct OpenSegment {
     rect: PixelRect,
     first: u64,
 }
+/// An encoder the worker was asked to prepare for `rect`.
+struct Pending {
+    ticket: u64,
+    rect: PixelRect,
+}
 
 pub(super) struct MovingCoder {
     jobs: mpsc::Sender<MovingJob>,
@@ -167,9 +183,14 @@ pub(super) struct MovingCoder {
     queued: Arc<AtomicUsize>,
     cpu_hns: Arc<AtomicI64>,
     creation_ms: Arc<AtomicUsize>,
+    /// Ticket of the last `Prepare` the worker finished.
+    ready: Arc<AtomicU64>,
     high_water: usize,
     buffers: usize,
     open: Option<OpenSegment>,
+    pending: Option<Pending>,
+    tickets: u64,
+    waited: u32,
     next_index: u32,
     fps: u32,
     thread: Option<JoinHandle<MovingSummary>>,
@@ -186,10 +207,12 @@ impl MovingCoder {
         let queued = Arc::new(AtomicUsize::new(0));
         let cpu_hns = Arc::new(AtomicI64::new(0));
         let creation_ms = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicU64::new(0));
         let worker_folder = folder.to_owned();
         let worker_queued = Arc::clone(&queued);
         let worker_cpu = Arc::clone(&cpu_hns);
         let worker_creation = Arc::clone(&creation_ms);
+        let worker_ready = Arc::clone(&ready);
         let thread = std::thread::Builder::new()
             .name("synapse-clip-moving".into())
             .spawn(move || {
@@ -201,7 +224,9 @@ impl MovingCoder {
                     queued: worker_queued,
                     cpu_hns: worker_cpu,
                     creation_ms: worker_creation,
+                    ready: worker_ready,
                     open: None,
+                    prepared: None,
                     summary: MovingSummary::default(),
                 }
                 .run(receiver)
@@ -214,9 +239,13 @@ impl MovingCoder {
             queued,
             cpu_hns,
             creation_ms,
+            ready,
             high_water: 0,
             buffers: 0,
             open: None,
+            pending: None,
+            tickets: 0,
+            waited: 0,
             next_index: 0,
             fps,
             thread: Some(thread),
@@ -246,16 +275,30 @@ impl MovingCoder {
             rect
         };
         let segment_frames = MOVING_SEGMENT_MS * u64::from(self.fps) / MILLISECONDS_PER_SECOND;
-        if self.open.as_ref().is_some_and(|s| {
+        // A segment that replaces one ended in this instant finds the encoder
+        // warm and begins at once; the queue covers its short creation.
+        let replaces = self.open.as_ref().is_some_and(|s| {
             Some(s.rect) != rect || instant.saturating_sub(s.first) >= segment_frames
-        }) {
+        });
+        if replaces {
             self.send(MovingJob::End);
             self.open = None;
         }
         let Some(rect) = rect else {
+            if self.pending.take().is_some() {
+                self.send(MovingJob::Unprepare);
+            }
             return MovingStep::default();
         };
+        // A segment after a calm period may meet an encoder that takes seconds
+        // to start. The area stays in the exact layer until the encoder is
+        // ready, so no frame waits in the queue and none is lost.
+        if self.open.is_none() && !replaces && !self.prepared(rect) {
+            self.waited += 1;
+            return MovingStep::default();
+        }
         let began = if self.open.is_none() {
+            self.pending = None;
             self.send(MovingJob::Begin {
                 segment: self.next_index,
                 rect,
@@ -322,6 +365,26 @@ impl MovingCoder {
             behind,
         }
     }
+    /// Whether the worker holds a ready encoder for `rect`. Asks for one when
+    /// none was requested for this rectangle.
+    fn prepared(&mut self, rect: PixelRect) -> bool {
+        if let Some(pending) = &self.pending
+            && pending.rect == rect
+        {
+            return self.ready.load(Ordering::Acquire) == pending.ticket;
+        }
+        self.tickets += 1;
+        self.pending = Some(Pending {
+            ticket: self.tickets,
+            rect,
+        });
+        self.send(MovingJob::Prepare {
+            ticket: self.tickets,
+            segment: self.next_index,
+            rect,
+        });
+        false
+    }
     pub fn take_committed(&self) -> Vec<MovingSegment> {
         self.committed.try_iter().collect()
     }
@@ -337,6 +400,7 @@ impl MovingCoder {
     pub fn finish(mut self) -> MovingSummary {
         let creation_ms = self.creation_ms();
         let high_water = self.high_water();
+        let waited = self.waited;
         drop(self.jobs);
         let mut summary = match self.thread.take().map(JoinHandle::join) {
             Some(Ok(summary)) => summary,
@@ -348,6 +412,7 @@ impl MovingCoder {
         summary.committed.extend(self.committed.try_iter());
         summary.creation_ms = creation_ms;
         summary.high_water = high_water;
+        summary.waited = waited;
         if let MovingAvailability::Unavailable(reason) = MovingAvailability::get() {
             summary.unavailable = Some(reason);
         }
@@ -371,7 +436,9 @@ struct MovingWorker {
     queued: Arc<AtomicUsize>,
     cpu_hns: Arc<AtomicI64>,
     creation_ms: Arc<AtomicUsize>,
+    ready: Arc<AtomicU64>,
     open: Option<WorkerSegment>,
+    prepared: Option<WorkerSegment>,
     summary: MovingSummary,
 }
 impl MovingWorker {
@@ -383,49 +450,28 @@ impl MovingWorker {
         let start_cpu = thread_cpu_hns();
         for job in jobs {
             match job {
+                MovingJob::Prepare {
+                    ticket,
+                    segment,
+                    rect,
+                } => {
+                    self.discard_prepared();
+                    self.prepared = Some(self.create(segment, rect));
+                    self.ready.store(ticket, Ordering::Release);
+                }
+                MovingJob::Unprepare => self.discard_prepared(),
                 MovingJob::Begin {
                     segment,
                     rect,
                     first_instant,
                 } => {
-                    let pixels = Nv12Box::new(rect.w, rect.h);
-                    let (width, height) = pixels.coded_size();
-                    let started = Instant::now();
-                    let encoder = if matches!(
-                        MovingAvailability::get(),
-                        MovingAvailability::Unavailable(_)
-                    ) {
-                        None
-                    } else {
-                        match ClipEncoder::create(
-                            &self
-                                .folder
-                                .join(format!("moving/seg-{segment:04}.mp4.part")),
-                            width,
-                            height,
-                            self.fps,
-                        ) {
-                            Ok(encoder) => {
-                                self.summary.grant = Some(encoder.grant().clone());
-                                MovingAvailability::set_available();
-                                Some(encoder)
-                            }
-                            Err(reason) => {
-                                MovingAvailability::set_unavailable(reason);
-                                None
-                            }
-                        }
-                    };
-                    self.creation_ms
-                        .fetch_max(started.elapsed().as_millis() as usize, Ordering::AcqRel);
-                    self.open = Some(WorkerSegment {
-                        index: segment,
-                        first: first_instant,
-                        rect,
-                        encoder,
-                        pixels,
-                        expected: 0,
-                    });
+                    let prepared = self
+                        .prepared
+                        .take_if(|p| p.index == segment && p.rect == rect);
+                    self.discard_prepared();
+                    let mut open = prepared.unwrap_or_else(|| self.create(segment, rect));
+                    open.first = first_instant;
+                    self.open = Some(open);
                 }
                 MovingJob::Frame { bgr } => {
                     if let Some(open) = &mut self.open {
@@ -444,12 +490,59 @@ impl MovingWorker {
             );
         }
         self.end();
+        self.discard_prepared();
         self.cpu_hns.store(
             thread_cpu_hns().saturating_sub(start_cpu),
             Ordering::Release,
         );
         drop(runtime);
         self.summary
+    }
+    fn part_path(&self, segment: u32) -> std::path::PathBuf {
+        self.folder
+            .join(format!("moving/seg-{segment:04}.mp4.part"))
+    }
+    /// Creates the encoder of one segment. A failure marks the encoder
+    /// unavailable; the segment then holds no samples.
+    fn create(&mut self, segment: u32, rect: PixelRect) -> WorkerSegment {
+        let pixels = Nv12Box::new(rect.w, rect.h);
+        let (width, height) = pixels.coded_size();
+        let started = Instant::now();
+        let encoder = if matches!(
+            MovingAvailability::get(),
+            MovingAvailability::Unavailable(_)
+        ) {
+            None
+        } else {
+            match ClipEncoder::create(&self.part_path(segment), width, height, self.fps) {
+                Ok(encoder) => {
+                    self.summary.grant = Some(encoder.grant().clone());
+                    MovingAvailability::set_available();
+                    Some(encoder)
+                }
+                Err(reason) => {
+                    MovingAvailability::set_unavailable(reason);
+                    None
+                }
+            }
+        };
+        self.creation_ms
+            .fetch_max(started.elapsed().as_millis() as usize, Ordering::AcqRel);
+        WorkerSegment {
+            index: segment,
+            first: 0,
+            rect,
+            encoder,
+            pixels,
+            expected: 0,
+        }
+    }
+    /// Closes a prepared encoder that no segment used and removes its file.
+    fn discard_prepared(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            drop(prepared.encoder);
+            let _ = std::fs::remove_file(self.part_path(prepared.index));
+        }
     }
     fn write_sample(&mut self) {
         if let Some(open) = &mut self.open {

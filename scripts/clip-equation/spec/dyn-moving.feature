@@ -2,7 +2,9 @@ Feature: DYN1 moving layer (architecture step 2)
   Scenario: hardware quality grant
     # Equation: hardware and quality_level=90 and b_frames=0 and gop_frames=20 | Known: true
   Scenario: one sample per instant
-    # Equation: sum(segment.frames)=instants for full, crop, minimum and paused inputs | Known: true
+    # Equation: sum(segment.frames)+waited=instants for full, crop, minimum and paused inputs | Known: true
+  Scenario: start stays exact
+    # Equation: waited=first_instant of the first segment; behind=0 | Known: true
   Scenario: mapping including repeated instants
     # Equation: SSIM-Y(expected[n], decoded[n]) >= each adjacent-source score for every n | Known: true
   Scenario: box quality

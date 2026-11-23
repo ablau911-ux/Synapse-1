@@ -308,6 +308,7 @@ fn moving(folder: &Path, out: &Path, args: &HashMap<String, String>) -> Result<(
         "GOP_FRAMES": crate::clip_encoder::GOP_FRAMES }, "instants": corpus.lines.len(),
         "grant": summary.grant, "segments": summary.committed, "short": summary.short,
         "unavailable": summary.unavailable, "scores": scores, "creation_ms": creation_ms,
+        "waited": summary.waited,
         "high_water": high_water, "behind": behind, "cpu_ns": cpu_ns, "ram_peak": ram_peak, "files": files });
     serde_json::to_writer(
         File::create(out.join("probe.json")).map_err(|e| e.to_string())?,
@@ -454,6 +455,7 @@ fn layers(folder: &Path, out: &Path, args: &HashMap<String, String>) -> Result<(
     };
     let report = json!({ "lines": lines, "segments": segments, "exact": summary.exact,
         "unavailable": summary.moving.unavailable, "grant": summary.moving.grant, "short": summary.moving.short,
+        "waited": summary.moving.waited, "creation_ms": summary.moving.creation_ms,
         "outside_mismatches": outside_mismatches, "mean_ssim": mean_ssim, "cpu_ns": cpu_ns, "ram_peak": ram_peak,
         "constants": { "BLOCK": crate::clip_motion::BLOCK, "MOVING_COST_SHARE": crate::clip_motion::MOVING_COST_SHARE,
         "MOVING_HOLD_MS": crate::clip_motion::MOVING_HOLD_MS, "SHORT_LIVED_MS": crate::clip_motion::SHORT_LIVED_MS,

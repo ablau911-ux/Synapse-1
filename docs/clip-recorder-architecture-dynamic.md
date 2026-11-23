@@ -982,7 +982,7 @@ The test passes when every scenario passes and the script exits 0. The run's fol
 
 | # | Risk | Effect | How the build finds out, what to do |
 |---|---|---|---|
-| R1 | Encoder creation takes longer than 8 instants | `moving_behind` losses at the start of an interval | Happened: measured up to 1,854 ms. Plan in the Builder notes "2026-11-23: R1 plan, cut the encoder start time by copying the Windows recorder" (owner: cut the start time; the warm-up was rejected) |
+| R1 | Encoder creation takes longer than 8 instants | `moving_behind` losses at the start of an interval | Happened: measured up to 1,854 ms. Plan in the Builder notes "2026-11-23: R1 plan, no frame lost while the encoder starts": the area stays in the exact layer until the encoder is ready |
 | R2 | Four lossless pictures of the box at every moving start | A few MB per start (up to 4 · box bytes) | Reported by step 3 "start cost" and by the YouTube size table. A delay line would remove it at about 60 MB of RAM; not built now |
 | R3 | The share threshold 0.5 misses slow animation (under 10 changes per second) | Such content is stored exactly on every change and is large | The YouTube run and the corpus show the exact-layer rate. If real content needs it, lower `ANIMATING_CHANGE_SHARE` by the proof, in recorder and viewer together |
 | R4 | A scroll that moves a playing video makes the whole scrolled area move for about 0.75 s | Text is quality 90 for that time, then exact | Scenario 11 checks that the box returns. Accepted behaviour (section 3.5) |
@@ -1040,8 +1040,15 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 **Proof (Claude runs it; one release build, `-j 4`, priority Idle):**
 - Red first: `final-dyn-moving-{1,2,3}.txt` and `final-dyn-motion-{1,2,3}.txt` (3/3 failed, `behind` 7–30).
-- Green: `dyn-moving` 3/3 with `behind` = 0 in every case, including runs that start cold; `dyn-motion` 3/3; `dyn-exact` 3/3; fmt; clippy `-D warnings`.
+- Green, one round per check (owner rule, 2026-11-23): `dyn-moving` with `behind` = 0 in every case, including cases that start cold; `dyn-motion`; `dyn-exact`; fmt; clippy `-D warnings`.
 - Reported: `waited` per case, and the exact bytes written during the wait.
+
+**Result (Claude, 2026-11-23, `results/r1-exact-start-*.txt`):**
+- `dyn-moving`: 9 of 9 passed. Five of the six cases started cold (encoder creation 1,728–1,755 ms): 35–36 instants waited in the exact layer, `behind` = 0, queue high-water 1, SSIM-Y 0.965–0.971. The sixth started warm (250 ms, 6 instants waited).
+- `dyn-motion`: 32 passed, 0 failed, including `slow`. Noise quality rose from 0.692 to 0.993.
+- `dyn-exact`: 9 of 9 passed.
+- Measured disk cost of the wait (`dyn-motion`, both starts warm): a 320 × 240 noise box stored 0.23 MB per waited instant (6 instants, 1.4 MB). The full 1920 × 1080 video stored 5.2 MB per waited instant (5 instants, 26 MB).
+- Estimate for a cold start, 36 instants at the same rates: about 8 MB for the small box, about 187 MB for the full 1920 × 1080 video. The corpus video barely compresses (5.2 of 6.2 MB), so real video should cost less; the live YouTube test will measure it.
 
 **Still open after this:** the silent `slow` crash in dyn-motion (part 4 of the first R1 plan); the live YouTube test; the software fallback plan.
 

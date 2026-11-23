@@ -30,9 +30,10 @@ for (const scene of [...SCENES, ...['video', 'typing', 'ui', 'scroll', 'flash'].
   check(`${scene.name} exact outside`, r.outside_mismatches === 0, r.outside_mismatches);
   if (['small', 'bar', 'flat', 'slow', 'typing', 'ui', 'scroll', 'flash'].includes(scene.name)) check(`${scene.name} stays exact`, moving.length === 0, moving.length);
   if (scene.name === 'noise') {
-    check('noise interval', moving[0]?.instant === 44 && moving.at(-1)?.instant === 134 && r.segments.length === 1, [moving[0]?.instant, moving.at(-1)?.instant, r.segments.length]);
+    // The rule admits the area at instant 44; it stays exact for `waited` instants while the encoder starts.
+    check('noise interval', moving[0]?.instant === 44 + r.waited && moving.at(-1)?.instant === 134 && r.segments.length === 1, [moving[0]?.instant, moving.at(-1)?.instant, r.segments.length, r.waited, r.creation_ms]);
     check('noise rectangle', JSON.stringify(r.segments[0]?.rect) === '[400,304,320,240]', r.segments[0]?.rect);
-    check('frozen exact rows', r.lines.filter(l => l.instant >= 44 && l.instant <= 134).every(l => !l.x), r.lines.filter(l => l.instant >= 44 && l.instant <= 134 && l.x));
+    check('frozen exact rows', r.lines.filter(l => l.instant >= 44 && l.instant <= 134).every(l => l.mv ? !l.x : Boolean(l.x)), r.lines.filter(l => l.instant >= 44 && l.instant <= 134 && Boolean(l.mv) === Boolean(l.x)));
     check('stop restored exact', Boolean(r.lines[135]?.x), r.lines[135]);
     check('first four exact', r.lines.slice(40, 44).every(l => l.x) && r.lines.slice(40, 44).reduce((n,l) => n + (l.x?.[3] || 0), 0) <= 4 * (240 * 1920 * 3 + 8), r.lines.slice(40,44));
   }
@@ -40,7 +41,7 @@ for (const scene of [...SCENES, ...['video', 'typing', 'ui', 'scroll', 'flash'].
   if (scene.name === 'odd') check('outward alignment', r.segments.length > 0 && r.segments.every(s => JSON.stringify(s.rect) === '[400,288,336,256]'), r.segments.map(s => s.rect));
   if (scene.name === 'corner') check('clamped corner', r.segments.length > 0 && r.segments.every(s => s.rect[0]+s.rect[2] === 1001 && s.rect[1]+s.rect[3] === 701 && s.coded_width % 2 === 0 && s.coded_height % 2 === 0), r.segments);
   if (['noise','video'].includes(scene.name)) check(`${scene.name} moving quality`, r.mean_ssim >= 0.95, r.mean_ssim);
-  if (scene.name === 'video') check('video admits whole picture', moving[0]?.instant <= 5 && r.segments.some(s => s.rect[2]*s.rect[3] >= 0.99*1920*1080), r.segments);
+  if (scene.name === 'video') check('video admits whole picture', moving[0]?.instant <= 5 + r.waited && r.segments.some(s => s.rect[2]*s.rect[3] >= 0.99*1920*1080), r.segments);
 }
 fs.writeFileSync(path.join(out, 'checks.json'), JSON.stringify(rows, null, 2));
 console.log(`dyn-motion: ${failed} failed`);

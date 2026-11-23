@@ -147,7 +147,8 @@ fn encoder_start() -> Result<()> {
     if keep && other {
         return Err("thread=other ends the first thread; use keep=0".into());
     }
-    let folder = std::path::PathBuf::from(args.get("out").ok_or("exp-encoder-start requires out=")?);
+    let folder =
+        std::path::PathBuf::from(args.get("out").ok_or("exp-encoder-start requires out=")?);
     std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
     println!(
         "keep={} thread={}",

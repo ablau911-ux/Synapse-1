@@ -456,8 +456,14 @@ impl MovingWorker {
                     rect,
                 } => {
                     self.discard_prepared();
-                    self.prepared = Some(self.create(segment, rect));
-                    self.ready.store(ticket, Ordering::Release);
+                    let prepared = self.create(segment, rect);
+                    // Only a created encoder is ready. After a failure the
+                    // area must stay exact, so the ticket is never reported.
+                    let created = prepared.encoder.is_some();
+                    self.prepared = Some(prepared);
+                    if created {
+                        self.ready.store(ticket, Ordering::Release);
+                    }
                 }
                 MovingJob::Unprepare => self.discard_prepared(),
                 MovingJob::Begin {

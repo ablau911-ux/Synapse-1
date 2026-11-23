@@ -38,5 +38,10 @@
     "label": "final-dyn-motion-2",
     "exit": 1,
     "elapsed_ms": 229886
+  },
+  {
+    "label": "final-dyn-motion-3",
+    "exit": 1,
+    "elapsed_ms": 228345
   }
 ]

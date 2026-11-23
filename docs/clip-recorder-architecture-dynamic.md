@@ -982,7 +982,7 @@ The test passes when every scenario passes and the script exits 0. The run's fol
 
 | # | Risk | Effect | How the build finds out, what to do |
 |---|---|---|---|
-| R1 | Encoder creation takes longer than 8 instants | `moving_behind` losses at the start of an interval | Step 2 measures the creation time. If it is over 400 ms, report; the fix is a larger `MOVING_QUEUE_FRAMES` within the RAM budget |
+| R1 | Encoder creation takes longer than 8 instants | `moving_behind` losses at the start of an interval | Happened: measured up to 1,854 ms. Fix plan in the Builder notes "2026-11-23: R1 fix plan, encoder start" (owner decision: warm-up at record start plus a queue sized from the measured warm start) |
 | R2 | Four lossless pictures of the box at every moving start | A few MB per start (up to 4 · box bytes) | Reported by step 3 "start cost" and by the YouTube size table. A delay line would remove it at about 60 MB of RAM; not built now |
 | R3 | The share threshold 0.5 misses slow animation (under 10 changes per second) | Such content is stored exactly on every change and is large | The YouTube run and the corpus show the exact-layer rate. If real content needs it, lower `ANIMATING_CHANGE_SHARE` by the proof, in recorder and viewer together |
 | R4 | A scroll that moves a playing video makes the whole scrolled area move for about 0.75 s | Text is quality 90 for that time, then exact | Scenario 11 checks that the box returns. Accepted behaviour (section 3.5) |
@@ -1007,6 +1007,55 @@ The test passes when every scenario passes and the script exits 0. The run's fol
 Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy gate before every write; the all-black first frame rule; the cursor rule (not drawn, logged per line); `recorder.lock`; the registry; atomic `clip.json`; the disk rule; the 10 % rule; the `record`, `record_status`, `record_stop`, `record_extend` operations and the four viewer operations; D5 items 2, 4, 5 and 6.
 
 ## Builder notes
+
+### 2026-11-23: R1 fix plan, encoder start (written by Claude 2026-11-23 16:30 IST; this section is the builder's spec)
+
+**Facts (sources):**
+- F1. `final-dyn-moving-{1,2,3}.txt`, row "bounded queue" `[name, high_water, behind, creation_ms]`. Creation of the moving encoder took 1,719–1,854 ms in 11 of 18 cases, 715–722 ms in 2 and 221–232 ms in 5. A 64 × 64 box took 1,719–1,724 ms, so the cost does not come from box size. Every case with creation ≥ 715 ms has `behind` 7–30. Every case with `behind` = 0 passes mapping and quality (SSIM 0.970 and 0.968).
+- F2. `final-dyn-motion-3.txt`: noise SSIM 0.692. About 28 of the 91 noise instants are `moving_behind` repeats that score near 0 against new noise. 63 × 0.97 / 91 ≈ 0.67, which matches.
+- F3. `MovingCoder::start(folder, fps)` needs no picture size (`clip_moving.rs`). It is called inside `ClipLayers::start` (`clip_layers.rs:79`), which runs after the first captured frame (`capture_clip.rs:860`). Creating the encoder there would block the recorder thread.
+- F4. Encoder creation = `MFCreateSinkWriterFromURL` with hardware transforms enabled, plus the media types (`clip_encoder.rs` `open_writer`). Each case of the probe is a new process, so each one pays any one-time start cost.
+- F5. RAM: the budget (section 1.5) has 26.5 MB of headroom against 500 MB, as an upper bound. Each queue frame at 1080p B,G,R = 6.2 MB.
+- F6. There is no software fallback (section 5, line 591: the Microsoft software encoder measured about 671 MB). The owner confirmed on 2026-11-23: Quick Sync, or any hardware H.264 encoder, only.
+
+**Owner decision (2026-11-23):** both parts. (A) Warm the encoder once at record start, before capture starts. (B) Size `MOVING_QUEUE_FRAMES` from the measured warm start time, within the RAM budget.
+
+**Parts, in order:**
+
+1. **M1: measure (probe only, no product change).** Add the probe command `clip-probe exp-encoder-start`. In one process, create and finish `ClipEncoder`s one after another:
+   - sizes: 64×64, 640×368, 1920×1080, 64×64, 1920×1080, 640×368;
+   - each encoder writes 3 frames before it finishes;
+   - print each creation time in ms;
+   - variant `keep=1` holds the first encoder open until all the others finish; variant `keep=0` drops each encoder before creating the next;
+   - variant `thread=other` creates the first encoder on another thread, which then ends, and the rest on the main thread.
+
+   Run each variant in 3 separate processes. Save the output to `scripts/clip-equation/results/r1-start-*.txt`.
+   - Result W = the largest creation time of encoders 2–6 across all runs of the chosen variant.
+   - Choose the cheapest variant whose W is smallest. Prefer `keep=0` if it is within 100 ms of `keep=1`.
+2. **A: warm-up.**
+   - `MovingCoder::start` creates one 64 × 64 warm-up encoder on the moving worker thread, writing to `moving/warm.mp4.part`. It keeps it open or drops it according to M1. On drop, it deletes the file.
+   - `start` returns only after the warm-up has finished or failed. It returns the warm-up time in ms (`warm_ms` in `MovingSummary`).
+   - A warm-up failure calls `MovingAvailability::set_unavailable(reason)`. The recording continues with the exact layer only, as with any other creation failure.
+   - Move the call out of `ClipLayers::start`: the recorder calls `MovingCoder::start` after the clip folder exists and before the observer captures the first frame, then passes the coder into `ClipLayers::start`.
+   - The probe's `exp-dyn` and the dyn-moving probe call `start` before they feed instant 0. This matches the product.
+   - The warm file is never left behind: it is deleted on `finish`, and recovery deletes a stale `moving/warm.mp4.part`.
+3. **B: queue size.**
+   - `MOVING_QUEUE_FRAMES` = max(8, ⌈W × `RECORD_FPS` / 1000⌉ + 2).
+   - RAM check: (Q + 1) × 6.2 MB replaces the 56 MB row of section 1.5, and the new sum must stay ≤ 500. Also measure the real peak with dyn-live `video` at 1080p (rule M3) and report it.
+   - If Q does not fit the budget, STOP and report to Claude with the numbers. Do not change the queue's picture format and do not lower any gate.
+4. **Bug: silent probe crash.** In dyn-motion run 3, scene `slow`, `clip-probe exp-dyn` exited non-zero with empty stderr, and the spec printed `FAIL slow: undefined` (Gitea #290, comment 1369).
+   - First make `dyn-motion.mjs` print `run.status`, `run.signal` and stdout's last line when a probe fails.
+   - Then run scene `slow` 20 times in a loop to reproduce it. Fix the cause in the probe or the product.
+   - If it does not reproduce in 20 runs, report that with the loop output. Do not mark it fixed.
+
+**Proof (all on one release build; `-j 4`, process priority Idle; one build at a time):**
+- `dyn-moving` 3/3 passed, with `behind` = 0 in every case. The output shows `warm_ms` and the creation time of each segment.
+- `dyn-motion` 3/3 passed, including noise and video quality ≥ 0.95, and `slow` passes.
+- `dyn-exact` 3/3 passed. fmt and clippy (`-D warnings`) are clean.
+- `r1-start-*.txt` committed. Section 1.5's RAM table updated with the measured peak.
+- No gate, threshold, timeout or assertion is loosened. A check that stays red is reported red, with its output.
+
+**Out of scope:** a software encoder, a different queue picture format, any change to quality 90, the GOP, or the segment length.
 
 ### 2026-11-23: step 9, decoder seek and recovery edges
 

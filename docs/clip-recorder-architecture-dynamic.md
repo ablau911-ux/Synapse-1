@@ -982,7 +982,7 @@ The test passes when every scenario passes and the script exits 0. The run's fol
 
 | # | Risk | Effect | How the build finds out, what to do |
 |---|---|---|---|
-| R1 | Encoder creation takes longer than 8 instants | `moving_behind` losses at the start of an interval | Happened: measured up to 1,854 ms. Fix plan in the Builder notes "2026-11-23: R1 fix plan, encoder start" (owner decision: warm-up at record start plus a queue sized from the measured warm start) |
+| R1 | Encoder creation takes longer than 8 instants | `moving_behind` losses at the start of an interval | Happened: measured up to 1,854 ms. Plan in the Builder notes "2026-11-23: R1 plan, cut the encoder start time by copying the Windows recorder" (owner: cut the start time; the warm-up was rejected) |
 | R2 | Four lossless pictures of the box at every moving start | A few MB per start (up to 4 · box bytes) | Reported by step 3 "start cost" and by the YouTube size table. A delay line would remove it at about 60 MB of RAM; not built now |
 | R3 | The share threshold 0.5 misses slow animation (under 10 changes per second) | Such content is stored exactly on every change and is large | The YouTube run and the corpus show the exact-layer rate. If real content needs it, lower `ANIMATING_CHANGE_SHARE` by the proof, in recorder and viewer together |
 | R4 | A scroll that moves a playing video makes the whole scrolled area move for about 0.75 s | Text is quality 90 for that time, then exact | Scenario 11 checks that the box returns. Accepted behaviour (section 3.5) |
@@ -1008,13 +1008,73 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: R1 plan, cut the encoder start time by copying the Windows recorder (written by Claude 2026-11-23 17:10 IST; this section is the builder's spec; it replaces parts 2–4 of the R1 fix plan below, and M1 stays)
+
+**Goal (owner, 2026-11-23):** cut the start time. A recorder that waits about 1.8 s to start is not acceptable. Waiting at record start (the warm-up) is rejected; that work is parked on branch `wip/r1-warmup`. The method is to copy what the Windows recorder (Snipping Tool) does, prototype two ways of doing it, measure both, and keep the winner.
+
+**Facts (sources):**
+- G1. The slow start follows idle time, not box size or our process (Claude, `opus-m1`, same probe binary; #290 comment 1371):
+  - after a 15 s idle, the first encoder starts in 216 ms;
+  - after 60, 180 and 300 s idle, it starts in 1,722, 1,738 and 1,749 ms;
+  - later encoders in the same process start in 65–114 ms.
+- G2. This PC has hybrid graphics: an NVIDIA RTX 4050 Laptop GPU plus Intel UHD graphics (`Win32_VideoController`). The encoder we get is Intel's (`VEN_8086`). Our sink writer gets no graphics device (`clip_encoder.rs` `open_writer`), so Windows searches the hardware encoders of every adapter ([MFTEnumEx](https://learn.microsoft.com/windows/win32/api/mfapi/nf-mfapi-mftenumex)). Waking the NVIDIA GPU from D3 is the leading explanation for the 1.5 s. It is NOT proven; the owner stopped that research. The prototypes below measure the NVIDIA power state only as a side reading.
+- G3. Snipping Tool 11.2602.49.0 (`SnippingTool.exe` strings) uses:
+  - `Windows.Graphics.Capture` with `Direct3D11CaptureFramePool` (13 references) and `CreateFreeThreaded`;
+  - its own `D3D11CreateDevice` and `CreateDirect3D11DeviceFromDXGIDevice`;
+  - `MediaStreamSource` (40 references) with `Starting` and `SampleRequested`;
+  - `Windows.Media.Transcoding`, `Windows.Media.MediaProperties`, and `MFStartup`.
+
+  This is Microsoft's documented screen-to-video pipeline: frame pool, then `MediaStreamSource`, then `MediaTranscoder` ([Screen capture to video](https://learn.microsoft.com/pl-pl/windows/uwp/audio-video-camera/screen-capture-video)).
+- G4. Media Foundation can bind an encoder to one device and adapter: [MF_SINK_WRITER_D3D_MANAGER](https://learn.microsoft.com/en-ca/windows/win32/medfound/mf-sink-writer-d3d-manager), [MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS with a D3D manager](https://learn.microsoft.com/en-au/Windows/Win32/medfound/mf-readwrite-use-only-hardware-transforms), [MFT_ENUM_ADAPTER_LUID](https://learn.microsoft.com/en-us/windows/win32/medfound/mft-enum-adapter-luid).
+- G5. Our capture uses the `windows_capture` crate (`clip_observer.rs:48-54`), which creates its own D3D11 device on the default adapter.
+- G6. Owner rule for these tests: only interfaces built into Windows (Media Foundation, WinRT, DXGI, D3D11, PnP device properties). No vendor tool or SDK (no `nvidia-smi`, no Intel or NVIDIA SDK).
+
+**Prototypes (probe commands only; the product does not change in this round):**
+
+Common input: the corpus `video-1920x1080` frames. Each instant is uploaded into a D3D11 BGRA texture on a device created the way Snipping Tool does it: `D3D11CreateDevice` on the default adapter, `D3D_DRIVER_TYPE_HARDWARE`, `D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT`. Instants are fed in real time at 20 fps (`RECORD_FPS`), 400 instants. Frames the encoder cannot take in time are counted as `behind`, never waited for.
+- **A, exact copy: `clip-probe exp-encode-winrt`.**
+  - `MediaStreamSource` with a `VideoStreamDescriptor` (BGRA8, w, h, 20 fps). `SampleRequested` returns `MediaStreamSample.CreateFromDirect3D11Surface`.
+  - `MediaTranscoder` with `HardwareAccelerationEnabled = true`, then `PrepareMediaStreamSourceTranscodeAsync` to an MP4, using `MediaEncodingProfile.CreateMp4`.
+  - Try to set quality 90, GOP 20 and no B-frames through `VideoEncodingProperties.Properties`. Report which of them the output file actually shows: key-frame spacing from `SampleTable`, B-frames from decode order versus presentation order. If they cannot be set, report the closest bitrate and its SSIM.
+- **B, key step: `clip-probe exp-encode-d3d`.**
+  - Today's `ClipEncoder` sink writer (quality 90, GOP 20, no B-frames, `ICodecAPI` as now), with `MF_SINK_WRITER_D3D_MANAGER` set to an `IMFDXGIDeviceManager` over the same device.
+  - The input is `MFCreateDXGISurfaceBuffer` samples from the texture. Use an RGB32 input type, so any color conversion runs on the GPU inside Media Foundation.
+- **Control C: `clip-probe exp-encoder-start` as it is today** (no device, CPU NV12).
+
+**Measurements (each prototype and control, each condition, 3 separate processes):**
+- Conditions:
+  - "warm": back to back;
+  - "idle": the run starts only after 120 s with no encoder use, and the NVIDIA GPU has been in D3 for 10 s, read by `DEVPKEY_Device_PowerData` (PnP).
+- Per run:
+  - `start_ms`: from the create call until the encoder accepts its first frame;
+  - time to the first sample written;
+  - `behind` over the 400 real-time instants;
+  - mean SSIM-Y against the source;
+  - largest key gap;
+  - B-frames present (yes or no);
+  - NVIDIA D-state changes during start (PnP, sampled every 50 ms);
+  - RAM peak (M3);
+  - processor time.
+- Output: `scripts/clip-equation/results/r1-proto-{a,b,c}-{warm,idle}-{1,2,3}.txt` plus `r1-proto-summary.txt`.
+
+**Decision rule (start time first):**
+- The winner has, in the idle condition, `start_ms` ≤ 400 (8 instants, today's queue) in all 3 runs and `behind` = 0. It also needs SSIM-Y ≥ 0.95, largest key gap ≤ 20 and no B-frames.
+- If both pass, choose the smaller product change (B). If only one passes, choose that one.
+- If neither passes, STOP and report the numbers to Claude, with the fastest idle `start_ms` reached and what limits it. Do not change any gate.
+
+**Carry-over:** part 4 of the plan below (the silent `slow` crash in dyn-motion) still stands. Do it after the prototypes.
+
+**Rules:** one build at a time, `-j 4`, priority Idle, `--offline`. No gate, threshold or assertion is loosened. Red stays red, with its output. Any visible window is opened, recorded and closed in one script. Do not commit or push (the sandbox cannot); Claude commits.
+
+**Out of scope here:** product integration of the winner (its own plan after the decision), the software fallback, and any change to quality 90.
+
 ### 2026-11-23: R1 M1 measured; commit blocked
 
 The probe-only measurement completed all nine processes: `keep=0/thread=same` W = 96.347 ms, `keep=1/thread=same` W = 74.652 ms, and `keep=0/thread=other` W = 100.620 ms. The provisional choice is `keep=0/thread=same`, within 21.695 ms of keep=1. These measurements used 30 fps; the product's RECORD_FPS is 20, so this rate mismatch must be resolved before using W as product proof. At 20 fps the queue formula gives Q = max(8, ceil(96.347 × 20 / 1000) + 2) = 8; this is arithmetic only, not completion of part 3. No RAM peak was measured and section 1.5 remains unchanged. The slow crash was not investigated; the 20-run loop was not run and no fix is claimed.
 
 The release probe build passed with `--offline -j 4` and Idle priority. Evidence is in `scripts/clip-equation/results/r1-start-*.txt` and `r1-m1-build.*.txt`. Git could not create the worktree's `index.lock` (Permission denied), and push authentication also failed; no commit or push succeeded. Parts 2–4 and the final proof suite remain unstarted. See `results/r1-commit-blocked.txt`. No product code, gate, threshold, timeout, or assertion changed.
 
-### 2026-11-23: R1 fix plan, encoder start (written by Claude 2026-11-23 16:30 IST; this section is the builder's spec)
+### 2026-11-23: R1 fix plan, encoder start (written by Claude 2026-11-23 16:30 IST; parts 2–4 REPLACED at 17:10 by "R1 plan, cut the encoder start time" above, and part 4 carries over)
 
 **Facts (sources):**
 - F1. `final-dyn-moving-{1,2,3}.txt`, row "bounded queue" `[name, high_water, behind, creation_ms]`. Creation of the moving encoder took 1,719–1,854 ms in 11 of 18 cases, 715–722 ms in 2 and 221–232 ms in 5. A 64 × 64 box took 1,719–1,724 ms, so the cost does not come from box size. Every case with creation ≥ 715 ms has `behind` 7–30. Every case with `behind` = 0 passes mapping and quality (SSIM 0.970 and 0.968).

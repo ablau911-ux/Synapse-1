@@ -90,7 +90,13 @@ Checked as Σ |decoded − corpus| = 0 over every pixel of every frame.
     nbWorkers > 0: M_cctx = ZSTD_sizeof_CCtx after the last frame                    (the estimates cover one thread only; the workspace is allocated at the first frame)
     viewer:        M_dec gains b_max, the largest clip file, which the viewer holds while it decodes
     dictionary:    M_comp(ZW16) gains M_train = μ · S_samples,  S_samples = N_train · px · 3       (μ fitted)
+                   ZW16 runs iff floor(0.75 · N_train) ≥ 5 and N_train − floor(0.75 · N_train) ≥ 1, i.e. N_train ≥ 7,
+                   N_train = min(20, N_new); otherwise zstd refuses with "Src size is incorrect"     (zstd 1.5.7 fastCover, splitPoint 0.75)
+    prefix ways:   M_dctx gains the prefix DDict (ZSTD_estimateDDictSize(0, byRef) = 27,352 B) only when
+                   N_prefixed = N_comp − ceil(N_comp / K_z) ≥ 1; a clip with no prefixed frame has M_dctx = ZSTD_estimateDCtxSize
     decoder:       M_dec gains m_d0, a fixed per-process overhead                                    (fitted)
+
+Two corrections from the first rows of the Z full run (2026-11-23 05:25 IST, `5bfb3fc4`). Both come from the still scenario, which has N_new = 1. Its 87 ZW16 runs per size end in zstd's refusal, which the check "runs that can run" now expects. Its 30 prefix-way decoder contexts measured 95,984 B against an estimate of 123,336 B.
 
 The two fitted terms come from the fix pilot of #295 (`c5e9090b`). ZW16 measured 31.9 and 35.0 MB against 5.3 MB without a training term. The decoder at 640 × 360 measured 0.5 to 1.2 MB above the equation in 52 of 78 rows. Their per-row RAM checks in step 2 become "known after the fit", and step 4 checks them on the held-out rows like every other fitted coefficient.
 

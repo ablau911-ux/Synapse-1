@@ -12,6 +12,13 @@ use crate::Result;
 use crate::clip_exact::{self, ExactEntry, ExactReader, ExactRef, ExactStream};
 use crate::exp_cpu::Spent;
 use crate::exp_measure::RamMeter;
+use crate::clip_decoder::ClipDecoder;
+use crate::clip_motion::PixelRect;
+use crate::clip_moving::{MovingAvailability, MovingCoder, MOVING_QUEUE_FRAMES};
+
+const PROBE_FPS: u32 = 20;
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
+const BGR_CHANNELS: usize = 3;
 
 #[derive(Deserialize, Serialize)]
 struct CorpusLine {
@@ -178,6 +185,81 @@ fn exact(folder: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+fn source_luma(corpus: &mut Corpus, index: usize, rect: PixelRect) -> Result<Vec<u8>> {
+    corpus.load(index)?;
+    let stride = corpus.lines[index].width as usize * BGR_CHANNELS;
+    let mut luma = Vec::with_capacity(rect.area() as usize);
+    for row in rect.y..rect.bottom() {
+        let start = row as usize * stride + rect.x as usize * BGR_CHANNELS;
+        let end = start + rect.w as usize * BGR_CHANNELS;
+        let line = corpus.picture.get(start..end).ok_or("rectangle outside source")?;
+        luma.extend(line.chunks_exact(BGR_CHANNELS).map(|p| crate::exp_d::luma(i32::from(p[2]), i32::from(p[1]), i32::from(p[0]))));
+    }
+    Ok(luma)
+}
+
+fn moving(folder: &Path, out: &Path, args: &HashMap<String, String>) -> Result<()> {
+    let mut corpus = Corpus::open(folder)?;
+    let rect_values = args.get("rect").ok_or("moving requires rect=")?.split(',')
+        .map(str::parse::<u32>).collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    let rect = PixelRect::from(<[u32; 4]>::try_from(rect_values).map_err(|_| "rect needs four values")?);
+    let source_bounds = PixelRect { x: 0, y: 0, w: corpus.lines[0].width, h: corpus.lines[0].height };
+    if !source_bounds.contains(&rect) || rect.area() == 0 { return Err("rectangle outside corpus".into()); }
+    let pause = args.get("pause").map(|value| -> Result<(usize, usize)> {
+        let (a, b) = value.split_once('-').ok_or("pause requires from-to")?;
+        Ok((a.parse::<usize>().map_err(|e| e.to_string())?, b.parse::<usize>().map_err(|e| e.to_string())?))
+    }).transpose()?;
+    if args.get("force").is_some_and(|v| v == "unavailable") { MovingAvailability::set_unavailable("probe forced unavailable".into()); }
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let ram = RamMeter::start();
+    let mut spent = Spent::default();
+    let mut coder = MovingCoder::start(out, PROBE_FPS)?;
+    let mut expected = Vec::with_capacity(corpus.lines.len());
+    let mut previous = 0;
+    let mut behind = 0;
+    let start = std::time::Instant::now();
+    for i in 0..corpus.lines.len() {
+        let deadline = start + std::time::Duration::from_millis(i as u64 * MILLISECONDS_PER_SECOND / u64::from(PROBE_FPS));
+        if let Some(delay) = deadline.checked_duration_since(std::time::Instant::now()) { std::thread::sleep(delay); }
+        let paused = pause.is_some_and(|(a, b)| i >= a && i <= b);
+        if !paused { previous = i; }
+        expected.push(previous);
+        corpus.load(previous)?;
+        let line = &corpus.lines[i];
+        let step = spent.time(|| coder.follow(line.instant, Some(rect), &corpus.picture, line.width, line.new && !paused));
+        behind += usize::from(step.behind);
+    }
+    let high_water = coder.high_water();
+    let creation_ms = coder.creation_ms();
+    let cpu_ns = spent.cpu_ns + coder.cpu_hns() as u64 * 100;
+    let summary = coder.finish();
+    let ram_peak = ram.read().ram;
+    let mut scores = Vec::new();
+    for segment in &summary.committed {
+        let mut decoder = ClipDecoder::open(&out.join(&segment.file))?;
+        for n in 0..segment.frames {
+            let decoded = decoder.frame_number(n, &segment.key_frames)?;
+            let luma = crate::exp_d::luma_of_bgra(&decoded.bgra, decoded.width as usize, rect.w as usize, rect.h as usize);
+            let index = segment.first_instant as usize + n as usize;
+            let mut compare = |at: usize| -> Result<f64> {
+                let reference = source_luma(&mut corpus, expected[at], rect)?;
+                Ok(crate::exp_d::ssim(&reference, &luma, rect.w as usize, rect.h as usize))
+            };
+            scores.push(json!({ "frame": n, "current": compare(index)?,
+                "previous": compare(index.saturating_sub(1))?, "next": compare((index + 1).min(expected.len() - 1))? }));
+        }
+    }
+    let files = std::fs::read_dir(out.join("moving")).map_err(|e| e.to_string())?.count();
+    let report = json!({ "constants": { "MOVING_QUEUE_FRAMES": MOVING_QUEUE_FRAMES,
+        "GOP_FRAMES": crate::clip_encoder::GOP_FRAMES }, "instants": corpus.lines.len(),
+        "grant": summary.grant, "segments": summary.committed, "short": summary.short,
+        "unavailable": summary.unavailable, "scores": scores, "creation_ms": creation_ms,
+        "high_water": high_water, "behind": behind, "cpu_ns": cpu_ns, "ram_peak": ram_peak, "files": files });
+    serde_json::to_writer(File::create(out.join("probe.json")).map_err(|e| e.to_string())?, &report).map_err(|e| e.to_string())?;
+    println!("{report}");
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let args: HashMap<String, String> = std::env::args()
         .skip(2)
@@ -190,6 +272,7 @@ pub fn run() -> Result<()> {
     let out = Path::new(args.get("out").ok_or("exp-dyn requires out=")?);
     match args.get("mode").map(String::as_str) {
         Some("exact") => exact(folder, out),
-        _ => Err("exp-dyn requires mode=exact".into()),
+        Some("moving") => moving(folder, out, &args),
+        _ => Err("exp-dyn requires mode=exact or mode=moving".into()),
     }
 }

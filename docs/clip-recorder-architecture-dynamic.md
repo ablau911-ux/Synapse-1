@@ -1008,6 +1008,14 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: continuation 3, step 2 integration and seek
+
+The inherited step-2 code builds in the probe. The workspace check still references the deleted encoder API in the old worker and the old timestamp API in the viewer; those callers are replaced in steps 4 and 6. The step-2 check is therefore not a workspace-green claim. Its diagnostics are saved in `results/step2-check.stderr.txt`.
+
+The first resumed moving check failed in all six encoding cases: seeking to keyframe 6 at 3,000,000 hns in fragmented MP4 landed at 0 hns. Sequential decoding now reads across keyframe boundaries without seeking. Random seek remains subject to step 6's strict landing and cost checks; no timestamp tolerance was relaxed.
+
+The latest owner instruction reserves all of `scripts/clip-equation/live-test/` for the reviewer. Steps 7 and 8 will update only their spec files and product code; live driver edits and YouTube execution remain reviewer work.
+
 ### 2026-11-23: continuation 2, framing equation
 
 The owner's continuation authorizes proceeding through steps 2–9 even when an acceptance gate remains open, superseding section 7's stop rule. Commits stay local; the reviewer runs the YouTube proof.

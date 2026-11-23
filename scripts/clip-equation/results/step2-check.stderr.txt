@@ -1,0 +1,95 @@
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+error[E0432]: unresolved import `super::super::clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME`
+   --> crates\synapse-mcp\src\server\capture_clip.rs:623:9
+    |
+623 |     use super::super::clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `FALLBACK_BITS_PER_PIXEL_FRAME` in `server::clip_encoder`
+    |
+help: a similar name exists in the module
+    |
+623 -     use super::super::clip_encoder::FALLBACK_BITS_PER_PIXEL_FRAME;
+623 +     use super::super::clip_encoder::NOMINAL_BITS_PER_PIXEL_FRAME;
+    |
+
+error[E0425]: cannot find type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:234:37
+    |
+234 |     samples: &[super::clip_encoder::SegmentSample],
+    |                                     ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0422]: cannot find struct, variant or union type `SegmentInput` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:394:42
+    |
+394 |         let input = super::clip_encoder::SegmentInput {
+    |                                          ^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0425]: cannot find function `encode_segment` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:402:44
+    |
+402 |         let encoded = super::clip_encoder::encode_segment(&part, &input)?;
+    |                                            ^^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0425]: cannot find type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:458:35
+    |
+458 |     ) -> Vec<super::clip_encoder::SegmentSample> {
+    |                                   ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0422]: cannot find struct, variant or union type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:485:38
+    |
+485 |                 super::clip_encoder::SegmentSample {
+    |                                      ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0425]: cannot find type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:507:41
+    |
+507 |         samples: &[super::clip_encoder::SegmentSample],
+    |                                         ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0425]: cannot find type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:508:38
+    |
+508 |     ) -> Option<super::clip_encoder::SegmentSample> {
+    |                                      ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0422]: cannot find struct, variant or union type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:513:34
+    |
+513 |             super::clip_encoder::SegmentSample {
+    |                                  ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0425]: cannot find type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:530:41
+    |
+530 |         samples: &[super::clip_encoder::SegmentSample],
+    |                                         ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0425]: cannot find type `SegmentSample` in module `super::clip_encoder`
+   --> crates\synapse-mcp\src\server\clip_worker.rs:531:44
+    |
+531 |         seed: Option<&super::clip_encoder::SegmentSample>,
+    |                                            ^^^^^^^^^^^^^ not found in `super::clip_encoder`
+
+error[E0624]: method `next_frame` is private
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:879:45
+    |
+879 |             while let Some(frame) = decoder.next_frame().map_err(decode_error)? {
+    |                                             ^^^^^^^^^^ private method
+    |
+   ::: crates\synapse-mcp\src\server\clip_decoder.rs:101:5
+    |
+101 |     fn next_frame(&mut self) -> Result<Option<DecodedFrame>, String> {
+    |     ---------------------------------------------------------------- private method defined here
+
+error[E0599]: no method named `frame_at` found for mutable reference `&mut ClipDecoder` in the current scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:2024:40
+     |
+2024 |                 |(_, decoder)| decoder.frame_at(local_ms, frame_ms),
+     |                                        ^^^^^^^^ method not found in `&mut ClipDecoder`
+
+Some errors have detailed explanations: E0422, E0425, E0432, E0599, E0624.
+For more information about an error, try `rustc --explain E0422`.
+error: could not compile `synapse-mcp` (bin "synapse-mcp") due to 13 previous errors

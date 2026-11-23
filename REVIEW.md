@@ -14,3 +14,6 @@ Continuation build | scripts/clip-equation/results/dyn-continuation-build.stderr
 Continuation blocker | docs/clip-recorder-architecture-dynamic.md:1011 | Whole-frame fallback reduced scroll size but exceeded the original same-run gate; superseded by continuation 2's owner-approved framing equation.
 Continuation 2 framing | scripts/clip-equation/spec/dyn-exact.mjs:38 | Counts actual record headers, zstd frame/block boundaries, and index bytes; prints both sides of the corrected equation.
 Continuation 2 exact verification | scripts/clip-equation/results/dyn-exact-green.txt:1 | All nine checks pass; scroll (3329582 - 108541) = 3221041 <= 3298546 bytes; every input and backward seek remains exact.
+Step 2 moving encoder | crates/synapse-mcp/src/server/clip_moving.rs:1 | Added bounded cropped-frame delivery, exact sample numbering, segment verification, sticky hardware failure, and CPU accounting.
+Step 2 decoder | crates/synapse-mcp/src/server/clip_decoder.rs:147 | Kept sequential reads continuous across keyframe boundaries after fragmented MP4 seek failures.
+Step 2 evidence | scripts/clip-equation/results/dyn-moving-cont3-fixed.txt:1 | All eight checks pass, 2400 encoded frames map correctly, queue peak 5/8, encoder creation 219–231 ms; workspace check still fails at old worker/viewer callers awaiting steps 4 and 6.

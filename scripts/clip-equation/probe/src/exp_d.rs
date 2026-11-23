@@ -1258,7 +1258,7 @@ fn crop_bgra(bgra: &[u8], stride_px: usize, width: usize, height: usize) -> Vec<
 }
 
 /// Y of a BGRA image with the product's matrix (`Nv12Canvas::draw`).
-fn luma_of_bgra(bgra: &[u8], stride_px: usize, width: usize, height: usize) -> Vec<u8> {
+pub(crate) fn luma_of_bgra(bgra: &[u8], stride_px: usize, width: usize, height: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(width * height);
     for row in 0..height {
         let line = &bgra[row * stride_px * 4..row * stride_px * 4 + width * 4];
@@ -1267,7 +1267,7 @@ fn luma_of_bgra(bgra: &[u8], stride_px: usize, width: usize, height: usize) -> V
     out
 }
 
-fn luma(red: i32, green: i32, blue: i32) -> u8 {
+pub(crate) fn luma(red: i32, green: i32, blue: i32) -> u8 {
     (((47 * red + 157 * green + 16 * blue + 128) >> 8) + 16).clamp(0, 255) as u8
 }
 
@@ -1280,7 +1280,7 @@ fn mse(a: &[u8], b: &[u8]) -> f64 {
 }
 
 /// Mean SSIM over 8 × 8 uniform windows at a stride of 4.
-fn ssim(a: &[u8], b: &[u8], width: usize, height: usize) -> f64 {
+pub(crate) fn ssim(a: &[u8], b: &[u8], width: usize, height: usize) -> f64 {
     let n = (SSIM_WINDOW * SSIM_WINDOW) as f64;
     let (mut total, mut count) = (0.0, 0_u64);
     let mut y = 0;

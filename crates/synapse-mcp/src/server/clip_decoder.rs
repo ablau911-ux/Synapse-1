@@ -8,10 +8,10 @@
 //! All calls must stay on the thread that created the decoder: it initialises
 //! COM (MTA) and Media Foundation for that thread and shuts both down on drop.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
+    IMFAttributes, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_FRAME_RATE,
     MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MFCreateAttributes, MFCreateMediaType,
@@ -24,11 +24,11 @@ use windows::core::{GUID, HSTRING};
 
 use super::clip_encoder::{MediaFoundationRuntime, hr};
 
-const HNS_PER_MS: i64 = 10_000;
-/// D7: a target ahead of the last decoded frame is reached by reading on for
-/// at most one GOP of decoded frames; farther targets seek to the keyframe
-/// before them, so seek cost is bounded in frames, not in time.
-const FORWARD_READ_LIMIT_FRAMES: u32 = super::clip_encoder::GOP_FRAMES;
+const HNS_PER_SECOND: u64 = 10_000_000;
+const PACKED_SHIFT: u32 = 32;
+const PACKED_LOW_MASK: u64 = u32::MAX as u64;
+const HALF_SAMPLE: i64 = 2;
+const BGRA_BYTES_PER_PIXEL: usize = 4;
 /// Empty reads (stream ticks) tolerated in a row before giving up.
 const MAX_EMPTY_READS: u32 = 1_000;
 
@@ -43,9 +43,23 @@ pub(super) struct DecodedFrame {
     pub(super) bgra: Vec<u8>,
 }
 
-impl DecodedFrame {
-    pub(super) fn t_ms(&self) -> u64 {
-        u64::try_from((self.t_hns + HNS_PER_MS / 2) / HNS_PER_MS).unwrap_or(0)
+/// A sample-table keyframe. Its time belongs to the file, not the instant clock.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(from = "(u32, i64)", into = "(u32, i64)")]
+pub(super) struct KeyFrame {
+    pub(super) frame: u32,
+    pub(super) t_hns: i64,
+}
+
+impl From<(u32, i64)> for KeyFrame {
+    fn from((frame, t_hns): (u32, i64)) -> Self {
+        Self { frame, t_hns }
+    }
+}
+
+impl From<KeyFrame> for (u32, i64) {
+    fn from(key: KeyFrame) -> Self {
+        (key.frame, key.t_hns)
     }
 }
 
@@ -59,7 +73,9 @@ pub(super) struct ClipDecoder {
     /// Bytes per row reported by the output type; negative means bottom-up.
     stride: i32,
     /// The most recent frame returned, for forward reads without a seek.
-    last: Option<DecodedFrame>,
+    last: Option<(u32, DecodedFrame)>,
+    half_sample_hns: i64,
+    path: PathBuf,
     _runtime: MediaFoundationRuntime,
 }
 
@@ -73,6 +89,8 @@ impl ClipDecoder {
             height: 0,
             stride: 0,
             last: None,
+            half_sample_hns: 0,
+            path: path.to_owned(),
             _runtime: runtime,
         };
         decoder.read_output_type()?;
@@ -80,7 +98,7 @@ impl ClipDecoder {
     }
 
     /// The next frame in decode order, or `None` at the end of the stream.
-    pub(super) fn next_frame(&mut self) -> Result<Option<DecodedFrame>, String> {
+    fn next_frame(&mut self) -> Result<Option<DecodedFrame>, String> {
         let stream = video_stream();
         for _ in 0..MAX_EMPTY_READS {
             let mut flags = 0_u32;
@@ -110,7 +128,6 @@ impl ClipDecoder {
                     height: self.height,
                     bgra: self.copy_pixels(&sample)?,
                 };
-                self.last = Some(frame.clone());
                 return Ok(Some(frame));
             }
             if flags & flag(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
@@ -122,55 +139,51 @@ impl ClipDecoder {
         ))
     }
 
-    /// The frame on screen at `t_ms`: the last frame whose time is at most
-    /// `t_ms` plus half a frame (`frame_ms / 2`). Frames come at uneven times
-    /// (repeats are not encoded). Reads on from the previous frame for at most
-    /// `FORWARD_READ_LIMIT_FRAMES` frames, otherwise seeks first.
-    pub(super) fn frame_at(&mut self, t_ms: u64, frame_ms: u64) -> Result<DecodedFrame, String> {
-        let tolerance = frame_ms / 2;
-        if let Some(last) = &self.last
-            && last.t_ms() <= t_ms + tolerance
-            && last.t_ms() + tolerance >= t_ms
+    /// D6 maps instants by sample count. File times are used only to land on a keyframe.
+    pub(super) fn frame_number(&mut self, number: u32, keys: &[KeyFrame]) -> Result<DecodedFrame, String> {
+        if let Some((last_number, last)) = &self.last
+            && *last_number == number
         {
             return Ok(last.clone());
         }
-        let mut reading_on = self.last.as_ref().is_some_and(|last| last.t_ms() <= t_ms);
-        if !reading_on {
-            self.seek(t_ms)?;
+        let key = keys.iter().rev().find(|key| key.frame <= number)
+            .ok_or_else(|| format!("{} has no keyframe before frame {number}", self.path.display()))?;
+        let reading_on = self.last.as_ref().filter(|(last_number, _)| {
+            *last_number + 1 == number || (key.frame <= *last_number && *last_number < number)
+        }).map(|(last_number, _)| *last_number + 1);
+        let first = match reading_on {
+            Some(next) => next,
+            None => {
+                self.seek(key.t_hns)?;
+                key.frame
+            }
+        };
+        for current in first..=number {
+            let frame = self.next_frame()?.ok_or_else(|| {
+                format!("{} has no decoded frame {current}", self.path.display())
+            })?;
+            if reading_on.is_none() && current == first
+                && frame.t_hns.abs_diff(key.t_hns) > self.half_sample_hns as u64
+            {
+                self.last = None;
+                return Err(format!(
+                    "{} seek to keyframe {} at {} hns landed at {} hns",
+                    self.path.display(), key.frame, key.t_hns, frame.t_hns,
+                ));
+            }
+            self.last = Some((current, frame));
         }
-        let mut previous = self.last.take();
-        let mut reads = 0_u32;
-        loop {
-            let Some(frame) = self.next_frame()? else {
-                // Past the end: the last frame stays on screen.
-                return previous.ok_or_else(|| format!("no frame decodes at {t_ms} ms"));
-            };
-            if frame.t_ms() > t_ms + tolerance {
-                return Ok(previous.unwrap_or(frame));
-            }
-            if frame.t_ms() + tolerance >= t_ms {
-                return Ok(frame);
-            }
-            previous = Some(frame);
-            reads += 1;
-            if reading_on && reads >= FORWARD_READ_LIMIT_FRAMES {
-                self.seek(t_ms)?;
-                previous = None;
-                reading_on = false;
-            }
-        }
+        self.last.as_ref().map(|(_, frame)| frame.clone())
+            .ok_or_else(|| format!("{} has no decoded frame {number}", self.path.display()))
     }
 
-    fn seek(&mut self, t_ms: u64) -> Result<(), String> {
+    fn seek(&mut self, t_hns: i64) -> Result<(), String> {
         let mut position = PROPVARIANT::default();
-        // SAFETY: writing the tag and the matching union member of a fresh
-        // PROPVARIANT; VT_I8 owns no resources.
+        // SAFETY: the union tag and value match; VT_I8 owns no resources.
         unsafe {
             let inner = &mut *position.Anonymous.Anonymous;
             inner.vt = VT_I8;
-            inner.Anonymous.hVal = i64::try_from(t_ms)
-                .unwrap_or(i64::MAX / HNS_PER_MS)
-                .saturating_mul(HNS_PER_MS);
+            inner.Anonymous.hVal = t_hns;
             self.reader
                 .SetCurrentPosition(&GUID::zeroed(), &raw const position)
                 .map_err(hr("IMFSourceReader::SetCurrentPosition"))?;
@@ -184,14 +197,23 @@ impl ClipDecoder {
             .map_err(hr("IMFSourceReader::GetCurrentMediaType"))?;
         let size =
             unsafe { current.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(hr("MF_MT_FRAME_SIZE"))?;
-        self.width = u32::try_from(size >> 32).unwrap_or(0);
-        self.height = u32::try_from(size & 0xFFFF_FFFF).unwrap_or(0);
+        self.width = u32::try_from(size >> PACKED_SHIFT).unwrap_or(0);
+        self.height = u32::try_from(size & PACKED_LOW_MASK).unwrap_or(0);
         if self.width == 0 || self.height == 0 {
             return Err(format!(
                 "the decoder reported an empty frame size {}x{}",
                 self.width, self.height
             ));
         }
+        // The file's rate defines the tolerance for validating a keyframe seek.
+        let rate = unsafe { current.GetUINT64(&MF_MT_FRAME_RATE) }
+            .map_err(hr("MF_MT_FRAME_RATE"))?;
+        let numerator = rate >> PACKED_SHIFT;
+        let denominator = rate & PACKED_LOW_MASK;
+        if numerator == 0 || denominator == 0 {
+            return Err("the decoder reported an invalid frame rate".into());
+        }
+        self.half_sample_hns = (HNS_PER_SECOND * denominator / numerator) as i64 / HALF_SAMPLE;
         // MF stores a negative stride (bottom-up rows) as its two's complement.
         self.stride = unsafe { current.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
             .map_or(0, |stride| i32::from_ne_bytes(stride.to_ne_bytes()));
@@ -206,7 +228,7 @@ impl ClipDecoder {
         unsafe { buffer.Lock(&raw mut data, None, Some(&raw mut length)) }
             .map_err(hr("IMFMediaBuffer::Lock"))?;
         let (width, height) = (self.width as usize, self.height as usize);
-        let row = width * 4;
+        let row = width * BGRA_BYTES_PER_PIXEL;
         let length = length as usize;
         let mut stride = match self.stride.unsigned_abs() as usize {
             0 => row,
@@ -227,7 +249,7 @@ impl ClipDecoder {
             }
         }
         let unlocked = unsafe { buffer.Unlock() }.map_err(hr("IMFMediaBuffer::Unlock"));
-        if stride < row || stride * height > length {
+        if data.is_null() || stride < row || stride * height > length {
             return Err(format!(
                 "decoded buffer of {length} bytes is too small for {width}x{height} RGB32"
             ));
@@ -237,44 +259,63 @@ impl ClipDecoder {
     }
 }
 
-/// The times (100 ns, within the file) of the keyframes of a finished segment,
-/// read from its compressed samples (B8: keyframe instants come from the
-/// file, not from the settings).
-pub(super) fn keyframe_times_hns(path: &Path) -> Result<Vec<i64>, String> {
-    let _runtime = MediaFoundationRuntime::start()?;
-    let url = HSTRING::from(path.as_os_str());
-    // SAFETY: a reader over the file with its native (compressed) output type.
-    let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }
-        .map_err(hr("MFCreateSourceReaderFromURL"))?;
-    let mut times = Vec::new();
-    loop {
-        let mut flags = 0_u32;
-        let mut timestamp = 0_i64;
-        let mut sample: Option<IMFSample> = None;
-        // SAFETY: three out-parameters.
-        unsafe {
-            reader.ReadSample(
-                video_stream(),
-                0,
-                None,
-                Some(&raw mut flags),
-                Some(&raw mut timestamp),
-                Some(&raw mut sample),
-            )
+/// Compressed samples in file order, including timestamps and actual keyframe flags.
+pub(super) struct SampleTable {
+    samples: Vec<(i64, bool)>,
+}
+
+impl SampleTable {
+    pub(super) fn read(path: &Path) -> Result<Self, String> {
+        let _runtime = MediaFoundationRuntime::start()?;
+        let url = HSTRING::from(path.as_os_str());
+        // SAFETY: the native output type reads compressed samples without decoding.
+        let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }
+            .map_err(hr("MFCreateSourceReaderFromURL"))?;
+        let mut samples = Vec::new();
+        let mut empty_reads = 0;
+        loop {
+            let mut flags = 0_u32;
+            let mut timestamp = 0_i64;
+            let mut sample: Option<IMFSample> = None;
+            // SAFETY: the three out-parameters live through the call.
+            unsafe {
+                reader.ReadSample(
+                    video_stream(), 0, None, Some(&raw mut flags),
+                    Some(&raw mut timestamp), Some(&raw mut sample),
+                )
+            }.map_err(hr("IMFSourceReader::ReadSample"))?;
+            if flags & flag(MF_SOURCE_READERF_ERROR.0) != 0 {
+                return Err("the source reader reported a stream error".to_owned());
+            }
+            if let Some(sample) = sample {
+                if samples.len() == u32::MAX as usize {
+                    return Err("sample table exceeds the frame-number range".into());
+                }
+                // SAFETY: a plain query on the compressed sample.
+                let key = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }
+                    .unwrap_or(0) != 0;
+                samples.push((timestamp, key));
+                empty_reads = 0;
+            } else {
+                empty_reads += 1;
+            }
+            if flags & flag(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
+                return Ok(Self { samples });
+            }
+            if empty_reads >= MAX_EMPTY_READS {
+                return Err(format!("sample table returned {MAX_EMPTY_READS} empty reads in a row"));
+            }
         }
-        .map_err(hr("IMFSourceReader::ReadSample"))?;
-        if flags & flag(MF_SOURCE_READERF_ERROR.0) != 0 {
-            return Err("the source reader reported a stream error".to_owned());
-        }
-        if let Some(sample) = sample
-            // SAFETY: a plain attribute query on the sample.
-            && unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0
-        {
-            times.push(timestamp);
-        }
-        if flags & flag(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
-            return Ok(times);
-        }
+    }
+
+    pub(super) fn len(&self) -> u32 {
+        self.samples.len() as u32
+    }
+
+    pub(super) fn key_frames(&self) -> Vec<KeyFrame> {
+        self.samples.iter().enumerate().filter_map(|(frame, &(t_hns, key))| {
+            key.then_some(KeyFrame { frame: frame as u32, t_hns })
+        }).collect()
     }
 }
 

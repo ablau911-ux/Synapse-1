@@ -27,6 +27,15 @@ mod clip_exact;
 #[allow(dead_code)]
 #[path = "../../../../crates/synapse-mcp/src/server/clip_motion.rs"]
 mod clip_motion;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_encoder.rs"]
+mod clip_encoder;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_decoder.rs"]
+mod clip_decoder;
+#[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_moving.rs"]
+mod clip_moving;
 mod clock;
 mod compress;
 mod delivery;

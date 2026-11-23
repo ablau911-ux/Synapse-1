@@ -43,7 +43,7 @@
 <div class="wrap" dir="rtl"><article>
 
 <h1>דחיסת וידיאו ויצירת קליפים של מסך: איכות טקסט, גודל קובץ ומשאבי מערכת</h1>
-<p class="meta">מחקר. נכתב 2026-11-23. מכסה גם דחיסה וגם יצירת וידיאו: לכידה, חותמות זמן, מכולה, קפיצה בזמן, קידוד, שרשרת הפקה, הפצה, סנכרון ו-HDR. הוא משלב סקירת ספרות (126 מקורות חיצוניים, 17 ציטוטים שאומתו), ניסוי E1 עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
+<p class="meta">מחקר. נכתב 2026-11-23. מכסה גם דחיסה וגם יצירת וידיאו: לכידה, חותמות זמן, מכולה, קפיצה בזמן, קידוד, שרשרת הפקה, עריכה, ייצוא, תיקון צבע, שמע, הפצה, סנכרון ו-HDR. הוא משלב סקירת ספרות (150 מקורות חיצוניים, 18 ציטוטים שאומתו), ניסוי E1 עם ניסויים מדודים על הקורפוס של מקליט הקליפים: 2,808 ריצות H.264 ו-6,195 ריצות zstd. מקורות פנימיים: commit <span dir="ltr">2ff3db5a</span>, ‏Gitea #290.</p>
 
 <div class="abstract">
   <b class="lbl">תקציר</b>
@@ -77,7 +77,8 @@
 <div class="eq">bits per pixel (8-bit):  4:4:4 = 8 + 8 + 8 = 24     4:2:2 = 8 + 2·8/2 = 16     4:2:0 = 8 + 2·8/4 = 12
 chroma samples kept:     4:4:4 = 100 %              4:2:2 = 50 %               4:2:0 = 25 %</div>
 <blockquote>Colorful computer text and line graphics can become blurry during reduced color resolution during 4:2:2 or 4:2:0 chroma resolution.<cite>TestUFO [22] ✓ אומת</cite></blockquote>
-<p>לפי RTINGS, העיוותים בולטים במיוחד בטקסט על רקע בצבע אחיד, ובשימוש שולחני 4:4:4 משפיע "מאוד"<sup><a href="#r21">21</a></sup>. זו פרפרזה, כי העמוד לא נטען לאימות.</p>
+<p>לפי RTINGS, העיוותים בולטים במיוחד בטקסט על רקע בצבע אחיד, ובשימוש שולחני 4:4:4 משפיע "מאוד"<sup><a href="#r21">21</a></sup>. זו פרפרזה, כי העמוד לא נטען לאימות. אותה טענה נתמכת במקורות שאומתו: TestUFO למעלה, והציטוטים הבאים.</p>
+<blockquote>YUV 4:4:4 does not downsample chroma at all, so this is more appropriate for screen capture<cite>FFmpeg-user 2018 [26] ✓ אומת</cite></blockquote>
 <blockquote>chroma subsampling will introduce visually disturbing artifacts, such as in images containing text<cite>US patent 9153017 [24, 110] ✓ אומת</cite></blockquote>
 <p>טקסט ב-Windows מצויר עם ClearType, שמשתמש בכל ערוץ צבע בנפרד לשולי האותיות<sup><a href="#r30">30</a>,<a href="#r31">31</a></sup>. ‏4:2:0 מוחק בדיוק את המידע הזה. מקורות נוספים מתעדים את אותה תופעה בהקלטות: ב-H.264 גם "lossless" עובר ל-4:2:0<sup><a href="#r25">25</a></sup>, טקסט מיטשטש ב-yuv420p<sup><a href="#r26">26</a></sup>, ובפורום OBS<sup><a href="#r27">27</a></sup>, אצל RED<sup><a href="#r23">23</a></sup> וב-VideoHelp<sup><a href="#r32">32</a></sup>.</p>
 
@@ -137,6 +138,36 @@ chroma samples kept:     4:4:4 = 100 %              4:2:2 = 50 %               4
 <p><b>קודקים חדשים.</b> VVC (H.266) הושלם ב-2020, עם כ-50% חיסכון לעומת HEVC לפי התקן עצמו<sup><a href="#r120">120</a></sup>. בדיקות עצמאיות מצאו 31–40%, עם קידוד מורכב פי 8 לפחות ופענוח פי 1.5<sup><a href="#r121">121</a></sup>. ככל שהקודק יעיל יותר, הקידוד יקר יותר ב-CPU, וזה בדיוק המשאב שאנחנו רוצים לחסוך.</p>
 <p><b>סנכרון שמע ותמונה.</b> לפי ITU-R BT.1359, ההבדל מורגש מ-+45 עד ‎−125 מילישניות, ומקובל עד +90/‎−185 (פלוס = הקול לפני התמונה)<sup><a href="#r122">122</a></sup>. מקורות אחרים מצטטים את אותם מספרים בסימן הפוך<sup><a href="#r123">123</a></sup>. בקליפ שלנו אין שמע. אם יתווסף, חותמת ה-QPC של כל פריים (סעיף 2.8) היא הבסיס לסנכרון.</p>
 <p><b>צבע וטווח דינמי.</b> HDR מוגדר ב-BT.2100 עם עקומות PQ או HLG, צבעי BT.2020 ועומק 10 או 12 ביט<sup><a href="#r124">124</a>–<a href="#r126">126</a></sup>. מסך Windows נלכד ב-BGRA 8 ביט ב-SDR (סעיף 2.1), ולכן הקליפ שלנו נשאר ב-8 ביט RGB. מסך HDR ידרוש החלטה נפרדת.</p>
+
+<h3>2.10 הפקת וידיאו: עריכה, ייצוא, צבע ושמע</h3>
+<p><b>עריכה לא-לינארית.</b> עבודת העריכה המקובלת היא בשני שלבים.</p>
+<ul>
+  <li><b>Offline:</b> עורכים עם קבצי proxy קלים במקום החומר המקורי<sup><a href="#r127">127</a>,<a href="#r128">128</a></sup>.</li>
+  <li><b>Online:</b> מחזירים את החומר המקורי ברזולוציה מלאה ומתאימים אותו לעריכה (conform). אחר כך באים אפקטים, תיקון צבע וגרפיקה<sup><a href="#r127">127</a></sup>.</li>
+</ul>
+<p>כדי שהחיבור יעבוד, ל-proxy צריכים להיות אותו שם, אותו timecode ואותם ערוצי שמע כמו למקור<sup><a href="#r129">129</a>,<a href="#r130">130</a></sup>. ‏Premiere ו-Avid מטפלים בזה בעצמם<sup><a href="#r130">130</a>,<a href="#r131">131</a></sup>.</p>
+<p><b>ייצוא.</b> בייצוא בוחרים מצב בקרת קצב. ‏CRF מתאים כשרוצים איכות ידועה, וקידוד דו-מעברי (2-pass) כשרוצים גודל קובץ ידוע<sup><a href="#r134">134</a></sup>. לפי בדיקה של Streaming Learning Center, דו-מעברי לוקח פי 2 זמן ומשפר בעיקר תוכן ארוך, וכמעט לא בקליפים קצרים<sup><a href="#r132">132</a></sup>. ‏YouTube ממליץ על מכולת MP4 ועל BT.709 לתוכן SDR, ומקודד כל העלאה מחדש<sup><a href="#r133">133</a></sup>.</p>
+<p><b>תיקון צבע.</b> צילום ב-log צריך המרה לפני העבודה היצירתית, אחרת הכלים פועלים במרחב הלא נכון<sup><a href="#r137">137</a></sup>. ‏LUT יכול לשמש כהמרת קלט (מצלמה ל-Rec.709) או כהמרת פלט בסוף השרשרת<sup><a href="#r137">137</a></sup>. יש שתי גישות:</p>
+<ul>
+  <li><b>Scene-referred:</b> מתקנים לפני ההמרה למרחב התצוגה, ושומרים את כל הטווח שהמצלמה צילמה<sup><a href="#r139">139</a></sup>.</li>
+  <li><b>Display-referred:</b> מתקנים אחרי ההמרה למרחב התצוגה.</li>
+</ul>
+<p>ACES הוא שרשרת scene-referred בצבעים רחבים, עם המרת רינדור לתצוגה<sup><a href="#r135">135</a>,<a href="#r136">136</a>,<a href="#r138">138</a></sup>.</p>
+<p><b>שמע.</b> ‏48 קילוהרץ הוא הקצב המקובל לשמע בתוך וידיאו<sup><a href="#r145">145</a></sup>. ‏AAC הוא ברירת המחדל להפצה, ו-Opus עדיף בקצב נמוך ובזמן אמת<sup><a href="#r144">144</a>,<a href="#r150">150</a></sup>. לגבי עוצמה:</p>
+<ul>
+  <li>EBU R 128 קובע ‎−23 LUFS לשידור<sup><a href="#r140">140</a>,<a href="#r141">141</a>,<a href="#r142">142</a></sup>.</li>
+  <li>פלטפורמות הזרמה מנרמלות לכ-‎−14 LUFS, ‏Apple Music ל-‎−16<sup><a href="#r143">143</a></sup>.</li>
+</ul>
+<p>מאסטר אחד צריך לכן התאמת עוצמה לכל יעד.</p>
+<p><b>הפקת screencast.</b> ההמלצות המעשיות:</p>
+<ul>
+  <li>להקליט באיכות גבוהה ולערוך אחר כך<sup><a href="#r147">147</a></sup>.</li>
+  <li>להגדיל את ממשק המשתמש כדי שהטקסט יהיה קריא<sup><a href="#r146">146</a></sup>.</li>
+  <li>להזיז את הסמן לאט, ולהשתמש בהדגשת סמן ובזום רק איפה שצריך<sup><a href="#r147">147</a>,<a href="#r148">148</a></sup>.</li>
+  <li>להימנע מפרטים פרטיים בזמן ההקלטה<sup><a href="#r149">149</a></sup>.</li>
+</ul>
+<p><b>הקשר למוצר שלנו.</b> הקליפ של המקליט הוא "חומר המקור" בשרשרת הזו. הוא נשמר ללא אובדן, כך שאפשר לייצא ממנו בכל רגע לכל קודק הפצה בלי לאבד דור.</p>
+<p>הצופה של Synapse הוא מקבילה ל-offline editing: הוא קורא את הקליפ, מסמן רגעי שינוי (D5) ומאפשר קפיצה לכל רגע. הסמן נדגם יחד עם כל פריים, ולכן אפשר להוסיף הדגשת סמן או זום בשלב ייצוא עתידי. כרגע אין שמע ואין צבע HDR (סעיף 2.9).</p>
 
 <h2>3. שיטת המחקר</h2>
 <h3>3.1 הקורפוס</h3>
@@ -252,7 +283,7 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <p>כל המערכות המקצועיות לשיתוף מסך מציעות מצב מיוחד לטקסט:</p>
 <blockquote>In the case of H.264 4:2:0 (the Visually lossless policy is disabled), the final image is not pixel perfect (lossless)<cite>Citrix Thinwire [39] ✓ אומת</cite></blockquote>
 <blockquote>YUV444 produces approximately 1.5–2 times more data than YUV420 for the same frame.<cite>Citrix YUV444 support [40] ✓ אומת</cite></blockquote>
-<p>לפי מדריך VMware Blast Extreme, ‏High Color Accuracy מכבה את 4:2:0 ועובר ל-4:4:4 כשטקסט לא חד<sup><a href="#r42">42</a>,<a href="#r43">43</a></sup>. זו פרפרזה: האתר לא היה זמין לאימות.</p>
+<p>לפי מדריך VMware Blast Extreme, ‏High Color Accuracy מכבה את 4:2:0 ועובר ל-4:4:4 כשטקסט לא חד<sup><a href="#r42">42</a>,<a href="#r43">43</a></sup>. זו פרפרזה, כי האתר לא היה זמין לאימות. אותו עיקרון מאומת בשני הציטוטים של Citrix למעלה.</p>
 <ul>
 <li><b>Microsoft AVC444:</b> שני זרמי H.264 בפורמט 4:2:0, אחד לבהירות ואחד לצבע, מאותו מקודד ואותו מפענח. יחד הם נותנים 4:4:4 על חומרה של 4:2:0<sup><a href="#r29">29</a>,<a href="#r33">33</a>,<a href="#r34">34</a>,<a href="#r38">38</a></sup>. המצב הזה מופעל ב-Azure ‏VD וב-Windows 365<sup><a href="#r35">35</a>–<a href="#r37">37</a></sup>.</li>
 <li><b>Citrix:</b> "Build to lossless" מחדד לתמונה ללא אובדן כשהמסך נרגע. ‏YUV444 מייצר פי 1.5–2 מידע<sup><a href="#r39">39</a>,<a href="#r40">40</a></sup>. בבדיקה אחת: 195MB לעומת 655MB ל-H.264 YUV444<sup><a href="#r41">41</a></sup>.</li>
@@ -284,7 +315,8 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li>ריצת Z חלקית: רק 506×333.</li>
 <li>ה-OCR הוא Windows OCR. מנוע אחר ייתן ערכי R אחרים, אבל השוואה על אותו מנוע הוגנת.</li>
 <li>הקורפוס סינתטי, ממחשב אחד וכרטיס מסך אחד.</li>
-<li>כל ציטוט ישיר במסמך (בתוך מסגרת ציטוט) נבדק מול העמוד המלא ב-2026-11-23 ומסומן ✓. שתי בדיקות, 26 עמודים, 17 ציטוטים אומתו. ארבעה עמודים לא נטענו, וטענותיהם מופיעות כפרפרזה מסומנת ולא כציטוט: RTINGS (תוכן לא נטען), ‏VMware/Omnissa (DNS, 403), ‏Blender (403), ‏FFmpeg wiki (הגנה מבוטים). שאר הטענות הן פרפרזות מהמקורות.</li>
+<li>כל ציטוט ישיר במסמך (בתוך מסגרת ציטוט) נבדק מול העמוד המלא ב-2026-11-23 ומסומן ✓. שתי בדיקות, 26 עמודים, 18 ציטוטים אומתו. ארבעה עמודים לא נטענו: RTINGS (תוכן לא נטען), ‏VMware/Omnissa (DNS, 403), ‏Blender (403), ‏FFmpeg wiki (הגנה מבוטים). הטענות שלהם מופיעות כפרפרזה מסומנת, וכל אחת נתמכת גם במקור שאומת: TestUFO ו-FFmpeg-user לתת-דגימה, Citrix ל-4:4:4, ‏OBS ל-RGB מול YUV 4:4:4. שאר הטענות הן פרפרזות מהמקורות.</li>
+<li>פרק 2.10 (הפקה) מבוסס על מדריכים מקצועיים, מסמכי תקן (EBU, ‏ITU) ובלוגים של ספקים, ולא על מדידה שלנו. המקליט לא עורך, לא מתקן צבע ולא מקליט שמע.</li>
 <li>ב-E1 ההמרה ההפוכה מ-NV12 משתמשת בצבע של כל בלוק בלי אינטרפולציה. מפענחים אמיתיים מבצעים אינטרפולציה, וזה מסביר את E1-ג.</li>
 <li>חלק מהמקורות הם פורומים או חומר שיווקי, ומשקלם נמוך יותר. מסומנים בתיאור.</li>
 </ul>
@@ -433,6 +465,30 @@ ready      t_ready = t_close ≤ 50 ms</div>
 <li id="r124">ITU-R Report BT.2390-8 (2020). High dynamic range television. <a href="https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BT.2390-8-2020-PDF-E.pdf">pdf</a></li>
 <li id="r125">AJA (2019). High dynamic range broadcasting. <a href="https://www.aja.com/pdf/2019/High_Dynamic_Range_Broadcasting.pdf">pdf</a></li>
 <li id="r126">Wikipedia. Hybrid log–gamma. <a href="https://wikipedia.com/wiki/HLG10">link</a></li>
+<li id="r127">OWC. Online vs offline editing: why you still need proxy videos. <a href="https://www.owc.com/blog/online-vs-offline-editing-why-you-still-need-to-consider-proxy-videos">link</a></li>
+<li id="r128">Videomaker. Getting to know offline editing. <a href="https://www.videomaker.com/article/c3/17050-getting-to-know-offline-editing">link</a></li>
+<li id="r129">Frame.io. C2C complete proxy workflow guide. <a href="https://help.frame.io/en/articles/6079079-c2c-complete-proxy-workflow-guide">link</a></li>
+<li id="r130">Frame.io workflow guide. Premiere Pro proxies. <a href="https://workflow.frame.io/guide/premiere-pro-proxies">link</a></li>
+<li id="r131">Adobe. Convert online clips to offline clips (Premiere Pro). <a href="https://helpx.adobe.com/uk/premiere/desktop/organize-media/ingest-proxy-workflow/convert-online-clips-to-offline-clips.html">link</a></li>
+<li id="r132">Streaming Learning Center. Single-pass vs two-pass encoding. <a href="https://streaminglearningcenter.com/?p=18071">link</a></li>
+<li id="r133">YouTube Help. Recommended upload encoding settings. <a href="https://support.google.com/youtube/answer/1722171">link</a></li>
+<li id="r134">VideoHelp forum. CRF vs 2-pass for upload. <a href="https://forum.videohelp.com/showthread.php?p=2522857">link</a></li>
+<li id="r135">Netflix Partner Help. What is color management. <a href="https://backlothelp.netflix.com/hc/en-us/articles/360025502033-What-is-Color-Management">link</a></li>
+<li id="r136">ARRI. About ACES. <a href="https://www.arri.com/en/learn-help/learn-help-camera-system/image-science/about-aces">link</a></li>
+<li id="r137">Videomaker. A guide to working with LUTs. <a href="https://www.videomaker.com/article/c01/18793-a-guide-to-working-with-luts">link</a></li>
+<li id="r138">Mixing Light. ACES from camera to completion. <a href="https://mixinglight.com/color-grading-tutorials/aces-from-camera-to-completion/">link</a></li>
+<li id="r139">Understanding ACES scene-referred workflows (2025). <a href="https://atulsingh-nikki.github.io/obsidian-notes/2025/01/10/understanding-aces-scene-referred-workflows.html">link</a></li>
+<li id="r140">EBU R 128 v4. Loudness normalisation and permitted maximum level. <a href="https://tech.ebu.ch/docs/r/r128v4_0.pdf">pdf</a></li>
+<li id="r141">EBU R 128 s2. Loudness in streaming. <a href="https://knowledgehub.ebu.ch/files/live/sites/tech/files/shared/r/r128s2v2_0.pdf">pdf</a></li>
+<li id="r142">ITU-R Report BS.2434 (2018). <a href="https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BS.2434-2018-PDF-E.pdf">pdf</a></li>
+<li id="r143">Wikipedia. EBU R 128 (platform targets table). <a href="https://en.wikipedia.org/wiki/EBU_R_128">link</a></li>
+<li id="r144">FFmpeg wiki. Encode/HighQualityAudio. <a href="https://trac.ffmpeg.org/wiki/Encode/HighQualityAudio?version=78">link</a></li>
+<li id="r145">The Broadcast Bridge. Standards for audio coding. <a href="https://thebroadcastbridge.com/content/entry/20283/standards-part-5-standards-for-audio-coding">link</a></li>
+<li id="r146">Hanselman. The guide to creating quality technical screencasts. <a href="https://www.hanselman.com/blog/the-guide-to-creating-quality-technical-screencasts">link</a></li>
+<li id="r147">TechSmith. Screen recording basics: video editing, part 2. <a href="https://www.techsmith.com/learn/tutorials/academy/screen-recording-basics-video-editing-part-2/">link</a></li>
+<li id="r148">Smashing Magazine (2010). Most common mistakes in screencasting. <a href="https://www.smashingmagazine.com/2010/12/most-common-mistakes-in-screencasting/">link</a></li>
+<li id="r149">InformIT. Creating a screencast, part 2: recording tips. <a href="https://informit.com/articles/article.aspx?p=1762611">link</a></li>
+<li id="r150">Cloudinary. AAC vs Opus. <a href="https://cloudinary.com/guides/video-formats/aac-vs-opus">link</a></li>
 </ol>
 <p class="note">מקורות פנימיים:</p>
 <ul class="note">

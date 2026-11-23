@@ -12,12 +12,14 @@ import { fileURLToPath } from 'node:url';
 const BASE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROBE = path.join(BASE, 'probe', 'target', 'release', 'clip-probe.exe');
 const CORPUS = JSON.parse(fs.readFileSync(path.join(BASE, 'corpus', 'corpus.json'), 'utf8'));
-const OUT = path.join(BASE, 'results', 'test-1080.csv');
+// RUN1080_OUT (file name in results/), RUN1080_Z (JSON list of zstd ways) and RUN1080_NO_D=1 (skip Quick Sync)
+// run a follow-up batch without touching the first one.
+const OUT = path.join(BASE, 'results', process.env.RUN1080_OUT || 'test-1080.csv');
 const SCENES = ['typing', 'ui', 'scroll', 'flash', 'video'];
 const REPS = 3;
 const T_S = CORPUS.t_s;
 const base = { layout: 'bgr', tile: 32, gap: 0, dict: 0, workers: 0, theta: 25, drain: 0 };
-const Z = [
+const Z = process.env.RUN1080_Z ? JSON.parse(process.env.RUN1080_Z) : [
   { name: 'whole L-3', way: 'ZW1', level: -3, mode: 'whole', wlog: 0, ldm: 0, kz: 20 },
   ...[24, 25, 26].flatMap((wlog) => [-3, 1].map((level) => ({ name: `stream L${level} W${wlog}`, way: 'ZW13', level, mode: 'stream', wlog, ldm: 0, kz: 20 }))),
   ...[1, 3].map((level) => ({ name: `prefix+ldm L${level}`, way: 'ZW15', level, mode: 'prefix', wlog: 24, ldm: 1, kz: 20 })),
@@ -75,7 +77,7 @@ for (const scene of SCENES) {
   const folder = `${scene}-1920x1080`;
   for (let rep = 1; rep <= REPS; rep += 1) {
     for (const cfg of Z) jobs.push({ id: id++, kind: 'Z', scene, folder, rep, cfg, name: cfg.name });
-    jobs.push({ id: id++, kind: 'D', scene, folder, rep, name: 'H.264 Quick Sync q70' });
+    if (!process.env.RUN1080_NO_D) jobs.push({ id: id++, kind: 'D', scene, folder, rep, name: 'H.264 Quick Sync q70' });
   }
 }
 const cols = ['name', 'scene', 'rep', 'status', 'mib_per_min', 'cpu_s', 'ram_mb', 'exact', 'seek_frames', 'ssim', 'psnr', 'r'];

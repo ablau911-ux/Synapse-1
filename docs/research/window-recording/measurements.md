@@ -326,3 +326,64 @@ Taken at 5 s, while the video plays. Source, Intel HEVC (quality 26) and x264 4:
 ## On this PC, Windows can read these formats
 
 Installed packages: Microsoft.HEVCVideoExtension 2.5.33.0, Microsoft.AV1VideoExtension 2.0.30.0, Microsoft.VP9VideoExtensions 1.2.20.0. Whether other PCs have them was not checked.
+
+
+# Fourth and fifth measurements: Direct3D 12 settings, regions of the page, the NVIDIA encoders
+
+Measured by Claude on 2026-11-23, one run each (scripts `measure4.py`, `measure5.py`).
+
+## Can settings close the size gap of the Direct3D 12 route? No.
+
+Intel HEVC on the real page:
+
+| route and setting | MB per minute | closeness |
+|---|---|---|
+| Direct3D 12, default settings, qp 23 | 7.3 | 0.9801 |
+| Direct3D 12, B pictures allowed (bf 2), qp 23 | 7.3 | 0.9801 |
+| Direct3D 12, B pictures, depth 2, qp 23 | 6.9 | 0.9802 |
+| Direct3D 12, no B pictures (bf 0), qp 23 | 7.5 | 0.9799 |
+| Direct3D 12, quality-defined rate (QVBR), 4 Mbit/s cap | 4.6 | 0.9745 |
+| Intel's library, quality 23 | 4.6 | 0.9819 |
+| Intel's library, quality 20 | 6.4 | 0.9845 |
+
+At a closeness of about 0.980–0.982, Direct3D 12 wrote 6.9–7.5 MB per minute and Intel's library 4.6. None of the five Direct3D 12 settings tried closed the gap. The route with the fastest start (about 130 ms) costs about 50–60 % more file size than Intel's library (about 400 ms start).
+
+## How often do the regions of the real page settle?
+
+A settle point is a picture that then stays unchanged for at least 0.5 s. The video plays until 36 s.
+
+| region | pictures that changed | settle points | share of the time the region is still | exact stills at settle points |
+|---|---|---|---|---|
+| whole window | 742 of 800 | 4 | 5 % | 4.08 MB per minute |
+| side column (right of the video) | 557 of 800 | 1 | 7 % | 0.41 MB per minute |
+| page header with the search box | 699 of 800 | 4 | 5 % | 0.08 MB per minute |
+| browser tabs and address bar | 13 of 800 | 2 | 98 % | 0.02 MB per minute |
+| video column (left) | 742 of 800 | 4 | 5 % | 2.38 MB per minute |
+
+On this page the side column and the header change almost as often as the video itself (the glow around the player follows the video's colours). Settling by region would give exact text there only 5–7 % of the time. Only the browser's own tab and address bar is still (98 %).
+
+## The NVIDIA encoders (through ffmpeg 7.1.1)
+
+The installed ffmpeg 9.0.1 needs a newer NVIDIA driver ("Required: 13.1 Found: 13.0"). ffmpeg 7.1.1 from the same publisher works with the installed driver and was used for these rows only. Each cell: MB per minute (closeness).
+
+| encoder | scene | smallest | middle | largest | CPU |
+|---|---|---|---|---|---|
+| NVIDIA HEVC | real-youtube | 2.0 (0.9585) | 3.9 (0.9751) | 7.8 (0.9830) | 0.11–0.13 |
+| NVIDIA AV1 | real-youtube | 1.3 (0.9450) | 2.5 (0.9663) | 4.3 (0.9767) | 0.14–0.16 |
+| NVIDIA H.264 | real-youtube | 3.2 (0.9699) | 6.1 (0.9793) | 11.1 (0.9845) | 0.15–0.15 |
+| NVIDIA HEVC | mix | 0.7 (0.9962) | 0.9 (0.9971) | 1.3 (0.9977) | 0.11–0.12 |
+| NVIDIA AV1 | mix | 0.4 (0.9956) | 0.5 (0.9965) | 0.8 (0.9972) | 0.11–0.13 |
+| NVIDIA H.264 | mix | 0.8 (0.9968) | 1.1 (0.9974) | 1.4 (0.9980) | 0.12–0.12 |
+
+At closeness 0.98 on the real page, read off between the measured points: NVIDIA HEVC about 6.0 MB per minute; NVIDIA H.264 about 6.3; NVIDIA AV1 did not reach 0.98 in the range tested (0.9767 at 4.3). Intel HEVC through Intel's library: 4.0–4.6.
+
+### NVIDIA start-up, with the power state of the NVIDIA chip read from Windows
+
+| encoder | when | NVIDIA power state before | first start | second start |
+|---|---|---|---|---|
+| hevc_nvenc | back to back | not read | 174 ms | 158 ms |
+| av1_nvenc | back to back | not read | 186 ms | 182 ms |
+| hevc_nvenc | after 150 s with no encoder use | D3 | 1674 ms | 157 ms |
+| av1_nvenc | after 150 s with no encoder use | D3 | 1707 ms | 194 ms |
+
+After 150 s without use the NVIDIA chip was in power state D3 (off). The first encoder start then took about 1.7 s; the next one, with the chip awake, took 157–194 ms. So waking the NVIDIA chip costs about 1.5 s on this PC. The Intel encoder through Direct3D 12 started in 113–141 ms whether or not anything had been idle.

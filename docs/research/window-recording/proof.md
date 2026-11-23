@@ -304,11 +304,40 @@ Sources: https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-v
 - "The Media Foundation H.265 video decoder is a Media Foundation Transform that supports decoding H.265/HEVC content…"
 - "The Media Foundation H.265 video encoder is a Media Foundation Transform that supports encoding content into the H…" (cut by the reader)
 
-**Still not readable after the retry:** Playwright's video settings (address returned 404), ffmpeg's wiki (no connection), the 47 % YouTube figure (not on the page), WebRTC zero-hertz behaviour (only the bug reference "go/rtc-0hz-present" was readable).
+### P58. Playwright's video bitrate (finding 11)
+Source: https://api.github.com/repos/microsoft/playwright/issues/31424 (the issue text)
+- "Currently video recording has only mode and size options, it's not possible to configure quality. For chromium-based browsers target bitrate = 1Mbit/s is hardcoded…"
+- That the codec is VP8 was not in the text read. Withdrawn.
+
+### P59. WebRTC zero-hertz capture (finding 38)
+Source: https://webrtc.googlesource.com/src/+/b4e96d48a20f88447fbd5fb8e0f382fb8f483eda
+- "The FrameCadenceAdapter will see its functionality grow in future CLs and eventually enable screenshare capture sources to have zero hertz as the minimum capture frequency."
+
+### P60. Lossless video codecs, MSU 2007 (finding 39)
+Source: https://videoprocessing.ai/codecs/lossless-codecs-comparison-2007.html
+- "Main conclusions: In Video Capture and Video Editing Area the overall clear winner is Lagarith. In Maximum Compression area the overall winner is YULS. The most balanced and flexible codec is FFV1: relatively good speed and high compression for various presets."
+
+### P61. When an HEVC royalty is due
+Source: https://accessadvance.com/topic-where-and-when-is-a-royalty-due/
+- "A royalty is due upon the Sale of a Consumer HEVC Product or HEVC Content on Digital Media Storage for which an HEVC Standard Essential Patent (listed on the HEVC Advance Patent Lis[t]…" (cut by the reader)
 
 ---
 
-## NOT PROVEN (claim is in the log; text not found, or page not readable)
+## FINAL STATUS OF THE LEDGER (2026-11-23, end of the proof work)
+
+- **Proven with a verbatim quote from a page Claude read: P1–P61.**
+- **Everything in the table below is WITHDRAWN.** These claims were written into `research-log.md` from search summaries. Claude tried to read their sources, some twice through other addresses, and could not find or read the text. They are not findings and must not be used. Nothing in `recommendation.md` rests on them.
+- `research-log.md` is kept only as a record of what was searched. Its "Meaning" lines and summaries are Claude's notes, not proof.
+
+---
+
+## WITHDRAWN: claims in the log that could not be proven from text
+
+Rows later proven are noted in the right-hand column with their P-number; all other rows are withdrawn.
+
+Updates after the retry passes: Intel hardware screen content coding → proven (P45) and measured. Zoom JPEG then H.264 → proven (P46). Lossless x264 sizes → proven (P44). JPEG XL against QOI → proven (P48). AV1 screen content 25 % → proven (P47). PCoIP → proven (P51). RDP AVC444 → proven (P49). Tight against Hextile → proven (P52). UI tree tokens → proven (P50). Time Travel Debugging trace size → proven (P53). Playwright 1 Mbit/s → proven (P58). WebRTC zero-hertz → proven (P59). Lagarith and FFV1 conclusions → proven (P60).
+
+Still withdrawn after all passes: Steps Recorder ZIP/MHT; the baseline of the 66/63/61 % figures; ffmpeg wiki statements on CRF and lossless; Playwright's codec being VP8; the 4:4:4 fix in the NVIDIA forum thread; AV1 saving 47 % on YouTube; VVenC at 6.6 frames per second; libaom at 140–170 frames per second; lossless codecs reaching about 2:1; the Windows versions that introduced the two capture interfaces; `PW_RENDERFULLCONTENT`; long key distances slowing seeks (measured instead, see `measurements.md`); apitrace and GFXReconstruct details; the two PDF sources (AV1 tool description, mixed raster content); screenpipe's 1 frame per second and MP4; OpenH264 running on one thread; the one claim from memory about Intel AV1 (measured instead: not usable on this PC).
 
 | Claim in `research-log.md` | What happened when Claude read the page |
 |---|---|

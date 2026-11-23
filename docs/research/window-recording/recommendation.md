@@ -57,14 +57,17 @@ Against today's recorder, the recommended method needs about 5–9 % of the file
 | HEVC screen profile | Valid file, but not smaller at the setting compared, and ffmpeg's software decoder cannot read it |
 | Hardware H.264 | Works; about 1.8 times the size of HEVC at equal closeness |
 
+## Questions that were open and are now answered by measurement
+
+- **The NVIDIA encoders** (measured with ffmpeg 7.1.1). At closeness 0.98 on the real page: NVIDIA HEVC about 6.0 MB per minute, NVIDIA H.264 about 6.3, against 4.0–4.6 for Intel HEVC. NVIDIA AV1 did not reach 0.98 in the range tested. Their first start after idle took about 1.7 s, with the NVIDIA chip read as powered off (D3) just before; with the chip awake, 157–194 ms. **So on a PC with two graphics chips, use the encoder of the integrated chip: it is the smallest here and it never has to wake the second chip.**
+- **Can settings close the size gap of Direct3D 12?** No. Five settings were tried; the best wrote 6.9 MB per minute where Intel's library wrote 4.6 at the same closeness. The choice is a trade: Direct3D 12 starts in about 130 ms and costs 50–60 % more size; Intel's library starts in about 400 ms and is the smallest.
+- **Exact text beside a playing video.** On the real page the side column changed in 557 of 800 pictures and the header in 699, because the glow around the player follows the video. Settling by region would give exact text there only 5–7 % of the time. The text there stays video quality, which Claude read without error.
+
 ## What is still not known
 
-- **The NVIDIA encoders.** Three routes failed on this PC's driver ("Required: 13.1 Found: 13.0"; two Direct3D 12 errors). Testing them needs a driver update, which is the owner's call.
-- **Other PCs.** Everything was measured on one PC with Intel graphics. AMD graphics and older PCs were not tested.
-- **A recorder written for the product.** The figures come from ffmpeg standing in for the recorder. A purpose-built one may use less memory; that is not measured.
-- **Direct3D 12 at its best size.** Through ffmpeg it wrote about twice the size of Intel's own library at equal closeness (about 8 against 4.0 MB per minute). Whether better settings close that gap was not tested.
-- **Exact text beside a playing video.** It is readable (measured) but stays video-quality until the whole window settles; the real page settled 4 times in 40 s. Settling by region, as Citrix's newer default does (P1), was not measured.
-- **HEVC licence.** The patent pool says: "We license HEVC Decoders and HEVC Encoders in Consumer HEVC Products, whether made available in devices, software, or through Cloud Based Services" (P55). It does not say who pays when a program only uses the encoder already in the PC's graphics chip. That needs a legal answer, not more reading.
+- **Other PCs.** Everything was measured on one PC (Intel plus NVIDIA graphics). AMD graphics and older PCs were not tested.
+- **A recorder written for the product.** The figures come from ffmpeg standing in for the recorder. A purpose-built one may use less memory; that can only be measured once it exists, which is the suggested first step below.
+- **HEVC licence.** The patent pool says "A royalty is due upon the Sale of a Consumer HEVC Product…" (P61) and that it licenses encoders "in devices, software, or through Cloud Based Services" (P55). It does not say who pays when a program only uses the encoder already in the PC's graphics chip. That needs a legal answer, not more reading. The fallback (Windows' own H.264) avoids the question at about four times the size.
 - **HEVC on the reading PC.** This PC has Microsoft's HEVC extension installed; others may not.
 
 ## Suggested first step

@@ -1008,7 +1008,44 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
-### 2026-11-23: R1 plan, cut the encoder start time by copying the Windows recorder (written by Claude 2026-11-23 17:10 IST; this section is the builder's spec; it replaces parts 2–4 of the R1 fix plan below, and M1 stays)
+### 2026-11-23: R1 plan, no frame lost while the encoder starts (written by Claude 2026-11-23 18:20 IST; this section is the spec; the two R1 plans below are stopped)
+
+**Owner decision (2026-11-23):** no frame may be lost. While the H.264 encoder starts, the moving area stays in the exact layer. When the encoder is ready, the area switches to H.264. No waiting at record start, no larger queue. The Snipping Tool prototypes are stopped and parked on branch `wip/r1-proto`; the warm-up is parked on `wip/r1-warmup`. Neither was verified.
+
+**Facts (sources):**
+- H1. The loss has one cause in our code: `MovingCoder::follow` sends `Begin` and frames at once. The worker creates the encoder inside `Begin` (up to 1.85 s after idle, F1 and G1 below). The queue holds `MOVING_QUEUE_FRAMES` = 8 frames (0.4 s at 20 fps); later frames become `Repeat` with `behind = true` (`clip_moving.rs`, `follow`). 1.85 s is 37 instants; 37 − 8 ≈ 29 lost, which matches the measured 27–30.
+- H2. `ClipLayers::write` already keeps pixels exact whenever `follow` returns no reference: `let rect = step.reference.and(rect)` (`clip_layers.rs`). Today that path serves an unavailable encoder. So the exact layer needs no change.
+- H3. An encoder created within 15 s of the last encoder use starts in 65–114 ms (G1 below, Claude's runs), under the 400 ms queue.
+- H4. `MovingSummary` is read by the product only for `short` and `unavailable` (`capture_clip.rs:1198-1217`), so a new counter in it changes no stored format.
+
+**The rule:**
+- A moving segment that starts while no segment is open (first motion, or motion after a calm period) starts in two steps. The recorder asks the worker to prepare the encoder (`MovingJob::Prepare`). Until the worker reports it ready, `follow` returns no reference, so every instant is written by the exact layer and nothing is queued or dropped. On the first instant after it is ready, the segment begins as today.
+- A segment that replaces one that ended in the same instant (the box changed, or the 60 s segment limit) begins at once as today. The encoder was in use 50 ms earlier, so it is warm (H3).
+- If motion stops, or the box changes, before the encoder is ready, the prepared encoder is discarded and its empty file deleted.
+- If preparing fails, the encoder is marked unavailable as today and the recording stays exact.
+- The queue bound and `moving_behind` stay as the guard for an encoder that falls behind mid-segment.
+
+**Cost, stated plainly:** up to about 37 lossless pictures of the moving box per cold start (a start after 60 s or more without encoder use). For a small box that is a few MB; for a large box it can be tens of MB. The proof measures it.
+
+**Parts:**
+1. `clip_moving.rs`: `MovingJob::Prepare` and `MovingJob::Unprepare`; the worker holds one prepared segment; `Begin` takes it when it matches, else creates as today; `MovingCoder` tracks the pending request and counts waited instants in `MovingSummary::waited`.
+2. Probe `exp-dyn mode=moving`: report `waited`. Probe `mode=layers`: report `waited`.
+3. Specs. These equations change because the rule changed, not to pass a check:
+   - `dyn-moving` "one sample per instant": sum(segment.frames) + waited = instants.
+   - `dyn-moving` "mapping": one score per sample.
+   - `dyn-moving`, new scenario "start stays exact": waited = first_instant of the first segment; behind = 0.
+   - `dyn-motion` "noise interval": the first moving instant = 44 + waited.
+   - `dyn-motion` "frozen exact rows": the waited instants have an exact record; the moving instants have none.
+   - `dyn-motion` "video admits whole picture": first moving instant ≤ 5 + waited.
+
+**Proof (Claude runs it; one release build, `-j 4`, priority Idle):**
+- Red first: `final-dyn-moving-{1,2,3}.txt` and `final-dyn-motion-{1,2,3}.txt` (3/3 failed, `behind` 7–30).
+- Green: `dyn-moving` 3/3 with `behind` = 0 in every case, including runs that start cold; `dyn-motion` 3/3; `dyn-exact` 3/3; fmt; clippy `-D warnings`.
+- Reported: `waited` per case, and the exact bytes written during the wait.
+
+**Still open after this:** the silent `slow` crash in dyn-motion (part 4 of the first R1 plan); the live YouTube test; the software fallback plan.
+
+### 2026-11-23: R1 plan, cut the encoder start time by copying the Windows recorder (written by Claude 2026-11-23 17:10 IST; STOPPED by the owner at 18:10, replaced by "no frame lost while the encoder starts" above; prototypes parked on `wip/r1-proto`)
 
 **Goal (owner, 2026-11-23):** cut the start time. A recorder that waits about 1.8 s to start is not acceptable. Waiting at record start (the warm-up) is rejected; that work is parked on branch `wip/r1-warmup`. The method is to copy what the Windows recorder (Snipping Tool) does, prototype two ways of doing it, measure both, and keep the winner.
 

@@ -1,6 +1,6 @@
 # Recommendation: how to record an application window for an AI
 
-Written by Claude on 2026-11-23. **This is Claude's recommendation, not a proven fact.** Each point names what supports it: a quote in `proof.md` (P-numbers) or a measurement in `measurements.md`. The choice is the owner's.
+Written by Claude on 2026-11-23, after three measurement rounds on this PC. Each point names its support: a quote in `proof.md` (P-numbers) or a table in `measurements.md`. The owner decides.
 
 **Task:** record a clip of an application window on Windows so that an AI model can read back what happened. Goals: maximum quality, small files, low CPU, low RAM.
 
@@ -8,68 +8,65 @@ Written by Claude on 2026-11-23. **This is Claude's recommendation, not a proven
 
 **Video while the screen changes, plus an exact still when it settles.**
 
-1. **One video stream of the whole window**, at full resolution, with a long distance between key pictures.
-   - Encoder: the graphics chip's HEVC encoder where the PC has one (Intel on this PC).
-   - Fallback on any PC: software x264 in 4:4:4.
-2. **One lossless still of the window each time the picture stops changing** (unchanged for 0.5 s).
-3. **Later addition:** a text and event track from UI Automation and input, stored beside the pictures.
+1. **Capture** the window with Windows.Graphics.Capture and keep the pictures on the graphics chip.
+2. **Encode one video stream of the whole window** at full resolution with the graphics chip's HEVC encoder.
+   - Reach the encoder through **Direct3D 12 video encoding** (part of Windows 11) or the chip maker's own library. **Not through the Media Foundation sink writer.**
+   - One key picture every 5 seconds.
+3. **Write one lossless still of the window each time the picture stops changing** for half a second.
+4. **Fallback** on a PC with no hardware HEVC encoder: Windows' own software H.264 encoder.
+5. **Later addition:** a text and event track from UI Automation and input, beside the pictures.
 
-No "moving rectangle" logic, and no lossless storage of changing pixels.
+There is no "moving rectangle" logic and no lossless storage of changing pixels.
 
-## Why this one
+## What was measured for this method
 
-### It is the method the leading screen products use
-- Citrix: "Build to lossless compresses the screen using H.264 (or H.265) during screen activity and sharpens to pixel perfect (lossless) when activity stops." (P34)
-- PCoIP: "Unchanged regions of the image progressively build to a lossless (perfect) quality…" (P51)
-- Step 3 follows screenpipe, which pairs "each screenshot with accessibility tree data" (P13), and Microsoft's statement that UI Automation events remove "the need to continually poll the UI elements" (P41).
+All on this PC, on a real YouTube page (video playing, a scroll, typing, a pause), one run each.
 
-### Size, measured on this PC
-
-Real YouTube page, 40 s (video playing, scroll, typing, pause):
-
-| method | MB per minute | against today |
+| goal | result | where |
 |---|---|---|
-| current Synapse recorder (lossless layer + H.264 moving rectangle) | 187 | 100 % |
-| Intel hardware HEVC, at closeness 0.98 | 4.0 | 2 % |
-| + exact stills at the 4 settle points | + 4.3 | |
-| **the recommended method, together** | **about 8** | **about 4 %** |
-| fallback: x264 4:4:4, at closeness 0.98 | 4.3 (+ 4.3 stills) | about 5 % |
+| Small files | Video 4.0–8 MB per minute at closeness 0.98 (by route), plus 4.3 for the exact stills. A live recording came to 11.1 MB per minute. Today's recorder: 187. | measurements, second and third parts |
+| Small files, interface work | About 0.5–0.7 MB per minute, plus 0.06 for stills | second and third parts |
+| Low CPU | Live recorder: 0.034 of one core | third part, live recording |
+| Low RAM | Live recorder: 327 MB peak (the whole ffmpeg program) | third part, live recording |
+| Starts at once | 113–141 ms through Direct3D 12, also after 150 s idle | third part, start-up |
+| Quality when still | Exact pixels (the lossless still) | by construction |
+| Quality when changing | Closeness 0.98 on the real page, 0.997 on interface work | second part |
+| A model can read it | Claude read the same text from source and encodes: typing, mid-scroll, and 12–13 pixel grey text beside the playing video | first and third parts |
+| Reading one moment back | 171 ms worst case with a key picture every 5 s (software decoder) | third part |
 
-Mixed interface work, 60 s:
+Against today's recorder, the recommended method needs about 5–9 % of the file size on the real page.
 
-| method | MB per minute |
+## Why each choice
+
+- **Video plus exact still:** it is what the leading screen products do. Citrix: "Build to lossless compresses the screen using H.264 (or H.265) during screen activity and sharpens to pixel perfect (lossless) when activity stops." (P34) PCoIP: "Unchanged regions of the image progressively build to a lossless (perfect) quality…" (P51)
+- **HEVC from the graphics chip:** smallest at equal closeness of everything that ran (4.0 MB per minute against 6.9 for x264 4:2:0 and 7.2 for hardware H.264), at 0.13–0.15 of one core.
+- **Direct3D 12, not Media Foundation:** the same Intel encoder started in 113–141 ms through Direct3D 12 and in 0.9–2.7 s through Media Foundation. The current recorder's 1.7 s start came from that route.
+- **Key picture every 5 s:** costs 47 % more than every 30 s (4.7 against 3.2 MB per minute) and cuts the worst-case fetch from 460 ms to 171 ms.
+- **Windows' own software H.264 as fallback:** it ships with Windows. x264 was smaller (4.3 against about 18 MB per minute at closeness 0.98) but it is "released under the terms of the GNU GPL" (P56).
+- **Text and event track later:** screenpipe pairs "each screenshot with accessibility tree data" (P13); UI Automation events remove "the need to continually poll the UI elements" (P41). Codex and Opus both put this in their first choice (opinions).
+
+## Why not the alternatives (measured)
+
+| alternative | result |
 |---|---|
-| Intel hardware HEVC, at closeness 0.997 | 0.5 |
-| + exact stills at the 4 settle points | + 0.06 |
-| lossless video (x264 RGB) | 15.7 |
-| lossless stills of every changed picture | 10.0 |
+| Lossless stills of every changed picture | 790 MB per minute on the real page; encoding took 361 s for 40 s |
+| Lossless video | 11–28 MB per minute on text and interface scenes; thousands on video |
+| Today's design (lossless layer + moving rectangle) | 187 MB per minute; frames lost when the rectangle changed (#290) |
+| AV1 from the graphics chip | Not usable on this PC: Intel's library says "Current codec type is unsupported"; the Media Foundation AV1 encoder wrote files with no readable video |
+| AV1 in software (libaom) | Same size as Intel HEVC on interface work (0.5), but 0.3–0.5 of one core, and below closeness 0.98 on the real page in the range tested |
+| HEVC screen profile | Valid file, but not smaller at the setting compared, and ffmpeg's software decoder cannot read it |
+| Hardware H.264 | Works; about 1.8 times the size of HEVC at equal closeness |
 
-### Quality
-- Whenever the window is still, the clip holds its exact pixels (the still).
-- While it changes, the video was close to the source: 0.98 on the real page, 0.997 on mixed interface work.
-- Claude read the same text, character for character, from the source and from the Intel HEVC, x264 and SVT-AV1 outputs, in a typing frame and in a frame taken in the middle of a scroll.
+## What is still not known
 
-### CPU
-- Intel hardware HEVC: 0.13–0.15 of one core on the real page. The two Intel hardware encoders were the lowest of everything measured (H.264: 0.10–0.18).
-- Fallback x264 4:4:4: 0.37–0.60 of one core on the test scenes.
-
-### Why not the alternatives (all measured here)
-- **Stills only, on every change:** 790 MB per minute on the real page, and encoding them took 361 s for 40 s of recording. With a video on screen, 742 of 800 pictures changed.
-- **Lossless video:** 11–28 MB per minute on text and interface scenes, 4,631 on the test video.
-- **The current design:** 187 MB per minute, and it lost frames when its moving rectangle changed (issue #290).
-- **AV1:** Intel's hardware AV1 does not exist on this PC ("Current codec type is unsupported"). Software libaom AV1 matched Intel HEVC's size on the mixed scene (0.5 MB per minute) but used 0.3–0.5 of one core and did not reach closeness 0.98 on the real page within the range tested. NVIDIA's encoders could not be tested (driver too old for this ffmpeg).
-- **HEVC screen profile:** not smaller than the plain profile at the setting compared, and ffmpeg's software decoder cannot read it.
-- **Plain H.264 from the graphics chip:** works, about 1.8 times the size of HEVC at equal closeness on the real page (7.2 against 4.0 MB per minute).
-
-## What is NOT yet known (must be measured before this is built as the product)
-
-- **RAM of a purpose-built recorder.** Only ffmpeg's own peak was measured (484–568 MB for the Intel encoders, including its source reader).
-- **Start-up.** Through ffmpeg the Intel encoders started in about 300–400 ms, once 919 ms; x264 in about 45 ms. Earlier, through the Media Foundation sink writer, an Intel encoder start took 1.7 s after idle time. Which programming route the product uses decides this; frames from the first moments must be held until the encoder is ready, or the software encoder used for the start.
-- **Reading back.** Whether every PC that reads the clip can decode HEVC, and how fast one exact moment can be fetched with a long key-picture distance. The exact stills double as entry points; not measured.
-- **Text that sits beside a playing video.** With whole-window settling it stays video-quality until the whole window stops. The real page had only 4 settle points in 40 s. Citrix's newer default settles by region (P1); that is more complex and was not measured.
-- **Small and coloured text.** The reading test used dark text of about 16–18 pixels.
-- **Other PCs.** One PC, one run per test, test pages plus one real page.
-- **HEVC licence terms** for shipping an encoder path. Not researched.
+- **The NVIDIA encoders.** Three routes failed on this PC's driver ("Required: 13.1 Found: 13.0"; two Direct3D 12 errors). Testing them needs a driver update, which is the owner's call.
+- **Other PCs.** Everything was measured on one PC with Intel graphics. AMD graphics and older PCs were not tested.
+- **A recorder written for the product.** The figures come from ffmpeg standing in for the recorder. A purpose-built one may use less memory; that is not measured.
+- **Direct3D 12 at its best size.** Through ffmpeg it wrote about twice the size of Intel's own library at equal closeness (about 8 against 4.0 MB per minute). Whether better settings close that gap was not tested.
+- **Exact text beside a playing video.** It is readable (measured) but stays video-quality until the whole window settles; the real page settled 4 times in 40 s. Settling by region, as Citrix's newer default does (P1), was not measured.
+- **HEVC licence.** The patent pool says: "We license HEVC Decoders and HEVC Encoders in Consumer HEVC Products, whether made available in devices, software, or through Cloud Based Services" (P55). It does not say who pays when a program only uses the encoder already in the PC's graphics chip. That needs a legal answer, not more reading.
+- **HEVC on the reading PC.** This PC has Microsoft's HEVC extension installed; others may not.
 
 ## Suggested first step
-Build the smallest version of steps 1 and 2 as a probe (not in the product), record the same real page through it, and measure size, CPU, RAM, start-up and read-back time against the numbers above.
+
+Build the smallest version of steps 1–3 as a separate probe (not in the product): Windows.Graphics.Capture → Direct3D 12 HEVC → file, plus the settled still. Record the same real page and compare with the tables in `measurements.md`.

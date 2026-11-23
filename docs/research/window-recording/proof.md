@@ -287,6 +287,23 @@ Source: https://forums.developer.nvidia.com/t/231994.json (a user's question)
 - "When the text color is Geen(ForeColor)/Black(BackColor)， the text in output.h264 created by NvFBCToGLEnc will blurred."
 - The fix by switching to YUV 4:4:4 was not in the text read. Not proven.
 
+### P55. HEVC patent pool: what it licenses
+Source: https://accessadvance.com/topic-what-do-we-license/
+- "We license HEVC Decoders and HEVC Encoders in Consumer HEVC Products, whether made available in devices, software, or through Cloud Based Services."
+- "We seek to be paid one royalty per device/software copy on First Sale."
+- "Royalties are due for HEVC Software Sold separately from a device…"
+- Not on the page: who pays when a program only uses the encoder already in the PC's graphics chip.
+
+### P56. x264 licence
+Source: https://www.videolan.org/developers/x264.html
+- "x264 is a free software library and application for encoding video streams into the H.264/MPEG-4 AVC compression format, and is released under the terms of the GNU GPL."
+- "In addition to being free to use under the GNU GPL, x264 is also available under a commercial license."
+
+### P57. Windows has Media Foundation transforms for HEVC
+Sources: https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-video-decoder , https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-video-encoder
+- "The Media Foundation H.265 video decoder is a Media Foundation Transform that supports decoding H.265/HEVC content…"
+- "The Media Foundation H.265 video encoder is a Media Foundation Transform that supports encoding content into the H…" (cut by the reader)
+
 **Still not readable after the retry:** Playwright's video settings (address returned 404), ffmpeg's wiki (no connection), the 47 % YouTube figure (not on the page), WebRTC zero-hertz behaviour (only the bug reference "go/rtc-0hz-present" was readable).
 
 ---

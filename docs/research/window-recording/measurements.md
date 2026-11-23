@@ -237,3 +237,92 @@ Measured by Claude on 2026-11-23, one run each (scripts `real-capture.mjs`, `mea
 ### Intel HEVC screen profile: the file is good, ffmpeg's software decoder is not
 
 One file of the typing scene, encoded with `hevc_qsv -profile:v scc`: ffprobe reports profile "Scc". Decoded with ffmpeg's software decoder the closeness to the source is 0.2699; decoded with the Intel hardware decoder (`-c:v hevc_qsv`) it is 0.9995. So the earlier "broken picture" came from the software decoder, not from the encoder. At the one setting compared, the screen profile was not smaller than the plain profile (typing 0.1 against 0.1, ui 1.1 against 1.0, scroll 3.0 against 2.7, mix 0.7 against 0.6 MB per minute).
+
+
+# Third measurement: Windows routes to the encoders, read-back, start-up, a live recording
+
+Measured by Claude on 2026-11-23, one run each (scripts `measure3.py`, `real-capture.mjs` with `MODE=live`).
+
+## The same Intel encoder through different programming routes
+
+Real YouTube page and the mixed scene. Each cell: MB per minute (closeness) at three quality levels, low to high size.
+
+| route | scene | lowest | middle | highest | CPU |
+|---|---|---|---|---|---|
+| Intel HEVC via Media Foundation | real-youtube | 3.8 (0.9711) | 7.0 (0.9796) | 13.2 (0.9842) | 0.14–0.18 |
+| Intel AV1 via Media Foundation | real-youtube | file not readable | file not readable | file not readable | 0.48–0.69 |
+| Intel H.264 via Media Foundation | real-youtube | 7.6 (0.9657) | 11.4 (0.9766) | 22.1 (0.9830) | 0.16–0.18 |
+| Intel HEVC via Direct3D 12 | real-youtube | 1.9 (0.9531) | 4.6 (0.9745) | 11.5 (0.9833) | 0.12–0.14 |
+| Microsoft software H.264 via Media Foundation | real-youtube | 6.6 (0.9663) | 11.3 (0.9758) | 20.7 (0.9822) | 0.38–0.41 |
+| Intel HEVC via Media Foundation | mix | 0.7 (0.9972) | 1.2 (0.9976) | 2.2 (0.9978) | 0.16–0.18 |
+| Intel AV1 via Media Foundation | mix | file not readable | file not readable | file not readable | 0.49–0.59 |
+| Intel H.264 via Media Foundation | mix | 1.9 (0.9963) | 2.8 (0.9967) | 4.7 (0.9975) | 0.12–0.15 |
+| Intel HEVC via Direct3D 12 | mix | 0.5 (0.9959) | 0.7 (0.9975) | 1.7 (0.9978) | 0.11–0.14 |
+| Microsoft software H.264 via Media Foundation | mix | 1.2 (0.9950) | 2.0 (0.9962) | 3.5 (0.9971) | 0.32–0.34 |
+
+- **Intel AV1 through Media Foundation:** Windows lists an "Intel® Hardware Accelerated AV1 Encoder MFT" and it accepted frames, but ffprobe found no video stream in any of its six files. It is not usable on this PC as tested. Intel's own library reports "Current codec type is unsupported".
+- **H.264 through Media Foundation** came out as "Constrained Baseline" profile, from both the Intel hardware encoder and Microsoft's software encoder.
+- **First attempt failed for a file-format reason:** these encoders give Matroska no header data ("Could not write header"). The figures above are from MP4 files.
+- **NVIDIA through Direct3D 12** (adapter 1): AV1 failed with "Driver does not support requested features", HEVC with "Encode failed: Unknown error occurred." Together with the earlier driver-version error, three routes to the NVIDIA encoders failed. They remain untested.
+
+## Start-up time by route (program start to one encoded 1920 × 1080 picture)
+
+| route | when | first start | second start |
+|---|---|---|---|
+| Intel H.264 via Media Foundation | back to back | 946 ms | 1578 ms |
+| Intel HEVC via Media Foundation | back to back | 893 ms | 888 ms |
+| Intel HEVC via Direct3D 12 | back to back | 141 ms | 122 ms |
+| Intel H.264 via Media Foundation | after 150 s with no encoder use | 2145 ms | 1123 ms |
+| Intel HEVC via Media Foundation | after 150 s with no encoder use | 2718 ms | 861 ms |
+| Intel HEVC via Direct3D 12 | after 150 s with no encoder use | 120 ms | 113 ms |
+| Intel HEVC through Intel's library (earlier table) | back to back | 919 ms | 410 ms |
+| Intel HEVC through Intel's library (earlier table) | after 150 s with no encoder use | 400 ms | 394 ms |
+
+The slow start belongs to the Media Foundation route: about 0.9–1.6 s normally and 2.1–2.7 s on the first start after idle. The same Intel HEVC encoder started in 113–141 ms through Direct3D 12, idle or not. This matches the 1.7 s start the current recorder showed (it uses the Media Foundation sink writer).
+
+## Reading one exact moment back, and the cost of closer key pictures
+
+Intel HEVC (Intel's library, quality 26) on the real page:
+
+| key picture every | MB per minute | closeness |
+|---|---|---|
+| 30 s | 3.17 | 0.9777 |
+| 5 s | 4.66 | 0.9780 |
+| 1 s | 11.09 | 0.9793 |
+
+Time to fetch one picture (starting the ffmpeg program included, about 35 ms):
+
+| key picture every | decoder | at 1 s | at 14.95 s | at 29.9 s | at 39 s |
+|---|---|---|---|---|---|
+| 30 s | software decoder | 91 ms | 275 ms | 460 ms | 189 ms |
+| 30 s | Intel hardware decoder | 237 ms | 1482 ms | 2735 ms | 998 ms |
+| 5 s | software decoder | 94 ms | 171 ms | 144 ms | 110 ms |
+| 5 s | Intel hardware decoder | 194 ms | 426 ms | 437 ms | 371 ms |
+| 1 s | software decoder | 121 ms | 114 ms | 108 ms | 102 ms |
+| 1 s | Intel hardware decoder | 183 ms | 186 ms | 170 ms | 178 ms |
+
+The software decoder fetched single pictures faster than the hardware decoder in every case.
+
+## A live recording on the graphics chip
+
+ffmpeg recorded the real YouTube window for 40 s as it happened: Windows.Graphics.Capture → Intel HEVC encoder, with the pictures staying on the graphics chip (`gfxcapture … hwmap=derive_device=qsv … hevc_qsv -global_quality 24 -g 100`). Same actions as before (scroll, typing, pause).
+
+| measure | value |
+|---|---|
+| file | 7.42 MB for 40 s = 11.1 MB per minute |
+| pictures written | 734 (the window delivered no new picture in 66 of 800 instants) |
+| processor time of the recorder | 1.39 s over 40.9 s = 0.034 of one core |
+| peak memory of the recorder | 327 MB |
+
+- The 5.7 s shown as "first output" by the test script is when the output file first had bytes on disk. ffmpeg buffers its writes, so this is not a start-up time. Start-up is in the table above.
+- No lossless twin exists for this live run, so its closeness to the source was not measured.
+
+## Reading test on the real page: small text beside the playing video
+
+Taken at 5 s, while the video plays. Source, Intel HEVC (quality 26) and x264 4:4:4 (CRF 23), stacked.
+- Grey text of about 12–13 pixels in the side column (`read-real-small.png`, enlarged twice): "A Small Miracle: Part 1", "Peter", "5.4M 6y ago". Claude read the same in all three.
+- White titles under the thumbnails (`read-real-stack.png`): "THE", "The Toad", "Zog's First". Same in all three.
+
+## On this PC, Windows can read these formats
+
+Installed packages: Microsoft.HEVCVideoExtension 2.5.33.0, Microsoft.AV1VideoExtension 2.0.30.0, Microsoft.VP9VideoExtensions 1.2.20.0. Whether other PCs have them was not checked.

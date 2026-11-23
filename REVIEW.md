@@ -17,3 +17,6 @@ Continuation 2 exact verification | scripts/clip-equation/results/dyn-exact-gree
 Step 2 moving encoder | crates/synapse-mcp/src/server/clip_moving.rs:1 | Added bounded cropped-frame delivery, exact sample numbering, segment verification, sticky hardware failure, and CPU accounting.
 Step 2 decoder | crates/synapse-mcp/src/server/clip_decoder.rs:147 | Kept sequential reads continuous across keyframe boundaries after fragmented MP4 seek failures.
 Step 2 evidence | scripts/clip-equation/results/dyn-moving-cont3-fixed.txt:1 | All eight checks pass, 2400 encoded frames map correctly, queue peak 5/8, encoder creation 219–231 ms; workspace check still fails at old worker/viewer callers awaiting steps 4 and 6.
+Step 3 motion rule | crates/synapse-mcp/src/server/clip_motion.rs:1 | Added shared block geometry, temporal windows, measured exact-cost admission, largest connected group, alignment, and hold rules.
+Step 3 split | crates/synapse-mcp/src/server/clip_layers.rs:1 | Orders source conversion, motion, cropped coding, frozen exact writes, cost feedback, and repeat restoration.
+Step 3 proof | scripts/clip-equation/spec/dyn-motion.mjs:1 | Added eight deterministic scenes and corpus checks; red rejects absent layers mode; first run passes geometry/exactness but misses noise/video quality with named queue losses.

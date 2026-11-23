@@ -260,6 +260,90 @@ fn moving(folder: &Path, out: &Path, args: &HashMap<String, String>) -> Result<(
     Ok(())
 }
 
+fn layers(folder: &Path, out: &Path) -> Result<()> {
+    use crate::clip_layers::ClipLayers;
+    let mut corpus = Corpus::open(folder)?;
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let mut index = File::create(out.join("frames.jsonl")).map_err(|e| e.to_string())?;
+    let ram = RamMeter::start();
+    let mut spent = Spent::default();
+    let mut layers = ClipLayers::start(out, corpus.lines[0].width, corpus.lines[0].height, PROBE_FPS)?;
+    let mut entries = Vec::new();
+    let mut lines = Vec::new();
+    let mut segments = Vec::new();
+    let mut bgra = Vec::new();
+    let start = std::time::Instant::now();
+    for i in 0..corpus.lines.len() {
+        let deadline = start + std::time::Duration::from_millis(i as u64 * MILLISECONDS_PER_SECOND / u64::from(PROBE_FPS));
+        if let Some(delay) = deadline.checked_duration_since(std::time::Instant::now()) { std::thread::sleep(delay); }
+        corpus.load(i)?;
+        let line = &corpus.lines[i];
+        let written = if line.new {
+            bgra.clear();
+            bgra.extend(corpus.picture.chunks_exact(BGR_CHANNELS).flat_map(|p| [p[0], p[1], p[2], u8::MAX]));
+            spent.time(|| layers.picture(line.instant, &bgra, line.width, line.height))?
+        } else { spent.time(|| layers.repeat(line.instant))? };
+        if let Some(exact) = written.exact { entries.push(ExactEntry { instant: line.instant, exact, width: line.width, height: line.height }); }
+        segments.extend(written.committed);
+        let mut stored = json!({ "instant": line.instant, "t_ms": line.t_ms, "new": line.new,
+            "width": line.width, "height": line.height });
+        if let Some(exact) = written.exact { stored["x"] = json!(exact); }
+        if let Some(moving) = written.moving { stored["mv"] = json!(moving); }
+        if let Some(rect) = written.moving_rect { stored["mv_rect"] = json!(rect); }
+        if written.moving_behind { stored["lost"] = json!("moving_behind"); }
+        serde_json::to_writer(&mut index, &stored).map_err(|e| e.to_string())?;
+        index.write_all(b"\n").map_err(|e| e.to_string())?;
+        lines.push(stored);
+    }
+    let cpu_ns = spent.cpu_ns + layers.cpu_hns() as u64 * 100;
+    let mut summary = layers.finish()?;
+    segments.append(&mut summary.moving.committed);
+    segments.sort_by_key(|s| s.index);
+    let ram_peak = ram.read().ram;
+    let mut exact = ExactReader::open(out, entries)?;
+    let mut decoder: Option<(u32, ClipDecoder)> = None;
+    let mut outside_mismatches = 0u64;
+    let mut scores = Vec::new();
+    for i in 0..lines.len() {
+        corpus.load(i)?;
+        let line = &lines[i];
+        let segment = line["mv"][0].as_u64().and_then(|id| segments.iter().find(|s| u64::from(s.index) == id));
+        let rect = segment.map(|s| s.rect);
+        let (picture, width, height) = exact.picture_at(corpus.lines[i].instant)?;
+        for row in 0..height {
+            let stride = width as usize * BGR_CHANNELS;
+            let parts = match rect.filter(|r| row >= r.y && row < r.bottom()) {
+                Some(r) => [0..r.x as usize * BGR_CHANNELS, r.right() as usize * BGR_CHANNELS..stride],
+                None => [0..stride, stride..stride],
+            };
+            for part in parts {
+                let first = row as usize * stride + part.start;
+                let end = row as usize * stride + part.end;
+                outside_mismatches += picture[first..end].iter().zip(&corpus.picture[first..end]).filter(|(a,b)| a != b).count() as u64;
+            }
+        }
+        if let Some(segment) = segment {
+            if decoder.as_ref().is_none_or(|(id, _)| *id != segment.index) { decoder = Some((segment.index, ClipDecoder::open(&out.join(&segment.file))?)); }
+            let number = line["mv"][1].as_u64().ok_or("missing moving frame")? as u32;
+            let decoded = decoder.as_mut().ok_or("missing decoder")?.1.frame_number(number, &segment.key_frames)?;
+            let rect = segment.rect;
+            let luma = crate::exp_d::luma_of_bgra(&decoded.bgra, decoded.width as usize, rect.w as usize, rect.h as usize);
+            let source = source_luma(&mut corpus, i, rect)?;
+            scores.push(crate::exp_d::ssim(&source, &luma, rect.w as usize, rect.h as usize));
+        }
+    }
+    let mean_ssim = if scores.is_empty() { 1.0 } else { scores.iter().sum::<f64>() / scores.len() as f64 };
+    let report = json!({ "lines": lines, "segments": segments, "exact": summary.exact,
+        "unavailable": summary.moving.unavailable, "grant": summary.moving.grant, "short": summary.moving.short,
+        "outside_mismatches": outside_mismatches, "mean_ssim": mean_ssim, "cpu_ns": cpu_ns, "ram_peak": ram_peak,
+        "constants": { "BLOCK": crate::clip_motion::BLOCK, "MOVING_COST_SHARE": crate::clip_motion::MOVING_COST_SHARE,
+        "MOVING_HOLD_MS": crate::clip_motion::MOVING_HOLD_MS, "SHORT_LIVED_MS": crate::clip_motion::SHORT_LIVED_MS,
+        "ANIMATING_CHANGE_SHARE": crate::clip_motion::ANIMATING_CHANGE_SHARE } });
+    serde_json::to_writer(File::create(out.join("layers.json")).map_err(|e| e.to_string())?, &report).map_err(|e| e.to_string())?;
+    println!("{report}");
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let args: HashMap<String, String> = std::env::args()
         .skip(2)
@@ -273,6 +357,7 @@ pub fn run() -> Result<()> {
     match args.get("mode").map(String::as_str) {
         Some("exact") => exact(folder, out),
         Some("moving") => moving(folder, out, &args),
-        _ => Err("exp-dyn requires mode=exact or mode=moving".into()),
+        Some("layers") => layers(folder, out),
+        _ => Err("exp-dyn requires mode=exact, mode=moving or mode=layers".into()),
     }
 }

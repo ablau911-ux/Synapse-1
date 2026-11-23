@@ -1008,6 +1008,14 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: continuation 3, step 3 acceptance gaps
+
+The first combined-layer run passed the exact-byte and geometry checks: scene 1 opened at 44, ended at 134, restored exact rows at 135, and wrote no exact record while the box stayed open. The minimum size, minimum side, flat-colour cost, slow-change share, largest-group, odd alignment, corner clamp, typing and UI checks passed.
+
+Two quality gates remain open: scene 1 measured mean SSIM-Y 0.6920073488, with 28 `moving_behind` instants (52–79); video measured 0.9421424366, with 27 `moving_behind` instants (13–39). The hardware grant was quality 90, GOP 20, zero B-frames in both. The combined path's initial queue saturation needs investigation; the isolated step-2 path had no queue losses. The queue bound and quality requirement are unchanged. Per the continuation instruction, implementation proceeds with these measured failures recorded.
+
+`Recording` initializes its layers after the first frame reveals its dimensions, so the field is an `Option<ClipLayers>` until frame zero is accepted. The first-picture and repeat paths fail if initialization is absent. This resolves the specification's field/initialization ordering without an extra pass-through type.
+
 ### 2026-11-23: continuation 3, step 2 integration and seek
 
 The inherited step-2 code builds in the probe. The workspace check still references the deleted encoder API in the old worker and the old timestamp API in the viewer; those callers are replaced in steps 4 and 6. The step-2 check is therefore not a workspace-green claim. Its diagnostics are saved in `results/step2-check.stderr.txt`.

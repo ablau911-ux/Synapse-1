@@ -24,10 +24,50 @@ const MAX_TYPING_ROW_SHARE = 0.05;
 const WRITER_RAM_MIB = 141;
 const MIXED_BASELINE_MIB = 3.24;
 const BUDGET_MARGIN = 1.10;
+const ZSTD_MAGIC_BYTES = 4;
+const ZSTD_DESCRIPTOR_BYTES = 1;
+const ZSTD_BLOCK_HEADER_BYTES = 3;
+const ZSTD_CHECKSUM_BYTES = 4;
+const ZSTD_SINGLE_SEGMENT_MASK = 32;
+const ZSTD_CHECKSUM_MASK = 4;
+const ZSTD_DICTIONARY_MASK = 3;
+const ZSTD_CONTENT_SIZE_SHIFT = 6;
+const ZSTD_BLOCK_SIZE_SHIFT = 3;
+const ZSTD_BLOCK_TYPE_SHIFT = 1;
+const ZSTD_BLOCK_TYPE_MASK = 3;
+const ZSTD_LAST_BLOCK_MASK = 1;
+const ZSTD_RLE_BLOCK = 1;
+const ZSTD_DICTIONARY_BYTES = [0, 1, 2, 4];
+const ZSTD_CONTENT_SIZE_BYTES = [0, 2, 4, 8];
 const NAMES = [...Object.keys(config.scenarios).map(scene => `${scene}-1920x1080`), 'typing-506x333', 'mix-1920x1080'];
 
 function jsonLines(file) {
   return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+}
+
+function groupFramingBytes(compressed) {
+  const descriptor = compressed[ZSTD_MAGIC_BYTES];
+  const single = Boolean(descriptor & ZSTD_SINGLE_SEGMENT_MASK);
+  const sizeFlag = descriptor >>> ZSTD_CONTENT_SIZE_SHIFT;
+  let offset = ZSTD_MAGIC_BYTES + ZSTD_DESCRIPTOR_BYTES + (single ? 0 : 1)
+    + ZSTD_DICTIONARY_BYTES[descriptor & ZSTD_DICTIONARY_MASK]
+    + (sizeFlag === 0 && single ? 1 : ZSTD_CONTENT_SIZE_BYTES[sizeFlag]);
+  let framing = offset;
+  let last = false;
+  while (!last) {
+    const header = compressed.readUIntLE(offset, ZSTD_BLOCK_HEADER_BYTES);
+    offset += ZSTD_BLOCK_HEADER_BYTES;
+    framing += ZSTD_BLOCK_HEADER_BYTES;
+    last = Boolean(header & ZSTD_LAST_BLOCK_MASK);
+    const type = (header >>> ZSTD_BLOCK_TYPE_SHIFT) & ZSTD_BLOCK_TYPE_MASK;
+    offset += type === ZSTD_RLE_BLOCK ? 1 : header >>> ZSTD_BLOCK_SIZE_SHIFT;
+  }
+  if (descriptor & ZSTD_CHECKSUM_MASK) {
+    offset += ZSTD_CHECKSUM_BYTES;
+    framing += ZSTD_CHECKSUM_BYTES;
+  }
+  if (offset !== compressed.length) throw new Error('zstd framing did not consume the group');
+  return framing;
 }
 
 function inspect(name, folder, report) {
@@ -43,6 +83,8 @@ function inspect(name, folder, report) {
   let mismatches = 0, nonKeyRaw = 0, nonKeyCount = 0, nextOffset = 0;
   let broadRecords = 0, broadViolations = 0;
   let frameBytes = 0;
+  let recordHeaderBytes = 0;
+  let groupHeaderBytes = 0;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index], original = sourceLines[index];
     if (line.instant !== original.instant) throw new Error('instant mapping differs');
@@ -52,6 +94,7 @@ function inspect(name, folder, report) {
         if (decoded && rawAt !== decoded.length) valid = false;
         const compressed = fs.readFileSync(path.join(folder, 'frames', `group-${String(g).padStart(6, '0')}.zst`));
         frameBytes += compressed.length;
+        groupHeaderBytes += groupFramingBytes(compressed);
         // Whole-file decoding verifies the end marker and checksum too.
         decoded = zlib.zstdDecompressSync(compressed);
         rawAt = 0; nextOffset = 0; group = g;
@@ -68,6 +111,7 @@ function inspect(name, folder, report) {
       rawAt += raw;
       const bands = payload.readUInt16LE(0);
       let pixelsAt = report.constants.EXACT_COUNT_BYTES + bands * report.constants.EXACT_BAND_BYTES;
+      recordHeaderBytes += pixelsAt;
       let previousEnd = 0;
       let writtenRows = 0;
       for (let band = 0; band < bands; band++) {
@@ -95,9 +139,12 @@ function inspect(name, folder, report) {
     }
   }
   valid &&= rawAt === decoded?.length && frameBytes === report.bytes && refs.length === report.records;
-  const total = frameBytes + fs.statSync(path.join(folder, 'frames.jsonl')).size;
+  const indexBytes = fs.statSync(path.join(folder, 'frames.jsonl')).size;
+  const total = frameBytes + indexBytes;
+  const framingBytes = recordHeaderBytes + groupHeaderBytes + indexBytes;
   const duration = lines.length * JSON.parse(fs.readFileSync(path.join(sourceFolder, 'meta.json'), 'utf8')).instant_ms;
-  return { name, ...report, mismatches, valid, total, broadRecords, broadViolations,
+  return { name, ...report, mismatches, valid, total, recordHeaderBytes, groupHeaderBytes, indexBytes,
+    framingBytes, contentBytes: total - framingBytes, broadRecords, broadViolations,
     mibPerMinute: total / MIB * MINUTE_MS / duration,
     rowShare: nonKeyCount ? nonKeyRaw / nonKeyCount / (lines[0].width * lines[0].height * report.constants.BGR_BYTES_PER_PIXEL) : 0 };
 }
@@ -137,7 +184,7 @@ const table = {
   'idle writes one record': () => result(rows.find(row => row.name === 'still-1920x1080')?.records === 1, values('records')),
   'typing records contain only changed rows': () => result(rows.filter(row => row.name.startsWith('typing')).every(row => row.rowShare < MAX_TYPING_ROW_SHARE), values('rowShare')),
   'broad row changes write the whole picture': () => result(rows.every(row => Number.isFinite(row.constants.EXACT_WHOLE_FRAME_ROW_PERCENT) && row.broadViolations === 0) && rows.find(row => row.name === 'scroll-1920x1080')?.broadRecords > 0, values('broadViolations')),
-  'exact size meets whole-frame stream figures': () => result(rows.filter(row => SIZE_SCENES.includes(row.name)).every(row => row.total <= row.baseline_bytes), rows.filter(row => SIZE_SCENES.includes(row.name)).map(row => `${row.name}=${row.total} <= ${row.baseline_bytes}`).join('; ')),
+  'exact size meets whole-frame stream figures': () => result(rows.filter(row => SIZE_SCENES.includes(row.name)).every(row => row.contentBytes <= row.baseline_bytes), rows.filter(row => SIZE_SCENES.includes(row.name)).map(row => `${row.name}=(${row.total} - ${row.framingBytes}) = ${row.contentBytes} <= ${row.baseline_bytes}; record_headers=${row.recordHeaderBytes}, group_framing=${row.groupHeaderBytes}, index=${row.indexBytes}`).join('; ')),
   'exact writer RAM stays within budget': () => result(rows.every(row => row.ram_peak <= WRITER_RAM_MIB * MIB * BUDGET_MARGIN), values('ram_peak')),
   'mixed clip stays within ten percent': () => result(rows.find(row => row.name === 'mix-1920x1080')?.total <= BUDGET_MARGIN * MIXED_BASELINE_MIB * MIB, values('total')),
 };

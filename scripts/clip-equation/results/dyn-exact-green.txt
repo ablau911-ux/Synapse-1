@@ -1,0 +1,17 @@
+Command: node scripts/clip-equation/spec/run-spec.mjs dyn-exact out=C:/Users/Adam/Synapse-clip/.runs/dyn-exact-cont2
+Exit: 0
+corpus pictures round trip independently: PASS; all eight inputs have 0 mismatching bytes
+product reader matches every instant and backward seeks: PASS; all eight inputs have 0 mismatching bytes
+groups are complete independent zstd frames: PASS
+idle writes one record: PASS; records=1
+typing records contain only changed rows: PASS; 1080p=0.013828158340954123; 506x333=0.04532431714396288
+exact size meets whole-frame stream figures: PASS
+typing-1920x1080=(93676 - 37141) = 56535 <= 179219; record_headers=886, group_framing=1685, index=34570
+flash-1920x1080=(791663 - 54642) = 737021 <= 975098; record_headers=4616, group_framing=8456, index=41570
+scroll-1920x1080=(3329582 - 108541) = 3221041 <= 3298546; record_headers=2400, group_framing=63695, index=42446
+ui-1920x1080=(1988077 - 56440) = 1931637 <= 2317605; record_headers=4512, group_framing=10103, index=41825
+broad row changes write the whole picture: PASS; all eight inputs have 0 broad violations
+exact writer RAM stays within budget: PASS; maximum=160362496 bytes
+mixed clip stays within ten percent: PASS; retained=2823850 bytes
+dyn-exact: all passed
+Full per-scene measurements: .runs/dyn-exact-cont2/checks.json

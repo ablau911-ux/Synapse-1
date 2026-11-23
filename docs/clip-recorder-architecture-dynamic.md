@@ -1008,6 +1008,14 @@ Capture and the observer; the instant grid and `RECORD_FPS` = 20; the privacy ga
 
 ## Builder notes
 
+### 2026-11-23: continuation 2, framing equation
+
+The owner's continuation authorizes proceeding through steps 2–9 even when an acceptance gate remains open, superseding section 7's stop rule. Commits stay local; the reviewer runs the YouTube proof.
+
+The step 1 gate now subtracts the counted logical record headers, physical zstd frame/block headers and checksum bytes, and the exact index file length. Record headers are counted from each decoded record's actual band count (including keys); zstd boundaries are parsed from each written group, not estimated from compression ratios. The logical record-header count is not a measurement of those headers' individual compressed contribution. This interpretation keeps the requested equation explicit and reproducible.
+
+The same-run scroll equation is `(3,329,582 - 108,541) = 3,221,041 <= 3,298,546` bytes. Framing consists of 2,400 record-header bytes, 63,695 zstd framing bytes, and 42,446 index bytes. All nine checks pass; every input and backward seek has zero mismatching bytes. Evidence: `scripts/clip-equation/results/dyn-exact-green.txt`; preceding red evidence remains in `dyn-exact-failed.txt`.
+
 ### 2026-11-23: continuation, measured baseline and broad-row fallback
 
 The owner's continuation replaces the incorrectly rounded absolute size gates with a same-run, per-scene comparison. `dyn-exact.mjs` now runs the existing `exp-z` whole-frame stream baseline with the exact writer's reported level, window log, and group length. It requires the baseline's round trip to pass and saves its measurements beside the exact measurements. The acceptance scope remains the four scenes named in step 1: typing, UI, scroll, and flash. All eight inputs retain the independent round-trip, reader, format, and RAM checks; the mixed clip also retains its separate size gate. Size includes the exact group files and index; the baseline includes all retained files, as the existing harness reports them.

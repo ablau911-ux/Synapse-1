@@ -22,7 +22,7 @@ use super::{
 use crate::daemon_lifecycle::consume_panic_payload;
 use crate::m1::{
     CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
-    CdpTargetInfoParams, ObserveParams, echoed_value, error_code, mcp_error,
+    CdpTargetInfoParams, ObserveParams, echoed_text, echoed_value, error_code, mcp_error,
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
@@ -3834,7 +3834,7 @@ async fn target_act_cleanup_notepad_tabs_impl(
             format!(
                 "target_act verb=cleanup_notepad_tabs refused: Notepad target title {:?} does not match keep file SoT {}",
                 before.context.window_title,
-                keep_path.display()
+                echoed_value(&keep_path.to_string_lossy())
             ),
         ));
     }
@@ -4668,7 +4668,7 @@ fn target_act_cleanup_notepad_tabs_postcondition_error(
         before_signature.to_owned(),
         after_signature,
         json!({
-            "path": keep_path.display().to_string(),
+            "path": echoed_text(&keep_path.to_string_lossy()),
             "keep_file_name": keep_file_name,
             "before_tabs": before.tabs,
             "after_tabs": after.tabs,
@@ -4692,7 +4692,7 @@ fn target_act_file_name(path: &Path, verb: &str) -> Result<String, ErrorData> {
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
                     "target_act verb={verb} path must have a UTF-8 file name: {}",
-                    path.display()
+                    echoed_value(&path.to_string_lossy())
                 ),
             )
         })
@@ -4812,7 +4812,7 @@ async fn target_act_save_impl(
             format!(
                 "target_act verb=save refused: Notepad target title {:?} does not match file SoT {}",
                 context.window_title,
-                path.display()
+                echoed_value(&path.to_string_lossy())
             ),
         ));
     }
@@ -4938,7 +4938,7 @@ fn canonical_existing_file_for_target_act_path(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
                 "target_act verb={verb} requires an existing file path Source of Truth; {} could not be read: {error}",
-                path.display()
+                echoed_value(&path.to_string_lossy())
             ),
         )
     })?;
@@ -4947,7 +4947,7 @@ fn canonical_existing_file_for_target_act_path(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
                 "target_act verb={verb} path must be an existing file, got {}",
-                path.display()
+                echoed_value(&path.to_string_lossy())
             ),
         ));
     }
@@ -4956,7 +4956,7 @@ fn canonical_existing_file_for_target_act_path(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
                 "target_act verb={verb} failed to canonicalize file SoT {}: {error}",
-                path.display()
+                echoed_value(&path.to_string_lossy())
             ),
         )
     })
@@ -4977,7 +4977,7 @@ fn target_act_file_snapshot(path: &Path) -> Result<TargetActFileSnapshot, ErrorD
             error_codes::ACTION_POSTCONDITION_FAILED,
             format!(
                 "target_act verb=save file SoT read failed for {}: {error}",
-                path.display()
+                echoed_value(&path.to_string_lossy())
             ),
         )
     })?;
@@ -5094,7 +5094,7 @@ fn target_act_save_postcondition_error(
         before.sha256.clone(),
         after.sha256.clone(),
         json!({
-            "path": path.display().to_string(),
+            "path": echoed_text(&path.to_string_lossy()),
             "before_len": before.len,
             "after_len": after.len,
             "expected_text_sha256": expected_text_sha256,

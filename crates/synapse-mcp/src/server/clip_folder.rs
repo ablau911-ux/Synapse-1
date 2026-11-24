@@ -919,9 +919,9 @@ pub(super) struct RegistryEntry {
 /// before its `clip.json` exists. An entry stays after the clip finished,
 /// so `record_status` and `record_stop` still find a clip in another folder
 /// by its id; recovery at start visits only unfinished entries, so its work
-/// does not grow with finished clips. The default clips folder is not
-/// scanned: a clip recorded there before every clip was registered is not
-/// visited.
+/// does not grow with finished clips. A clip recorded in the default clips
+/// folder before every clip was registered is registered once at start
+/// (`register_default_folder`).
 pub(super) struct ClipRegistry;
 
 impl ClipRegistry {
@@ -1000,6 +1000,54 @@ impl ClipRegistry {
                 let folder = clips_root().join(clip_id);
                 folder.join(CLIP_JSON_FILE).is_file().then_some(folder)
             }))
+    }
+
+    /// Registers, unfinished, every folder under the default clips folder
+    /// that holds a `clip.json` of this recorder's format (or one that cannot
+    /// be read, for recovery to judge) and is not registered yet: a clip
+    /// recorded there before every clip was registered, which a crash may
+    /// have left `recording`. Its id is its folder name, as `folder_of` finds
+    /// it. Once registered, a folder is not read here again.
+    pub(super) fn register_default_folder() -> Result<(), String> {
+        let root = clips_root();
+        let listing = match std::fs::read_dir(&root) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("could not list {}: {error}", root.display())),
+        };
+        let registered = Self::entries()?;
+        let mut found = Vec::new();
+        for item in listing {
+            let folder = item
+                .map_err(|error| format!("could not list {}: {error}", root.display()))?
+                .path();
+            let Some(clip_id) = folder.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let known = registered
+                .iter()
+                .any(|entry| entry.clip_id == clip_id || entry.folder == folder);
+            if known || !folder.join(CLIP_JSON_FILE).is_file() {
+                continue;
+            }
+            if !matches!(ClipJson::other_format(&folder), Ok(Some(_))) {
+                found.push((clip_id.to_owned(), folder));
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        Self::change(|entries| {
+            for (clip_id, folder) in found {
+                if !entries.iter().any(|entry| entry.clip_id == clip_id) {
+                    entries.push(RegistryEntry {
+                        clip_id,
+                        folder,
+                        finished: false,
+                    });
+                }
+            }
+        })
     }
 
     /// Every clip that may need recovery: the entries not marked finished.

@@ -22,7 +22,8 @@
 //!   clip-probe exp-av1-recover runs the product's recovery on a clip folder in place:
 //!                            folder=<clip folder>
 //!   clip-probe exp-av1-registry runs one change of the product's clip registry under
-//!                            %LOCALAPPDATA%: action=mark_finished clip=<clip id>
+//!                            %LOCALAPPDATA%: action=mark_finished clip=<clip id>, or
+//!                            action=recover (the recovery the service runs at start)
 //!
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.

@@ -4,6 +4,7 @@
 //! folder of its own, so the user's registry is never touched.
 //!
 //!   clip-probe exp-av1-registry action=mark_finished clip=<clip id>
+//!   clip-probe exp-av1-registry action=recover   (the recovery the service runs at start)
 //!
 //! Prints one JSON line: ok, error. An error of the product is reported with ok=false and
 //! the run still exits 0: the check judges it.
@@ -12,13 +13,22 @@ use serde_json::json;
 
 use crate::Result;
 use crate::clip_folder::ClipRegistry;
+use crate::clip_recovery::ClipRecovery;
 use crate::exp_meter::Args;
 
 pub fn run() -> Result<()> {
     let args = Args::from_env();
     let outcome = match args.text("action")? {
         "mark_finished" => ClipRegistry::mark_finished(args.text("clip")?),
-        other => return Err(format!("unknown action={other}; use mark_finished")),
+        "recover" => {
+            ClipRecovery::recover_registered();
+            Ok(())
+        }
+        other => {
+            return Err(format!(
+                "unknown action={other}; use mark_finished or recover"
+            ));
+        }
     };
     let line = json!({ "ok": outcome.is_ok(), "error": outcome.err() });
     println!("{line}");

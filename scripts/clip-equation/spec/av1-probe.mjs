@@ -714,6 +714,32 @@ function registryKeptOnFailedRead() {
 }
 
 /**
+ * A clip the earlier code recorded in the default clips folder without registering it, left `recording`
+ * by a crash, with no registry at all (here under a LOCALAPPDATA of the bench's own): recovery at start
+ * reaches it. The clip is ready afterwards and the registry lists it, finished.
+ */
+function unregisteredDefaultClipRecovered() {
+  const appData = path.join(OUT, 'registry-unregistered');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const source = path.join(ROOT, 'killed-text-page');
+  const clipId = JSON.parse(fs.readFileSync(path.join(source, 'clip.json'), 'utf8')).clip_id;
+  const clips = path.join(appData, 'synapse', 'clips');
+  const folder = path.join(clips, clipId);
+  fs.cpSync(source, folder, { recursive: true });
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  if (!got.ok) problems.push(`recovery at start: ${got.error}`);
+  const state = JSON.parse(fs.readFileSync(path.join(folder, 'clip.json'), 'utf8')).state;
+  if (state !== 'ready') problems.push(`the unregistered clip is ${state} after recovery at start, not ready`);
+  const registry = path.join(clips, 'active-clips.json');
+  const entries = fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, 'utf8')) : [];
+  const entry = entries.find(e => e.clip_id === clipId);
+  if (!entry) problems.push(`the registry does not list the clip (${entries.length} entries)`);
+  else if (!entry.finished || path.resolve(entry.folder) !== folder) problems.push(`the registry lists the clip as ${JSON.stringify(entry)}`);
+  return verdict(problems, `unregistered clip ${clipId} in the default folder, left recording: recovery at start registered it, made it ready and marked it finished`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -827,6 +853,7 @@ const table = {
   'recovery treats an empty still as missing': emptyStillMissing,
   'recovery never deletes a still it could not read': heldStillKept,
   'a registry change never writes from a failed read': registryKeptOnFailedRead,
+  'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

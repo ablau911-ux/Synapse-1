@@ -605,9 +605,11 @@ fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
         {
             return enriched;
         }
+        // serde's text echoes the caller's value (`unknown variant`, `invalid
+        // type: string`), so it is bounded like an echoed value (#248).
         return mcp_error(
             synapse_core::error_codes::TOOL_PARAMS_INVALID,
-            error.message.to_string(),
+            crate::m1::echoed_text(&error.message),
         );
     }
     error

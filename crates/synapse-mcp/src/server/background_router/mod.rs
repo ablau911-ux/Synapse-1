@@ -340,7 +340,8 @@ impl<'de> Deserialize<'de> for TargetActClickModifier {
             "alt" | "option" => Ok(Self::Alt),
             "meta" | "super" | "cmd" | "command" => Ok(Self::Meta),
             other => Err(de::Error::custom(format!(
-                "unsupported click modifier {other:?}; expected ctrl, shift, alt, or meta"
+                "unsupported click modifier {}; expected ctrl, shift, alt, or meta",
+                echoed_value(other)
             ))),
         }
     }
@@ -5234,7 +5235,8 @@ async fn target_act_browser_dom_primitive(
                 return Err(mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "target_act verb={action} supports browser DOM/CDP targets only; native/UIA element_id {raw_element_id:?} is not supported by this primitive"
+                        "target_act verb={action} supports browser DOM/CDP targets only; native/UIA element_id {} is not supported by this primitive",
+                        echoed_value(raw_element_id)
                     ),
                 ));
             }
@@ -6834,7 +6836,8 @@ fn target_act_validate_bridge_cdp_input(
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "target_act verb={action} observed raw-CDP element_id {raw:?} requires a raw CDP endpoint; re-resolve the element through browser_locate for a chrome-tab:... bridge element id or use selector/role/name"
+                    "target_act verb={action} observed raw-CDP element_id {} requires a raw CDP endpoint; re-resolve the element through browser_locate for a chrome-tab:... bridge element id or use selector/role/name",
+                    echoed_value(raw)
                 ),
             ));
         }
@@ -7077,7 +7080,8 @@ async fn target_act_validate_observed_cdp_element_target(
             mcp_error(
                 error.code(),
                 format!(
-                    "target_act verb={verb} could not validate CDP frame ownership for element target {element_cdp_target_id:?} under session target {session_cdp_target_id:?}: {error}"
+                    "target_act verb={verb} could not validate CDP frame ownership for element target {} under session target {session_cdp_target_id:?}: {error}",
+                    echoed_value(element_cdp_target_id)
                 ),
             )
         })?;
@@ -7091,7 +7095,8 @@ async fn target_act_validate_observed_cdp_element_target(
     Err(mcp_error(
         error_codes::ACTION_ELEMENT_NOT_RESOLVED,
         format!(
-            "target_act verb={verb} element_id belongs to CDP target {element_cdp_target_id:?}, but that target is not the owned tab {session_cdp_target_id:?} or any currently attached frame target under it; re-resolve the element because its frame may be stale"
+            "target_act verb={verb} element_id belongs to CDP target {}, but that target is not the owned tab {session_cdp_target_id:?} or any currently attached frame target under it; re-resolve the element because its frame may be stale",
+            echoed_value(element_cdp_target_id)
         ),
     ))
 }
@@ -7283,8 +7288,10 @@ async fn target_act_locate_tap_element(
         return Err(mcp_error(
             error_codes::ACTION_ELEMENT_NOT_RESOLVED,
             format!(
-                "target_act verb={verb} found no element for {} query {:?} in target {:?}",
-                located.engine, located.query, located.target_id
+                "target_act verb={verb} found no element for {} query {} in target {:?}",
+                located.engine,
+                echoed_value(&located.query),
+                located.target_id
             ),
         ));
     };

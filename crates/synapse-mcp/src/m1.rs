@@ -4708,6 +4708,28 @@ pub(crate) fn echoed_value(value: &str) -> String {
     format!("{head:?}... ({total_chars} characters)")
 }
 
+/// Bounds error text that carries a caller-supplied value it cannot quote
+/// apart, such as a serde error text, or a value stored unquoted in error data
+/// (#248). Text of up to twice [`ECHOED_VALUE_MAX_CHARS`] characters is kept as
+/// is; longer text keeps that many characters from each end, so serde's
+/// `expected ...` tail survives, and states its full length.
+pub(crate) fn echoed_text(text: &str) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= 2 * ECHOED_VALUE_MAX_CHARS {
+        return text.to_owned();
+    }
+    let head = &text[..char_boundary(text, ECHOED_VALUE_MAX_CHARS)];
+    let tail = &text[char_boundary(text, total_chars - ECHOED_VALUE_MAX_CHARS)..];
+    format!("{head}... ({total_chars} characters) ...{tail}")
+}
+
+/// Byte index of the character at position `chars` in `text`.
+fn char_boundary(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(at, _)| at)
+}
+
 /// Reads the Synapse error code (`data.code`) that `mcp_error` stores on an error.
 pub(crate) fn error_code(error: &ErrorData) -> Option<&str> {
     error

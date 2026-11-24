@@ -5,7 +5,7 @@ use synapse_action::ActionError;
 use synapse_core::{Key, KeyCode, error_codes};
 
 use super::action_error_to_mcp;
-use crate::m1::mcp_error;
+use crate::m1::{echoed_value, mcp_error};
 
 const MODIFIER_ORDER: [&str; 4] = ["ctrl", "shift", "alt", "super"];
 
@@ -73,7 +73,7 @@ fn canonical_key_name(raw_key: &str) -> Result<String, ErrorData> {
         Ok(key.to_owned())
     } else {
         Err(action_error_to_mcp(&ActionError::UnsupportedKey {
-            detail: format!("act_press unsupported key '{raw_key}'"),
+            detail: format!("act_press unsupported key {}", echoed_value(raw_key)),
         }))
     }
 }

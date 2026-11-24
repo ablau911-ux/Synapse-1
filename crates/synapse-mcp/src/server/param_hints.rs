@@ -25,6 +25,8 @@ use rmcp::model::{ErrorCode, ErrorData};
 use serde_json::json;
 use synapse_core::error_codes;
 
+use crate::m1::echoed_text;
+
 /// rmcp wraps every `Parameters<T>` deserialize failure with this prefix
 /// (`rmcp::handler::server::tool`). We only enrich errors that carry it so we
 /// never touch domain errors that happen to share the INVALID_PARAMS code.
@@ -73,21 +75,23 @@ pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> O
     let hint =
         registry_hint(tool, parsed.field).or_else(|| generic_hint(parsed.field, &parsed.accepted));
 
+    // The caller's field name is echoed bounded (#248); the hints above match
+    // the full name.
+    let field = echoed_text(parsed.field);
+
     let (message, remediation, mut data) = match &hint {
         Some(Hint::DidYouMean { candidate }) => (
             format!(
-                "{tool}: unknown field `{}` — did you mean `{candidate}`? (facade fields are snake_case and fail-closed)",
-                parsed.field
+                "{tool}: unknown field `{field}` — did you mean `{candidate}`? (facade fields are snake_case and fail-closed)"
             ),
-            format!("rename `{}` to `{candidate}`", parsed.field),
+            format!("rename `{field}` to `{candidate}`"),
             json!({ "hint_kind": "did_you_mean", "did_you_mean": candidate }),
         ),
         Some(Hint::NestedLocation { location }) => (
             format!(
-                "{tool}: unknown field `{}` at the envelope top level — it belongs on {location}",
-                parsed.field
+                "{tool}: unknown field `{field}` at the envelope top level — it belongs on {location}"
             ),
-            format!("move `{}` to {location}", parsed.field),
+            format!("move `{field}` to {location}"),
             json!({ "hint_kind": "nested_location", "belongs_at": location }),
         ),
         Some(Hint::OperationValue {
@@ -95,19 +99,14 @@ pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> O
             note,
         }) => (
             format!(
-                "{tool}: unknown field `{}` — `{}` is a value of `{operation_field}`, not a field. {note}",
-                parsed.field, parsed.field
+                "{tool}: unknown field `{field}` — `{field}` is a value of `{operation_field}`, not a field. {note}"
             ),
-            format!(
-                "pass {operation_field}=\"{}\" instead of a `{}` field",
-                parsed.field, parsed.field
-            ),
+            format!("pass {operation_field}=\"{field}\" instead of a `{field}` field"),
             json!({ "hint_kind": "operation_value", "operation_field": operation_field }),
         ),
         None => (
             format!(
-                "{tool}: unknown field `{}`; accepted fields are {}",
-                parsed.field,
+                "{tool}: unknown field `{field}`; accepted fields are {}",
                 format_accepted(&parsed.accepted)
             ),
             format!(
@@ -121,7 +120,7 @@ pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> O
     if let Some(object) = data.as_object_mut() {
         object.insert("code".to_owned(), json!(error_codes::TOOL_PARAMS_INVALID));
         object.insert("tool".to_owned(), json!(tool));
-        object.insert("unknown_field".to_owned(), json!(parsed.field));
+        object.insert("unknown_field".to_owned(), json!(field));
         object.insert("accepted_fields".to_owned(), json!(parsed.accepted));
         object.insert("remediation".to_owned(), json!(remediation));
         object.insert(

@@ -8749,15 +8749,16 @@ fn spawn_launch_child(
         }
 
         let child = command.spawn().map_err(|error| {
+            let not_found = error.kind() == io::ErrorKind::NotFound;
             launch_tool_error(
                 error_codes::ACTION_TARGET_INVALID,
-                format!("act_launch failed to spawn target: {error}"),
+                command_spawn_failure_message("act_launch", &params.target, not_found, &error),
                 json!({
                     "code": error_codes::ACTION_TARGET_INVALID,
                     "target": params.target,
                     "args": params.args,
                     "working_dir": params.working_dir,
-                    "reason": "spawn_failed",
+                    "reason": command_spawn_failure_reason(not_found),
                 }),
             )
         })?;
@@ -8890,19 +8891,22 @@ fn spawn_windows_child(
                 desktop_lease: desktop.map(|desktop| desktop.lease),
             })
         }
-        Err(error) => Err(launch_tool_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!("act_launch failed to spawn target: {error}"),
-            json!({
-                "code": error_codes::ACTION_TARGET_INVALID,
-                "target": params.target,
-                "args": params.args,
-                "working_dir": params.working_dir,
-                "reason": "spawn_failed",
-                "desktop": params.desktop,
-                "source_error": error.to_string(),
-            }),
-        )),
+        Err(error) => {
+            let not_found = windows_error_is_not_found(&error);
+            Err(launch_tool_error(
+                error_codes::ACTION_TARGET_INVALID,
+                command_spawn_failure_message("act_launch", &params.target, not_found, &error),
+                json!({
+                    "code": error_codes::ACTION_TARGET_INVALID,
+                    "target": params.target,
+                    "args": params.args,
+                    "working_dir": params.working_dir,
+                    "reason": command_spawn_failure_reason(not_found),
+                    "desktop": params.desktop,
+                    "source_error": error.to_string(),
+                }),
+            ))
+        }
     }
 }
 
@@ -15795,9 +15799,15 @@ fn spawn_shell_job_child(
         .spawn()
         .map_err(|error| {
             let command_metadata = shell_command_metadata(&params.command, &params.args);
+            let not_found = error.kind() == io::ErrorKind::NotFound;
             shell_tool_error(
                 error_codes::ACTION_TARGET_INVALID,
-                format!("act_run_shell_start failed to spawn command: {error}"),
+                command_spawn_failure_message(
+                    "act_run_shell_start",
+                    &params.command,
+                    not_found,
+                    &error,
+                ),
                 json!({
                     "code": error_codes::ACTION_TARGET_INVALID,
                     "command": params.command,
@@ -15814,7 +15824,7 @@ fn spawn_shell_job_child(
                     "command_line_original_bytes": command_metadata.command_line_original_bytes,
                     "command_line_sha256": command_metadata.command_line_sha256,
                     "working_dir": params.working_dir,
-                    "reason": "spawn_failed",
+                    "reason": command_spawn_failure_reason(not_found),
                 }),
             )
         })
@@ -19289,9 +19299,10 @@ fn spawn_shell_child(
 
     let mut child = command.spawn().map_err(|error| {
         let command_metadata = shell_command_metadata(&params.command, &params.args);
+        let not_found = error.kind() == io::ErrorKind::NotFound;
         shell_tool_error(
             error_codes::ACTION_TARGET_INVALID,
-            format!("act_run_shell failed to spawn command: {error}"),
+            command_spawn_failure_message("act_run_shell", &params.command, not_found, &error),
             json!({
                 "code": error_codes::ACTION_TARGET_INVALID,
                 "command": params.command,
@@ -19308,7 +19319,7 @@ fn spawn_shell_child(
                 "command_line_original_bytes": command_metadata.command_line_original_bytes,
                 "command_line_sha256": command_metadata.command_line_sha256,
                 "working_dir": params.working_dir,
-                "reason": "spawn_failed",
+                "reason": command_spawn_failure_reason(not_found),
             }),
         )
     })?;
@@ -20202,13 +20213,20 @@ fn resolve_launch_target_for_policy(target: &str) -> Result<String, ErrorData> {
     }
 
     win32_long_path_name(target).map_err(|error| {
+        // The policy resolves a path-like target to its long name before
+        // spawning; a target that is not an existing file fails here, so this
+        // answer is the spawn failure for that target (#194).
+        let not_found = error
+            .downcast_ref::<windows::core::Error>()
+            .is_some_and(windows_error_is_not_found);
         launch_tool_error(
             error_codes::ACTION_TARGET_INVALID,
-            format!("act_launch target path could not be resolved with GetLongPathNameW: {error}"),
+            command_spawn_failure_message("act_launch", target, not_found, &format!("{error:#}")),
             json!({
                 "code": error_codes::ACTION_TARGET_INVALID,
                 "target": target,
-                "reason": "launch_target_path_resolution_failed",
+                "reason": command_spawn_failure_reason(not_found),
+                "detail_reason": "launch_target_path_resolution_failed",
             }),
         )
     })
@@ -20298,6 +20316,42 @@ fn quote_command_part(part: &str) -> String {
         quoted.push('"');
     }
     quoted
+}
+
+/// The message for a command that could not be started: it names the command
+/// (#194), says when the program was not found, and hints at a command line
+/// packed into the program field.
+fn command_spawn_failure_message(
+    tool: &str,
+    command: &str,
+    not_found: bool,
+    error: &dyn std::fmt::Display,
+) -> String {
+    if !not_found {
+        return format!("{tool} could not start '{command}': {error}");
+    }
+    let hint = if command.contains([' ', '\t']) {
+        "; put only the program in this field and its arguments in args"
+    } else {
+        ""
+    };
+    format!("{tool} could not start '{command}': program not found ({error}){hint}")
+}
+
+const fn command_spawn_failure_reason(not_found: bool) -> &'static str {
+    if not_found {
+        "command_not_found"
+    } else {
+        "spawn_failed"
+    }
+}
+
+#[cfg(windows)]
+fn windows_error_is_not_found(error: &windows::core::Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+
+    error.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+        || error.code() == ERROR_PATH_NOT_FOUND.to_hresult()
 }
 
 fn posix_single_quote(value: &str) -> String {

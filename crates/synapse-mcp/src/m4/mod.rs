@@ -663,9 +663,20 @@ pub struct ActRunShellCancelResponse {
     pub termination_attempted: bool,
     pub termination_status: String,
     pub remaining_process_ids: Vec<u32>,
+    /// The local process set `termination_status` and `remaining_process_ids`
+    /// cover (`SHELL_CANCEL_TERMINATION_SCOPE`).
+    pub termination_scope: String,
+    /// What that set leaves out (`SHELL_CANCEL_TERMINATION_SCOPE_NOTE`).
+    pub termination_scope_note: String,
     pub remote_process_scope: ActRunShellRemoteProcessScope,
     pub status: ActRunShellStatusResponse,
 }
+
+/// Cancel terminates and re-checks the job's root process and its descendants
+/// found by parent process id; nothing outside that tree.
+const SHELL_CANCEL_TERMINATION_SCOPE: &str = "job_root_process_and_parent_pid_descendants";
+const SHELL_CANCEL_TERMINATION_SCOPE_NOTE: &str =
+    "termination_status and remaining_process_ids cover only the job's root process and its descendants by parent process id; processes started outside that tree (for example through WMI Win32_Process.Create, the Task Scheduler or a service) are not tracked, not terminated and not listed";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -3198,6 +3209,8 @@ pub fn cancel_shell_job(
         termination_attempted,
         termination_status,
         remaining_process_ids,
+        termination_scope: SHELL_CANCEL_TERMINATION_SCOPE.to_owned(),
+        termination_scope_note: SHELL_CANCEL_TERMINATION_SCOPE_NOTE.to_owned(),
         remote_process_scope,
         status,
     })

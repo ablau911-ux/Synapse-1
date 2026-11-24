@@ -1,6 +1,6 @@
 # Clip recorder plan 5.0: one video stream plus settled stills
 
-Created 2026-11-24 06:20 IST by Claude. This plan replaces `docs/clip-recorder-plan-4.2.md` and `docs/clip-recorder-architecture-dynamic.md` for the build. It is the builder's spec; a builder reports any deviation before or while making it.
+Created 2026-11-24 06:20 IST by Claude. This plan replaces every earlier clip recorder plan. The earlier documents are archived in `docs/archive/clip-recorder-before-5.0/` and are not in force (owner, 2026-11-24). It is the builder's spec; a builder reports any deviation before or while making it.
 
 Every number in this plan comes from `docs/research/window-recording/measurements.md` (measured on this PC) or `docs/research/window-recording/proof.md` (quoted from a source, P-numbers). Nothing is taken from memory.
 

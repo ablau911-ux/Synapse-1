@@ -76,6 +76,8 @@ The still is written at instant k + S and belongs to instant k. No second still 
 | mixed, 60 s | 0.9969 at 0.5 | see `measurements.md`, second part |
 | real YouTube page | 0.9703 at 3.4 | 0.9796 at 6.8 |
 
+  The sizes in this table were measured with a key picture every 30 s. §7 has the sizes at the chosen 10 s.
+
 - **Readable by a model.** Claude read the same text, character for character, from the source and from the x264, Intel HEVC and SVT-AV1 outputs: typing, the middle of a scroll, and 12–13 pixel grey text beside a playing video. **The libaom output itself has not had this reading test.** It is the first proof of W1.
 - **Known limit, measured:** text beside a playing video stays video quality. On the real page the side column was still only 7 % of the time and the header 5 %, because the glow around the player follows the video. Settling by region would not change that.
 
@@ -87,9 +89,9 @@ The reader of a clip is an AI model. Every answer must be true to what was recor
   1. If a still exists for the instant shown at t, return the still (exact).
   2. Otherwise decode the video from the last key picture at or before t.
 
-         N_dec ≤ KEY_INSTANTS      (100 at a key picture every 5 s)
+         N_dec ≤ KEY_INSTANTS      (200 at a key picture every 10 s)
 
-     Measured stand-in: 171 ms worst case with a key picture every 5 s (HEVC, software decoder, starting the program included).
+     Measured stand-in: 340 ms worst case with a key picture every 10 s (libaom AV1 file, ffmpeg's decoder, starting the program included).
 - **Each returned picture says what it is:** `exact still`, `video`, or `lost`. A lost instant is never returned as a recorded picture; the answer names the loss, its cause, and the nearest recorded instants before and after it (#290 comment 1375, finding 2).
 - **Full resolution and crops:** a model shrinks a large image before reading it (P7), so the viewer keeps full resolution and serves regions at native size. This exists today and stays.
 - **Findings of the live test by an AI agent to fix here** (#290 comment 1374):
@@ -107,7 +109,7 @@ The reader of a clip is an AI model. Every answer must be true to what was recor
 | instants per second | 20 | existing recorder; all measurements were at 20 |
 | encoder | libaom AV1, realtime usage, speed 8, screen content tuning, row multithreading, 4:2:0 | measurements, libaom section |
 | AV1 quality setting | 35, to be confirmed by the reading test in W1; 25 if 35 fails it | §4 |
-| `KEY_INSTANTS` (key picture distance) | 100 (5 s) | measured on HEVC: 47 % more size than 30 s, worst fetch 171 ms against 460 ms |
+| `KEY_INSTANTS` (key picture distance) | 200 (10 s) | measured on libaom AV1, W0 (2026-11-24): real page 4.04 MB per minute and worst fetch 340 ms at 10 s; 7.40 and 181 ms at 5 s; 3.42 and 676 ms at 30 s |
 | `SETTLE_INSTANTS` | 10 (0.5 s) | measurements, second part: 4 settle points in 40 s on the real page |
 | still format | WebP lossless | P16; measured 697–727 KB per still on the real page, 15 KB on interface work |
 | encoder queue | pictures wait for the encoder in a bounded queue; a full queue names the instant lost | start-up about 70 ms measured, so under 2 instants |
@@ -116,18 +118,29 @@ Removed: zstd level and window, `MOVING_*` constants, the H.264 quality level, t
 
 ## 7. Targets (gates of the build)
 
-Measured with ffmpeg standing in for the recorder. The product must reach them on the same scenes; a miss is reported with its numbers, never hidden.
+Measured with ffmpeg standing in for the recorder, libaom AV1 at quality setting 35 and a key picture every 10 s. The product must reach them on the same scenes; a miss is reported with its numbers, never hidden.
+
+**Correction, 2026-11-24.** The first version of this table took its sizes from runs with a key picture every 30 s while §6 set 5 s. That was Claude's error. W0 measured the trade on libaom itself:
+
+| key picture every | real page, MB per minute | worst fetch | scrolling | mixed |
+|---|---|---|---|---|
+| 5 s | 7.40 | 181 ms | 3.75 | 0.72 |
+| 10 s | 4.04 | 340 ms | 2.69 | 0.53 |
+| 15 s | 3.81 | 399 ms | 2.68 | 0.53 |
+| 30 s | 3.42 | 676 ms | 2.46 | 0.51 |
+
+10 s is chosen: it is the shortest distance that keeps the real page near 4 MB per minute, and its worst fetch is under 0.5 s.
 
 | measure | scene | target |
 |---|---|---|
-| Size | real YouTube page | video ≤ 4.1 MB per minute at setting 35 (3.4 measured + 20 %); stills reported apart |
-| Size | mixed, 60 s | ≤ 0.6 MB per minute (0.5 + 20 %) |
-| Size | scrolling | ≤ 3.0 MB per minute (2.5 + 20 %) |
+| Size | real YouTube page | video ≤ 4.85 MB per minute (4.04 + 20 %); stills reported apart |
+| Size | scrolling | ≤ 3.23 MB per minute (2.69 + 20 %) |
+| Size | mixed, 60 s | ≤ 0.64 MB per minute (0.53 + 20 %) |
 | Lost instants | every scene | 0, or each named with its cause |
-| Processor time | every scene | ≤ 0.5 of one core (measured 0.28–0.48) |
-| Peak memory of the recorder | every scene | reported; ffmpeg's whole program used 382–412 MB |
+| Processor time | every scene | not above ffmpeg's on the same scene, measured in the same session. Measured so far: mixed 0.43–0.48 of one core, scrolling 0.42–0.67, real page 0.46–0.78 (the higher figures were taken while other work ran on the PC). |
+| Peak memory of the recorder | every scene | not above ffmpeg's whole program: about 410 MB |
 | Start | first encoded picture after the `record` call | ≤ 2 instants (100 ms); measured stand-in about 70 ms |
-| Read-back | one picture at any time | ≤ 0.5 s |
+| Read-back | one picture at any time | ≤ 0.5 s (measured stand-in 340 ms worst case) |
 
 ## 8. Work packages
 

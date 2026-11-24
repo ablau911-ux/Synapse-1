@@ -59,7 +59,7 @@ Added 2026-11-24 so the check-writer and the builder work against the same text.
     clip-probe exp-av1 out=<dir> folder=<corpus scene folder>          replay a captured scene in real time
 
 - `folder=` replays a scene of `C:\Users\Adam\clip-corpus` (one picture per instant from its `frames.jsonl`, 20 instants per second, paced by the clock) through exactly the same pipeline as a live window. The checks use this mode, because the source pictures are known.
-- Optional: `quality=<n>` (default 35), `key=<instants>` (default 100), `settle=<instants>` (default 10).
+- Optional: `quality=<n>` (default 35), `key=<instants>` (default 200, a key picture every 10 s; see Builder notes, part 1), `settle=<instants>` (default 10).
 - Exit code 0 on success. Any failure prints one line to stderr and exits non-zero.
 
 **Output folder:**
@@ -121,4 +121,31 @@ The product integration; the UI Automation text and event track; hardware HEVC; 
 
 ## Builder notes
 
-(empty)
+### 2026-11-24: part 1 done by Claude. Encoder: libaom, linked through `libaom-sys`
+
+Measured through ffmpeg (same libraries), one run each, key picture every 5 s, scripts `scripts/clip-equation/spec/w0-encoder-choice.py` and `w0-key-distance.py`. Each size cell: MB per minute (closeness).
+
+| candidate | scrolling | mixed | real YouTube page | CPU, cores | RAM | slowest speed |
+|---|---|---|---|---|---|---|
+| libaom, realtime, screen, setting 35 | 3.75 (0.9837) | 0.72 (0.9974) | 7.40 (0.9749) | 0.48–0.81 | 409–411 MB | 2.9 × real time |
+| rav1e, speed 10, quantizer 80 | 10.70 (0.9702) | 1.70 (0.9952) | 8.07 (0.9651) | 3.7–7.8 | about 800 MB | 0.3 × |
+| rav1e, speed 10, low latency | 9.72 (0.9620) | 1.50 (0.9934) | 6.27 (0.9473) | 2.0–3.5 | about 560 MB | 0.5 × |
+| SVT-AV1, preset 10, screen, setting 35 | 11.04 (0.9836) | 1.67 (0.9972) | 5.70 (0.9766) | 0.40–0.57 | 1,331–1,413 MB | 12.2 × |
+
+- **rav1e fails:** slower than real time on every scene, larger and less close. Its own README claims only "near real-time" at the fastest setting.
+- **SVT-AV1 fails:** 2.9 times libaom's size on scrolling and 2.3 times on the mixed scene (the rule allows 20 %), and about 1.4 GB of memory.
+- **libaom is chosen.** Rust package: `libaom-sys` 0.18.1, which carries libaom 3.15.3 (crates.io, updated 2026-11-16, "Bindings for libaom. Part of libavif-sys"). Licence: P67 in `proof.md`. Building it downloads packages from crates.io; this was reported to the owner on 2026-11-24.
+- **Not yet verified:** that `libaom-sys` builds on this PC and exposes the realtime usage, the speed setting, the screen-content tuning and row multithreading. That is the builder's first action; if it does not, STOP and report.
+
+**Key picture distance** (libaom, setting 35):
+
+| key picture every | real page | worst fetch | scrolling | mixed |
+|---|---|---|---|---|
+| 5 s | 7.40 | 181 ms | 3.75 | 0.72 |
+| 10 s | 4.04 | 340 ms | 2.69 | 0.53 |
+| 15 s | 3.81 | 399 ms | 2.68 | 0.53 |
+| 30 s | 3.42 | 676 ms | 2.46 | 0.51 |
+
+Chosen: 10 s (`key=200`). Plan 5.0 §6 and §7 were corrected to this.
+
+**Encoder settings to reproduce** (what ffmpeg passed to libaom): realtime usage; speed (`cpu-used`) 8; constant quality 35 with no bitrate cap; `tune-content=screen`; row multithreading on; 4:2:0, 8 bit; key picture every 200 pictures.

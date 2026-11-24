@@ -1,6 +1,8 @@
 # Recommendation: how to record an application window for an AI
 
-Written by Claude on 2026-11-23, after five measurement rounds on this PC. Each point names its support: a quote in `proof.md` (P-numbers) or a table in `measurements.md`. The owner decides.
+Written by Claude on 2026-11-23, after five measurement rounds on this PC. Each point names its support: a quote in `proof.md` (P-numbers) or a table in `measurements.md`.
+
+**Accepted by the owner on 2026-11-24, with software AV1 as the standard encoder.** The building plan for the first step is `probe-plan.md`.
 
 **Task:** record a clip of an application window on Windows so that an AI model can read back what happened. Goals: maximum quality, small files, low CPU, low RAM.
 

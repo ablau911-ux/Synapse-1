@@ -2544,7 +2544,7 @@ impl SynapseService {
         const TOOL: &str = "cdp_open_tab";
         validate_cdp_tab_url(&params.url)?;
         let window_hwnd = self.resolve_cdp_context_window(session_id, params.window_hwnd)?;
-        let window_context = validate_target_window_context(TOOL, window_hwnd)?;
+        let window_context = validate_browser_window(TOOL, window_hwnd)?;
         let window_title = window_context.window_title.clone();
         let process_name = window_context.process_name.clone();
         let endpoint = cdp_endpoint_for_action_log(window_hwnd);
@@ -6290,7 +6290,7 @@ impl SynapseService {
         human_foreground_hwnd: Option<i64>,
     ) -> Result<(i64, BrowserTabEntry), ErrorData> {
         let candidates = match window_hwnd_param {
-            Some(hwnd) => vec![validate_target_window_context(tool, hwnd)?],
+            Some(hwnd) => vec![validate_browser_window(tool, hwnd)?],
             None => passive_chromium_window_candidates(tool, None)?,
         };
         let mut matches: Vec<(i64, BrowserTabEntry)> = Vec::new();

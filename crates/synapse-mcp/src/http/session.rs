@@ -40,7 +40,10 @@ type SharedInFlightRequestIds = Arc<Mutex<BTreeSet<(String, String)>>>;
 /// response to its request's stream by the id alone, so a second request with
 /// the same id in the same session takes over the first one's stream: one
 /// caller gets the other's result and the other stream never ends. The id is
-/// held from the request until its response body ends or is dropped.
+/// held from the request until rmcp ends the request's response stream: rmcp
+/// ends it after routing the request's response, on the client's cancellation
+/// notification, when the session closes, or at daemon shutdown. A client that
+/// stops reading the stream does not end the request in rmcp.
 struct InFlightRequestId {
     in_flight: SharedInFlightRequestIds,
     key: (String, String),
@@ -83,10 +86,10 @@ impl InFlightRequestId {
         }))
     }
 
-    /// Keeps the id claimed until `response`'s body ends or is dropped. An SSE
-    /// body that ends without this request's response gets a JSON-RPC error as
-    /// its last event (#258).
-    fn hold_until_body_ends(self, response: Response) -> Response {
+    /// Keeps the id claimed until rmcp ends `response`'s body, also when the
+    /// client stops reading it first. An SSE body that ends without this
+    /// request's response gets a JSON-RPC error as its last event (#258).
+    fn hold_until_request_ends(self, response: Response) -> Response {
         let is_event_stream = response.status() == StatusCode::OK
             && response
                 .headers()
@@ -97,7 +100,7 @@ impl InFlightRequestId {
         let (parts, body) = response.into_parts();
         let body = InFlightBody {
             data: body.into_data_stream(),
-            in_flight: self,
+            in_flight: Some(self),
             reply_watch,
             finished: false,
         };
@@ -114,10 +117,13 @@ impl Drop for InFlightRequestId {
     }
 }
 
-/// A response body that releases its request's in-flight id when dropped.
+/// A request's response body that keeps the request's in-flight id claimed
+/// until rmcp ends the body.
 struct InFlightBody {
     data: axum::body::BodyDataStream,
-    in_flight: InFlightRequestId,
+    /// `None` once `Drop` handed the claim to the task that reads the rest of
+    /// rmcp's stream.
+    in_flight: Option<InFlightRequestId>,
     /// `None` when the body is not an SSE stream.
     reply_watch: Option<SseReplyWatch>,
     finished: bool,
@@ -140,10 +146,14 @@ impl futures_util::Stream for InFlightBody {
             }
             Poll::Ready(None) => {
                 this.finished = true;
+                let session_id = this
+                    .in_flight
+                    .as_ref()
+                    .map_or("", |in_flight| in_flight.key.0.as_str());
                 if let Some(event) = this
                     .reply_watch
                     .take()
-                    .and_then(|watch| watch.missing_reply_event(&this.in_flight.key.0))
+                    .and_then(|watch| watch.missing_reply_event(session_id))
                 {
                     return Poll::Ready(Some(Ok(event)));
                 }
@@ -151,6 +161,33 @@ impl futures_util::Stream for InFlightBody {
             Poll::Ready(Some(Err(_))) | Poll::Pending => {}
         }
         polled
+    }
+}
+
+impl Drop for InFlightBody {
+    /// The client stopped reading before rmcp ended the stream (#243). rmcp
+    /// 1.7.0 does not cancel the request then: its service task runs the
+    /// handler to completion and sends the response (`service.rs`,
+    /// `serve_inner`), and its session worker routes that response by the
+    /// JSON-RPC id to whichever stream registered the id last (`session/
+    /// local.rs`, `resolve_outbound_channel`). Releasing the id now would let
+    /// a new request with the same id take the old response, so the rest of
+    /// rmcp's stream is read to its end and the id released then.
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Some(in_flight) = self.in_flight.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut data = std::mem::replace(&mut self.data, Body::empty().into_data_stream());
+        runtime.spawn(async move {
+            while let Some(Ok(_chunk)) = futures_util::StreamExt::next(&mut data).await {}
+            drop(in_flight);
+        });
     }
 }
 
@@ -407,7 +444,7 @@ pub(super) async fn require_mcp_session(
                 );
             }
             match in_flight {
-                Some(in_flight) => in_flight.hold_until_body_ends(response),
+                Some(in_flight) => in_flight.hold_until_request_ends(response),
                 None => response,
             }
         })

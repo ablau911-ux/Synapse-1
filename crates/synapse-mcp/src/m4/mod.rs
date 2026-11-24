@@ -10711,7 +10711,7 @@ fn validate_run_shell_start_params(params: &ActRunShellStartParams) -> Result<()
         ));
     }
     if let Some(job_id) = &params.job_id {
-        validate_shell_job_id(job_id)?;
+        validate_new_shell_job_id(job_id)?;
     }
     let shell_params = run_shell_params_for_start_validation(params);
     validate_run_shell_params(&shell_params)
@@ -10770,6 +10770,34 @@ fn validate_shell_job_id(job_id: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Check a caller-chosen job id that will name a new job directory. Windows
+/// maps the reserved device names (CON, PRN, AUX, NUL, COM0-COM9, LPT0-LPT9,
+/// in any case) to devices, so a directory with such a name can only be
+/// removed through `\\?\` paths (#284). Existing job directories keep only the
+/// [`validate_shell_job_id`] check so they stay readable and removable.
+fn validate_new_shell_job_id(job_id: &str) -> Result<(), ErrorData> {
+    validate_shell_job_id(job_id)?;
+    let upper = job_id.to_ascii_uppercase();
+    let numbered_device = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            suffix.len() == 1 && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if numbered_device || matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_run_shell job_id must not be a Windows reserved device name (CON, PRN, AUX, NUL, COM0-COM9, LPT0-LPT9)",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "job_id": job_id,
+                "reason": "job_id_reserved_device_name",
+            }),
+        ));
+    }
+    Ok(())
+}
+
 fn create_shell_job_paths(
     requested_job_id: Option<&str>,
 ) -> Result<(String, ShellJobPaths), ErrorData> {
@@ -10787,7 +10815,7 @@ fn create_shell_job_paths(
     })?;
 
     if let Some(job_id) = requested_job_id {
-        validate_shell_job_id(job_id)?;
+        validate_new_shell_job_id(job_id)?;
         let paths = shell_job_paths_from_root(&root, job_id);
         match fs::create_dir(&paths.job_dir) {
             Ok(()) => return Ok((job_id.to_owned(), paths)),

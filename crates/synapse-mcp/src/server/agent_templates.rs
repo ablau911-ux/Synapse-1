@@ -640,6 +640,16 @@ impl SynapseService {
             .ok_or_else(|| template_not_found(template_id))?;
         render_spawn(&template)
     }
+
+    /// Fails with `AGENT_TEMPLATE_NOT_FOUND` unless a template with this id is
+    /// stored. A task may only name a template that can be dispatched.
+    pub(crate) fn require_template(&self, template_id: &str) -> Result<(), ErrorData> {
+        let db = self.agent_template_db()?;
+        match Self::read_template(&db, template_id)? {
+            Some(_) => Ok(()),
+            None => Err(template_not_found(template_id)),
+        }
+    }
 }
 
 fn template_not_found(template_id: &str) -> ErrorData {

@@ -1104,6 +1104,7 @@ impl SynapseService {
             ));
         }
         validate_template_params(&params.template_params)?;
+        self.require_template(&params.template_id)?;
 
         let db = self.agent_task_db()?;
         let now = unix_time_ms_now();

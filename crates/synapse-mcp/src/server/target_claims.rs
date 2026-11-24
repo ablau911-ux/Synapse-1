@@ -361,7 +361,15 @@ impl SynapseService {
             .lock_session_authorities(&[session_id.as_str(), owner_session_id.as_str()])
             .await?;
         self.reject_terminated_session_tool_call("target_claim_adopt", &session_id)?;
-        self.reject_terminated_session_tool_call("target_claim_adopt", &owner_session_id)?;
+        if self.session_is_terminated(&owner_session_id)? {
+            return Err(adopt_refused_error(
+                &session_id,
+                &owner_session_id,
+                "owner_session_id was already terminated (another session adopted its claim, or it ended)",
+                None,
+                None,
+            ));
+        }
         validate_target_claim_ttl(ttl_ms)?;
         let target = self.resolve_target_claim_target(&session_id, target)?;
         validate_claim_target(&target)?;

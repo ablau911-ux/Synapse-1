@@ -395,18 +395,30 @@ fn finish_routed_tool_call(
 }
 
 impl SynapseService {
+    /// Whether the session lifecycle already terminated `session_id`.
+    pub(super) fn session_is_terminated(&self, session_id: &str) -> Result<bool, ErrorData> {
+        self.terminated_sessions
+            .lock()
+            .map(|terminated| terminated.contains(session_id))
+            .map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "terminated-session registry lock poisoned while admitting MCP tool call",
+                )
+            })
+    }
+
+    /// Refuses a tool call made by `session_id` itself after the session
+    /// lifecycle terminated it. The error names `session_id` as the caller, so
+    /// a terminated counterparty session (an adopt owner, a handoff recipient)
+    /// is checked with [`Self::session_is_terminated`] and refused by that
+    /// tool's own error instead (#259).
     pub(super) fn reject_terminated_session_tool_call(
         &self,
         tool_name: &str,
         session_id: &str,
     ) -> Result<(), ErrorData> {
-        let terminated = self.terminated_sessions.lock().map_err(|_error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "terminated-session registry lock poisoned while admitting MCP tool call",
-            )
-        })?;
-        if !terminated.contains(session_id) {
+        if !self.session_is_terminated(session_id)? {
             return Ok(());
         }
         tracing::warn!(

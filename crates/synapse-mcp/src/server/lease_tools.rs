@@ -516,7 +516,9 @@ impl SynapseService {
         )?;
         let _authority_gates = authority_gates?;
         self.reject_terminated_session_tool_call("control_lease_handoff", &session_id)?;
-        self.reject_terminated_session_tool_call("control_lease_handoff", &to_session)?;
+        if self.session_is_terminated(&to_session)? {
+            return Err(recipient_unknown_error(&session_id, &to_session, None));
+        }
         ensure_control_lease_operator_panic_not_observed(
             "control_lease_handoff",
             &session_id,

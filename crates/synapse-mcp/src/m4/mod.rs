@@ -74,7 +74,15 @@ pub(crate) const SHELL_JOB_TAIL_DEFAULT_BYTES: u64 = 64 * 1024;
 const SHELL_JOB_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const SHELL_JOB_DASHBOARD_TAIL_BYTES: u64 = 2 * 1024;
 const SHELL_JOB_ID_MAX_BYTES: usize = 128;
-const SHELL_COMMAND_METADATA_POLICY: &str = "safe_display_v1";
+/// The rule that builds a shell record's `command_line` and hash: display-safe
+/// args, and the line as `shell_spawned_command_line` renders it (std's quoted
+/// program plus Microsoft C runtime argument quoting, #236).
+const SHELL_COMMAND_METADATA_POLICY: &str = "spawned_line_v2";
+/// The rule before #236: display-safe args, but a line quoted by the older
+/// `quote_command_part`, which could differ from the line the child got.
+/// Records under it keep their line and hash as written; the policy name tells
+/// them apart.
+const SHELL_COMMAND_METADATA_POLICY_V1: &str = "safe_display_v1";
 const SHELL_ARG_DISPLAY_MAX_BYTES: usize = 160;
 const SHELL_ARGS_DISPLAY_MAX_ITEMS: usize = 16;
 const SHELL_COMMAND_LINE_DISPLAY_MAX_BYTES: usize = 512;
@@ -20214,7 +20222,12 @@ fn shell_arg_looks_like_opaque_token(arg: &str) -> bool {
 fn shell_job_status_with_safe_command_metadata(
     status: &ActRunShellJobStatus,
 ) -> ActRunShellJobStatus {
-    if status.command_metadata_policy == SHELL_COMMAND_METADATA_POLICY
+    // A record already built by a display-safe rule is kept as written, so a
+    // pre-#236 record keeps its line, hash and policy name; only a
+    // `legacy_raw` record (raw args) is rebuilt under the current rule.
+    let safe_policy = [SHELL_COMMAND_METADATA_POLICY, SHELL_COMMAND_METADATA_POLICY_V1]
+        .contains(&status.command_metadata_policy.as_str());
+    if safe_policy
         && !status.args_sha256.is_empty()
         && !status.command_line_sha256.is_empty()
     {

@@ -701,9 +701,6 @@ mod live {
         recording.finish(reason);
     }
 
-    /// A `record` that fails before its first picture removes the folder it
-    /// created (plan §3; #290). `capture_clip_plan` refuses a folder that
-    /// existed before the call, so this never touches one.
     /// Applies the Windows build rule (owned by the observer) before anything
     /// exists, so an old Windows leaves nothing behind, then creates the clip
     /// folder exclusively: a folder that exists by now (another process made
@@ -748,6 +745,9 @@ mod live {
         }
     }
 
+    /// A `record` that fails before its first picture removes the folder it
+    /// created (plan §3; #290). `capture_clip_plan` refuses a folder that
+    /// existed before the call, so this never touches one.
     /// Removes the clip folder this recording created (`create_clip_folder`),
     /// the parents it created up to `first_created`, and its registry entry,
     /// after a start that failed before its first picture.

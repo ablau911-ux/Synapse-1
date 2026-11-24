@@ -1590,7 +1590,7 @@ impl SynapseService {
         hwnd: i64,
     ) -> Result<(String, String), ErrorData> {
         crate::m1::validate_window_hwnd_shape("set_target", hwnd)?;
-        match validate_target_window(hwnd) {
+        match validate_target_window("set_target", hwnd) {
             Ok(target) => Ok(target),
             Err(error) => {
                 let Some(context) = self.hidden_desktop_context_for_session(session_id, hwnd)?
@@ -2544,7 +2544,7 @@ impl SynapseService {
         const TOOL: &str = "cdp_open_tab";
         validate_cdp_tab_url(&params.url)?;
         let window_hwnd = self.resolve_cdp_context_window(session_id, params.window_hwnd)?;
-        let window_context = validate_target_window_context(window_hwnd)?;
+        let window_context = validate_target_window_context(TOOL, window_hwnd)?;
         let window_title = window_context.window_title.clone();
         let process_name = window_context.process_name.clone();
         let endpoint = cdp_endpoint_for_action_log(window_hwnd);
@@ -6292,7 +6292,7 @@ impl SynapseService {
         human_foreground_hwnd: Option<i64>,
     ) -> Result<(i64, BrowserTabEntry), ErrorData> {
         let candidates = match window_hwnd_param {
-            Some(hwnd) => vec![validate_target_window_context(hwnd)?],
+            Some(hwnd) => vec![validate_target_window_context(tool, hwnd)?],
             None => passive_chromium_window_candidates(tool, None)?,
         };
         let mut matches: Vec<(i64, BrowserTabEntry)> = Vec::new();
@@ -6511,7 +6511,7 @@ impl SynapseService {
                 .ensure_cdp_target_bindable(session_id, window_hwnd, &endpoint, cdp_target_id)
                 .await;
         }
-        let expected_context = validate_target_window_context(window_hwnd).ok();
+        let expected_context = validate_target_window_context("set_target", window_hwnd).ok();
         crate::chrome_debugger_bridge::target_info(
             window_hwnd,
             cdp_target_id,
@@ -6972,7 +6972,7 @@ impl SynapseService {
         let owner =
             self.cdp_target_owner_for_readback("cdp_target_info", session_id, cdp_target_id)?;
         let expected_chrome_window_id = owner.as_ref().and_then(|owner| owner.chrome_window_id);
-        let expected_context = validate_target_window_context(window_hwnd).ok();
+        let expected_context = validate_target_window_context("cdp_target_info", window_hwnd).ok();
         let info = crate::chrome_debugger_bridge::target_info(
             window_hwnd,
             cdp_target_id,
@@ -7066,7 +7066,7 @@ impl SynapseService {
     ) -> Result<BrowserTabsWindowResolution, ErrorData> {
         let explicit_or_session_resolution = if let Some(hwnd) = window_hwnd {
             Some((
-                validate_target_window_context(hwnd)?,
+                validate_target_window_context(tool, hwnd)?,
                 false,
                 "explicit_window_hwnd",
                 1,
@@ -7077,7 +7077,7 @@ impl SynapseService {
                 SessionTarget::Cdp { window_hwnd, .. } => window_hwnd,
             };
             Some((
-                validate_target_window_context(hwnd)?,
+                validate_target_window_context(tool, hwnd)?,
                 false,
                 "session_target",
                 1,
@@ -7695,7 +7695,7 @@ impl SynapseService {
             }
         };
         if let Some(identity) = listed.chrome_window_id {
-            let current = validate_target_window_context(window_context.hwnd)?;
+            let current = validate_target_window_context("browser_tabs", window_context.hwnd)?;
             if current.pid != window_context.pid {
                 return Err(mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
@@ -15910,7 +15910,7 @@ fn browser_tabs_activation_visual_probe(
             ),
         ));
     }
-    let context = validate_target_window_context(window_hwnd)?;
+    let context = validate_target_window_context("browser_tabs", window_hwnd)?;
     let captured =
         synapse_capture::window_full_frame_to_bgra_bitmap(window_hwnd, WINDOW_SCREENSHOT_TIMEOUT_MS)
             .map_err(|error| {
@@ -16580,8 +16580,8 @@ fn browser_screenshot_foreground_summary(context: &ForegroundContext) -> String 
 /// (title, process_name) so the response confirms exactly which window was bound.
 /// Fail-loud: a nonpositive HWND is `TOOL_PARAMS_INVALID`; a positive but
 /// dead/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
-pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
-    let context = validate_target_window_context(hwnd)?;
+pub(crate) fn validate_target_window(tool: &str, hwnd: i64) -> Result<(String, String), ErrorData> {
+    let context = validate_target_window_context(tool, hwnd)?;
     Ok((context.window_title, context.process_name))
 }
 
@@ -16610,24 +16610,23 @@ fn native_chrome_window_identity(
     Ok(remembered.or(owner_id))
 }
 
-fn validate_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
+/// `tool` is the calling tool; every refusal names it, not `set_target`.
+fn validate_target_window_context(tool: &str, hwnd: i64) -> Result<ForegroundContext, ErrorData> {
     // Keep the shape contract at the lowest shared window-validation seam so
     // session recovery, agent spawning, facade calls, and future internal
     // callers all classify nonpositive HWNDs identically before touching the
     // capture/UIA backends.
-    crate::m1::validate_window_hwnd_shape("window_target_validation", hwnd)?;
+    crate::m1::validate_window_hwnd_shape(tool, hwnd)?;
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("set_target window_hwnd {hwnd:#x} is not a live window: {error}"),
+            format!("{tool} window_hwnd {hwnd:#x} is not a live window: {error}"),
         )
     })?;
     synapse_a11y::foreground_context(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!(
-                "set_target window_hwnd {hwnd:#x} could not be resolved for perception: {error}"
-            ),
+            format!("{tool} window_hwnd {hwnd:#x} could not be resolved for perception: {error}"),
         )
     })
 }

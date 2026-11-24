@@ -874,7 +874,9 @@ pub(crate) fn delete_persisted_session_lease_row_from_db(
 
 fn validate_restored_target(session_id: &str, target: &SessionTarget) -> Result<(), ErrorData> {
     match target {
-        SessionTarget::Window { hwnd } => validate_target_window(*hwnd).map(|_| ()),
+        SessionTarget::Window { hwnd } => {
+            validate_target_window("session_target_restore", *hwnd).map(|_| ())
+        }
         SessionTarget::Cdp {
             window_hwnd,
             cdp_target_id,
@@ -887,7 +889,7 @@ fn validate_restored_target(session_id: &str, target: &SessionTarget) -> Result<
                     ),
                 ));
             }
-            validate_target_window(*window_hwnd).map(|_| ())
+            validate_target_window("session_target_restore", *window_hwnd).map(|_| ())
         }
     }
 }

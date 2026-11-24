@@ -1099,7 +1099,7 @@ fn persisted_cdp_target_owner_live_readback(
     window_hwnd: i64,
     _cdp_target_id: &str,
 ) -> PersistedCdpTargetOwnerLiveReadback {
-    match super::m1_tools::validate_target_window(window_hwnd) {
+    match super::m1_tools::validate_target_window("cdp_target_owner_readback", window_hwnd) {
         Ok((window_title, process_name)) => PersistedCdpTargetOwnerLiveReadback {
             source_of_truth:
                 "synapse_capture::validate_hwnd + UI foreground_context for owner window; target existence is not checked by read-only session list"

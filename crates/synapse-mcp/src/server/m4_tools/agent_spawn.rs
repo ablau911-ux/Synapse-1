@@ -996,7 +996,7 @@ pub(super) fn validate_spawn_target(target: &Option<ActSpawnAgentTarget>) -> Res
             ActSpawnAgentTarget::Window { window_hwnd }
             | ActSpawnAgentTarget::Cdp { window_hwnd, .. },
         ) => {
-            validate_target_window(*window_hwnd)?;
+            validate_target_window("act_spawn_agent", *window_hwnd)?;
         }
         None => {}
     }

@@ -16450,6 +16450,13 @@ fn shell_job_terminal_status(status: &str) -> bool {
     )
 }
 
+/// True when the job process ran to its own exit (`ok` or `exit_nonzero`).
+/// Every other ending (timed out, cancelled, killed, lost or unobserved) did
+/// not complete normally.
+pub(crate) fn shell_job_completed_normally(status: &str) -> bool {
+    matches!(status, "ok" | "exit_nonzero")
+}
+
 fn elapsed_ms_since_rfc3339(started_at: &str) -> Option<u64> {
     let started_at = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
     let elapsed = chrono::Utc::now().signed_duration_since(started_at);

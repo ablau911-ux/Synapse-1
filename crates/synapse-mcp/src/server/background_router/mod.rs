@@ -29,7 +29,10 @@ use crate::m2::{
     ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, act_press_normalized_labels,
     default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
-use crate::m4::{ActRunShellJobIdParams, ActRunShellStartParams, ActRunShellStatusParams};
+use crate::m4::{
+    ActRunShellJobIdParams, ActRunShellStartParams, ActRunShellStatusParams,
+    shell_job_completed_normally,
+};
 use futures_util::FutureExt as _;
 use rmcp::schemars::{JsonSchema, schema_for};
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
@@ -8543,11 +8546,12 @@ async fn target_act_run_shell(
                 json!(true),
             );
         }
-        // A job killed by its timeout_ms cap did not complete: report it as
+        // A job that did not run to its own exit (killed by its timeout_ms
+        // cap, cancelled, lost or unobserved) did not complete: report it as
         // not ok. The process was launched, so the delivery state stays
         // "delivered" (verify_needed) and a caller does not blindly re-run a
         // command that may already have had side effects.
-        if status.0.job.timed_out {
+        if status.0.job.timed_out || !shell_job_completed_normally(&status.0.job.status) {
             return Ok((
                 "act_run_shell_start+act_run_shell_status",
                 false,

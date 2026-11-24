@@ -1851,7 +1851,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV cost/price/v1 row",
                 Some("exact CF_KV price row readback after write"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                COST_PRICE_REMEDIATION,
             ),
             op(
                 "price_delete",
@@ -1860,7 +1860,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV cost/price/v1 row",
                 Some("exact CF_KV row absence/existed readback after delete"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                COST_PRICE_REMEDIATION,
             ),
         ],
     ),
@@ -2093,7 +2093,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "host setup files + external setup script process/socket state",
                 Some("post-repair daemon process/socket/token/config readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                SETUP_REPAIR_REMEDIATION,
             ),
         ],
     ),
@@ -2210,8 +2210,24 @@ const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
 
 /// Remediation for operations gated on `break_glass` / `full_capability`
 /// (`require_maintenance_profile`). There is no "maintenance" profile, so the
-/// text names the real, executable steps.
-pub(crate) const MAINTENANCE_PROFILE_REMEDIATION: &str = "requires profile=break_glass (or full_capability): call act operation=lease_acquire, then profile operation=set profile=break_glass confirm_break_glass=true reason=<why>, retry this operation, then restore profile=normal_agent and release the lease";
+/// text names the real, executable steps. A macro so the per-operation
+/// variants below can extend it with `concat!`.
+macro_rules! maintenance_profile_remediation {
+    () => {
+        "requires profile=break_glass (or full_capability): call act operation=lease_acquire, then profile operation=set profile=break_glass confirm_break_glass=true reason=<why>, retry this operation, then restore profile=normal_agent and release the lease"
+    };
+}
+
+pub(crate) const MAINTENANCE_PROFILE_REMEDIATION: &str = maintenance_profile_remediation!();
+/// setup repair: the shared steps, and repair runs from an external process.
+pub(crate) const SETUP_REPAIR_REMEDIATION: &str = concat!(
+    maintenance_profile_remediation!(),
+    "; run repair from an external process"
+);
+pub(crate) const COST_PRICE_REMEDIATION: &str = concat!(
+    maintenance_profile_remediation!(),
+    "; normal_agent may use summarize or price_list first"
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

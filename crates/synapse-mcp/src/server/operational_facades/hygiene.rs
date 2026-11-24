@@ -2,6 +2,7 @@ use rmcp::{RoleServer, service::RequestContext};
 
 use crate::server::{
     ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+    tool_profiles::MAINTENANCE_PROFILE_REMEDIATION,
 };
 
 use super::{
@@ -49,6 +50,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     spec.source_cf.as_deref().unwrap_or("source_cf_missing"),
                     HYGIENE_SOT,
+                    MAINTENANCE_PROFILE_REMEDIATION,
                 )?;
             }
             service.require_m3_permissions(
@@ -88,6 +90,7 @@ pub(super) async fn handle(
                 operation.as_str(),
                 "storage_scan",
                 HYGIENE_SOT,
+                MAINTENANCE_PROFILE_REMEDIATION,
             )?;
             service.require_m3_permissions(
                 HYGIENE_TOOL,

@@ -4,6 +4,7 @@ use crate::{
     m3::local_models::{LocalModelListParams, LocalModelListResponse},
     server::{
         ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+        tool_profiles::MAINTENANCE_PROFILE_REMEDIATION,
     },
 };
 
@@ -146,6 +147,7 @@ pub(super) async fn handle(
                 operation.as_str(),
                 &spec.name,
                 MODEL_SOT,
+                MAINTENANCE_PROFILE_REMEDIATION,
             )?;
             service.require_m3_permissions(
                 MODEL_TOOL,
@@ -182,6 +184,7 @@ pub(super) async fn handle(
                 operation.as_str(),
                 &spec.name,
                 MODEL_SOT,
+                MAINTENANCE_PROFILE_REMEDIATION,
             )?;
             service.require_m3_permissions(
                 MODEL_TOOL,
@@ -217,6 +220,7 @@ pub(super) async fn handle(
                 operation.as_str(),
                 &spec.name,
                 MODEL_SOT,
+                MAINTENANCE_PROFILE_REMEDIATION,
             )?;
             service.require_m3_permissions(
                 MODEL_TOOL,

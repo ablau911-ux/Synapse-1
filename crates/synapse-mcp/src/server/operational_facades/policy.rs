@@ -1,6 +1,6 @@
 use rmcp::{RoleServer, service::RequestContext};
 
-use crate::server::{ErrorData, SynapseService, tool_profiles::MAINTENANCE_PROFILE_REMEDIATION};
+use crate::server::{ErrorData, SynapseService};
 
 use super::errors::facade_policy_error;
 pub(super) fn session_or_stdio(
@@ -12,6 +12,8 @@ pub(super) fn session_or_stdio(
     )
 }
 
+/// `remediation` is `tool_profiles::MAINTENANCE_PROFILE_REMEDIATION` or one of
+/// its per-operation variants, the same text the facade contract lists.
 pub(in crate::server) fn require_maintenance_profile(
     service: &SynapseService,
     request_context: &RequestContext<RoleServer>,
@@ -19,6 +21,7 @@ pub(in crate::server) fn require_maintenance_profile(
     operation: &'static str,
     source_id: &str,
     source_of_truth: &'static str,
+    remediation: &'static str,
 ) -> Result<(), ErrorData> {
     let session_id = crate::server::context::mcp_session_id_from_request_context(request_context)?;
     let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
@@ -31,6 +34,6 @@ pub(in crate::server) fn require_maintenance_profile(
         source_id,
         snapshot.profile,
         source_of_truth,
-        MAINTENANCE_PROFILE_REMEDIATION,
+        remediation,
     ))
 }

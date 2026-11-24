@@ -19,7 +19,7 @@ use crate::{
     chrome_debugger_bridge,
     server::{
         ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
-        mcp_error,
+        mcp_error, tool_profiles::SETUP_REPAIR_REMEDIATION,
     },
 };
 
@@ -104,6 +104,7 @@ pub(super) async fn handle(
                 operation.as_str(),
                 "synapse_setup_repair",
                 SETUP_SOT,
+                SETUP_REPAIR_REMEDIATION,
             )?;
             let (chrome_bridge_preflight, browser_recovered) =
                 preflight_setup_repair_chrome_bridge().await?;

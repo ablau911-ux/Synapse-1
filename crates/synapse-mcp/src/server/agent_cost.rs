@@ -694,6 +694,7 @@ impl SynapseService {
                     operation.as_str(),
                     "CF_KV cost/price/v1",
                     COST_SOURCE_OF_TRUTH,
+                    super::tool_profiles::COST_PRICE_REMEDIATION,
                 )?;
                 let price_put = params
                     .0
@@ -730,6 +731,7 @@ impl SynapseService {
                     operation.as_str(),
                     "CF_KV cost/price/v1",
                     COST_SOURCE_OF_TRUTH,
+                    super::tool_profiles::COST_PRICE_REMEDIATION,
                 )?;
                 let price_delete = params
                     .0

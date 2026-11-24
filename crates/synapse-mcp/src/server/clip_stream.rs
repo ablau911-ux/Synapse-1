@@ -17,11 +17,14 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use image_webp::{ColorType, WebPEncoder};
 
 use super::capture_clip::RECORD_FPS;
-use super::clip_encoder::{BGRA_BYTES, EncoderSettings, VideoPlace, VideoQueue, encoder_name};
+use super::clip_encoder::{
+    BGRA_BYTES, EncoderSettings, VideoPlace, VideoQueue, VideoTimes, encoder_name,
+};
 use super::clip_folder::{
     EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_NO_PICTURE_YET,
     LOST_WINDOW_RESIZED, LostInstant, PartInfo, STILLS_DIR, StillInfo, still_path,
@@ -35,6 +38,48 @@ const RGB_BYTES: usize = 3;
 const BLUE: usize = 0;
 const GREEN: usize = 1;
 const RED: usize = 2;
+
+/// Count, total and slowest time of one recorder stage, for the
+/// `CLIP_RECORD_TIMING` line at the end of a recording.
+#[derive(Clone, Copy, Default)]
+pub(super) struct StageTime {
+    pub(super) count: u64,
+    total: Duration,
+    slowest: Duration,
+}
+
+impl StageTime {
+    pub(super) fn add(&mut self, took: Duration) {
+        self.count += 1;
+        self.total += took;
+        self.slowest = self.slowest.max(took);
+    }
+
+    /// Times `step` as one occurrence of this stage.
+    pub(super) fn time<T>(&mut self, step: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let result = step();
+        self.add(started.elapsed());
+        result
+    }
+
+    pub(super) fn total_ms(&self) -> u64 {
+        u64::try_from(self.total.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub(super) fn slowest_ms(&self) -> u64 {
+        u64::try_from(self.slowest.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// The stream's stage totals over one recording.
+#[derive(Clone, Copy, Default)]
+pub(super) struct StreamTimes {
+    pub(super) compare: StageTime,
+    pub(super) stills: StageTime,
+    pub(super) index: StageTime,
+    pub(super) video: VideoTimes,
+}
 
 /// What the capture knows about one instant.
 pub(super) enum StreamInput<'a> {
@@ -69,6 +114,7 @@ pub(super) struct StreamSummary {
     pub(super) parts: Vec<PartInfo>,
     pub(super) stills: Vec<StillInfo>,
     pub(super) encoder: EncoderInfo,
+    pub(super) times: StreamTimes,
 }
 
 /// The decision for one instant.
@@ -104,6 +150,8 @@ pub(super) struct ClipStream {
     encoded: u64,
     same: u64,
     lost: Vec<LostInstant>,
+    /// Pixel comparisons of a picture with the one before.
+    compare: StageTime,
 }
 
 impl ClipStream {
@@ -123,6 +171,7 @@ impl ClipStream {
             encoded: 0,
             same: 0,
             lost: Vec::new(),
+            compare: StageTime::default(),
         })
     }
 
@@ -200,8 +249,11 @@ impl ClipStream {
                         bgra.len()
                     ));
                 }
-                let same = self.shown.as_ref().is_some_and(|shown| {
-                    (shown.width, shown.height) == (width, height) && shown.bgra == bgra
+                let shown = self.shown.as_ref();
+                let same = self.compare.time(|| {
+                    shown.is_some_and(|shown| {
+                        (shown.width, shown.height) == (width, height) && shown.bgra == bgra
+                    })
                 });
                 if same {
                     return Ok(Decision::Same);
@@ -260,9 +312,18 @@ impl ClipStream {
     pub(super) fn finish(mut self) -> Result<StreamSummary, String> {
         self.index.write_decided(None)?;
         let encoder = self.encoder_info();
-        let parts = match self.video.take() {
-            Some(video) => video.finish()?.closed_parts,
-            None => Vec::new(),
+        let (parts, video_times) = match self.video.take() {
+            Some(video) => {
+                let (written, times) = video.finish()?;
+                (written.closed_parts, times)
+            }
+            None => (Vec::new(), VideoTimes::default()),
+        };
+        let times = StreamTimes {
+            compare: self.compare,
+            stills: self.stills.time,
+            index: self.index.time,
+            video: video_times,
         };
         Ok(StreamSummary {
             instants: self.next_instant,
@@ -272,6 +333,7 @@ impl ClipStream {
             parts,
             stills: self.stills.written,
             encoder,
+            times,
         })
     }
 }
@@ -344,6 +406,8 @@ struct Stills {
     folder: PathBuf,
     rgb: Vec<u8>,
     written: Vec<StillInfo>,
+    /// Conversion, WebP encoding and file write of each still.
+    time: StageTime,
 }
 
 impl Stills {
@@ -355,11 +419,19 @@ impl Stills {
             folder: folder.to_owned(),
             rgb: Vec::new(),
             written: Vec::new(),
+            time: StageTime::default(),
         })
     }
 
     /// Writes the still of `instant`; returns its bytes.
     fn write(&mut self, instant: u64, picture: &Shown) -> Result<u64, String> {
+        let started = Instant::now();
+        let bytes = self.encode_and_write(instant, picture)?;
+        self.time.add(started.elapsed());
+        Ok(bytes)
+    }
+
+    fn encode_and_write(&mut self, instant: u64, picture: &Shown) -> Result<u64, String> {
         self.rgb.clear();
         self.rgb.extend(
             picture
@@ -390,6 +462,8 @@ impl Stills {
 struct Index {
     file: File,
     waiting: VecDeque<IndexLine>,
+    /// Calls that wrote at least one line.
+    time: StageTime,
 }
 
 impl Index {
@@ -402,6 +476,7 @@ impl Index {
         Ok(Self {
             file,
             waiting: VecDeque::new(),
+            time: StageTime::default(),
         })
     }
 
@@ -422,6 +497,15 @@ impl Index {
     /// Writes every waiting line before `open` (all of them when nothing is
     /// open); returns the bytes written.
     fn write_decided(&mut self, open: Option<u64>) -> Result<u64, String> {
+        let started = Instant::now();
+        let bytes = self.write_lines(open)?;
+        if bytes > 0 {
+            self.time.add(started.elapsed());
+        }
+        Ok(bytes)
+    }
+
+    fn write_lines(&mut self, open: Option<u64>) -> Result<u64, String> {
         let mut bytes = 0;
         while let Some(line) = self.waiting.front() {
             if open.is_some_and(|open| line.instant >= open) {

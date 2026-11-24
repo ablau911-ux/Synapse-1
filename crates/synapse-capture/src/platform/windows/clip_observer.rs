@@ -42,7 +42,9 @@ use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::{Interface as _, w};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
@@ -180,6 +182,14 @@ pub struct ObserverStats {
     pub max_hold_hns: i64,
     /// Instants lost because no slot was free.
     pub slot_overflow_instants: Vec<i64>,
+    /// Frames read back from the graphics chip to the processor (`read_back`).
+    pub readbacks: u64,
+    /// Wall time of those read-backs, in 100 ns units.
+    pub readback_hns: i64,
+    /// Processor time of the reader's thread during those read-backs, in
+    /// 100 ns units (Windows counts it in scheduler ticks, so short calls
+    /// round to 0 or one tick).
+    pub readback_cpu_hns: i64,
 }
 
 /// Processor time (kernel plus user) of the calling thread, in 100 ns units.
@@ -190,6 +200,26 @@ pub fn current_thread_cpu_hns() -> i64 {
     let read = unsafe {
         GetThreadTimes(
             GetCurrentThread(),
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    if read.is_err() {
+        return 0;
+    }
+    filetime_hns(kernel).saturating_add(filetime_hns(user))
+}
+
+/// Processor time (kernel plus user) of the whole process, in 100 ns units.
+#[must_use]
+pub fn current_process_cpu_hns() -> i64 {
+    let (mut creation, mut exit, mut kernel, mut user) = Default::default();
+    // SAFETY: the pseudo handle of the current process and four out-parameters.
+    let read = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
             &raw mut creation,
             &raw mut exit,
             &raw mut kernel,
@@ -614,6 +644,11 @@ pub struct ClipObserver {
     shared: Arc<Shared>,
     settings: ObserverSettings,
     staging: Option<Staging>,
+    /// Read-backs so far: count, wall time and reader-thread processor time
+    /// (100 ns units), reported in `ObserverStats`.
+    readbacks: u64,
+    readback_hns: i64,
+    readback_cpu_hns: i64,
 }
 
 impl ClipObserver {
@@ -665,6 +700,9 @@ impl ClipObserver {
             shared,
             settings,
             staging: None,
+            readbacks: 0,
+            readback_hns: 0,
+            readback_cpu_hns: 0,
         })
     }
 
@@ -704,6 +742,15 @@ impl ClipObserver {
     ///
     /// `CAPTURE_THREAD_FAILED` when the frame is no longer pinned or Map fails.
     pub fn read_back(&mut self, frame: &ObservedFrame) -> Result<ObservedPixels, CaptureError> {
+        let (started, started_cpu) = (now_hns(), current_thread_cpu_hns());
+        let pixels = self.copy_to_memory(frame)?;
+        self.readbacks += 1;
+        self.readback_hns += now_hns() - started;
+        self.readback_cpu_hns += current_thread_cpu_hns() - started_cpu;
+        Ok(pixels)
+    }
+
+    fn copy_to_memory(&mut self, frame: &ObservedFrame) -> Result<ObservedPixels, CaptureError> {
         let source = self
             .shared
             .table()
@@ -795,6 +842,9 @@ impl ClipObserver {
             frames_delivered: self.shared.frames_delivered.load(Ordering::Relaxed),
             max_hold_hns: self.shared.max_hold_hns.load(Ordering::Relaxed),
             slot_overflow_instants: self.shared.table().overflow_instants.clone(),
+            readbacks: self.readbacks,
+            readback_hns: self.readback_hns,
+            readback_cpu_hns: self.readback_cpu_hns,
         }
     }
 

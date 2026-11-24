@@ -28,6 +28,9 @@ const MAX_DECODER_THREADS: usize = 64;
 /// The `code` of the debug lines that time one picture read-back (stages
 /// `read_part`, `decode`, `convert`; the viewer adds `png`).
 pub(super) const VIEW_TIMING_CODE: &str = "CLIP_VIEW_TIMING";
+/// libaom's decoder row multithreading (`AV1D_SET_ROW_MT`): rows of one
+/// tile are decoded in parallel; the recorder writes one tile per picture.
+const ROW_MULTITHREADING_ON: c_uint = 1;
 /// libaom may return 8-bit pictures for 8-bit streams (`allow_lowbitdepth`).
 const ALLOW_LOW_BIT_DEPTH: c_uint = 1;
 /// No `AOM_CODEC_USE_*` flags.
@@ -378,10 +381,21 @@ impl Av1Decoder {
                 "aom_codec_dec_init_ver failed: libaom error {code}"
             ));
         }
-        Ok(Self {
+        // Built before the control call so `Drop` releases the context either way.
+        let mut decoder = Self {
             context,
             frame: std::ptr::null(),
-        })
+        };
+        // SAFETY: an initialised decoder; this control takes one unsigned int.
+        let code = unsafe {
+            aom::aom_codec_control(
+                &raw mut *decoder.context,
+                aom::AV1D_SET_ROW_MT as c_int,
+                ROW_MULTITHREADING_ON,
+            )
+        };
+        decoder.check(code, "AV1D_SET_ROW_MT")?;
+        Ok(decoder)
     }
 
     /// Decodes one compressed picture; `rgba` converts the picture it produced.

@@ -30,7 +30,7 @@ pub use frame::*;
 pub use platform::{
     ClipObserver, HNS_PER_MS, MAX_SELECTION_LATENESS_INSTANTS, MIN_WINDOWS_BUILD, OBSERVE_SLOTS,
     ObservedFrame, ObservedPixels, ObserverSettings, ObserverStats, REQUESTED_UPDATE_INTERVAL_MS,
-    check_windows_build, current_thread_cpu_hns, now_hns, windows_build,
+    check_windows_build, current_process_cpu_hns, current_thread_cpu_hns, now_hns, windows_build,
 };
 pub use stats::{CaptureStats, CaptureThreadPriority};
 

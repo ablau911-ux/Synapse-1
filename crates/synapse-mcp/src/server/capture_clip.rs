@@ -580,7 +580,9 @@ mod live {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use synapse_capture::{ClipObserver, ClipSource, HNS_PER_MS};
+    use synapse_capture::{
+        ClipObserver, ClipSource, HNS_PER_MS, ObserverStats, current_process_cpu_hns,
+    };
     use synapse_core::error_codes;
 
     use super::super::clip_folder::{
@@ -588,7 +590,9 @@ mod live {
         ClipState, ClipTargetInfo, ConditionStatus, Conditions, LOST_CAPTURE_FAILED,
         LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason,
     };
-    use super::super::clip_stream::{ClipStream, SETTLE_INSTANTS, StreamInput};
+    use super::super::clip_stream::{
+        ClipStream, SETTLE_INSTANTS, StageTime, StreamInput, StreamTimes,
+    };
     use super::super::{CaptureClipResponse, ErrorData};
     use super::{
         CLIP_JSON_FILE, ClipPlan, DISK_CHECK_MS, EXCLUDED_APP_CHECK_MS, FIRST_FRAME_TIMEOUT_MS,
@@ -687,6 +691,64 @@ mod live {
         }
     }
 
+    /// What one recording cost as a whole: wall time, the process's processor
+    /// time and the `clip.json` writes; the stages report their own totals.
+    #[derive(Clone, Copy)]
+    struct RecordingTimes {
+        started: Instant,
+        process_cpu_at_start_hns: i64,
+        clip_json: StageTime,
+    }
+
+    impl RecordingTimes {
+        fn begin() -> Self {
+            Self {
+                started: Instant::now(),
+                process_cpu_at_start_hns: current_process_cpu_hns(),
+                clip_json: StageTime::default(),
+            }
+        }
+
+        /// The one `CLIP_RECORD_TIMING` line of a recording: totals of every
+        /// stage, so its processor cost is explained by measurement.
+        fn log(&self, clip_id: &str, observer: &ObserverStats, instants: u64, stream: &StreamTimes) {
+            let video = &stream.video;
+            let wall_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let process_cpu_ms =
+                (current_process_cpu_hns() - self.process_cpu_at_start_hns) / HNS_PER_MS;
+            tracing::info!(
+                code = "CLIP_RECORD_TIMING",
+                clip_id,
+                instants,
+                wall_ms,
+                process_cpu_ms,
+                frames_delivered = observer.frames_delivered,
+                readbacks = observer.readbacks,
+                readback_ms = observer.readback_hns / HNS_PER_MS,
+                readback_thread_cpu_ms = observer.readback_cpu_hns / HNS_PER_MS,
+                compares = stream.compare.count,
+                compare_ms = stream.compare.total_ms(),
+                conversions = video.convert.count,
+                convert_ms = video.convert.total_ms(),
+                submits = video.submit.count,
+                submit_ms = video.submit.total_ms(),
+                max_queue_depth = video.max_queue_depth,
+                encodes = video.encode.count,
+                encode_ms = video.encode.total_ms(),
+                slowest_encode_ms = video.encode.slowest_ms(),
+                key_encodes = video.key_encode.count,
+                key_encode_ms = video.key_encode.total_ms(),
+                stills = stream.stills.count,
+                stills_ms = stream.stills.total_ms(),
+                index_writes = stream.index.count,
+                index_ms = stream.index.total_ms(),
+                clip_json_writes = self.clip_json.count,
+                clip_json_ms = self.clip_json.total_ms(),
+                "clip recording cost by stage"
+            );
+        }
+    }
+
     /// The live part of one clip: the observer hands each instant's frame
     /// to the stream.
     struct Recording<'a> {
@@ -701,6 +763,7 @@ mod live {
         last_composed: Option<i64>,
         next_instant: u64,
         excluded_checked_at: Instant,
+        times: RecordingTimes,
         /// Held for the life of the recording; declared last, so it is
         /// released after everything else, once `finish` wrote the stop.
         _recorder_lock: RecorderLock,
@@ -709,6 +772,7 @@ mod live {
     impl<'a> Recording<'a> {
         /// Folder, lock, `clip.json`, observer, first frame and instant zero.
         fn start(plan: &'a ClipPlan) -> Result<Self, ErrorData> {
+            let times = RecordingTimes::begin();
             // The observer owns the Windows build rule; applied before the
             // clip folder exists, so an old Windows leaves nothing behind.
             synapse_capture::check_windows_build().map_err(|error| {
@@ -749,6 +813,7 @@ mod live {
                 last_composed: None,
                 next_instant: 0,
                 excluded_checked_at: Instant::now(),
+                times,
                 _recorder_lock: recorder_lock,
             };
             recording.write_instant_zero()?;
@@ -809,7 +874,11 @@ mod live {
             let geometry = self.geometry;
             let settings = self.observer.settings();
             let encoder = self.stream.encoder_info();
-            ClipJson::update(&self.plan.folder, |clip| {
+            let folder = &self.plan.folder;
+            self.times
+                .clip_json
+                .time(|| {
+                    ClipJson::update(folder, |clip| {
                 clip.clock = clock;
                 clip.geometry = geometry;
                 clip.observer = ObserverGrant {
@@ -822,8 +891,9 @@ mod live {
                 clip.encoder = Some(encoder);
                 clip.instants = 1;
                 clip.recorded_ms = instant_ms(1);
-            })
-            .map_err(internal_error)?;
+                    })
+                })
+                .map_err(internal_error)?;
             Ok(())
         }
 
@@ -976,7 +1046,11 @@ mod live {
             self.disk.wrote(written.bytes);
             if !written.closed_parts.is_empty() {
                 let parts = written.closed_parts;
-                ClipJson::update(&self.plan.folder, |clip| clip.parts.extend(parts)).map_err(
+                let folder = &self.plan.folder;
+                self.times
+                    .clip_json
+                    .time(|| ClipJson::update(folder, |clip| clip.parts.extend(parts)))
+                    .map_err(
                     |error| {
                         tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
                         StopReason::WriteFailed
@@ -998,26 +1072,39 @@ mod live {
         }
 
         /// Ends the stream (waiting index lines, last part) and publishes the
-        /// clip `ready` with every count of plan §3.
-        fn finish(self, reason: StopReason) {
+        /// clip `ready` with every count of plan §3, then logs what each stage
+        /// cost (`CLIP_RECORD_TIMING`).
+        fn finish(mut self, reason: StopReason) {
             let folder = &self.plan.folder;
             let summary = match self.stream.finish() {
                 Ok(summary) => summary,
                 Err(error) => {
                     tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
-                    let _ = ClipJson::update(folder, |clip| {
-                        clip.state = ClipState::Failed;
-                        clip.failure = Some(error);
+                    let _ = self.times.clip_json.time(|| {
+                        ClipJson::update(folder, |clip| {
+                            clip.state = ClipState::Failed;
+                            clip.failure = Some(error);
+                        })
                     });
-                    let _ = self.observer.stop();
+                    let stats = self.observer.stop();
+                    // The stream's own totals ended with it; the observer's and the
+                    // process's are still told.
+                    self.times.log(
+                        &self.plan.clip_id,
+                        &stats,
+                        self.next_instant,
+                        &StreamTimes::default(),
+                    );
                     return;
                 }
             };
             let stats = self.observer.stop();
             let geometry = self.geometry;
             let recorded_ms = instant_ms(summary.instants);
+            let (instants, stream_times) = (summary.instants, summary.times);
             let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
-            let updated = ClipJson::update(folder, |clip| -> Result<(), String> {
+            let updated = self.times.clip_json.time(|| {
+            ClipJson::update(folder, |clip| -> Result<(), String> {
                 clip.parts.extend(summary.parts);
                 clip.stills = summary.stills;
                 clip.encoder = Some(summary.encoder);
@@ -1057,14 +1144,19 @@ mod live {
                 }
                 clip.set_total_bytes(folder)
             })
-            .and_then(|(_, result)| result);
+            .and_then(|(_, result)| result)
+            });
             if let Err(error) = updated {
                 tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
-                let _ = ClipJson::update(folder, |clip| {
-                    clip.state = ClipState::Failed;
-                    clip.failure = Some(error);
+                let _ = self.times.clip_json.time(|| {
+                    ClipJson::update(folder, |clip| {
+                        clip.state = ClipState::Failed;
+                        clip.failure = Some(error);
+                    })
                 });
             }
+            self.times
+                .log(&self.plan.clip_id, &stats, instants, &stream_times);
         }
     }
 

@@ -12,14 +12,18 @@
 
 use std::ffi::{CStr, c_int, c_uint};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use libaom_sys as aom;
 use serde_json::json;
 
 use super::capture_clip::RECORD_FPS;
 use super::clip_folder::{IvfWriter, PartInfo, VIDEO_DIR, part_path};
+use super::clip_stream::StageTime;
 
 /// Constant quality level (`-crf`), plan §6.
 pub(super) const AV1_QUALITY: u32 = 35;
@@ -438,6 +442,19 @@ struct Job {
     place: VideoPlace,
 }
 
+/// The video's stage totals over one recording: conversion and queueing on
+/// the recorder thread, encoding on the encoder thread.
+#[derive(Clone, Copy, Default)]
+pub(super) struct VideoTimes {
+    pub(super) convert: StageTime,
+    pub(super) submit: StageTime,
+    /// The most pictures seen waiting in the queue right after a submit.
+    pub(super) max_queue_depth: usize,
+    /// Every libaom encode call (key pictures included).
+    pub(super) encode: StageTime,
+    pub(super) key_encode: StageTime,
+}
+
 /// What the encoder thread wrote: video bytes and the parts it closed, read back.
 #[derive(Default)]
 pub(super) struct VideoWritten {
@@ -459,6 +476,8 @@ struct ClipEncoder {
     width: u32,
     height: u32,
     part: Option<OpenPart>,
+    /// Encode times (only `encode` and `key_encode` are this side's).
+    times: VideoTimes,
 }
 
 impl ClipEncoder {
@@ -474,6 +493,7 @@ impl ClipEncoder {
             width,
             height,
             part: None,
+            times: VideoTimes::default(),
         })
     }
 
@@ -482,7 +502,13 @@ impl ClipEncoder {
     /// recorder said, because the index already names that place.
     fn encode(&mut self, job: Job) -> Result<VideoWritten, String> {
         let pts = i64::try_from(job.instant).map_err(|_| "instant out of range".to_owned())?;
+        let started = Instant::now();
         let packet = self.encoder.encode(&job.picture, pts, job.force_key)?;
+        let took = started.elapsed();
+        self.times.encode.add(took);
+        if packet.key {
+            self.times.key_encode.add(took);
+        }
         if packet.key != job.force_key {
             return Err(format!(
                 "instant {}: libaom gave key={}, key={} was planned",
@@ -544,13 +570,15 @@ impl ClipEncoder {
         )
     }
 
-    /// Closes the last part; returns it read back. Realtime libaom without
-    /// look-ahead holds no pictures, so nothing is left to drain.
-    fn finish(mut self) -> Result<Option<PartInfo>, String> {
-        match self.part.take() {
-            Some(open) => self.close(open).map(Some),
-            None => Ok(None),
-        }
+    /// Closes the last part; returns it read back, with the encode times.
+    /// Realtime libaom without look-ahead holds no pictures, so nothing is
+    /// left to drain.
+    fn finish(mut self) -> Result<(Option<PartInfo>, VideoTimes), String> {
+        let last = match self.part.take() {
+            Some(open) => Some(self.close(open)?),
+            None => None,
+        };
+        Ok((last, self.times))
     }
 }
 
@@ -563,10 +591,12 @@ fn encode_queued(
     height: u32,
     settings: EncoderSettings,
     queued: &Receiver<Job>,
+    waiting: &AtomicUsize,
     report: &Sender<Result<VideoWritten, String>>,
-) -> Result<Option<PartInfo>, String> {
+) -> Result<(Option<PartInfo>, VideoTimes), String> {
     let result = ClipEncoder::create(folder, width, height, settings).and_then(|mut video| {
         for job in queued {
+            waiting.fetch_sub(1, Ordering::Relaxed);
             let written = video.encode(job)?;
             // A send fails only when the recorder dropped the queue without
             // `finish`; there is no one left to tell then.
@@ -595,8 +625,12 @@ pub(super) struct VideoQueue {
     /// The place of the last queued picture.
     last_place: Option<VideoPlace>,
     jobs: SyncSender<Job>,
+    /// Pictures queued and not yet taken by the encoder thread.
+    waiting: Arc<AtomicUsize>,
     done: Receiver<Result<VideoWritten, String>>,
-    thread: JoinHandle<Result<Option<PartInfo>, String>>,
+    thread: JoinHandle<Result<(Option<PartInfo>, VideoTimes), String>>,
+    /// Conversion and queueing times; the thread adds its encode times at `finish`.
+    times: VideoTimes,
 }
 
 impl VideoQueue {
@@ -613,10 +647,22 @@ impl VideoQueue {
             .map_err(|error| format!("could not create {}: {error}", video.display()))?;
         let (jobs, queued) = std::sync::mpsc::sync_channel(ENCODER_QUEUE_PICTURES);
         let (report, done) = std::sync::mpsc::channel();
+        let waiting = Arc::new(AtomicUsize::new(0));
         let folder = folder.to_owned();
+        let thread_waiting = Arc::clone(&waiting);
         let thread = std::thread::Builder::new()
             .name(ENCODER_THREAD_NAME.to_owned())
-            .spawn(move || encode_queued(&folder, width, height, settings, &queued, &report))
+            .spawn(move || {
+                encode_queued(
+                    &folder,
+                    width,
+                    height,
+                    settings,
+                    &queued,
+                    &thread_waiting,
+                    &report,
+                )
+            })
             .map_err(|error| format!("could not start the encoder thread: {error}"))?;
         Ok(Self {
             width,
@@ -626,8 +672,10 @@ impl VideoQueue {
             last_key: None,
             last_place: None,
             jobs,
+            waiting,
             done,
             thread,
+            times: VideoTimes::default(),
         })
     }
 
@@ -646,14 +694,24 @@ impl VideoQueue {
             Some((part, _)) => (part + 1, 0),
             None => (0, 0),
         };
-        let picture = self.converter.convert(bgra)?;
+        let converter = &self.converter;
+        let picture = self.times.convert.time(|| converter.convert(bgra))?;
         let job = Job {
             instant,
             picture,
             force_key,
             place,
         };
-        match self.jobs.try_send(job) {
+        // Counted before the send, so the thread's decrement never runs first.
+        let waiting = self.waiting.fetch_add(1, Ordering::Relaxed) + 1;
+        let jobs = &self.jobs;
+        let sent = self.times.submit.time(|| jobs.try_send(job));
+        if sent.is_err() {
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.times.max_queue_depth = self.times.max_queue_depth.max(waiting);
+        }
+        match sent {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Ok(None),
             Err(TrySendError::Disconnected(_)) => {
@@ -681,13 +739,17 @@ impl VideoQueue {
 
     /// Lets the encoder thread encode every queued picture and close the last
     /// part; returns what it wrote since the last `written`, the last part
-    /// included.
-    pub(super) fn finish(self) -> Result<VideoWritten, String> {
+    /// included, and the video's stage times.
+    pub(super) fn finish(self) -> Result<(VideoWritten, VideoTimes), String> {
         let Self {
-            jobs, done, thread, ..
+            jobs,
+            done,
+            thread,
+            mut times,
+            ..
         } = self;
         drop(jobs);
-        let last_part = thread
+        let (last_part, thread_times) = thread
             .join()
             .map_err(|_| "the encoder thread panicked".to_owned())??;
         let mut written = VideoWritten::default();
@@ -695,6 +757,8 @@ impl VideoQueue {
             written.add(message?);
         }
         written.closed_parts.extend(last_part);
-        Ok(written)
+        times.encode = thread_times.encode;
+        times.key_encode = thread_times.key_encode;
+        Ok((written, times))
     }
 }

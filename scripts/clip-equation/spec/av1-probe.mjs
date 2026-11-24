@@ -20,7 +20,7 @@ const ROOT = options.root || JSON.parse(fs.readFileSync(path.join(BASE, 'corpus/
 const OUT = path.resolve(options.out || path.join(BASE, '../../.runs/av1-probe'));
 const PROBE = path.resolve(options.probe || path.join(BASE, 'probe/target/release/clip-probe.exe'));
 // `scenes=a,b,c` runs other corpus scenes (for example the small and odd-sized ones) through the same checks.
-const SCENES = options.scenes ? options.scenes.split(',') : ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080'];
+const SCENES = options.scenes ? options.scenes.split(',') : ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080', 'resize-640x360-to-506x333'];
 // A clip the product recorded on a real page (1904x1012, 40 s, parts of 200 pictures); the fetch checks read it.
 const FETCH_CLIP = path.join(ROOT, 'recorded-real-page');
 const FETCH_GOLDEN = path.join(FETCH_CLIP, 'fetch-reference.json');
@@ -280,6 +280,32 @@ function readBack(scene) {
   return { note: `slowest ${slowest.ms.toFixed(0)} ms (instant ${slowest.instant})` };
 }
 
+/**
+ * A window that changes size keeps being recorded: no instant is lost, the first instant at a new
+ * size starts a new part, and the pictures come back at the size they were recorded at.
+ */
+function resizeKeepsRecording(scene) {
+  const size = k => `${scene.corpus[k].width}x${scene.corpus[k].height}`;
+  const resizes = scene.corpus.map((row, k) => k).filter(k => k > 0 && size(k) !== size(k - 1));
+  if (!resizes.length) return { note: 'no size change in this scene' };
+  const lost = scene.lines.filter(line => kindOf(line) === 'lost');
+  if (lost.length) return { problem: `${lost.length} instants lost (${firstOf([...new Set(lost.map(line => line.lost))])}), first at ${lost[0].instant}` };
+  const bad = [];
+  for (const k of resizes) {
+    const line = scene.lines[k] ?? {};
+    if (kindOf(line) !== 'enc' || line.enc[1] !== 0) bad.push(`instant ${k} (first at ${size(k)}) is ${JSON.stringify(line.enc ?? kindOf(line))}, not the first picture of a new part`);
+  }
+  // the last encoded instant of every size segment comes back at that segment's size
+  for (const end of [...resizes.map(k => k - 1), scene.instants - 1]) {
+    const line = scene.lines.slice(0, end + 1).reverse().find(l => kindOf(l) === 'enc');
+    const got = fetchPicture(scene.out, line.instant);
+    if (got.error) bad.push(`fetch of instant ${line.instant}: ${got.error}`);
+    else if (`${got.width}x${got.height}` !== size(line.instant)) bad.push(`instant ${line.instant} comes back ${got.width}x${got.height}, recorded ${size(line.instant)}`);
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  return { note: `${resizes.length} size changes at instants ${resizes.join(', ')}: 0 lost, each starts a new part, pictures come back at their own size` };
+}
+
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
 function fetchPicture(folder, instant) {
   const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
@@ -358,6 +384,7 @@ const table = {
   'a still appears when the window settles': () => judge(stillOnSettle),
   'unchanged instants cost nothing': () => judge(unchangedCostsNothing),
   'read-back': () => judge(readBack),
+  'a resized window keeps recording': () => judge(resizeKeepsRecording),
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

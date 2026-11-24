@@ -11,6 +11,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: every scene: instant k is marked iff pixels(k)!=pixels(k-1) (instant 0 counts as a change) and pixels(k+1..k+9)=pixels(k) (settle=10 instants on screen, the changed one included); the mark is still:true when no earlier still holds the same pixels, else still_of=<instant of that still>; mix corpus settle points >= 1 | Known: true
   Scenario: unchanged instants cost nothing
     # Equation: same iff pixels(k)=pixels(k-1) (SHA-256 of the corpus B,G,R bytes); instant 0 is enc | Known: true
+  Scenario: a resized window keeps recording
+    # Equation: scene whose window size changes: lost=0; the first instant at a new size is enc [part,0] of a new part; the last encoded instant of each size comes back from the product decoder at that size | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

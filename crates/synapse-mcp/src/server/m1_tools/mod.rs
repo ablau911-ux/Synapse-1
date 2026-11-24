@@ -299,7 +299,9 @@ struct TargetParams {
     target: Option<SetTargetParam>,
     #[serde(default)]
     owner_session_id: Option<String>,
+    /// Claim lifetime in ms for operation=claim or adopt (default 120000).
     #[serde(default)]
+    #[schemars(range(min = 1000, max = 600000))]
     ttl_ms: Option<u64>,
     #[serde(default)]
     title_contains: Option<String>,

@@ -991,11 +991,11 @@ impl SessionLifecycleState {
         validate_lifecycle_session_id(session_id)?;
         // This is the normal lifecycle authority boundary. The only prelocked
         // path is the explicit two-session target-adoption entry point above.
-        let _authority_gate = self
+        let authority_gate = self
             .authority_service
             .lock_session_authority(session_id)
             .await?;
-        self.teardown_session_with_options_report_authority_locked(session_id, reason, options)
+        self.supervised_teardown(session_id, reason, options, Some(authority_gate))
             .await
     }
 
@@ -1005,7 +1005,52 @@ impl SessionLifecycleState {
         reason: &str,
         options: SessionTeardownOptions,
     ) -> Result<SessionTeardownReport, ErrorData> {
+        self.supervised_teardown(session_id, reason, options, None)
+            .await
+    }
+
+    /// #278: a teardown that started finishes, and daemon shutdown waits for
+    /// it. The teardown runs as a cooperative authority transaction: dropping
+    /// the caller's future (the shutdown abort of the stale reaper, a DELETE
+    /// whose client went away) does not stop it, and shutdown's authority
+    /// drain waits for it and, past its grace, reports it and keeps the
+    /// daemon lifetime locks. `authority_gate` is the session's gate when this
+    /// call took it; it moves into the transaction so it is held until the
+    /// teardown ends.
+    async fn supervised_teardown(
+        &self,
+        session_id: &str,
+        reason: &str,
+        options: SessionTeardownOptions,
+        authority_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<SessionTeardownReport, ErrorData> {
         validate_lifecycle_session_id(session_id)?;
+        let lifecycle = self.clone();
+        let owned_session_id = session_id.to_owned();
+        let owned_reason = reason.to_owned();
+        let teardown = self
+            .authority_service
+            .spawn_cooperative_authority_transaction(move |_shutdown| async move {
+                let report = lifecycle
+                    .run_teardown(&owned_session_id, &owned_reason, options)
+                    .await;
+                drop(authority_gate);
+                report
+            })?;
+        teardown.await.map_err(|join_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("session teardown task failed: {join_error}"),
+            )
+        })
+    }
+
+    async fn run_teardown(
+        &self,
+        session_id: &str,
+        reason: &str,
+        options: SessionTeardownOptions,
+    ) -> SessionTeardownReport {
         let mut report = SessionTeardownReport::new(session_id, reason);
         self.mark_terminated_session(&mut report);
         report.input = self.cleanup_inputs_and_lease(session_id).await;
@@ -1067,7 +1112,7 @@ impl SessionLifecycleState {
                 "session lifecycle teardown encountered cleanup failures"
             );
         }
-        Ok(report)
+        report
     }
 
     pub(crate) async fn release_session_inputs_for_daemon_shutdown(

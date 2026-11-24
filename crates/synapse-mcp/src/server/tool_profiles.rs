@@ -2023,7 +2023,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV timeline/control/v1 + CF_TIMELINE boundary row",
                 Some("timeline control row and boundary-row readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "escalate to an explicit privacy/admin profile and inspect timeline control rows",
+                PRIVACY_MUTATION_REMEDIATION,
             ),
             op(
                 "resume",
@@ -2032,7 +2032,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV timeline/control/v1 + CF_TIMELINE boundary row",
                 Some("timeline control row and boundary-row readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "escalate to an explicit privacy/admin profile and inspect timeline control rows",
+                PRIVACY_MUTATION_REMEDIATION,
             ),
             op(
                 "exclusions",
@@ -2041,7 +2041,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV timeline/control/v1 runtime exclusions",
                 Some("runtime/effective exclusion set readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "escalate before mutating exclusions; read-only exclusion inspection is allowed",
+                PRIVACY_MUTATION_REMEDIATION,
             ),
             op(
                 "redact",
@@ -2050,7 +2050,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "physical source rows + hygiene taint/audit rows",
                 Some("redacted source rows plus hygiene taint/audit readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "escalate to an explicit privacy/admin profile and inspect source rows plus hygiene taint/audit rows",
+                PRIVACY_MUTATION_REMEDIATION,
             ),
             op(
                 "purge",
@@ -2059,7 +2059,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_TIMELINE rows + purge audit row",
                 Some("CF_TIMELINE row count/audit-key readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "escalate to an explicit privacy/admin profile and inspect CF_TIMELINE rows plus purge audit row",
+                PRIVACY_MUTATION_REMEDIATION,
             ),
         ],
     ),
@@ -2240,6 +2240,11 @@ pub(crate) const MODEL_REGISTRY_REMEDIATION: &str = concat!(
 pub(crate) const HYGIENE_PERSIST_REMEDIATION: &str = concat!(
     maintenance_profile_remediation!(),
     "; normal_agent may use scan_text without persist, flags or report first"
+);
+/// privacy pause, resume, redact, purge and exclusions add/remove.
+pub(crate) const PRIVACY_MUTATION_REMEDIATION: &str = concat!(
+    maintenance_profile_remediation!(),
+    "; read-only exclusion inspection (exclusions without add/remove) is allowed for normal_agent"
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]

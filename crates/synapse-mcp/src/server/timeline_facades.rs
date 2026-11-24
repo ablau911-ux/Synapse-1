@@ -418,7 +418,7 @@ impl SynapseService {
                             operation,
                             "timeline/control/v1",
                             error,
-                            "escalate to an explicit privacy/admin profile, then inspect CF_KV timeline control and boundary rows",
+                            "inspect CF_KV timeline control and boundary rows",
                         )
                     })?
                     .0;
@@ -452,7 +452,7 @@ impl SynapseService {
                             operation,
                             "timeline/control/v1",
                             error,
-                            "escalate to an explicit privacy/admin profile, then inspect CF_KV timeline control and boundary rows",
+                            "inspect CF_KV timeline control and boundary rows",
                         )
                     })?
                     .0;
@@ -488,7 +488,7 @@ impl SynapseService {
                             operation,
                             "timeline/control/v1/exclusions",
                             error,
-                            "fix exclusion add/remove entries, escalate for mutations, and inspect recorder control state",
+                            "fix exclusion add/remove entries and inspect recorder control state",
                         )
                     })?
                     .0;
@@ -520,7 +520,7 @@ impl SynapseService {
                             operation,
                             source_id,
                             error,
-                            "escalate to an explicit privacy/admin profile, fix the flag selector, and inspect source rows plus hygiene taint/audit rows",
+                            "fix the flag selector and inspect source rows plus hygiene taint/audit rows",
                         )
                     })?
                     .0;
@@ -551,7 +551,7 @@ impl SynapseService {
                             operation,
                             source_id,
                             error,
-                            "escalate to an explicit privacy/admin profile, fix purge filters, and inspect CF_TIMELINE rows plus purge audit row",
+                            "fix purge filters and inspect CF_TIMELINE rows plus purge audit row",
                         )
                     })?
                     .0;
@@ -573,36 +573,24 @@ impl SynapseService {
 }
 
 impl SynapseService {
+    /// Privacy mutations use the maintenance gate (`break_glass` /
+    /// `full_capability`); the denial names the same remediation as the
+    /// `privacy` contract rows.
     fn require_privacy_mutation_profile(
         &self,
         operation: PrivacyOperation,
         source_id: &str,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
-        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
-        let snapshot = self.tool_profile_snapshot(session_id.as_deref())?;
-        if snapshot.profile.allows_maintenance_mutation() {
-            return Ok(());
-        }
-        Err(ErrorData::new(
-            ErrorCode(-32099),
-            format!(
-                "privacy operation={} requires an explicit privacy/admin tool profile",
-                operation.as_str()
-            ),
-            Some(json!({
-                "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "tool": PRIVACY_TOOL,
-                "operation": operation.as_str(),
-                "source_id": source_id,
-                "source_of_truth": "CF_SESSIONS mcp/tool-profile/v1/<session_id>",
-                "session_id": session_id,
-                "profile": snapshot.profile.as_str(),
-                "profile_label": snapshot.profile_label,
-                "policy_row": snapshot.policy_row,
-                "remediation": "call profile operation=set profile=break_glass confirm_break_glass=true reason=<privacy mutation reason> after acquiring any required lease, or run from the trusted full_capability local-agent/admin profile",
-            })),
-        ))
+        super::operational_facades::policy::require_maintenance_profile(
+            self,
+            request_context,
+            PRIVACY_TOOL,
+            operation.as_str(),
+            source_id,
+            "CF_SESSIONS mcp/tool-profile/v1/<session_id>",
+            super::tool_profiles::PRIVACY_MUTATION_REMEDIATION,
+        )
     }
 }
 

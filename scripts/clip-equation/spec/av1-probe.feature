@@ -53,6 +53,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed text-page recording copied to <bench clips>\clip-other (its own clip_id), the registry already listing clip_id "clip-other" (finished, another folder); a second copy in <bench clips>\explicit-b whose clip.json says clip_id <its id>-b; the product's recovery at start: both clips state = ready; the registry lists <its id> with folder clip-other and <its id>-b with folder explicit-b, both finished; no entry has clip_id "explicit-b" | Known: true
   Scenario: recovery at start reports a clip it could not recover
     # Equation: registry under the bench's own LOCALAPPDATA listing one unfinished clip in <bench>\elsewhere\clip-broken whose clip.json is not JSON; the product's recovery at start (clip-probe exp-av1-registry action=recover): ok = false with an error naming that clip.json; the registry still lists the clip unfinished | Known: true
+  Scenario: a failed start that made the clips folder leaves no registry behind
+    # Equation: bench clips folder holding only a registry that lists the failed start's clip; the product drops that entry as a start that created the clips folder (clip-probe exp-av1-registry action=remove root_created=true): ok; the clips folder is empty (no registry file, no lock file). Same with a second clip listed: ok; the registry lists exactly the second clip | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

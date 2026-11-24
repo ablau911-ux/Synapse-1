@@ -5,6 +5,9 @@
 //!
 //!   clip-probe exp-av1-registry action=mark_finished clip=<clip id>
 //!   clip-probe exp-av1-registry action=recover   (the recovery the service runs at start)
+//!   clip-probe exp-av1-registry action=remove clip=<clip id> root_created=<true|false>
+//!     (what a `record` that failed before its first picture does with its registry entry;
+//!     root_created: that start created the default clips folder)
 //!
 //! Prints one JSON line: ok, error. An error of the product is reported with ok=false and
 //! the run still exits 0: the check judges it.
@@ -21,9 +24,10 @@ pub fn run() -> Result<()> {
     let outcome = match args.text("action")? {
         "mark_finished" => ClipRegistry::mark_finished(args.text("clip")?),
         "recover" => ClipRecovery::recover_registered(),
+        "remove" => ClipRegistry::remove(args.text("clip")?, args.text("root_created")? == "true"),
         other => {
             return Err(format!(
-                "unknown action={other}; use mark_finished or recover"
+                "unknown action={other}; use mark_finished, recover or remove"
             ));
         }
     };

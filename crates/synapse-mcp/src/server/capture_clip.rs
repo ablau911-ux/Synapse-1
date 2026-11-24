@@ -644,7 +644,7 @@ mod live {
     use super::super::clip_folder::{
         CLIP_METHOD, CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry,
         ClipState, ClipTargetInfo, ConditionStatus, Conditions, LOST_CAPTURE_FAILED,
-        LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason,
+        LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason, clips_root,
     };
     use super::super::clip_recovery::ClipRecovery;
     use super::super::clip_stream::{
@@ -676,6 +676,10 @@ mod live {
     /// One clip. Sends the start result as soon as `clip.json` and instant
     /// zero are written.
     pub(super) fn record(plan: &ClipPlan, control: &RecordingControl, started: StartSender) {
+        // The default clips folder (where the registry lives) and the
+        // parents of it that do not exist before this start: a failed start
+        // removes again what it made of them.
+        let root_first_created = first_missing(&clips_root());
         let first_created = match create_clip_folder(plan) {
             Ok(first_created) => first_created,
             Err(error) => {
@@ -689,7 +693,7 @@ mod live {
             Ok(recording) => recording,
             Err(error) => {
                 control.seal();
-                discard_folder(plan, &first_created);
+                discard_folder(plan, &first_created, root_first_created.as_deref());
                 let _ = started.send(Err(error));
                 return;
             }
@@ -731,13 +735,7 @@ mod live {
         let could_not_create = |path: &Path, error: std::io::Error| {
             internal_error(format!("could not create {}: {error}", path.display()))
         };
-        let first_created = plan
-            .folder
-            .ancestors()
-            .take_while(|path| !path.exists())
-            .last()
-            .unwrap_or(&plan.folder)
-            .to_path_buf();
+        let first_created = first_missing(&plan.folder).unwrap_or_else(|| plan.folder.clone());
         let created = plan
             .folder
             .parent()
@@ -760,10 +758,14 @@ mod live {
     /// A `record` that fails before its first picture removes the folder it
     /// created (plan §3; #290). `capture_clip_plan` refuses a folder that
     /// existed before the call, so this never touches one.
-    /// Removes the clip folder this recording created (`create_clip_folder`),
-    /// the parents it created up to `first_created`, and its registry entry,
-    /// after a start that failed before its first picture.
-    fn discard_folder(plan: &ClipPlan, first_created: &Path) {
+    /// After a start that failed before its first picture, the disk is left
+    /// as it was: the clip folder this recording created
+    /// (`create_clip_folder`) is removed, then its registry entry (with the
+    /// registry file and its lock file when this start created the default
+    /// clips folder and no other clip is listed), then the parents this
+    /// start created: those of the clip folder up to `first_created`, and the
+    /// default clips folder up to `root_first_created`.
+    fn discard_folder(plan: &ClipPlan, first_created: &Path, root_first_created: Option<&Path>) {
         match std::fs::remove_dir_all(&plan.folder) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -773,10 +775,23 @@ mod live {
                 error = %error
             ),
         }
-        remove_created_parents(&plan.folder, first_created);
-        if let Err(error) = ClipRegistry::remove(&plan.clip_id) {
+        if let Err(error) = ClipRegistry::remove(&plan.clip_id, root_first_created.is_some()) {
             tracing::warn!(code = "CAPTURE_CLIP_DISCARD_FAILED", error = %error);
         }
+        remove_created_parents(&plan.folder, first_created);
+        if let Some(root_first_created) = root_first_created {
+            remove_created_parents(&ClipRegistry::path(), root_first_created);
+        }
+    }
+
+    /// The highest ancestor of `path` (or `path` itself) that does not
+    /// exist: the first folder that creating `path` makes. `None` when
+    /// `path` exists.
+    fn first_missing(path: &Path) -> Option<PathBuf> {
+        path.ancestors()
+            .take_while(|ancestor| !ancestor.exists())
+            .last()
+            .map(Path::to_path_buf)
     }
 
     /// Removes the parents of `folder` that a start created, from the

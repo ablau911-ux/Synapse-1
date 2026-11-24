@@ -800,6 +800,34 @@ function recoveryFailureReported() {
 }
 
 /**
+ * A `record` that failed before its first picture leaves the disk as it was. When that start created
+ * the default clips folder, dropping its registry entry leaves no registry file and no lock file there,
+ * so the folder can be removed; a registry that still lists another clip is kept with that clip.
+ */
+function failedStartLeavesNoRegistry() {
+  const problems = [];
+  const cases = [['registry-failed-start-only', ['clip-a'], []], ['registry-failed-start-other', ['clip-a', 'clip-b'], ['clip-b']]];
+  for (const [name, listed, left] of cases) {
+    const appData = path.join(OUT, name);
+    if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+    const clips = path.join(appData, 'synapse', 'clips');
+    fs.mkdirSync(clips, { recursive: true });
+    const registry = path.join(clips, 'active-clips.json');
+    fs.writeFileSync(registry, JSON.stringify(listed.map(id => ({ clip_id: id, folder: path.join(clips, id), finished: false })), null, 2));
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=remove', 'clip=clip-a', 'root_created=true'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (!got.ok) { problems.push(`${name}: remove: ${got.error}`); continue; }
+    if (left.length === 0) {
+      const files = fs.readdirSync(clips);
+      if (files.length) problems.push(`${name}: the clips folder still holds ${files.join(', ')}`);
+    } else {
+      const ids = fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, 'utf8')).map(e => e.clip_id) : null;
+      if (JSON.stringify(ids) !== JSON.stringify(left)) problems.push(`${name}: the registry lists ${JSON.stringify(ids)}, not ${JSON.stringify(left)}`);
+    }
+  }
+  return verdict(problems, 'failed start that made the clips folder: its entry dropped, no registry file and no lock file left; with a second clip listed, the registry keeps exactly that clip');
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -916,6 +944,7 @@ const table = {
   'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
   'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
   'recovery at start reports a clip it could not recover': recoveryFailureReported,
+  'a failed start that made the clips folder leaves no registry behind': failedStartLeavesNoRegistry,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

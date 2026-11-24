@@ -68,3 +68,6 @@ tracing-*.log
 # dirty git status. The script itself IS committed; its run products are not.
 /synapse-update-*.log
 /synapse-update.log
+
+# Serena (code-intelligence tool) per-project settings and cache
+/.serena/

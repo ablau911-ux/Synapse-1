@@ -176,39 +176,13 @@ fn run_view(params: &ClipViewParams) -> Result<ViewOutput, ErrorData> {
 // ---------------------------------------------------------------------------
 
 /// Refuses any folder that is not a plan 5.0 clip, naming the format it
-/// holds, before the typed `clip.json` is read.
+/// holds (`ClipJson::other_format`), before the typed `clip.json` is read.
 fn check_format(folder: &Path) -> Result<(), ErrorData> {
-    let path = folder.join(CLIP_JSON_FILE);
-    let text = std::fs::read_to_string(&path).map_err(|error| {
-        params_invalid(format!(
-            "{} is not a readable clip folder: could not read {}: {error}",
-            folder.display(),
-            path.display()
-        ))
-    })?;
-    let header: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
-        params_invalid(format!("{} is not valid JSON: {error}", path.display()))
-    })?;
-    let version = header
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64);
-    let method = header.get("method").and_then(serde_json::Value::as_str);
-    if version == Some(u64::from(CLIP_SCHEMA_VERSION)) && method == Some(CLIP_METHOD) {
+    let Some(format) = ClipJson::other_format(folder).map_err(params_invalid)? else {
         return Ok(());
-    }
-    let format = match (
-        header.get("way").and_then(serde_json::Value::as_str),
-        method,
-    ) {
-        (Some(way), _) => format!(
-            "the older {way} format (exact zstd rows under frames/ plus H.264 segments under moving/)"
-        ),
-        (None, Some(method)) => format!("the format {method}"),
-        (None, None) => "an unknown format".to_owned(),
     };
-    let version = version.map_or_else(|| "missing".to_owned(), |version| version.to_string());
     Err(params_invalid(format!(
-        "{} holds a clip in {format}, schema_version {version}; this viewer reads only the {CLIP_METHOD} format (schema_version {CLIP_SCHEMA_VERSION}: {VIDEO_DIR}/part-NNNN.ivf, {STILLS_DIR}/still-NNNNNNNN.webp, {FRAMES_FILE}); record the clip again",
+        "{} holds a clip in {format}; this viewer reads only the {CLIP_METHOD} format (schema_version {CLIP_SCHEMA_VERSION}: {VIDEO_DIR}/part-NNNN.ivf, {STILLS_DIR}/still-NNNNNNNN.webp, {FRAMES_FILE}); record the clip again",
         folder.display()
     )))
 }

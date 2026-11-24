@@ -31,6 +31,13 @@ pub(super) struct ClipRecovery;
 
 impl ClipRecovery {
     pub(super) fn run(folder: &Path) -> Result<(), String> {
+        // A clip of another (older) format is no recording of this recorder:
+        // it needs no recovery and is skipped quietly, before anything is
+        // written in its folder.
+        if let Some(format) = ClipJson::other_format(folder)? {
+            tracing::debug!(code = "CLIP_RECOVERY_SKIPPED_FORMAT", folder = %folder.display(), format = %format);
+            return Ok(());
+        }
         // The recorder lock is held across recovery, so a second recovery waits out.
         if RecorderLock::held(folder) {
             return Ok(());

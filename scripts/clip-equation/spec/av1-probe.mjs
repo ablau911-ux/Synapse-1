@@ -576,6 +576,30 @@ function overlongClipCapped() {
   return verdict(problems, `clip planned ${LONGEST_MS + INSTANT_MS} ms long: recovered ready, ${got.lines.length} index lines (capped at the longest recording), ${recorded} recorded lines kept`);
 }
 
+/**
+ * A clip folder of an older format (its clip.json lacks `method`, as the 16 old clips on disk do):
+ * recovery skips it quietly (no error, so no CLIP_RECOVERY_FAILED warning) and changes nothing in it.
+ */
+function otherFormatSkipped() {
+  const list = dir => fs.readdirSync(dir, { recursive: true }).map(String).sort();
+  let filesBefore, clipBefore;
+  const got = recovered('killed-text-page', 'other-format', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    delete clip.method;
+    fs.writeFileSync(file, JSON.stringify(clip));
+    clipBefore = fs.readFileSync(file, 'utf8');
+    filesBefore = list(dir);
+  });
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  if (fs.readFileSync(path.join(got.dir, 'clip.json'), 'utf8') !== clipBefore) problems.push('recovery changed clip.json');
+  if (JSON.stringify(got.lines) !== JSON.stringify(got.before)) problems.push('recovery changed frames.jsonl');
+  const filesAfter = list(got.dir);
+  const added = filesAfter.filter(file => !filesBefore.includes(file)), removed = filesBefore.filter(file => !filesAfter.includes(file));
+  if (added.length || removed.length) problems.push(`recovery added ${added.join(', ') || 'nothing'} and removed ${removed.join(', ') || 'nothing'}`);
+  return verdict(problems, 'clip.json without method (an older format): recovery skips it without an error and changes no file');
+}
+
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
 function fetchPicture(folder, instant) {
   const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
@@ -666,6 +690,7 @@ const table = {
   'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
   'recovery caps a clip longer than the longest recording': overlongClipCapped,
   'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,
+  'recovery skips a clip of another format quietly': otherFormatSkipped,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

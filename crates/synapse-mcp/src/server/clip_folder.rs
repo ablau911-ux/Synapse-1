@@ -599,6 +599,42 @@ impl ClipJson {
         }
     }
 
+    /// The format of the clip in `folder`, read from the head of its
+    /// `clip.json` before the typed read: `None` for a plan 5.0 clip
+    /// (`CLIP_METHOD`, `CLIP_SCHEMA_VERSION`), else the format it holds, in
+    /// words. An error when `clip.json` cannot be read or is not JSON.
+    pub(super) fn other_format(folder: &Path) -> Result<Option<String>, String> {
+        let path = folder.join(CLIP_JSON_FILE);
+        let text = retry_brief_hold(|| std::fs::read_to_string(&path)).map_err(|error| {
+            format!(
+                "{} is not a readable clip folder: could not read {}: {error}",
+                folder.display(),
+                path.display()
+            )
+        })?;
+        let header: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
+        let version = header
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64);
+        let method = header.get("method").and_then(serde_json::Value::as_str);
+        if version == Some(u64::from(CLIP_SCHEMA_VERSION)) && method == Some(CLIP_METHOD) {
+            return Ok(None);
+        }
+        let format = match (
+            header.get("way").and_then(serde_json::Value::as_str),
+            method,
+        ) {
+            (Some(way), _) => format!(
+                "the older {way} format (exact zstd rows under frames/ plus H.264 segments under moving/)"
+            ),
+            (None, Some(method)) => format!("the format {method}"),
+            (None, None) => "an unknown format".to_owned(),
+        };
+        let version = version.map_or_else(|| "missing".to_owned(), |version| version.to_string());
+        Ok(Some(format!("{format}, schema_version {version}")))
+    }
+
     /// Reads `clip.json` of a clip folder.
     pub(super) fn read(folder: &Path) -> Result<Self, String> {
         let path = folder.join(CLIP_JSON_FILE);

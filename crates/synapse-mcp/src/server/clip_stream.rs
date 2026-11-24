@@ -5,8 +5,11 @@
 //!   on screen for `SETTLE_INSTANTS` in a row, the changed instant included
 //!                                        → one lossless still for the changed instant
 //!   no picture known                     → `lost`, with its cause
+//!   changed, but the encoder queue full  → `lost` (`encoder_behind`)
 //!
 //! Every instant gets exactly one index line, so N = N_enc + N_same + N_lost.
+//! A changed picture is queued for the encoder thread (`VideoQueue`) with its
+//! place [part, index] already decided, so this thread never waits for an encode.
 //! Moved from the W0 probe (`scripts/clip-equation/probe/src/exp_av1.rs`:
 //! `Recorder`, `StillRule`, `Stills`, `Index`), whose checks proved it.
 
@@ -18,10 +21,10 @@ use std::path::{Path, PathBuf};
 use image_webp::{ColorType, WebPEncoder};
 
 use super::capture_clip::RECORD_FPS;
-use super::clip_encoder::{BGRA_BYTES, ClipEncoder, EncoderSettings, VideoPlace, encoder_name};
+use super::clip_encoder::{BGRA_BYTES, EncoderSettings, VideoPlace, VideoQueue, encoder_name};
 use super::clip_folder::{
-    EncoderInfo, FRAMES_FILE, IndexLine, LOST_NO_PICTURE_YET, LOST_WINDOW_RESIZED, LostInstant,
-    PartInfo, STILLS_DIR, StillInfo, still_path,
+    EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_NO_PICTURE_YET,
+    LOST_WINDOW_RESIZED, LostInstant, PartInfo, STILLS_DIR, StillInfo, still_path,
 };
 
 /// `SETTLE_INSTANTS`: 0.5 s on screen, the changed instant included (plan §6).
@@ -49,10 +52,11 @@ pub(super) enum StreamInput<'a> {
 
 /// What one instant wrote.
 pub(super) struct Written {
-    /// Bytes written to the clip folder (video, still, index lines).
+    /// Bytes written to the clip folder (video the encoder thread wrote since
+    /// the instant before, still, index lines).
     pub(super) bytes: u64,
-    /// A video part this instant's key picture closed, read back.
-    pub(super) closed_part: Option<PartInfo>,
+    /// Video parts the encoder thread closed since the instant before, read back.
+    pub(super) closed_parts: Vec<PartInfo>,
 }
 
 /// What a finished stream hands to `clip.json`.
@@ -61,8 +65,8 @@ pub(super) struct StreamSummary {
     pub(super) encoded: u64,
     pub(super) same: u64,
     pub(super) lost: Vec<LostInstant>,
-    /// The last part, closed by `finish`.
-    pub(super) last_part: Option<PartInfo>,
+    /// The parts closed while `finish` drained the encoder queue, the last part included.
+    pub(super) parts: Vec<PartInfo>,
     pub(super) stills: Vec<StillInfo>,
     pub(super) encoder: EncoderInfo,
 }
@@ -84,12 +88,14 @@ struct Shown {
 
 /// Owns the rule "changed → encode, equal → same": per instant it decides
 /// `enc`, `same` or `lost` by comparing pixels with the picture before,
-/// encodes, writes due stills and passes the line to the index.
+/// queues changed pictures for the encoder, writes due stills and passes the
+/// line to the index.
 pub(super) struct ClipStream {
     folder: PathBuf,
     settings: EncoderSettings,
     next_instant: u64,
-    encoder: Option<ClipEncoder>,
+    /// Starts with the first changed picture.
+    video: Option<VideoQueue>,
     shown: Option<Shown>,
     previous_lost: Option<&'static str>,
     still_rule: StillRule,
@@ -108,7 +114,7 @@ impl ClipStream {
             folder: folder.to_owned(),
             settings: EncoderSettings::standard(),
             next_instant: 0,
-            encoder: None,
+            video: None,
             shown: None,
             previous_lost: None,
             still_rule: StillRule::new(SETTLE_INSTANTS),
@@ -139,9 +145,15 @@ impl ClipStream {
         self.next_instant += 1;
         let mut written = Written {
             bytes: 0,
-            closed_part: None,
+            closed_parts: Vec::new(),
         };
-        let decision = self.decide(instant, input, &mut written)?;
+        let decision = self.decide(instant, input)?;
+        if let Some(video) = &self.video {
+            // An encoder error reaches the recording here and stops it.
+            let video_written = video.written()?;
+            written.bytes += video_written.bytes;
+            written.closed_parts = video_written.closed_parts;
+        }
         match decision {
             Decision::Enc(_) => self.encoded += 1,
             Decision::Same => self.same += 1,
@@ -168,12 +180,7 @@ impl ClipStream {
         Ok(written)
     }
 
-    fn decide(
-        &mut self,
-        instant: u64,
-        input: StreamInput,
-        written: &mut Written,
-    ) -> Result<Decision, String> {
+    fn decide(&mut self, instant: u64, input: StreamInput) -> Result<Decision, String> {
         match input {
             StreamInput::Lost(cause) => Ok(Decision::Lost(cause)),
             StreamInput::Unchanged => Ok(match (self.previous_lost, &self.shown) {
@@ -200,38 +207,41 @@ impl ClipStream {
                     return Ok(Decision::Same);
                 }
                 if self
-                    .encoder
+                    .video
                     .as_ref()
-                    .is_some_and(|encoder| encoder.size() != (width, height))
+                    .is_some_and(|video| video.size() != (width, height))
                 {
                     return Ok(Decision::Lost(LOST_WINDOW_RESIZED));
                 }
-                self.encode(instant, bgra, width, height, written)
-                    .map(Decision::Enc)
+                Ok(match self.queue(instant, bgra, width, height)? {
+                    Some(place) => Decision::Enc(place),
+                    None => Decision::Lost(LOST_ENCODER_BEHIND),
+                })
             }
         }
     }
 
-    fn encode(
+    /// Queues the changed picture for the encoder; returns its place, or
+    /// `None` when the queue is full (the shown picture stays the one before).
+    fn queue(
         &mut self,
         instant: u64,
         bgra: &[u8],
         width: u32,
         height: u32,
-        written: &mut Written,
-    ) -> Result<VideoPlace, String> {
-        let encoder = match &mut self.encoder {
-            Some(encoder) => encoder,
-            None => self.encoder.insert(ClipEncoder::create(
+    ) -> Result<Option<VideoPlace>, String> {
+        let video = match &mut self.video {
+            Some(video) => video,
+            None => self.video.insert(VideoQueue::start(
                 &self.folder,
                 width,
                 height,
                 self.settings,
             )?),
         };
-        let encoded = encoder.encode(instant, bgra)?;
-        written.bytes += encoded.bytes;
-        written.closed_part = encoded.closed_part;
+        let Some(place) = video.submit(instant, bgra)? else {
+            return Ok(None);
+        };
         let shown = self.shown.get_or_insert_with(|| Shown {
             bgra: Vec::new(),
             width,
@@ -240,24 +250,26 @@ impl ClipStream {
         shown.bgra.clear();
         shown.bgra.extend_from_slice(bgra);
         (shown.width, shown.height) = (width, height);
-        Ok(encoded.place)
+        Ok(Some(place))
     }
 
     /// Writes the waiting index lines (an open still is not written: the
-    /// recording ended before its picture settled) and closes the last part.
+    /// recording ended before its picture settled), lets the encoder thread
+    /// encode every queued picture and closes the last part. An encoder error
+    /// is returned, so the clip fails instead of turning ready.
     pub(super) fn finish(mut self) -> Result<StreamSummary, String> {
         self.index.write_decided(None)?;
         let encoder = self.encoder_info();
-        let last_part = match self.encoder.take() {
-            Some(video) => video.finish()?,
-            None => None,
+        let parts = match self.video.take() {
+            Some(video) => video.finish()?.closed_parts,
+            None => Vec::new(),
         };
         Ok(StreamSummary {
             instants: self.next_instant,
             encoded: self.encoded,
             same: self.same,
             lost: self.lost,
-            last_part,
+            parts,
             stills: self.stills.written,
             encoder,
         })
@@ -373,7 +385,8 @@ impl Stills {
 /// `frames.jsonl`: one line per instant, in order. A line waits while its
 /// own or an earlier instant's still is undecided (at most `SETTLE_INSTANTS`
 /// lines); every decided line goes straight to the file (unbuffered), so a
-/// killed recorder keeps it.
+/// killed recorder keeps it. An `enc` line can reach the file before the
+/// encoder thread wrote its picture; recovery names such a line lost.
 struct Index {
     file: File,
     waiting: VecDeque<IndexLine>,

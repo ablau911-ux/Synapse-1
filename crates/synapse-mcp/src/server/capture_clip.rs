@@ -974,8 +974,9 @@ mod live {
                 StopReason::WriteFailed
             })?;
             self.disk.wrote(written.bytes);
-            if let Some(part) = written.closed_part {
-                ClipJson::update(&self.plan.folder, |clip| clip.parts.push(part)).map_err(
+            if !written.closed_parts.is_empty() {
+                let parts = written.closed_parts;
+                ClipJson::update(&self.plan.folder, |clip| clip.parts.extend(parts)).map_err(
                     |error| {
                         tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
                         StopReason::WriteFailed
@@ -1017,7 +1018,7 @@ mod live {
             let recorded_ms = instant_ms(summary.instants);
             let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
             let updated = ClipJson::update(folder, |clip| -> Result<(), String> {
-                clip.parts.extend(summary.last_part);
+                clip.parts.extend(summary.parts);
                 clip.stills = summary.stills;
                 clip.encoder = Some(summary.encoder);
                 clip.instants = summary.instants;

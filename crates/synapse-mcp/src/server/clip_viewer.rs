@@ -28,14 +28,19 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use std::time::Instant;
+
 use base64::Engine as _;
-use image::RgbaImage;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ExtendedColorType, ImageEncoder as _, RgbaImage};
 use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 use synapse_core::{Rect, error_codes};
 
 use super::ErrorData;
-use super::clip_decoder::{ClipDecoder, ClipPicture, PictureKind, PictureSource};
+use super::clip_decoder::{
+    ClipDecoder, ClipPicture, PictureKind, PictureSource, VIEW_TIMING_CODE, elapsed_ms,
+};
 use super::clip_folder::{
     CLIP_JSON_FILE, CLIP_METHOD, CLIP_SCHEMA_VERSION, ClipJson, ClipState, FRAMES_FILE, IndexLine,
     STILLS_DIR, VIDEO_DIR, VIEWS_DIR, read_index,
@@ -49,6 +54,10 @@ use crate::m1::{
 
 /// N: upper bound on images per call; the token budget may allow fewer.
 const MAX_IMAGES_PER_CALL: usize = 8;
+/// PNG compression of returned pictures: the fast level. One picture
+/// read-back must answer within 500 ms, and a returned PNG is read once, so
+/// encode time counts more than its size.
+const VIEW_PNG_COMPRESSION: CompressionType = CompressionType::Fast;
 /// Default image long edge: standard-tier Claude models downsize anything
 /// larger. `max_long_edge` overrides it.
 const VIEW_MAX_LONG_EDGE: u32 = 1_568;
@@ -1019,12 +1028,24 @@ impl ClipView {
             ),
         );
         let path = self.clip.views_dir()?.join(format!("{stem}.png"));
+        let started = Instant::now();
         let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
         let mut png = Vec::new();
-        rgb.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        PngEncoder::new_with_quality(&mut png, VIEW_PNG_COMPRESSION, FilterType::Adaptive)
+            .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
             .map_err(|error| internal(format!("PNG encode failed: {error}")))?;
         std::fs::write(&path, &png)
             .map_err(|error| internal(format!("could not write {path:?}: {error}")))?;
+        tracing::debug!(
+            code = VIEW_TIMING_CODE,
+            stage = "png",
+            frame = picture.instant,
+            width = rgb.width(),
+            height = rgb.height(),
+            bytes = png.len(),
+            ms = elapsed_ms(started),
+            "clip picture read-back: PNG encoded and written"
+        );
         let _ = writeln!(self.text, "{label}: {}", path.display());
         self.images.push(ClipViewImage {
             index,

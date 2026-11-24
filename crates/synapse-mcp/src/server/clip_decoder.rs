@@ -14,14 +14,20 @@
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use image::RgbaImage;
 use libaom_sys as aom;
 
 use super::clip_folder::{IndexLine, IvfPicture, part_path, read_ivf, still_path};
 
-/// Decoder threads: the machine's parallelism, at most this many.
-const MAX_DECODER_THREADS: usize = 8;
+/// Decoder threads: one per processor thread, as the encoder has, at most
+/// libaom's limit for one context. A read-back late in a part decodes up to
+/// 200 pictures, so decode speed sets the read-back time.
+const MAX_DECODER_THREADS: usize = 64;
+/// The `code` of the debug lines that time one picture read-back (stages
+/// `read_part`, `decode`, `convert`; the viewer adds `png`).
+pub(super) const VIEW_TIMING_CODE: &str = "CLIP_VIEW_TIMING";
 /// libaom may return 8-bit pictures for 8-bit streams (`allow_lowbitdepth`).
 const ALLOW_LOW_BIT_DEPTH: c_uint = 1;
 /// No `AOM_CODEC_USE_*` flags.
@@ -225,9 +231,19 @@ struct PartReader {
 impl PartReader {
     fn open(folder: &Path, part: u32) -> Result<Self, String> {
         let path = part_path(folder, part);
+        let started = Instant::now();
+        let pictures = read_ivf(&path)?;
+        tracing::debug!(
+            code = VIEW_TIMING_CODE,
+            stage = "read_part",
+            part,
+            pictures = pictures.len(),
+            ms = elapsed_ms(started),
+            "clip picture read-back: IVF part read"
+        );
         Ok(Self {
             part,
-            pictures: read_ivf(&path)?,
+            pictures,
             path,
             decoder: Av1Decoder::new()?,
             next: 0,
@@ -245,7 +261,8 @@ impl PartReader {
         {
             return Ok(image.clone());
         }
-        let mut wanted = None;
+        let started = Instant::now();
+        let first = self.next;
         while self.next <= index {
             let current = self.next;
             let data = usize::try_from(current)
@@ -259,14 +276,31 @@ impl PartReader {
                         self.pictures.len()
                     )
                 })?;
-            let image = self.decoder.decode(data, current == index)?;
+            self.decoder.decode(data)?;
             self.next += 1;
-            if current == index {
-                wanted = image;
-            }
         }
-        let image = wanted
-            .ok_or_else(|| format!("{} gave no picture {index}", self.path.display()))?;
+        if self.next == first {
+            return Err(format!("{} gave no picture {index}", self.path.display()));
+        }
+        tracing::debug!(
+            code = VIEW_TIMING_CODE,
+            stage = "decode",
+            part = self.part,
+            index,
+            pictures = self.next - first,
+            ms = elapsed_ms(started),
+            "clip picture read-back: AV1 pictures decoded up to the one asked for"
+        );
+        let started = Instant::now();
+        let image = self.decoder.rgba()?;
+        tracing::debug!(
+            code = VIEW_TIMING_CODE,
+            stage = "convert",
+            part = self.part,
+            index,
+            ms = elapsed_ms(started),
+            "clip picture read-back: 4:2:0 to RGBA"
+        );
         self.last = Some((index, image.clone()));
         Ok(image)
     }
@@ -301,9 +335,17 @@ fn decode_still(path: &Path) -> Result<RgbaImage, String> {
         .ok_or_else(|| format!("{} decoded to a buffer of the wrong size", path.display()))
 }
 
+/// Milliseconds since `started`, for the `VIEW_TIMING_CODE` lines.
+pub(super) fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// One libaom AV1 decoder context.
 struct Av1Decoder {
     context: Box<aom::aom_codec_ctx_t>,
+    /// The picture the last `decode` produced; libaom keeps it valid until
+    /// the next `decode`.
+    frame: *const aom::aom_image_t,
 }
 
 impl Av1Decoder {
@@ -336,12 +378,15 @@ impl Av1Decoder {
                 "aom_codec_dec_init_ver failed: libaom error {code}"
             ));
         }
-        Ok(Self { context })
+        Ok(Self {
+            context,
+            frame: std::ptr::null(),
+        })
     }
 
-    /// Decodes one compressed picture. With `convert`, returns the picture it
-    /// produced as RGBA; otherwise only advances the decoder.
-    fn decode(&mut self, data: &[u8], convert: bool) -> Result<Option<RgbaImage>, String> {
+    /// Decodes one compressed picture; `rgba` converts the picture it produced.
+    fn decode(&mut self, data: &[u8]) -> Result<(), String> {
+        self.frame = std::ptr::null();
         // SAFETY: `data` is readable for `data.len()` bytes through the call.
         let code = unsafe {
             aom::aom_codec_decode(
@@ -353,22 +398,25 @@ impl Av1Decoder {
         };
         self.check(code, "aom_codec_decode")?;
         let mut iterator: aom::aom_codec_iter_t = std::ptr::null();
-        let mut picture = None;
         loop {
             // SAFETY: the iterator starts null and is only advanced by libaom.
             let image = unsafe { aom::aom_codec_get_frame(&raw mut *self.context, &raw mut iterator) };
             if image.is_null() {
                 break;
             }
-            if convert {
-                // SAFETY: libaom keeps the image valid until the next decode call.
-                picture = Some(i420_to_rgba(unsafe { &*image })?);
-            }
+            self.frame = image.cast_const();
         }
-        if convert && picture.is_none() {
+        Ok(())
+    }
+
+    /// The picture the last `decode` produced, as RGBA.
+    fn rgba(&self) -> Result<RgbaImage, String> {
+        if self.frame.is_null() {
             return Err("the AV1 decoder returned no picture".to_owned());
         }
-        Ok(picture)
+        // SAFETY: set by the last `decode`; libaom keeps the image valid until
+        // the next decode call, and none happened since.
+        i420_to_rgba(unsafe { &*self.frame })
     }
 
     fn check(&self, code: aom::aom_codec_err_t, step: &str) -> Result<(), String> {

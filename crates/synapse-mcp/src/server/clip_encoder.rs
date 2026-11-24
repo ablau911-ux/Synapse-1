@@ -5,9 +5,15 @@
 //!
 //! Moved from the W0 probe (`scripts/clip-equation/probe/src/exp_av1_video.rs`),
 //! whose checks proved it; the probe's stage timers are left out.
+//!
+//! The encoder runs on its own thread behind a bounded queue (plan §6,
+//! `VideoQueue`): a key picture takes far longer than one instant to encode,
+//! and the recorder thread must never wait for it.
 
 use std::ffi::{CStr, c_int, c_uint};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::thread::JoinHandle;
 
 use libaom_sys as aom;
 use serde_json::json;
@@ -20,6 +26,15 @@ pub(super) const AV1_QUALITY: u32 = 35;
 /// `KEY_INSTANTS`: a key picture at the first encoded picture this many
 /// instants after the last one (10 s at 20 instants per second), plan §6.
 pub(super) const KEY_INSTANTS: u64 = 200;
+/// `ENCODER_QUEUE_PICTURES`: converted pictures waiting for the encoder thread
+/// (plan §6). The first live run measured 250-650 ms for one key picture, that
+/// is up to 13 instants; 30 pictures = 1.5 s holds more than twice the slowest
+/// key picture, so the pictures behind it wait instead of being lost. A
+/// converted 4:2:0 picture of a 1920 x 1008 window is about 2.9 MB, so a full
+/// queue holds about 87 MB, and only while the encoder is behind.
+pub(super) const ENCODER_QUEUE_PICTURES: usize = 30;
+/// The encoder thread's name, as it shows in a debugger or a crash dump.
+const ENCODER_THREAD_NAME: &str = "synapse-clip-encoder";
 /// The ffmpeg settings W0 measured (`-usage realtime -cpu-used 8 -row-mt 1`).
 const CPU_USED: c_int = 8;
 const ROW_MULTITHREADING_ON: c_uint = 1;
@@ -87,6 +102,32 @@ struct Packet {
     key: bool,
 }
 
+/// One picture in 4:2:0: the luma plane, then U, then V, each plane's rows
+/// tightly packed. Made on the recorder thread, encoded on the encoder thread.
+struct I420Picture {
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
+}
+
+impl I420Picture {
+    const fn chroma_size(width: usize, height: usize) -> (usize, usize) {
+        (width.div_ceil(2), height.div_ceil(2))
+    }
+
+    /// Each plane with its row length and row count: Y, U, V.
+    fn planes(&self) -> [(&[u8], usize, usize); 3] {
+        let (chroma_width, chroma_height) = Self::chroma_size(self.width, self.height);
+        let luma = self.width * self.height;
+        let chroma = chroma_width * chroma_height;
+        [
+            (&self.data[..luma], self.width, self.height),
+            (&self.data[luma..luma + chroma], chroma_width, chroma_height),
+            (&self.data[luma + chroma..], chroma_width, chroma_height),
+        ]
+    }
+}
+
 /// B,G,R,A rows (top to bottom) into 4:2:0 planes: BT.601 limited range,
 /// 8-bit fixed point (what ffmpeg's bgr24 to yuv420p gives). The largest
 /// stage of the recorder (W0: 0.20 of a core at 20 pictures per second),
@@ -115,8 +156,8 @@ impl I420Converter {
         }
     }
 
-    /// Fills the three planes of `image` from `bgra`.
-    fn convert(&self, bgra: &[u8], image: &mut aom::aom_image_t) -> Result<(), String> {
+    /// The 4:2:0 picture of `bgra`.
+    fn convert(&self, bgra: &[u8]) -> Result<I420Picture, String> {
         let (width, height) = (self.width, self.height);
         if bgra.len() != width * height * BGRA_BYTES {
             return Err(format!(
@@ -125,22 +166,12 @@ impl I420Converter {
                 width * height * BGRA_BYTES
             ));
         }
-        let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-        let stride = |plane: usize| usize::try_from(image.stride[plane]).unwrap_or(0);
-        let (luma_stride, u_stride, v_stride) = (stride(0), stride(1), stride(2));
-        if luma_stride < width || u_stride < chroma_width || v_stride < chroma_width {
-            return Err("the encoder's picture rows are shorter than the window".to_owned());
-        }
-        // SAFETY: allocated by `aom_img_alloc` for these dimensions and not
-        // shared; each plane holds at least `stride * rows` bytes (rows
-        // rounded up to even).
-        let (luma, u_plane, v_plane) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(image.planes[0], luma_stride * height),
-                std::slice::from_raw_parts_mut(image.planes[1], u_stride * chroma_height),
-                std::slice::from_raw_parts_mut(image.planes[2], v_stride * chroma_height),
-            )
-        };
+        let (chroma_width, chroma_height) = I420Picture::chroma_size(width, height);
+        let luma_bytes = width * height;
+        let chroma_bytes = chroma_width * chroma_height;
+        let mut data = vec![0_u8; luma_bytes + 2 * chroma_bytes];
+        let (luma, chroma) = data.split_at_mut(luma_bytes);
+        let (u_plane, v_plane) = chroma.split_at_mut(chroma_bytes);
         let pixel = |x: usize, y: usize| {
             let at = (y * width + x) * BGRA_BYTES;
             [
@@ -153,8 +184,7 @@ impl I420Converter {
             (weights[0] * rgb[0] + weights[1] * rgb[1] + weights[2] * rgb[2] + Self::FIXED_ROUND)
                 >> Self::FIXED_SHIFT
         };
-        for y in 0..height {
-            let row = &mut luma[y * luma_stride..y * luma_stride + width];
+        for (y, row) in luma.chunks_exact_mut(width).enumerate() {
             for (x, out) in row.iter_mut().enumerate() {
                 *out = (weigh(pixel(x, y), Self::LUMA) + Self::LUMA_OFFSET).clamp(0, 255) as u8;
             }
@@ -171,13 +201,17 @@ impl I420Converter {
                     }
                 }
                 let mean = sum.map(|total| (total + count / 2) / count);
-                u_plane[cy * u_stride + cx] =
+                u_plane[cy * chroma_width + cx] =
                     (weigh(mean, Self::CHROMA_U) + Self::CHROMA_OFFSET).clamp(0, 255) as u8;
-                v_plane[cy * v_stride + cx] =
+                v_plane[cy * chroma_width + cx] =
                     (weigh(mean, Self::CHROMA_V) + Self::CHROMA_OFFSET).clamp(0, 255) as u8;
             }
         }
-        Ok(())
+        Ok(I420Picture {
+            width,
+            height,
+            data,
+        })
     }
 }
 
@@ -185,7 +219,8 @@ impl I420Converter {
 struct Av1Encoder {
     context: Box<aom::aom_codec_ctx_t>,
     image: *mut aom::aom_image_t,
-    converter: I420Converter,
+    width: usize,
+    height: usize,
 }
 
 impl Av1Encoder {
@@ -215,7 +250,7 @@ impl Av1Encoder {
         config.g_threads = settings.threads;
         config.g_lag_in_frames = NO_LAG;
         config.rc_end_usage = aom::AOM_Q;
-        // Key pictures are placed by `ClipEncoder`, at instant distances, not by libaom.
+        // Key pictures are placed by `VideoQueue`, at instant distances, not by libaom.
         config.kf_mode = aom::AOM_KF_DISABLED;
         // SAFETY: a plain C struct that `aom_codec_enc_init_ver` initialises.
         let mut context: Box<aom::aom_codec_ctx_t> = Box::new(unsafe { std::mem::zeroed() });
@@ -246,7 +281,8 @@ impl Av1Encoder {
         let mut encoder = Self {
             context,
             image,
-            converter: I420Converter::new(width, height),
+            width: width as usize,
+            height: height as usize,
         };
         if image.is_null() {
             return Err("aom_img_alloc failed".to_owned());
@@ -297,11 +333,35 @@ impl Av1Encoder {
         Err(format!("{step} failed: {}", text.to_string_lossy()))
     }
 
-    /// Converts and encodes one B,G,R,A picture; `pts` is its instant number.
-    fn encode(&mut self, bgra: &[u8], pts: i64, force_key: bool) -> Result<Packet, String> {
+    /// Copies `picture` into the encoder's own picture buffer, row by row.
+    fn fill(&mut self, picture: &I420Picture) -> Result<(), String> {
+        if (picture.width, picture.height) != (self.width, self.height) {
+            return Err(format!(
+                "picture is {}x{}, the encoder {}x{}",
+                picture.width, picture.height, self.width, self.height
+            ));
+        }
         // SAFETY: allocated in `create`, non-null, owned by this encoder alone.
         let image = unsafe { &mut *self.image };
-        self.converter.convert(bgra, image)?;
+        for (plane, (source, row_bytes, rows)) in picture.planes().into_iter().enumerate() {
+            let stride = usize::try_from(image.stride[plane]).unwrap_or(0);
+            if stride < row_bytes {
+                return Err("the encoder's picture rows are shorter than the window".to_owned());
+            }
+            // SAFETY: allocated by `aom_img_alloc` for these dimensions and not
+            // shared; each plane holds at least `stride * rows` bytes (rows
+            // rounded up to even for U and V).
+            let target = unsafe { std::slice::from_raw_parts_mut(image.planes[plane], stride * rows) };
+            for (row, line) in source.chunks_exact(row_bytes).enumerate() {
+                target[row * stride..row * stride + row_bytes].copy_from_slice(line);
+            }
+        }
+        Ok(())
+    }
+
+    /// Encodes one 4:2:0 picture; `pts` is its instant number.
+    fn encode(&mut self, picture: &I420Picture, pts: i64, force_key: bool) -> Result<Packet, String> {
+        self.fill(picture)?;
         let flags = if force_key {
             aom::AOM_EFLAG_FORCE_KF as aom::aom_enc_frame_flags_t
         } else {
@@ -370,77 +430,82 @@ struct OpenPart {
     last_instant: u64,
 }
 
-/// What one encoded picture produced.
-pub(super) struct Encoded {
-    pub(super) place: VideoPlace,
-    /// Bytes written to the video for this picture.
-    pub(super) bytes: u64,
-    /// The part this picture's key picture closed, read back.
-    pub(super) closed_part: Option<PartInfo>,
+/// One picture for the encoder thread, with the place the recorder gave it.
+struct Job {
+    instant: u64,
+    picture: I420Picture,
+    force_key: bool,
+    place: VideoPlace,
 }
 
-/// The clip's video: one AV1 encoder, a new IVF part at each key picture.
-pub(super) struct ClipEncoder {
+/// What the encoder thread wrote: video bytes and the parts it closed, read back.
+#[derive(Default)]
+pub(super) struct VideoWritten {
+    pub(super) bytes: u64,
+    pub(super) closed_parts: Vec<PartInfo>,
+}
+
+impl VideoWritten {
+    fn add(&mut self, more: Self) {
+        self.bytes += more.bytes;
+        self.closed_parts.extend(more.closed_parts);
+    }
+}
+
+/// The encoder thread's side: one AV1 encoder, a new IVF part at each key picture.
+struct ClipEncoder {
     folder: PathBuf,
     encoder: Av1Encoder,
     width: u32,
     height: u32,
-    key_instants: u64,
-    last_key: Option<u64>,
     part: Option<OpenPart>,
 }
 
 impl ClipEncoder {
-    /// Opens the encoder for pictures of `width` x `height`; `folder` is the
-    /// clip folder (parts go to its `video/`).
-    pub(super) fn create(
+    fn create(
         folder: &Path,
         width: u32,
         height: u32,
         settings: EncoderSettings,
     ) -> Result<Self, String> {
-        let video = folder.join(VIDEO_DIR);
-        std::fs::create_dir_all(&video)
-            .map_err(|error| format!("could not create {}: {error}", video.display()))?;
         Ok(Self {
             folder: folder.to_owned(),
             encoder: Av1Encoder::create(width, height, settings)?,
             width,
             height,
-            key_instants: settings.key_instants,
-            last_key: None,
             part: None,
         })
     }
 
-    pub(super) const fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// Encodes the picture of `instant` (B,G,R,A rows) and appends it to the
-    /// current part; a key picture first closes that part and starts the next.
-    pub(super) fn encode(&mut self, instant: u64, bgra: &[u8]) -> Result<Encoded, String> {
-        let force_key = self
-            .last_key
-            .is_none_or(|key| instant >= key + self.key_instants);
-        let pts = i64::try_from(instant).map_err(|_| "instant out of range".to_owned())?;
-        let packet = self.encoder.encode(bgra, pts, force_key)?;
-        let mut closed_part = None;
+    /// Encodes `job` and appends it to the current part; a key picture first
+    /// closes that part and starts the next. The picture must land where the
+    /// recorder said, because the index already names that place.
+    fn encode(&mut self, job: Job) -> Result<VideoWritten, String> {
+        let pts = i64::try_from(job.instant).map_err(|_| "instant out of range".to_owned())?;
+        let packet = self.encoder.encode(&job.picture, pts, job.force_key)?;
+        if packet.key != job.force_key {
+            return Err(format!(
+                "instant {}: libaom gave key={}, key={} was planned",
+                job.instant, packet.key, job.force_key
+            ));
+        }
+        let mut written = VideoWritten::default();
         if packet.key {
-            self.last_key = Some(instant);
-            closed_part = self.start_part(instant)?;
+            written.closed_parts.extend(self.start_part(job.instant)?);
         }
         let Some(part) = self.part.as_mut() else {
             return Err("the first encoded picture is not a key picture".to_owned());
         };
-        let index = part.writer.pictures();
-        let bytes = part.writer.append(instant, &packet.data)?;
-        part.last_instant = instant;
-        Ok(Encoded {
-            place: (part.number, index),
-            bytes,
-            closed_part,
-        })
+        let place = (part.number, part.writer.pictures());
+        if place != job.place {
+            return Err(format!(
+                "instant {}: picture went to {place:?}, the index names {:?}",
+                job.instant, job.place
+            ));
+        }
+        written.bytes = part.writer.append(job.instant, &packet.data)?;
+        part.last_instant = job.instant;
+        Ok(written)
     }
 
     /// Closes the open part (if any) and opens the next one at `instant`.
@@ -481,10 +546,155 @@ impl ClipEncoder {
 
     /// Closes the last part; returns it read back. Realtime libaom without
     /// look-ahead holds no pictures, so nothing is left to drain.
-    pub(super) fn finish(mut self) -> Result<Option<PartInfo>, String> {
+    fn finish(mut self) -> Result<Option<PartInfo>, String> {
         match self.part.take() {
             Some(open) => self.close(open).map(Some),
             None => Ok(None),
         }
+    }
+}
+
+/// The encoder thread: encodes the queued pictures in order until the
+/// recorder drops its end of the queue, then closes the last part. An error
+/// is also sent to the recorder at once, so the recording stops on it.
+fn encode_queued(
+    folder: &Path,
+    width: u32,
+    height: u32,
+    settings: EncoderSettings,
+    queued: &Receiver<Job>,
+    report: &Sender<Result<VideoWritten, String>>,
+) -> Result<Option<PartInfo>, String> {
+    let result = ClipEncoder::create(folder, width, height, settings).and_then(|mut video| {
+        for job in queued {
+            let written = video.encode(job)?;
+            // A send fails only when the recorder dropped the queue without
+            // `finish`; there is no one left to tell then.
+            let _ = report.send(Ok(written));
+        }
+        video.finish()
+    });
+    if let Err(error) = &result {
+        let _ = report.send(Err(error.clone()));
+    }
+    result
+}
+
+/// The clip's video behind a bounded queue (plan §6). On the recorder thread
+/// it converts each changed picture to 4:2:0, gives it its place [part,
+/// index] (a new part at every key picture, `key_instants` apart) and queues
+/// it; the encoder thread encodes the pictures in order and checks each
+/// place. A full queue refuses the picture at once: the recorder never waits
+/// for an encode.
+pub(super) struct VideoQueue {
+    width: u32,
+    height: u32,
+    converter: I420Converter,
+    key_instants: u64,
+    last_key: Option<u64>,
+    /// The place of the last queued picture.
+    last_place: Option<VideoPlace>,
+    jobs: SyncSender<Job>,
+    done: Receiver<Result<VideoWritten, String>>,
+    thread: JoinHandle<Result<Option<PartInfo>, String>>,
+}
+
+impl VideoQueue {
+    /// Starts the encoder thread for pictures of `width` x `height`; `folder`
+    /// is the clip folder (parts go to its `video/`).
+    pub(super) fn start(
+        folder: &Path,
+        width: u32,
+        height: u32,
+        settings: EncoderSettings,
+    ) -> Result<Self, String> {
+        let video = folder.join(VIDEO_DIR);
+        std::fs::create_dir_all(&video)
+            .map_err(|error| format!("could not create {}: {error}", video.display()))?;
+        let (jobs, queued) = std::sync::mpsc::sync_channel(ENCODER_QUEUE_PICTURES);
+        let (report, done) = std::sync::mpsc::channel();
+        let folder = folder.to_owned();
+        let thread = std::thread::Builder::new()
+            .name(ENCODER_THREAD_NAME.to_owned())
+            .spawn(move || encode_queued(&folder, width, height, settings, &queued, &report))
+            .map_err(|error| format!("could not start the encoder thread: {error}"))?;
+        Ok(Self {
+            width,
+            height,
+            converter: I420Converter::new(width, height),
+            key_instants: settings.key_instants,
+            last_key: None,
+            last_place: None,
+            jobs,
+            done,
+            thread,
+        })
+    }
+
+    pub(super) const fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Converts and queues the picture of `instant` (B,G,R,A rows); returns
+    /// its place, or `None` when the queue is full (the encoder is behind).
+    pub(super) fn submit(&mut self, instant: u64, bgra: &[u8]) -> Result<Option<VideoPlace>, String> {
+        let force_key = self
+            .last_key
+            .is_none_or(|key| instant >= key + self.key_instants);
+        let place = match self.last_place {
+            Some((part, index)) if !force_key => (part, index + 1),
+            Some((part, _)) => (part + 1, 0),
+            None => (0, 0),
+        };
+        let picture = self.converter.convert(bgra)?;
+        let job = Job {
+            instant,
+            picture,
+            force_key,
+            place,
+        };
+        match self.jobs.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Ok(None),
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(self
+                    .written()
+                    .err()
+                    .unwrap_or_else(|| "the encoder thread ended".to_owned()));
+            }
+        }
+        if force_key {
+            self.last_key = Some(instant);
+        }
+        self.last_place = Some(place);
+        Ok(Some(place))
+    }
+
+    /// What the encoder thread wrote since the last call; its error, if it failed.
+    pub(super) fn written(&self) -> Result<VideoWritten, String> {
+        let mut written = VideoWritten::default();
+        for message in self.done.try_iter() {
+            written.add(message?);
+        }
+        Ok(written)
+    }
+
+    /// Lets the encoder thread encode every queued picture and close the last
+    /// part; returns what it wrote since the last `written`, the last part
+    /// included.
+    pub(super) fn finish(self) -> Result<VideoWritten, String> {
+        let Self {
+            jobs, done, thread, ..
+        } = self;
+        drop(jobs);
+        let last_part = thread
+            .join()
+            .map_err(|_| "the encoder thread panicked".to_owned())??;
+        let mut written = VideoWritten::default();
+        for message in done.try_iter() {
+            written.add(message?);
+        }
+        written.closed_parts.extend(last_part);
+        Ok(written)
     }
 }

@@ -44,6 +44,8 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 pub(super) const LOST_NO_PICTURE_YET: &str = "no_picture_yet";
 pub(super) const LOST_WINDOW_RESIZED: &str = "window_resized";
 pub(super) const LOST_SLOT_OVERFLOW: &str = "slot_overflow";
+/// The encoder queue was full: the changed picture could not be queued.
+pub(super) const LOST_ENCODER_BEHIND: &str = "encoder_behind";
 pub(super) const LOST_CAPTURE_FAILED: &str = "capture_failed";
 pub(super) const LOST_SERVICE_RESTART: &str = "service_restart";
 

@@ -22,7 +22,7 @@ use super::{
 use crate::daemon_lifecycle::consume_panic_payload;
 use crate::m1::{
     CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
-    CdpTargetInfoParams, ObserveParams, error_code, mcp_error,
+    CdpTargetInfoParams, ObserveParams, echoed_value, error_code, mcp_error,
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
@@ -4241,7 +4241,8 @@ fn target_act_modified_stale_policy(
         Some(other) => Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "target_act verb=cleanup_notepad_tabs value must be discard_modified or refuse_modified, got {other:?}"
+                "target_act verb=cleanup_notepad_tabs value must be discard_modified or refuse_modified, got {}",
+                echoed_value(other)
             ),
         )),
     }
@@ -7447,7 +7448,10 @@ async fn target_act_scroll(
         raw.trim().parse::<i32>().map_err(|_| {
             mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                format!("target_act verb=scroll args must be integer deltas [dx, dy]; got {raw:?}"),
+                format!(
+                    "target_act verb=scroll args must be integer deltas [dx, dy]; got {}",
+                    echoed_value(raw)
+                ),
             )
         })
     };
@@ -8045,7 +8049,10 @@ fn require_param(value: Option<String>, verb: &str, field: &str) -> Result<Strin
 fn target_act_unknown_verb_error(verb: &str) -> ErrorData {
     mcp_error(
         error_codes::TOOL_PARAMS_INVALID,
-        format!("target_act verb must be one of {TARGET_ACT_KNOWN_VERBS}; got {verb:?}"),
+        format!(
+            "target_act verb must be one of {TARGET_ACT_KNOWN_VERBS}; got {}",
+            echoed_value(verb)
+        ),
     )
 }
 

@@ -4693,6 +4693,21 @@ pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
     )
 }
 
+/// Longest caller-supplied value an error message echoes back verbatim (#248).
+const ECHOED_VALUE_MAX_CHARS: usize = 256;
+
+/// Quotes a caller-supplied value for an error message, bounded so a huge input
+/// is not echoed back in full (#248). A longer value keeps its first
+/// [`ECHOED_VALUE_MAX_CHARS`] characters and states its full length.
+pub(crate) fn echoed_value(value: &str) -> String {
+    let total_chars = value.chars().count();
+    if total_chars <= ECHOED_VALUE_MAX_CHARS {
+        return format!("{value:?}");
+    }
+    let head: String = value.chars().take(ECHOED_VALUE_MAX_CHARS).collect();
+    format!("{head:?}... ({total_chars} characters)")
+}
+
 /// Reads the Synapse error code (`data.code`) that `mcp_error` stores on an error.
 pub(crate) fn error_code(error: &ErrorData) -> Option<&str> {
     error

@@ -6983,28 +6983,37 @@ pub fn run_shell_idempotent_request(
 }
 
 /// The idempotent identity of an `act_launch` request; `None` without a key.
-/// The launch policy is checked first, so a refused target never reserves a
-/// row.
+/// It holds only what the stored row is found and matched by (key, session,
+/// request fingerprint), so replaying a completed launch needs nothing that
+/// can differ now: no policy match and no target path resolution (#146).
 pub fn launch_idempotent_request(
-    config: &M4ServiceConfig,
     params: &ActLaunchParams,
     session_id: Option<&str>,
 ) -> Result<Option<IdempotentRequest>, ErrorData> {
     let Some(key) = params.idempotency_key.as_deref() else {
         return Ok(None);
     };
-    let matched_pattern = validate_launch_authorized(config, params)?;
-    let mut request = IdempotentRequest::new(
+    Ok(Some(IdempotentRequest::new(
         LAUNCH_IDEMPOTENCY,
         key,
         session_id,
         launch_request_sha256(params)?,
-    )?;
+    )?))
+}
+
+/// Checks the launch policy for a keyed request that has no stored row yet and
+/// fills the policy line and pattern its reservation row records. Run before
+/// the row is reserved, so a refused target never reserves one.
+pub fn authorize_launch_idempotent_request(
+    config: &M4ServiceConfig,
+    params: &ActLaunchParams,
+    request: &mut IdempotentRequest,
+) -> Result<(), ErrorData> {
+    request.matched_pattern = validate_launch_authorized(config, params)?;
     let command_line = launch_command_line(params)?;
     request.command_line_sha256 = sha256_hex(command_line.as_bytes());
     request.command_line = command_line;
-    request.matched_pattern = matched_pattern;
-    Ok(Some(request))
+    Ok(())
 }
 
 fn run_shell_request_sha256(params: &ActRunShellParams) -> Result<String, ErrorData> {

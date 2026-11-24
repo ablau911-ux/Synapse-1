@@ -7,7 +7,7 @@ use super::{
     AgentSpawnTaskStartedResponse, ErrorData, IdempotentRequest, Json, LaunchWindowState,
     MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, Parameters, RunShellAuthorization, SessionTarget,
     ShellExecutionContext, SynapseService, TargetWire, assign_owned_process_job,
-    authorize_run_shell, authorize_run_shell_start, cancel_shell_job, execute_combo_with_boundary,
+    authorize_launch_idempotent_request, authorize_run_shell, authorize_run_shell_start, cancel_shell_job, execute_combo_with_boundary,
     launch_for_session_with_boundary, launch_idempotent_request, launch_process_history_row,
     launch_process_history_row_key, launch_request_details, mcp_error,
     prepare_run_shell_params_for_context, prepare_run_shell_start_params_for_context,
@@ -1422,13 +1422,14 @@ impl SynapseService {
         session_id: Option<String>,
         preflight: &super::action_preflight::ActionPreflightReadback,
     ) -> Result<ActLaunchResponse, ErrorData> {
-        let Some(request) =
-            launch_idempotent_request(&self.m4_config, &params, session_id.as_deref())?
-        else {
+        let Some(mut request) = launch_idempotent_request(&params, session_id.as_deref())? else {
             return self.launch_and_record(params, session_id, preflight).await;
         };
         let runtime = self.reflex_runtime()?;
-        if let Some(response) = reserve_idempotent_request(&runtime, &request)? {
+        let m4_config = &self.m4_config;
+        if let Some(response) = reserve_idempotent_request(&runtime, &mut request, |request| {
+            authorize_launch_idempotent_request(m4_config, &params, request)
+        })? {
             return Ok(response);
         }
         match self.launch_and_record(params, session_id, preflight).await {
@@ -3856,7 +3857,8 @@ async fn run_shell_with_idempotency(
     validate_run_shell_execution_plan(&params, inline_await_limit_ms)?;
     let session_id = context.map(ShellExecutionContext::session_id);
     let boundary = |stage| ensure_m4_physical_mutation_boundary(preflight, stage);
-    let Some(request) = run_shell_idempotent_request(&params, &authorization, session_id)? else {
+    let Some(mut request) = run_shell_idempotent_request(&params, &authorization, session_id)?
+    else {
         return run_authorized_shell_with_boundary(
             params,
             &authorization,
@@ -3868,7 +3870,7 @@ async fn run_shell_with_idempotency(
     };
 
     let runtime = service.reflex_runtime()?;
-    if let Some(response) = reserve_idempotent_request(&runtime, &request)? {
+    if let Some(response) = reserve_idempotent_request(&runtime, &mut request, |_request| Ok(()))? {
         return Ok(response);
     }
 
@@ -3905,32 +3907,45 @@ async fn run_shell_with_idempotency(
     Ok(response)
 }
 
+/// Replays `request`'s stored row, or reserves one. A stored row is looked up
+/// before anything else, so an identical request with a completed record gets
+/// its stored response before any check that could differ now (#146).
+/// `authorize` runs only when no row exists, outside the runtime lock (it may
+/// touch the file system); the lookup is repeated under the lock before the
+/// reservation is written, so two identical calls never both reserve.
 fn reserve_idempotent_request<R: DeserializeOwned>(
     runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
-    request: &IdempotentRequest,
+    request: &mut IdempotentRequest,
+    authorize: impl FnOnce(&mut IdempotentRequest) -> Result<(), ErrorData>,
 ) -> Result<Option<R>, ErrorData> {
-    let reservation = request.reservation_row()?;
-    {
-        let runtime = runtime.lock().map_err(|_error| {
+    let tool = request.tool_name();
+    let lock = || {
+        runtime.lock().map_err(|_error| {
             mcp_error(
                 synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "reflex runtime lock poisoned while checking {} idempotency",
-                    request.tool_name()
-                ),
+                format!("reflex runtime lock poisoned while checking {tool} idempotency"),
             )
-        })?;
-        if let Some(existing) = runtime
-            .storage_kv_row(request.row_key())
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?
-        {
-            drop(runtime);
-            return request.replay(&existing).map(Some);
-        }
-        runtime
-            .storage_put_kv_rows(vec![(request.row_key().to_vec(), reservation)])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        })
+    };
+    let stored = lock()?
+        .storage_kv_row(request.row_key())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    if let Some(existing) = stored {
+        return request.replay(&existing).map(Some);
     }
+    authorize(request)?;
+    let reservation = request.reservation_row()?;
+    let runtime = lock()?;
+    if let Some(existing) = runtime
+        .storage_kv_row(request.row_key())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+    {
+        drop(runtime);
+        return request.replay(&existing).map(Some);
+    }
+    runtime
+        .storage_put_kv_rows(vec![(request.row_key().to_vec(), reservation)])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(None)
 }
 

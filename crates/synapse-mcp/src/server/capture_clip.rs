@@ -698,10 +698,10 @@ mod live {
         // A start the caller is told failed leaves nothing behind: every
         // failure before the start response is sent (the first frame,
         // instant zero, or the response itself) seals the end first, before
-        // anything of the recording is shut down, then releases the
-        // recording and discards what this start made. `Recording::start`
-        // starts the observer as its last step, so nothing runs when it
-        // fails.
+        // anything of the recording is shut down, then stops every writer of
+        // the folder (`Recording::abandon`) and only then discards what this
+        // start made. `Recording::start` starts the observer as its last
+        // step, so nothing runs when it fails.
         let begun = match Recording::start(plan) {
             Ok(mut recording) => match recording
                 .write_instant_zero()
@@ -710,7 +710,7 @@ mod live {
                 Ok(response) => Ok((recording, response)),
                 Err(error) => {
                     control.seal();
-                    drop(recording);
+                    recording.abandon();
                     Err(error)
                 }
             },
@@ -1282,6 +1282,18 @@ mod live {
                 .as_bool(),
                 ClipSource::Monitor { .. } => false,
             }
+        }
+
+        /// Stops every writer of the clip folder without publishing the clip:
+        /// the stream ends as in `finish` (its encoder thread joined, so no
+        /// part file appears later) and the observer stops; the recorder
+        /// lock is released last. A start that failed calls it after sealing
+        /// the end and before its folder is discarded.
+        fn abandon(self) {
+            if let Err(failure) = self.stream.finish() {
+                tracing::warn!(code = "CAPTURE_CLIP_DISCARD_FAILED", error = %failure.error);
+            }
+            let _ = self.observer.stop();
         }
 
         /// Ends the stream (waiting index lines, last part) and publishes the

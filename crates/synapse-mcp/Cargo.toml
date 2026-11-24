@@ -67,10 +67,15 @@ uuid.workspace = true
 zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
-# Clip recorder (docs/clip-recorder-plan-5.0.md): libaom AV1, the encoder for recording
-# and the decoder for the viewer. libaom-sys builds libaom with the static C runtime and
-# needs CMake with the Ninja generator: see the repository's .cargo/config.toml.
-libaom-sys = { version = "0.18.1", default-features = false, features = ["av1_encoder", "av1_decoder"] }
+# Clip recorder (docs/clip-recorder-plan-5.0.md): libaom AV1, the encoder for recording.
+# libaom-sys forces the static C runtime and needs CMake with the Ninja generator: see the
+# repository's .cargo/config.toml and cmake/msvc-dynamic-runtime.cmake.
+libaom-sys = { version = "0.18.1", default-features = false, features = ["av1_encoder"] }
+# The viewer's AV1 decoder: rav1d, the Rust port of dav1d (BSD-2-Clause); about twice as
+# fast as libaom's decoder on recorded clips (ffmpeg, same content: 292 ms against 671 ms).
+rav1d = "1.1.0"
+# dav1d's "again" result is DAV1D_ERR(EAGAIN); rav1d takes EAGAIN from libc.
+libc = "0.2"
 windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Variant", "Win32_System_Com_StructuredStorage"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

@@ -31,7 +31,9 @@ fs2 = "0.4"
 # The product's clip modules (exp-av1, exp-av1-fetch) are included by #[path]; these are
 # their dependencies, at the product's versions.
 sha2 = "0.11"
-libaom-sys = { version = "0.18.1", default-features = false, features = ["av1_encoder", "av1_decoder"] }
+libaom-sys = { version = "0.18.1", default-features = false, features = ["av1_encoder"] }
+rav1d = "1.1.0"
+libc = "0.2"
 image-webp = "0.2.4"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 

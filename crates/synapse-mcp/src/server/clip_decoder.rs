@@ -5,36 +5,47 @@
 //!   still of the picture on screen when one exists (exact), else the encoded
 //!   video picture it repeats, else nothing (lost).
 //! - `ClipDecoder` turns that source into pixels: a lossless WebP still, or
-//!   the AV1 pictures of one video part decoded by libaom from the part's
-//!   first (key) picture up to the one asked for. Decoding never reads more
-//!   than one part.
+//!   the AV1 pictures of one video part decoded by dav1d (the `rav1d` crate,
+//!   its Rust port) from the part's first (key) picture up to the one asked
+//!   for. Decoding never reads more than one part.
 //!
 //! Every picture comes back as top-down RGBA with opaque alpha.
 
-use std::ffi::CStr;
-use std::os::raw::{c_int, c_uint};
+use std::ffi::{c_int, c_void};
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use image::RgbaImage;
-use libaom_sys as aom;
+use rav1d::include::dav1d::data::Dav1dData;
+use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
+use rav1d::include::dav1d::headers::{DAV1D_MC_BT709, DAV1D_PIXEL_LAYOUT_I420};
+use rav1d::include::dav1d::picture::Dav1dPicture;
+use rav1d::src::lib::{
+    dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_get_picture,
+    dav1d_open, dav1d_picture_unref, dav1d_send_data,
+};
 
 use super::clip_folder::{IndexLine, IvfPicture, part_path, read_ivf, still_path};
 
 /// Decoder threads: one per processor thread, as the encoder has, at most
-/// libaom's limit for one context. A read-back late in a part decodes up to
-/// 200 pictures, so decode speed sets the read-back time.
+/// this many. A read-back late in a part decodes up to 200 pictures, so
+/// decode speed sets the read-back time.
 const MAX_DECODER_THREADS: usize = 64;
 /// The `code` of the debug lines that time one picture read-back (stages
 /// `read_part`, `decode`, `convert`; the viewer adds `png`).
 pub(super) const VIEW_TIMING_CODE: &str = "CLIP_VIEW_TIMING";
-/// libaom's decoder row multithreading (`AV1D_SET_ROW_MT`): rows of one
-/// tile are decoded in parallel; the recorder writes one tile per picture.
-const ROW_MULTITHREADING_ON: c_uint = 1;
-/// libaom may return 8-bit pictures for 8-bit streams (`allow_lowbitdepth`).
-const ALLOW_LOW_BIT_DEPTH: c_uint = 1;
-/// No `AOM_CODEC_USE_*` flags.
-const NO_DECODER_FLAGS: aom::aom_codec_flags_t = 0;
+/// dav1d's `max_frame_delay`: 0 lets dav1d choose, which turns on frame
+/// threading (several pictures decoded at once); pictures then come out later
+/// than their units go in, and `Av1Decoder` matches them by count.
+const AUTOMATIC_FRAME_DELAY: c_int = 0;
+/// dav1d's results: 0, or a negated `errno`; `DAV1D_ERR(EAGAIN)` means "take a
+/// picture out first" (sending) or "no picture ready" (getting).
+const DAV1D_OK: c_int = 0;
+const DAV1D_AGAIN: c_int = -libc::EAGAIN;
+/// The `bpc` of an 8-bit picture.
+const EIGHT_BIT: c_int = 8;
 
 const OPAQUE: u8 = u8::MAX;
 const RGB_BYTES: usize = 3;
@@ -343,6 +354,7 @@ impl PartReader {
         if self.next == first {
             return Err(format!("{} gave no picture {index}", self.path.display()));
         }
+        self.decoder.finish_last()?;
         let decode = started.elapsed();
         let started = Instant::now();
         let image = self.decoder.rgba()?;
@@ -412,12 +424,19 @@ fn millis(time: Duration) -> u64 {
     u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// One libaom AV1 decoder context.
+/// One dav1d decoder (rav1d) with frame threading. Pictures come out later
+/// than their units go in, so they are matched by count: the recorder's
+/// stream shows every picture, in order, so the n-th picture dav1d returns
+/// is picture n − 1 of the part.
 struct Av1Decoder {
-    context: Box<aom::aom_codec_ctx_t>,
-    /// The picture the last `decode` produced; libaom keeps it valid until
-    /// the next `decode`.
-    frame: *const aom::aom_image_t,
+    context: Option<Dav1dContext>,
+    /// Units sent so far.
+    sent: u32,
+    /// Pictures taken out so far.
+    taken: u32,
+    /// The last picture taken, with its number in the part; one reference
+    /// held until a later picture replaces it or the decoder drops.
+    held: Option<(u32, Dav1dPicture)>,
 }
 
 impl Av1Decoder {
@@ -425,105 +444,174 @@ impl Av1Decoder {
         let threads = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .min(MAX_DECODER_THREADS);
-        let config = aom::aom_codec_dec_cfg_t {
-            threads: c_uint::try_from(threads).unwrap_or(1),
-            w: 0,
-            h: 0,
-            allow_lowbitdepth: ALLOW_LOW_BIT_DEPTH,
+        let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
+        // SAFETY: `dav1d_default_settings` writes every field of the settings.
+        let mut settings = unsafe {
+            dav1d_default_settings(NonNull::from(&mut settings).cast());
+            settings.assume_init()
         };
-        // SAFETY: a plain C struct of pointers and integers; all-zero is its
-        // unset state, and `aom_codec_dec_init_ver` initialises it.
-        let mut context: Box<aom::aom_codec_ctx_t> = Box::new(unsafe { std::mem::zeroed() });
-        // SAFETY: the context and configuration live through the call; the
-        // ABI version is the one these bindings were generated for.
-        let code = unsafe {
-            aom::aom_codec_dec_init_ver(
-                &raw mut *context,
-                aom::aom_codec_av1_dx(),
-                &raw const config,
-                NO_DECODER_FLAGS,
-                aom::AOM_DECODER_ABI_VERSION as c_int,
+        settings.n_threads = c_int::try_from(threads).unwrap_or(1);
+        settings.max_frame_delay = AUTOMATIC_FRAME_DELAY;
+        let mut context: Option<Dav1dContext> = None;
+        // SAFETY: both pointers are valid through the call; dav1d reads the
+        // settings and writes the context.
+        let opened = unsafe {
+            dav1d_open(
+                Some(NonNull::from(&mut context)),
+                Some(NonNull::from(&mut settings)),
             )
         };
-        if code != aom::AOM_CODEC_OK {
-            return Err(format!(
-                "aom_codec_dec_init_ver failed: libaom error {code}"
-            ));
-        }
-        // Built before the control call so `Drop` releases the context either way.
-        let mut decoder = Self {
+        check(opened.0, "dav1d_open")?;
+        Ok(Self {
             context,
-            frame: std::ptr::null(),
-        };
-        // SAFETY: an initialised decoder; this control takes one unsigned int.
-        let code = unsafe {
-            aom::aom_codec_control(
-                &raw mut *decoder.context,
-                aom::AV1D_SET_ROW_MT as c_int,
-                ROW_MULTITHREADING_ON,
-            )
-        };
-        decoder.check(code, "AV1D_SET_ROW_MT")?;
-        Ok(decoder)
+            sent: 0,
+            taken: 0,
+            held: None,
+        })
     }
 
-    /// Decodes one compressed picture; `rgba` converts the picture it produced.
+    /// Sends one compressed picture (one IVF picture is one temporal unit)
+    /// and takes out a picture if one is ready, without waiting for frames
+    /// still being decoded; `rgba` waits for the picture of the last unit.
     fn decode(&mut self, data: &[u8]) -> Result<(), String> {
-        self.frame = std::ptr::null();
-        // SAFETY: `data` is readable for `data.len()` bytes through the call.
-        let code = unsafe {
-            aom::aom_codec_decode(
-                &raw mut *self.context,
-                data.as_ptr(),
-                data.len(),
-                std::ptr::null_mut(),
-            )
-        };
-        self.check(code, "aom_codec_decode")?;
-        let mut iterator: aom::aom_codec_iter_t = std::ptr::null();
-        loop {
-            // SAFETY: the iterator starts null and is only advanced by libaom.
-            let image = unsafe { aom::aom_codec_get_frame(&raw mut *self.context, &raw mut iterator) };
-            if image.is_null() {
-                break;
+        let mut buffer = Dav1dData::default();
+        // SAFETY: `buffer` is writable; dav1d allocates `data.len()` bytes it owns.
+        let target = unsafe { dav1d_data_create(Some(NonNull::from(&mut buffer)), data.len()) };
+        if target.is_null() {
+            return Err("dav1d_data_create failed".to_owned());
+        }
+        // SAFETY: dav1d allocated `data.len()` writable bytes at `target`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len()) };
+        let sent = self.send(&mut buffer);
+        // SAFETY: `buffer` came from `dav1d_data_create`; an emptied buffer unrefs to nothing.
+        unsafe { dav1d_data_unref(Some(NonNull::from(&mut buffer))) };
+        sent?;
+        self.sent += 1;
+        // The first get after a send never waits (dav1d clears its drain flag on send).
+        self.take()?;
+        Ok(())
+    }
+
+    /// Hands the whole unit to dav1d. "Again" means its input is full: a
+    /// picture is taken out (the first get only takes a ready one, the second
+    /// waits for one), then the unit is sent again.
+    fn send(&mut self, buffer: &mut Dav1dData) -> Result<(), String> {
+        while buffer.sz > 0 {
+            // SAFETY: an open context and a buffer from `dav1d_data_create`.
+            let sent = unsafe { dav1d_send_data(self.context, Some(NonNull::from(&mut *buffer))) };
+            match sent.0 {
+                DAV1D_OK => {}
+                DAV1D_AGAIN => {
+                    if !self.take()? && !self.take()? {
+                        return Err("dav1d refused data and gave no picture to make room".to_owned());
+                    }
+                }
+                code => return check(code, "dav1d_send_data"),
             }
-            self.frame = image.cast_const();
         }
         Ok(())
     }
 
-    /// The picture the last `decode` produced, as RGBA.
-    fn rgba(&self) -> Result<RgbaImage, String> {
-        if self.frame.is_null() {
-            return Err("the AV1 decoder returned no picture".to_owned());
+    /// Takes the next picture out and holds it, numbered by count; `false`
+    /// when dav1d has none (a get after the first since a send drains, so
+    /// "again" there means no picture is left).
+    fn take(&mut self) -> Result<bool, String> {
+        let mut picture = Dav1dPicture::default();
+        // SAFETY: an open context and a writable picture.
+        let got = unsafe { dav1d_get_picture(self.context, Some(NonNull::from(&mut picture))) };
+        match got.0 {
+            DAV1D_OK => {
+                self.release();
+                self.held = Some((self.taken, picture));
+                self.taken += 1;
+                Ok(true)
+            }
+            DAV1D_AGAIN => Ok(false),
+            code => check(code, "dav1d_get_picture").map(|()| false),
         }
-        // SAFETY: set by the last `decode`; libaom keeps the image valid until
-        // the next decode call, and none happened since.
-        i420_to_rgba(unsafe { &*self.frame })
     }
 
-    fn check(&self, code: aom::aom_codec_err_t, step: &str) -> Result<(), String> {
-        if code == aom::AOM_CODEC_OK {
-            return Ok(());
+    fn release(&mut self) {
+        if let Some((_, picture)) = self.held.take() {
+            unref(picture);
         }
-        // SAFETY: libaom returns a static or context-owned NUL-terminated string.
-        let text = unsafe { aom::aom_codec_error(&raw const *self.context) };
-        let text = if text.is_null() {
-            String::new()
-        } else {
-            // SAFETY: checked non-null above.
-            unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
+    }
+
+    /// Drains dav1d until the picture of the last unit sent is out (part of
+    /// decoding: it waits for the frames still being decoded).
+    fn finish_last(&mut self) -> Result<(), String> {
+        let wanted = self
+            .sent
+            .checked_sub(1)
+            .ok_or_else(|| "the AV1 decoder was sent no picture".to_owned())?;
+        while self.held.as_ref().is_none_or(|(number, _)| *number < wanted) {
+            if !self.take()? {
+                return Err(format!(
+                    "dav1d gave {} pictures for {} units; picture {wanted} never came out",
+                    self.taken, self.sent
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The picture of the last unit sent, as RGBA.
+    fn rgba(&mut self) -> Result<RgbaImage, String> {
+        self.finish_last()?;
+        let wanted = self.sent - 1;
+        let Some((number, picture)) = self.held.as_ref() else {
+            return Err("the AV1 decoder returned no picture".to_owned());
         };
-        Err(format!("{step} failed: libaom error {code} {text}"))
+        if *number != wanted {
+            return Err(format!(
+                "dav1d's picture {number} came out where picture {wanted} was due"
+            ));
+        }
+        if picture.p.layout != DAV1D_PIXEL_LAYOUT_I420 || picture.p.bpc != EIGHT_BIT {
+            return Err(format!(
+                "decoded picture layout {} at {} bits is not 8-bit 4:2:0",
+                picture.p.layout, picture.p.bpc
+            ));
+        }
+        let size = |value: c_int| usize::try_from(value).map_err(|_| "decoded picture has a negative size".to_owned());
+        let (width, height) = (size(picture.p.w)?, size(picture.p.h)?);
+        let (chroma_width, chroma_rows) = (width.div_ceil(2), height.div_ceil(2));
+        // SAFETY: dav1d sets the sequence header of every picture it outputs;
+        // it stays valid while the picture is held.
+        let header = picture.seq_hdr.map(|header| unsafe { header.as_ref() });
+        let matrix = YuvMatrix::of(
+            header.is_some_and(|header| header.mtrx == DAV1D_MC_BT709),
+            header.is_some_and(|header| header.color_range != 0),
+        );
+        // The planes stay valid while `self.held` holds its reference, which
+        // outlives this call.
+        let luma = Plane::of(picture.data[0], picture.stride[0], width, height)?;
+        let blue = Plane::of(picture.data[1], picture.stride[1], chroma_width, chroma_rows)?;
+        let red = Plane::of(picture.data[2], picture.stride[1], chroma_width, chroma_rows)?;
+        i420_to_rgba(width, height, [&luma, &blue, &red], matrix)
     }
 }
 
 impl Drop for Av1Decoder {
     fn drop(&mut self) {
-        // SAFETY: the context was initialised by `aom_codec_dec_init_ver`.
-        unsafe {
-            aom::aom_codec_destroy(&raw mut *self.context);
-        }
+        self.release();
+        // SAFETY: the context came from `dav1d_open` and is closed once, here.
+        unsafe { dav1d_close(Some(NonNull::from(&mut self.context))) };
+    }
+}
+
+/// Releases dav1d's reference to a picture.
+fn unref(mut picture: Dav1dPicture) {
+    // SAFETY: a picture from `dav1d_get_picture`, released once.
+    unsafe { dav1d_picture_unref(Some(NonNull::from(&mut picture))) };
+}
+
+/// A dav1d result as `Result`: 0 is success, anything else names the step.
+fn check(code: c_int, step: &str) -> Result<(), String> {
+    if code == DAV1D_OK {
+        Ok(())
+    } else {
+        Err(format!("{step} failed: dav1d error {code}"))
     }
 }
 
@@ -573,10 +661,10 @@ const BT709_FULL: YuvMatrix = YuvMatrix {
 };
 
 impl YuvMatrix {
-    /// The matrix the stream signals: BT.709 when named, else BT.601.
-    fn of(image: &aom::aom_image_t) -> &'static Self {
-        let full = image.range == aom::AOM_CR_FULL_RANGE;
-        match (image.mc == aom::AOM_CICP_MC_BT_709, full) {
+    /// The matrix the stream signals: BT.709 when named, else BT.601; full
+    /// or limited range.
+    const fn of(bt709: bool, full: bool) -> &'static Self {
+        match (bt709, full) {
             (true, true) => &BT709_FULL,
             (true, false) => &BT709_LIMITED,
             (false, true) => &BT601_FULL,
@@ -604,25 +692,23 @@ struct Plane<'a> {
 }
 
 impl<'a> Plane<'a> {
-    /// Plane `plane` of `image`, `width` x `rows` samples.
-    fn of(image: &'a aom::aom_image_t, plane: u32, width: usize, rows: usize) -> Result<Self, String> {
-        let index = plane as usize;
-        let stride = image
-            .stride
-            .get(index)
-            .and_then(|stride| usize::try_from(*stride).ok())
+    /// A plane of `width` x `rows` samples at `pointer`, rows `stride` bytes
+    /// apart. The caller keeps the picture that owns it alive for `'a`.
+    fn of(
+        pointer: Option<NonNull<c_void>>,
+        stride: isize,
+        width: usize,
+        rows: usize,
+    ) -> Result<Self, String> {
+        let stride = usize::try_from(stride)
+            .ok()
             .filter(|stride| *stride >= width)
-            .ok_or_else(|| format!("decoded plane {plane} has an invalid stride"))?;
-        let pointer = image
-            .planes
-            .get(index)
-            .copied()
-            .filter(|pointer| !pointer.is_null())
-            .ok_or_else(|| format!("decoded plane {plane} has no data"))?;
+            .ok_or_else(|| "decoded plane has an invalid stride".to_owned())?;
+        let pointer = pointer.ok_or_else(|| "decoded plane has no data".to_owned())?;
         let length = stride * rows.saturating_sub(1) + width;
-        // SAFETY: libaom allocates `stride` bytes for each of the plane's
-        // rows; the last row is read only up to `width`.
-        let bytes = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
+        // SAFETY: dav1d allocates `stride` bytes for each of the plane's rows;
+        // the last row is read only up to `width`.
+        let bytes = unsafe { std::slice::from_raw_parts(pointer.as_ptr().cast::<u8>().cast_const(), length) };
         Ok(Self { bytes, stride })
     }
 
@@ -632,22 +718,15 @@ impl<'a> Plane<'a> {
     }
 }
 
-/// Converts an 8-bit 4:2:0 picture to RGBA (chroma by nearest sample).
-fn i420_to_rgba(image: &aom::aom_image_t) -> Result<RgbaImage, String> {
-    if image.fmt != aom::AOM_IMG_FMT_I420 {
-        return Err(format!(
-            "decoded picture format {} is not 8-bit 4:2:0",
-            image.fmt
-        ));
-    }
-    let (width, height) = (image.d_w as usize, image.d_h as usize);
-    let (x_shift, y_shift) = (image.x_chroma_shift, image.y_chroma_shift);
-    let chroma_width = (width + (1 << x_shift) - 1) >> x_shift;
-    let chroma_rows = (height + (1 << y_shift) - 1) >> y_shift;
-    let luma = Plane::of(image, aom::AOM_PLANE_Y, width, height)?;
-    let blue = Plane::of(image, aom::AOM_PLANE_U, chroma_width, chroma_rows)?;
-    let red = Plane::of(image, aom::AOM_PLANE_V, chroma_width, chroma_rows)?;
-    let matrix = YuvMatrix::of(image);
+/// Converts an 8-bit 4:2:0 picture (Y, U, V planes) to RGBA (chroma by nearest sample).
+fn i420_to_rgba(
+    width: usize,
+    height: usize,
+    [luma, blue, red]: [&Plane<'_>; 3],
+    matrix: &YuvMatrix,
+) -> Result<RgbaImage, String> {
+    let (x_shift, y_shift) = (1, 1);
+    let chroma_width = width.div_ceil(2);
     let mut rgba = Vec::with_capacity(width * height * 4);
     for y in 0..height {
         let luma_row = luma.row(y, width);
@@ -662,6 +741,7 @@ fn i420_to_rgba(image: &aom::aom_image_t) -> Result<RgbaImage, String> {
             rgba.extend_from_slice(&matrix.rgba(sample, u, v));
         }
     }
-    RgbaImage::from_raw(image.d_w, image.d_h, rgba)
+    let size = |value: usize| u32::try_from(value).map_err(|_| "decoded picture is too large".to_owned());
+    RgbaImage::from_raw(size(width)?, size(height)?, rgba)
         .ok_or_else(|| "a decoded picture converted to a buffer of the wrong size".to_owned())
 }

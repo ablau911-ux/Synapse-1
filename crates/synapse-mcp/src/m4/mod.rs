@@ -20292,12 +20292,12 @@ fn shell_job_status_with_safe_command_metadata(
     // A record already built by a display-safe rule is kept as written, so a
     // pre-#236 record keeps its line, hash and policy name; only a
     // `legacy_raw` record (raw args) is rebuilt under the current rule.
-    let safe_policy = [SHELL_COMMAND_METADATA_POLICY, SHELL_COMMAND_METADATA_POLICY_V1]
-        .contains(&status.command_metadata_policy.as_str());
-    if safe_policy
-        && !status.args_sha256.is_empty()
-        && !status.command_line_sha256.is_empty()
-    {
+    let safe_policy = [
+        SHELL_COMMAND_METADATA_POLICY,
+        SHELL_COMMAND_METADATA_POLICY_V1,
+    ]
+    .contains(&status.command_metadata_policy.as_str());
+    if safe_policy && !status.args_sha256.is_empty() && !status.command_line_sha256.is_empty() {
         return status.clone();
     }
     let metadata = shell_command_metadata(&status.command, &status.args);
@@ -20312,9 +20312,7 @@ fn shell_job_status_with_safe_command_metadata(
     safe.args_sha256 = metadata.args_sha256;
     safe.command_line_original_bytes = metadata.command_line_original_bytes;
     safe.command_line_sha256 = metadata.command_line_sha256;
-    safe.command_line_not_reproduced = metadata
-        .command_line_not_reproduced
-        .map(ToOwned::to_owned);
+    safe.command_line_not_reproduced = metadata.command_line_not_reproduced.map(ToOwned::to_owned);
     safe
 }
 

@@ -401,13 +401,21 @@ fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
     let has_method = message
         .get("method")
         .is_some_and(serde_json::Value::is_string);
+    // rmcp decodes an `error` member as its `ErrorData` (an integer `code`, a
+    // string `message`); any other `error` fails rmcp's decode and gets its
+    // plain-text 415 (#189).
+    let error_decodes = message
+        .get("error")
+        .map(|error| <rmcp::model::ErrorData as serde::Deserialize>::deserialize(error).is_ok());
     let is_response = message.contains_key("id")
-        && (message.contains_key("result") || message.contains_key("error"));
+        && (message.contains_key("result") || error_decodes == Some(true));
     if !has_method && !is_response {
-        return Err(invalid_jsonrpc_request(
-            id,
-            "a message needs a string `method`, or an `id` with `result` or `error`",
-        ));
+        let detail = if error_decodes == Some(false) {
+            "`error` must be an object with an integer `code` and a string `message`"
+        } else {
+            "a message needs a string `method`, or an `id` with `result` or `error`"
+        };
+        return Err(invalid_jsonrpc_request(id, detail));
     }
     Ok(serde_json::Value::Object(message))
 }

@@ -5794,8 +5794,11 @@ impl SynapseService {
         let target_id = match (cdp_target_id_param, active_target.as_ref()) {
             (Some(target_id), _) => target_id.to_owned(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
-            (None, Some(SessionTarget::Window { .. }) | None) => {
-                return Err(missing_cdp_tab_target_error(tool, window_hwnd_param));
+            (None, Some(SessionTarget::Window { hwnd })) => {
+                return Err(missing_cdp_tab_target_error(tool, window_hwnd_param, Some(*hwnd)));
+            }
+            (None, None) => {
+                return Err(missing_cdp_tab_target_error(tool, window_hwnd_param, None));
             }
         };
         let window_hwnd = window_hwnd_param
@@ -5869,8 +5872,19 @@ impl SynapseService {
         let target_id = match (params.cdp_target_id.as_ref(), active_target.as_ref()) {
             (Some(target_id), _) => target_id.clone(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
-            (None, Some(SessionTarget::Window { .. }) | None) => {
-                return Err(missing_cdp_tab_target_error("cdp_target_info", params.window_hwnd));
+            (None, Some(SessionTarget::Window { hwnd })) => {
+                return Err(missing_cdp_tab_target_error(
+                    "cdp_target_info",
+                    params.window_hwnd,
+                    Some(*hwnd),
+                ));
+            }
+            (None, None) => {
+                return Err(missing_cdp_tab_target_error(
+                    "cdp_target_info",
+                    params.window_hwnd,
+                    None,
+                ));
             }
         };
         let window_hwnd = params
@@ -16652,20 +16666,33 @@ fn chromium_window_required_error(tool: &str, context: &ForegroundContext) -> Er
 
 /// Refusal when a CDP tab tool got no `cdp_target_id` and this session has no
 /// CDP tab target. The human foreground tab is never a fallback, and an
-/// explicit `window_hwnd` alone does not select a tab.
+/// explicit `window_hwnd` alone does not select a tab. A session target that
+/// is a native window is a target of the wrong kind, not a missing one.
 pub(super) fn missing_cdp_tab_target_error(
     tool: &str,
     window_hwnd_param: Option<i64>,
+    session_window_hwnd: Option<i64>,
 ) -> ErrorData {
-    let message = match window_hwnd_param {
-        Some(hwnd) => format!(
-            "{tool} window_hwnd {hwnd:#x} does not select a tab: pass the cdp_target_id of a tab in that window (browser_tabs operation=list) or bind one with browser_tabs operation=select"
+    match (window_hwnd_param, session_window_hwnd) {
+        (Some(hwnd), _) => mcp_error(
+            error_codes::TARGET_NOT_SET,
+            format!(
+                "{tool} window_hwnd {hwnd:#x} does not select a tab: pass the cdp_target_id of a tab in that window (browser_tabs operation=list) or bind one with browser_tabs operation=select"
+            ),
         ),
-        None => format!(
-            "{tool} requires an active CDP session target or explicit cdp_target_id owned by this session; refusing to use the human foreground tab"
+        (None, Some(hwnd)) => mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "{tool} needs a browser tab target, but this session's target is the native window {hwnd:#x}; pass cdp_target_id or bind a tab with browser_tabs operation=select"
+            ),
         ),
-    };
-    mcp_error(error_codes::TARGET_NOT_SET, message)
+        (None, None) => mcp_error(
+            error_codes::TARGET_NOT_SET,
+            format!(
+                "{tool} requires an active CDP session target or explicit cdp_target_id owned by this session; refusing to use the human foreground tab"
+            ),
+        ),
+    }
 }
 
 impl TargetFacadeResponse {

@@ -986,8 +986,19 @@ impl SynapseService {
         let cdp_target_id = match (cdp_target_id_param, active_target.as_ref()) {
             (Some(target_id), _) => target_id.to_owned(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
-            (None, _) => {
-                return Err(super::m1_tools::missing_cdp_tab_target_error(tool, window_hwnd_param));
+            (None, Some(SessionTarget::Window { hwnd })) => {
+                return Err(super::m1_tools::missing_cdp_tab_target_error(
+                    tool,
+                    window_hwnd_param,
+                    Some(*hwnd),
+                ));
+            }
+            (None, None) => {
+                return Err(super::m1_tools::missing_cdp_tab_target_error(
+                    tool,
+                    window_hwnd_param,
+                    None,
+                ));
             }
         };
         let window_hwnd = window_hwnd_param

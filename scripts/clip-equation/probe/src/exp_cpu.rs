@@ -11,21 +11,29 @@
 use crate::clock;
 use crate::exp_meter::{process_cpu_ns, wall_ns};
 
-/// One counter set: process CPU (ns, `GetProcessTimes`), process cycles and wall time (ns).
+/// One counter set: process CPU (ns, `GetProcessTimes`), process cycles, the cycles of
+/// the calling thread alone (exp-av1's stage breakdown) and wall time (ns).
 #[derive(Default, Clone, Copy)]
 pub struct Spent {
     pub cpu_ns: u64,
     pub cycles: u64,
+    pub thread_cycles: u64,
     pub wall_ns: u64,
 }
 
 impl Spent {
     /// Runs `work` and adds what it cost.
     pub fn time<T>(&mut self, work: impl FnOnce() -> T) -> T {
-        let (cpu, cycles, wall) = (process_cpu_ns(), clock::process_cycles(), wall_ns());
+        let (cpu, cycles, thread, wall) = (
+            process_cpu_ns(),
+            clock::process_cycles(),
+            clock::thread_cycles(),
+            wall_ns(),
+        );
         let value = work();
         self.cpu_ns += process_cpu_ns().saturating_sub(cpu);
         self.cycles += clock::process_cycles().saturating_sub(cycles);
+        self.thread_cycles += clock::thread_cycles().saturating_sub(thread);
         self.wall_ns += wall_ns().saturating_sub(wall);
         value
     }
@@ -35,6 +43,7 @@ impl Spent {
         Self {
             cpu_ns: self.cpu_ns + other.cpu_ns,
             cycles: self.cycles + other.cycles,
+            thread_cycles: self.thread_cycles + other.thread_cycles,
             wall_ns: self.wall_ns + other.wall_ns,
         }
     }

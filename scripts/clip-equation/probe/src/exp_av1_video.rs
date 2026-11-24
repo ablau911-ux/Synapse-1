@@ -12,6 +12,10 @@ use libaom_sys as aom;
 use serde_json::json;
 
 use crate::Result;
+use crate::clock::{self, HNS_PER_MS};
+use crate::exp_cpu::Spent;
+
+const NS_PER_MS: f64 = 1e6;
 
 /// Instants per second; one instant is one tick of the IVF and libaom time base.
 pub const INSTANTS_PER_SECOND: u32 = 20;
@@ -95,16 +99,33 @@ struct Packet {
     key: bool,
 }
 
-/// One libaom AV1 encoder and the 4:2:0 picture it reads from.
+/// Wall time of the encoder's first steps, in ms (probe.json "start").
+#[derive(Clone, Copy, Default)]
+pub struct StartTimes {
+    pub open_ms: f64,
+    pub first_convert_ms: Option<f64>,
+    pub first_encode_ms: Option<f64>,
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / NS_PER_MS
+}
+
+/// One libaom AV1 encoder and the 4:2:0 picture it reads from, with the time its
+/// two stages took: colour conversion (`fill`) and the libaom encode call.
 struct Av1Encoder {
     context: Box<aom::aom_codec_ctx_t>,
     image: *mut aom::aom_image_t,
     width: usize,
     height: usize,
+    convert: Spent,
+    encode_call: Spent,
+    start: StartTimes,
 }
 
 impl Av1Encoder {
     fn create(width: u32, height: u32, settings: EncoderSettings) -> Result<Self> {
+        let opening = clock::now_hns();
         // SAFETY: returns libaom's static interface table.
         let iface = unsafe { aom::aom_codec_av1_cx() };
         // SAFETY: a plain C struct; libaom fills every field below.
@@ -160,6 +181,9 @@ impl Av1Encoder {
             image,
             width: width as usize,
             height: height as usize,
+            convert: Spent::default(),
+            encode_call: Spent::default(),
+            start: StartTimes::default(),
         };
         if image.is_null() {
             return Err("aom_img_alloc failed".into());
@@ -176,6 +200,7 @@ impl Av1Encoder {
             aom::AV1E_SET_ROW_MT,
             ROW_MULTITHREADING_ON,
         )?;
+        encoder.start.open_ms = (clock::now_hns() - opening) as f64 / HNS_PER_MS as f64;
         Ok(encoder)
     }
 
@@ -202,7 +227,24 @@ impl Av1Encoder {
 
     /// Encodes one picture; `pts` is its instant number.
     fn encode(&mut self, bgr: &[u8], pts: i64, force_key: bool) -> Result<Packet> {
-        self.fill(bgr)?;
+        let mut convert = self.convert;
+        let filled = convert.time(|| self.fill(bgr));
+        self.start
+            .first_convert_ms
+            .get_or_insert(ns_to_ms(convert.wall_ns - self.convert.wall_ns));
+        self.convert = convert;
+        filled?;
+        let mut call = self.encode_call;
+        let packet = call.time(|| self.encode_filled(pts, force_key));
+        self.start
+            .first_encode_ms
+            .get_or_insert(ns_to_ms(call.wall_ns - self.encode_call.wall_ns));
+        self.encode_call = call;
+        packet
+    }
+
+    /// The libaom encode call on the filled picture, and its one packet.
+    fn encode_filled(&mut self, pts: i64, force_key: bool) -> Result<Packet> {
         let flags = if force_key {
             aom::AOM_EFLAG_FORCE_KF as aom::aom_enc_frame_flags_t
         } else {
@@ -374,6 +416,15 @@ impl IvfFile {
 /// Where an encoded picture went: its part and its index in that part.
 pub type VideoPlace = (u32, u32);
 
+/// What the video reports at the end of a run: its size and the time of its stages.
+pub struct VideoReport {
+    pub bytes: u64,
+    pub convert: Spent,
+    pub encode_call: Spent,
+    pub writes: Spent,
+    pub start: StartTimes,
+}
+
 /// The recorded video: one encoder, a new IVF part at each key picture.
 pub struct Video {
     folder: PathBuf,
@@ -384,6 +435,8 @@ pub struct Video {
     last_key: Option<u64>,
     part: Option<(u32, IvfFile)>,
     closed_bytes: u64,
+    /// Time spent creating, appending to and closing the IVF files.
+    writes: Spent,
 }
 
 impl Video {
@@ -398,6 +451,7 @@ impl Video {
             last_key: None,
             part: None,
             closed_bytes: 0,
+            writes: Spent::default(),
         })
     }
 
@@ -420,28 +474,37 @@ impl Video {
             return Err("the first encoded picture is not a key picture".into());
         };
         let index = file.pictures;
-        file.append(instant, &packet.data)?;
+        self.writes.time(|| file.append(instant, &packet.data))?;
         Ok((*number, index))
     }
 
     fn start_part(&mut self) -> Result<()> {
         let number = match self.part.take() {
             Some((number, file)) => {
-                self.closed_bytes += file.close()?;
+                self.closed_bytes += self.writes.time(|| file.close())?;
                 number + 1
             }
             None => 0,
         };
         let path = self.folder.join(format!("part-{number:04}.ivf"));
-        self.part = Some((number, IvfFile::create(&path, self.width, self.height)?));
+        let file = self
+            .writes
+            .time(|| IvfFile::create(&path, self.width, self.height))?;
+        self.part = Some((number, file));
         Ok(())
     }
 
-    /// Closes the last part; returns the bytes of all parts.
-    pub fn finish(mut self) -> Result<u64> {
+    /// Closes the last part; reports the bytes of all parts and the time of each stage.
+    pub fn finish(mut self) -> Result<VideoReport> {
         if let Some((_, file)) = self.part.take() {
-            self.closed_bytes += file.close()?;
+            self.closed_bytes += self.writes.time(|| file.close())?;
         }
-        Ok(self.closed_bytes)
+        Ok(VideoReport {
+            bytes: self.closed_bytes,
+            convert: self.encoder.convert,
+            encode_call: self.encoder.encode_call,
+            writes: self.writes,
+            start: self.encoder.start,
+        })
     }
 }

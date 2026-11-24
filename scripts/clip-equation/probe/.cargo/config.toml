@@ -5,3 +5,11 @@
 # repository's own .cargo/config.toml.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# libaom must be compiled with optimization. With no generator named, the cmake crate picks a
+# Visual Studio generator and, for MSVC, overwrites CMAKE_C_FLAGS_RELEASE with the cc flags
+# minus every /O flag ("let cmake deal with optimization" in cmake 0.1.58 src/lib.rs), so
+# libaom's Release build ran without /O2. With a named generator it leaves CMake's own
+# Release flags (/O2 /Ob2 /DNDEBUG) in place; Ninja is a single-configuration generator.
+[env]
+CMAKE_GENERATOR = "Ninja"

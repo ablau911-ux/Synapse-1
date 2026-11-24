@@ -20,6 +20,7 @@ use crate::Result;
 use crate::clock::{self, HNS_PER_MS};
 use crate::exp_av1::{Input, Recorder};
 use crate::exp_av1_video::INSTANTS_PER_SECOND;
+use crate::exp_cpu::Spent;
 use crate::exp_measure::bgra_to_bgr;
 use crate::gpu::{MapWait, ReadBack};
 use crate::observer::{self, Interval, composition_time};
@@ -39,8 +40,9 @@ const LOST_BEHIND: &str = "recorder_behind";
 const LOST_CAPTURE_FAILED: &str = "capture_failed";
 const LOST_WINDOW_CLOSED: &str = "window_closed";
 
-/// Records `seconds` of the window `hwnd` into `recorder`.
-pub fn record(hwnd: isize, seconds: u64, recorder: &mut Recorder) -> Result<()> {
+/// Records `seconds` of the window `hwnd` into `recorder`. Returns the source stage's
+/// time: frame read-back on the capture thread plus taking and converting on this one.
+pub fn record(hwnd: isize, seconds: u64, recorder: &mut Recorder) -> Result<Spent> {
     let control = observer::start_with_cursor::<LiveFrames>(
         hwnd,
         Interval::Millis(REQUESTED_INTERVAL_MS),
@@ -50,20 +52,23 @@ pub fn record(hwnd: isize, seconds: u64, recorder: &mut Recorder) -> Result<()> 
     let handler = control.callback();
     let fed = feed(&handler, seconds * u64::from(INSTANTS_PER_SECOND), recorder);
     let stopped = observer::stop(control);
-    fed?;
-    stopped.map(|_| ())
+    let taking = fed?;
+    let read_back = stopped?.lock().read_back;
+    Ok(read_back.plus(taking))
 }
 
-fn feed(handler: &Arc<Mutex<LiveFrames>>, instants: u64, recorder: &mut Recorder) -> Result<()> {
+/// Feeds every instant to the recorder; returns the time spent taking and converting frames.
+fn feed(handler: &Arc<Mutex<LiveFrames>>, instants: u64, recorder: &mut Recorder) -> Result<Spent> {
     let k0 = first_instant(handler)?;
     let mut bgr = Vec::new();
+    let mut taking = Spent::default();
     for instant in 0..instants {
         let end = (k0 + i64::try_from(instant).map_err(|_| "too many instants")?) * INSTANT_HNS;
         clock::sleep_until(end + READ_MARGIN_HNS);
-        let taken = handler.lock().take(instant);
+        let taken = taking.time(|| handler.lock().take(instant));
         let input = match &taken {
             Taken::Picture(frame) => {
-                bgra_to_bgr(&frame.bgra, &mut bgr);
+                taking.time(|| bgra_to_bgr(&frame.bgra, &mut bgr));
                 Input::Picture {
                     bgr: &bgr,
                     width: frame.width,
@@ -75,7 +80,7 @@ fn feed(handler: &Arc<Mutex<LiveFrames>>, instants: u64, recorder: &mut Recorder
         };
         recorder.instant(instant, input)?;
     }
-    Ok(())
+    Ok(taking)
 }
 
 /// Waits for the first delivered frame; its instant is instant 0.
@@ -124,6 +129,8 @@ pub struct LiveFrames {
     taken: Option<u64>,
     failed: bool,
     closed: bool,
+    /// Time spent on the capture thread reading frames back and keeping them.
+    read_back: Spent,
 }
 
 impl LiveFrames {
@@ -206,6 +213,7 @@ impl GraphicsCaptureApiHandler for LiveFrames {
             taken: None,
             failed: false,
             closed: false,
+            read_back: Spent::default(),
         })
     }
 
@@ -214,8 +222,23 @@ impl GraphicsCaptureApiHandler for LiveFrames {
         frame: &mut Frame,
         _control: InternalCaptureControl,
     ) -> Result<()> {
+        let mut read_back = self.read_back;
+        read_back.time(|| self.keep(frame));
+        self.read_back = read_back;
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<()> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl LiveFrames {
+    /// Reads `frame` back and holds it as the picture of its instant.
+    fn keep(&mut self, frame: &mut Frame) {
         if self.failed {
-            return Ok(());
+            return;
         }
         // Instant of a composition time: the first s_j at or after it.
         let composed = composition_time(frame);
@@ -234,14 +257,8 @@ impl GraphicsCaptureApiHandler for LiveFrames {
             // Every later instant is named lost (`take`); the capture itself keeps running.
             self.failed = true;
             self.held = None;
-            return Ok(());
+            return;
         }
         self.held = Some(instant);
-        Ok(())
-    }
-
-    fn on_closed(&mut self) -> Result<()> {
-        self.closed = true;
-        Ok(())
     }
 }

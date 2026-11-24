@@ -24,7 +24,8 @@ use serde_json::json;
 use crate::Result;
 use crate::clock::{self, HNS_PER_MS};
 use crate::exp_av1_live;
-use crate::exp_av1_video::{EncoderSettings, Video, VideoPlace, libaom_version};
+use crate::exp_av1_video::{EncoderSettings, Video, VideoPlace, VideoReport, libaom_version};
+use crate::exp_cpu::Spent;
 use crate::exp_dyn::Corpus;
 use crate::exp_measure::os_peak_private;
 use crate::exp_meter::{Args, process_cpu_ns};
@@ -61,8 +62,8 @@ pub fn run() -> Result<()> {
             // The scene is read before the recording starts: reading it is not recording.
             let mut corpus = Corpus::open(Path::new(folder))?;
             let mut recorder = Recorder::create(&out, settings, settle)?;
-            replay(&mut corpus, &mut recorder)?;
-            report(&out, recorder.finish()?, settings)
+            let source = replay(&mut corpus, &mut recorder)?;
+            report(&out, recorder.finish()?, source, settings)
         }
         (Err(_), Ok(hwnd)) => {
             let hwnd = parse_handle(hwnd)?;
@@ -71,8 +72,8 @@ pub fn run() -> Result<()> {
                 return Err("live mode needs seconds=<n> of at least 1".into());
             }
             let mut recorder = Recorder::create(&out, settings, settle)?;
-            exp_av1_live::record(hwnd, seconds, &mut recorder)?;
-            report(&out, recorder.finish()?, settings)
+            let source = exp_av1_live::record(hwnd, seconds, &mut recorder)?;
+            report(&out, recorder.finish()?, source, settings)
         }
         _ => Err("exp-av1 needs out= and either folder=<corpus scene> or hwnd=<handle> seconds=<n>".into()),
     }
@@ -88,12 +89,14 @@ fn parse_handle(text: &str) -> Result<isize> {
 }
 
 /// Replays a corpus scene: the picture of instant k is handed over at start + k instants.
-fn replay(corpus: &mut Corpus, recorder: &mut Recorder) -> Result<()> {
+/// Returns the time spent reading and decompressing the scene's pictures (the source stage).
+fn replay(corpus: &mut Corpus, recorder: &mut Recorder) -> Result<Spent> {
+    let mut source = Spent::default();
     let start = clock::now_hns();
     for index in 0..corpus.lines.len() {
         let due = i64::try_from(index).map_err(|_| "corpus too long")? * INSTANT_HNS;
         clock::sleep_until(start + due);
-        corpus.load(index)?;
+        source.time(|| corpus.load(index))?;
         let line = &corpus.lines[index];
         let input = Input::Picture {
             bgr: &corpus.picture,
@@ -102,7 +105,7 @@ fn replay(corpus: &mut Corpus, recorder: &mut Recorder) -> Result<()> {
         };
         recorder.instant(line.instant, input)?;
     }
-    Ok(())
+    Ok(source)
 }
 
 /// What a source knows about one instant.
@@ -144,6 +147,8 @@ pub struct Recorder {
     stills: Stills,
     index: Index,
     totals: Totals,
+    /// Time spent comparing pictures and keeping the one compared against.
+    compare: Spent,
 }
 
 /// Counts and sizes for probe.json.
@@ -161,8 +166,12 @@ struct Summary {
     totals: Totals,
     stills: u64,
     bytes_stills: u64,
-    bytes_video: u64,
+    video: Option<VideoReport>,
     size: (u32, u32),
+    compare: Spent,
+    still_encode: Spent,
+    /// Still files and index lines; the video's own writes are in `video`.
+    other_writes: Spent,
 }
 
 impl Recorder {
@@ -183,6 +192,7 @@ impl Recorder {
             stills: Stills::create(&folder.join("stills"))?,
             index: Index::create(&folder.join("frames.jsonl"))?,
             totals: Totals::default(),
+            compare: Spent::default(),
         })
     }
 
@@ -235,10 +245,13 @@ impl Recorder {
                         bgr.len()
                     ));
                 }
-                if let Some(shown) = &self.shown
-                    && (shown.width, shown.height) == (width, height)
-                    && shown.bgr == bgr
-                {
+                let shown = &self.shown;
+                let same = self.compare.time(|| {
+                    shown.as_ref().is_some_and(|shown| {
+                        (shown.width, shown.height) == (width, height) && shown.bgr == bgr
+                    })
+                });
+                if same {
                     return Ok(Kind::Same);
                 }
                 if self
@@ -268,14 +281,17 @@ impl Recorder {
             self.totals.first_encoded_ms =
                 Some((clock::now_hns() - self.started_hns) as f64 / HNS_PER_MS_F64);
         }
-        let shown = self.shown.get_or_insert_with(|| Shown {
-            bgr: Vec::new(),
-            width,
-            height,
+        let shown = &mut self.shown;
+        self.compare.time(|| {
+            let shown = shown.get_or_insert_with(|| Shown {
+                bgr: Vec::new(),
+                width,
+                height,
+            });
+            shown.bgr.clear();
+            shown.bgr.extend_from_slice(bgr);
+            (shown.width, shown.height) = (width, height);
         });
-        shown.bgr.clear();
-        shown.bgr.extend_from_slice(bgr);
-        (shown.width, shown.height) = (width, height);
         Ok(place)
     }
 
@@ -283,17 +299,17 @@ impl Recorder {
     fn finish(mut self) -> Result<Summary> {
         self.index.write_decided(None)?;
         let size = self.video.as_ref().map_or((0, 0), Video::size);
-        let bytes_video = match self.video.take() {
-            Some(video) => video.finish()?,
-            None => 0,
-        };
+        let video = self.video.take().map(Video::finish).transpose()?;
         Ok(Summary {
             instants: self.next_instant,
             totals: self.totals,
             stills: self.stills.count,
             bytes_stills: self.stills.bytes,
-            bytes_video,
+            video,
             size,
+            compare: self.compare,
+            still_encode: self.stills.encode,
+            other_writes: self.stills.writes.plus(self.index.writes),
         })
     }
 }
@@ -342,12 +358,14 @@ impl StillRule {
     }
 }
 
-/// Lossless WebP stills of the whole window.
+/// Lossless WebP stills of the whole window, and the time spent encoding and writing them.
 struct Stills {
     folder: PathBuf,
     rgb: Vec<u8>,
     count: u64,
     bytes: u64,
+    encode: Spent,
+    writes: Spent,
 }
 
 impl Stills {
@@ -359,23 +377,31 @@ impl Stills {
             rgb: Vec::new(),
             count: 0,
             bytes: 0,
+            encode: Spent::default(),
+            writes: Spent::default(),
         })
     }
 
     fn write(&mut self, instant: u64, picture: &Shown) -> Result<()> {
-        self.rgb.clear();
-        self.rgb.extend(
-            picture
-                .bgr
-                .chunks_exact(BGR_BYTES)
-                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]]),
-        );
-        let mut encoded = Vec::new();
-        WebPEncoder::new(&mut encoded)
-            .encode(&self.rgb, picture.width, picture.height, ColorType::Rgb8)
-            .map_err(|e| format!("WebP still of instant {instant}: {e}"))?;
+        let rgb = &mut self.rgb;
+        let encoded = self.encode.time(|| {
+            rgb.clear();
+            rgb.extend(
+                picture
+                    .bgr
+                    .chunks_exact(BGR_BYTES)
+                    .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]]),
+            );
+            let mut encoded = Vec::new();
+            WebPEncoder::new(&mut encoded)
+                .encode(rgb, picture.width, picture.height, ColorType::Rgb8)
+                .map(|()| encoded)
+                .map_err(|e| format!("WebP still of instant {instant}: {e}"))
+        })?;
         let path = self.folder.join(format!("still-{instant:08}.webp"));
-        std::fs::write(&path, &encoded).map_err(|e| format!("write {}: {e}", path.display()))?;
+        self.writes
+            .time(|| std::fs::write(&path, &encoded))
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
         self.count += 1;
         self.bytes += encoded.len() as u64;
         Ok(())
@@ -410,6 +436,7 @@ impl Line {
 struct Index {
     file: File,
     waiting: VecDeque<Line>,
+    writes: Spent,
 }
 
 impl Index {
@@ -422,6 +449,7 @@ impl Index {
         Ok(Self {
             file,
             waiting: VecDeque::new(),
+            writes: Spent::default(),
         })
     }
 
@@ -445,8 +473,10 @@ impl Index {
             if open.is_some_and(|open| line.instant >= open) {
                 break;
             }
-            self.file
-                .write_all(line.text().as_bytes())
+            let text = line.text();
+            let file = &mut self.file;
+            self.writes
+                .time(|| file.write_all(text.as_bytes()))
                 .map_err(|e| format!("write frames.jsonl: {e}"))?;
             self.waiting.pop_front();
         }
@@ -454,17 +484,54 @@ impl Index {
     }
 }
 
-/// probe.json, also printed as the last stdout line.
-fn report(out: &Path, summary: Summary, settings: EncoderSettings) -> Result<()> {
+/// probe.json, also printed as the last stdout line. `source` is the source's own stage
+/// time (corpus reading, or frame read-back in live mode).
+///
+/// Stage processor time is the processor time of the thread that ran the stage. It is
+/// counted in cycles (`QueryThreadCycleTime`) and turned into nanoseconds at the whole
+/// process's own ratio of processor time (`GetProcessTimes`) to cycles over the run, so no
+/// calibration spin adds to `cpu_ns`. `other_cpu_ns` is `cpu_ns` minus the stages: libaom's
+/// worker threads and the main thread's work outside the stages.
+fn report(out: &Path, summary: Summary, source: Spent, settings: EncoderSettings) -> Result<()> {
+    let cpu_ns = process_cpu_ns();
+    let ns_per_cycle = cpu_ns as f64 / clock::process_cycles().max(1) as f64;
+    let thread_ns = |spent: &Spent| (spent.thread_cycles as f64 * ns_per_cycle) as u64;
+    let video = summary.video.as_ref();
+    let from_video = |pick: fn(&VideoReport) -> Spent| video.map_or_else(Spent::default, pick);
+    let stages = [
+        ("source", source),
+        ("compare", summary.compare),
+        ("convert", from_video(|v| v.convert)),
+        ("encode", from_video(|v| v.encode_call)),
+        ("still_encode", summary.still_encode),
+        ("writes", from_video(|v| v.writes).plus(summary.other_writes)),
+    ];
+    let covered_ns: u64 = stages.iter().map(|(_, spent)| thread_ns(spent)).sum();
+    let stages_json: serde_json::Map<String, serde_json::Value> = stages
+        .iter()
+        .map(|(name, spent)| {
+            let stage = json!({ "thread_cpu_ns": thread_ns(spent), "wall_ns": spent.wall_ns });
+            ((*name).to_owned(), stage)
+        })
+        .collect();
     let report = json!({
         "instants": summary.instants,
         "encoded": summary.totals.encoded,
         "same": summary.totals.same,
         "lost": summary.totals.lost,
         "stills": summary.stills,
-        "bytes_video": summary.bytes_video,
+        "bytes_video": video.map_or(0, |v| v.bytes),
         "bytes_stills": summary.bytes_stills,
-        "cpu_ns": process_cpu_ns(),
+        "cpu_ns": cpu_ns,
+        "stages": stages_json,
+        "other_cpu_ns": cpu_ns.saturating_sub(covered_ns),
+        "ns_per_cycle": ns_per_cycle,
+        "start": {
+            "encoder_open_ms": video.map(|v| v.start.open_ms),
+            "first_convert_ms": video.and_then(|v| v.start.first_convert_ms),
+            "first_encode_ms": video.and_then(|v| v.start.first_encode_ms)
+        },
+        "encoder_threads": settings.threads,
         "ram_peak": os_peak_private(),
         "first_encoded_ms": summary.totals.first_encoded_ms,
         "width": summary.size.0,

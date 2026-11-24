@@ -1016,8 +1016,33 @@ impl SessionLifecycleState {
         report.cdp =
             cleanup_session_cdp_targets(&self.m3_state, &self.cdp_target_owners, session_id).await;
         report.target_claims = self.cleanup_target_claims(session_id);
-        report.shell = cleanup_shell_jobs(session_id, reason);
-        report.processes = self.cleanup_owned_processes(session_id, options);
+        // #278: shell-job and owned-process cleanup poll and sleep until the
+        // processes exit (up to 5 s per process, 30 s for a spawned agent). On
+        // an async worker that wait stalls every request the worker would
+        // serve, so it runs on the blocking pool.
+        let lifecycle = self.clone();
+        let blocking_session_id = session_id.to_owned();
+        let blocking_reason = reason.to_owned();
+        let blocking_cleanup = tokio::task::spawn_blocking(move || {
+            let shell = cleanup_shell_jobs(&blocking_session_id, &blocking_reason);
+            let processes = lifecycle.cleanup_owned_processes(&blocking_session_id, options);
+            (shell, processes)
+        })
+        .await;
+        (report.shell, report.processes) = blocking_cleanup.unwrap_or_else(|join_error| {
+            let error_message = Some(format!("session cleanup worker failed: {join_error}"));
+            (
+                SessionShellCleanupReport {
+                    failed: 1,
+                    error_message,
+                    ..SessionShellCleanupReport::default()
+                },
+                SessionProcessCleanupReport {
+                    failed: 1,
+                    ..SessionProcessCleanupReport::default()
+                },
+            )
+        });
         let registry_reason = reconciled_teardown_exit_reason(reason, &report.processes);
         report.reason.clone_from(&registry_reason);
         report.subscriptions = self.cleanup_subscriptions(session_id);

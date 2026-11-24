@@ -28,6 +28,7 @@ pub(super) fn validate_audit_params(params: &AuditParams) -> Result<AuditOperati
             ),
             ("export_bundle", params.export_bundle.is_some()),
         ],
+        &["lifecycle_events", "lifecycle_exits"],
         AUDIT_SOT,
     )?;
     Ok(operation)
@@ -45,20 +46,24 @@ pub(super) fn validate_replay_params(params: &ReplayParams) -> Result<ReplayOper
             ("demo_stop", params.demo_stop.is_some()),
             ("artifact_inspect", params.artifact_inspect.is_some()),
         ],
+        &["demo_status"],
         REPLAY_SOT,
     )?;
     Ok(operation)
 }
 
+/// Accepts the payload whose key matches `operation` and no other payload.
+/// Operations listed in `payload_optional` take defaults for every field, so
+/// their payload may be omitted.
 fn validate_exact_spec(
     tool: &'static str,
     operation: &'static str,
     specs: &[(&'static str, bool)],
+    payload_optional: &[&'static str],
     source_of_truth: &'static str,
 ) -> Result<(), ErrorData> {
-    let matching_present = specs
-        .iter()
-        .any(|(name, present)| *name == operation && *present);
+    let matching_present = payload_optional.contains(&operation)
+        || specs.iter().any(|(name, present)| *name == operation && *present);
     let extra = specs
         .iter()
         .filter_map(|(name, present)| (*present && *name != operation).then_some(*name))

@@ -7,8 +7,7 @@ use crate::server::ErrorData;
 use super::{
     HYGIENE_TOOL, MODEL_TOOL, SETUP_TOOL, STORAGE_TOOL,
     types::{
-        HygieneParams, ModelParams, SetupOperation, SetupParams, StorageParams, TelemetryOperation,
-        TelemetryParams,
+        HygieneParams, ModelParams, SetupParams, StorageParams, TelemetryOperation, TelemetryParams,
     },
 };
 pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), ErrorData> {
@@ -20,6 +19,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("summary", params.summary.is_some()),
             ("gc_once", params.gc_once.is_some()),
         ],
+        &["inspect", "summary"],
     )
 }
 
@@ -35,6 +35,7 @@ pub(super) fn validate_model_params(params: &ModelParams) -> Result<(), ErrorDat
             ("update", params.update.is_some()),
             ("remove", params.remove.is_some()),
         ],
+        &["list", "status"],
     )
 }
 
@@ -48,19 +49,11 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("flags", params.flags.is_some()),
             ("report", params.report.is_some()),
         ],
+        &["flags", "report"],
     )
 }
 
 pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorData> {
-    match params.operation {
-        SetupOperation::Status if params.doctor.is_none() && params.repair.is_none() => {
-            return Ok(());
-        }
-        SetupOperation::Doctor if params.status.is_none() && params.repair.is_none() => {
-            return Ok(());
-        }
-        _ => {}
-    }
     validate_exact_spec(
         SETUP_TOOL,
         params.operation.as_str(),
@@ -69,6 +62,7 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
             ("doctor", params.doctor.is_some()),
             ("repair", params.repair.is_some()),
         ],
+        &["status", "doctor"],
     )
 }
 
@@ -81,14 +75,17 @@ pub(super) fn validate_telemetry_params(params: &TelemetryParams) -> Result<(), 
     }
 }
 
+/// Accepts the payload whose key matches `operation` and no other payload.
+/// Operations listed in `payload_optional` take defaults for every field, so
+/// their payload may be omitted.
 fn validate_exact_spec(
     tool: &'static str,
     operation: &'static str,
     specs: &[(&'static str, bool)],
+    payload_optional: &[&'static str],
 ) -> Result<(), ErrorData> {
-    let matching_present = specs
-        .iter()
-        .any(|(name, present)| *name == operation && *present);
+    let matching_present = payload_optional.contains(&operation)
+        || specs.iter().any(|(name, present)| *name == operation && *present);
     let extra = specs
         .iter()
         .filter_map(|(name, present)| (*present && *name != operation).then_some(*name))

@@ -561,8 +561,17 @@ fn session_invalid_for(failure: SessionFailure, session_id: Option<&str>) -> Res
         .into_response()
 }
 
+/// 413 for a body over [`MAX_MCP_REQUEST_BYTES`], as a JSON-RPC error that
+/// states the limit (#266). The id is `null`: the body was not read.
 fn payload_too_large() -> Response {
-    (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
+    jsonrpc_error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &serde_json::Value::Null,
+        ErrorCode::INVALID_REQUEST,
+        format!(
+            "invalid request: the body exceeds the {MAX_MCP_REQUEST_BYTES}-byte limit of an /mcp request"
+        ),
+    )
 }
 
 fn lifecycle_cleanup_failed(error: rmcp::ErrorData) -> Response {

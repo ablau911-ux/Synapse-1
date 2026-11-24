@@ -241,6 +241,28 @@ impl ServerHandler for SynapseService {
         })
     }
 
+    /// rmcp decodes a request whose params do not fit a standard method's typed
+    /// shape (e.g. `tools/call` without `params`, or with non-object
+    /// `arguments`) as a custom request. A standard method name there means
+    /// invalid params (-32602), not an unknown method (#206).
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CustomResult, ErrorData> {
+        let method = request.method;
+        if !is_standard_client_request_method(&method) {
+            return Err(ErrorData::new(ErrorCode::METHOD_NOT_FOUND, method, None));
+        }
+        Err(ErrorData::invalid_params(
+            format!("{method} params are missing or do not match the {method} request shape"),
+            Some(json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "method": method,
+            })),
+        ))
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -503,6 +525,38 @@ impl SynapseService {
         })
         .map_err(lifecycle_mcp_error)
     }
+}
+
+/// Whether `method` names one of the client requests rmcp decodes into a typed
+/// `ClientRequest` variant (everything but `CustomRequest`).
+fn is_standard_client_request_method(method: &str) -> bool {
+    use rmcp::model::{
+        CallToolRequestMethod, CancelTaskMethod, CompleteRequestMethod, ConstString,
+        GetPromptRequestMethod, GetTaskInfoMethod, GetTaskResultMethod, InitializeResultMethod,
+        ListPromptsRequestMethod, ListResourceTemplatesRequestMethod, ListResourcesRequestMethod,
+        ListTasksMethod, ListToolsRequestMethod, PingRequestMethod, ReadResourceRequestMethod,
+        SetLevelRequestMethod, SubscribeRequestMethod, UnsubscribeRequestMethod,
+    };
+    [
+        PingRequestMethod::VALUE,
+        InitializeResultMethod::VALUE,
+        CompleteRequestMethod::VALUE,
+        SetLevelRequestMethod::VALUE,
+        GetPromptRequestMethod::VALUE,
+        ListPromptsRequestMethod::VALUE,
+        ListResourcesRequestMethod::VALUE,
+        ListResourceTemplatesRequestMethod::VALUE,
+        ReadResourceRequestMethod::VALUE,
+        SubscribeRequestMethod::VALUE,
+        UnsubscribeRequestMethod::VALUE,
+        CallToolRequestMethod::VALUE,
+        ListToolsRequestMethod::VALUE,
+        GetTaskInfoMethod::VALUE,
+        ListTasksMethod::VALUE,
+        GetTaskResultMethod::VALUE,
+        CancelTaskMethod::VALUE,
+    ]
+    .contains(&method)
 }
 
 fn tool_operation_from_arguments(

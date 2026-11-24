@@ -2173,7 +2173,7 @@ fn workspace_version_conflict_error(
     let detail = match (expected_version, current_version) {
         (None, Some(current)) => {
             format!(
-                "key already exists at version {current}; read it first and retry with expected_version={current}"
+                "expected_version is required because the key exists at version {current}; read it first and retry with expected_version={current}"
             )
         }
         (Some(expected), None) => {

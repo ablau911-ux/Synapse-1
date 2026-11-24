@@ -357,21 +357,32 @@ async fn record_session_request(
 /// route, and answers a JSON-RPC error otherwise (#189): rmcp answers a body it
 /// cannot decode with a plain-text 415, which no JSON-RPC client can match.
 fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
-    let value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
-        jsonrpc_error_response(
-            StatusCode::BAD_REQUEST,
-            &serde_json::Value::Null,
-            ErrorCode::PARSE_ERROR,
-            format!("parse error: {error}"),
-        )
+    let JsonRpcObject(message) = serde_json::from_slice::<JsonRpcObject>(bytes).map_err(|error| {
+        if error.classify() == serde_json::error::Category::Data {
+            invalid_jsonrpc_request(&serde_json::Value::Null, &error.to_string())
+        } else {
+            jsonrpc_error_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::Value::Null,
+                ErrorCode::PARSE_ERROR,
+                format!("parse error: {error}"),
+            )
+        }
     })?;
-    let Some(message) = value.as_object() else {
-        return Err(invalid_jsonrpc_request(
-            &serde_json::Value::Null,
-            "the body must be one JSON-RPC message object (batches are not supported)",
-        ));
+    // A present id that is not a string or an integer (null, object, bool,
+    // float, array) fails rmcp's request decode, and rmcp then reads the
+    // message as a notification: HTTP 202, never executed, never answered
+    // (#207, #264).
+    let id = match message.get("id") {
+        None => &serde_json::Value::Null,
+        Some(id) if id.is_string() || id.as_i64().is_some() => id,
+        Some(_) => {
+            return Err(invalid_jsonrpc_request(
+                &serde_json::Value::Null,
+                "id must be a string or an integer (null is not allowed)",
+            ));
+        }
     };
-    let id = message.get("id").unwrap_or(&serde_json::Value::Null);
     if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
         return Err(invalid_jsonrpc_request(id, "jsonrpc must be \"2.0\""));
     }
@@ -384,7 +395,47 @@ fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
             "a message needs a string `method`, or an `id` with `result` or `error`",
         ));
     }
-    Ok(value)
+    Ok(serde_json::Value::Object(message))
+}
+
+/// One `/mcp` body: a single JSON object whose top level repeats no member
+/// name. serde_json's `Value` keeps the last of two `"id"` members silently,
+/// while rmcp's typed request refuses the duplicate and reads the message as a
+/// notification, so the request is dropped with a 202 (#264).
+struct JsonRpcObject(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for JsonRpcObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonRpcObjectVisitor)
+    }
+}
+
+struct JsonRpcObjectVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonRpcObjectVisitor {
+    type Value = JsonRpcObject;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one JSON-RPC message object (batches are not supported)")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut members = serde_json::Map::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if members.contains_key(&name) {
+                return Err(serde::de::Error::custom(format_args!("duplicate member `{name}`")));
+            }
+            let value = map.next_value()?;
+            members.insert(name, value);
+        }
+        Ok(JsonRpcObject(members))
+    }
 }
 
 fn invalid_jsonrpc_request(id: &serde_json::Value, message: &str) -> Response {

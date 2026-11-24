@@ -527,6 +527,12 @@ impl SynapseService {
         &self,
         params: AgentTemplateListParams,
     ) -> Result<AgentTemplateListResponse, ErrorData> {
+        if !(1..=MAX_LIST_TEMPLATES).contains(&params.max) {
+            return Err(params_error(format!(
+                "agent_template list max must be 1..={MAX_LIST_TEMPLATES}, got {}",
+                params.max
+            )));
+        }
         let db = self.agent_template_db()?;
         let prefix = template_prefix();
         let rows = db

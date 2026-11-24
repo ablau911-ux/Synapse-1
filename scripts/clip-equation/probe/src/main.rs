@@ -21,6 +21,8 @@
 //!                            folder=<clip folder> instant=<k> [png=<file>]
 //!   clip-probe exp-av1-recover runs the product's recovery on a clip folder in place:
 //!                            folder=<clip folder>
+//!   clip-probe exp-av1-registry runs one change of the product's clip registry under
+//!                            %LOCALAPPDATA%: action=mark_finished clip=<clip id>
 //!
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.
@@ -48,10 +50,11 @@ mod compress;
 mod delivery;
 mod disk;
 mod encoder;
-mod exp_corpus;
 mod exp_av1;
 mod exp_av1_fetch;
 mod exp_av1_recover;
+mod exp_av1_registry;
+mod exp_corpus;
 mod exp_cpu;
 mod exp_d;
 mod exp_dyn;
@@ -115,8 +118,9 @@ fn main() {
         "exp-av1" => exp_av1::run(),
         "exp-av1-fetch" => exp_av1_fetch::run(),
         "exp-av1-recover" => exp_av1_recover::run(),
+        "exp-av1-registry" => exp_av1_registry::run(),
         _ => Err(format!(
-            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus, exp-z, exp-d, exp-rate, exp-av1, exp-av1-fetch or exp-av1-recover"
+            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus, exp-z, exp-d, exp-rate, exp-av1, exp-av1-fetch, exp-av1-recover or exp-av1-registry"
         )),
     };
     if let Err(error) = outcome {

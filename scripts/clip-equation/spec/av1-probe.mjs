@@ -362,9 +362,8 @@ function recovered(fixture, name, damage, held) {
   fs.cpSync(source, dir, { recursive: true });
   const before = readJsonl(path.join(dir, 'frames.jsonl'));
   damage(dir);
-  const run = held
-    ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', HOLD_AND_RECOVER], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, HOLD_FILE: held(dir), HOLD_PROBE: PROBE, HOLD_FOLDER: dir } })
-    : spawnSync(PROBE, ['exp-av1-recover', `folder=${dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  const args = ['exp-av1-recover', `folder=${dir}`];
+  const run = held ? runProbeHolding(held(dir), args) : spawnSync(PROBE, args, { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
   if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
   let result;
   try { result = JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
@@ -372,8 +371,16 @@ function recovered(fixture, name, damage, held) {
   return { dir, result, before, lines: readJsonl(path.join(dir, 'frames.jsonl')) };
 }
 // Another process holds HOLD_FILE (opened for reading, sharing only delete, as an indexer or antivirus
-// may) while the product's recovery runs on HOLD_FOLDER; prints the recovery's JSON line.
-const HOLD_AND_RECOVER = "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Delete'); try { & $env:HOLD_PROBE exp-av1-recover \"folder=$env:HOLD_FOLDER\" } finally { $f.Close() }";
+// may) while the probe runs with the arguments of HOLD_ARGS (one per line); prints the probe's output.
+const HOLD_AND_RUN = "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Delete'); try { & $env:HOLD_PROBE ($env:HOLD_ARGS -split '\\n') } finally { $f.Close() }";
+/** Runs the probe with `args` (and `env` added) while another process holds `file`. */
+const runProbeHolding = (file, args, env = {}) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', HOLD_AND_RUN],
+  { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, ...env, HOLD_FILE: file, HOLD_PROBE: PROBE, HOLD_ARGS: args.join('\n') } });
+/** The probe's last output line as JSON, or { error }. */
+const probeJson = run => {
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
+  try { return JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
+};
 /** SHA-256 of every file under `dir`, by relative path. */
 const fileHashes = dir => Object.fromEntries(fs.readdirSync(dir, { recursive: true }).map(String).filter(file => fs.statSync(path.join(dir, file)).isFile()).map(file => [file, crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, file))).digest('hex')]));
 const lastPart = dir => path.join(dir, 'video', fs.readdirSync(path.join(dir, 'video')).filter(f => /^part-\d+\.ivf$/.test(f)).sort().at(-1));
@@ -684,6 +691,29 @@ function heldStillKept() {
 }
 
 /**
+ * The clip registry (active-clips.json under the default clips folder, here under a LOCALAPPDATA of the
+ * bench's own) is held by another process while a clip is marked finished: a registry change never
+ * writes from a failed read. The change ends with an error and the registry keeps its bytes.
+ */
+function registryKeptOnFailedRead() {
+  const appData = path.join(OUT, 'registry-held');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const file = path.join(clips, 'active-clips.json');
+  const entries = ['clip-a', 'clip-b'].map((id, n) => ({ clip_id: id, folder: path.join(clips, id), finished: n === 1 }));
+  fs.writeFileSync(file, JSON.stringify(entries, null, 2));
+  const before = fs.readFileSync(file, 'utf8');
+  const got = probeJson(runProbeHolding(file, ['exp-av1-registry', 'action=mark_finished', 'clip=clip-a'], { LOCALAPPDATA: appData }));
+  const problems = [];
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('mark_finished succeeded while it could not read the registry');
+  const after = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  if (after !== before) problems.push(`the registry was written from a failed read: it now holds ${after === null ? 'no file' : after.replace(/\s+/g, ' ').slice(0, 120)}`);
+  return verdict(problems, `registry held by another process: mark_finished ended with an error (${String(got.error).replace(/\s+/g, ' ').slice(0, 120)}) and the registry kept its ${entries.length} entries byte for byte`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -796,6 +826,7 @@ const table = {
   'recovery says a recovered clip needs no more recovery': recoveredClipFinished,
   'recovery treats an empty still as missing': emptyStillMissing,
   'recovery never deletes a still it could not read': heldStillKept,
+  'a registry change never writes from a failed read': registryKeptOnFailedRead,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

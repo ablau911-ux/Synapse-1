@@ -339,7 +339,15 @@ pub(crate) fn recover_clips_on_start() {
     let started = std::thread::Builder::new()
         .name("synapse-clip-recovery".into())
         .spawn(|| {
-            for entry in ClipRegistry::unfinished() {
+            // A registry that cannot be read is logged and nothing changes.
+            let unfinished = match ClipRegistry::unfinished() {
+                Ok(unfinished) => unfinished,
+                Err(error) => {
+                    tracing::warn!(code = "CLIP_REGISTRY_READ_FAILED", error = %error);
+                    return;
+                }
+            };
+            for entry in unfinished {
                 let folder = &entry.folder;
                 match ClipRecovery::run(folder) {
                     Ok(true) => {

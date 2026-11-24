@@ -309,7 +309,9 @@ pub(super) fn clip_status(clip_id: &str) -> Result<ClipStatusResponse, ErrorData
     if let Some((control, folder)) = Recorders::find(clip_id) {
         return status_of(&folder, Some(&control));
     }
-    let folder = ClipRegistry::folder_of(clip_id).ok_or_else(|| {
+    let folder = ClipRegistry::folder_of(clip_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
         mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(

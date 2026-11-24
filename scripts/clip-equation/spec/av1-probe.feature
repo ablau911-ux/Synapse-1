@@ -45,6 +45,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed text-page recording whose first still on an encoded instant is cut to 0 bytes: product recovery succeeds; no index line names that still (still or still_of); its file is not on disk; the product decoder returns that instant as video | Known: true
   Scenario: recovery never deletes a still it could not read
     # Equation: killed text-page recording whose first still is held by another process during product recovery (opened for reading, sharing only delete): recovery ends with an error "could not read" naming the still; every file of the folder before recovery is still there, byte-equal | Known: true
+  Scenario: a registry change never writes from a failed read
+    # Equation: registry with 2 entries under the bench's own LOCALAPPDATA, held by another process (opened for reading, sharing only delete) while the product marks one clip finished (clip-probe exp-av1-registry): the change ends with an error (ok = false); the registry file is byte-equal | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

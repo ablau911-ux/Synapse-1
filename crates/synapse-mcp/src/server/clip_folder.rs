@@ -929,12 +929,19 @@ impl ClipRegistry {
         clips_root().join(REGISTRY_FILE)
     }
 
-    /// Every registered clip.
-    pub(super) fn entries() -> Vec<RegistryEntry> {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    /// Every registered clip; none while the registry file does not exist.
+    /// A registry that cannot be read (another process holds it past the
+    /// brief-hold retries) or is not valid is an error, never an empty
+    /// list, so no change writes a registry from a failed read.
+    pub(super) fn entries() -> Result<Vec<RegistryEntry>, String> {
+        let path = Self::path();
+        let text = match retry_brief_hold(|| std::fs::read_to_string(&path)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+        };
+        serde_json::from_str(&text)
+            .map_err(|error| format!("{} is not valid: {error}", path.display()))
     }
 
     /// Lists a clip, unfinished.
@@ -961,7 +968,10 @@ impl ClipRegistry {
     /// Drops a clip from the registry (a `record` that failed before its
     /// first picture removed its folder).
     pub(super) fn remove(clip_id: &str) -> Result<(), String> {
-        if !Self::entries().iter().any(|entry| entry.clip_id == clip_id) {
+        if !Self::entries()?
+            .iter()
+            .any(|entry| entry.clip_id == clip_id)
+        {
             return Ok(());
         }
         Self::change(|entries| entries.retain(|entry| entry.clip_id != clip_id))
@@ -973,7 +983,7 @@ impl ClipRegistry {
             .map_err(|error| format!("could not create {}: {error}", root.display()))?;
         let path = Self::path();
         let _lock = FolderLock::on(&path.with_extension(format!("json{LOCK_SUFFIX}")))?;
-        let mut entries = Self::entries();
+        let mut entries = Self::entries()?;
         edit(&mut entries);
         write_atomically(&path, &entries)
     }
@@ -981,22 +991,22 @@ impl ClipRegistry {
     /// The folder of a clip id: the registry, then the default folder (a clip
     /// recorded there before every clip was registered). A registered folder
     /// that no longer holds a `clip.json` is skipped.
-    pub(super) fn folder_of(clip_id: &str) -> Option<PathBuf> {
-        Self::entries()
+    pub(super) fn folder_of(clip_id: &str) -> Result<Option<PathBuf>, String> {
+        Ok(Self::entries()?
             .into_iter()
             .find(|entry| entry.clip_id == clip_id && entry.folder.join(CLIP_JSON_FILE).is_file())
             .map(|entry| entry.folder)
             .or_else(|| {
                 let folder = clips_root().join(clip_id);
                 folder.join(CLIP_JSON_FILE).is_file().then_some(folder)
-            })
+            }))
     }
 
     /// Every clip that may need recovery: the entries not marked finished.
-    pub(super) fn unfinished() -> Vec<RegistryEntry> {
-        Self::entries()
+    pub(super) fn unfinished() -> Result<Vec<RegistryEntry>, String> {
+        Ok(Self::entries()?
             .into_iter()
             .filter(|entry| !entry.finished)
-            .collect()
+            .collect())
     }
 }

@@ -142,7 +142,8 @@ impl ClipRecovery {
     /// instant 0 with no gap; an `enc` line whose picture is not complete on
     /// disk, and a `same` line after a line that shows no picture, become
     /// lost (`cause`); the instants never written, up to `planned`, are added
-    /// as lost. A line that becomes lost keeps its still mark (`still` or
+    /// as lost. A lost line, one that becomes lost here or was lost already
+    /// (it keeps its own cause), keeps its still mark (`still` or
     /// `still_of`) while that still's file is on disk (`still_on_disk`): the
     /// still shows the instant's exact picture, so it is never deleted for a
     /// missing video picture. A mark whose file is gone is dropped, so a lost
@@ -177,12 +178,12 @@ impl ClipRecovery {
                 .last()
                 .is_some_and(|before| before.lost.is_some() && before.still_file().is_none());
             let shows_missing = line.same.is_some() && previous_shows_nothing;
-            if picture_missing || shows_missing {
+            if picture_missing || shows_missing || line.lost.is_some() {
                 let still_kept = line.still_file().is_some_and(&still_on_disk);
                 lines.push(IndexLine {
                     enc: None,
                     same: None,
-                    lost: Some(cause.to_owned()),
+                    lost: line.lost.clone().or_else(|| Some(cause.to_owned())),
                     still: line.still.filter(|_| still_kept),
                     still_of: line.still_of.filter(|_| still_kept),
                     ..line.clone()

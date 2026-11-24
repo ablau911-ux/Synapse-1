@@ -389,22 +389,35 @@ function stillSurvivesRecovery() {
   return verdict(problems, `video pictures gone, still of instant ${still.instant} kept and returned as exact still`);
 }
 
-/** The video picture and the still of an instant are both gone: no index line may name that still. */
-function lostLinePromisesNoMissingStill() {
+/**
+ * The still file of an instant is gone and its line is lost: no lost line may name that still.
+ * `alreadyLost` false: the line becomes lost in this recovery (its part is cut to the header).
+ * `alreadyLost` true: the index already holds the line as lost with its still mark (an earlier recovery wrote it).
+ */
+function lostLineNamesNoMissingStill(name, alreadyLost) {
   const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
   let gone;
-  const got = recovered('killed-text-page', 'crash-still-and-video-gone', dir => {
-    fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
-    gone = readJsonl(path.join(dir, 'frames.jsonl')).find(line => line.still === true)?.instant;
-    if (gone !== undefined) fs.rmSync(path.join(dir, 'stills', `still-${pad(gone, 8)}.webp`));
+  const got = recovered('killed-text-page', name, dir => {
+    const index = path.join(dir, 'frames.jsonl');
+    const lines = readJsonl(index);
+    const still = lines.find(line => line.still === true);
+    if (!still) return;
+    gone = still.instant;
+    if (alreadyLost) {
+      lines[gone] = { instant: still.instant, t_ms: still.t_ms, lost: 'service_restart', still: true };
+      fs.writeFileSync(index, lines.map(line => `${JSON.stringify(line)}\n`).join(''));
+    } else fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    fs.rmSync(path.join(dir, 'stills', `still-${pad(gone, 8)}.webp`));
   });
   if (got.error) return verdict([got.error]);
   if (gone === undefined) return verdict(['the killed recording has no still']);
   const problems = [];
   if (kindOf(got.lines[gone] ?? {}) !== 'lost') problems.push(`instant ${gone} is not named lost`);
-  const naming = got.lines.filter(line => (line.still === true && line.instant === gone) || line.still_of === gone);
-  if (naming.length) problems.push(`${naming.length} index lines name the missing still of instant ${gone} (first: instant ${naming[0].instant})`);
-  return verdict(problems, `video picture and still of instant ${gone} gone: the instant is lost and no line names the still`);
+  const naming = got.lines.filter(line => kindOf(line) === 'lost' && ((line.still === true && line.instant === gone) || line.still_of === gone));
+  if (naming.length) problems.push(`${naming.length} lost lines name the missing still of instant ${gone} (first: instant ${naming[0].instant})`);
+  const next = got.before[gone + 1];
+  if (next && kindOf(next) === 'same' && kindOf(got.lines[next.instant] ?? {}) !== 'lost') problems.push(`instant ${next.instant} repeats the lost instant ${gone} and is not named lost`);
+  return verdict(problems, `still of instant ${gone} gone and its line lost: no line names the still`);
 }
 
 /** A planned length off the 50 ms grid: every planned instant has an index line after recovery. */
@@ -506,7 +519,8 @@ const table = {
   'a picture after a lost instant is recorded again': () => judge(recordedAgainAfterLoss),
   'a torn last part does not stop recovery': tornLastPart,
   'recovery keeps a complete still': stillSurvivesRecovery,
-  'a lost line names no missing still': lostLinePromisesNoMissingStill,
+  'a lost line names no missing still': () => lostLineNamesNoMissingStill('crash-still-and-video-gone', false),
+  'a line already lost names no missing still': () => lostLineNamesNoMissingStill('crash-lost-line-stale-still', true),
   'recovery names every planned instant': recoveryNamesEveryInstant,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,

@@ -3167,7 +3167,9 @@ pub fn cancel_shell_job(
         }
         termination_status =
             remote_aware_termination_status(&termination_status, &job.remote_process_scope);
-        write_shell_job_status(&paths.status_path, &job)?;
+        // `job` was read before the monitor may have recorded a verified remote
+        // cleanup; latest-terminal-wins keeps that newer record (#174).
+        write_shell_job_reconciliation_status(&paths, job)?;
     }
 
     let status = shell_job_status(
@@ -16621,6 +16623,13 @@ fn shell_job_latest_terminal_should_win(
         candidate.status.as_str(),
         "exited_unobserved" | "pid_unavailable"
     ) {
+        return true;
+    }
+    // A verified remote cleanup is final; an older copy that has not seen it
+    // must not replace it with a cleanup failure (#174).
+    if latest.remote_process_scope.remote_cleanup_verified
+        && !candidate.remote_process_scope.remote_cleanup_verified
+    {
         return true;
     }
     if latest.status == "ok" && latest.exit_code == Some(0) && candidate.exit_code != Some(0) {

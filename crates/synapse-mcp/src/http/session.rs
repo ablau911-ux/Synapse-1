@@ -367,17 +367,18 @@ async fn record_session_request(
 /// route, and answers a JSON-RPC error otherwise (#189): rmcp answers a body it
 /// cannot decode with a plain-text 415, which no JSON-RPC client can match.
 fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
+    // A syntax error anywhere in the body is a parse error (-32700). The shape
+    // check below stops at the first wrong shape (an array, a scalar, a
+    // repeated member) before serde_json reads the rest of the body, so the
+    // whole body is checked for well-formed JSON first (#207, #264).
+    serde_json::from_slice::<serde::de::IgnoredAny>(bytes)
+        .map_err(|error| jsonrpc_parse_error(&error))?;
     let JsonRpcObject(message) =
         serde_json::from_slice::<JsonRpcObject>(bytes).map_err(|error| {
             if error.classify() == serde_json::error::Category::Data {
                 invalid_jsonrpc_request(&serde_json::Value::Null, &error.to_string())
             } else {
-                jsonrpc_error_response(
-                    StatusCode::BAD_REQUEST,
-                    &serde_json::Value::Null,
-                    ErrorCode::PARSE_ERROR,
-                    format!("parse error: {error}"),
-                )
+                jsonrpc_parse_error(&error)
             }
         })?;
     // A present id that is not a string or an integer (null, object, bool,
@@ -451,6 +452,15 @@ impl<'de> serde::de::Visitor<'de> for JsonRpcObjectVisitor {
         }
         Ok(JsonRpcObject(members))
     }
+}
+
+fn jsonrpc_parse_error(error: &serde_json::Error) -> Response {
+    jsonrpc_error_response(
+        StatusCode::BAD_REQUEST,
+        &serde_json::Value::Null,
+        ErrorCode::PARSE_ERROR,
+        format!("parse error: {error}"),
+    )
 }
 
 fn invalid_jsonrpc_request(id: &serde_json::Value, message: &str) -> Response {

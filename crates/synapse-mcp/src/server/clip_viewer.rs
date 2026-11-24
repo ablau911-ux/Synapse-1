@@ -40,7 +40,7 @@ use synapse_core::{Rect, error_codes};
 
 use super::ErrorData;
 use super::clip_decoder::{
-    ClipDecoder, ClipPicture, PictureKind, PictureSource, VIEW_TIMING_CODE, elapsed_ms,
+    ClipDecoder, ClipPicture, PictureKind, PictureSource, VIEW_TIMING_CODE, elapsed_ms, find_line,
 };
 use super::clip_folder::{
     CLIP_JSON_FILE, CLIP_METHOD, CLIP_SCHEMA_VERSION, ClipJson, ClipState, FRAMES_FILE, IndexLine,
@@ -266,6 +266,11 @@ impl ViewedClip {
             .iter()
             .filter(|line| line.still_file().is_some())
             .map(|line| line.instant)
+    }
+
+    /// The cursor logged with instant k's frame, in recorded pixels.
+    fn cursor(&self, instant: u64) -> Option<(i32, i32)> {
+        find_line(&self.lines, instant).and_then(|line| line.cursor)
     }
 
     fn source(&self, instant: u64) -> Result<PictureSource, ErrorData> {
@@ -1087,8 +1092,13 @@ impl ClipView {
         } else {
             format!(", unchanged since frame {shown}")
         };
+        let cursor = self.clip.cursor(picture.instant);
+        let cursor_text = cursor.map_or_else(
+            || ", cursor not logged".to_owned(),
+            |(x, y)| format!(", cursor at x={x} y={y}"),
+        );
         let label = format!(
-            "Image {index} ({}, t={}, frame {}{unchanged}, {reason})",
+            "Image {index} ({}, t={}, frame {}{unchanged}{cursor_text}, {reason})",
             kind.as_str(),
             fmt_time(picture.t_ms),
             picture.instant
@@ -1138,6 +1148,7 @@ impl ClipView {
             path: path.to_string_lossy().into_owned(),
             width: rgb.width(),
             height: rgb.height(),
+            cursor: cursor.map(<[i32; 2]>::from),
         });
         self.pngs.push(png);
         Ok(())

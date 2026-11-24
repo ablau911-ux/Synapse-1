@@ -106,7 +106,9 @@ pub fn still_path(folder: &Path, instant: u64) -> PathBuf {
 /// `still_of: k` an instant whose settled picture equals the still of instant
 /// k (no second file is written). A `lost` line can keep its still mark:
 /// recovery found its video picture missing, but its complete still shows the
-/// instant's exact picture.
+/// instant's exact picture. `cursor` is the cursor in the pixels of the
+/// instant's frame, sampled with that frame (absent when the instant had no
+/// frame, Windows did not report it, or the clip is older than this field).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexLine {
     pub instant: u64,
@@ -121,6 +123,8 @@ pub struct IndexLine {
     pub still: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub still_of: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<(i32, i32)>,
 }
 
 impl IndexLine {

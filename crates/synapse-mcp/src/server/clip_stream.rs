@@ -206,7 +206,14 @@ impl ClipStream {
     }
 
     /// Takes the input of `instant`; instants arrive in order from 0.
-    pub(super) fn instant(&mut self, instant: u64, input: StreamInput) -> Result<Written, String> {
+    /// `cursor` is the cursor in the pixels of the instant's frame, sampled
+    /// with that frame; it is logged in the instant's index line.
+    pub(super) fn instant(
+        &mut self,
+        instant: u64,
+        input: StreamInput,
+        cursor: Option<(i32, i32)>,
+    ) -> Result<Written, String> {
         if instant != self.next_instant {
             return Err(format!(
                 "instant {instant} arrived, {} expected",
@@ -237,7 +244,7 @@ impl ClipStream {
             Decision::Lost(cause) => Some(cause),
             _ => None,
         };
-        self.index.add(line_of(instant, decision));
+        self.index.add(line_of(instant, decision, cursor));
         if let Some(settled) = self.still_rule.observe(instant, decision) {
             // Every instant since `settled` was `same`, so the shown picture is its picture.
             let shown = self
@@ -382,8 +389,9 @@ impl ClipStream {
     }
 }
 
-/// The index line of a decided instant (its still is marked later).
-fn line_of(instant: u64, decision: Decision) -> IndexLine {
+/// The index line of a decided instant, with its frame's cursor (its still
+/// is marked later).
+fn line_of(instant: u64, decision: Decision, cursor: Option<(i32, i32)>) -> IndexLine {
     let mut line = IndexLine {
         instant,
         t_ms: instant * MS_PER_SECOND / u64::from(RECORD_FPS),
@@ -392,6 +400,7 @@ fn line_of(instant: u64, decision: Decision) -> IndexLine {
         lost: None,
         still: None,
         still_of: None,
+        cursor,
     };
     match decision {
         Decision::Enc(place) => line.enc = Some(place),

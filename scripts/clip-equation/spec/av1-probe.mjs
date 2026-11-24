@@ -151,6 +151,24 @@ function nothingLostSilently(scene) {
   return { note: `lost=${lost.length}${causes.length ? ` (${firstOf(causes)})` : ''}` };
 }
 
+/**
+ * Every instant that had a frame logs that frame's cursor in its own index line. exp-av1 hands the
+ * product the cursor [k mod 300, k mod 200] (frame pixels) with the picture of instant k, as the
+ * recorder hands the cursor sampled with the frame; an instant the corpus marks lost has no frame
+ * (a failed capture) and no cursor.
+ */
+function cursorLogged(scene) {
+  const expected = k => [k % 300, k % 200];
+  const bad = [];
+  for (const line of scene.lines) {
+    const framed = line.lost !== 'capture_failed';
+    if (framed && JSON.stringify(line.cursor) !== JSON.stringify(expected(line.instant))) bad.push(`instant ${line.instant}: cursor ${JSON.stringify(line.cursor)}, expected ${JSON.stringify(expected(line.instant))}`);
+    else if (!framed && line.cursor !== undefined) bad.push(`instant ${line.instant}: a failed capture logs cursor ${JSON.stringify(line.cursor)}`);
+  }
+  if (bad.length) return { problem: `${bad.length} lines: ${firstOf(bad)}` };
+  return { note: `${scene.lines.length} lines, each framed instant logs its cursor` };
+}
+
 /** Decodes every picture of one part: { codec, pictures } or { error }. */
 function decodePart(file) {
   const run = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0',
@@ -722,6 +740,7 @@ const table = {
   'read-back': () => judge(readBack),
   'a resized window keeps recording': () => judge(resizeKeepsRecording),
   'a picture after a lost instant is recorded again': () => judge(recordedAgainAfterLoss),
+  'each instant logs the cursor of its frame': () => judge(cursorLogged),
   'a torn last part does not stop recovery': tornLastPart,
   'recovery keeps a complete still': stillSurvivesRecovery,
   'a lost line names no missing still': () => lostLineNamesNoMissingStill('crash-still-and-video-gone', false),

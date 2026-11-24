@@ -585,6 +585,12 @@ pub struct ClipViewImage {
     pub path: String,
     pub width: u32,
     pub height: u32,
+    /// The cursor at `frame`, in recorded pixels `[x, y]` from the top-left
+    /// of the whole recorded picture (not of a crop or a scaled view; it can
+    /// lie outside the picture). Not drawn in the picture. Absent when it was
+    /// not logged (older clips, or Windows did not report it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<[i32; 2]>,
 }
 
 /// An asked-for instant that holds no recorded picture.

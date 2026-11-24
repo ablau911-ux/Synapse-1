@@ -161,9 +161,10 @@ pub struct ObservedFrame {
     pub width: u32,
     pub height: u32,
     pub dirty: Option<Rect>,
-    /// The cursor's screen position, read when the handler took the frame,
-    /// so a logged position belongs to this composition (E9, C15); `None`
-    /// when Windows does not report it.
+    /// The cursor in this frame's pixels (`frame_cursor`): its screen
+    /// position and the frame's top-left, both read when the handler took
+    /// the frame, so the position belongs to this composition (E9, C15);
+    /// `None` when Windows does not report either one.
     pub cursor: Option<(i32, i32)>,
 }
 
@@ -239,6 +240,16 @@ fn cursor_position() -> Option<(i32, i32)> {
     // SAFETY: one out-parameter.
     unsafe { GetCursorPos(&raw mut point) }.ok()?;
     Some((point.x, point.y))
+}
+
+/// The cursor in the pixels of the frame `source` delivers now: its screen
+/// position minus the frame's top-left (`ClipSource::origin`), both read in
+/// this call, never an origin read at another time (#292). `None` when
+/// Windows does not report either one.
+fn frame_cursor(source: ClipSource) -> Option<(i32, i32)> {
+    let (x, y) = cursor_position()?;
+    let (left, top) = source.origin()?;
+    Some((x.saturating_sub(left), y.saturating_sub(top)))
 }
 
 fn filetime_hns(time: FILETIME) -> i64 {
@@ -523,6 +534,8 @@ unsafe impl Sync for Gpu {}
 
 /// What the handler and the reader share.
 pub struct Shared {
+    /// The captured window or monitor, for the frame's top-left (`frame_cursor`).
+    source: ClipSource,
     table: Mutex<SlotTable>,
     gpu: OnceLock<Gpu>,
     dirty_regions: bool,
@@ -584,7 +597,7 @@ impl GraphicsCaptureApiHandler for ClipFrameHandler {
             } else {
                 None
             },
-            cursor: cursor_position(),
+            cursor: frame_cursor(self.shared.source),
         };
         {
             // The table stays locked while the copy is issued, so the reader
@@ -667,6 +680,7 @@ impl ClipObserver {
         }
         let settings = ObserverSettings::supported();
         let shared = Arc::new(Shared {
+            source,
             table: Mutex::new(SlotTable::new(instant_hns.max(1))),
             gpu: OnceLock::new(),
             dirty_regions: settings.dirty_regions,

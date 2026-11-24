@@ -15,6 +15,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: scene whose window size changes: lost=0; the first instant at a new size is enc [part,0] of a new part; the last encoded instant of each size comes back from the product decoder at that size | Known: true
   Scenario: a picture after a lost instant is recorded again
     # Equation: every scene: the first instant with a picture after a lost instant is enc, never same; it and a later same instant come back from the product decoder as pictures | Known: true
+  Scenario: each instant logs the cursor of its frame
+    # Equation: every scene, exp-av1 hands the product cursor [k mod 300, k mod 200] with the picture of instant k: every index line except a failed capture has cursor = [k mod 300, k mod 200]; a failed capture's line has no cursor | Known: true
   Scenario: a torn last part does not stop recovery
     # Equation: killed real-page recording, last part cut to 10 bytes: product recovery succeeds; every picture of the earlier parts stays enc and comes back as video; every picture of the torn part is named lost | Known: true
   Scenario: recovery keeps a complete still

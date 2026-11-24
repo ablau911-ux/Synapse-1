@@ -991,6 +991,7 @@ mod live {
                         width: pixels.width,
                         height: pixels.height,
                     },
+                    frame.cursor,
                 )
                 .map_err(internal_error)?;
             self.disk.wrote(written.bytes);
@@ -1139,18 +1140,18 @@ mod live {
                 Some(frame) if !overflowed => frame,
                 _ => {
                     self.last_composed = None;
-                    return self.feed(k, StreamInput::Lost(LOST_SLOT_OVERFLOW));
+                    return self.feed(k, StreamInput::Lost(LOST_SLOT_OVERFLOW), None);
                 }
             };
             if self.last_composed == Some(frame.composed_hns) {
-                return self.feed(k, StreamInput::Unchanged);
+                return self.feed(k, StreamInput::Unchanged, frame.cursor);
             }
             let pixels = match self.observer.read_back(&frame) {
                 Ok(pixels) => pixels,
                 Err(error) => {
                     tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
                     self.last_composed = None;
-                    self.feed(k, StreamInput::Lost(LOST_CAPTURE_FAILED))?;
+                    self.feed(k, StreamInput::Lost(LOST_CAPTURE_FAILED), frame.cursor)?;
                     return Err(StopReason::CaptureFailed);
                 }
             };
@@ -1161,15 +1162,22 @@ mod live {
                     width: pixels.width,
                     height: pixels.height,
                 },
+                frame.cursor,
             )?;
             self.last_composed = Some(frame.composed_hns);
             Ok(())
         }
 
-        /// Hands instant k to the stream; a closed video part is published
-        /// in `clip.json` at once.
-        fn feed(&mut self, k: u64, input: StreamInput) -> Result<(), StopReason> {
-            let written = self.stream.instant(k, input).map_err(|error| {
+        /// Hands instant k to the stream, with the cursor sampled with its
+        /// frame (`ObservedFrame::cursor`; `None` without a frame); a closed
+        /// video part is published in `clip.json` at once.
+        fn feed(
+            &mut self,
+            k: u64,
+            input: StreamInput,
+            cursor: Option<(i32, i32)>,
+        ) -> Result<(), StopReason> {
+            let written = self.stream.instant(k, input, cursor).map_err(|error| {
                 tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", instant = k, error = %error);
                 StopReason::WriteFailed
             })?;

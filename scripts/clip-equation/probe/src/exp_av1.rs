@@ -73,6 +73,14 @@ struct Replayed {
     size: (u32, u32),
 }
 
+/// The cursor handed over with the picture of instant k: [k mod 300, k mod 200] (frame
+/// pixels). The corpus holds no cursor; a known one lets the bench check that each instant's
+/// line logs the cursor handed with its frame.
+fn replay_cursor(instant: u64) -> (i32, i32) {
+    let at = |modulus: u64| i32::try_from(instant % modulus).unwrap_or(0);
+    (at(300), at(200))
+}
+
 /// Replays a corpus scene: the picture of instant k is handed over at start + k instants.
 fn replay(corpus: &mut Corpus, stream: &mut ClipStream, started_hns: i64) -> Result<Replayed> {
     let mut source = Spent::default();
@@ -85,7 +93,7 @@ fn replay(corpus: &mut Corpus, stream: &mut ClipStream, started_hns: i64) -> Res
         if corpus.lines[index].lost {
             // A failed capture: no picture is read, the product names the loss.
             let instant = corpus.lines[index].instant;
-            stream.instant(instant, StreamInput::Lost(LOST_CAPTURE_FAILED))?;
+            stream.instant(instant, StreamInput::Lost(LOST_CAPTURE_FAILED), None)?;
             continue;
         }
         source.time(|| -> Result<()> {
@@ -105,7 +113,7 @@ fn replay(corpus: &mut Corpus, stream: &mut ClipStream, started_hns: i64) -> Res
             width: line.width,
             height: line.height,
         };
-        stream.instant(line.instant, input)?;
+        stream.instant(line.instant, input, Some(replay_cursor(line.instant)))?;
         if first_encoded_ms.is_none() {
             first_encoded_ms = Some((clock::now_hns() - started_hns) as f64 / HNS_PER_MS_F64);
             size = (line.width, line.height);

@@ -215,6 +215,7 @@ impl ClipRecovery {
             lost: Some(cause.to_owned()),
             still: None,
             still_of: None,
+            cursor: None,
         };
         let mut lines: Vec<IndexLine> = Vec::with_capacity(read.len());
         for (expected, line) in (0_u64..).zip(read) {

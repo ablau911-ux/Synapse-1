@@ -12406,14 +12406,22 @@ fn ssh_family_client_for_executable(command: &str) -> Option<&'static str> {
 }
 
 fn shell_spawn_command(command: &str) -> Cow<'_, str> {
-    #[cfg(windows)]
-    if let Some(resolved) = resolve_windows_ssh_family_spawn_command(command) {
+    let spawn_command = shell_spawn_program(command);
+    if let Cow::Owned(resolved) = &spawn_command {
         tracing::info!(
             code = "M4_ACT_RUN_SHELL_SSH_CLIENT_RESOLVED",
             requested_command = command,
             resolved_command = %resolved,
             "resolved bare Windows SSH-family command to Git-bundled executable"
         );
+    }
+    spawn_command
+}
+
+/// The program a shell child is spawned with, without logging.
+fn shell_spawn_program(command: &str) -> Cow<'_, str> {
+    #[cfg(windows)]
+    if let Some(resolved) = resolve_windows_ssh_family_spawn_command(command) {
         return Cow::Owned(resolved);
     }
     Cow::Borrowed(command)
@@ -15653,8 +15661,8 @@ fn spawn_shell_job_child(
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, SpawnShellJobChildFailure> {
     let spawn_command = shell_spawn_command(&spawn_plan.command);
-    let mut command = TokioCommand::new(spawn_command.as_ref());
-    command.args(&spawn_plan.args);
+    let child_command = shell_child_command(spawn_command.as_ref(), &spawn_plan.args);
+    let mut command = TokioCommand::from(child_command);
     if let Some(working_dir) = &params.working_dir {
         command.current_dir(working_dir);
     }
@@ -19149,8 +19157,8 @@ fn spawn_shell_child(
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, ErrorData> {
     let spawn_command = shell_spawn_command(&params.command);
-    let mut command = TokioCommand::new(spawn_command.as_ref());
-    command.args(&params.args);
+    let child_command = shell_child_command(spawn_command.as_ref(), &params.args);
+    let mut command = TokioCommand::from(child_command);
     if let Some(working_dir) = &params.working_dir {
         command.current_dir(working_dir);
     }
@@ -19888,8 +19896,51 @@ fn default_shell_command_metadata_policy() -> String {
     "legacy_raw".to_owned()
 }
 
+/// The command line a shell child gets: Rust std writes the program name in
+/// quotes and `shell_child_command` appends each argument as
+/// `quote_command_part` renders it. The policy line (`shell_command_line`)
+/// keeps the program unquoted so allowlist patterns stay as written.
+fn shell_spawned_command_line(command: &str, args: &[String]) -> String {
+    std::iter::once(shell_spawned_program_part(command))
+        .chain(args.iter().map(|arg| quote_command_part(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_spawned_program_part(command: &str) -> String {
+    format!("\"{}\"", shell_spawn_program(command))
+}
+
+/// Builds the child command with the arguments in the form the record shows.
+/// On Windows each argument goes in pre-quoted through `raw_arg`, so the line
+/// the child gets and `shell_spawned_command_line` come from the same
+/// `quote_command_part`. Batch files keep std's own argument handling: std
+/// rewrites them into a `cmd.exe /c` line and refuses unsafe batch arguments,
+/// which `raw_arg` would bypass.
+fn shell_child_command(program: &str, args: &[String]) -> StdCommand {
+    let mut command = StdCommand::new(program);
+    #[cfg(windows)]
+    if !is_windows_batch_program(program) {
+        use std::os::windows::process::CommandExt;
+        for arg in args {
+            command.raw_arg(quote_command_part(arg));
+        }
+        return command;
+    }
+    command.args(args);
+    command
+}
+
+/// Rust std treats a program whose name ends in `.bat` or `.cmd` (any case) as
+/// a batch file and launches it through `cmd.exe`.
+#[cfg(windows)]
+fn is_windows_batch_program(program: &str) -> bool {
+    let lower = program.to_ascii_lowercase();
+    lower.ends_with(".bat") || lower.ends_with(".cmd")
+}
+
 fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadata {
-    let raw_command_line = shell_command_line_from_parts(command, args);
+    let raw_command_line = shell_spawned_command_line(command, args);
     let args_sha256 = shell_args_sha256(args);
     let command_line_sha256 = sha256_hex(raw_command_line.as_bytes());
     let args_original_bytes = args.iter().map(|arg| arg.len()).sum();
@@ -19912,14 +19963,14 @@ fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadat
         display_args.push(display);
     }
 
-    let mut display_command_line = shell_command_line_from_parts(command, &display_args);
+    let mut display_command_line = shell_spawned_command_line(command, &display_args);
     let mut command_line_redacted =
         args_redacted || raw_command_line.len() > SHELL_COMMAND_LINE_DISPLAY_MAX_BYTES;
     if display_command_line.len() > SHELL_COMMAND_LINE_DISPLAY_MAX_BYTES {
         command_line_redacted = true;
         display_command_line = format!(
             "{} [redacted-command-line:sha256={command_line_sha256}:bytes={}:args={}]",
-            quote_command_part(command),
+            shell_spawned_program_part(command),
             raw_command_line.len(),
             args.len()
         );
@@ -20110,15 +20161,33 @@ fn win32_long_path_name(target: &str) -> anyhow::Result<String> {
     Ok(OsString::from_wide(&buffer).to_string_lossy().into_owned())
 }
 
+/// Quotes one argument by the Microsoft C runtime rules, exactly as Rust std's
+/// Windows `append_arg` does: quote when the argument is empty or contains a
+/// space or tab, write `"` as `\"`, and double the backslashes that precede a
+/// `"` or the closing quote.
 fn quote_command_part(part: &str) -> String {
-    if part.is_empty() {
-        return "\"\"".to_owned();
+    let quote = part.is_empty() || part.contains([' ', '\t']);
+    let mut quoted = String::with_capacity(part.len() + 2);
+    if quote {
+        quoted.push('"');
     }
-    if !part.chars().any(|ch| ch.is_whitespace() || ch == '"') {
-        return part.to_owned();
+    let mut backslashes = 0usize;
+    for ch in part.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else {
+            if ch == '"' {
+                quoted.push_str(&"\\".repeat(backslashes + 1));
+            }
+            backslashes = 0;
+        }
+        quoted.push(ch);
     }
-    let escaped = part.replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    if quote {
+        quoted.push_str(&"\\".repeat(backslashes));
+        quoted.push('"');
+    }
+    quoted
 }
 
 fn posix_single_quote(value: &str) -> String {

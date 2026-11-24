@@ -219,6 +219,12 @@ pub(super) async fn release_held_inputs_on_delete(
         );
         return session_invalid_for(SessionFailure::UnknownOrExpired, Some(session_id));
     }
+    // #277: a session the lifecycle already terminated (e.g. by adoption) can
+    // still be open in rmcp's session manager. Its DELETE still closes it, but
+    // answers like every other DELETE of a terminated session.
+    let already_terminated = cleanup_session_id
+        .as_deref()
+        .is_some_and(|session_id| state.lifecycle.is_session_terminated(session_id));
     let response = next.run(request).await;
     let Some(session_id) = cleanup_session_id else {
         return response;
@@ -239,7 +245,11 @@ pub(super) async fn release_held_inputs_on_delete(
                 report = ?report,
                 "readback=session_lifecycle edge=http_delete after_cleanup"
             );
-            response
+            if already_terminated {
+                StatusCode::OK.into_response()
+            } else {
+                response
+            }
         }
         Err(error) => {
             tracing::error!(

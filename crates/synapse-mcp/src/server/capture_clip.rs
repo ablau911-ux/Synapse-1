@@ -621,7 +621,7 @@ fn thread_failed(detail: String) -> ErrorData {
 
 #[cfg(windows)]
 mod live {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
@@ -665,16 +665,20 @@ mod live {
     /// One clip. Sends the start result as soon as `clip.json` and instant
     /// zero are written.
     pub(super) fn record(plan: &ClipPlan, control: &RecordingControl, started: StartSender) {
-        if let Err(error) = create_clip_folder(plan) {
-            // Nothing of this recording exists: nothing is removed.
-            let _ = started.send(Err(error));
-            return;
-        }
+        let first_created = match create_clip_folder(plan) {
+            Ok(first_created) => first_created,
+            Err(error) => {
+                // Nothing of this recording exists: `create_clip_folder`
+                // removed what it created.
+                let _ = started.send(Err(error));
+                return;
+            }
+        };
         let mut recording = match Recording::start(plan) {
             Ok(recording) => recording,
             Err(error) => {
                 control.seal();
-                discard_folder(plan);
+                discard_folder(plan, &first_created);
                 let _ = started.send(Err(error));
                 return;
             }
@@ -704,8 +708,11 @@ mod live {
     /// exists, so an old Windows leaves nothing behind, then creates the clip
     /// folder exclusively: a folder that exists by now (another process made
     /// it after the plan's check) is refused, never taken over, so a failed
-    /// start removes only a folder this recording created.
-    fn create_clip_folder(plan: &ClipPlan) -> Result<(), ErrorData> {
+    /// start removes only a folder this recording created. Returns the first
+    /// folder this start created: the highest missing parent, or the clip
+    /// folder itself; when creating fails, the parents it created are
+    /// removed again.
+    fn create_clip_folder(plan: &ClipPlan) -> Result<PathBuf, ErrorData> {
         synapse_capture::check_windows_build().map_err(|error| {
             mcp_error(
                 error.code(),
@@ -715,15 +722,36 @@ mod live {
         let could_not_create = |path: &Path, error: std::io::Error| {
             internal_error(format!("could not create {}: {error}", path.display()))
         };
-        if let Some(parent) = plan.folder.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| could_not_create(parent, error))?;
+        let first_created = plan
+            .folder
+            .ancestors()
+            .take_while(|path| !path.exists())
+            .last()
+            .unwrap_or(&plan.folder)
+            .to_path_buf();
+        let created = plan
+            .folder
+            .parent()
+            .map_or(Ok(()), |parent| {
+                std::fs::create_dir_all(parent).map_err(|error| could_not_create(parent, error))
+            })
+            .and_then(|()| {
+                std::fs::create_dir(&plan.folder)
+                    .map_err(|error| could_not_create(&plan.folder, error))
+            });
+        match created {
+            Ok(()) => Ok(first_created),
+            Err(error) => {
+                remove_created_parents(&plan.folder, &first_created);
+                Err(error)
+            }
         }
-        std::fs::create_dir(&plan.folder).map_err(|error| could_not_create(&plan.folder, error))
     }
 
-    /// Removes the clip folder this recording created (`create_clip_folder`)
-    /// and its registry entry, after a start that failed before its first picture.
-    fn discard_folder(plan: &ClipPlan) {
+    /// Removes the clip folder this recording created (`create_clip_folder`),
+    /// the parents it created up to `first_created`, and its registry entry,
+    /// after a start that failed before its first picture.
+    fn discard_folder(plan: &ClipPlan, first_created: &Path) {
         match std::fs::remove_dir_all(&plan.folder) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -733,8 +761,34 @@ mod live {
                 error = %error
             ),
         }
+        remove_created_parents(&plan.folder, first_created);
         if let Err(error) = ClipRegistry::remove(&plan.clip_id) {
             tracing::warn!(code = "CAPTURE_CLIP_DISCARD_FAILED", error = %error);
+        }
+    }
+
+    /// Removes the parents of `folder` that a start created, from the
+    /// nearest up to `first_created`; each only while it is empty, so
+    /// anything else put there (the clip registry, another process's files)
+    /// stays.
+    fn remove_created_parents(folder: &Path, first_created: &Path) {
+        for parent in folder
+            .ancestors()
+            .skip(1)
+            .take_while(|parent| parent.starts_with(first_created))
+        {
+            match std::fs::remove_dir(parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => return,
+                Err(error) => {
+                    tracing::warn!(
+                        code = "CAPTURE_CLIP_DISCARD_FAILED",
+                        folder = %parent.display(),
+                        error = %error
+                    );
+                    return;
+                }
+            }
         }
     }
 

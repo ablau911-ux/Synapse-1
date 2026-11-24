@@ -689,8 +689,18 @@ mod live {
                 return;
             }
         };
-        let mut recording = match Recording::start(plan) {
-            Ok(recording) => recording,
+        // A start the caller is told failed leaves nothing behind: every
+        // failure before the start response is sent (instant zero, or the
+        // response itself) seals the end, releases the recording and
+        // discards what this start made.
+        let mut recording = match Recording::start(plan).and_then(|recording| {
+            let response = recording.response()?;
+            Ok((recording, response))
+        }) {
+            Ok((recording, response)) => {
+                let _ = started.send(Ok(response));
+                recording
+            }
             Err(error) => {
                 control.seal();
                 discard_folder(plan, &first_created, root_first_created.as_deref());
@@ -698,17 +708,6 @@ mod live {
                 return;
             }
         };
-        match recording.response() {
-            Ok(response) => {
-                let _ = started.send(Ok(response));
-            }
-            Err(error) => {
-                let _ = started.send(Err(error));
-                control.seal();
-                recording.finish(StopReason::WriteFailed);
-                return;
-            }
-        }
         // Every way the recorder ends sealed the end where it was decided,
         // before the flush: a stop call in `request_stop`, `Completed` in
         // `ends_at`, a failed read-back in `handle_instant`, any other

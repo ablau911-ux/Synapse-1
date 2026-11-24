@@ -12192,6 +12192,25 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
             }),
         )
     })?;
+    if job.job_id != job_id && job.job_id.eq_ignore_ascii_case(job_id) {
+        // Job ids are exact; a case-insensitive store (Windows) resolves a
+        // case variant to the directory of another job. That is an unknown
+        // job for this id, not a corrupt store (#265).
+        return Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_run_shell job {job_id} was not found; job ids are case-sensitive and job {} exists",
+                job.job_id
+            ),
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "job_id": job_id,
+                "persisted_job_id": job.job_id,
+                "path": path,
+                "reason": "job_not_found",
+            }),
+        ));
+    }
     if job.job_id != job_id {
         return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,

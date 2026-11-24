@@ -19,6 +19,8 @@
 //!                            (clip_stream.rs): out=<dir> folder=<corpus scene>
 //!   clip-probe exp-av1-fetch fetches one instant's picture through the product's decoder:
 //!                            folder=<clip folder> instant=<k> [png=<file>]
+//!   clip-probe exp-av1-recover runs the product's recovery on a clip folder in place:
+//!                            folder=<clip folder>
 //!
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.
@@ -36,6 +38,9 @@ mod clip_encoder;
 #[path = "../../../../crates/synapse-mcp/src/server/clip_folder.rs"]
 mod clip_folder;
 #[allow(dead_code)]
+#[path = "../../../../crates/synapse-mcp/src/server/clip_recovery.rs"]
+mod clip_recovery;
+#[allow(dead_code)]
 #[path = "../../../../crates/synapse-mcp/src/server/clip_stream.rs"]
 mod clip_stream;
 mod clock;
@@ -46,6 +51,7 @@ mod encoder;
 mod exp_corpus;
 mod exp_av1;
 mod exp_av1_fetch;
+mod exp_av1_recover;
 mod exp_cpu;
 mod exp_d;
 mod exp_dyn;
@@ -108,8 +114,9 @@ fn main() {
         "exp-rate" => exp_meter::run_rate(),
         "exp-av1" => exp_av1::run(),
         "exp-av1-fetch" => exp_av1_fetch::run(),
+        "exp-av1-recover" => exp_av1_recover::run(),
         _ => Err(format!(
-            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus, exp-z, exp-d, exp-rate, exp-av1 or exp-av1-fetch"
+            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus, exp-z, exp-d, exp-rate, exp-av1, exp-av1-fetch or exp-av1-recover"
         )),
     };
     if let Err(error) = outcome {

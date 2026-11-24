@@ -15,10 +15,18 @@ pub(crate) struct CorpusLine {
     pub(crate) instant: u64,
     #[serde(default)]
     t_ms: u64,
+    #[serde(default)]
     new: bool,
+    #[serde(default)]
     frame: u32,
+    #[serde(default)]
     pub(crate) width: u32,
+    #[serde(default)]
     pub(crate) height: u32,
+    /// `true`: no picture is known for this instant (a failed capture); the
+    /// line names no frame to read.
+    #[serde(default)]
+    pub(crate) lost: bool,
 }
 
 pub(crate) struct Corpus {

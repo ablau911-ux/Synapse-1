@@ -3,6 +3,7 @@
 //! fix proven on this bench is the fix the app runs (docs/research/window-recording/probe-plan.md).
 //!
 //!   clip-probe exp-av1 out=<dir> folder=<corpus scene>       replay a corpus scene in real time
+//!   a corpus line with `"lost": true` is handed over as a failed capture (`capture_failed`)
 //!   accepted for the old command line, only at the product's values:
 //!   quality=35, key=200, settle=10
 //!
@@ -19,6 +20,7 @@ use serde_json::json;
 
 use crate::Result;
 use crate::clip_encoder::{AV1_QUALITY, KEY_INSTANTS};
+use crate::clip_folder::LOST_CAPTURE_FAILED;
 use crate::clip_stream::{ClipStream, SETTLE_INSTANTS, StageTime, StreamInput, StreamSummary};
 use crate::clock::{self, HNS_PER_MS};
 use crate::exp_cpu::Spent;
@@ -79,6 +81,12 @@ fn replay(corpus: &mut Corpus, stream: &mut ClipStream, started_hns: i64) -> Res
     for index in 0..corpus.lines.len() {
         let due = i64::try_from(index).map_err(|_| "corpus too long")? * INSTANT_HNS;
         clock::sleep_until(started_hns + due);
+        if corpus.lines[index].lost {
+            // A failed capture: no picture is read, the product names the loss.
+            let instant = corpus.lines[index].instant;
+            stream.instant(instant, StreamInput::Lost(LOST_CAPTURE_FAILED))?;
+            continue;
+        }
         source.time(|| -> Result<()> {
             corpus.load(index)?;
             bgra.clear();

@@ -20,7 +20,7 @@ const ROOT = options.root || JSON.parse(fs.readFileSync(path.join(BASE, 'corpus/
 const OUT = path.resolve(options.out || path.join(BASE, '../../.runs/av1-probe'));
 const PROBE = path.resolve(options.probe || path.join(BASE, 'probe/target/release/clip-probe.exe'));
 // `scenes=a,b,c` runs other corpus scenes (for example the small and odd-sized ones) through the same checks.
-const SCENES = options.scenes ? options.scenes.split(',') : ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080', 'resize-640x360-to-506x333'];
+const SCENES = options.scenes ? options.scenes.split(',') : ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080', 'resize-640x360-to-506x333', 'lost-then-same-640x360'];
 // A clip the product recorded on a real page (1904x1012, 40 s, parts of 200 pictures); the fetch checks read it.
 const FETCH_CLIP = path.join(ROOT, 'recorded-real-page');
 const FETCH_GOLDEN = path.join(FETCH_CLIP, 'fetch-reference.json');
@@ -76,13 +76,16 @@ class Scene {
     return this.hashes.get(frame);
   }
 
-  /** True when instant k shows a different picture than instant k-1; instant 0 counts as a change. */
-  changed(k) { return k === 0 || this.pictureHash(k) !== this.pictureHash(k - 1); }
+  /** True when instant k shows a different picture than instant k-1; instant 0 and the instant after a lost one count as a change. */
+  changed(k) { return k === 0 || this.lostInCorpus(k - 1) || this.pictureHash(k) !== this.pictureHash(k - 1); }
+
+  /** True when the corpus says this instant's capture failed: the recorder is given no picture for it. */
+  lostInCorpus(k) { return this.corpus[k].lost === true; }
 
   /** How many instants directly after k show the same picture as k. */
   unchangedAfter(k) {
     let n = 0;
-    while (k + 1 + n < this.instants && this.pictureHash(k + 1 + n) === this.pictureHash(k)) n += 1;
+    while (k + 1 + n < this.instants && !this.lostInCorpus(k + 1 + n) && this.pictureHash(k + 1 + n) === this.pictureHash(k)) n += 1;
     return n;
   }
 
@@ -229,7 +232,7 @@ function stillOnSettle(scene) {
   const wrong = [], stored = new Map(); // pixel hash -> instant of the still file that holds it
   scene.corpus.forEach((row, k) => {
     const line = scene.lines[k] ?? {};
-    const expected = scene.changed(k) && scene.unchangedAfter(k) >= SETTLE_INSTANTS - 1;
+    const expected = !scene.lostInCorpus(k) && scene.changed(k) && scene.unchangedAfter(k) >= SETTLE_INSTANTS - 1;
     const marked = line.still === true || line.still_of != null;
     if (line.still === true && line.still_of != null) wrong.push(`${k} has both still and still_of`);
     else if (marked !== expected) wrong.push(`${k}${expected ? ' missing' : ' extra'}`);
@@ -250,6 +253,7 @@ function unchangedCostsNothing(scene) {
   const wrong = [];
   scene.lines.forEach((line, k) => {
     const kind = kindOf(line);
+    if (scene.lostInCorpus(k)) { if (kind !== 'lost') wrong.push(`${k} is ${kind}, the corpus has no picture for it`); return; }
     if (k === 0) { if (kind !== 'enc') wrong.push(`0 is ${kind}`); return; }
     const unchanged = !scene.changed(k);
     if ((kind === 'same') !== unchanged) wrong.push(`${k} is ${kind}, corpus ${unchanged ? 'unchanged' : 'changed'}`);
@@ -304,6 +308,102 @@ function resizeKeepsRecording(scene) {
   }
   if (bad.length) return { problem: firstOf(bad) };
   return { note: `${resizes.length} size changes at instants ${resizes.join(', ')}: 0 lost, each starts a new part, pictures come back at their own size` };
+}
+
+/** After a lost instant the next picture is recorded again, never written as 'same' (a 'same' line would resolve back to the loss). */
+function recordedAgainAfterLoss(scene) {
+  const after = scene.lines.filter((line, k) => k > 0 && kindOf(scene.lines[k - 1]) === 'lost' && kindOf(line) !== 'lost');
+  if (!after.length) return { note: 'no lost instant in this scene' };
+  const bad = [];
+  for (const line of after) {
+    if (kindOf(line) !== 'enc') { bad.push(`instant ${line.instant} follows a lost instant and is ${kindOf(line)}`); continue; }
+    const got = fetchPicture(scene.out, line.instant);
+    if (got.error) bad.push(`fetch of instant ${line.instant}: ${got.error}`);
+    else if (got.kind === 'lost') bad.push(`instant ${line.instant} comes back as lost`);
+  }
+  // an unchanged instant later in the same run must come back as a picture too
+  const later = scene.lines.find((line, k) => kindOf(line) === 'same' && scene.lines.slice(0, k).some(l => kindOf(l) === 'lost'));
+  if (later) {
+    const got = fetchPicture(scene.out, later.instant);
+    if (got.error || got.kind === 'lost') bad.push(`instant ${later.instant} (same, after a loss) comes back as ${got.error ?? 'lost'}`);
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  return { note: `${after.length} instants after a loss are recorded again and come back as pictures` };
+}
+
+/** A copy of a killed recording, changed by `damage(dir)`, then recovered by the product: { dir, result, before, lines } or { error }. */
+function recovered(fixture, name, damage) {
+  const source = path.join(ROOT, fixture);
+  if (!fs.existsSync(path.join(source, 'clip.json'))) return { error: `no killed recording at ${source}` };
+  const dir = path.join(OUT, name);
+  if (fs.existsSync(dir)) return { error: `output folder exists: ${dir}` };
+  fs.cpSync(source, dir, { recursive: true });
+  const before = readJsonl(path.join(dir, 'frames.jsonl'));
+  damage(dir);
+  const run = spawnSync(PROBE, ['exp-av1-recover', `folder=${dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
+  let result;
+  try { result = JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
+  if (!result.ok) return { error: `recovery failed: ${result.error}` };
+  return { dir, result, before, lines: readJsonl(path.join(dir, 'frames.jsonl')) };
+}
+const lastPart = dir => path.join(dir, 'video', fs.readdirSync(path.join(dir, 'video')).filter(f => /^part-\d+\.ivf$/.test(f)).sort().at(-1));
+const verdict = (problems, note) => ({ pass: problems.length === 0, value: '-', measured: problems.length ? problems.join('; ') : note });
+
+/** The recorder died while writing the first bytes of a new part: the earlier parts must stay readable. */
+function tornLastPart() {
+  const TORN_BYTES = 10; // less than the 32-byte IVF header
+  let torn;
+  const got = recovered('killed-real-page', 'crash-torn-part', dir => {
+    torn = Number(path.basename(lastPart(dir)).match(/\d+/)[0]);
+    fs.truncateSync(lastPart(dir), TORN_BYTES);
+  });
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  const earlier = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] < torn);
+  const stillEnc = earlier.filter(line => kindOf(got.lines[line.instant] ?? {}) === 'enc').length;
+  if (stillEnc !== earlier.length) problems.push(`${earlier.length - stillEnc} of ${earlier.length} pictures of the earlier parts are no longer in the index`);
+  const fromTorn = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] === torn);
+  const unnamed = fromTorn.filter(line => { const now = got.lines[line.instant] ?? {}; return kindOf(now) !== 'lost' || !String(now.lost).trim(); }).length;
+  if (unnamed) problems.push(`${unnamed} of ${fromTorn.length} pictures of the torn part are not named lost`);
+  const sample = earlier.at(-1);
+  const fetched = fetchPicture(got.dir, sample.instant);
+  if (fetched.error || fetched.kind !== 'video') problems.push(`instant ${sample.instant} of an earlier part comes back as ${fetched.error ?? fetched.kind}`);
+  return verdict(problems, `part ${torn} torn to ${TORN_BYTES} bytes: recovery succeeded, ${earlier.length} earlier pictures kept, ${fromTorn.length} named lost, instant ${sample.instant} comes back as video`);
+}
+
+/** The still reached disk but the video picture of its instant did not: the still must survive and be the answer. */
+function stillSurvivesRecovery() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  const got = recovered('killed-text-page', 'crash-still-without-video', dir => fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES));
+  if (got.error) return verdict([got.error]);
+  const still = got.before.find(line => line.still === true);
+  if (!still) return verdict(['the killed recording has no still']);
+  const problems = [];
+  if (!got.result.stills_on_disk.includes(still.instant)) problems.push(`still of instant ${still.instant} was deleted`);
+  const next = got.before[still.instant + 1];
+  for (const instant of [still.instant, ...(next && kindOf(next) === 'same' ? [next.instant] : [])]) {
+    const fetched = fetchPicture(got.dir, instant);
+    if (fetched.error || fetched.kind !== 'exact still') problems.push(`instant ${instant} comes back as ${fetched.error ?? fetched.kind}, not the exact still`);
+  }
+  return verdict(problems, `video pictures gone, still of instant ${still.instant} kept and returned as exact still`);
+}
+
+/** A planned length off the 50 ms grid: every planned instant has an index line after recovery. */
+function recoveryNamesEveryInstant() {
+  const OFF_GRID_MS = 25;
+  let planned;
+  const got = recovered('killed-text-page', 'crash-off-grid', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.end_ms = readJsonl(path.join(dir, 'frames.jsonl')).length * INSTANT_MS + OFF_GRID_MS;
+    planned = Math.ceil(clip.end_ms / INSTANT_MS);
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  if (got.lines.length !== planned) problems.push(`${got.lines.length} index lines after recovery, ${planned} instants were planned (end_ms ${OFF_GRID_MS} ms off the grid)`);
+  else if (kindOf(got.lines.at(-1)) !== 'lost') problems.push(`the last planned instant is ${kindOf(got.lines.at(-1))}, not named lost`);
+  return verdict(problems, `${planned} planned instants, ${got.lines.length} index lines, the last one named lost`);
 }
 
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
@@ -385,6 +485,10 @@ const table = {
   'unchanged instants cost nothing': () => judge(unchangedCostsNothing),
   'read-back': () => judge(readBack),
   'a resized window keeps recording': () => judge(resizeKeepsRecording),
+  'a picture after a lost instant is recorded again': () => judge(recordedAgainAfterLoss),
+  'a torn last part does not stop recovery': tornLastPart,
+  'recovery keeps a complete still': stillSurvivesRecovery,
+  'recovery names every planned instant': recoveryNamesEveryInstant,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

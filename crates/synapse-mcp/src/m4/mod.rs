@@ -2723,7 +2723,7 @@ pub fn shell_job_status(
     let diagnostics =
         shell_job_status_diagnostics(&job, running, stdout_len_bytes, stderr_len_bytes);
     job.diagnostics = Some(diagnostics);
-    let (job, running) =
+    let (job, running, stdout_len_bytes, stderr_len_bytes) =
         write_shell_job_status_readback(&paths, job, running, stdout_len_bytes, stderr_len_bytes)?;
     let stdout_tail = tail_file_lossy(&paths.stdout_path, tail_bytes)?;
     let stderr_tail = tail_file_lossy(&paths.stderr_path, tail_bytes)?;
@@ -2759,7 +2759,7 @@ fn write_shell_job_status_readback(
     candidate_running: bool,
     stdout_len_bytes: u64,
     stderr_len_bytes: u64,
-) -> Result<(ActRunShellJobStatus, bool), ErrorData> {
+) -> Result<(ActRunShellJobStatus, bool, u64, u64), ErrorData> {
     let candidate_status = candidate.status.clone();
     let candidate_exit_code = candidate.exit_code;
     let candidate_completed_at = candidate.completed_at.clone();
@@ -2768,9 +2768,15 @@ fn write_shell_job_status_readback(
         || persisted.exit_code != candidate_exit_code
         || persisted.completed_at != candidate_completed_at;
     if !terminal_won {
-        return Ok((persisted, candidate_running));
+        return Ok((persisted, candidate_running, stdout_len_bytes, stderr_len_bytes));
     }
 
+    // The lengths were measured while the job still looked live, so output
+    // written just before the process exited can be missing from them. A
+    // terminal record reports lengths measured after its terminal status was
+    // observed (#229).
+    let stdout_len_bytes = file_len(&paths.stdout_path, &persisted.job_id, "stdout")?;
+    let stderr_len_bytes = file_len(&paths.stderr_path, &persisted.job_id, "stderr")?;
     let persisted_running = shell_job_process_still_running(&persisted);
     persisted.diagnostics = Some(shell_job_status_diagnostics(
         &persisted,
@@ -2780,7 +2786,7 @@ fn write_shell_job_status_readback(
     ));
     let persisted = write_shell_job_reconciliation_status(paths, persisted)?;
     let running = shell_job_process_still_running(&persisted);
-    Ok((persisted, running))
+    Ok((persisted, running, stdout_len_bytes, stderr_len_bytes))
 }
 
 fn shell_job_process_still_running(job: &ActRunShellJobStatus) -> bool {

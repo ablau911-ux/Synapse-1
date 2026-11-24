@@ -1744,7 +1744,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "summary",
                 false,
                 false,
-                "RocksDB CF live-data estimates + exact row counts",
+                "RocksDB CF size estimates (live data + memtables) + estimated row counts",
                 None,
                 error_codes::STORAGE_READ_FAILED,
                 "repair storage initialization and read CF metadata again",

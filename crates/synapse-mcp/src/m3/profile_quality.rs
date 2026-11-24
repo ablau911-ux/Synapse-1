@@ -165,7 +165,10 @@ fn validate_params(params: &ProfileQualityRefreshParams) -> Result<(), ErrorData
     Ok(())
 }
 
-fn find_profile(runtime: &ProfileRuntime, profile_id: &str) -> Result<ProfileStatus, ErrorData> {
+pub(crate) fn find_profile(
+    runtime: &ProfileRuntime,
+    profile_id: &str,
+) -> Result<ProfileStatus, ErrorData> {
     runtime
         .list(true)
         .map_err(|error| profile_error(&error))?

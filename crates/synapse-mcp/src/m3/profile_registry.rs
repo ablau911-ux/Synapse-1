@@ -2012,10 +2012,12 @@ pub fn rollback_registry_profile(
 }
 
 pub fn query_audit_intelligence(
+    profile_runtime: &synapse_profiles::ProfileRuntime,
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
     params: &AuditIntelligenceQueryParams,
 ) -> Result<AuditIntelligenceQueryResponse, ErrorData> {
     validate_limit(params.max_rows)?;
+    super::profile_quality::find_profile(profile_runtime, &params.profile_id)?;
     let runtime = lock_runtime_while(reflex_runtime, "querying audit intelligence")?;
     let action_rows = runtime
         .storage_cf_tail_rows(cf::CF_ACTION_LOG, params.max_rows as usize)

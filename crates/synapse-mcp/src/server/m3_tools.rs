@@ -661,8 +661,9 @@ impl SynapseService {
             "audit_intelligence_query",
             &crate::m3::profile_registry::required_permissions_audit(&params.0),
         )?;
+        let profile_runtime = self.profile_runtime()?;
         let reflex_runtime = self.reflex_runtime()?;
-        query_audit_intelligence(&reflex_runtime, &params.0).map(Json)
+        query_audit_intelligence(&profile_runtime, &reflex_runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Export a local redacted audit bundle after explicit consent")]

@@ -116,16 +116,27 @@ impl SynapseService {
                         "repair M3 storage initialization before retrying profile_intelligence",
                     )
                 })?;
-                let response = query_audit_intelligence(&reflex_runtime, &spec).map_err(|error| {
+                let profile_runtime = self.profile_runtime().map_err(|error| {
                     wrapped_delegate_error(
                         AUDIT_TOOL,
                         operation.as_str(),
-                        &spec.profile_id,
+                        "profile_runtime",
                         AUDIT_SOT,
                         error,
-                        "inspect profile id and audit CF health before retrying profile_intelligence",
+                        "repair M3 profile initialization before retrying profile_intelligence",
                     )
                 })?;
+                let response = query_audit_intelligence(&profile_runtime, &reflex_runtime, &spec)
+                    .map_err(|error| {
+                        wrapped_delegate_error(
+                            AUDIT_TOOL,
+                            operation.as_str(),
+                            &spec.profile_id,
+                            AUDIT_SOT,
+                            error,
+                            "inspect profile id and audit CF health before retrying profile_intelligence",
+                        )
+                    })?;
                 Ok(Json(audit_response(
                     operation,
                     format!(

@@ -148,4 +148,26 @@ Measured through ffmpeg (same libraries), one run each, key picture every 5 s, s
 
 Chosen: 10 s (`key=200`). Plan 5.0 §6 and §7 were corrected to this.
 
+### 2026-11-24: scout's map of the existing probe (read-only agent; paths under `scripts/clip-equation/probe/src/`)
+
+Reuse these; do not rewrite them.
+
+| need | what exists | where |
+|---|---|---|
+| Register a command | `match command.as_str()`; each command is `fn run() -> Result<()>`; `mod` list | `main.rs:191-211`, `main.rs:21-78` |
+| Read `key=value` arguments | `exp_meter::Args::from_env()`, `text`, `text_or`, `number`, `flag` | `exp_meter.rs:27-62` |
+| Result type | `pub type Result<T> = std::result::Result<T, String>;` errors by `.map_err(\|e\| e.to_string())?` | `main.rs:86` |
+| Capture a window by handle | `observer::start_with_cursor::<H>(hwnd, Interval, with_cursor, flags)`, `observer::stop`, `observer::composition_time(frame)`; frames are BGRA 8 bit | `observer.rs:58-126` |
+| A capture handler to copy the pattern from | `CorpusFrames` (`GraphicsCaptureApiHandler`, `on_frame_arrived`, `keep_held`, `finish`) | `exp_corpus.rs:377-446` |
+| Read a frame back from the graphics chip | `gpu::ReadBack::{new, read, pixels, size}`: tightly packed BGRA | `gpu.rs:264-292` |
+| The instant grid | `slots::INSTANT_HNS` (50 ms), `clock::{now_hns, sleep_until, HNS_PER_MS}`; which instant a frame belongs to | `slots.rs:33`, `clock.rs:22-48`, `exp_corpus.rs:156-157, 436-442` |
+| Replay a corpus scene | `Corpus::open`, `load`, `lines`, `picture` (B,G,R, 3 bytes per pixel, top to bottom); the real-time pacing loop. `Corpus` and `CorpusLine` are private to `exp_dyn.rs` and need `meta.json` | `exp_dyn.rs:19-85, 247-255` |
+| Processor time of the whole process | `exp_meter::process_cpu_ns()` | `exp_meter.rs:117` |
+| Peak private bytes | `exp_measure::os_peak_private()` | `exp_measure.rs:66` |
+| BGRA to BGR | `exp_measure::bgra_to_bgr` | `exp_measure.rs:57` |
+| Write the JSON report | `json!({...})` to `out/probe.json`, then `println!("{report}")` as the last stdout line | `exp_dyn.rs:313-318` |
+| Cargo setup | package `clip-probe`, edition 2024, its own empty `[workspace]`; no lint denies; `png` and `zstd` are dependencies | `Cargo.toml` |
+
+**Not present, to be added:** an AV1 encoder binding, a lossless WebP encoder, an IVF writer.
+
 **Encoder settings to reproduce** (what ffmpeg passed to libaom): realtime usage; speed (`cpu-used`) 8; constant quality 35 with no bitrate cap; `tune-content=screen`; row multithreading on; 4:2:0, 8 bit; key picture every 200 pictures.

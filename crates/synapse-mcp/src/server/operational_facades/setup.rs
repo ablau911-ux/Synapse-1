@@ -95,7 +95,10 @@ pub(super) async fn handle(
                 .repair
                 .ok_or_else(|| missing_spec(SETUP_TOOL, "repair"))?;
             if spec.reason.trim().is_empty() {
-                return Err(missing_spec(SETUP_TOOL, "repair.reason"));
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "setup operation=repair requires a non-empty repair.reason",
+                ));
             }
             require_maintenance_profile(
                 service,

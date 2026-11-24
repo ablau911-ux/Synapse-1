@@ -58,8 +58,9 @@ impl StopReason {
 /// the length recorded so far (published on every instant, not written to disk).
 struct RecordingControl {
     stop: AtomicBool,
-    /// The planned end; `END_SEALED` once the recorder decided the recording
-    /// is over, so no `record_extend` applies any more.
+    /// The planned end; `END_SEALED` once the recording is ending (a stop
+    /// call, the planned end, a failure), so no `record_extend` applies any
+    /// more.
     end_ms: AtomicU64,
     recorded_ms: AtomicU64,
 }
@@ -83,6 +84,14 @@ impl RecordingControl {
     /// Seals the end when the recording stops for any other reason.
     fn seal(&self) {
         self.end_ms.store(END_SEALED, Ordering::Relaxed);
+    }
+
+    /// A stop call: the end is sealed before the recorder is told to stop,
+    /// so an extend that comes after the stop call is refused, never
+    /// accepted for a recording that is ending.
+    fn request_stop(&self) {
+        self.seal();
+        self.stop.store(true, Ordering::Relaxed);
     }
 
     /// Moves the end by `add_ms`, up to `MAX_DURATION_MS`; returns the new
@@ -180,7 +189,7 @@ impl Recorders {
         let running = active
             .as_mut()
             .filter(|running| running.clip_id == clip_id)?;
-        running.control.stop.store(true, Ordering::Relaxed);
+        running.control.request_stop();
         running.thread.take()
     }
 }
@@ -694,10 +703,10 @@ mod live {
                 return;
             }
         }
+        // Every way the recorder ends sealed the end where it was decided,
+        // before the flush: a stop call in `request_stop`, `Completed` in
+        // `ends_at`, a failure or stop condition in `run`.
         let reason = recording.run(control);
-        // Every stop seals the end before the flush: `Completed` sealed it
-        // when it decided (`ends_at`); a stop for any other reason seals it here.
-        control.seal();
         recording.finish(reason);
     }
 
@@ -1089,10 +1098,14 @@ mod live {
                 if control.stop.load(Ordering::Relaxed) {
                     return StopReason::StopCall;
                 }
-                if let Some(reason) = self.stop_condition() {
-                    return reason;
-                }
-                if let Err(reason) = self.handle_instant(k) {
+                let ended = match self.stop_condition() {
+                    Some(reason) => Err(reason),
+                    None => self.handle_instant(k),
+                };
+                if let Err(reason) = ended {
+                    // The recorder decides here that the recording ends: the
+                    // end is sealed at once, before anything else runs.
+                    control.seal();
                     return reason;
                 }
                 self.next_instant = k + 1;

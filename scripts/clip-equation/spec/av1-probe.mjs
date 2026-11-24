@@ -601,6 +601,30 @@ function otherFormatSkipped() {
 }
 
 /**
+ * A still file cut to 0 bytes while its index line reached the disk (a power loss): recovery treats
+ * it as a missing still. No line names it, its file is gone, and its instant comes back as the
+ * video picture that is on disk.
+ */
+function emptyStillMissing() {
+  let cut;
+  const got = recovered('killed-text-page', 'crash-empty-still', dir => {
+    const still = readJsonl(path.join(dir, 'frames.jsonl')).find(line => line.still === true && kindOf(line) === 'enc');
+    if (!still) return;
+    cut = still.instant;
+    fs.truncateSync(path.join(dir, 'stills', `still-${pad(cut, 8)}.webp`), 0);
+  });
+  if (got.error) return verdict([got.error]);
+  if (cut === undefined) return verdict(['the killed recording has no still on an encoded instant']);
+  const problems = [];
+  const naming = got.lines.filter(line => (line.still === true && line.instant === cut) || line.still_of === cut);
+  if (naming.length) problems.push(`${naming.length} lines still name the empty still of instant ${cut} (first: instant ${naming[0].instant})`);
+  if (got.result.stills_on_disk.includes(cut)) problems.push(`the empty still of instant ${cut} is still on disk`);
+  const fetched = fetchPicture(got.dir, cut);
+  if (fetched.error || fetched.kind !== 'video') problems.push(`instant ${cut} comes back as ${fetched.error ?? fetched.kind}, not video`);
+  return verdict(problems, `still of instant ${cut} cut to 0 bytes: no line names it, its file is removed, the instant comes back as video`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -710,6 +734,7 @@ const table = {
   'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,
   'recovery skips a clip of another format quietly': otherFormatSkipped,
   'recovery says a recovered clip needs no more recovery': recoveredClipFinished,
+  'recovery treats an empty still as missing': emptyStillMissing,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

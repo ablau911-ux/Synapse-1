@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use super::clip_decoder::decode_still;
 use super::clip_folder::{
     CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
     LOST_SERVICE_RESTART, LostInstant, MAX_DURATION_MS, PartInfo, RECORD_FPS, RecorderLock,
@@ -155,8 +156,15 @@ impl ClipRecovery {
         let complete = Self::repair_parts(folder)?;
         let read = read_index(folder).map_err(|error| error.to_string())?;
         let planned = planned.unwrap_or(read.len() as u64);
+        // A still is on disk when its file decodes: one that a power loss
+        // left empty or cut counts as missing. Each named still is decoded once.
+        let named: BTreeSet<u64> = read.iter().filter_map(IndexLine::still_file).collect();
+        let on_disk: BTreeSet<u64> = named
+            .into_iter()
+            .filter(|&instant| decode_still(&still_path(folder, instant)).is_ok())
+            .collect();
         let lines = Self::repair_index(&read, &complete, planned, fps, cause, |instant| {
-            still_path(folder, instant).is_file()
+            on_disk.contains(&instant)
         });
         if lines != read {
             let mut text = String::new();
@@ -185,12 +193,12 @@ impl ClipRecovery {
     /// instant 0 with no gap; an `enc` line whose picture is not complete on
     /// disk, and a `same` line after a line that shows no picture, become
     /// lost (`cause`); the instants never written, up to `planned`, are added
-    /// as lost. A lost line, one that becomes lost here or was lost already
-    /// (it keeps its own cause), keeps its still mark (`still` or
-    /// `still_of`) while that still's file is on disk (`still_on_disk`): the
-    /// still shows the instant's exact picture, so it is never deleted for a
-    /// missing video picture. A mark whose file is gone is dropped, so a lost
-    /// line never names a picture that cannot be shown.
+    /// as lost. Every line keeps its still mark (`still` or `still_of`) only
+    /// while that still is on disk (`still_on_disk`): a lost line, one that
+    /// becomes lost here or was lost already (it keeps its own cause), keeps
+    /// it, since the still shows the instant's exact picture and is never
+    /// deleted for a missing video picture; a mark whose still is gone is
+    /// dropped, so no line names a picture that cannot be shown.
     fn repair_index(
         read: &[IndexLine],
         complete: &BTreeMap<u32, u32>,
@@ -221,18 +229,26 @@ impl ClipRecovery {
                 .last()
                 .is_some_and(|before| before.lost.is_some() && before.still_file().is_none());
             let shows_missing = line.same.is_some() && previous_shows_nothing;
+            let still_kept = line.still_file().is_some_and(&still_on_disk);
+            let (still, still_of) = (
+                line.still.filter(|_| still_kept),
+                line.still_of.filter(|_| still_kept),
+            );
             if picture_missing || shows_missing || line.lost.is_some() {
-                let still_kept = line.still_file().is_some_and(&still_on_disk);
                 lines.push(IndexLine {
                     enc: None,
                     same: None,
                     lost: line.lost.clone().or_else(|| Some(cause.to_owned())),
-                    still: line.still.filter(|_| still_kept),
-                    still_of: line.still_of.filter(|_| still_kept),
+                    still,
+                    still_of,
                     ..line.clone()
                 });
             } else {
-                lines.push(line.clone());
+                lines.push(IndexLine {
+                    still,
+                    still_of,
+                    ..line.clone()
+                });
             }
         }
         let written = lines.len() as u64;
@@ -272,7 +288,8 @@ impl ClipRecovery {
 
     /// The stills the index names: each `still` line's own file and every
     /// file a `still_of` line points to. A still file the index does not name
-    /// (its line had not been written when the recorder died) is removed, so
+    /// (its line had not been written when the recorder died, or the file
+    /// does not decode and `repair_index` dropped its mark) is removed, so
     /// the folder holds exactly the files of plan §3.
     fn stills(folder: &Path, lines: &[IndexLine]) -> Result<Vec<StillInfo>, String> {
         let named: BTreeSet<u64> = lines.iter().filter_map(IndexLine::still_file).collect();

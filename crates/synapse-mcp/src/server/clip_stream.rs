@@ -525,8 +525,12 @@ impl Stills {
             self.skipped_budget += 1;
             return Ok(Settled::OverBudget);
         }
+        // The still is on the disk before its index line is written (after
+        // this call), so after a power loss a line never names a still whose
+        // bytes did not reach the disk. Stills are rare (budget above).
         let path = still_path(&self.folder, settled);
-        std::fs::write(&path, &encoded)
+        File::create(&path)
+            .and_then(|mut file| file.write_all(&encoded).and_then(|()| file.sync_all()))
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
         self.written
             .push(StillInfo::new(&self.folder, settled, bytes));

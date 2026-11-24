@@ -8,6 +8,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use rmcp::model::ErrorCode;
 use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, SessionConfig};
 
 const SESSION_IDLE_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SESSION_IDLE_TIMEOUT_SECS";
@@ -324,14 +325,11 @@ async fn allow_initialize_without_session(
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
-    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
-    let is_initialize = parsed.as_ref().is_ok_and(jsonrpc_method_is_initialize);
-    let request = Request::from_parts(parts, Body::from(bytes));
-    if parsed.is_err() || is_initialize {
-        Ok(request)
-    } else {
-        Err(session_invalid(SessionFailure::Missing))
+    let message = jsonrpc_message(&bytes)?;
+    if !jsonrpc_method_is_initialize(&message) {
+        return Err(session_invalid(SessionFailure::Missing));
     }
+    Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
 async fn record_session_request(
@@ -348,11 +346,73 @@ async fn record_session_request(
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
         .map_err(|_| payload_too_large())?;
-    let action = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| jsonrpc_action_label(&value));
+    let message = jsonrpc_message(&bytes);
+    let action = message.as_ref().ok().and_then(jsonrpc_action_label);
     record_session_heartbeat(session_registry, session_id, action)?;
+    message?;
     Ok(Request::from_parts(parts, Body::from(bytes)))
+}
+
+/// Checks that a buffered `/mcp` POST body is one JSON-RPC 2.0 message rmcp can
+/// route, and answers a JSON-RPC error otherwise (#189): rmcp answers a body it
+/// cannot decode with a plain-text 415, which no JSON-RPC client can match.
+fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
+        jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::Value::Null,
+            ErrorCode::PARSE_ERROR,
+            format!("parse error: {error}"),
+        )
+    })?;
+    let Some(message) = value.as_object() else {
+        return Err(invalid_jsonrpc_request(
+            &serde_json::Value::Null,
+            "the body must be one JSON-RPC message object (batches are not supported)",
+        ));
+    };
+    let id = message.get("id").unwrap_or(&serde_json::Value::Null);
+    if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err(invalid_jsonrpc_request(id, "jsonrpc must be \"2.0\""));
+    }
+    let has_method = message.get("method").is_some_and(serde_json::Value::is_string);
+    let is_response = message.contains_key("id")
+        && (message.contains_key("result") || message.contains_key("error"));
+    if !has_method && !is_response {
+        return Err(invalid_jsonrpc_request(
+            id,
+            "a message needs a string `method`, or an `id` with `result` or `error`",
+        ));
+    }
+    Ok(value)
+}
+
+fn invalid_jsonrpc_request(id: &serde_json::Value, message: &str) -> Response {
+    jsonrpc_error_response(
+        StatusCode::BAD_REQUEST,
+        id,
+        ErrorCode::INVALID_REQUEST,
+        format!("invalid request: {message}"),
+    )
+}
+
+/// A JSON-RPC 2.0 error response the HTTP layer sends for a body that never
+/// reaches rmcp. `id` is `null` when the request id could not be read.
+fn jsonrpc_error_response(
+    status: StatusCode,
+    id: &serde_json::Value,
+    code: ErrorCode,
+    message: String,
+) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code.0,
+            "message": message,
+        },
+    });
+    (status, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
 }
 
 fn record_session_heartbeat(
@@ -377,9 +437,6 @@ fn record_session_heartbeat(
 }
 
 fn jsonrpc_action_label(value: &serde_json::Value) -> Option<String> {
-    if value.is_array() {
-        return Some("jsonrpc_batch".to_owned());
-    }
     let method = value.get("method")?.as_str()?;
     if method == "tools/call"
         && let Some(name) = value

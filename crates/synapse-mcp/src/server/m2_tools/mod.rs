@@ -3511,7 +3511,7 @@ impl SynapseService {
                             point.x, point.y
                         ),
                     ),
-                    usize::from(error.input_delivered(action_index)),
+                    usize::from(error.refused_before_delivery(action_index) == Some(false)),
                 )
             })?;
         }
@@ -6228,9 +6228,11 @@ fn act_type_text_target_changed(
 }
 
 /// Structured failure for the `act_set_field_text` foreground tier: precise
-/// reason code, full target evidence, and the action error detail. It says
-/// nothing was delivered; a failure after delivered input passes through
-/// `crate::m2::error_after_earlier_steps`.
+/// reason code, full target evidence, and the action error detail.
+/// `refused_before_delivery` is true only for a target window that was not
+/// foreground (nothing was sent); for every other reason it is null, since
+/// this function does not know. A failure after delivered input passes
+/// through `crate::m2::error_after_earlier_steps`, which sets it to false.
 fn set_field_text_foreground_error(
     target: &ActTypeForegroundFallbackTarget,
     code: &'static str,
@@ -6256,7 +6258,7 @@ fn set_field_text_foreground_error(
             "reason": reason,
             "detail": detail,
             "target": target,
-            "refused_before_delivery": true,
+            "refused_before_delivery": (reason == "target_window_not_foreground").then_some(true),
             "backend_tier_used": crate::m2::TIER_FOREGROUND_KEYS,
             "required_foreground": true,
         })),
@@ -6411,7 +6413,7 @@ fn act_type_foreground_fallback_click_error(
                 .unwrap_or(error_codes::ACTION_BACKEND_UNAVAILABLE),
             "tool": "act_type",
             "reason": "chromium_foreground_fallback_click_failed",
-            "refused_before_delivery": !error.input_delivered(earlier_actions_done),
+            "refused_before_delivery": error.refused_before_delivery(earlier_actions_done),
             "point": point,
             "target": target,
             "cause": mapped.data,

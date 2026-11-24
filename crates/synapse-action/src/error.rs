@@ -191,20 +191,22 @@ impl ActionError {
         )
     }
 
-    /// True when input of the tool call was delivered before this error: an
-    /// earlier step ran (`earlier_steps_done > 0`), or this action delivered a
-    /// batch before its foreground refusal. Other errors carry no delivery
-    /// record and count as nothing delivered by this action.
+    /// What this error knows about delivery in its tool call, as the
+    /// `refused_before_delivery` field of an error. `Some(false)`: input was
+    /// delivered (an earlier step ran, or this action delivered a batch
+    /// before its foreground refusal). `Some(true)`: no earlier step ran and
+    /// the action was refused before any batch. `None`: the error carries no
+    /// delivery record, so nothing is claimed either way.
     #[must_use]
-    pub const fn input_delivered(&self, earlier_steps_done: usize) -> bool {
-        earlier_steps_done > 0
-            || matches!(
-                self,
-                Self::ForegroundLost {
-                    before_any_delivery: false,
-                    ..
-                }
-            )
+    pub const fn refused_before_delivery(&self, earlier_steps_done: usize) -> Option<bool> {
+        match self {
+            _ if earlier_steps_done > 0 => Some(false),
+            Self::ForegroundLost {
+                before_any_delivery,
+                ..
+            } => Some(*before_any_delivery),
+            _ => None,
+        }
     }
 
     #[must_use]

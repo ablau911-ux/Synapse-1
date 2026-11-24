@@ -79,6 +79,10 @@ pub(crate) const DASHBOARD_ANALYTICS_WINDOW_NS: u64 = 7 * 24 * 60 * 60 * 1_000_0
 /// Rows pulled per `scan_cf_from` page.
 const SCAN_CHUNK_ROWS: usize = 4_096;
 
+/// Default and ceiling for anchors returned in the per-agent breakdown.
+const DEFAULT_PER_AGENT_LIMIT: u32 = 100;
+const MAX_PER_AGENT_LIMIT: u32 = 1_000;
+
 /// Milliseconds in a minute, for per-minute rate denominators.
 const MS_PER_MIN: f64 = 60_000.0;
 
@@ -110,6 +114,11 @@ pub struct AgentStatsParams {
     /// rollup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_by: Option<String>,
+    /// Most anchors returned in `per_agent` for `group_by = "agent"` (default
+    /// 100, max 1000). `agents_total` still counts every anchor in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub per_agent_limit: Option<u32>,
 }
 
 // ----------------------------------------------------------------------------
@@ -133,7 +142,8 @@ pub struct AgentStatsResponse {
     pub agents_total: u64,
     pub fleet: ScopeStats,
     /// Per-agent breakdown, present only when `group_by = "agent"`. Ordered by
-    /// anchor.
+    /// anchor; at most `per_agent_limit` anchors, fewer than `agents_total`
+    /// when the limit cut it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub per_agent: Option<Vec<AgentScopeStats>>,
 }
@@ -285,6 +295,7 @@ impl SynapseService {
             spawn_id: None,
             session_id: None,
             group_by: Some("agent".to_owned()),
+            per_agent_limit: Some(MAX_PER_AGENT_LIMIT),
         })
     }
 
@@ -302,16 +313,16 @@ impl SynapseService {
     }
 
     fn agent_stats_impl(&self, params: AgentStatsParams) -> Result<AgentStatsResponse, ErrorData> {
-        let include_per_agent = resolve_options(&params)?;
+        let per_agent_limit = resolve_options(&params)?;
         let db = self.agent_stats_db()?;
         let (anchors, scanned_rows) = collect_anchors(&db, &params, MAX_SCAN_ROWS_PER_CALL)?;
 
         // Resolve each anchor, and fold the fleet aggregate from the same data.
         let mut fleet = ScopeAccumulator::default();
-        let mut per_agent: Vec<AgentScopeStats> = Vec::with_capacity(anchors.len());
+        let mut per_agent: Vec<AgentScopeStats> = Vec::new();
         for (anchor, acc) in &anchors {
             fleet.merge(&acc.scope);
-            if include_per_agent {
+            if per_agent_limit.is_some_and(|limit| per_agent.len() < limit) {
                 per_agent.push(AgentScopeStats {
                     anchor: anchor.clone(),
                     spawn_id: acc.spawn_id.clone(),
@@ -329,18 +340,20 @@ impl SynapseService {
             scanned_rows,
             agents_total: anchors.len() as u64,
             fleet: fleet.finish(),
-            per_agent: include_per_agent.then_some(per_agent),
+            per_agent: per_agent_limit.is_some().then_some(per_agent),
         })
     }
 }
 
-/// Validates the request and resolves whether to emit a per-agent breakdown.
+/// Validates the request and resolves the per-agent breakdown: `None` for the
+/// fleet rollup only, else the most anchors to return.
 /// Pure, so the param contract is unit-testable without a service instance.
 ///
 /// # Errors
 ///
-/// Refuses an inverted/degenerate time window and an unknown `group_by`.
-fn resolve_options(params: &AgentStatsParams) -> Result<bool, ErrorData> {
+/// Refuses an inverted/degenerate time window, an unknown `group_by` and a
+/// `per_agent_limit` outside 1..=1000.
+fn resolve_options(params: &AgentStatsParams) -> Result<Option<usize>, ErrorData> {
     if let (Some(since), Some(until)) = (params.since_ns, params.until_ns)
         && since >= until
     {
@@ -348,9 +361,15 @@ fn resolve_options(params: &AgentStatsParams) -> Result<bool, ErrorData> {
             "AGENT_STATS_RANGE_INVALID: since_ns {since} must be < until_ns {until}"
         )));
     }
+    let limit = params.per_agent_limit.unwrap_or(DEFAULT_PER_AGENT_LIMIT);
+    if !(1..=MAX_PER_AGENT_LIMIT).contains(&limit) {
+        return Err(invalid_params(format!(
+            "AGENT_STATS_LIMIT_INVALID: per_agent_limit must be 1..={MAX_PER_AGENT_LIMIT}, got {limit}"
+        )));
+    }
     match params.group_by.as_deref() {
-        None | Some("fleet") => Ok(false),
-        Some("agent") => Ok(true),
+        None | Some("fleet") => Ok(None),
+        Some("agent") => Ok(Some(limit as usize)),
         Some(other) => Err(invalid_params(format!(
             "AGENT_STATS_GROUP_BY_INVALID: group_by must be `fleet` or `agent`, got {other:?}"
         ))),

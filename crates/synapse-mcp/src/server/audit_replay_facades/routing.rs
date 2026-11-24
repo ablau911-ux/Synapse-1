@@ -102,9 +102,10 @@ impl SynapseService {
                     .profile_intelligence
                     .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
                 self.require_m3_permissions(
-                    "audit_profile_intelligence",
+                    AUDIT_TOOL,
                     &crate::m3::profile_registry::required_permissions_audit(&spec),
-                )?;
+                )
+                .map_err(|error| with_audit_operation(error, operation.as_str()))?;
                 let reflex_runtime = self.reflex_runtime().map_err(|error| {
                     wrapped_delegate_error(
                         AUDIT_TOOL,
@@ -140,9 +141,10 @@ impl SynapseService {
                     .export_bundle
                     .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
                 self.require_m3_permissions(
-                    "audit_export_bundle",
+                    AUDIT_TOOL,
                     &crate::m3::audit_export::required_permissions_bundle(&spec),
-                )?;
+                )
+                .map_err(|error| with_audit_operation(error, operation.as_str()))?;
                 let reflex_runtime = self.reflex_runtime().map_err(|error| {
                     wrapped_delegate_error(
                         AUDIT_TOOL,
@@ -462,4 +464,13 @@ impl SynapseService {
             }
         }
     }
+}
+
+/// Audit permission errors keep `tool = "audit"`, like every other audit
+/// error, and name the operation in its own field.
+fn with_audit_operation(mut error: ErrorData, operation: &'static str) -> ErrorData {
+    if let Some(data) = error.data.as_mut().and_then(Value::as_object_mut) {
+        data.insert("operation".to_owned(), json!(operation));
+    }
+    error
 }

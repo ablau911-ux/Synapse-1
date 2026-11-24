@@ -1,387 +1,536 @@
-//! H.264 clip decoder on the Media Foundation Source Reader ("Bug clip video"
-//! research, section 8; building plan Part 2 "Decoding").
+//! Clip decoder (docs/clip-recorder-plan-5.0.md, sections 3 and 5): the
+//! picture shown at one instant of a clip folder.
 //!
-//! `ClipDecoder` owns one Source Reader over one segment file of a clip. The
-//! reader's own video processing converts the decoded stream to RGB32, so
-//! every frame comes back as top-down BGRA with its sample timestamp.
+//! - `PictureSource` owns the rule of which recording shows instant k: the
+//!   still of the picture on screen when one exists (exact), else the encoded
+//!   video picture it repeats, else nothing (lost).
+//! - `ClipDecoder` turns that source into pixels: a lossless WebP still, or
+//!   the AV1 pictures of one video part decoded by libaom from the part's
+//!   first (key) picture up to the one asked for. Decoding never reads more
+//!   than one part.
 //!
-//! All calls must stay on the thread that created the decoder: it initialises
-//! COM (MTA) and Media Foundation for that thread and shuts both down on drop.
+//! Every picture comes back as top-down RGBA with opaque alpha.
 
+use std::ffi::CStr;
+use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFSample, IMFSourceReader, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
-    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR, MFCreateAttributes, MFCreateMediaType,
-    MFCreateSourceReaderFromURL, MFMediaType_Video, MFSampleExtension_CleanPoint,
-    MFVideoFormat_RGB32,
-};
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Variant::VT_I8;
-use windows::core::{GUID, HSTRING};
+use image::RgbaImage;
+use libaom_sys as aom;
 
-use super::clip_encoder::{MediaFoundationRuntime, hr};
+use super::clip_folder::{IndexLine, IvfPicture, part_path, read_ivf, still_path};
 
-const HNS_PER_SECOND: u64 = 10_000_000;
-const PACKED_SHIFT: u32 = 32;
-const PACKED_LOW_MASK: u64 = u32::MAX as u64;
-const HALF_SAMPLE: i64 = 2;
-const BGRA_BYTES_PER_PIXEL: usize = 4;
-/// Empty reads (stream ticks) tolerated in a row before giving up.
-const MAX_EMPTY_READS: u32 = 1_000;
+/// Decoder threads: the machine's parallelism, at most this many.
+const MAX_DECODER_THREADS: usize = 8;
+/// libaom may return 8-bit pictures for 8-bit streams (`allow_lowbitdepth`).
+const ALLOW_LOW_BIT_DEPTH: c_uint = 1;
+/// No `AOM_CODEC_USE_*` flags.
+const NO_DECODER_FLAGS: aom::aom_codec_flags_t = 0;
 
-/// One decoded frame.
-#[derive(Clone)]
-pub(super) struct DecodedFrame {
-    /// Sample timestamp in 100 ns units from the start of the stream.
-    pub(super) t_hns: i64,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    /// Top-down BGRA (alpha undefined), `width * 4` bytes per row.
-    pub(super) bgra: Vec<u8>,
+const OPAQUE: u8 = u8::MAX;
+const RGB_BYTES: usize = 3;
+
+/// 8-bit fixed point for the YUV to RGB conversion.
+const FIXED_SHIFT: i32 = 8;
+const FIXED_ROUND: i32 = 1 << (FIXED_SHIFT - 1);
+const CHROMA_OFFSET: i32 = 128;
+/// The chroma sample of a grey pixel.
+const NEUTRAL_CHROMA: u8 = 128;
+
+/// What a returned picture is (plan section 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PictureKind {
+    /// The window's exact pixels: a lossless still of a settle point.
+    ExactStill,
+    /// A decoded AV1 picture: video quality.
+    Video,
+    /// Nothing was recorded for the instant.
+    Lost,
 }
 
-/// A sample-table keyframe. Its time belongs to the file, not the instant clock.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(from = "(u32, i64)", into = "(u32, i64)")]
-pub(super) struct KeyFrame {
-    pub(super) frame: u32,
-    pub(super) t_hns: i64,
-}
-
-impl From<(u32, i64)> for KeyFrame {
-    fn from((frame, t_hns): (u32, i64)) -> Self {
-        Self { frame, t_hns }
+impl PictureKind {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactStill => "exact still",
+            Self::Video => "video",
+            Self::Lost => "lost",
+        }
     }
 }
 
-impl From<KeyFrame> for (u32, i64) {
-    fn from(key: KeyFrame) -> Self {
-        (key.frame, key.t_hns)
+/// Where the picture shown at one instant comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PictureSource {
+    /// The lossless still that belongs to `instant`.
+    Still { instant: u64 },
+    /// Picture `index` of video part `part`, encoded at `instant`.
+    Video { instant: u64, part: u32, index: u32 },
+    /// No picture: `cause` names why.
+    Lost { cause: String },
+}
+
+impl PictureSource {
+    /// The rule of plan section 5 on the index lines of a clip. From instant
+    /// k back over unchanged (`same`) instants to the instant whose picture
+    /// is on screen: a still there (or on any unchanged instant between)
+    /// gives the exact picture, otherwise the encoded video picture is used.
+    /// A lost instant, or an unchanged one that repeats a lost picture, is
+    /// lost.
+    pub(super) fn resolve(folder: &Path, lines: &[IndexLine], instant: u64) -> Result<Self, String> {
+        let mut current = instant;
+        loop {
+            let line = find_line(lines, current)
+                .ok_or_else(|| format!("frames.jsonl has no line for instant {current}"))?;
+            if let Some(cause) = &line.lost {
+                let cause = if current == instant {
+                    cause.clone()
+                } else {
+                    format!("unchanged since instant {current}, which was lost ({cause})")
+                };
+                return Ok(Self::Lost { cause });
+            }
+            if line.still == Some(true) && still_path(folder, current).is_file() {
+                return Ok(Self::Still { instant: current });
+            }
+            if let Some((part, index)) = line.enc {
+                return Ok(Self::Video {
+                    instant: current,
+                    part,
+                    index,
+                });
+            }
+            if line.same != Some(true) {
+                return Err(format!(
+                    "frames.jsonl line of instant {current} has none of enc, same or lost"
+                ));
+            }
+            current = current.checked_sub(1).ok_or_else(|| {
+                "frames.jsonl marks instant 0 as same, but nothing comes before it".to_owned()
+            })?;
+        }
+    }
+
+    pub(super) const fn kind(&self) -> PictureKind {
+        match self {
+            Self::Still { .. } => PictureKind::ExactStill,
+            Self::Video { .. } => PictureKind::Video,
+            Self::Lost { .. } => PictureKind::Lost,
+        }
+    }
+
+    /// The instant whose recording is shown; `None` when lost.
+    pub(super) const fn shown_instant(&self) -> Option<u64> {
+        match self {
+            Self::Still { instant } | Self::Video { instant, .. } => Some(*instant),
+            Self::Lost { .. } => None,
+        }
     }
 }
 
-/// The Source Reader of one segment file (`segment-NNNN.mp4`), with RGB32 output.
+/// The index line of `instant` (lines are in instant order).
+pub(super) fn find_line(lines: &[IndexLine], instant: u64) -> Option<&IndexLine> {
+    lines
+        .binary_search_by_key(&instant, |line| line.instant)
+        .ok()
+        .and_then(|position| lines.get(position))
+}
+
+/// The picture at one instant.
+pub(super) struct ClipPicture {
+    pub(super) instant: u64,
+    pub(super) t_ms: u64,
+    pub(super) source: PictureSource,
+    /// `None` exactly when the source is lost.
+    pub(super) image: Option<RgbaImage>,
+}
+
+impl ClipPicture {
+    pub(super) const fn kind(&self) -> PictureKind {
+        self.source.kind()
+    }
+}
+
+/// Reads pictures of one clip folder. Keeps the video part last decoded, so
+/// pictures asked for in time order decode each picture once.
 pub(super) struct ClipDecoder {
-    // Field order matters: the reader is released before Media Foundation
-    // shuts down (fields drop in declaration order).
-    reader: IMFSourceReader,
-    width: u32,
-    height: u32,
-    /// Bytes per row reported by the output type; negative means bottom-up.
-    stride: i32,
-    /// The most recent frame returned, for forward reads without a seek.
-    last: Option<(u32, DecodedFrame)>,
-    half_sample_hns: i64,
-    path: PathBuf,
-    _runtime: MediaFoundationRuntime,
+    folder: PathBuf,
+    lines: Vec<IndexLine>,
+    video: Option<PartReader>,
 }
 
 impl ClipDecoder {
-    pub(super) fn open(path: &Path) -> Result<Self, String> {
-        let runtime = MediaFoundationRuntime::start()?;
-        let reader = create_reader(path)?;
-        let mut decoder = Self {
-            reader,
-            width: 0,
-            height: 0,
-            stride: 0,
+    pub(super) fn new(folder: &Path, lines: Vec<IndexLine>) -> Self {
+        Self {
+            folder: folder.to_path_buf(),
+            lines,
+            video: None,
+        }
+    }
+
+    /// Where the picture of `instant` comes from, without decoding.
+    pub(super) fn source(&self, instant: u64) -> Result<PictureSource, String> {
+        PictureSource::resolve(&self.folder, &self.lines, instant)
+    }
+
+    /// The picture shown at `instant`.
+    pub(super) fn picture_at(&mut self, instant: u64) -> Result<ClipPicture, String> {
+        let t_ms = find_line(&self.lines, instant)
+            .map(|line| line.t_ms)
+            .ok_or_else(|| format!("instant {instant} is outside the clip"))?;
+        let source = self.source(instant)?;
+        let image = match &source {
+            PictureSource::Still { instant } => Some(decode_still(&still_path(&self.folder, *instant))?),
+            PictureSource::Video { part, index, .. } => Some(self.video_picture(*part, *index)?),
+            PictureSource::Lost { .. } => None,
+        };
+        Ok(ClipPicture {
+            instant,
+            t_ms,
+            source,
+            image,
+        })
+    }
+
+    /// Picture `index` of part `part`: read on from the part in use when it
+    /// is not past `index`, else decode the part from its key picture.
+    fn video_picture(&mut self, part: u32, index: u32) -> Result<RgbaImage, String> {
+        let reusable = self
+            .video
+            .as_ref()
+            .is_some_and(|reader| reader.part == part && reader.can_reach(index));
+        if !reusable {
+            self.video = Some(PartReader::open(&self.folder, part)?);
+        }
+        let reader = self
+            .video
+            .as_mut()
+            .ok_or_else(|| format!("video part {part} could not be opened"))?;
+        reader.picture(index)
+    }
+}
+
+/// One video part being decoded in order.
+struct PartReader {
+    part: u32,
+    path: PathBuf,
+    /// The part's complete pictures (a torn last one is left out).
+    pictures: Vec<IvfPicture>,
+    decoder: Av1Decoder,
+    /// The next picture the decoder has not seen yet.
+    next: u32,
+    /// The last picture converted, with its index.
+    last: Option<(u32, RgbaImage)>,
+}
+
+impl PartReader {
+    fn open(folder: &Path, part: u32) -> Result<Self, String> {
+        let path = part_path(folder, part);
+        Ok(Self {
+            part,
+            pictures: read_ivf(&path)?,
+            path,
+            decoder: Av1Decoder::new()?,
+            next: 0,
             last: None,
-            half_sample_hns: 0,
-            path: path.to_owned(),
-            _runtime: runtime,
-        };
-        decoder.read_output_type()?;
-        Ok(decoder)
+        })
     }
 
-    /// The next frame in decode order, or `None` at the end of the stream.
-    fn next_frame(&mut self) -> Result<Option<DecodedFrame>, String> {
-        let stream = video_stream();
-        for _ in 0..MAX_EMPTY_READS {
-            let mut flags = 0_u32;
-            let mut timestamp = 0_i64;
-            let mut sample: Option<IMFSample> = None;
-            unsafe {
-                self.reader.ReadSample(
-                    stream,
-                    0,
-                    None,
-                    Some(&raw mut flags),
-                    Some(&raw mut timestamp),
-                    Some(&raw mut sample),
-                )
-            }
-            .map_err(hr("IMFSourceReader::ReadSample"))?;
-            if flags & flag(MF_SOURCE_READERF_ERROR.0) != 0 {
-                return Err("the source reader reported a stream error".to_owned());
-            }
-            if flags & flag(MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0) != 0 {
-                self.read_output_type()?;
-            }
-            if let Some(sample) = sample {
-                let frame = DecodedFrame {
-                    t_hns: timestamp.max(0),
-                    width: self.width,
-                    height: self.height,
-                    bgra: self.copy_pixels(&sample)?,
-                };
-                return Ok(Some(frame));
-            }
-            if flags & flag(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
-                return Ok(None);
-            }
-        }
-        Err(format!(
-            "the source reader returned {MAX_EMPTY_READS} empty reads in a row"
-        ))
+    fn can_reach(&self, index: u32) -> bool {
+        index >= self.next || self.last.as_ref().is_some_and(|(last, _)| *last == index)
     }
 
-    /// D6 maps instants by sample count. File times are used only to land on a keyframe.
-    pub(super) fn frame_number(
-        &mut self,
-        number: u32,
-        keys: &[KeyFrame],
-    ) -> Result<DecodedFrame, String> {
-        if let Some((last_number, last)) = &self.last
-            && *last_number == number
+    fn picture(&mut self, index: u32) -> Result<RgbaImage, String> {
+        if let Some((last, image)) = &self.last
+            && *last == index
         {
-            return Ok(last.clone());
+            return Ok(image.clone());
         }
-        let key = keys
-            .iter()
-            .rev()
-            .find(|key| key.frame <= number)
-            .ok_or_else(|| {
-                format!(
-                    "{} has no keyframe before frame {number}",
-                    self.path.display()
-                )
-            })?;
-        let reading_on = self
-            .last
-            .as_ref()
-            .filter(|(last_number, _)| {
-                *last_number + 1 == number || (key.frame <= *last_number && *last_number < number)
-            })
-            .map(|(last_number, _)| *last_number + 1);
-        let first = match reading_on {
-            Some(next) => next,
-            None => {
-                // Seek inside the key sample. Seeking its exact boundary can
-                // select the previous fragment in the Windows MP4 source.
-                let position = key.t_hns.saturating_add(self.half_sample_hns);
-                self.seek(position)?;
-                key.frame
-            }
-        };
-        for current in first..=number {
-            let frame = self
-                .next_frame()?
-                .ok_or_else(|| format!("{} has no decoded frame {current}", self.path.display()))?;
-            tracing::trace!(
-                frame = current,
-                sample_time_hns = frame.t_hns,
-                "decoded moving sample"
-            );
-            self.last = Some((current, frame));
-        }
-        self.last
-            .as_ref()
-            .map(|(_, frame)| frame.clone())
-            .ok_or_else(|| format!("{} has no decoded frame {number}", self.path.display()))
-    }
-
-    fn seek(&mut self, t_hns: i64) -> Result<(), String> {
-        let mut position = PROPVARIANT::default();
-        // SAFETY: the union tag and value match; VT_I8 owns no resources.
-        unsafe {
-            let inner = &mut *position.Anonymous.Anonymous;
-            inner.vt = VT_I8;
-            inner.Anonymous.hVal = t_hns;
-            self.reader
-                .Flush(video_stream())
-                .map_err(hr("IMFSourceReader::Flush"))?;
-            self.reader
-                .SetCurrentPosition(&GUID::zeroed(), &raw const position)
-                .map_err(hr("IMFSourceReader::SetCurrentPosition"))?;
-        }
-        self.last = None;
-        Ok(())
-    }
-
-    fn read_output_type(&mut self) -> Result<(), String> {
-        let current = unsafe { self.reader.GetCurrentMediaType(video_stream()) }
-            .map_err(hr("IMFSourceReader::GetCurrentMediaType"))?;
-        let size =
-            unsafe { current.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(hr("MF_MT_FRAME_SIZE"))?;
-        self.width = u32::try_from(size >> PACKED_SHIFT).unwrap_or(0);
-        self.height = u32::try_from(size & PACKED_LOW_MASK).unwrap_or(0);
-        if self.width == 0 || self.height == 0 {
-            return Err(format!(
-                "the decoder reported an empty frame size {}x{}",
-                self.width, self.height
-            ));
-        }
-        // The file's rate defines the tolerance for validating a keyframe seek.
-        let rate =
-            unsafe { current.GetUINT64(&MF_MT_FRAME_RATE) }.map_err(hr("MF_MT_FRAME_RATE"))?;
-        let numerator = rate >> PACKED_SHIFT;
-        let denominator = rate & PACKED_LOW_MASK;
-        if numerator == 0 || denominator == 0 {
-            return Err("the decoder reported an invalid frame rate".into());
-        }
-        self.half_sample_hns = (HNS_PER_SECOND * denominator / numerator) as i64 / HALF_SAMPLE;
-        // MF stores a negative stride (bottom-up rows) as its two's complement.
-        self.stride = unsafe { current.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
-            .map_or(0, |stride| i32::from_ne_bytes(stride.to_ne_bytes()));
-        Ok(())
-    }
-
-    fn copy_pixels(&self, sample: &IMFSample) -> Result<Vec<u8>, String> {
-        let buffer = unsafe { sample.ConvertToContiguousBuffer() }
-            .map_err(hr("IMFSample::ConvertToContiguousBuffer"))?;
-        let mut data = std::ptr::null_mut::<u8>();
-        let mut length = 0_u32;
-        unsafe { buffer.Lock(&raw mut data, None, Some(&raw mut length)) }
-            .map_err(hr("IMFMediaBuffer::Lock"))?;
-        let (width, height) = (self.width as usize, self.height as usize);
-        let row = width * BGRA_BYTES_PER_PIXEL;
-        let length = length as usize;
-        let mut stride = match self.stride.unsigned_abs() as usize {
-            0 => row,
-            stride => stride,
-        };
-        if stride * height > length && length >= row * height {
-            stride = length / height;
-        }
-        let bottom_up = self.stride < 0;
-        let mut out = vec![0_u8; row * height];
-        if !data.is_null() && stride >= row && stride * height <= length {
-            // SAFETY: `data` points at `length` readable bytes until Unlock.
-            let bytes = unsafe { std::slice::from_raw_parts(data, length) };
-            for (y, target) in out.chunks_exact_mut(row).enumerate() {
-                let source_row = if bottom_up { height - 1 - y } else { y };
-                let start = source_row * stride;
-                target.copy_from_slice(&bytes[start..start + row]);
+        let mut wanted = None;
+        while self.next <= index {
+            let current = self.next;
+            let data = usize::try_from(current)
+                .ok()
+                .and_then(|position| self.pictures.get(position))
+                .map(|picture| picture.data.as_slice())
+                .ok_or_else(|| {
+                    format!(
+                        "{} holds {} complete pictures; picture {current} is missing",
+                        self.path.display(),
+                        self.pictures.len()
+                    )
+                })?;
+            let image = self.decoder.decode(data, current == index)?;
+            self.next += 1;
+            if current == index {
+                wanted = image;
             }
         }
-        let unlocked = unsafe { buffer.Unlock() }.map_err(hr("IMFMediaBuffer::Unlock"));
-        if data.is_null() || stride < row || stride * height > length {
-            return Err(format!(
-                "decoded buffer of {length} bytes is too small for {width}x{height} RGB32"
-            ));
-        }
-        unlocked?;
-        Ok(out)
+        let image = wanted
+            .ok_or_else(|| format!("{} gave no picture {index}", self.path.display()))?;
+        self.last = Some((index, image.clone()));
+        Ok(image)
     }
 }
 
-/// Compressed samples in file order, including timestamps and actual keyframe flags.
-pub(super) struct SampleTable {
-    samples: Vec<(i64, bool)>,
-}
-
-impl SampleTable {
-    pub(super) fn read(path: &Path) -> Result<Self, String> {
-        let _runtime = MediaFoundationRuntime::start()?;
-        let url = HSTRING::from(path.as_os_str());
-        // SAFETY: the native output type reads compressed samples without decoding.
-        let reader = unsafe { MFCreateSourceReaderFromURL(&url, None) }
-            .map_err(hr("MFCreateSourceReaderFromURL"))?;
-        let mut samples = Vec::new();
-        let mut empty_reads = 0;
-        loop {
-            let mut flags = 0_u32;
-            let mut timestamp = 0_i64;
-            let mut sample: Option<IMFSample> = None;
-            // SAFETY: the three out-parameters live through the call.
-            unsafe {
-                reader.ReadSample(
-                    video_stream(),
-                    0,
-                    None,
-                    Some(&raw mut flags),
-                    Some(&raw mut timestamp),
-                    Some(&raw mut sample),
-                )
-            }
-            .map_err(hr("IMFSourceReader::ReadSample"))?;
-            if flags & flag(MF_SOURCE_READERF_ERROR.0) != 0 {
-                return Err("the source reader reported a stream error".to_owned());
-            }
-            if let Some(sample) = sample {
-                if samples.len() == u32::MAX as usize {
-                    return Err("sample table exceeds the frame-number range".into());
-                }
-                // SAFETY: a plain query on the compressed sample.
-                let key =
-                    unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
-                samples.push((timestamp, key));
-                empty_reads = 0;
-            } else {
-                empty_reads += 1;
-            }
-            if flags & flag(MF_SOURCE_READERF_ENDOFSTREAM.0) != 0 {
-                return Ok(Self { samples });
-            }
-            if empty_reads >= MAX_EMPTY_READS {
-                return Err(format!(
-                    "sample table returned {MAX_EMPTY_READS} empty reads in a row"
-                ));
-            }
+/// Decodes a lossless WebP still to RGBA.
+fn decode_still(path: &Path) -> Result<RgbaImage, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let mut decoder = image_webp::WebPDecoder::new(std::io::BufReader::new(file))
+        .map_err(|error| format!("{} is not a readable WebP: {error}", path.display()))?;
+    let (width, height) = decoder.dimensions();
+    let size = decoder
+        .output_buffer_size()
+        .ok_or_else(|| format!("{} is too large to decode", path.display()))?;
+    let mut buffer = vec![0_u8; size];
+    decoder
+        .read_image(&mut buffer)
+        .map_err(|error| format!("could not decode {}: {error}", path.display()))?;
+    let rgba = if decoder.has_alpha() {
+        for pixel in buffer.chunks_exact_mut(RGB_BYTES + 1) {
+            pixel[RGB_BYTES] = OPAQUE;
         }
-    }
-
-    pub(super) fn len(&self) -> u32 {
-        self.samples.len() as u32
-    }
-
-    pub(super) fn key_frames(&self) -> Vec<KeyFrame> {
-        self.samples
-            .iter()
-            .enumerate()
-            .filter_map(|(frame, &(t_hns, key))| {
-                key.then_some(KeyFrame {
-                    frame: frame as u32,
-                    t_hns,
-                })
-            })
+        buffer
+    } else {
+        buffer
+            .chunks_exact(RGB_BYTES)
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], OPAQUE])
             .collect()
+    };
+    RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| format!("{} decoded to a buffer of the wrong size", path.display()))
+}
+
+/// One libaom AV1 decoder context.
+struct Av1Decoder {
+    context: Box<aom::aom_codec_ctx_t>,
+}
+
+impl Av1Decoder {
+    fn new() -> Result<Self, String> {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(MAX_DECODER_THREADS);
+        let config = aom::aom_codec_dec_cfg_t {
+            threads: c_uint::try_from(threads).unwrap_or(1),
+            w: 0,
+            h: 0,
+            allow_lowbitdepth: ALLOW_LOW_BIT_DEPTH,
+        };
+        // SAFETY: a plain C struct of pointers and integers; all-zero is its
+        // unset state, and `aom_codec_dec_init_ver` initialises it.
+        let mut context: Box<aom::aom_codec_ctx_t> = Box::new(unsafe { std::mem::zeroed() });
+        // SAFETY: the context and configuration live through the call; the
+        // ABI version is the one these bindings were generated for.
+        let code = unsafe {
+            aom::aom_codec_dec_init_ver(
+                &raw mut *context,
+                aom::aom_codec_av1_dx(),
+                &raw const config,
+                NO_DECODER_FLAGS,
+                aom::AOM_DECODER_ABI_VERSION as c_int,
+            )
+        };
+        if code != aom::AOM_CODEC_OK {
+            return Err(format!(
+                "aom_codec_dec_init_ver failed: libaom error {code}"
+            ));
+        }
+        Ok(Self { context })
+    }
+
+    /// Decodes one compressed picture. With `convert`, returns the picture it
+    /// produced as RGBA; otherwise only advances the decoder.
+    fn decode(&mut self, data: &[u8], convert: bool) -> Result<Option<RgbaImage>, String> {
+        // SAFETY: `data` is readable for `data.len()` bytes through the call.
+        let code = unsafe {
+            aom::aom_codec_decode(
+                &raw mut *self.context,
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        self.check(code, "aom_codec_decode")?;
+        let mut iterator: aom::aom_codec_iter_t = std::ptr::null();
+        let mut picture = None;
+        loop {
+            // SAFETY: the iterator starts null and is only advanced by libaom.
+            let image = unsafe { aom::aom_codec_get_frame(&raw mut *self.context, &raw mut iterator) };
+            if image.is_null() {
+                break;
+            }
+            if convert {
+                // SAFETY: libaom keeps the image valid until the next decode call.
+                picture = Some(i420_to_rgba(unsafe { &*image })?);
+            }
+        }
+        if convert && picture.is_none() {
+            return Err("the AV1 decoder returned no picture".to_owned());
+        }
+        Ok(picture)
+    }
+
+    fn check(&self, code: aom::aom_codec_err_t, step: &str) -> Result<(), String> {
+        if code == aom::AOM_CODEC_OK {
+            return Ok(());
+        }
+        // SAFETY: libaom returns a static or context-owned NUL-terminated string.
+        let text = unsafe { aom::aom_codec_error(&raw const *self.context) };
+        let text = if text.is_null() {
+            String::new()
+        } else {
+            // SAFETY: checked non-null above.
+            unsafe { CStr::from_ptr(text) }.to_string_lossy().into_owned()
+        };
+        Err(format!("{step} failed: libaom error {code} {text}"))
     }
 }
 
-fn create_reader(path: &Path) -> Result<IMFSourceReader, String> {
-    let mut attributes: Option<IMFAttributes> = None;
-    unsafe { MFCreateAttributes(&raw mut attributes, 1) }.map_err(hr("MFCreateAttributes"))?;
-    let attributes = attributes.ok_or("MFCreateAttributes returned no attribute store")?;
-    unsafe { attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1) }
-        .map_err(hr("MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING"))?;
-    let url = HSTRING::from(path.as_os_str());
-    let reader = unsafe { MFCreateSourceReaderFromURL(&url, &attributes) }
-        .map_err(hr("MFCreateSourceReaderFromURL"))?;
-    let output = unsafe { MFCreateMediaType() }.map_err(hr("MFCreateMediaType"))?;
-    unsafe {
-        output
-            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .map_err(hr("MF_MT_MAJOR_TYPE"))?;
-        output
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-            .map_err(hr("MF_MT_SUBTYPE"))?;
-        reader
-            .SetCurrentMediaType(video_stream(), None, &output)
-            .map_err(hr("IMFSourceReader::SetCurrentMediaType(RGB32)"))?;
+impl Drop for Av1Decoder {
+    fn drop(&mut self) {
+        // SAFETY: the context was initialised by `aom_codec_dec_init_ver`.
+        unsafe {
+            aom::aom_codec_destroy(&raw mut *self.context);
+        }
     }
-    Ok(reader)
 }
 
-const fn video_stream() -> u32 {
-    flag(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0)
+/// YUV to RGB coefficients in `FIXED_SHIFT` fixed point.
+struct YuvMatrix {
+    luma: i32,
+    luma_offset: i32,
+    red_v: i32,
+    green_u: i32,
+    green_v: i32,
+    blue_u: i32,
 }
 
-/// Media Foundation passes these i32 constants as u32 bit patterns.
-const fn flag(value: i32) -> u32 {
-    u32::from_ne_bytes(value.to_ne_bytes())
+/// BT.601 limited range: what the recorder's RGB to 4:2:0 conversion writes
+/// when the stream names no matrix (libaom's default is "unspecified").
+const BT601_LIMITED: YuvMatrix = YuvMatrix {
+    luma: 298,
+    luma_offset: 16,
+    red_v: 409,
+    green_u: -100,
+    green_v: -208,
+    blue_u: 516,
+};
+const BT709_LIMITED: YuvMatrix = YuvMatrix {
+    luma: 298,
+    luma_offset: 16,
+    red_v: 459,
+    green_u: -55,
+    green_v: -136,
+    blue_u: 541,
+};
+const BT601_FULL: YuvMatrix = YuvMatrix {
+    luma: 256,
+    luma_offset: 0,
+    red_v: 359,
+    green_u: -88,
+    green_v: -183,
+    blue_u: 454,
+};
+const BT709_FULL: YuvMatrix = YuvMatrix {
+    luma: 256,
+    luma_offset: 0,
+    red_v: 403,
+    green_u: -48,
+    green_v: -120,
+    blue_u: 475,
+};
+
+impl YuvMatrix {
+    /// The matrix the stream signals: BT.709 when named, else BT.601.
+    fn of(image: &aom::aom_image_t) -> &'static Self {
+        let full = image.range == aom::AOM_CR_FULL_RANGE;
+        match (image.mc == aom::AOM_CICP_MC_BT_709, full) {
+            (true, true) => &BT709_FULL,
+            (true, false) => &BT709_LIMITED,
+            (false, true) => &BT601_FULL,
+            (false, false) => &BT601_LIMITED,
+        }
+    }
+
+    fn rgba(&self, y: u8, u: u8, v: u8) -> [u8; 4] {
+        let luma = self.luma * (i32::from(y) - self.luma_offset) + FIXED_ROUND;
+        let (u, v) = (i32::from(u) - CHROMA_OFFSET, i32::from(v) - CHROMA_OFFSET);
+        let channel = |value: i32| u8::try_from((value >> FIXED_SHIFT).clamp(0, 255)).unwrap_or(OPAQUE);
+        [
+            channel(luma + self.red_v * v),
+            channel(luma + self.green_u * u + self.green_v * v),
+            channel(luma + self.blue_u * u),
+            OPAQUE,
+        ]
+    }
+}
+
+/// One plane of a decoded picture: its rows and stride.
+struct Plane<'a> {
+    bytes: &'a [u8],
+    stride: usize,
+}
+
+impl<'a> Plane<'a> {
+    /// Plane `plane` of `image`, `width` x `rows` samples.
+    fn of(image: &'a aom::aom_image_t, plane: u32, width: usize, rows: usize) -> Result<Self, String> {
+        let index = plane as usize;
+        let stride = image
+            .stride
+            .get(index)
+            .and_then(|stride| usize::try_from(*stride).ok())
+            .filter(|stride| *stride >= width)
+            .ok_or_else(|| format!("decoded plane {plane} has an invalid stride"))?;
+        let pointer = image
+            .planes
+            .get(index)
+            .copied()
+            .filter(|pointer| !pointer.is_null())
+            .ok_or_else(|| format!("decoded plane {plane} has no data"))?;
+        let length = stride * rows.saturating_sub(1) + width;
+        // SAFETY: libaom allocates `stride` bytes for each of the plane's
+        // rows; the last row is read only up to `width`.
+        let bytes = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
+        Ok(Self { bytes, stride })
+    }
+
+    fn row(&self, row: usize, width: usize) -> &'a [u8] {
+        let start = row * self.stride;
+        self.bytes.get(start..start + width).unwrap_or_default()
+    }
+}
+
+/// Converts an 8-bit 4:2:0 picture to RGBA (chroma by nearest sample).
+fn i420_to_rgba(image: &aom::aom_image_t) -> Result<RgbaImage, String> {
+    if image.fmt != aom::AOM_IMG_FMT_I420 {
+        return Err(format!(
+            "decoded picture format {} is not 8-bit 4:2:0",
+            image.fmt
+        ));
+    }
+    let (width, height) = (image.d_w as usize, image.d_h as usize);
+    let (x_shift, y_shift) = (image.x_chroma_shift, image.y_chroma_shift);
+    let chroma_width = (width + (1 << x_shift) - 1) >> x_shift;
+    let chroma_rows = (height + (1 << y_shift) - 1) >> y_shift;
+    let luma = Plane::of(image, aom::AOM_PLANE_Y, width, height)?;
+    let blue = Plane::of(image, aom::AOM_PLANE_U, chroma_width, chroma_rows)?;
+    let red = Plane::of(image, aom::AOM_PLANE_V, chroma_width, chroma_rows)?;
+    let matrix = YuvMatrix::of(image);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let luma_row = luma.row(y, width);
+        let (u_row, v_row) = (
+            blue.row(y >> y_shift, chroma_width),
+            red.row(y >> y_shift, chroma_width),
+        );
+        for (x, &sample) in luma_row.iter().enumerate() {
+            let chroma = x >> x_shift;
+            let u = u_row.get(chroma).copied().unwrap_or(NEUTRAL_CHROMA);
+            let v = v_row.get(chroma).copied().unwrap_or(NEUTRAL_CHROMA);
+            rgba.extend_from_slice(&matrix.rgba(sample, u, v));
+        }
+    }
+    RgbaImage::from_raw(image.d_w, image.d_h, rgba)
+        .ok_or_else(|| "a decoded picture converted to a buffer of the wrong size".to_owned())
 }

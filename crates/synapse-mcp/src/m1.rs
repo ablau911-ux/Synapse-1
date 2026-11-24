@@ -522,13 +522,20 @@ pub struct ClipViewResponse {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Instants in the clip (one `frames.jsonl` line each).
     pub frames_total: u64,
+    /// Instants whose picture changed (`enc` lines: encoded video pictures).
     pub frames_new: u64,
-    /// `clip_overview`: changes, static stretches and gaps in time order.
+    /// `clip_overview` (page 1): changed stretches, settle points (exact
+    /// stills), unchanged stretches and lost ranges in time order, read from
+    /// `frames.jsonl` without decoding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timeline: Vec<ClipTimelineEntry>,
     /// The images returned with this call, in content order.
     pub images: Vec<ClipViewImage>,
+    /// Asked-for instants that were lost: no picture is returned for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lost: Vec<ClipLostInstant>,
     /// `clip_diff`: changed regions (merged 8x8 blocks) in clip pixels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<ClipChangedRegion>,
@@ -545,15 +552,15 @@ pub struct ClipViewResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ClipTimelineEntry {
-    /// `change`, `short_lived`, `static` or `minimized`.
+    /// `change`, `settled`, `static` or `lost`.
     pub kind: String,
     pub start_ms: u64,
     pub end_ms: u64,
     pub start_frame: u64,
     pub end_frame: u64,
-    /// Changed 8x8 blocks over the whole change (0 for `static`/`minimized`).
+    /// `change`: changed pictures in the stretch; 0 for the other kinds.
     pub changed_blocks: u64,
-    /// Bounding box of the changed blocks, in clip pixels.
+    /// Not set by the index timeline (kept for the response shape).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox: Option<Rect>,
     pub text: String,
@@ -566,12 +573,35 @@ pub struct ClipViewImage {
     pub index: u32,
     pub t_ms: u64,
     pub frame: u64,
+    /// What the picture is: `exact still` (the window's exact pixels) or
+    /// `video` (decoded AV1, video quality). Lost instants have no image.
+    pub kind: String,
+    /// The instant whose recorded picture is shown (equal to `frame` unless
+    /// the picture was unchanged since an earlier instant).
+    pub shown_frame: u64,
     pub reason: String,
     pub label: String,
     /// Labelled PNG copy written under `<clip folder>\views\`.
     pub path: String,
     pub width: u32,
     pub height: u32,
+}
+
+/// An asked-for instant that holds no recorded picture.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ClipLostInstant {
+    /// Always `lost`.
+    pub kind: String,
+    pub frame: u64,
+    pub t_ms: u64,
+    /// Why nothing was recorded (the `lost` cause in `frames.jsonl`).
+    pub cause: String,
+    /// The nearest earlier instant with a recorded picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_before: Option<u64>,
+    /// The nearest later instant with a recorded picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_after: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -684,7 +714,8 @@ pub struct ClipStatusResponse {
     /// Bytes held in exact frame groups.
     pub exact_bytes: u64,
     pub segments: Vec<ClipSegmentInfo>,
-    /// The `conditions` block of `clip.json` so far (C, G, Q, B, T).
+    /// The `conditions` block of `clip.json` so far (`capture`, `geometry`,
+    /// `quality`, `totals`).
     pub conditions: serde_json::Value,
 }
 

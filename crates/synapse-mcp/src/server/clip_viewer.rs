@@ -1,112 +1,109 @@
 //! Clip viewer: `screenshot operation=clip_overview | clip_frames | clip_frame
-//! | clip_diff` (docs/clip-recorder-plan.md, version 4.1, section D).
+//! | clip_diff` (docs/clip-recorder-plan-5.0.md, section 5).
 //!
-//! Agents cannot watch video, so a clip folder is read back as a text timeline
-//! plus a few labelled PNG frames:
+//! The reader of a clip is an AI model, so a clip folder is read back as a
+//! text timeline plus a few labelled PNG pictures, and every answer is true
+//! to what was recorded:
 //!
-//! - `clip_overview`: the change timeline (page 1 only) and key frames, as many
-//!   per page as the token budget allows (D6).
-//! - `clip_frames`: frames in a time range, as many as the call budget allows.
-//! - `clip_frame`: one frame at recorded pixels, optional crop and ×2 close-up.
-//! - `clip_diff`: changed regions between two times plus one before/after crop.
-//!
-//! D1: a clip is a list of committed segments (`segment-NNNN.mp4`) with
-//! frames at uneven times; `frames.jsonl` has one line per instant k, and
-//! instant k of a segment plays at k / f minus the segment's start. D4: only
-//! committed segments are shown; a part still waiting is refused with the
-//! count of frames waiting.
-//!
-//! Frame choice: `frames.jsonl` `new` flags skip repeated frames without
-//! comparing them; new frames are compared block by block (8 × 8, recorded
-//! resolution) by the D5 equation: a two-threshold block test set from the
-//! measured encoder noise; each block against its anchor, its last settled
-//! picture; a block back at its anchor within `SHORT_LIVED_MS` is a FLASH, a
-//! block that keeps changing animates; block changes with the same outcome
-//! join into events. The logged cursor is masked when Windows drew it into
-//! the picture, and a blinking caret is ignored.
+//! - every picture says what it is: `exact still` (a lossless still of a
+//!   settle point: the window's exact pixels) or `video` (a decoded AV1
+//!   picture: video quality); a `lost` instant is never returned as a picture,
+//!   the answer names the loss, its cause and the nearest recorded instants;
+//! - `clip_overview`: the timeline straight from `frames.jsonl` (changed
+//!   stretches, settle points, unchanged stretches, lost ranges; nothing is
+//!   decoded for it) and key pictures spread over the whole clip on every
+//!   page;
+//! - `clip_frames`: pictures in a time range, as many as the call budget
+//!   allows; unchanged repeats are named, not sent again;
+//! - `clip_frame`: one picture at recorded pixels, optional crop and x2
+//!   close-up;
+//! - `clip_diff`: changed regions between two exact stills. Change analysis
+//!   on video is not measured yet (plan open item O2), so video pictures are
+//!   not compared.
 //!
 //! Every image is a labelled PNG copy in the clip's `views` folder (the clip
-//! files stay untouched). All decoding and image work runs on a blocking
-//! thread, never on the async worker.
+//! files stay untouched); the label sits in a band above the picture, never
+//! over it. All decoding and image work runs on a blocking thread.
 
-use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
+use image::RgbaImage;
 use rmcp::model::{CallToolResult, Content};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use synapse_core::{Rect, error_codes};
 
 use super::ErrorData;
-use super::clip_decoder::{ClipDecoder, DecodedFrame};
-use super::clip_exact::{ExactEntry, ExactReader};
+use super::clip_decoder::{ClipDecoder, ClipPicture, PictureKind, PictureSource};
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipState, CommittedSegment, FRAMES_FILE, FrameLine, VIEWS_DIR,
-    read_frame_lines,
+    CLIP_JSON_FILE, CLIP_METHOD, CLIP_SCHEMA_VERSION, ClipJson, ClipState, FRAMES_FILE, IndexLine,
+    STILLS_DIR, VIDEO_DIR, VIEWS_DIR, read_index,
 };
-use super::clip_motion::{
-    BLOCK, BlockGrid as Grid, MotionTiming, MotionWindow, PixelRect, SHORT_LIVED_MS,
-};
+use super::clip_stream::SETTLE_INSTANTS;
 use crate::m1::clip_view_limits::{MAX_FRAMES_FPS, MIN_CROP_SHORT_SIDE};
 use crate::m1::{
-    ClipChangedRegion, ClipTimelineEntry, ClipViewImage, ClipViewParams, ClipViewResponse,
-    ScreenshotOperation, ScreenshotResponse, mcp_error,
+    ClipChangedRegion, ClipLostInstant, ClipTimelineEntry, ClipViewImage, ClipViewParams,
+    ClipViewResponse, ScreenshotOperation, ScreenshotResponse, mcp_error,
 };
 
-/// N: upper bound on images per call; the token budget may allow fewer (D6).
+/// N: upper bound on images per call; the token budget may allow fewer.
 const MAX_IMAGES_PER_CALL: usize = 8;
-/// Image ceiling: standard-tier Claude models downsize anything larger (S4).
+/// Default image long edge: standard-tier Claude models downsize anything
+/// larger. `max_long_edge` overrides it.
 const VIEW_MAX_LONG_EDGE: u32 = 1_568;
-/// σ_v lower bound: overview images keep at least this share of the window
-/// size (h_leg / h_text = 9 / 12).
-const OVERVIEW_MIN_SCALE: f64 = 0.75;
-/// Token budget of the overview's images and of its text (S4).
+/// Below this share of the window size small text may become unreadable.
+const READABLE_MIN_SCALE: f64 = 0.75;
+/// Token budget of the overview's images and of its text.
 const OVERVIEW_IMAGE_TOKEN_BUDGET: u64 = 20_000;
 const OVERVIEW_TEXT_TOKEN_BUDGET: u64 = 4_000;
-/// Token budget of every other viewer call (S4).
+/// Token budget of every other viewer call.
 const CALL_TOKEN_BUDGET: u64 = 10_000;
-/// The equation's token formula: tokens = N · w_v · h_v / 770 + 1500.
+/// The token formula: tokens = N · w_v · h_v / 770 + 1500.
 const PIXELS_PER_TOKEN: u64 = 770;
 const RESPONSE_TEXT_TOKENS: u64 = 1_500;
 /// Characters per token when the timeline text is held to its budget.
 const TEXT_CHARS_PER_TOKEN: usize = 4;
-/// Close-ups enlarge by whole-number duplication (D3).
+/// Close-ups enlarge by whole-number duplication.
 const CLOSEUP_SCALE: u32 = 2;
+const MS_PER_SECOND: u64 = 1_000;
 
-/// Exact pixels need only the retained viewer threshold.
-const DELTA_LO: u8 = 32;
-/// A block has settled after this long the same: K_s = SETTLE_MS · f / 1000.
-const SETTLE_MS: u64 = 200;
-/// Block changes with the same outcome and overlapping intervals form one
-/// event across at most this many empty blocks (columns, rows): wide along a
-/// row, so the changed words of one text line are one event, and two blocks
-/// between rows (the line gap of a text block) (D5 step 4).
-const REGION_GAP_BLOCKS: (usize, usize) = (24, 2);
-/// The box masked around the logged cursor, in window pixels (D5 step 5).
-const CURSOR_MASK_PX: u32 = 48;
-/// A caret (D5 step 5): a change at most this wide and this tall, in window
-/// pixels, that alternates between two pictures for at least this many
-/// cycles with a half-period in this range (the Windows default is 530 ms).
-const CARET_MAX_WIDTH_PX: u32 = 3;
-const CARET_HEIGHT_PX: std::ops::RangeInclusive<u32> = 8..=48;
-const CARET_MIN_CYCLES: usize = 2;
-const CARET_HALF_PERIOD_MS: std::ops::RangeInclusive<u64> = 400..=700;
-/// At least one key frame per this interval.
+/// At least one key picture per this interval in the overview.
 const FLOOR_INTERVAL_MS: u64 = 10_000;
 /// Unchanged stretches at least this long are listed in the timeline.
 const STATIC_REPORT_MS: u64 = 1_000;
+
+/// `clip_diff`: blocks of this many pixels a side; changed blocks within
+/// this many empty blocks (columns, rows) join one region: wide along a
+/// row, so the changed words of one text line are one region, and two
+/// blocks between rows (the line gap of a text block).
+const BLOCK_PX: usize = 8;
+const REGION_GAP_BLOCKS: (usize, usize) = (24, 2);
 /// Padding around the changed area in the `clip_diff` crop.
 const CROP_PADDING: i32 = 16;
 const MAX_DIFF_REGIONS: usize = 20;
+const PERCENT: u64 = 100;
+const RGBA_BYTES: usize = 4;
+const RGB_BYTES: usize = 3;
 
-/// Cached overview analysis, so later pages skip the full decode.
-const ANALYSIS_FILE: &str = "overview_analysis.json";
-const ANALYSIS_VERSION: u32 = 14;
+/// The label band above every picture: glyph unit 3 px on pictures whose
+/// short side is at least this long, else 2 px.
+const LARGE_LABEL_MIN_PX: u32 = 600;
+const LARGE_LABEL_UNIT: u32 = 3;
+const SMALL_LABEL_UNIT: u32 = 2;
+const GLYPH_ROWS: u32 = 5;
+const GLYPH_COLUMNS: u32 = 3;
+/// A glyph advances by its 3 columns plus one blank column.
+const GLYPH_ADVANCE: u32 = 4;
+const LABEL_BACKGROUND: image::Rgba<u8> = image::Rgba([20, 20, 20, 255]);
+const LABEL_INK: image::Rgba<u8> = image::Rgba([255, 255, 255, 255]);
+const OUTLINE_RED: image::Rgba<u8> = image::Rgba([230, 30, 30, 255]);
+const OUTLINE_PX: i64 = 2;
+const DIVIDER_GREY: image::Rgba<u8> = image::Rgba([128, 128, 128, 255]);
+const DIVIDER_PX: u32 = 8;
 
-/// Runs a `clip_*` operation and builds the tool result: the response JSON as
-/// structured content, then a text timeline, then `Image k` label + PNG pairs.
+/// Runs a `clip_*` operation and builds the tool result: the text answer,
+/// the response JSON, then `Image k` label + PNG pairs.
 pub(super) async fn screenshot_clip_view_result(
     params: ClipViewParams,
 ) -> Result<CallToolResult, ErrorData> {
@@ -149,7 +146,7 @@ struct ViewOutput {
 
 fn run_view(params: &ClipViewParams) -> Result<ViewOutput, ErrorData> {
     let clip = ViewedClip::open(Path::new(&params.folder))?;
-    let mut view = ClipView::new(clip)?;
+    let mut view = ClipView::new(clip);
     match params.operation {
         ScreenshotOperation::ClipOverview => view.overview(params)?,
         ScreenshotOperation::ClipFrames => view.frames(params)?,
@@ -168,16 +165,50 @@ fn run_view(params: &ClipViewParams) -> Result<ViewOutput, ErrorData> {
 // Clip folder
 // ---------------------------------------------------------------------------
 
-/// A clip folder as the viewer reads it: `clip.json`, one line per instant,
-/// and the committed segments (D1).
+/// Refuses any folder that is not a plan 5.0 clip, naming the format it
+/// holds, before the typed `clip.json` is read.
+fn check_format(folder: &Path) -> Result<(), ErrorData> {
+    let path = folder.join(CLIP_JSON_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|error| {
+        params_invalid(format!(
+            "{} is not a readable clip folder: could not read {}: {error}",
+            folder.display(),
+            path.display()
+        ))
+    })?;
+    let header: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        params_invalid(format!("{} is not valid JSON: {error}", path.display()))
+    })?;
+    let version = header.get("schema_version").and_then(serde_json::Value::as_u64);
+    let method = header.get("method").and_then(serde_json::Value::as_str);
+    if version == Some(u64::from(CLIP_SCHEMA_VERSION)) && method == Some(CLIP_METHOD) {
+        return Ok(());
+    }
+    let format = match (header.get("way").and_then(serde_json::Value::as_str), method) {
+        (Some(way), _) => format!(
+            "the older {way} format (exact zstd rows under frames/ plus H.264 segments under moving/)"
+        ),
+        (None, Some(method)) => format!("the format {method}"),
+        (None, None) => "an unknown format".to_owned(),
+    };
+    let version = version.map_or_else(|| "missing".to_owned(), |version| version.to_string());
+    Err(params_invalid(format!(
+        "{} holds a clip in {format}, schema_version {version}; this viewer reads only the {CLIP_METHOD} format (schema_version {CLIP_SCHEMA_VERSION}: {VIDEO_DIR}/part-NNNN.ivf, {STILLS_DIR}/still-NNNNNNNN.webp, {FRAMES_FILE}); record the clip again",
+        folder.display()
+    )))
+}
+
+/// A clip folder as the viewer reads it: `clip.json` and one index line per
+/// instant. It owns the timeline read from the index.
 struct ViewedClip {
     folder: PathBuf,
     clip: ClipJson,
-    lines: Vec<FrameLine>,
+    lines: Vec<IndexLine>,
 }
 
 impl ViewedClip {
     fn open(folder: &Path) -> Result<Self, ErrorData> {
+        check_format(folder)?;
         let clip = ClipJson::read(folder).map_err(|error| {
             params_invalid(format!(
                 "{} is not a readable clip folder: {error}",
@@ -187,113 +218,92 @@ impl ViewedClip {
         if clip.fps == 0 {
             return Err(params_invalid(format!("{CLIP_JSON_FILE} has fps 0")));
         }
-        let lines = read_frame_lines(folder)
+        if clip.state == ClipState::Recording {
+            return Err(params_invalid(format!(
+                "clip {} is still recording; wait for record_status to report ready",
+                clip.clip_id
+            )));
+        }
+        let lines = read_index(folder)
             .map_err(|error| params_invalid(format!("{FRAMES_FILE} is not readable: {error}")))?;
         if lines.is_empty() {
             return Err(params_invalid(format!("{FRAMES_FILE} lists no instants")));
         }
-        let viewed = Self {
+        if let Some(line) = lines.iter().find(|line| marks(line) != 1) {
+            return Err(params_invalid(format!(
+                "{FRAMES_FILE} line of instant {} must hold exactly one of enc, same and lost; it is not the {CLIP_METHOD} format",
+                line.instant
+            )));
+        }
+        Ok(Self {
             folder: folder.to_path_buf(),
             clip,
             lines,
-        };
-        if viewed.clip.state != ClipState::Ready {
-            return Err(viewed.waiting_error(0));
-        }
-        Ok(viewed)
+        })
     }
 
     fn fps(&self) -> u64 {
         u64::from(self.clip.fps)
     }
 
-    /// The last instant that is in a committed segment.
-    fn last_frame(&self) -> u64 {
+    fn last_instant(&self) -> u64 {
         self.lines.last().map_or(0, |line| line.instant)
     }
 
     /// Time of instant k: k / f.
-    fn t_of(&self, frame: u64) -> u64 {
-        frame * 1_000 / self.fps()
+    fn t_of(&self, instant: u64) -> u64 {
+        instant * MS_PER_SECOND / self.fps()
     }
 
     /// The instant on screen at `t_ms`.
-    fn frame_at_ms(&self, t_ms: u64) -> u64 {
-        (t_ms * self.fps() / 1_000).min(self.last_frame())
+    fn instant_at_ms(&self, t_ms: u64) -> u64 {
+        (t_ms * self.fps() / MS_PER_SECOND).min(self.last_instant())
     }
 
-    fn line(&self, frame: u64) -> Option<&FrameLine> {
-        usize::try_from(frame)
-            .ok()
-            .and_then(|index| self.lines.get(index))
-    }
-
-    fn is_new(&self, frame: u64) -> bool {
-        self.line(frame).is_some_and(FrameLine::shows_new_picture)
-    }
-
-    /// `true` when no new frame arrived in `(from, to]`: same picture.
-    fn same_picture(&self, from: u64, to: u64) -> bool {
-        (from + 1..=to).all(|frame| !self.is_new(frame))
-    }
-
-    /// The viewable length: up to the end of the last committed segment.
     fn duration_ms(&self) -> u64 {
-        self.t_of(self.last_frame() + 1)
+        self.t_of(self.last_instant() + 1)
     }
 
-    /// The whole recorded length, committed or not.
-    fn recorded_ms(&self) -> u64 {
-        self.t_of(self.lines.len() as u64)
+    fn size(&self) -> (u32, u32) {
+        (
+            self.clip.geometry.recorded_width,
+            self.clip.geometry.recorded_height,
+        )
     }
 
-    fn scale_at(&self, _frame: u64) -> u32 {
-        1
+    fn changed_count(&self) -> u64 {
+        self.lines.iter().filter(|line| line.enc.is_some()).count() as u64
     }
 
-    fn waiting_error(&self, t_ms: u64) -> ErrorData {
-        params_invalid(format!(
-            "{t_ms} ms is not viewable: clip state {}; wait for record_status to report ready",
-            self.clip.state.as_str()
-        ))
-    }
-
-    /// Size and modified time of the files the overview is computed from; a
-    /// cached overview is reused only while this is unchanged (also when a new
-    /// segment is committed).
-    fn fingerprint(&self) -> String {
-        let mut names = vec![FRAMES_FILE.to_owned(), CLIP_JSON_FILE.to_owned()];
-        names.extend(
-            self.clip
-                .moving
-                .segments
-                .iter()
-                .map(|segment| segment.segment.file.clone()),
-        );
-        let groups: std::collections::BTreeSet<_> = self
-            .lines
+    fn still_instants(&self) -> impl Iterator<Item = u64> + '_ {
+        self.lines
             .iter()
-            .filter_map(|line| line.exact.map(|x| x.group))
-            .collect();
-        names.extend(
-            groups
-                .into_iter()
-                .map(|group| format!("frames/group-{group:06}.zst")),
-        );
-        names
-            .iter()
-            .map(|name| {
-                let metadata = std::fs::metadata(self.folder.join(name)).ok();
-                let modified = metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |since| since.as_nanos());
-                let size = metadata.map_or(0, |metadata| metadata.len());
-                format!("{name}:{size}:{modified}")
-            })
-            .collect::<Vec<_>>()
-            .join(";")
+            .filter(|line| line.still == Some(true))
+            .map(|line| line.instant)
+    }
+
+    fn source(&self, instant: u64) -> Result<PictureSource, ErrorData> {
+        PictureSource::resolve(&self.folder, &self.lines, instant).map_err(decode_error)
+    }
+
+    fn is_recorded(&self, instant: u64) -> bool {
+        self.source(instant)
+            .is_ok_and(|source| source.shown_instant().is_some())
+    }
+
+    /// The nearest instants before and after `instant` that show a picture.
+    fn nearest_recorded(&self, instant: u64) -> (Option<u64>, Option<u64>) {
+        let before = (0..instant).rev().find(|k| self.is_recorded(*k));
+        let after = (instant + 1..=self.last_instant()).find(|k| self.is_recorded(*k));
+        (before, after)
+    }
+
+    /// The nearest settle points (instants with an exact still) at or
+    /// before and after `instant`.
+    fn settle_points_around(&self, instant: u64) -> (Option<u64>, Option<u64>) {
+        let before = self.still_instants().filter(|k| *k <= instant).last();
+        let after = self.still_instants().find(|k| *k > instant);
+        (before, after)
     }
 
     fn views_dir(&self) -> Result<PathBuf, ErrorData> {
@@ -303,27 +313,19 @@ impl ViewedClip {
         Ok(views)
     }
 
-    /// The largest recorded size among the committed segments.
-    fn largest_recorded(&self) -> (u32, u32) {
-        self.lines.iter().fold((0, 0), |(w, h), line| {
-            (w.max(line.width), h.max(line.height))
-        })
-    }
-
-    /// D2: the long edge of overview and range images: at least
-    /// `OVERVIEW_MIN_SCALE` of the window size, at most `VIEW_MAX_LONG_EDGE`.
-    /// The second value is `true` when the ceiling cuts below the floor.
+    /// The long edge of overview and range images: `max_long_edge` when
+    /// given, else `VIEW_MAX_LONG_EDGE`. The second value is `true` when it
+    /// shrinks the window below `READABLE_MIN_SCALE`.
     fn view_long_edge(&self, requested: Option<u32>) -> (u32, bool) {
-        let (width, height) = self.largest_recorded();
-        let window_long = width.max(height);
-        let floor = (f64::from(window_long) * OVERVIEW_MIN_SCALE).ceil() as u32;
-        let wanted = requested.unwrap_or(VIEW_MAX_LONG_EDGE).max(floor);
-        (wanted.min(VIEW_MAX_LONG_EDGE), floor > VIEW_MAX_LONG_EDGE)
+        let (width, height) = self.size();
+        let long_edge = requested.unwrap_or(VIEW_MAX_LONG_EDGE);
+        let readable = (f64::from(width.max(height)) * READABLE_MIN_SCALE).ceil();
+        (long_edge, f64::from(long_edge) < readable)
     }
 
-    /// D6: images per call so that N · w_v · h_v / 770 stays inside `budget`.
+    /// Images per call so that N · w_v · h_v / 770 stays inside `budget`.
     fn images_per_call(&self, long_edge: u32, budget: u64) -> usize {
-        let (width, height) = self.largest_recorded();
+        let (width, height) = self.size();
         let long = width.max(height).max(1);
         let factor = f64::from(long_edge.min(long)) / f64::from(long);
         let pixels = (f64::from(width) * factor) * (f64::from(height) * factor);
@@ -331,1278 +333,217 @@ impl ViewedClip {
         ((budget as f64 / per_image) as usize).clamp(1, MAX_IMAGES_PER_CALL)
     }
 
-    /// The cursor of instant k in recorded pixels, when Windows drew it into
-    /// the picture (E9: otherwise it is not in the frames).
-    fn cursor_at(&self, frame: u64) -> Option<(i64, i64)> {
-        if !self.clip.observer.cursor_in_picture {
-            return None;
-        }
-        let [x, y] = self.line(frame)?.cursor?;
-        let scale = i64::from(self.scale_at(frame));
-        Some((i64::from(x) * scale, i64::from(y) * scale))
-    }
-}
-
-/// Reconstructs exact pixels, then overlays the numbered sample of the same instant.
-struct ClipPictures {
-    folder: PathBuf,
-    exact: ExactReader,
-    lines: Vec<FrameLine>,
-    segments: Vec<CommittedSegment>,
-    lost: std::collections::BTreeSet<u64>,
-    decoder: Option<(u32, ClipDecoder)>,
-    fps: u32,
-}
-impl ClipPictures {
-    fn new(clip: &ViewedClip) -> Result<Self, ErrorData> {
-        let entries = clip
-            .lines
-            .iter()
-            .filter_map(|line| {
-                let exact = line.exact?;
-                let size = std::fs::metadata(
-                    clip.folder
-                        .join(format!("frames/group-{:06}.zst", exact.group)),
-                )
-                .ok()?
-                .len();
-                (exact.offset + u64::from(exact.bytes) <= size).then_some(ExactEntry {
-                    instant: line.instant,
-                    exact,
-                    width: line.width,
-                    height: line.height,
-                })
-            })
-            .collect();
-        Ok(Self {
-            folder: clip.folder.clone(),
-            exact: ExactReader::open(&clip.folder, entries).map_err(decode_error)?,
-            lines: clip.lines.clone(),
-            segments: clip.clip.moving.segments.clone(),
-            lost: clip.clip.lost.iter().map(|l| l.instant).collect(),
-            decoder: None,
-            fps: clip.clip.fps,
-        })
-    }
-    fn at(&mut self, instant: u64) -> Result<DecodedFrame, ErrorData> {
-        const BGRA: usize = 4;
-        const BGR: usize = 3;
-        const HNS: u64 = 10_000_000;
-        let line = self
-            .lines
-            .get(instant as usize)
-            .ok_or_else(|| params_invalid("instant outside clip".into()))?;
-        let (exact, width, height) = self.exact.picture_at(instant).map_err(decode_error)?;
-        let mut bgra: Vec<u8> = exact
-            .chunks_exact(BGR)
-            .flat_map(|p| [p[0], p[1], p[2], u8::MAX])
-            .collect();
-        if !self.lost.contains(&instant)
-            && let Some(reference) = line.moving
-            && let Some(committed) = self.segments.iter().find(|s| {
-                s.segment.index == reference.segment && reference.frame < s.segment.frames
-            })
-        {
-            let segment = &committed.segment;
-            if self.folder.join(&segment.file).is_file() {
-                if self
-                    .decoder
-                    .as_ref()
-                    .is_none_or(|(index, _)| *index != segment.index)
-                {
-                    self.decoder = Some((
-                        segment.index,
-                        ClipDecoder::open(&self.folder.join(&segment.file))
-                            .map_err(decode_error)?,
-                    ));
-                }
-                let moving = self
-                    .decoder
-                    .as_mut()
-                    .ok_or_else(|| internal("decoder unavailable".into()))?
-                    .1
-                    .frame_number(reference.frame, &segment.key_frames)
-                    .map_err(decode_error)?;
-                let rect = segment.rect;
-                if rect.right() > width
-                    || rect.bottom() > height
-                    || moving.width < rect.w
-                    || moving.height < rect.h
-                {
-                    return Err(decode_error(
-                        "moving rectangle does not fit its pictures".into(),
-                    ));
-                }
-                for row in 0..rect.h as usize {
-                    let source = row * moving.width as usize * BGRA;
-                    let destination =
-                        ((row + rect.y as usize) * width as usize + rect.x as usize) * BGRA;
-                    let bytes = rect.w as usize * BGRA;
-                    bgra[destination..destination + bytes]
-                        .copy_from_slice(&moving.bgra[source..source + bytes]);
-                }
-            }
-        }
-        Ok(DecodedFrame {
-            t_hns: (instant * HNS / u64::from(self.fps)) as i64,
-            width,
-            height,
-            bgra,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Change test (D5 step 1: the block test from the measured noise)
-// ---------------------------------------------------------------------------
-
-/// The pixel test: the largest R, G or B difference of two pixels.
-fn pixel_delta(a: &[u8], b: &[u8]) -> u8 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| x.abs_diff(*y))
-        .max()
-        .unwrap_or(0)
-}
-
-#[derive(Clone)]
-struct Picture {
-    grid: Grid,
-    rgb: Vec<u8>,
-}
-
-impl Picture {
-    fn new(frame: &DecodedFrame) -> Self {
-        Self {
-            grid: Grid::new(frame.width as usize, frame.height as usize),
-            rgb: frame
-                .bgra
-                .chunks_exact(4)
-                .flat_map(|px| [px[2], px[1], px[0]])
-                .collect(),
-        }
-    }
-
-    /// D5 step 1 for block `b` of this picture and of `other` (same size).
-    fn test(&self, other: &Self, b: usize) -> bool {
-        self.grid.differs(&self.rgb, &other.rgb, b, DELTA_LO)
-    }
-
-    /// A copy of the pixels of block `b`, row after row.
-    fn block(&self, b: usize) -> Vec<u8> {
-        self.grid
-            .rows_of(b)
-            .flat_map(|row| self.rgb.get(row).unwrap_or_default().iter().copied())
-            .collect()
-    }
-
-    /// Copies block `b` from `other` (same size).
-    fn copy_block(&mut self, other: &Self, b: usize) {
-        for row in self.grid.rows_of(b) {
-            if let (Some(to), Some(from)) = (self.rgb.get_mut(row.clone()), other.rgb.get(row)) {
-                to.copy_from_slice(from);
-            }
-        }
-    }
-
-    /// The box of the pixels of block `b` that differ from `other` by more
-    /// than δ_lo: x0, y0, x1, y1 (inclusive, recorded pixels).
-    fn footprint(&self, other: &Self, b: usize) -> Option<(usize, usize, usize, usize)> {
-        let (x0, y0, ..) = self.grid.span(b);
-        let mut bounds: Option<(usize, usize, usize, usize)> = None;
-        for (y, row) in (y0..).zip(self.grid.rows_of(b)) {
-            let mine = self.rgb.get(row.clone()).unwrap_or_default();
-            let theirs = other.rgb.get(row).unwrap_or_default();
-            for (x, (a, c)) in (x0..).zip(mine.chunks_exact(3).zip(theirs.chunks_exact(3))) {
-                if pixel_delta(a, c) > DELTA_LO {
-                    bounds = Some(bounds.map_or((x, y, x, y), |(a0, b0, a1, b1)| {
-                        (a0.min(x), b0.min(y), a1.max(x), b1.max(y))
-                    }));
-                }
-            }
-        }
-        bounds
-    }
-}
-
-/// Which blocks differ between two pictures of the same size (`clip_diff`).
-struct BlockMap {
-    grid: Grid,
-    changed: Vec<bool>,
-    count: u64,
-}
-
-impl BlockMap {
-    fn between(before: &Picture, after: &Picture) -> Self {
-        let changed: Vec<bool> = (0..after.grid.blocks())
-            .map(|b| after.test(before, b))
-            .collect();
-        let count = changed.iter().filter(|flag| **flag).count() as u64;
-        Self {
-            grid: after.grid,
-            changed,
-            count,
-        }
-    }
-
-    /// The changed blocks, as indices.
-    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.changed
-            .iter()
-            .enumerate()
-            .filter_map(|(index, flag)| flag.then_some(index))
-    }
-
-    fn percent(&self) -> f64 {
-        self.grid.percent(self.count)
-    }
-
-    fn bbox(&self) -> Option<Rect> {
-        self.grid.bbox(self.indices()).map(view_rect)
-    }
-
-    /// Connected groups of changed blocks (8-neighbour), largest first, as
-    /// rectangles.
-    fn regions(&self) -> Vec<ClipChangedRegion> {
-        let mut seen = vec![false; self.changed.len()];
-        let mut regions = Vec::new();
-        for start in self.indices() {
-            if seen[start] {
-                continue;
-            }
-            seen[start] = true;
-            let (mut stack, mut group) = (vec![start], Vec::new());
-            while let Some(b) = stack.pop() {
-                group.push(b);
-                let (col, row) = self.grid.place(b);
-                for near_row in row.saturating_sub(1)..=(row + 1).min(self.grid.rows - 1) {
-                    for near_col in col.saturating_sub(1)..=(col + 1).min(self.grid.cols - 1) {
-                        let next = near_row * self.grid.cols + near_col;
-                        if self.changed[next] && !seen[next] {
-                            seen[next] = true;
-                            stack.push(next);
-                        }
-                    }
-                }
-            }
-            if let Some(rect) = self.grid.bbox(group.iter().copied()) {
-                let rect = view_rect(rect);
-                regions.push(ClipChangedRegion {
-                    rect,
-                    changed_blocks: group.len() as u64,
-                });
-            }
-        }
-        regions.sort_by_key(|region| std::cmp::Reverse(region.changed_blocks));
-        regions
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Overview analysis (D5 steps 2 to 6)
-// ---------------------------------------------------------------------------
-
-/// D5's times in instants of the clip (f instants per second).
-#[derive(Clone, Copy)]
-struct Instants {
-    /// K_s = SETTLE_MS · f / 1000.
-    settle: u64,
-    motion: MotionTiming,
-}
-
-impl Instants {
-    fn of(clip: &ViewedClip) -> Self {
-        let per_ms = |ms: u64| (ms * clip.fps() / 1_000).max(1);
-        Self {
-            settle: per_ms(SETTLE_MS),
-            motion: MotionTiming::of(clip.clip.fps),
-        }
-    }
-}
-
-/// The pictures shown in the last K_s instants, each with the instant it was
-/// first shown, the newest last: a block settles against them (D5 step 2).
-struct Recent {
-    pictures: VecDeque<(u64, Picture)>,
-    settle: u64,
-}
-
-impl Recent {
-    fn latest(&self) -> Option<&(u64, Picture)> {
-        self.pictures.back()
-    }
-
-    fn restart(&mut self, instant: u64, picture: Picture) {
-        self.pictures.clear();
-        self.pictures.push_back((instant, picture));
-    }
-
-    fn push(&mut self, instant: u64, picture: Picture) {
-        self.pictures.push_back((instant, picture));
-        // The oldest picture stays while it was on screen K_s instants ago.
-        let settle = self.settle;
-        while self
-            .pictures
-            .get(1)
-            .is_some_and(|(next, _)| next + settle <= instant)
-        {
-            self.pictures.pop_front();
-        }
-    }
-
-    /// The first instant since which block `b` has shown only pictures that
-    /// are SAME as `picture` (`now` when the last one is not).
-    fn stable_since(&self, picture: &Picture, b: usize, now: u64) -> u64 {
-        let mut since = now;
-        for (first, earlier) in self.pictures.iter().rev() {
-            if picture.test(earlier, b) {
-                break;
-            }
-            since = *first;
-        }
-        since
-    }
-}
-
-/// What a change of a block turned out to be.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Outcome {
-    /// It settled on a new picture.
-    Changed,
-    /// It came back to its anchor within `SHORT_LIVED_MS`.
-    Flash,
-    /// It came back to its anchor later.
-    Reverted,
-    /// It kept changing (D5 step 3).
-    Animation,
-}
-
-/// An open change of one block: from the first instant it was not SAME as
-/// its anchor until it settles.
-#[derive(Clone)]
-struct Activity {
-    start: u64,
-    /// The last instant it changed against the previous frame.
-    last_move: u64,
-    /// The last instant of this change at which it animated: the end of its
-    /// animated stretch; `None` when it never animated.
-    animated_until: Option<u64>,
-    /// After its animated stretch: the first instant it was not SAME as its
-    /// anchor, the start of a later excursion (D5 step 3, owner decision on
-    /// issue #293).
-    left_after_animation: Option<u64>,
-    /// The instants at which it was DIFF from its anchor.
-    differed: Vec<u64>,
-}
-
-/// How an open change of a block ends.
-#[derive(Clone, Copy)]
-enum Close {
-    /// It settled; the instant its settling was confirmed.
-    Settled(u64),
-    /// The clip end or a resize cut it before it settled; the first instant
-    /// after the boundary.
-    Cut(u64),
-}
-
-/// The live state of one block (D5 steps 2 and 3).
-#[derive(Clone, Default)]
-struct BlockState {
-    /// The instants of its last changes against the previous frame: at most
-    /// as many as make it animate.
-    moves: MotionWindow,
-    recorded_until: Option<u64>,
-    /// The first instant of the picture it shows now (SAME since then).
-    stable_since: u64,
-    /// While quiet: the first instant of its current run of pictures that
-    /// are not SAME as its anchor. An undecided picture is not yet a change
-    /// and never moves the anchor; it only dates the start of the change
-    /// once the block becomes DIFF (D5 step 2).
-    pending: Option<u64>,
-    active: Option<Activity>,
-}
-
-impl BlockState {
-    /// The first instant at which the block no longer animates: fewer than
-    /// `Instants::animating` changes in the W_a that ends there.
-    fn animating_until(&self, instants: Instants) -> u64 {
-        self.moves
-            .animating_until(&instants.motion)
-            .max(self.recorded_until.unwrap_or(0))
-    }
-
-    /// When an open change settles if nothing changes any more: SAME for K_s
-    /// instants and not animating.
-    fn settle_at(&self, instants: Instants) -> Option<u64> {
-        self.active.as_ref()?;
-        Some((self.stable_since + instants.settle).max(self.animating_until(instants)))
-    }
-}
-
-/// How a change of one block ended: its outcome and interval, and what the
-/// events, picks and caret test need.
-#[derive(Clone)]
-struct BlockEpisode {
-    outcome: Outcome,
-    block: usize,
-    grid: Grid,
-    generation: u64,
-    start: u64,
-    end: u64,
-    /// The instant its settling was confirmed: quiet for K_s instants and
-    /// not animating (D5 step 2); the last instant before the boundary when
-    /// the clip end or a resize closed it. CHANGED picks it (D5 step 6).
-    settle_frame: u64,
-    /// Quiet for `SETTLE_MS` when it ended; `false` when the clip end or a
-    /// resize closed it earlier.
-    settled: bool,
-    /// An animation still running when the clip end or a resize closed it.
-    running: bool,
-    /// FLASH, REVERTED: the instants at which the block was DIFF from its
-    /// anchor.
-    differed: Vec<u64>,
-    /// CHANGED: the anchor and the new picture of the block, and the box of
-    /// the pixels that changed.
-    before: Vec<u8>,
-    after: Vec<u8>,
-    footprint: Option<(usize, usize, usize, usize)>,
-}
-
-/// One decode pass over the committed segments (D5 steps 2 and 3): each
-/// block is compared with its anchor, and each change of a block ends as a
-/// `BlockEpisode`; `finish` joins them into events.
-struct Analyzer<'a> {
-    clip: &'a ViewedClip,
-    instants: Instants,
-    /// A_b of every block: its last settled picture.
-    anchor: Picture,
-    recent: Recent,
-    states: Vec<BlockState>,
-    episodes: Vec<BlockEpisode>,
-    resizes: Vec<(u64, usize, usize)>,
-    /// Goes up on every size change; changes are compared and joined only
-    /// within one generation, also when a later resize restores the size.
-    generation: u64,
-    /// Captured size (frames.jsonl) of the picture last decoded.
-    captured: (u32, u32),
-    /// New frames in which no block changed against the previous frame.
-    still_frames: u64,
-}
-
-impl<'a> Analyzer<'a> {
-    fn run(clip: &'a ViewedClip) -> Result<Analysis, ErrorData> {
-        let instants = Instants::of(clip);
-        let mut analyzer = Self {
-            clip,
-            instants,
-            anchor: Picture {
-                grid: Grid::new(0, 0),
-                rgb: Vec::new(),
-            },
-            recent: Recent {
-                pictures: VecDeque::new(),
-                settle: instants.settle,
-            },
-            states: Vec::new(),
-            episodes: Vec::new(),
-            resizes: Vec::new(),
-            generation: 0,
-            captured: (0, 0),
-            still_frames: 0,
-        };
-        let mut pictures = ClipPictures::new(clip)?;
-        for line in &clip.lines {
-            if line.shows_new_picture() {
-                let frame = pictures.at(line.instant)?;
-                analyzer.step(line.instant, &frame);
-            }
-        }
-        analyzer.close_all(clip.last_frame() + 1);
-        Ok(analyzer.finish())
-    }
-
-    fn step(&mut self, instant: u64, frame: &DecodedFrame) {
-        let picture = Picture::new(frame);
-        // A resize is a change of the captured size in frames.jsonl: an odd
-        // size padded up to even can decode at the same size as before.
-        let captured = self
-            .clip
-            .line(instant)
-            .filter(|line| line.width != 0 && line.height != 0)
-            .map_or(self.captured, |line| (line.width, line.height));
-        if picture.grid != self.anchor.grid || captured != self.captured {
-            self.captured = captured;
-            if self.recent.latest().is_some() {
-                self.close_all(instant);
-                self.resizes
-                    .push((instant, picture.grid.width, picture.grid.height));
-            }
-            self.generation += 1;
-            self.states = vec![BlockState::default(); picture.grid.blocks()];
-            self.anchor = picture.clone();
-            self.recent.restart(instant, picture);
-            return;
-        }
-        if !self.clip.is_new(instant) {
-            return;
-        }
-        self.settle_due(instant.saturating_sub(1));
-        let masked = self.cursor_blocks(instant);
-        let recorded = self
-            .clip
-            .line(instant)
-            .and_then(|line| line.moving)
-            .and_then(|reference| {
-                self.clip
-                    .clip
-                    .moving
-                    .segments
-                    .iter()
-                    .find(|s| s.segment.index == reference.segment)
-            })
-            .map(|s| (s.segment.rect, s.segment.last_instant + 1));
-        let instants = self.instants;
-        let Some((_, previous)) = self.recent.latest() else {
-            return;
-        };
-        let mut moved_any = false;
-        for (b, state) in self.states.iter_mut().enumerate() {
-            if masked.contains(&b) {
-                // The cursor hides the block: an open change waits for it.
-                if state.active.is_some() {
-                    state.stable_since = instant;
-                }
-                continue;
-            }
-            let stored_moving = recorded.is_some_and(|(rect, _)| {
-                picture
-                    .grid
-                    .bbox([b])
-                    .is_some_and(|block| rect.intersect(&block).is_some())
-            });
-            let moved = stored_moving || picture.test(previous, b);
-            if moved {
-                moved_any = true;
-                state.moves.moved(instant, &instants.motion);
-                if stored_moving {
-                    state.recorded_until = recorded.map(|(_, until)| until);
-                }
-            }
-            // D5 step 3 from the frame-to-frame test alone: a block can
-            // animate while every picture stays SAME as its anchor.
-            let animating = stored_moving || instant < state.animating_until(instants);
-            let to_anchor = !stored_moving && picture.test(&self.anchor, b);
-            if state.active.is_none() {
-                if to_anchor {
-                    state.pending = state.pending.or(Some(instant));
-                } else {
-                    state.pending = None;
-                }
-                if !to_anchor && !animating {
-                    continue;
-                }
-                // quiet -> active on DIFF, or once it animates; the start is
-                // the first instant that was not SAME, or the first motion
-                // of the animation when that is earlier.
-                let first_move = state.moves.first_move().filter(|_| animating);
-                let start = state
-                    .pending
-                    .take()
-                    .into_iter()
-                    .chain(first_move)
-                    .min()
-                    .unwrap_or(instant);
-                state.active = Some(Activity {
-                    start,
-                    last_move: instant,
-                    animated_until: None,
-                    left_after_animation: None,
-                    differed: Vec::new(),
-                });
-            }
-            let Some(activity) = state.active.as_mut() else {
-                continue;
-            };
-            if to_anchor {
-                activity.differed.push(instant);
-            }
-            if moved {
-                activity.last_move = instant;
-            }
-            if animating {
-                activity.animated_until = Some(instant);
-                activity.left_after_animation = None;
-            } else if activity.animated_until.is_some() && to_anchor {
-                activity.left_after_animation = activity.left_after_animation.or(Some(instant));
-            }
-            state.stable_since = if stored_moving {
-                instant
-            } else {
-                self.recent.stable_since(&picture, b, instant)
-            };
-        }
-        if !moved_any {
-            self.still_frames += 1;
-        }
-        self.recent.push(instant, picture);
-        self.settle_due(instant);
-    }
-
-    /// Ends the open change of every block that has settled by `now`.
-    fn settle_due(&mut self, now: u64) {
-        for b in 0..self.states.len() {
-            if let Some(at) = self.states[b]
-                .settle_at(self.instants)
-                .filter(|at| *at <= now)
-            {
-                self.end_change(b, Close::Settled(at));
-            }
-        }
-    }
-
-    /// Ends every open change at a resize or at the clip end (`end`, the
-    /// first instant after it). The quiet time is measured at the boundary:
-    /// a block quiet for at least `SETTLE_MS` up to `end` has settled; its
-    /// settle frame is then at most the last instant before `end`.
-    fn close_all(&mut self, end: u64) {
-        let last = end.saturating_sub(1);
-        for b in 0..self.states.len() {
-            match self.states[b].settle_at(self.instants) {
-                Some(at) if at <= end => self.end_change(b, Close::Settled(at.min(last))),
-                Some(_) => self.end_change(b, Close::Cut(end)),
-                None => {}
-            }
-        }
-    }
-
-    /// D5 steps 2 and 3: block `b` has settled or is closed by the clip end
-    /// or a resize; its picture is compared with its anchor.
-    fn end_change(&mut self, b: usize, close: Close) {
-        let Some(mut activity) = self.states[b].active.take() else {
-            return;
-        };
-        let Some((shown_at, picture)) = self.recent.latest() else {
-            return;
-        };
-        let state = &self.states[b];
-        // Settling is confirmed no earlier than the picture it settles on was
-        // decoded: a newer picture SAME as older ones moves stable_since back,
-        // so `at` can lie before it. `shown_at` is before any boundary.
-        let settle_frame = match close {
-            Close::Settled(at) => at.max(*shown_at),
-            Close::Cut(end) => end.saturating_sub(1),
-        };
-        let mut episode = BlockEpisode {
-            outcome: Outcome::Changed,
-            block: b,
-            grid: picture.grid,
-            generation: self.generation,
-            start: activity.start,
-            end: state.stable_since.max(activity.start),
-            settle_frame: settle_frame.max(activity.start),
-            settled: matches!(close, Close::Settled(_)),
-            running: false,
-            differed: Vec::new(),
-            before: Vec::new(),
-            after: Vec::new(),
-            footprint: None,
-        };
-        // A return to the anchor starts at the first instant that was not
-        // SAME; after an animation, at the first such instant after the
-        // stretch.
-        let mut return_start = activity.start;
-        if let Some(animated_until) = activity.animated_until {
-            let running = match close {
-                Close::Cut(end) => end <= state.animating_until(self.instants),
-                Close::Settled(_) => false,
-            };
-            let end = match close {
-                Close::Cut(end) if running => end.saturating_sub(1),
-                _ => activity.last_move,
-            };
-            self.episodes.push(BlockEpisode {
-                outcome: Outcome::Animation,
-                end,
-                running,
-                ..episode.clone()
-            });
-            // While it animates, its anchor stays frozen and it makes no event;
-            // once it stops, it is compared like any settling block. That change
-            // starts where the motion stopped, so a checkmark that replaces a
-            // spinner starts at the checkmark. Back at its anchor, the animated
-            // stretch makes no FLASH or REVERTED: the animation already reports
-            // that interval (a playhead would otherwise leave a short-lived
-            // change in every block it crossed). Owner decision, issue #293:
-            // only that stretch is exempt; a later excursion of the same block
-            // away from its anchor is classified as usual.
-            if running {
-                return;
-            }
-            episode.start = activity.last_move.min(episode.end);
-            activity.differed.retain(|at| *at > animated_until);
-            return_start = activity
-                .left_after_animation
-                .or(activity.differed.first().copied())
-                .map_or(episode.start, |first| first.min(episode.end));
-        }
-        match picture.test(&self.anchor, b) {
-            true => {
-                episode.before = self.anchor.block(b);
-                episode.after = picture.block(b);
-                episode.footprint = picture.footprint(&self.anchor, b);
-                self.anchor.copy_block(picture, b);
-                self.episodes.push(episode);
-            }
-            false if !activity.differed.is_empty() => {
-                episode.start = return_start;
-                let span = self.clip.t_of(episode.end) - self.clip.t_of(episode.start);
-                episode.outcome = if span <= SHORT_LIVED_MS {
-                    Outcome::Flash
-                } else {
-                    Outcome::Reverted
-                };
-                episode.differed = activity.differed;
-                self.episodes.push(episode);
-            }
-            false => {} // Drift or noise: the block takes the picture without an event.
-        }
-    }
-
-    /// D5 step 5: the blocks under the logged cursor box, now and at the
-    /// last decoded instant, when the cursor is in the picture.
-    fn cursor_blocks(&self, instant: u64) -> Vec<usize> {
-        let grid = self.anchor.grid;
-        let previous = self.recent.latest().map_or(instant, |(at, _)| *at);
-        let to_block = |value: i64| usize::try_from(value).unwrap_or(0) / BLOCK;
-        let mut blocks = Vec::new();
-        for at in [previous, instant] {
-            let Some((x, y)) = self.clip.cursor_at(at) else {
-                continue;
-            };
-            let box_px = i64::from(CURSOR_MASK_PX * self.clip.scale_at(at));
-            let (x0, y0) = ((x - box_px / 2).max(0), (y - box_px / 2).max(0));
-            for row in to_block(y0)..=to_block(y0 + box_px).min(grid.rows.saturating_sub(1)) {
-                for col in to_block(x0)..=to_block(x0 + box_px).min(grid.cols.saturating_sub(1)) {
-                    blocks.push(row * grid.cols + col);
-                }
-            }
-        }
-        blocks
-    }
-
-    fn finish(self) -> Analysis {
-        let clip = self.clip;
-        let mut events = Event::join_all(self.episodes);
-        events.sort_by_key(|event| (event.start, event.end));
-        let (events, carets) = Event::without_carets(events, clip);
-        let first = 0;
-        let mut picks = vec![pick(clip, first, "first frame")];
-        let mut timeline = Vec::new();
-        // D5 step 6: a stable interval that an animation overlaps is not
-        // listed as "no change".
-        let mut quiet_from = first;
-        for event in &events {
-            if clip.t_of(event.start).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
-                timeline.push(static_entry(
-                    clip,
-                    quiet_from,
-                    event.start.saturating_sub(1),
-                ));
-            }
-            quiet_from = quiet_from.max(event.end);
-            picks.extend(event.picks(clip));
-            timeline.push(event.entry(clip, self.generation));
-        }
-        let last = clip.last_frame();
-        if clip.t_of(last).saturating_sub(clip.t_of(quiet_from)) >= STATIC_REPORT_MS {
-            timeline.push(static_entry(clip, quiet_from, last));
-        }
-        for &(instant, width, height) in &self.resizes {
-            picks.push(pick(clip, instant, "first frame after resize"));
-            timeline.push(region_entry(
-                clip,
-                "change",
+    /// The timeline of the clip, read from the index without decoding:
+    /// changed stretches, settle points, unchanged stretches and lost
+    /// ranges, in time order.
+    fn timeline(&self) -> Vec<ClipTimelineEntry> {
+        let mut entries = self.change_entries();
+        entries.extend(self.still_instants().map(|instant| {
+            self.entry(
+                "settled",
                 instant,
                 instant,
                 0,
-                None,
-                &format!("window size changed; recorded size now {width}x{height}"),
-            ));
-        }
-        timeline.extend(minimized_entries(clip));
-        timeline.sort_by_key(|entry| (entry.start_ms, entry.end_ms));
-        picks.push(pick(clip, last, "last frame"));
-        let picks = with_floor(clip, merge_picks(picks));
-
-        let count = |outcome: Outcome| {
-            events
-                .iter()
-                .filter(|event| event.outcome == outcome)
-                .count()
-        };
-        let repeated = clip.lines.iter().filter(|line| !line.new).count();
-        let mut notes = vec![
-            format!(
-                "{} changes, {} short-lived changes, {} changes that returned and {} animations found; {repeated} repeated frames skipped by frames.jsonl flags; {} new frames showed no visible change",
-                count(Outcome::Changed),
-                count(Outcome::Flash),
-                count(Outcome::Reverted),
-                count(Outcome::Animation),
-                self.still_frames
-            ),
-            format!(
-                "change test: {BLOCK}x{BLOCK} exact blocks differ when any R/G/B byte differs by more than {DELTA_LO}; stored moving areas animate without pixel-noise tests; settled after {SETTLE_MS} ms without change; short-lived = back within {SHORT_LIVED_MS} ms"
-            ),
-        ];
-        if clip.clip.observer.cursor_in_picture {
-            notes.push(format!(
-                "the cursor is in the picture on this Windows; a {CURSOR_MASK_PX} px box at its logged position is masked"
-            ));
-        }
-        if carets > 0 {
-            notes.push(format!("{carets} blinking caret toggles ignored"));
-        }
-        let lost = clip.clip.lost.len();
-        if lost > 0 {
-            notes.push(format!(
-                "{lost} instants are lost (clip.json lost lists each with its cause)"
-            ));
-        }
-        if clip.last_frame() + 1 < clip.lines.len() as u64 {
-            notes.push(format!(
-                "only the committed part is shown: {} of {} ms (state {})",
-                clip.duration_ms(),
-                clip.recorded_ms(),
-                clip.clip.state.as_str()
-            ));
-        }
-        let unsettled = events
-            .iter()
-            .filter(|event| event.outcome != Outcome::Animation && !event.settled)
-            .count();
-        if unsettled > 0 {
-            notes.push(format!(
-                "{unsettled} changes had not settled when the clip ended or the window size changed"
-            ));
-        }
-        if let Some(reason) = clip.clip.stop_reason
-            && reason != super::clip_folder::StopReason::Completed
-        {
-            notes.push(format!("the recording stopped: {}", reason.as_str()));
-        }
-        Analysis {
-            version: ANALYSIS_VERSION,
-            inputs: String::new(),
-            timeline,
-            picks,
-            notes,
-        }
-    }
-}
-
-/// One reported change (D5 step 4): block episodes with the same outcome
-/// whose intervals overlap and whose blocks are 8-neighbours, a gap of
-/// `REGION_GAP_BLOCKS` allowed.
-struct Event {
-    outcome: Outcome,
-    grid: Grid,
-    generation: u64,
-    start: u64,
-    end: u64,
-    /// Its blocks, each once, in index order.
-    blocks: Vec<usize>,
-    /// CHANGED: the latest settle frame of its blocks, the frame it is
-    /// pictured at (D5 step 6).
-    settle_frame: u64,
-    settled: bool,
-    running: bool,
-    /// FLASH, REVERTED: the instant at which most of its blocks were DIFF
-    /// from their anchors.
-    peak: u64,
-    /// CHANGED: per block (index order) the anchor and the new picture, and
-    /// the box of the pixels that changed.
-    pictures: Vec<(usize, Vec<u8>, Vec<u8>)>,
-    footprint: Option<(usize, usize, usize, usize)>,
-}
-
-impl Event {
-    fn join_all(mut episodes: Vec<BlockEpisode>) -> Vec<Self> {
-        episodes.sort_by_key(|episode| (episode.generation, episode.outcome, episode.start));
-        let mut root: Vec<usize> = (0..episodes.len()).collect();
-        // Episodes of the same kind whose interval still reaches the start
-        // of the next one.
-        let mut open: Vec<usize> = Vec::new();
-        for (index, episode) in episodes.iter().enumerate() {
-            open.retain(|&other| {
-                let other = &episodes[other];
-                (other.generation, other.outcome) == (episode.generation, episode.outcome)
-                    && other.end >= episode.start
-            });
-            for &other in &open {
-                if episode
-                    .grid
-                    .near(episode.block, episodes[other].block, REGION_GAP_BLOCKS)
-                {
-                    let (a, b) = (find_root(&mut root, index), find_root(&mut root, other));
-                    root[a] = b;
-                }
-            }
-            open.push(index);
-        }
-        let mut groups: BTreeMap<usize, Vec<BlockEpisode>> = BTreeMap::new();
-        for (index, episode) in episodes.into_iter().enumerate() {
-            groups
-                .entry(find_root(&mut root, index))
-                .or_default()
-                .push(episode);
-        }
-        groups.into_values().map(Self::from_episodes).collect()
-    }
-
-    fn from_episodes(mut group: Vec<BlockEpisode>) -> Self {
-        group.sort_by_key(|episode| (episode.block, episode.start));
-        let (outcome, grid, generation) = (group[0].outcome, group[0].grid, group[0].generation);
-        let start = group.iter().map(|episode| episode.start).min().unwrap_or(0);
-        let end = group
-            .iter()
-            .map(|episode| episode.end)
-            .max()
-            .unwrap_or(start);
-        let mut differed: BTreeMap<u64, usize> = BTreeMap::new();
-        for at in group.iter().flat_map(|episode| &episode.differed) {
-            *differed.entry(*at).or_default() += 1;
-        }
-        let peak = differed
-            .iter()
-            .max_by_key(|(at, count)| (**count, std::cmp::Reverse(**at)))
-            .map_or(start, |(at, _)| *at);
-        let settle_frame = group
-            .iter()
-            .map(|episode| episode.settle_frame)
-            .max()
-            .unwrap_or(end);
-        let mut blocks: Vec<usize> = group.iter().map(|episode| episode.block).collect();
-        blocks.dedup();
-        Self {
-            outcome,
-            grid,
-            generation,
-            start,
-            end,
-            blocks,
-            settle_frame,
-            settled: group.iter().all(|episode| episode.settled),
-            running: group.iter().any(|episode| episode.running),
-            peak,
-            footprint: group.iter().filter_map(|episode| episode.footprint).reduce(
-                |(a0, b0, a1, b1), (x0, y0, x1, y1)| {
-                    (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
-                },
-            ),
-            pictures: group
-                .into_iter()
-                .filter(|episode| !episode.after.is_empty())
-                .map(|episode| (episode.block, episode.before, episode.after))
-                .collect(),
-        }
-    }
-
-    /// D5 step 5: removes blinking carets, thin changes in one place that
-    /// alternate between two pictures (one of them the anchor) for at least
-    /// `CARET_MIN_CYCLES` cycles with a half-period in `CARET_HALF_PERIOD_MS`.
-    /// `events` are in start order; returns the rest and the toggles removed.
-    fn without_carets(events: Vec<Self>, clip: &ViewedClip) -> (Vec<Self>, usize) {
-        let mut places: BTreeMap<(u64, &[usize]), Vec<usize>> = BTreeMap::new();
-        for (index, event) in events.iter().enumerate() {
-            if event.caret_shaped(clip.scale_at(event.start) as usize) {
-                places
-                    .entry((event.generation, event.blocks.as_slice()))
-                    .or_default()
-                    .push(index);
-            }
-        }
-        let mut caret = vec![false; events.len()];
-        for toggles in places.values() {
-            let runs = toggles.chunk_by(|&earlier, &later| {
-                let half = clip
-                    .t_of(events[later].start)
-                    .saturating_sub(clip.t_of(events[earlier].start));
-                CARET_HALF_PERIOD_MS.contains(&half) && events[later].undoes(&events[earlier])
-            });
-            for run in runs.filter(|run| run.len() >= 2 * CARET_MIN_CYCLES) {
-                for &index in run {
-                    caret[index] = true;
-                }
-            }
-        }
-        let removed = caret.iter().filter(|caret| **caret).count();
-        let kept = events
-            .into_iter()
-            .zip(caret)
-            .filter_map(|(event, caret)| (!caret).then_some(event))
-            .collect();
-        (kept, removed)
-    }
-
-    /// A CHANGED event at most `CARET_MAX_WIDTH_PX` wide and
-    /// `CARET_HEIGHT_PX` tall, each of its blocks changed once.
-    fn caret_shaped(&self, scale: usize) -> bool {
-        let to_window =
-            |pixels: usize| u32::try_from(pixels.div_ceil(scale.max(1))).unwrap_or(u32::MAX);
-        self.outcome == Outcome::Changed
-            && self.pictures.len() == self.blocks.len()
-            && self.footprint.is_some_and(|(x0, y0, x1, y1)| {
-                to_window(x1 + 1 - x0) <= CARET_MAX_WIDTH_PX
-                    && CARET_HEIGHT_PX.contains(&to_window(y1 + 1 - y0))
-            })
-    }
-
-    /// `true` when this change brings every block back to the picture it
-    /// had before `earlier`.
-    fn undoes(&self, earlier: &Self) -> bool {
-        self.pictures.len() == earlier.pictures.len()
-            && self.pictures.iter().zip(&earlier.pictures).all(
-                |((block, _, after), (earlier_block, before, _))| {
-                    block == earlier_block
-                        && after
-                            .iter()
-                            .zip(before)
-                            .all(|(a, b)| a.abs_diff(*b) <= DELTA_LO)
-                },
+                format!(
+                    "{} settled: exact still of instant {instant}",
+                    fmt_time(self.t_of(instant))
+                ),
             )
-    }
-
-    /// D5 step 6: one image per event.
-    fn picks(&self, clip: &ViewedClip) -> Vec<Pick> {
-        match self.outcome {
-            Outcome::Changed => vec![pick(clip, self.settle_frame, "settled frame after change")],
-            Outcome::Flash => vec![pick(clip, self.peak, "short-lived change")],
-            Outcome::Reverted => vec![pick(clip, self.peak, "change that returned")],
-            Outcome::Animation if self.running => vec![pick(clip, self.start, "animating region")],
-            Outcome::Animation => vec![
-                pick(clip, self.start, "animating region"),
-                pick(clip, self.end, "animation end"),
-            ],
+        }));
+        let static_instants = STATIC_REPORT_MS * self.fps() / MS_PER_SECOND;
+        for (start, end, ()) in runs(&self.lines, |line| (line.same == Some(true)).then_some(())) {
+            if end + 1 - start >= static_instants.max(1) {
+                let seconds = (self.t_of(end + 1) - self.t_of(start)) as f64 / MS_PER_SECOND as f64;
+                let text = format!(
+                    "{}-{} no change ({seconds:.1} s)",
+                    fmt_time(self.t_of(start)),
+                    fmt_time(self.t_of(end + 1))
+                );
+                entries.push(self.entry("static", start, end, 0, text));
+            }
         }
-    }
-
-    fn entry(&self, clip: &ViewedClip, last_generation: u64) -> ClipTimelineEntry {
-        let bbox = self.grid.bbox(self.blocks.iter().copied()).map(view_rect);
-        if self.outcome == Outcome::Animation {
-            return region_entry(
-                clip,
-                "animating",
-                self.start,
-                self.end,
-                self.blocks.len(),
-                bbox,
-                "region kept changing (animation)",
+        for (start, end, cause) in runs(&self.lines, |line| line.lost.clone()) {
+            let (before, after) = self.nearest_recorded(start);
+            let mut text = format!(
+                "{}-{} lost: {} instants ({cause}), no picture recorded",
+                fmt_time(self.t_of(start)),
+                fmt_time(self.t_of(end + 1)),
+                end + 1 - start
             );
+            let _ = write!(text, "; {}", nearest_text(before, after));
+            entries.push(self.entry("lost", start, end, 0, text));
         }
-        let (start_ms, end_ms) = (clip.t_of(self.start), clip.t_of(self.end));
-        let area = bbox.map_or_else(String::new, |r| {
-            format!(" in x={} y={} w={} h={}", r.x, r.y, r.w, r.h)
-        });
-        let outcome = match self.outcome {
-            Outcome::Flash => format!(
-                "short-lived: back to the previous picture at {}",
-                fmt_time(end_ms)
-            ),
-            Outcome::Reverted => {
-                format!("returned to the previous picture at {}", fmt_time(end_ms))
+        entries.sort_by_key(|entry| (entry.start_frame, timeline_rank(&entry.kind)));
+        entries
+    }
+
+    /// Changed instants joined into stretches: two changes fewer than
+    /// `SETTLE_INSTANTS` apart belong to one stretch; a lost instant ends it.
+    fn change_entries(&self) -> Vec<ClipTimelineEntry> {
+        let mut stretches: Vec<(u64, u64, u64)> = Vec::new();
+        let mut open: Option<(u64, u64, u64)> = None;
+        for line in &self.lines {
+            if line.lost.is_some() {
+                stretches.extend(open.take());
+            } else if line.enc.is_some() {
+                open = match open {
+                    Some((start, last, count)) if line.instant - last < SETTLE_INSTANTS => {
+                        Some((start, line.instant, count + 1))
+                    }
+                    other => {
+                        stretches.extend(other);
+                        Some((line.instant, line.instant, 1))
+                    }
+                };
             }
-            _ if self.settled => format!(
-                "settled at {} (frame {}), confirmed at frame {}",
-                fmt_time(end_ms),
-                self.end,
-                self.settle_frame
-            ),
-            _ if self.generation == last_generation => {
-                "still changing when the clip ended".to_owned()
-            }
-            _ => "still changing when the window size changed".to_owned(),
-        };
-        let count = self.blocks.len() as u64;
+        }
+        stretches.extend(open);
+        stretches
+            .into_iter()
+            .map(|(start, end, count)| {
+                let text = if count == 1 {
+                    format!(
+                        "{} changed: 1 new picture (video) at instant {start}",
+                        fmt_time(self.t_of(start))
+                    )
+                } else {
+                    format!(
+                        "{}-{} changing: {count} new pictures (video), instants {start}-{end}",
+                        fmt_time(self.t_of(start)),
+                        fmt_time(self.t_of(end + 1))
+                    )
+                };
+                self.entry("change", start, end, count, text)
+            })
+            .collect()
+    }
+
+    fn entry(&self, kind: &str, start: u64, end: u64, count: u64, text: String) -> ClipTimelineEntry {
         ClipTimelineEntry {
-            kind: if self.outcome == Outcome::Flash {
-                "short_lived"
-            } else {
-                "change"
-            }
-            .to_owned(),
-            start_ms,
-            end_ms,
-            start_frame: self.start,
-            end_frame: self.end,
+            kind: kind.to_owned(),
+            start_ms: self.t_of(start),
+            end_ms: self.t_of(end + 1),
+            start_frame: start,
+            end_frame: end,
             changed_blocks: count,
-            bbox,
-            text: format!(
-                "{}-{} change: {count} blocks ({}% of the picture){area}; {outcome}",
-                fmt_time(start_ms),
-                fmt_time(end_ms),
-                self.grid.percent(count)
-            ),
+            bbox: None,
+            text,
         }
     }
-}
 
-/// The root of `index` in a union-find forest, halving the path on the way.
-fn find_root(root: &mut [usize], mut index: usize) -> usize {
-    while root[index] != index {
-        root[index] = root[root[index]];
-        index = root[index];
+    /// Key pictures of the overview, in time order: the first and last
+    /// recorded instants, every settle point, the end of every changed
+    /// stretch, and one picture per `FLOOR_INTERVAL_MS` where none falls.
+    /// Picks that show the same recorded picture are joined; lost instants
+    /// are never picked.
+    fn overview_picks(&self) -> Vec<Pick> {
+        let mut picks: Vec<Pick> = Vec::new();
+        let first = (0..=self.last_instant()).find(|k| self.is_recorded(*k));
+        let last = (0..=self.last_instant()).rev().find(|k| self.is_recorded(*k));
+        picks.extend(first.map(|instant| Pick::new(instant, "first")));
+        picks.extend(self.still_instants().map(|instant| Pick::new(instant, "settled")));
+        picks.extend(
+            self.change_entries()
+                .iter()
+                .map(|entry| Pick::new(entry.end_frame, "end of a change")),
+        );
+        picks.extend(last.map(|instant| Pick::new(instant, "last")));
+        picks.sort_by_key(|pick| pick.instant);
+        let mut floored: Vec<Pick> = Vec::with_capacity(picks.len());
+        for next in picks {
+            while let Some(previous) = floored.last() {
+                let floor = self.instant_at_ms(self.t_of(previous.instant) + FLOOR_INTERVAL_MS);
+                if self.t_of(next.instant) <= self.t_of(previous.instant) + FLOOR_INTERVAL_MS
+                    || floor <= previous.instant
+                {
+                    break;
+                }
+                floored.push(Pick::new(floor, "10 s floor"));
+            }
+            floored.push(next);
+        }
+        let mut joined: Vec<(u64, Pick)> = Vec::with_capacity(floored.len());
+        for pick in floored {
+            let Some(shown) = self
+                .source(pick.instant)
+                .ok()
+                .and_then(|source| source.shown_instant())
+            else {
+                continue;
+            };
+            match joined.last_mut() {
+                Some((last_shown, last)) if *last_shown == shown => last.join(&pick.reason),
+                _ => joined.push((shown, pick)),
+            }
+        }
+        joined.into_iter().map(|(_, pick)| pick).collect()
     }
-    index
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// How many of `enc`, `same` and `lost` an index line holds.
+fn marks(line: &IndexLine) -> usize {
+    [
+        line.enc.is_some(),
+        line.same == Some(true),
+        line.lost.is_some(),
+    ]
+    .into_iter()
+    .filter(|mark| *mark)
+    .count()
+}
+
+/// Runs of consecutive lines with the same `Some` key: (first, last, key).
+fn runs<T: PartialEq>(lines: &[IndexLine], key: impl Fn(&IndexLine) -> Option<T>) -> Vec<(u64, u64, T)> {
+    let mut runs: Vec<(u64, u64, T)> = Vec::new();
+    for line in lines {
+        let Some(value) = key(line) else {
+            continue;
+        };
+        match runs.last_mut() {
+            Some((_, end, last)) if *end + 1 == line.instant && *last == value => *end = line.instant,
+            _ => runs.push((line.instant, line.instant, value)),
+        }
+    }
+    runs
+}
+
+/// Order of timeline entries that start at the same instant.
+fn timeline_rank(kind: &str) -> u8 {
+    match kind {
+        "lost" => 0,
+        "change" => 1,
+        "settled" => 2,
+        _ => 3,
+    }
+}
+
+fn nearest_text(before: Option<u64>, after: Option<u64>) -> String {
+    let side = |instant: Option<u64>| instant.map_or_else(|| "none".to_owned(), |k| format!("instant {k}"));
+    format!(
+        "nearest recorded: {} before, {} after",
+        side(before),
+        side(after)
+    )
+}
+
+/// One key picture of the overview and why it was chosen.
 struct Pick {
-    frame: u64,
-    t_ms: u64,
+    instant: u64,
     reason: String,
 }
 
-/// Overview result, cached as `views/overview_analysis.json`.
-#[derive(Serialize, Deserialize)]
-struct Analysis {
-    version: u32,
-    /// `ViewedClip::fingerprint` of the files this was computed from.
-    #[serde(default)]
-    inputs: String,
-    timeline: Vec<ClipTimelineEntry>,
-    picks: Vec<Pick>,
-    notes: Vec<String>,
-}
-
-/// The `minimized` intervals: consecutive instants marked minimized.
-fn minimized_entries(clip: &ViewedClip) -> Vec<ClipTimelineEntry> {
-    let mut entries = Vec::new();
-    let mut start: Option<u64> = None;
-    let last = clip.last_frame();
-    for line in clip.lines.iter().take_while(|line| line.instant <= last) {
-        match (line.minimized, start) {
-            (true, None) => start = Some(line.instant),
-            (false, Some(from)) => {
-                entries.push(minimized_entry(clip, from, line.instant));
-                start = None;
-            }
-            _ => {}
+impl Pick {
+    fn new(instant: u64, reason: &str) -> Self {
+        Self {
+            instant,
+            reason: reason.to_owned(),
         }
     }
-    if let Some(from) = start {
-        entries.push(minimized_entry(clip, from, last + 1));
-    }
-    entries
-}
 
-fn minimized_entry(clip: &ViewedClip, from: u64, to: u64) -> ClipTimelineEntry {
-    let (start_ms, end_ms) = (clip.t_of(from), clip.t_of(to));
-    ClipTimelineEntry {
-        kind: "minimized".to_owned(),
-        start_ms,
-        end_ms,
-        start_frame: from,
-        end_frame: to.saturating_sub(1),
-        changed_blocks: 0,
-        bbox: None,
-        text: format!(
-            "{}-{} gap: window minimized, the last picture was repeated",
-            fmt_time(start_ms),
-            fmt_time(end_ms)
-        ),
-    }
-}
-
-fn region_entry(
-    clip: &ViewedClip,
-    kind: &str,
-    start: u64,
-    end: u64,
-    blocks: usize,
-    bbox: Option<Rect>,
-    what: &str,
-) -> ClipTimelineEntry {
-    let (start_ms, end_ms) = (clip.t_of(start), clip.t_of(end));
-    let area = bbox.map_or_else(String::new, |r| {
-        format!(" in x={} y={} w={} h={}", r.x, r.y, r.w, r.h)
-    });
-    ClipTimelineEntry {
-        kind: kind.to_owned(),
-        start_ms,
-        end_ms,
-        start_frame: start,
-        end_frame: end,
-        changed_blocks: blocks as u64,
-        bbox,
-        text: format!(
-            "{}-{} {what}{area} (frame {start})",
-            fmt_time(start_ms),
-            fmt_time(end_ms)
-        ),
-    }
-}
-
-fn pick(clip: &ViewedClip, frame: u64, reason: &str) -> Pick {
-    Pick {
-        frame,
-        t_ms: clip.t_of(frame),
-        reason: reason.to_owned(),
-    }
-}
-
-/// Sorts picks by frame and joins the reasons of picks on the same frame.
-fn merge_picks(mut picks: Vec<Pick>) -> Vec<Pick> {
-    picks.sort_by_key(|pick| pick.frame);
-    let mut merged: Vec<Pick> = Vec::with_capacity(picks.len());
-    for pick in picks {
-        match merged.last_mut() {
-            Some(last) if last.frame == pick.frame => {
-                if !last.reason.contains(&pick.reason) {
-                    last.reason = format!("{} + {}", last.reason, pick.reason);
-                }
-            }
-            _ => merged.push(pick),
+    fn join(&mut self, reason: &str) {
+        if !self.reason.contains(reason) {
+            self.reason = format!("{} + {reason}", self.reason);
         }
-    }
-    merged
-}
-
-/// Adds a frame wherever two picks are more than `FLOOR_INTERVAL_MS` apart.
-fn with_floor(clip: &ViewedClip, picks: Vec<Pick>) -> Vec<Pick> {
-    let mut out: Vec<Pick> = Vec::with_capacity(picks.len());
-    for next in picks {
-        while let Some(last) = out.last() {
-            let floor_t = last.t_ms + FLOOR_INTERVAL_MS;
-            if next.t_ms <= floor_t {
-                break;
-            }
-            let frame = clip.frame_at_ms(floor_t);
-            if frame <= last.frame {
-                break;
-            }
-            out.push(pick(clip, frame, "10 s floor"));
-        }
-        out.push(next);
-    }
-    out
-}
-
-fn static_entry(clip: &ViewedClip, from: u64, to: u64) -> ClipTimelineEntry {
-    let (start_ms, end_ms) = (clip.t_of(from), clip.t_of(to));
-    ClipTimelineEntry {
-        kind: "static".to_owned(),
-        start_ms,
-        end_ms,
-        start_frame: from,
-        end_frame: to,
-        changed_blocks: 0,
-        bbox: None,
-        text: format!(
-            "{}-{} no change ({:.1} s)",
-            fmt_time(start_ms),
-            fmt_time(end_ms),
-            (end_ms - start_ms) as f64 / 1_000.0
-        ),
     }
 }
 
@@ -1610,14 +551,14 @@ fn static_entry(clip: &ViewedClip, from: u64, to: u64) -> ClipTimelineEntry {
 // The four operations
 // ---------------------------------------------------------------------------
 
-/// One viewer call: the clip, the decoder of the segment in use and the images
-/// made so far.
+/// One viewer call: the clip, its decoder and the answer built so far.
 struct ClipView {
     clip: ViewedClip,
-    pictures: ClipPictures,
+    decoder: ClipDecoder,
     images: Vec<ClipViewImage>,
     pngs: Vec<Vec<u8>>,
     timeline: Vec<ClipTimelineEntry>,
+    lost: Vec<ClipLostInstant>,
     regions: Vec<ClipChangedRegion>,
     paging: Option<(u32, u32)>,
     notes: Vec<String>,
@@ -1625,31 +566,39 @@ struct ClipView {
 }
 
 impl ClipView {
-    fn new(clip: ViewedClip) -> Result<Self, ErrorData> {
-        let pictures = ClipPictures::new(&clip)?;
-        Ok(Self {
+    fn new(clip: ViewedClip) -> Self {
+        let decoder = ClipDecoder::new(&clip.folder, clip.lines.clone());
+        let mut notes = Vec::new();
+        if clip.clip.state == ClipState::Failed {
+            notes.push(format!(
+                "the recording ended early ({}); instants after the last complete video part are named lost",
+                clip.clip.failure.as_deref().unwrap_or("no cause recorded")
+            ));
+        }
+        Self {
             clip,
-            pictures,
+            decoder,
             images: Vec::new(),
             pngs: Vec::new(),
             timeline: Vec::new(),
+            lost: Vec::new(),
             regions: Vec::new(),
             paging: None,
-            notes: Vec::new(),
+            notes,
             text: String::new(),
-        })
+        }
     }
 
-    /// D2, D6: key frames shrunk by averaging, never below 75 % of the window
-    /// size and never above the ceiling, as many per page as the image budget
-    /// allows; the timeline on page 1 only, held to the text budget.
+    /// The timeline on page 1 (held to the text budget) and key pictures,
+    /// as many per page as the image budget allows. Page p holds every
+    /// `pages`-th pick from pick p, so each page spreads over the whole clip.
     fn overview(&mut self, params: &ClipViewParams) -> Result<(), ErrorData> {
-        let analysis = self.analysis()?;
-        let (long_edge, ceiling_below_floor) = self.clip.view_long_edge(params.max_long_edge);
+        let picks = self.clip.overview_picks();
+        let (long_edge, unreadable) = self.clip.view_long_edge(params.max_long_edge);
         let per_page = self
             .clip
             .images_per_call(long_edge, OVERVIEW_IMAGE_TOKEN_BUDGET);
-        let pages = u32::try_from(analysis.picks.len().div_ceil(per_page))
+        let pages = u32::try_from(picks.len().div_ceil(per_page))
             .unwrap_or(u32::MAX)
             .max(1);
         let page = params.page.unwrap_or(1);
@@ -1658,54 +607,62 @@ impl ClipView {
                 "page {page} is outside 1..={pages} for this clip"
             )));
         }
-        let first = (page as usize - 1) * per_page;
-        let picks: Vec<Pick> = analysis
-            .picks
-            .iter()
-            .skip(first)
-            .take(per_page)
-            .cloned()
-            .collect();
+        let stills = self.clip.still_instants().count();
+        let lost = self.clip.lines.iter().filter(|line| line.lost.is_some()).count();
         let _ = writeln!(
             self.text,
-            "Clip {} ({} key frames, page {page}/{pages}):",
+            "Clip {}: {} instants over {}, {} changed (video), {stills} settle points (exact stills), {lost} lost; {} key pictures, page {page}/{pages} (every page spreads over the whole clip):",
             self.clip.clip.clip_id,
-            analysis.picks.len()
+            self.clip.lines.len(),
+            fmt_time(self.clip.duration_ms()),
+            self.clip.changed_count(),
+            picks.len()
         );
         if page == 1 {
-            let budget_chars = usize::try_from(OVERVIEW_TEXT_TOKEN_BUDGET).unwrap_or(usize::MAX)
-                * TEXT_CHARS_PER_TOKEN;
-            let mut kept = Vec::new();
-            for entry in analysis.timeline {
-                if self.text.len() + entry.text.len() + 3 > budget_chars {
-                    self.notes.push(format!(
-                        "the timeline was cut at {} to stay inside its token budget; call clip_frames or clip_diff for later times",
-                        fmt_time(entry.start_ms)
-                    ));
-                    break;
-                }
-                let _ = writeln!(self.text, "- {}", entry.text);
-                kept.push(entry);
-            }
-            self.timeline = kept;
+            self.write_timeline();
         }
-        if ceiling_below_floor {
+        if unreadable {
             self.notes.push(format!(
-                "this window is too large for 75 % of its size inside the {VIEW_MAX_LONG_EDGE} px image ceiling; small text may be unreadable here, use clip_frame (recorded pixels, region crop, close-up) to read it"
+                "images are shrunk to a {long_edge} px long edge, below {}% of the window size; small text may be unreadable, use clip_frame (recorded pixels, region crop, close-up) to read it",
+                (READABLE_MIN_SCALE * PERCENT as f64) as u64
             ));
         }
-        for (offset, pick) in picks.iter().enumerate() {
-            let index = u32::try_from(first + offset + 1).unwrap_or(u32::MAX);
-            let frame = self.pictures.at(pick.frame)?;
-            let image = fit(to_rgba(&frame), long_edge);
-            let stem = format!("overview_{index:02}_f{}", pick.frame);
-            self.export(image, index, pick.frame, &pick.reason, &stem)?;
+        let stride = pages as usize;
+        let chosen: Vec<(usize, &Pick)> = picks
+            .iter()
+            .enumerate()
+            .skip(page as usize - 1)
+            .step_by(stride)
+            .collect();
+        for (position, pick) in chosen {
+            let index = u32::try_from(position + 1).unwrap_or(u32::MAX);
+            let mut picture = self.picture(pick.instant)?;
+            let Some(image) = picture.image.take() else {
+                continue;
+            };
+            let stem = format!("overview_{index:02}_f{}", pick.instant);
+            self.export(fit(image, long_edge), index, &picture, &pick.reason, &stem)?;
         }
-        let mut notes = analysis.notes;
-        notes.append(&mut self.notes);
-        self.notes = notes;
         self.paging = Some((page, pages));
         Ok(())
+    }
+
+    fn write_timeline(&mut self) {
+        let budget_chars =
+            usize::try_from(OVERVIEW_TEXT_TOKEN_BUDGET).unwrap_or(usize::MAX) * TEXT_CHARS_PER_TOKEN;
+        let mut kept = Vec::new();
+        for entry in self.clip.timeline() {
+            if self.text.len() + entry.text.len() + 3 > budget_chars {
+                self.notes.push(format!(
+                    "the timeline was cut at {} to stay inside its token budget; call clip_frames or clip_frame for later times",
+                    fmt_time(entry.start_ms)
+                ));
+                break;
+            }
+            let _ = writeln!(self.text, "- {}", entry.text);
+            kept.push(entry);
+        }
+        self.timeline = kept;
     }
 
     fn frames(&mut self, params: &ClipViewParams) -> Result<(), ErrorData> {
@@ -1717,7 +674,7 @@ impl ClipView {
             .fps
             .unwrap_or(MAX_FRAMES_FPS)
             .clamp(1, MAX_FRAMES_FPS);
-        let min_step = 1_000_u64.div_ceil(u64::from(fps));
+        let min_step = MS_PER_SECOND.div_ceil(u64::from(fps));
         let fit_step = (end - start).div_ceil(max_images.saturating_sub(1).max(1) as u64);
         let step = min_step.max(fit_step).max(1);
         if step > min_step {
@@ -1727,55 +684,72 @@ impl ClipView {
         }
         let _ = writeln!(
             self.text,
-            "Clip {} frames {}-{} every {step} ms:",
+            "Clip {} pictures {}-{} every {step} ms:",
             self.clip.clip.clip_id,
             fmt_time(start),
             fmt_time(end)
         );
         let mut previous: Option<(u64, u32)> = None;
+        let mut last_instant: Option<u64> = None;
         let mut t_ms = start;
         while t_ms <= end && self.images.len() < max_images {
-            let number = self.clip.frame_at_ms(t_ms);
+            let instant = self.clip.instant_at_ms(t_ms);
             t_ms += step;
-            if let Some((last, index)) = previous {
-                if number == last {
-                    continue;
+            if last_instant == Some(instant) {
+                continue;
+            }
+            last_instant = Some(instant);
+            let source = self.clip.source(instant)?;
+            let Some(shown) = source.shown_instant() else {
+                if let PictureSource::Lost { cause } = &source {
+                    self.name_lost(instant, cause);
                 }
-                if self.clip.same_picture(last, number) {
-                    let _ = writeln!(
-                        self.text,
-                        "- {} frame {number}: repeat, same picture as Image {index}",
-                        fmt_time(self.clip.t_of(number))
-                    );
-                    continue;
-                }
+                continue;
+            };
+            if let Some((previous_shown, index)) = previous
+                && previous_shown == shown
+            {
+                let _ = writeln!(
+                    self.text,
+                    "- {} frame {instant}: unchanged, the same recorded picture as Image {index}",
+                    fmt_time(self.clip.t_of(instant))
+                );
+                continue;
             }
             let index = u32::try_from(self.images.len() + 1).unwrap_or(u32::MAX);
-            let frame = self.pictures.at(number)?;
-            let image = fit(to_rgba(&frame), long_edge);
-            let stem = format!("frames_{start}-{end}_{index:02}_f{number}");
-            self.export(image, index, number, "range sample", &stem)?;
-            previous = Some((number, index));
+            let mut picture = self.picture(instant)?;
+            let Some(image) = picture.image.take() else {
+                continue;
+            };
+            let stem = format!("frames_{start}-{end}_{index:02}_f{instant}");
+            self.export(fit(image, long_edge), index, &picture, "range sample", &stem)?;
+            previous = Some((shown, index));
         }
         Ok(())
     }
 
-    /// One frame at recorded pixels; D3: a close-up duplicates every pixel
+    /// One picture at recorded pixels; a close-up duplicates every pixel
     /// `CLOSEUP_SCALE` times, never blurs.
     fn frame(&mut self, params: &ClipViewParams) -> Result<(), ErrorData> {
         let t_ms = params.t_ms.unwrap_or(0);
-        self.check_committed(t_ms)?;
-        let number = self.clip.frame_at_ms(t_ms);
-        let frame = self.pictures.at(number)?;
-        let mut image = to_rgba(&frame);
-        let mut stem = format!("frame_f{number}");
+        self.check_inside(t_ms)?;
+        let instant = self.clip.instant_at_ms(t_ms);
+        let mut picture = self.picture(instant)?;
+        let Some(mut image) = picture.image.take() else {
+            if let PictureSource::Lost { cause } = &picture.source {
+                let cause = cause.clone();
+                self.name_lost(instant, &cause);
+            }
+            return Ok(());
+        };
+        let mut stem = format!("frame_f{instant}");
         if let Some(region) = params.region {
             let crop = clamp_rect(region, image.width(), image.height())?;
             let short = crop.w.min(crop.h);
             let possible = MIN_CROP_SHORT_SIDE.min(image.width()).min(image.height());
             if u32::try_from(short).unwrap_or(0) < possible {
                 return Err(params_invalid(format!(
-                    "the crop inside the {}x{} frame is {}x{}; its short side must be at least {MIN_CROP_SHORT_SIDE} px",
+                    "the crop inside the {}x{} picture is {}x{}; its short side must be at least {MIN_CROP_SHORT_SIDE} px",
                     image.width(),
                     image.height(),
                     crop.w,
@@ -1788,7 +762,7 @@ impl ClipView {
         let closeup = params.scale.is_some_and(|scale| scale > 1.0);
         let factor = if closeup { CLOSEUP_SCALE } else { 1 };
         let (width, height) = (image.width() * factor, image.height() * factor);
-        // D6: the call stays inside its token budget (tokens = w · h / 770 + 1500).
+        // The call stays inside its token budget (tokens = w · h / 770 + 1500).
         let tokens = u64::from(width) * u64::from(height) / PIXELS_PER_TOKEN + RESPONSE_TEXT_TOKENS;
         if tokens > CALL_TOKEN_BUDGET {
             let max_pixels =
@@ -1816,9 +790,9 @@ impl ClipView {
         }
         let _ = writeln!(
             self.text,
-            "Clip {} frame {number} at {} ({}x{} px, close-up x{factor}):",
+            "Clip {} frame {instant} at {} ({}x{} px, close-up x{factor}):",
             self.clip.clip.clip_id,
-            fmt_time(self.clip.t_of(number)),
+            fmt_time(picture.t_ms),
             width,
             height
         );
@@ -1827,12 +801,14 @@ impl ClipView {
         } else {
             "recorded pixels"
         };
-        self.export(image, 1, number, reason, &stem)
+        self.export(image, 1, &picture, reason, &stem)
     }
 
+    /// Changed regions between the pictures at `start_ms` and `end_ms`;
+    /// only two exact stills are compared.
     fn diff(&mut self, params: &ClipViewParams) -> Result<(), ErrorData> {
         let (start, end) = self.range(params)?;
-        let (from, to) = (self.clip.frame_at_ms(start), self.clip.frame_at_ms(end));
+        let (from, to) = (self.clip.instant_at_ms(start), self.clip.instant_at_ms(end));
         let _ = writeln!(
             self.text,
             "Clip {} diff {} (frame {from}) -> {} (frame {to}):",
@@ -1840,52 +816,54 @@ impl ClipView {
             fmt_time(self.clip.t_of(from)),
             fmt_time(self.clip.t_of(to))
         );
-        if from == to || self.clip.same_picture(from, to) {
-            let _ = writeln!(self.text, "- no new frame between the two times: no change");
+        let sources = [(from, self.clip.source(from)?), (to, self.clip.source(to)?)];
+        let mut any_lost = false;
+        for (instant, source) in &sources {
+            if let PictureSource::Lost { cause } = source {
+                self.name_lost(*instant, cause);
+                any_lost = true;
+            }
+        }
+        if any_lost {
+            let _ = writeln!(self.text, "- no comparison: a lost instant holds no picture");
             return Ok(());
         }
-        let before = self.pictures.at(from)?;
-        let after = self.pictures.at(to)?;
-        if (before.width, before.height) != (after.width, after.height) {
+        let [(_, before_source), (_, after_source)] = &sources;
+        if before_source.shown_instant() == after_source.shown_instant() {
             let _ = writeln!(
                 self.text,
-                "- the window size changed between the two times ({}x{} -> {}x{}); compare them with clip_frame",
-                before.width, before.height, after.width, after.height
+                "- the same recorded picture at both times: no change"
             );
             return Ok(());
         }
-        let mut blocks = BlockMap::between(&Picture::new(&before), &Picture::new(&after));
-        for instant in [from, to] {
-            let moving = self
-                .clip
-                .line(instant)
-                .and_then(|line| line.moving)
-                .and_then(|reference| {
-                    self.clip
-                        .clip
-                        .moving
-                        .segments
-                        .iter()
-                        .find(|s| s.segment.index == reference.segment)
-                });
-            if let Some(moving) = moving {
-                for b in 0..blocks.grid.blocks() {
-                    if !blocks.changed[b]
-                        && blocks
-                            .grid
-                            .bbox([b])
-                            .is_some_and(|r| moving.segment.rect.intersect(&r).is_some())
-                    {
-                        blocks.changed[b] = true;
-                        blocks.count += 1;
-                    }
-                }
-            }
+        if before_source.kind() != PictureKind::ExactStill
+            || after_source.kind() != PictureKind::ExactStill
+        {
+            self.refuse_video_diff(&sources);
+            return Ok(());
         }
+        let mut before = self.picture(from)?;
+        let mut after = self.picture(to)?;
+        let (Some(before_image), Some(after_image)) = (before.image.take(), after.image.take())
+        else {
+            return Err(decode_error("a still decoded to no picture".to_owned()));
+        };
+        if before_image.dimensions() != after_image.dimensions() {
+            let _ = writeln!(
+                self.text,
+                "- the window size changed between the two times ({}x{} -> {}x{}); compare them with clip_frame",
+                before_image.width(),
+                before_image.height(),
+                after_image.width(),
+                after_image.height()
+            );
+            return Ok(());
+        }
+        let blocks = ChangedBlocks::between(&before_image, &after_image);
         let mut regions = blocks.regions();
         let _ = writeln!(
             self.text,
-            "- {} changed blocks ({}% of the picture) in {} regions",
+            "- exact still to exact still: {} changed {BLOCK_PX}x{BLOCK_PX} blocks ({}% of the picture) in {} regions",
             blocks.count,
             blocks.percent(),
             regions.len()
@@ -1906,12 +884,12 @@ impl ClipView {
             );
         }
         let Some(bbox) = blocks.bbox() else {
-            let _ = writeln!(self.text, "- no visible change (below the block threshold)");
+            let _ = writeln!(self.text, "- no pixel differs");
             return Ok(());
         };
-        let crop = diff_crop(bbox, before.width, before.height);
-        let mut left = crop_image(&to_rgba(&before), crop);
-        let mut right = crop_image(&to_rgba(&after), crop);
+        let crop = diff_crop(bbox, before_image.width(), before_image.height());
+        let mut left = crop_image(&before_image, crop);
+        let mut right = crop_image(&after_image, crop);
         for region in &regions {
             outline(&mut left, region.rect, crop);
             outline(&mut right, region.rect, crop);
@@ -1919,25 +897,76 @@ impl ClipView {
         let image = fit(side_by_side(&left, &right), VIEW_MAX_LONG_EDGE);
         let reason = format!(
             "before {} / after {}, crop x={} y={} w={} h={}",
-            fmt_time(self.clip.t_of(from)),
-            fmt_time(self.clip.t_of(to)),
+            fmt_time(before.t_ms),
+            fmt_time(after.t_ms),
             crop.x,
             crop.y,
             crop.w,
             crop.h
         );
         self.regions = regions;
-        self.export(image, 1, to, &reason, &format!("diff_f{from}-f{to}"))
+        self.export(image, 1, &after, &reason, &format!("diff_f{from}-f{to}"))
     }
 
-    /// D4: a time past the committed segments is refused, saying how many
-    /// frames wait.
-    fn check_committed(&self, t_ms: u64) -> Result<(), ErrorData> {
+    /// Names why a video picture is not compared, and the settle points an
+    /// agent can compare instead.
+    fn refuse_video_diff(&mut self, sources: &[(u64, PictureSource); 2]) {
+        let _ = writeln!(
+            self.text,
+            "- clip_diff compares exact stills only: change analysis on video pictures is not measured yet (plan 5.0, open item O2)"
+        );
+        for (instant, source) in sources {
+            let (before, after) = self.clip.settle_points_around(*instant);
+            let point = |settle: Option<u64>| {
+                settle.map_or_else(
+                    || "none".to_owned(),
+                    |k| format!("instant {k} ({})", fmt_time(self.clip.t_of(k))),
+                )
+            };
+            let _ = writeln!(
+                self.text,
+                "- {} (frame {instant}) shows {}; nearest settle points: {} before, {} after",
+                fmt_time(self.clip.t_of(*instant)),
+                source.kind().as_str(),
+                point(before),
+                point(after)
+            );
+        }
+        let _ = writeln!(
+            self.text,
+            "- call clip_diff with the times of two settle points, or clip_frames to see the video pictures"
+        );
+    }
+
+    fn picture(&mut self, instant: u64) -> Result<ClipPicture, ErrorData> {
+        self.decoder.picture_at(instant).map_err(decode_error)
+    }
+
+    /// Answers a lost instant: its cause and the nearest recorded instants;
+    /// no picture.
+    fn name_lost(&mut self, instant: u64, cause: &str) {
+        let (before, after) = self.clip.nearest_recorded(instant);
+        let t_ms = self.clip.t_of(instant);
+        let _ = writeln!(
+            self.text,
+            "- {} frame {instant}: lost ({cause}); no picture was recorded; {}",
+            fmt_time(t_ms),
+            nearest_text(before, after)
+        );
+        self.lost.push(ClipLostInstant {
+            kind: PictureKind::Lost.as_str().to_owned(),
+            frame: instant,
+            t_ms,
+            cause: cause.to_owned(),
+            recorded_before: before,
+            recorded_after: after,
+        });
+    }
+
+    /// A time inside the clip.
+    fn check_inside(&self, t_ms: u64) -> Result<(), ErrorData> {
         if t_ms < self.clip.duration_ms() {
             return Ok(());
-        }
-        if t_ms < self.clip.recorded_ms() || self.clip.clip.state != ClipState::Ready {
-            return Err(self.clip.waiting_error(t_ms));
         }
         Err(params_invalid(format!(
             "t_ms {t_ms} is at or after the clip end ({} ms)",
@@ -1945,7 +974,7 @@ impl ClipView {
         )))
     }
 
-    /// `start_ms`..=`end_ms`, checked against the committed part of the clip.
+    /// `start_ms`..=`end_ms`, the end clamped to the clip's last instant.
     fn range(&self, params: &ClipViewParams) -> Result<(u64, u64), ErrorData> {
         let (start, end) = (params.start_ms.unwrap_or(0), params.end_ms.unwrap_or(0));
         if start >= end {
@@ -1953,52 +982,42 @@ impl ClipView {
                 "start_ms {start} must be before end_ms {end}"
             )));
         }
-        self.check_committed(start)?;
-        let duration = self.clip.duration_ms();
-        // D4: a range that reaches uncommitted time (its end included) is
-        // refused; only a finished clip clamps the end to its last frame.
-        let uncommitted =
-            self.clip.recorded_ms() > duration || self.clip.clip.state != ClipState::Ready;
-        if end >= duration && uncommitted {
-            return Err(self.clip.waiting_error(end));
-        }
-        Ok((start, end.min(duration - 1)))
+        self.check_inside(start)?;
+        Ok((start, end.min(self.clip.duration_ms() - 1)))
     }
 
-    fn analysis(&self) -> Result<Analysis, ErrorData> {
-        let cache = self.clip.views_dir()?.join(ANALYSIS_FILE);
-        let inputs = self.clip.fingerprint();
-        if let Some(analysis) = std::fs::read(&cache)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Analysis>(&bytes).ok())
-            .filter(|analysis| analysis.version == ANALYSIS_VERSION && analysis.inputs == inputs)
-        {
-            return Ok(analysis);
-        }
-        let mut analysis = Analyzer::run(&self.clip)?;
-        analysis.inputs = inputs;
-        if let Ok(bytes) = serde_json::to_vec_pretty(&analysis) {
-            let _ = std::fs::write(&cache, bytes);
-        }
-        Ok(analysis)
-    }
-
-    /// Labels the image (text and drawn copy), writes the PNG under `views/`
-    /// and keeps it for the result.
+    /// Labels the picture (text and a band above it), writes the PNG under
+    /// `views/` and keeps it for the result.
     fn export(
         &mut self,
-        mut image: image::RgbaImage,
+        image: RgbaImage,
         index: u32,
-        frame: u64,
+        picture: &ClipPicture,
         reason: &str,
         stem: &str,
     ) -> Result<(), ErrorData> {
-        let t_ms = self.clip.t_of(frame);
+        let kind = picture.kind();
+        let shown = picture.source.shown_instant().unwrap_or(picture.instant);
+        let unchanged = if shown == picture.instant {
+            String::new()
+        } else {
+            format!(", unchanged since frame {shown}")
+        };
         let label = format!(
-            "Image {index} (t={}, frame {frame}, {reason})",
-            fmt_time(t_ms)
+            "Image {index} ({}, t={}, frame {}{unchanged}, {reason})",
+            kind.as_str(),
+            fmt_time(picture.t_ms),
+            picture.instant
         );
-        draw_label(&mut image, &format!("#{index} {} F{frame}", fmt_time(t_ms)));
+        let image = labelled(
+            &image,
+            &format!(
+                "#{index} {} F{} {}",
+                fmt_time(picture.t_ms),
+                picture.instant,
+                label_word(kind)
+            ),
+        );
         let path = self.clip.views_dir()?.join(format!("{stem}.png"));
         let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
         let mut png = Vec::new();
@@ -2009,8 +1028,10 @@ impl ClipView {
         let _ = writeln!(self.text, "{label}: {}", path.display());
         self.images.push(ClipViewImage {
             index,
-            t_ms,
-            frame,
+            t_ms: picture.t_ms,
+            frame: picture.instant,
+            kind: kind.as_str().to_owned(),
+            shown_frame: shown,
             reason: reason.to_owned(),
             label,
             path: path.to_string_lossy().into_owned(),
@@ -2030,9 +1051,9 @@ impl ClipView {
             .paging
             .and_then(|(page, pages)| (page < pages).then_some(page + 1));
         if let Some(next) = next_page {
-            let _ = writeln!(self.text, "More key frames: call again with page={next}.");
+            let _ = writeln!(self.text, "More key pictures: call again with page={next}.");
         }
-        let (width, height) = self.clip.largest_recorded();
+        let (width, height) = self.clip.size();
         ViewOutput {
             response: ClipViewResponse {
                 clip_id: self.clip.clip.clip_id.clone(),
@@ -2042,9 +1063,10 @@ impl ClipView {
                 height,
                 fps: self.clip.clip.fps,
                 frames_total: self.clip.lines.len() as u64,
-                frames_new: self.clip.lines.iter().filter(|line| line.new).count() as u64,
+                frames_new: self.clip.changed_count(),
                 timeline: self.timeline,
                 images: self.images,
+                lost: self.lost,
                 regions: self.regions,
                 page,
                 pages,
@@ -2058,22 +1080,139 @@ impl ClipView {
 }
 
 // ---------------------------------------------------------------------------
+// Change between two exact stills
+// ---------------------------------------------------------------------------
+
+/// The `BLOCK_PX` blocks in which any pixel differs between two pictures of
+/// the same size. Exact stills hold the window's exact pixels, so any
+/// difference is a real change.
+struct ChangedBlocks {
+    width: u32,
+    height: u32,
+    columns: usize,
+    rows: usize,
+    changed: Vec<bool>,
+    count: u64,
+}
+
+impl ChangedBlocks {
+    fn between(before: &RgbaImage, after: &RgbaImage) -> Self {
+        let (width, height) = before.dimensions();
+        let columns = (width as usize).div_ceil(BLOCK_PX);
+        let rows = (height as usize).div_ceil(BLOCK_PX);
+        let mut changed = vec![false; columns * rows];
+        let row_bytes = width as usize * RGBA_BYTES;
+        if row_bytes > 0 {
+            let row_pairs = before
+                .as_raw()
+                .chunks_exact(row_bytes)
+                .zip(after.as_raw().chunks_exact(row_bytes));
+            for (y, (above, below)) in row_pairs.enumerate() {
+                let pixels = above
+                    .chunks_exact(RGBA_BYTES)
+                    .zip(below.chunks_exact(RGBA_BYTES));
+                for (x, (a, b)) in pixels.enumerate() {
+                    if a[..RGB_BYTES] != b[..RGB_BYTES]
+                        && let Some(block) = changed.get_mut((y / BLOCK_PX) * columns + x / BLOCK_PX)
+                    {
+                        *block = true;
+                    }
+                }
+            }
+        }
+        let count = changed.iter().filter(|block| **block).count() as u64;
+        Self {
+            width,
+            height,
+            columns,
+            rows,
+            changed,
+            count,
+        }
+    }
+
+    fn percent(&self) -> u64 {
+        self.count * PERCENT / (self.changed.len() as u64).max(1)
+    }
+
+    /// Changed blocks joined across at most `REGION_GAP_BLOCKS` empty
+    /// blocks, largest region first.
+    fn regions(&self) -> Vec<ClipChangedRegion> {
+        let (gap_columns, gap_rows) = REGION_GAP_BLOCKS;
+        let mut seen = vec![false; self.changed.len()];
+        let mut regions = Vec::new();
+        for start in 0..self.changed.len() {
+            if !self.changed[start] || seen[start] {
+                continue;
+            }
+            seen[start] = true;
+            let mut stack = vec![start];
+            let (mut first, mut last) = (self.cell(start), self.cell(start));
+            let mut count = 0_u64;
+            while let Some(block) = stack.pop() {
+                count += 1;
+                let (column, row) = self.cell(block);
+                first = (first.0.min(column), first.1.min(row));
+                last = (last.0.max(column), last.1.max(row));
+                let near_rows = row.saturating_sub(gap_rows)..=(row + gap_rows).min(self.rows - 1);
+                for near_row in near_rows {
+                    let near_columns =
+                        column.saturating_sub(gap_columns)..=(column + gap_columns).min(self.columns - 1);
+                    for near_column in near_columns {
+                        let near = near_row * self.columns + near_column;
+                        if self.changed[near] && !seen[near] {
+                            seen[near] = true;
+                            stack.push(near);
+                        }
+                    }
+                }
+            }
+            regions.push(ClipChangedRegion {
+                rect: self.pixels(first, last),
+                changed_blocks: count,
+            });
+        }
+        regions.sort_by(|a, b| b.changed_blocks.cmp(&a.changed_blocks));
+        regions
+    }
+
+    /// The box around every changed block, in pixels.
+    fn bbox(&self) -> Option<Rect> {
+        let mut cells = (0..self.changed.len())
+            .filter(|block| self.changed[*block])
+            .map(|block| self.cell(block));
+        let first = cells.next()?;
+        let (low, high) = cells.fold((first, first), |(low, high), (column, row)| {
+            (
+                (low.0.min(column), low.1.min(row)),
+                (high.0.max(column), high.1.max(row)),
+            )
+        });
+        Some(self.pixels(low, high))
+    }
+
+    /// Column and row of block `block`.
+    fn cell(&self, block: usize) -> (usize, usize) {
+        (block % self.columns, block / self.columns)
+    }
+
+    /// The pixels of the blocks from `first` to `last` (column, row), inclusive.
+    fn pixels(&self, first: (usize, usize), last: (usize, usize)) -> Rect {
+        let x = first.0 * BLOCK_PX;
+        let y = first.1 * BLOCK_PX;
+        let right = ((last.0 + 1) * BLOCK_PX).min(self.width as usize);
+        let bottom = ((last.1 + 1) * BLOCK_PX).min(self.height as usize);
+        rect(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Image helpers
 // ---------------------------------------------------------------------------
 
-fn to_rgba(frame: &DecodedFrame) -> image::RgbaImage {
-    let mut rgba = frame.bgra.clone();
-    for px in rgba.chunks_exact_mut(4) {
-        px.swap(0, 2);
-        px[3] = u8::MAX;
-    }
-    image::RgbaImage::from_raw(frame.width, frame.height, rgba)
-        .unwrap_or_else(|| image::RgbaImage::new(frame.width.max(1), frame.height.max(1)))
-}
-
 /// Shrinks (never enlarges) so the long edge fits `long_edge`; every output
-/// pixel is the average of all source pixels it covers (D2).
-fn fit(image: image::RgbaImage, long_edge: u32) -> image::RgbaImage {
+/// pixel is the average of all source pixels it covers.
+fn fit(image: RgbaImage, long_edge: u32) -> RgbaImage {
     let long = image.width().max(image.height());
     if long <= long_edge {
         return image;
@@ -2091,7 +1230,7 @@ fn fit(image: image::RgbaImage, long_edge: u32) -> image::RgbaImage {
                 .min(source),
         )
     };
-    image::RgbaImage::from_fn(width, height, |x, y| {
+    RgbaImage::from_fn(width, height, |x, y| {
         let (x0, x1) = span(x, width, source_width);
         let (y0, y1) = span(y, height, source_height);
         let mut sum = [0_u64; 4];
@@ -2111,14 +1250,6 @@ fn scaled(value: u32, scale: f64) -> u32 {
     ((f64::from(value) * scale).round() as u32).max(1)
 }
 
-fn view_rect(rectangle: PixelRect) -> Rect {
-    rect(
-        rectangle.x as usize,
-        rectangle.y as usize,
-        rectangle.w as usize,
-        rectangle.h as usize,
-    )
-}
 fn rect(x: usize, y: usize, w: usize, h: usize) -> Rect {
     let to_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
     Rect {
@@ -2141,7 +1272,7 @@ fn clamp_rect(region: Rect, width: u32, height: u32) -> Result<Rect, ErrorData> 
     let y1 = region.y.saturating_add(region.h).clamp(0, height);
     if x1 <= x0 || y1 <= y0 {
         return Err(params_invalid(format!(
-            "region x={} y={} w={} h={} lies outside the {width}x{height} frame",
+            "region x={} y={} w={} h={} lies outside the {width}x{height} picture",
             region.x, region.y, region.w, region.h
         )));
     }
@@ -2153,7 +1284,7 @@ fn clamp_rect(region: Rect, width: u32, height: u32) -> Result<Rect, ErrorData> 
     })
 }
 
-fn crop_image(image: &image::RgbaImage, crop: Rect) -> image::RgbaImage {
+fn crop_image(image: &RgbaImage, crop: Rect) -> RgbaImage {
     let to_u32 = |value: i32| u32::try_from(value).unwrap_or(0);
     image::imageops::crop_imm(
         image,
@@ -2189,20 +1320,22 @@ fn diff_crop(bbox: Rect, width: u32, height: u32) -> Rect {
     Rect { x, y, w, h }
 }
 
-/// Draws a 2 px red outline of `region` (clip pixels) on a crop at `crop`.
-fn outline(image: &mut image::RgbaImage, region: Rect, crop: Rect) {
-    let red = image::Rgba([230, 30, 30, 255]);
+/// Draws an `OUTLINE_PX` red outline of `region` (clip pixels) on a crop at `crop`.
+fn outline(image: &mut RgbaImage, region: Rect, crop: Rect) {
     let x0 = i64::from(region.x - crop.x);
     let y0 = i64::from(region.y - crop.y);
     let x1 = x0 + i64::from(region.w) - 1;
     let y1 = y0 + i64::from(region.h) - 1;
     let (width, height) = (i64::from(image.width()), i64::from(image.height()));
     let mut put = |x: i64, y: i64| {
-        if (0..width).contains(&x) && (0..height).contains(&y) {
-            image.put_pixel(x as u32, y as u32, red);
+        if let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y))
+            && i64::from(x) < width
+            && i64::from(y) < height
+        {
+            image.put_pixel(x, y, OUTLINE_RED);
         }
     };
-    for t in 0..2 {
+    for t in 0..OUTLINE_PX {
         for x in x0..=x1 {
             put(x, y0 + t);
             put(x, y1 - t);
@@ -2214,15 +1347,23 @@ fn outline(image: &mut image::RgbaImage, region: Rect, crop: Rect) {
     }
 }
 
-/// `left` and `right` next to each other with an 8 px grey divider.
-fn side_by_side(left: &image::RgbaImage, right: &image::RgbaImage) -> image::RgbaImage {
-    const GAP: u32 = 8;
-    let width = left.width() + GAP + right.width();
+/// `left` and `right` next to each other with a grey divider.
+fn side_by_side(left: &RgbaImage, right: &RgbaImage) -> RgbaImage {
+    let width = left.width() + DIVIDER_PX + right.width();
     let height = left.height().max(right.height());
-    let mut out = image::RgbaImage::from_pixel(width, height, image::Rgba([128, 128, 128, 255]));
+    let mut out = RgbaImage::from_pixel(width, height, DIVIDER_GREY);
     image::imageops::replace(&mut out, left, 0, 0);
-    image::imageops::replace(&mut out, right, i64::from(left.width() + GAP), 0);
+    image::imageops::replace(&mut out, right, i64::from(left.width() + DIVIDER_PX), 0);
     out
+}
+
+/// The word drawn in the label band for each kind of picture.
+const fn label_word(kind: PictureKind) -> &'static str {
+    match kind {
+        PictureKind::ExactStill => "STILL",
+        PictureKind::Video => "VIDEO",
+        PictureKind::Lost => "LOST",
+    }
 }
 
 /// 3x5 bitmap glyphs (one row per byte, bit 2 = left column).
@@ -2242,44 +1383,50 @@ fn glyph(c: char) -> [u8; 5] {
         '.' => [0, 0, 0, 0, 2],
         '#' => [5, 7, 5, 7, 5],
         'F' => [7, 4, 6, 4, 4],
+        'S' => [3, 4, 2, 1, 6],
+        'T' => [7, 2, 2, 2, 2],
+        'I' => [7, 2, 2, 2, 7],
+        'L' => [4, 4, 4, 4, 7],
+        'V' => [5, 5, 5, 5, 2],
+        'D' => [6, 5, 5, 5, 6],
+        'E' => [7, 4, 6, 4, 7],
+        'O' => [2, 5, 5, 5, 2],
         _ => [0; 5],
     }
 }
 
-/// Draws `text` in white on a dark box at the top-left corner.
-fn draw_label(image: &mut image::RgbaImage, text: &str) {
-    let unit: u32 = if image.width().min(image.height()) >= 600 {
-        3
+/// `image` below a dark band that carries `text` in white, so the label
+/// never covers recorded pixels.
+fn labelled(image: &RgbaImage, text: &str) -> RgbaImage {
+    let unit = if image.width().min(image.height()) >= LARGE_LABEL_MIN_PX {
+        LARGE_LABEL_UNIT
     } else {
-        2
+        SMALL_LABEL_UNIT
     };
     let pad = unit * 2;
-    let chars = u32::try_from(text.chars().count()).unwrap_or(0);
-    let box_w = (pad * 2 + chars * unit * 4).min(image.width());
-    let box_h = (pad * 2 + unit * 5).min(image.height());
-    for y in 0..box_h {
-        for x in 0..box_w {
-            image.put_pixel(x, y, image::Rgba([20, 20, 20, 255]));
-        }
-    }
+    let band = pad * 2 + unit * GLYPH_ROWS;
+    let width = image.width();
+    let mut out = RgbaImage::from_pixel(width, image.height() + band, LABEL_BACKGROUND);
+    image::imageops::replace(&mut out, image, 0, i64::from(band));
     for (position, c) in (0_u32..).zip(text.chars()) {
-        let left = pad + position * unit * 4;
+        let left = pad + position * unit * GLYPH_ADVANCE;
         for (row, bits) in (0_u32..).zip(glyph(c)) {
-            for col in 0..3_u32 {
-                if bits & (4 >> col) == 0 {
+            for column in 0..GLYPH_COLUMNS {
+                if bits & (4 >> column) == 0 {
                     continue;
                 }
                 for dy in 0..unit {
                     for dx in 0..unit {
-                        let (x, y) = (left + col * unit + dx, pad + row * unit + dy);
-                        if x < box_w && y < box_h {
-                            image.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+                        let (x, y) = (left + column * unit + dx, pad + row * unit + dy);
+                        if x < width && y < band {
+                            out.put_pixel(x, y, LABEL_INK);
                         }
                     }
                 }
             }
         }
     }
+    out
 }
 
 fn fmt_time(ms: u64) -> String {
@@ -2297,7 +1444,7 @@ fn fmt_time(ms: u64) -> String {
 
 fn source_of_truth(folder: &str) -> String {
     format!(
-        "clip folder {folder} (frames/, moving/, {FRAMES_FILE}, {CLIP_JSON_FILE}); exported images under {VIEWS_DIR}"
+        "clip folder {folder} ({VIDEO_DIR}/, {STILLS_DIR}/, {FRAMES_FILE}, {CLIP_JSON_FILE}); exported images under {VIEWS_DIR}"
     )
 }
 
@@ -2310,7 +1457,7 @@ fn internal(message: String) -> ErrorData {
 }
 
 fn decode_error(message: String) -> ErrorData {
-    internal(format!("segment decode failed: {message}"))
+    internal(format!("clip decode failed: {message}"))
 }
 
 /// Adds tool, operation, source of truth and a remediation to an error.
@@ -2329,9 +1476,9 @@ fn with_view_context(
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned();
     let remediation = if code == error_codes::TOOL_PARAMS_INVALID {
-        "pass a clip folder written by screenshot operation=record and times inside its committed segments (record_status lists them)"
+        "pass a ready clip folder written by screenshot operation=record and times inside it (record_status gives its length)"
     } else {
-        "check that the segment files are complete (record_status lists their size and SHA-256); record the clip again if one is damaged"
+        "check that the video parts and stills are complete (record_status lists their size and SHA-256); record the clip again if one is damaged"
     };
     let operation = super::m1_tools::screenshot_operation_name(operation);
     error.message = format!("screenshot operation={operation}: {}", error.message).into();

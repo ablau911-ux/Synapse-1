@@ -27,6 +27,8 @@ futures-util.workspace = true
 http.workspace = true
 hyper.workspace = true
 image.workspace = true
+# Clip recorder (docs/clip-recorder-plan-5.0.md): lossless WebP stills, pure Rust.
+image-webp = "0.2.4"
 metrics.workspace = true
 notify.workspace = true
 rmcp = { workspace = true, features = [
@@ -65,6 +67,10 @@ uuid.workspace = true
 zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
+# Clip recorder (docs/clip-recorder-plan-5.0.md): libaom AV1, the encoder for recording
+# and the decoder for the viewer. libaom-sys builds libaom with the static C runtime and
+# needs CMake with the Ninja generator: see the repository's .cargo/config.toml.
+libaom-sys = { version = "0.18.1", default-features = false, features = ["av1_encoder", "av1_decoder"] }
 windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Variant", "Win32_System_Com_StructuredStorage"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

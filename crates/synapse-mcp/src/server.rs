@@ -249,12 +249,10 @@ mod capture_gif;
 mod clip_decoder;
 #[cfg(windows)]
 mod clip_encoder;
-mod clip_exact;
 mod clip_folder;
-mod clip_layers;
-mod clip_motion;
-mod clip_moving;
 mod clip_recovery;
+#[cfg(windows)]
+mod clip_stream;
 #[cfg(windows)]
 mod clip_viewer;
 #[cfg(windows)]

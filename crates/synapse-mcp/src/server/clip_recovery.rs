@@ -18,8 +18,9 @@ use std::path::Path;
 
 use super::clip_folder::{
     ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
-    LOST_ENCODER_FAILED, LOST_SERVICE_RESTART, LostInstant, PartInfo, RecorderLock, STILLS_DIR,
-    StillInfo, StopReason, part_path, read_index, repair_ivf, still_path, write_bytes_atomically,
+    LOST_ENCODER_FAILED, LOST_SERVICE_RESTART, LostInstant, MAX_DURATION_MS, PartInfo, RECORD_FPS,
+    RecorderLock, STILLS_DIR, StillInfo, StopReason, part_path, read_index, repair_ivf, still_path,
+    write_bytes_atomically,
 };
 
 const MILLISECONDS_PER_SECOND: u64 = 1_000;
@@ -46,7 +47,21 @@ impl ClipRecovery {
             ClipState::Ready => return Ok(()),
         }
         // Instant k is recorded when k / f < end: ceil(end * f / 1000) instants.
-        let planned = (clip.end_ms * u64::from(clip.fps)).div_ceil(MILLISECONDS_PER_SECOND);
+        // The recorder makes no clip longer than MAX_DURATION_MS at RECORD_FPS,
+        // so a plan beyond that is not a recording's: it is refused before a
+        // lost line is made for each of its instants.
+        let longest = MAX_DURATION_MS * u64::from(RECORD_FPS) / MILLISECONDS_PER_SECOND;
+        let planned = clip
+            .end_ms
+            .checked_mul(u64::from(clip.fps))
+            .map(|scaled| scaled.div_ceil(MILLISECONDS_PER_SECOND))
+            .filter(|&planned| planned <= longest)
+            .ok_or_else(|| {
+                format!(
+                    "clip.json plans {} ms at {} instants per second, beyond the longest recording ({MAX_DURATION_MS} ms at {RECORD_FPS})",
+                    clip.end_ms, clip.fps
+                )
+            })?;
         let (lines, complete) =
             Self::reconcile(folder, Some(planned), clip.fps, LOST_SERVICE_RESTART)?;
         let parts = Self::parts(folder, &lines, &complete)?;

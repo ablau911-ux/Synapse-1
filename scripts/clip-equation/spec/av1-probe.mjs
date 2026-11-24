@@ -498,6 +498,22 @@ function failedClipZeroFpsRefused() {
   return verdict(refused ? [] : [`recovery did not refuse cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], 'failed clip with fps 0 and a gap at instant 0: recovery refuses it (zero fps) and does not crash');
 }
 
+/**
+ * A killed recording whose clip.json plans more than the longest recording (10 minutes): recovery
+ * refuses it with an error and does not make the lost lines up to that end.
+ */
+function overlongClipRefused() {
+  const LONGEST_MS = 600_000; // the recorder's longest clip
+  const got = recovered('killed-text-page', 'crash-overlong', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.end_ms = LONGEST_MS + INSTANT_MS;
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (!got.error) return verdict([`recovery accepted a clip planned ${LONGEST_MS + INSTANT_MS} ms long and wrote ${got.lines.length} index lines`]);
+  const refused = /^recovery failed: .*longest recording/.test(got.error);
+  return verdict(refused ? [] : [`recovery did not refuse cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], `clip planned ${LONGEST_MS + INSTANT_MS} ms long: recovery refuses it (beyond the longest recording)`);
+}
+
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
 function fetchPicture(folder, instant) {
   const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
@@ -585,6 +601,7 @@ const table = {
   'recovery names every planned instant': recoveryNamesEveryInstant,
   'recovery makes a failed clip agree with its pictures': failedClipReconciled,
   'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
+  'recovery refuses a clip longer than the longest recording': overlongClipRefused,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

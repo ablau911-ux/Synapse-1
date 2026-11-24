@@ -770,7 +770,8 @@ mod live {
     /// Removes the parents of `folder` that a start created, from the
     /// nearest up to `first_created`; each only while it is empty, so
     /// anything else put there (the clip registry, another process's files)
-    /// stays.
+    /// stays. A parent that does not exist (`create_dir_all` failed before
+    /// it) is passed over, so the ones above it that were made are removed.
     fn remove_created_parents(folder: &Path, first_created: &Path) {
         for parent in folder
             .ancestors()
@@ -779,6 +780,7 @@ mod live {
         {
             match std::fs::remove_dir(parent) {
                 Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => return,
                 Err(error) => {
                     tracing::warn!(

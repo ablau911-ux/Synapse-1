@@ -883,6 +883,38 @@ function failedStartKeepsRegistry() {
 }
 
 /**
+ * A clip folder never is, or holds, the default clips folder or the registry: a failed start removes its
+ * clip folder with everything in it. Under a LOCALAPPDATA of the bench's own with no synapse folder (so
+ * the clips folder does not exist yet and `record` would create it as the clip folder), the product's
+ * check refuses the clips folder however it is written, the folder above it and the registry path, and
+ * accepts a folder inside the clips folder and one elsewhere.
+ */
+function clipFolderNeverHoldsRegistry() {
+  const appData = path.join(OUT, 'clip-folder-check');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  fs.mkdirSync(appData, { recursive: true });
+  const clips = path.join(appData, 'synapse', 'clips');
+  const cases = [
+    ['the clips folder', clips, false],
+    ['the clips folder in other case, with .. and a trailing separator', `${path.join(appData, 'SYNAPSE', 'x')}\\..\\CLIPS\\`, false],
+    ['the clips folder relative to the working folder', path.join('synapse', 'clips'), false],
+    ['the synapse folder above it', path.join(appData, 'synapse'), false],
+    ['the registry path', path.join(clips, 'active-clips.json'), false],
+    ['a folder in the clips folder', path.join(clips, 'clip-new'), true],
+    ['a folder elsewhere', path.join(appData, 'elsewhere', 'clip'), true],
+  ];
+  const problems = [];
+  for (const [name, folder, accepted] of cases) {
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=check_folder', `folder=${folder}`], { cwd: appData, encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (got.ok === undefined) problems.push(`${name}: probe: ${String(got.error).replace(/\s+/g, ' ').slice(0, 160)}`);
+    else if (got.ok !== accepted) problems.push(`${name} (${folder}) was ${got.ok ? 'accepted' : `refused: ${got.error}`}`);
+    else if (!accepted && !/holds the default clips folder/.test(String(got.error))) problems.push(`${name}: refused for another reason: ${got.error}`);
+  }
+  if (fs.existsSync(path.join(appData, 'synapse'))) problems.push('the check created the synapse folder');
+  return verdict(problems, `${cases.filter(c => !c[2]).length} ways of naming the clips folder, a folder above it or the registry are refused; a folder in the clips folder and one elsewhere are accepted`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -1002,6 +1034,7 @@ const table = {
   'recovery at start reports a clip it could not recover': recoveryFailureReported,
   'recovery at start reports every failure of registering the default folder': registerFailuresAllReported,
   'a failed start leaves no registry entry and never deletes the registry or its lock file': failedStartKeepsRegistry,
+  'a clip folder never is or holds the clips folder or the registry': clipFolderNeverHoldsRegistry,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

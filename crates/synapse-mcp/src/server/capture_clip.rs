@@ -492,6 +492,12 @@ fn capture_clip_plan(
             ),
         ));
     }
+    ClipRegistry::check_clip_folder(&folder).map_err(|reason| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("screenshot operation=record folder refused: {reason}"),
+        )
+    })?;
     let volume = folder
         .ancestors()
         .find(|ancestor| ancestor.exists())

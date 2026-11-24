@@ -87,6 +87,26 @@ pub(super) fn clips_root() -> PathBuf {
         .join("clips")
 }
 
+/// `path` in one form for comparing paths, also paths that do not exist
+/// yet: absolute with `.` and `..` resolved, its deepest existing ancestor
+/// canonicalised (links, short names, the letter case on disk) with the rest
+/// appended, all in lower case (Windows compares names without case).
+fn comparable_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
+    let resolved = absolute
+        .ancestors()
+        .find_map(|ancestor| {
+            let canonical = std::fs::canonicalize(ancestor).ok()?;
+            let rest = absolute.strip_prefix(ancestor).ok()?;
+            Some(canonical.join(rest))
+        })
+        .unwrap_or(absolute);
+    Ok(PathBuf::from(
+        resolved.as_os_str().to_string_lossy().to_lowercase(),
+    ))
+}
+
 /// The file of video part `part`: `video/part-NNNN.ivf`.
 pub fn part_path(folder: &Path, part: u32) -> PathBuf {
     folder.join(VIDEO_DIR).join(format!("part-{part:04}.ivf"))
@@ -937,6 +957,23 @@ impl ClipRegistry {
     /// The registry file, in the default clips folder.
     pub(super) fn path() -> PathBuf {
         clips_root().join(REGISTRY_FILE)
+    }
+
+    /// A clip folder never is, or holds, the default clips folder or the
+    /// registry: a start that fails removes its clip folder with everything
+    /// in it. Refused however the folder is written (another letter case,
+    /// `.` or `..`, a relative path, a link or short name in the part that
+    /// exists).
+    pub(super) fn check_clip_folder(folder: &Path) -> Result<(), String> {
+        let registry = Self::path();
+        if comparable_path(&registry)?.starts_with(comparable_path(folder)?) {
+            return Err(format!(
+                "{} is or holds the default clips folder {} and its registry; a failed start removes its clip folder with everything in it",
+                folder.display(),
+                clips_root().display()
+            ));
+        }
+        Ok(())
     }
 
     /// Every registered clip; none while the registry file does not exist.

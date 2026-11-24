@@ -27,7 +27,26 @@ const BINDING_PREFIX: &str = "verification/binding/v1/";
 const AUDIT_SCHEMA: u32 = 1;
 const BINDING_SCHEMA: u32 = 1;
 const MAX_CODES: usize = 25;
+/// Upper bound for the `max` row count of `audit` and `sources` readbacks.
+const MAX_READBACK_ROWS: usize = 1000;
 static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Resolves a readback `max`: omitted takes `default`; 0 or above
+/// `MAX_READBACK_ROWS` is refused instead of silently clamped.
+fn validate_readback_max(
+    tool: &str,
+    max: Option<usize>,
+    default: usize,
+) -> Result<usize, ErrorData> {
+    let max = max.unwrap_or(default);
+    if max == 0 || max > MAX_READBACK_ROWS {
+        return Err(mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} max must be between 1 and {MAX_READBACK_ROWS}; got {max}"),
+        ));
+    }
+    Ok(max)
+}
 
 fn validate_persisted_verification_hwnd(tool: &str, hwnd: i64) -> Result<(), ErrorData> {
     if crate::m1::window_hwnd_shape_is_canonical(hwnd) {
@@ -145,8 +164,9 @@ struct VerificationReadOnce {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationAuditParams {
-    /// Max rows to return, newest first (default 50).
+    /// Max rows to return, newest first (default 50, max 1000).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 1000))]
     pub max: Option<usize>,
 }
 
@@ -221,7 +241,9 @@ pub struct VerificationBindResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationSourcesParams {
+    /// Max bindings to return (default 100, max 1000).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 1000))]
     pub max: Option<usize>,
 }
 
@@ -449,7 +471,7 @@ impl SynapseService {
         params: Parameters<VerificationAuditParams>,
         _request_context: RequestContext<RoleServer>,
     ) -> Result<Json<VerificationAuditResponse>, ErrorData> {
-        let max = params.0.max.unwrap_or(50).min(1000);
+        let max = validate_readback_max("verification_audit", params.0.max, 50)?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "verification_audit",
@@ -552,7 +574,7 @@ impl SynapseService {
         params: Parameters<VerificationSourcesParams>,
         _request_context: RequestContext<RoleServer>,
     ) -> Result<Json<VerificationSourcesResponse>, ErrorData> {
-        let max = params.0.max.unwrap_or(100).min(1000);
+        let max = validate_readback_max("verification_sources", params.0.max, 100)?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "verification_sources",

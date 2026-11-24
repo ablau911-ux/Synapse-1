@@ -1466,6 +1466,7 @@ pub struct SuggestionListParams {
     pub routine_id: Option<String>,
     /// Max rows (default 100, max 1000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<u32>,
 }
 
@@ -1516,7 +1517,14 @@ pub fn list_suggestions(
     db: &Arc<Db>,
     params: &SuggestionListParams,
 ) -> Result<SuggestionListResponse, ErrorData> {
-    let limit = params.limit.unwrap_or(100).min(1000) as usize;
+    let limit = params.limit.unwrap_or(100);
+    if limit == 0 || limit > 1000 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("suggestion_list limit must be between 1 and 1000; got {limit}"),
+        ));
+    }
+    let limit = limit as usize;
     let all = load_all_suggestions(db)?;
     let total_rows = all.len() as u64;
     let mut filtered: Vec<SuggestionRecord> = all

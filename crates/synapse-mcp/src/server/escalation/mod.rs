@@ -2009,6 +2009,7 @@ pub struct EscalationListParams {
     pub anchor: Option<String>,
     /// Max rows to return (default 50, max 500).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 500))]
     pub limit: Option<u32>,
 }
 
@@ -2176,12 +2177,19 @@ impl SynapseService {
         params: Parameters<EscalationListParams>,
     ) -> Result<Json<EscalationListResponse>, ErrorData> {
         let params = params.0;
+        let limit = params.limit.unwrap_or(50);
+        if limit == 0 || limit > 500 {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("escalation_list limit must be between 1 and 500; got {limit}"),
+            ));
+        }
+        let limit = limit as usize;
         let db = self.m3_storage()?;
         prune_terminal_items(&db, unix_time_ms_now())?;
         let mut items = scan_items(&db)?;
         items.sort_by_key(|item| std::cmp::Reverse(item.created_at_unix_ms));
         let total_open = items.iter().filter(|item| item.status.is_open()).count();
-        let limit = params.limit.unwrap_or(50).min(500) as usize;
         let filtered: Vec<EscalationItem> = items
             .into_iter()
             .filter(|item| params.status.map(|s| s == item.status).unwrap_or(true))

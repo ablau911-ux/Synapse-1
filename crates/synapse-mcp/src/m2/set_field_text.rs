@@ -456,26 +456,26 @@ pub(crate) fn finish_replace_response(
         );
         return Err(super::error_after_earlier_steps(
             ErrorData::new(
-            ErrorCode(-32099),
-            format!(
-                "{TOOL} Source-of-Truth postcondition failed: separate target readback does not equal the requested replacement text"
-            ),
-            Some(json!({
-                "code": error_codes::ACTION_POSTCONDITION_FAILED,
-                "tool": TOOL,
-                "method": method,
-                "backend_tier_used": backend_tier_used,
-                "source_of_truth": source_of_truth,
-                "verify_delta": {
-                    "before_signature": before_sha256,
-                    "after_signature": after_sha256,
-                    "requested_signature": requested_sha256,
-                    "before_len": before_len,
-                    "after_len": after_len,
-                    "requested_len": requested_len,
-                },
-                "evidence": evidence,
-            })),
+                ErrorCode(-32099),
+                format!(
+                    "{TOOL} Source-of-Truth postcondition failed: separate target readback does not equal the requested replacement text"
+                ),
+                Some(json!({
+                    "code": error_codes::ACTION_POSTCONDITION_FAILED,
+                    "tool": TOOL,
+                    "method": method,
+                    "backend_tier_used": backend_tier_used,
+                    "source_of_truth": source_of_truth,
+                    "verify_delta": {
+                        "before_signature": before_sha256,
+                        "after_signature": after_sha256,
+                        "requested_signature": requested_sha256,
+                        "before_len": before_len,
+                        "after_len": after_len,
+                        "requested_len": requested_len,
+                    },
+                    "evidence": evidence,
+                })),
             ),
             1,
         ));

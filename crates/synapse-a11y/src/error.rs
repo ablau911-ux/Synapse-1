@@ -46,7 +46,7 @@ pub enum A11yError {
     #[error("{error}")]
     AfterInput {
         code: &'static str,
-        error: Box<A11yError>,
+        error: Box<Self>,
     },
 }
 
@@ -75,7 +75,7 @@ impl A11yError {
                 error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND
             }
             Self::InvalidElementId { .. } | Self::Internal { .. } => error_codes::OBSERVE_INTERNAL,
-            Self::AfterInput { code, .. } => *code,
+            Self::AfterInput { code, .. } => code,
         }
     }
 

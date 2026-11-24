@@ -1152,7 +1152,11 @@ pub async fn cdp_dom_primitive_node(
     .await?;
     // A primitive that failed after its first event returns the failure with
     // the events it dispatched instead of throwing.
-    if let Some(failure) = result.value.get("failed_after_events").and_then(Value::as_str) {
+    if let Some(failure) = result
+        .value
+        .get("failed_after_events")
+        .and_then(Value::as_str)
+    {
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
                 "Runtime.callFunctionOn DOM primitive {normalized} failed after events {}: {failure}",
@@ -1228,20 +1232,20 @@ pub async fn cdp_set_node_text(
             target_id_hint.as_deref(),
             backend_node_id,
             |page, center| async move {
-            dispatch_mouse_click_on_page(
-                &input_endpoint,
-                &page,
-                center,
-                MouseButton::Left,
-                1,
-                0,
-            )
-            .await?;
-            // The click above was delivered input: every later error is
-            // marked as raised after input.
-            set_node_text_after_click(&input_endpoint, &page, backend_node_id, text)
-                .await
-                .map_err(A11yError::after_input)
+                dispatch_mouse_click_on_page(
+                    &input_endpoint,
+                    &page,
+                    center,
+                    MouseButton::Left,
+                    1,
+                    0,
+                )
+                .await?;
+                // The click above was delivered input: every later error is
+                // marked as raised after input.
+                set_node_text_after_click(&input_endpoint, &page, backend_node_id, text)
+                    .await
+                    .map_err(A11yError::after_input)
             },
         )
         .await
@@ -6315,7 +6319,8 @@ async fn dispatch_key_sequence_on_page(
         }
     }
     let settled = if release_failures.is_empty() {
-        resolve_persisted_cdp_mutation_owner(&owner).and(primary_error.map_or(Ok(()), Err))
+        resolve_persisted_cdp_mutation_owner(&owner)
+            .and_then(|()| primary_error.map_or(Ok(()), Err))
     } else {
         Err(record_unresolved_input_release_detail(
             primary_error,

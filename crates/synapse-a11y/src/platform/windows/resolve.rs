@@ -236,8 +236,7 @@ fn toggle_pattern_action(
         .map_err(|err| pattern_operation_error(id, "TogglePattern", "toggle", &err))?;
     // Toggle ran: every error below is after the click reached the element.
     let after_state = toggle_state_label(toggle_pattern.get_toggle_state().map_err(|err| {
-        pattern_operation_error(id, "TogglePattern", "ToggleState after Toggle", &err)
-            .after_input()
+        pattern_operation_error(id, "TogglePattern", "ToggleState after Toggle", &err).after_input()
     })?);
     if before_state == after_state {
         return Err(A11yError::internal(format!(
@@ -516,7 +515,9 @@ pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValue
         let after_value = if is_password {
             String::new()
         } else {
-            pattern.get_value().map_err(|err| map_uia_error(err).after_input())?
+            pattern
+                .get_value()
+                .map_err(|err| map_uia_error(err).after_input())?
         };
         Ok(ElementValueSetReadback {
             method: "uia_value_pattern".to_owned(),
@@ -983,11 +984,7 @@ fn native_replace_element_text_selection(
     };
     // In append mode EM_SETSEL above already moved the selection.
     let after_selection_move = |error: A11yError| {
-        if append {
-            error.after_input()
-        } else {
-            error
-        }
+        if append { error.after_input() } else { error }
     };
     let inserted_wide: Vec<u16> = inserted_text.encode_utf16().collect();
     let requested_text_utf16_len =
@@ -1010,8 +1007,8 @@ fn native_replace_element_text_selection(
     // EM_REPLACESEL was sent: every error below is after input.
     let after_value = native_text_value(id, hwnd).map_err(A11yError::after_input)?;
     let after_wide: Vec<u16> = after_value.encode_utf16().collect();
-    let after_text_utf16_len = native_text_u32_len(id, after_wide.len(), "after text")
-        .map_err(A11yError::after_input)?;
+    let after_text_utf16_len =
+        native_text_u32_len(id, after_wide.len(), "after text").map_err(A11yError::after_input)?;
     if after_wide != expected_wide {
         return Err(A11yError::internal(format!(
             "native text insertion postcondition failed for {id}: expected UTF-16 len {expected_after_text_utf16_len}, read back {after_text_utf16_len}"

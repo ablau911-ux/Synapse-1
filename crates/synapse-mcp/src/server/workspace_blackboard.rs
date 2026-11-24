@@ -123,7 +123,8 @@ pub struct WorkspacePutParams {
     /// Required when replacing an existing key. Omit to create only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<u64>,
-    /// Small JSON value to store inline. Omit when publishing only an artifact.
+    /// Small non-null JSON value to store inline. Omit when publishing only an
+    /// artifact. JSON null means "no inline value", the same as omitting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     /// Optional large-artifact handle. If `path` is supplied, the file is read
@@ -804,7 +805,7 @@ impl SynapseService {
         validate_inline_value_size(params.value.as_ref())?;
         if params.value.is_none() && params.artifact.is_none() {
             return Err(params_error(
-                "workspace_put requires at least one of value or artifact",
+                "workspace_put requires at least one of value or artifact (a JSON null value counts as omitted)",
             ));
         }
         let (artifact, artifact_readback) = match params.artifact {

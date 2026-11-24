@@ -20,10 +20,7 @@ pub fn run() -> Result<()> {
     let args = Args::from_env();
     let outcome = match args.text("action")? {
         "mark_finished" => ClipRegistry::mark_finished(args.text("clip")?),
-        "recover" => {
-            ClipRecovery::recover_registered();
-            Ok(())
-        }
+        "recover" => ClipRecovery::recover_registered(),
         other => {
             return Err(format!(
                 "unknown action={other}; use mark_finished or recover"

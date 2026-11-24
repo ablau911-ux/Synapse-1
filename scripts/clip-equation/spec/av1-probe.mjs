@@ -776,6 +776,30 @@ function defaultClipRegisteredByItsId() {
 }
 
 /**
+ * Recovery at start reports what happened: a registered clip it could not recover (its clip.json is
+ * not JSON) makes the run end with an error naming that clip, and the clip stays unfinished.
+ */
+function recoveryFailureReported() {
+  const appData = path.join(OUT, 'registry-recovery-failed');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  const folder = path.join(appData, 'elsewhere', 'clip-broken');
+  fs.mkdirSync(clips, { recursive: true });
+  fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(folder, 'clip.json'), 'not json');
+  const registry = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(registry, JSON.stringify([{ clip_id: 'clip-broken', folder, finished: false }], null, 2));
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('recovery at start reported ok while it could not recover clip-broken');
+  else if (!String(got.error).includes(path.join(folder, 'clip.json'))) problems.push(`the error does not name the clip.json of clip-broken: ${String(got.error).replace(/\s+/g, ' ').slice(0, 200)}`);
+  const entry = JSON.parse(fs.readFileSync(registry, 'utf8')).find(e => e.clip_id === 'clip-broken');
+  if (!entry || entry.finished) problems.push(`the registry lists clip-broken as ${JSON.stringify(entry)}, not unfinished`);
+  return verdict(problems, `registered clip with a clip.json that is not JSON: recovery at start ended with an error (${String(got.error).replace(/\s+/g, ' ').slice(0, 120)}) and the clip stays unfinished`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -891,6 +915,7 @@ const table = {
   'a registry change never writes from a failed read': registryKeptOnFailedRead,
   'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
   'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
+  'recovery at start reports a clip it could not recover': recoveryFailureReported,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

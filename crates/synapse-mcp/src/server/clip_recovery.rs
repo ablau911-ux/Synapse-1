@@ -339,17 +339,22 @@ impl ClipRecovery {
     /// Recovery at service start: the clips of the default folder that were
     /// never registered are registered, then every unfinished clip of the
     /// registry is recovered, and marked finished once it needs no more
-    /// recovery.
-    pub(super) fn recover_registered() {
+    /// recovery. Each failure is logged where it happens and the run goes
+    /// on; the run then ends with an error naming every failure, so a
+    /// caller learns what happened.
+    pub(super) fn recover_registered() -> Result<(), String> {
+        let mut failures = Vec::new();
         if let Err(error) = ClipRegistry::register_default_folder() {
             tracing::warn!(code = "CLIP_REGISTRY_SCAN_FAILED", error = %error);
+            failures.push(error);
         }
         // A registry that cannot be read is logged and nothing changes.
         let unfinished = match ClipRegistry::unfinished() {
             Ok(unfinished) => unfinished,
             Err(error) => {
                 tracing::warn!(code = "CLIP_REGISTRY_READ_FAILED", error = %error);
-                return;
+                failures.push(error);
+                return Err(failures.join("; "));
             }
         };
         for entry in unfinished {
@@ -358,21 +363,31 @@ impl ClipRecovery {
                 Ok(true) => {
                     if let Err(error) = ClipRegistry::mark_finished(&entry.clip_id) {
                         tracing::warn!(code = "CLIP_REGISTRY_WRITE_FAILED", folder = %folder.display(), error = %error);
+                        failures.push(error);
                     }
                 }
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(code = "CLIP_RECOVERY_FAILED", folder = %folder.display(), error = %error);
+                    failures.push(format!("{}: {error}", folder.display()));
                 }
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
         }
     }
 }
 
 pub(crate) fn recover_clips_on_start() {
+    // Every failure was logged where it happened: at start, nothing more.
     let started = std::thread::Builder::new()
         .name("synapse-clip-recovery".into())
-        .spawn(ClipRecovery::recover_registered);
+        .spawn(|| {
+            let _ = ClipRecovery::recover_registered();
+        });
     if let Err(error) = started {
         tracing::warn!(code = "CLIP_RECOVERY_THREAD_FAILED", error = %error);
     }

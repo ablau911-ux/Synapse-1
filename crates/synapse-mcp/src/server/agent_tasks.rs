@@ -1109,13 +1109,21 @@ impl SynapseService {
         let now = unix_time_ms_now();
         Self::prune_terminal_tasks(&db, now)?;
         if Self::read_task(&db, &params.task_id)?.is_some() {
-            return Err(mcp_error(
+            // detail_code tells a create-race loser "someone else created it"
+            // apart from "my parameters are invalid" without parsing text.
+            let mut error = mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
                     "agent_task {:?} already exists; use task_update to modify it",
                     params.task_id
                 ),
-            ));
+            );
+            error.data = Some(serde_json::json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "detail_code": "AGENT_TASK_ALREADY_EXISTS",
+                "task_id": params.task_id,
+            }));
+            return Err(error);
         }
         // Strict global FIFO survives terminal-row pruning via a durable
         // namespace watermark instead of deriving from retained rows.

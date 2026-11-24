@@ -399,7 +399,9 @@ impl SynapseService {
                                 Some(error) => format!(
                                     "storage opened at daemon startup (reflex runtime idle); {CF_SIZES_ESTIMATE_NOTE}; maintenance unhealthy: {error}"
                                 ),
-                                None => format!("storage opened at daemon startup (reflex runtime idle); {CF_SIZES_ESTIMATE_NOTE}; maintenance tasks running and pressure probe observed"),
+                                None => format!(
+                                    "storage opened at daemon startup (reflex runtime idle); {CF_SIZES_ESTIMATE_NOTE}; maintenance tasks running and pressure probe observed"
+                                ),
                             }),
                             db_path,
                             schema_version: Some(synapse_core::SCHEMA_VERSION),
@@ -431,7 +433,9 @@ impl SynapseService {
                                     Some(error) => format!(
                                         "storage runtime initialized; {CF_SIZES_ESTIMATE_NOTE}; maintenance unhealthy: {error}"
                                     ),
-                                    None => format!("storage runtime initialized; {CF_SIZES_ESTIMATE_NOTE}; maintenance tasks running and pressure probe observed"),
+                                    None => format!(
+                                        "storage runtime initialized; {CF_SIZES_ESTIMATE_NOTE}; maintenance tasks running and pressure probe observed"
+                                    ),
                                 }),
                                 db_path: Some(runtime.storage_path().display().to_string()),
                                 schema_version: Some(runtime.schema_version()),

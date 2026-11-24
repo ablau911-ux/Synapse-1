@@ -4841,8 +4841,14 @@ async fn target_act_save_impl(
         NotepadSaveCommandSource::Accelerator,
     ] {
         ensure_target_act_operator_panic_boundary("save_before_notepad_save_command")?;
-        let attempt = send_notepad_save_command(hwnd, source)
-            .map_err(|error| crate::m2::error_after_earlier_steps(error, attempts.len()))?;
+        // Only a command that was sent counts as delivered input.
+        let attempt = send_notepad_save_command(hwnd, source).map_err(|error| {
+            let sent = attempts
+                .iter()
+                .filter(|attempt: &&TargetActSaveAttempt| attempt.sent)
+                .count();
+            crate::m2::error_after_earlier_steps(error, sent)
+        })?;
         attempts.push(attempt);
         if let Some(after) =
             poll_target_act_save_file(&path, &before, expected_text, verify_timeout_ms).await?

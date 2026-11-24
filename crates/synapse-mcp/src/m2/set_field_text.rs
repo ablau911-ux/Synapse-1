@@ -339,7 +339,13 @@ pub(crate) async fn act_set_field_text_web(
         backend_node_id,
     )
     .await
-    .map_err(|error| cdp_tier_error(element_id, backend_node_id, "after_value_read", &error))?;
+    .map_err(|error| {
+        // The text was already set before this readback failed.
+        super::error_after_earlier_steps(
+            cdp_tier_error(element_id, backend_node_id, "after_value_read", &error),
+            1,
+        )
+    })?;
 
     let method = if readback.cleared_with_delete {
         METHOD_CDP_CLEAR

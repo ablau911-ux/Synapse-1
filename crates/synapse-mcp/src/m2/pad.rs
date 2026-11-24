@@ -144,10 +144,9 @@ pub(crate) async fn act_pad_with_handle_and_boundary(
             let boundary_error = boundary
                 .ensure("after_pad_hold_before_neutral_cleanup")
                 .err();
-            let neutral_result = handle
-                .execute(neutral_action)
-                .await
-                .map_err(|error| action_error_to_mcp(&error));
+            let neutral_result = handle.execute(neutral_action).await.map_err(|error| {
+                crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1)
+            });
             if let Some(error) = boundary_error {
                 if let Err(neutral_error) = neutral_result {
                     tracing::error!(

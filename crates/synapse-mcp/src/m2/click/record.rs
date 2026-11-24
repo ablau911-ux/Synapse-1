@@ -16,10 +16,9 @@ pub(super) async fn execute_actor_actions(
     let action_count = actions.len();
     for (action_index, action) in actions.into_iter().enumerate() {
         boundary.ensure("immediately_before_click_actor_action")?;
-        handle
-            .execute(action)
-            .await
-            .map_err(|error| action_error_to_mcp(&error.after_earlier_steps(action_index)))?;
+        handle.execute(action).await.map_err(|error| {
+            crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), action_index)
+        })?;
         maybe_sleep_between_clicks(action_index, action_count, timing).await;
     }
     Ok(())

@@ -529,11 +529,14 @@ async fn execute_coordinate_element_click(
                     element_id = %element.element_id,
                     "act_click element coordinate route could not use the background HWND message tier; escalating to leased foreground input"
                 );
+                // Messages the failed PostMessage tier already posted stay delivered.
+                let postmessage_steps = usize::from(crate::m2::error_delivered_input(&error));
                 let _lease_guard = acquire_click_foreground_lease(
                     &foreground_click_policy,
                     params.hold_ms,
                     &mut tier_attempts,
-                )?;
+                )
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, postmessage_steps))?;
                 boundary
                     .ensure("immediately_before_coordinate_element_foreground_fallback_dispatch")?;
                 match record::execute_actor_actions(handle, actions, timing, boundary).await {
@@ -555,7 +558,10 @@ async fn execute_coordinate_element_click(
                             true,
                             error.message.to_string(),
                         ));
-                        return Err(attach_click_tier_attempts(error, tier_attempts));
+                        return Err(attach_click_tier_attempts(
+                            crate::m2::error_after_earlier_steps(error, postmessage_steps),
+                            tier_attempts,
+                        ));
                     }
                 }
             }
@@ -796,10 +802,19 @@ async fn post_element_window_message_click(
             .map_err(|error| action_error_to_mcp(&error))?;
     for click_index in 0..params.clicks {
         boundary.ensure("immediately_before_postmessage_mouse_down")?;
-        post_mouse_message(readback.hwnd, WM_MOUSEMOVE, 0, readback.client_point)
-            .map_err(|error| action_error_to_mcp(&error))?;
-        let (down_message, up_message, down_wparam) =
-            mouse_button_messages(params.button).map_err(|error| action_error_to_mcp(&error))?;
+        // Only the first mouse move goes out before any input was posted.
+        post_mouse_message(readback.hwnd, WM_MOUSEMOVE, 0, readback.client_point).map_err(
+            |error| {
+                crate::m2::error_after_earlier_steps(
+                    action_error_to_mcp(&error),
+                    usize::from(click_index),
+                )
+            },
+        )?;
+        let (down_message, up_message, down_wparam) = mouse_button_messages(params.button)
+            .map_err(|error| {
+                crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1)
+            })?;
         boundary.ensure("immediately_before_postmessage_mouse_button_down")?;
         post_mouse_message(
             readback.hwnd,
@@ -807,14 +822,15 @@ async fn post_element_window_message_click(
             down_wparam,
             readback.client_point,
         )
-        .map_err(|error| action_error_to_mcp(&error))?;
+        .map_err(|error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1))?;
         sleep(Duration::from_millis(u64::from(params.hold_ms))).await;
         let boundary_error = boundary
             .ensure("after_postmessage_mouse_hold_before_release")
             .err();
         let release_result =
-            post_mouse_message(readback.hwnd, up_message, 0, readback.client_point)
-                .map_err(|error| action_error_to_mcp(&error));
+            post_mouse_message(readback.hwnd, up_message, 0, readback.client_point).map_err(
+                |error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1),
+            );
         if let Some(error) = boundary_error {
             if let Err(release_error) = release_result {
                 tracing::error!(

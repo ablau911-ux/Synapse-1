@@ -494,13 +494,15 @@ impl SynapseService {
                 self.audit_action_result_for_request("act_type", &result, &request_context)?;
                 return result.map(Json);
             }
+            // The fallback click was delivered: every later failure says so.
             let focus_readback = match self
                 .capture_act_type_text_signature(160, true, false, None)
                 .await
             {
                 Ok(signature) => signature,
                 Err(error) => {
-                    let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                    let result: Result<ActTypeResponse, ErrorData> =
+                        Err(crate::m2::error_after_earlier_steps(error, 1));
                     self.audit_action_result_for_request("act_type", &result, &request_context)?;
                     return result.map(Json);
                 }
@@ -508,7 +510,8 @@ impl SynapseService {
             if let Err(error) =
                 act_type_foreground_fallback_focus_matches_target(target, &focus_readback.signature)
             {
-                let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                let result: Result<ActTypeResponse, ErrorData> =
+                    Err(crate::m2::error_after_earlier_steps(error, 1));
                 self.audit_action_result_for_request("act_type", &result, &request_context)?;
                 return result.map(Json);
             }
@@ -554,7 +557,11 @@ impl SynapseService {
                 {
                     Ok(signature) => Some(signature),
                     Err(error) => {
-                        let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                        let result: Result<ActTypeResponse, ErrorData> =
+                            Err(crate::m2::error_after_earlier_steps(
+                                error,
+                                usize::from(foreground_fallback.is_some()),
+                            ));
                         self.audit_action_result_for_request(
                             "act_type",
                             &result,
@@ -566,7 +573,14 @@ impl SynapseService {
             } else {
                 None
             };
-        let result = act_type_with_handle_and_boundary(handle, recording, params, boundary).await;
+        let result = act_type_with_handle_and_boundary(handle, recording, params, boundary)
+            .await
+            .map_err(|error| {
+                crate::m2::error_after_earlier_steps(
+                    error,
+                    usize::from(foreground_fallback.is_some()),
+                )
+            });
         let result = match (result, before_text_signature) {
             (Ok(response), Some(before)) => match self
                 .verify_act_type_response(
@@ -780,7 +794,16 @@ impl SynapseService {
                 element_id = %element_id,
                 "act_set_field_text target went stale; re-resolving locator and retrying once"
             );
-            match self.act_set_field_text_resolve_params(&params, &request_context, "stale_retry") {
+            // Input the first attempt delivered stays delivered for the retry.
+            let initial_delivered_input = result
+                .as_ref()
+                .err()
+                .is_some_and(crate::m2::error_delivered_input);
+            let retry_result = match self.act_set_field_text_resolve_params(
+                &params,
+                &request_context,
+                "stale_retry",
+            ) {
                 Ok(retry_params) => {
                     let retry_element_id = crate::m2::required_element_id(&retry_params)?.clone();
                     if let Err(error) = self.ensure_target_claim_allows_action(
@@ -800,7 +823,10 @@ impl SynapseService {
                     }
                 }
                 Err(error) => Err(error),
-            }
+            };
+            retry_result.map_err(|error| {
+                crate::m2::error_after_earlier_steps(error, usize::from(initial_delivered_input))
+            })
         } else {
             result
         };
@@ -2747,15 +2773,21 @@ impl SynapseService {
         started: Instant,
         boundary: OperatorPanicActionBoundary,
     ) -> Result<ActClickResponse, ErrorData> {
-        match act_click_with_handle_and_lease(
+        let first_tier = act_click_with_handle_and_lease(
             handle.clone(),
             recording.clone(),
             params.clone(),
             foreground_click_policy.clone(),
             boundary,
         )
-        .await
-        {
+        .await;
+        // Once the first tier dispatched the click, every later failure, of
+        // the readback or of a next tier, says that input was delivered.
+        let dispatched = match &first_tier {
+            Ok(_) => true,
+            Err(error) => click_postdispatch_readback_failed(error),
+        };
+        let result = match first_tier {
             Ok(response) => {
                 match self
                     .verify_click_response(
@@ -2832,13 +2864,12 @@ impl SynapseService {
                         );
                     }
                 }
+                let tier_attempts = click_tier_attempts_from_error(&error);
                 if !can_route_click_element_background_first(&params, recording.as_ref())
                     || !should_try_next_click_tier(&error)
                 {
-                    return Err(error);
-                }
-                let tier_attempts = click_tier_attempts_from_error(&error);
-                if should_try_click_postmessage_tier(&tier_attempts) {
+                    Err(error)
+                } else if should_try_click_postmessage_tier(&tier_attempts) {
                     self.act_click_try_postmessage_then_foreground(
                         handle,
                         recording,
@@ -2869,7 +2900,8 @@ impl SynapseService {
                 }
             }
             Err(error) => Err(error),
-        }
+        };
+        result.map_err(|error| crate::m2::error_after_earlier_steps(error, usize::from(dispatched)))
     }
 
     async fn act_click_try_postmessage_then_foreground(
@@ -3253,7 +3285,7 @@ impl SynapseService {
         for (action_index, action) in actions.into_iter().enumerate() {
             boundary.ensure("immediately_before_act_type_foreground_fallback_click")?;
             handle.execute(action).await.map_err(|error| {
-                act_type_foreground_fallback_click_error(target, point, &error, action_index == 0)
+                act_type_foreground_fallback_click_error(target, point, &error, action_index)
             })?;
         }
         tracing::info!(
@@ -3466,17 +3498,20 @@ impl SynapseService {
                 backend: Backend::Auto,
             },
         ];
-        for action in click_actions {
+        for (action_index, action) in click_actions.into_iter().enumerate() {
             boundary.ensure("immediately_before_set_field_text_foreground_click")?;
             handle.execute(action).await.map_err(|error| {
-                set_field_text_foreground_error(
-                    &target,
-                    error.code(),
-                    "target_click_failed",
-                    format!(
-                        "act_set_field_text foreground click at ({}, {}) failed: {error}",
-                        point.x, point.y
+                crate::m2::error_after_earlier_steps(
+                    set_field_text_foreground_error(
+                        &target,
+                        error.code(),
+                        "target_click_failed",
+                        format!(
+                            "act_set_field_text foreground click at ({}, {}) failed: {error}",
+                            point.x, point.y
+                        ),
                     ),
+                    usize::from(error.input_delivered(action_index)),
                 )
             })?;
         }
@@ -3490,19 +3525,25 @@ impl SynapseService {
             "readback=foreground_click tool=act_set_field_text tier=foreground_keys"
         );
 
+        // The click was delivered: every later failure of this tier says so.
         let focus_readback = self
             .capture_act_type_text_signature(160, false, false, None)
-            .await?;
-        act_type_foreground_fallback_focus_matches_target(&target, &focus_readback.signature)?;
+            .await
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
+        act_type_foreground_fallback_focus_matches_target(&target, &focus_readback.signature)
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
 
         let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)?;
         boundary.ensure("immediately_before_set_field_text_select_all")?;
         handle.execute(select_all).await.map_err(|error| {
-            set_field_text_foreground_error(
-                &target,
-                error.code(),
-                "select_all_failed",
-                format!("act_set_field_text Ctrl+A select-all failed: {error}"),
+            crate::m2::error_after_earlier_steps(
+                set_field_text_foreground_error(
+                    &target,
+                    error.code(),
+                    "select_all_failed",
+                    format!("act_set_field_text Ctrl+A select-all failed: {error}"),
+                ),
+                1,
             )
         })?;
 
@@ -3525,23 +3566,29 @@ impl SynapseService {
         };
         boundary.ensure("immediately_before_set_field_text_replacement_input")?;
         handle.execute(replace_action).await.map_err(|error| {
-            set_field_text_foreground_error(
-                &target,
-                error.code(),
-                "replacement_input_failed",
-                format!("act_set_field_text foreground replacement input failed: {error}"),
+            crate::m2::error_after_earlier_steps(
+                set_field_text_foreground_error(
+                    &target,
+                    error.code(),
+                    "replacement_input_failed",
+                    format!("act_set_field_text foreground replacement input failed: {error}"),
+                ),
+                2,
             )
         })?;
 
         tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
         let after = synapse_a11y::element_value(&element_id).map_err(|error| {
-            set_field_text_foreground_error(
-                &target,
-                error.code(),
-                "after_value_read_failed",
-                format!(
-                    "act_set_field_text after-value UIA readback failed for element {element_id}: {error}"
+            crate::m2::error_after_earlier_steps(
+                set_field_text_foreground_error(
+                    &target,
+                    error.code(),
+                    "after_value_read_failed",
+                    format!(
+                        "act_set_field_text after-value UIA readback failed for element {element_id}: {error}"
+                    ),
                 ),
+                3,
             )
         })?;
 
@@ -6181,7 +6228,9 @@ fn act_type_text_target_changed(
 }
 
 /// Structured failure for the `act_set_field_text` foreground tier: precise
-/// reason code, full target evidence, and the action error detail.
+/// reason code, full target evidence, and the action error detail. It says
+/// nothing was delivered; a failure after delivered input passes through
+/// `crate::m2::error_after_earlier_steps`.
 fn set_field_text_foreground_error(
     target: &ActTypeForegroundFallbackTarget,
     code: &'static str,
@@ -6207,7 +6256,7 @@ fn set_field_text_foreground_error(
             "reason": reason,
             "detail": detail,
             "target": target,
-            "refused_before_delivery": reason == "target_window_not_foreground",
+            "refused_before_delivery": true,
             "backend_tier_used": crate::m2::TIER_FOREGROUND_KEYS,
             "required_foreground": true,
         })),
@@ -6348,7 +6397,7 @@ fn act_type_foreground_fallback_click_error(
     target: &ActTypeForegroundFallbackTarget,
     point: Point,
     error: &ActionError,
-    before_any_action: bool,
+    earlier_actions_done: usize,
 ) -> ErrorData {
     let mapped = crate::m2::action_error_to_mcp(error);
     ErrorData::new(
@@ -6362,7 +6411,7 @@ fn act_type_foreground_fallback_click_error(
                 .unwrap_or(error_codes::ACTION_BACKEND_UNAVAILABLE),
             "tool": "act_type",
             "reason": "chromium_foreground_fallback_click_failed",
-            "refused_before_delivery": before_any_action && error.refused_before_any_delivery(),
+            "refused_before_delivery": !error.input_delivered(earlier_actions_done),
             "point": point,
             "target": target,
             "cause": mapped.data,

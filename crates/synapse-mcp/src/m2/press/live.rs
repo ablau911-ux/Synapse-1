@@ -29,8 +29,9 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
             .await
         {
             release_pressed_keys(&handle, &pressed, backend).await;
-            return Err(action_error_to_mcp(
-                &error.after_earlier_steps(pressed.len()),
+            return Err(crate::m2::error_after_earlier_steps(
+                action_error_to_mcp(&error),
+                pressed.len(),
             ));
         }
         pressed.push(key.clone());
@@ -72,7 +73,10 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
         return Err(error);
     }
     if let Some(error) = first_error {
-        return Err(action_error_to_mcp(&error));
+        return Err(crate::m2::error_after_earlier_steps(
+            action_error_to_mcp(&error),
+            pressed.len(),
+        ));
     }
     match hold_end {
         HoldEnd::Elapsed => {}

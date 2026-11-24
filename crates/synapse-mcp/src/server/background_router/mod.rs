@@ -2650,7 +2650,13 @@ impl SynapseService {
                 ensure_target_act_operator_panic_boundary("type_before_input_delivery")?;
                 let response = self
                     .act_type(Parameters(type_params), request_context)
-                    .await;
+                    .await
+                    .map_err(|error| {
+                        crate::m2::error_after_earlier_steps(
+                            error,
+                            usize::from(coordinate_result.is_some()),
+                        )
+                    });
                 let (_delegated_tool, ok, status, type_result) =
                     target_act_delegate_response("act_type", response)?;
                 if let Some((coordinate_tool, coordinate_result)) = coordinate_result {
@@ -3863,56 +3869,65 @@ async fn target_act_cleanup_notepad_tabs_impl(
 
     let deadline = Instant::now() + Duration::from_millis(u64::from(verify_timeout_ms));
     let mut attempts = Vec::new();
-    loop {
-        target_act_validate_notepad_keep_tab(&before.tabs, &keep_file_name)?;
-        if modified_policy == TargetActModifiedStalePolicy::RefuseModified {
-            if let Some(stale) = target_act_first_modified_stale_notepad_tab(&before.tabs) {
-                return Err(target_act_refuse_modified_stale_tab_error(&stale));
+    // Once a tab close ran, every later failure reports that input of this
+    // call was already delivered.
+    let closing = async {
+        loop {
+            target_act_validate_notepad_keep_tab(&before.tabs, &keep_file_name)?;
+            if modified_policy == TargetActModifiedStalePolicy::RefuseModified {
+                if let Some(stale) = target_act_first_modified_stale_notepad_tab(&before.tabs) {
+                    return Err(target_act_refuse_modified_stale_tab_error(&stale));
+                }
             }
-        }
-        let Some(stale) = target_act_next_stale_notepad_tab(&before.tabs) else {
-            break;
-        };
-        if attempts.len() > 64 {
-            return Err(target_act_cleanup_notepad_tabs_postcondition_error(
-                "tab cleanup iteration limit reached",
-                &keep_path,
+            let Some(stale) = target_act_next_stale_notepad_tab(&before.tabs) else {
+                break;
+            };
+            if attempts.len() > 64 {
+                return Err(target_act_cleanup_notepad_tabs_postcondition_error(
+                    "tab cleanup iteration limit reached",
+                    &keep_path,
+                    &keep_file_name,
+                    &before_signature,
+                    &before,
+                    &before,
+                    &attempts,
+                    verify_timeout_ms,
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(target_act_cleanup_notepad_tabs_postcondition_error(
+                    "tab cleanup timed out before all stale tabs were removed",
+                    &keep_path,
+                    &keep_file_name,
+                    &before_signature,
+                    &before,
+                    &before,
+                    &attempts,
+                    verify_timeout_ms,
+                ));
+            }
+            let attempt = target_act_cleanup_close_notepad_tab(
+                service,
+                &session_id,
+                hwnd,
                 &keep_file_name,
-                &before_signature,
-                &before,
-                &before,
-                &attempts,
-                verify_timeout_ms,
-            ));
+                stale,
+                modified_policy,
+                deadline,
+            )
+            .await?;
+            attempts.push(attempt);
+            before =
+                target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
         }
-        if Instant::now() >= deadline {
-            return Err(target_act_cleanup_notepad_tabs_postcondition_error(
-                "tab cleanup timed out before all stale tabs were removed",
-                &keep_path,
-                &keep_file_name,
-                &before_signature,
-                &before,
-                &before,
-                &attempts,
-                verify_timeout_ms,
-            ));
-        }
-        let attempt = target_act_cleanup_close_notepad_tab(
-            service,
-            &session_id,
-            hwnd,
-            &keep_file_name,
-            stale,
-            modified_policy,
-            deadline,
-        )
-        .await?;
-        attempts.push(attempt);
-        before = target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
+        let after =
+            target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
+        target_act_validate_notepad_keep_tab(&after.tabs, &keep_file_name)?;
+        Ok::<_, ErrorData>(after)
     }
-
-    let after = target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
-    target_act_validate_notepad_keep_tab(&after.tabs, &keep_file_name)?;
+    .await;
+    let after =
+        closing.map_err(|error| crate::m2::error_after_earlier_steps(error, attempts.len()))?;
     let stale_tabs_after = target_act_stale_notepad_tab_count(&after.tabs);
     if stale_tabs_after != 0 {
         return Err(target_act_cleanup_notepad_tabs_postcondition_error(
@@ -4005,149 +4020,156 @@ async fn target_act_cleanup_close_notepad_tab(
         "cleanup_notepad_tabs.select_stale_tab",
         &action_stale.element_id,
     )?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut selected =
-        target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
-    let mut selected_stale =
-        target_act_matching_notepad_tab(&selected.tabs, &action_stale).ok_or_else(|| {
-            mcp_error(
-                error_codes::ACTION_POSTCONDITION_FAILED,
-                format!(
-                    "target_act verb=cleanup_notepad_tabs selected stale tab {:?}, but the tab was absent from the selected hidden Notepad SoT",
-                    stale.name
-                ),
-            )
-        })?;
-    if !target_act_rect_has_area(selected_stale.bbox) {
-        target_act_scroll_uia_element_into_view(
-            "cleanup_notepad_tabs.scroll_selected_stale_tab_into_view",
-            &selected_stale.element_id,
-        )?;
-        scrolled_into_view = true;
+    // The tab select was delivered: every later failure of this close says so.
+    let closed = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        selected = target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
-        selected_stale =
-            target_act_matching_notepad_tab(&selected.tabs, &action_stale).ok_or_else(|| {
+        let mut selected =
+            target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+        let mut selected_stale = target_act_matching_notepad_tab(&selected.tabs, &action_stale)
+            .ok_or_else(|| {
                 mcp_error(
                     error_codes::ACTION_POSTCONDITION_FAILED,
                     format!(
-                        "target_act verb=cleanup_notepad_tabs scrolled selected stale tab {:?}, but the tab was absent from the post-scroll SoT",
+                        "target_act verb=cleanup_notepad_tabs selected stale tab {:?}, but the tab was absent from the selected hidden Notepad SoT",
                         stale.name
                     ),
                 )
             })?;
-    }
-    if !target_act_notepad_title_matches_document(
-        &selected.context.window_title,
-        &stale.document_name,
-    ) {
-        return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            format!(
-                "target_act verb=cleanup_notepad_tabs selected stale tab {:?}, but Notepad title readback stayed {:?}",
-                stale.name, selected.context.window_title
-            ),
-        ));
-    }
-    let (close_method, close_button_element_id) = if let Some(close_button) =
-        target_act_notepad_close_tab_button(&selected.nodes, &selected_stale)
-    {
-        let close_button_element_id = Some(close_button.element_id.clone());
-        target_act_invoke_uia_element(
-            "cleanup_notepad_tabs.invoke_close_tab",
-            &close_button.element_id,
-        )?;
-        ("uia_close_tab_button".to_owned(), close_button_element_id)
-    } else if let Some(close_menu_item) = target_act_notepad_close_tab_menu_item_for_hidden_desktop(
-        service,
-        session_id,
-        hwnd,
-        &selected.nodes,
-    )
-    .await?
-    {
-        let close_button_element_id = Some(close_menu_item.element_id.clone());
-        target_act_invoke_uia_element(
-            "cleanup_notepad_tabs.invoke_file_close_tab",
-            &close_menu_item.element_id,
-        )?;
-        (
-            "uia_file_menu_close_tab".to_owned(),
-            close_button_element_id,
-        )
-    } else {
-        let close_glyph = target_act_notepad_close_tab_glyph(&selected.nodes, &selected_stale);
-        return Err(mcp_error(
-            error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-            format!(
-                "target_act verb=cleanup_notepad_tabs could not find a UIA Close Tab button or File > Close tab menu item for stale hidden Notepad tab {:?}; close_glyph_present={}",
-                stale.name,
-                close_glyph.is_some()
-            ),
-        ));
-    };
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    let mut discard_button_element_id = None;
-    let mut discarded_modified = false;
-    let mut after_close =
-        target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
-    if target_act_notepad_tab_still_present(&after_close.tabs, &stale) && stale.modified {
-        if modified_policy == TargetActModifiedStalePolicy::DiscardModified {
-            let discard_button = target_act_notepad_discard_button_for_hidden_desktop(
-                service,
-                session_id,
-                hwnd,
-                &after_close.nodes,
-            )
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-                    format!(
-                        "target_act verb=cleanup_notepad_tabs close of modified stale tab {:?} did not remove the tab and no discard button was visible in the hidden target/popup SoT: {error}",
-                        stale.name
-                    ),
-                )
-            })?;
-            discard_button_element_id = Some(discard_button.element_id.clone());
-            target_act_invoke_uia_element(
-                "cleanup_notepad_tabs.discard_modified_stale_tab",
-                &discard_button.element_id,
+        if !target_act_rect_has_area(selected_stale.bbox) {
+            target_act_scroll_uia_element_into_view(
+                "cleanup_notepad_tabs.scroll_selected_stale_tab_into_view",
+                &selected_stale.element_id,
             )?;
-            discarded_modified = true;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            after_close =
+            scrolled_into_view = true;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            selected =
                 target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+            selected_stale = target_act_matching_notepad_tab(&selected.tabs, &action_stale)
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "target_act verb=cleanup_notepad_tabs scrolled selected stale tab {:?}, but the tab was absent from the post-scroll SoT",
+                            stale.name
+                        ),
+                    )
+                })?;
         }
-    }
-    while target_act_notepad_tab_still_present(&after_close.tabs, &stale) {
-        if Instant::now() >= deadline {
+        if !target_act_notepad_title_matches_document(
+            &selected.context.window_title,
+            &stale.document_name,
+        ) {
             return Err(mcp_error(
                 error_codes::ACTION_POSTCONDITION_FAILED,
                 format!(
-                    "target_act verb=cleanup_notepad_tabs stale tab {:?} remained after Close Tab",
-                    stale.name
+                    "target_act verb=cleanup_notepad_tabs selected stale tab {:?}, but Notepad title readback stayed {:?}",
+                    stale.name, selected.context.window_title
                 ),
             ));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        after_close =
-            target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
-    }
+        let (close_method, close_button_element_id) = if let Some(close_button) =
+            target_act_notepad_close_tab_button(&selected.nodes, &selected_stale)
+        {
+            let close_button_element_id = Some(close_button.element_id.clone());
+            target_act_invoke_uia_element(
+                "cleanup_notepad_tabs.invoke_close_tab",
+                &close_button.element_id,
+            )?;
+            ("uia_close_tab_button".to_owned(), close_button_element_id)
+        } else if let Some(close_menu_item) =
+            target_act_notepad_close_tab_menu_item_for_hidden_desktop(
+                service,
+                session_id,
+                hwnd,
+                &selected.nodes,
+            )
+            .await?
+        {
+            let close_button_element_id = Some(close_menu_item.element_id.clone());
+            target_act_invoke_uia_element(
+                "cleanup_notepad_tabs.invoke_file_close_tab",
+                &close_menu_item.element_id,
+            )?;
+            (
+                "uia_file_menu_close_tab".to_owned(),
+                close_button_element_id,
+            )
+        } else {
+            let close_glyph = target_act_notepad_close_tab_glyph(&selected.nodes, &selected_stale);
+            return Err(mcp_error(
+                error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                format!(
+                    "target_act verb=cleanup_notepad_tabs could not find a UIA Close Tab button or File > Close tab menu item for stale hidden Notepad tab {:?}; close_glyph_present={}",
+                    stale.name,
+                    close_glyph.is_some()
+                ),
+            ));
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
-    Ok(TargetActNotepadTabCloseAttempt {
-        tab: stale,
-        selected: true,
-        scrolled_into_view,
-        stale_bbox_before,
-        stale_bbox_after_select: selected_stale.bbox,
-        close_method,
-        close_button_element_id,
-        close_invoked: true,
-        discard_button_element_id,
-        discarded_modified,
-        tabs_after: after_close.tabs,
-    })
+        let mut discard_button_element_id = None;
+        let mut discarded_modified = false;
+        let mut after_close =
+            target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+        if target_act_notepad_tab_still_present(&after_close.tabs, &stale) && stale.modified {
+            if modified_policy == TargetActModifiedStalePolicy::DiscardModified {
+                let discard_button = target_act_notepad_discard_button_for_hidden_desktop(
+                    service,
+                    session_id,
+                    hwnd,
+                    &after_close.nodes,
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                        format!(
+                            "target_act verb=cleanup_notepad_tabs close of modified stale tab {:?} did not remove the tab and no discard button was visible in the hidden target/popup SoT: {error}",
+                            stale.name
+                        ),
+                    )
+                })?;
+                discard_button_element_id = Some(discard_button.element_id.clone());
+                target_act_invoke_uia_element(
+                    "cleanup_notepad_tabs.discard_modified_stale_tab",
+                    &discard_button.element_id,
+                )?;
+                discarded_modified = true;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                after_close =
+                    target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+            }
+        }
+        while target_act_notepad_tab_still_present(&after_close.tabs, &stale) {
+            if Instant::now() >= deadline {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "target_act verb=cleanup_notepad_tabs stale tab {:?} remained after Close Tab",
+                        stale.name
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            after_close =
+                target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+        }
+
+        Ok::<_, ErrorData>(TargetActNotepadTabCloseAttempt {
+            tab: stale,
+            selected: true,
+            scrolled_into_view,
+            stale_bbox_before,
+            stale_bbox_after_select: selected_stale.bbox,
+            close_method,
+            close_button_element_id,
+            close_invoked: true,
+            discard_button_element_id,
+            discarded_modified,
+            tabs_after: after_close.tabs,
+        })
+    }
+    .await;
+    closed.map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
 }
 
 fn target_act_validate_cleanup_notepad_tabs_params(
@@ -4819,7 +4841,8 @@ async fn target_act_save_impl(
         NotepadSaveCommandSource::Accelerator,
     ] {
         ensure_target_act_operator_panic_boundary("save_before_notepad_save_command")?;
-        let attempt = send_notepad_save_command(hwnd, source)?;
+        let attempt = send_notepad_save_command(hwnd, source)
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, attempts.len()))?;
         attempts.push(attempt);
         if let Some(after) =
             poll_target_act_save_file(&path, &before, expected_text, verify_timeout_ms).await?
@@ -5687,7 +5710,8 @@ async fn target_act_browser_dom_action(
         if let Err(error) =
             target_act_register_created_popup_tabs(service, &session_id, window_hwnd, value)
         {
-            result = Err(error);
+            // The DOM action itself already ran.
+            result = Err(crate::m2::error_after_earlier_steps(error, 1));
         }
     }
     target_act_audit_result_for_session(
@@ -8761,7 +8785,8 @@ async fn target_act_insert_or_append_text(
         ensure_target_act_operator_panic_boundary("append_text_before_move_caret_to_end")?;
         let key_response = service
             .act_press(Parameters(press_params), request_context.clone())
-            .await;
+            .await
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, steps.len()));
         let (tool, ok, status, result) = target_act_delegate_response("act_press", key_response)?;
         steps.push(json!({
             "step": "move_caret_to_end",
@@ -8787,9 +8812,11 @@ async fn target_act_insert_or_append_text(
 
     let type_params = target_act_type_params(text, params.wait_timeout_ms, None)?;
     ensure_target_act_operator_panic_boundary("text_insert_before_type_delivery")?;
+    // Every recorded step (focus click, caret move) succeeded and delivered.
     let type_response = service
         .act_type(Parameters(type_params), request_context.clone())
-        .await;
+        .await
+        .map_err(|error| crate::m2::error_after_earlier_steps(error, steps.len()));
     let (tool, ok, status, result) = target_act_delegate_response("act_type", type_response)?;
     steps.push(json!({
         "step": "type",
@@ -9989,6 +10016,12 @@ fn target_act_result_has_visual_pixel_verification(value: &Value) -> bool {
 }
 
 fn target_act_error_status(error: &ErrorData) -> &'static str {
+    // A call that already delivered input (a later step of a composite, or a
+    // foreground refusal after an earlier batch) is never a refusal, whatever
+    // its code: the caller must verify, not retry blindly.
+    if crate::m2::error_delivered_input(error) {
+        return TARGET_ACT_STATUS_VERIFY_NEEDED;
+    }
     // A foreground refusal raised before any input batch was delivered is a
     // refusal, not a verify-needed outcome. Post-action readbacks raise the
     // same code after input *was* delivered and keep verify_needed (#234,

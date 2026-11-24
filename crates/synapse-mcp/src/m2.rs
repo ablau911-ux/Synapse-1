@@ -1245,6 +1245,43 @@ pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
     }
 }
 
+/// Marks an error of a later step of a multi-step tool call: once
+/// `earlier_steps_done` steps of the same call ran, input was already
+/// delivered, so `data.refused_before_delivery` becomes false, whatever the
+/// kind of error. The one place that writes this rule: input loops pass their
+/// step count, composites the count of steps that ran before.
+pub(crate) fn error_after_earlier_steps(
+    mut error: ErrorData,
+    earlier_steps_done: usize,
+) -> ErrorData {
+    if earlier_steps_done == 0 {
+        return error;
+    }
+    let mut data = match error.data.take() {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("original_data".to_owned(), other);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+    data.insert("refused_before_delivery".to_owned(), Value::Bool(false));
+    error.data = Some(Value::Object(data));
+    error
+}
+
+/// True when the error records that input of its tool call was already
+/// delivered (`data.refused_before_delivery` is false).
+pub(crate) fn error_delivered_input(error: &ErrorData) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("refused_before_delivery"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
 pub struct M2State {
     pub emitter_handle: ActionHandle,
     pub snapshot_handle: ActionEmitterSnapshotHandle,

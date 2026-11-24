@@ -650,10 +650,9 @@ async fn execute_scroll_actions(
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.into_iter().enumerate() {
         boundary.ensure("immediately_before_foreground_scroll_dispatch")?;
-        handle
-            .execute(action)
-            .await
-            .map_err(|error| action_error_to_mcp(&error.after_earlier_steps(index)))?;
+        handle.execute(action).await.map_err(|error| {
+            crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), index)
+        })?;
         if smooth && index < last_index {
             tokio::time::sleep(Duration::from_millis(u64::from(SMOOTH_SCROLL_INTERVAL_MS))).await;
         }

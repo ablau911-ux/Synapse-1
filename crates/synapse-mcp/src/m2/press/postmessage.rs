@@ -98,19 +98,22 @@ async fn post_key_sequence_impl(
                 .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else {
-            for spec in &key_specs {
+            for (key_index, spec) in key_specs.iter().enumerate() {
                 boundary.ensure("immediately_before_postmessage_key_down")?;
                 post_key_message(
                     target.hwnd,
                     windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
                     spec,
                 )
-                .map_err(|error| action_error_to_mcp(&error))?;
+                .map_err(|error| {
+                    crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), key_index)
+                })?;
             }
             release_keys = true;
             boundary.ensure("immediately_before_postmessage_key_chars")?;
-            post_char_messages(target.hwnd, &key_specs)
-                .map_err(|error| action_error_to_mcp(&error))?;
+            post_char_messages(target.hwnd, &key_specs).map_err(|error| {
+                crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), key_specs.len())
+            })?;
             hwnd_to_i64(target.hwnd)
         }
     };
@@ -130,7 +133,10 @@ async fn post_key_sequence_impl(
                 spec,
             ) && release_error.is_none()
             {
-                release_error = Some(action_error_to_mcp(&error));
+                release_error = Some(crate::m2::error_after_earlier_steps(
+                    action_error_to_mcp(&error),
+                    key_specs.len(),
+                ));
             }
         }
     }
@@ -148,8 +154,10 @@ async fn post_key_sequence_impl(
     if let Some(error) = release_error {
         return Err(error);
     }
-    let target = best_keyboard_target(root_hwnd).map_err(|error| action_error_to_mcp(&error))?;
-    target_state(target).map_err(|error| action_error_to_mcp(&error))
+    // Input was already posted before this readback.
+    best_keyboard_target(root_hwnd)
+        .and_then(target_state)
+        .map_err(|error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1))
 }
 
 #[cfg(not(windows))]

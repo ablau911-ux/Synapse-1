@@ -892,8 +892,9 @@ async fn execute_with_modifiers(
             let _release_result =
                 release_pressed_modifiers(handle, &pressed, backend, "modifier_press_cleanup")
                     .await;
-            return Err(action_error_to_mcp(
-                &error.after_earlier_steps(pressed.len()),
+            return Err(crate::m2::error_after_earlier_steps(
+                action_error_to_mcp(&error),
+                pressed.len(),
             ));
         }
         pressed.push(key.clone());
@@ -919,8 +920,9 @@ async fn execute_with_modifiers(
     let release_result = release_pressed_modifiers(handle, &pressed, backend, release_stage).await;
 
     if let Err(error) = stroke_result {
-        return Err(action_error_to_mcp(
-            &error.after_earlier_steps(pressed.len()),
+        return Err(crate::m2::error_after_earlier_steps(
+            action_error_to_mcp(&error),
+            pressed.len(),
         ));
     }
     if let Some(error) = boundary_error {
@@ -935,7 +937,11 @@ async fn execute_with_modifiers(
         return Err(error);
     }
     if let Err(error) = release_result {
-        return Err(action_error_to_mcp(&error));
+        // The modifier key-downs and the stroke ran before this release.
+        return Err(crate::m2::error_after_earlier_steps(
+            action_error_to_mcp(&error),
+            pressed.len() + 1,
+        ));
     }
     Ok(())
 }

@@ -49,6 +49,31 @@ For each: can it be built on this PC without network access problems, does it of
 4. **Index.** One line per recorded instant in a text file: time, whether a picture was encoded, whether a still was written, and, if an instant was lost, that it was lost and why. A lost instant is never left unnamed.
 5. **Measurement run.** One recording of the real YouTube page with the same actions as in `measurements.md` (scroll at 8 s, typing from 15 s, pause at 36 s; 40 s). The window opens, is recorded and closes in one script.
 
+## Probe interface (the contract between the checks and the code)
+
+Added 2026-11-24 so the check-writer and the builder work against the same text.
+
+**Command:**
+
+    clip-probe exp-av1 out=<dir> seconds=<n> hwnd=<window handle>      record a live window
+    clip-probe exp-av1 out=<dir> folder=<corpus scene folder>          replay a captured scene in real time
+
+- `folder=` replays a scene of `C:\Users\Adam\clip-corpus` (one picture per instant from its `frames.jsonl`, 20 instants per second, paced by the clock) through exactly the same pipeline as a live window. The checks use this mode, because the source pictures are known.
+- Optional: `quality=<n>` (default 35), `key=<instants>` (default 100), `settle=<instants>` (default 10).
+- Exit code 0 on success. Any failure prints one line to stderr and exits non-zero.
+
+**Output folder:**
+
+| path | content |
+|---|---|
+| `video/part-NNNN.ivf` | AV1 in the IVF container. A new part starts at each key picture. Each picture's timestamp is its instant number. |
+| `stills/still-NNNNNNNN.webp` | Lossless WebP of the whole window; the number is the instant the still belongs to, zero-padded to 8 digits. |
+| `frames.jsonl` | One JSON line per instant, in order: `{"instant":k,"t_ms":k*50}` plus exactly one of `"enc":[part,index_in_part]`, `"same":true`, `"lost":"<cause>"`; plus `"still":true` on the instant a still belongs to. |
+| `probe.json` | `{"instants","encoded","same","lost","stills","bytes_video","bytes_stills","cpu_ns","ram_peak","first_encoded_ms","width","height","encoder":{"name","settings"}}` |
+
+- `cpu_ns` is the processor time of the whole probe process; `ram_peak` its peak private bytes; `first_encoded_ms` the time from the start of recording to the first encoded picture.
+- Instant 0 is always encoded (it is a key picture). An instant whose picture equals the one before it is `same` and nothing is encoded for it.
+
 ## Files
 
 - `scripts/clip-equation/probe/src/exp_av1.rs` (new): the command of parts 2–4.

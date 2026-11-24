@@ -12,8 +12,8 @@ use synapse_capture::ClipSource;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, RECORD_FPS, StopReason,
-    clips_root, file_size_and_sha256,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, MAX_DURATION_MS, RECORD_FPS,
+    StopReason, clips_root, file_size_and_sha256,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -283,7 +283,8 @@ pub(super) async fn clip_stop(clip_id: &str) -> Result<ClipStatusResponse, Error
     clip_status(clip_id)
 }
 
-/// `record_extend`: moves the end of a running recording by `add_ms`.
+/// `record_extend`: moves the end of a running recording by `add_ms`, up to
+/// `MAX_DURATION_MS` in all.
 pub(super) fn clip_extend(clip_id: &str, add_ms: u64) -> Result<ClipStatusResponse, ErrorData> {
     let (control, folder) = Recorders::find(clip_id).ok_or_else(|| {
         mcp_error(
@@ -291,7 +292,21 @@ pub(super) fn clip_extend(clip_id: &str, add_ms: u64) -> Result<ClipStatusRespon
             format!("clip {clip_id} is not recording; only a running recording can be extended"),
         )
     })?;
-    let end_ms = control.end_ms.fetch_add(add_ms, Ordering::Relaxed) + add_ms;
+    let end_ms = control
+        .end_ms
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+            end.checked_add(add_ms)
+                .filter(|&end| end <= MAX_DURATION_MS)
+        })
+        .map(|before| before + add_ms)
+        .map_err(|end| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "clip {clip_id} ends at {end} ms; {add_ms} ms more would pass the longest recording ({MAX_DURATION_MS} ms)"
+                ),
+            )
+        })?;
     ClipJson::update(&folder, |clip| clip.end_ms = clip.end_ms.max(end_ms))
         .map_err(internal_error)?;
     status_of(&folder, Some(&control))

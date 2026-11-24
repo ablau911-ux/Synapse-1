@@ -8,6 +8,10 @@ use sha2::{Digest as _, Sha256};
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{Backend, ChromeBridgeDetail};
 
+/// Storage `detail` label: `cf_sizes` are `RocksDB` estimates, not exact byte scans.
+const CF_SIZES_ESTIMATE_NOTE: &str =
+    "cf_sizes are RocksDB size estimates (flushed live data plus memtables), not exact byte counts";
+
 /// Verbosity control for the `health` tool response.
 ///
 /// `health` is called frequently and its verbose per-subsystem `detail` prose
@@ -393,9 +397,9 @@ impl SynapseService {
                             },
                             detail: Some(match maintenance_error {
                                 Some(error) => format!(
-                                    "storage opened at daemon startup (reflex runtime idle); maintenance unhealthy: {error}"
+                                    "storage opened at daemon startup (reflex runtime idle); {CF_SIZES_ESTIMATE_NOTE}; maintenance unhealthy: {error}"
                                 ),
-                                None => "storage opened at daemon startup (reflex runtime idle); maintenance tasks running and pressure probe observed".to_owned(),
+                                None => format!("storage opened at daemon startup (reflex runtime idle); {CF_SIZES_ESTIMATE_NOTE}; maintenance tasks running and pressure probe observed"),
                             }),
                             db_path,
                             schema_version: Some(synapse_core::SCHEMA_VERSION),
@@ -425,9 +429,9 @@ impl SynapseService {
                                 ),
                                 detail: Some(match maintenance_error {
                                     Some(error) => format!(
-                                        "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance unhealthy: {error}"
+                                        "storage runtime initialized; {CF_SIZES_ESTIMATE_NOTE}; maintenance unhealthy: {error}"
                                     ),
-                                    None => "storage runtime initialized; cf_sizes use RocksDB live-data estimates; maintenance tasks running and pressure probe observed".to_owned(),
+                                    None => format!("storage runtime initialized; {CF_SIZES_ESTIMATE_NOTE}; maintenance tasks running and pressure probe observed"),
                                 }),
                                 db_path: Some(runtime.storage_path().display().to_string()),
                                 schema_version: Some(runtime.schema_version()),

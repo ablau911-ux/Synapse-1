@@ -40,6 +40,7 @@ const TIMELINE_PERIODIC_COMPACTION_SECONDS: u64 = 86_400;
 const STORAGE_WRITES_SHED_TOTAL: &str = "storage_writes_shed_total";
 const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
 const ESTIMATE_LIVE_DATA_SIZE: &str = "rocksdb.estimate-live-data-size";
+const CUR_SIZE_ALL_MEM_TABLES: &str = "rocksdb.cur-size-all-mem-tables";
 const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 
 /// One raw storage row: key bytes and value bytes.
@@ -545,7 +546,9 @@ impl Db {
         Ok(sizes)
     }
 
-    /// Returns `RocksDB`'s live-data-size estimate for each Synapse column family.
+    /// Returns `RocksDB`'s size estimate for each Synapse column family: the
+    /// live-data estimate of flushed SST files plus the bytes still held in
+    /// memtables, so rows not yet flushed are not reported as 0 bytes.
     ///
     /// This is metadata-backed and intentionally cheaper than [`Self::cf_sizes`],
     /// which scans every key/value byte to compute exact logical sizes.
@@ -556,9 +559,20 @@ impl Db {
     /// be read.
     #[tracing::instrument(skip_all)]
     pub fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap> {
-        let estimates = self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)?;
-        emit_storage_cf_bytes(&estimates.0);
-        Ok(estimates)
+        let (mut sizes, mut missing) = self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)?;
+        let (memtable_sizes, missing_memtables) =
+            self.cf_property_estimates(CUR_SIZE_ALL_MEM_TABLES)?;
+        for (cf_name, memtable_bytes) in memtable_sizes {
+            let bytes = sizes.entry(cf_name).or_insert(0);
+            *bytes = bytes.saturating_add(memtable_bytes);
+        }
+        for cf_name in missing_memtables {
+            if !missing.contains(&cf_name) {
+                missing.push(cf_name);
+            }
+        }
+        emit_storage_cf_bytes(&sizes);
+        Ok((sizes, missing))
     }
 
     /// Returns exact row counts for each Synapse column family.

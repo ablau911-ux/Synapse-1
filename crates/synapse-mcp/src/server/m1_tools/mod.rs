@@ -5803,7 +5803,11 @@ impl SynapseService {
             (Some(target_id), _) => target_id.to_owned(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
             (None, Some(SessionTarget::Window { hwnd })) => {
-                return Err(missing_cdp_tab_target_error(tool, window_hwnd_param, Some(*hwnd)));
+                return Err(missing_cdp_tab_target_error(
+                    tool,
+                    window_hwnd_param,
+                    Some(*hwnd),
+                ));
             }
             (None, None) => {
                 return Err(missing_cdp_tab_target_error(tool, window_hwnd_param, None));

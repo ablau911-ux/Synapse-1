@@ -204,9 +204,6 @@ impl ViewedClip {
                 folder.display()
             ))
         })?;
-        if clip.fps == 0 {
-            return Err(params_invalid(format!("{CLIP_JSON_FILE} has fps 0")));
-        }
         if clip.state == ClipState::Recording {
             return Err(params_invalid(format!(
                 "clip {} is still recording; wait for record_status to report ready",

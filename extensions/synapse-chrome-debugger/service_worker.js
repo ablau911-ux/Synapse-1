@@ -7040,21 +7040,24 @@ async function handleDomAction(params) {
       "chrome.scripting.executeScript domAction returned no structured action result"
     );
   }
+  // Events the in-page action dispatched were delivered input; an action that
+  // dispatched none (a no-op check/uncheck, resolve_only) delivered nothing.
+  const eventsDispatched = Array.isArray(actionResult.events_dispatched) ? actionResult.events_dispatched : [];
+  const inputDelivered = eventsDispatched.length > 0;
   if (!actionResult.ok) {
     const failure = bridgeError(
       String(actionResult.error_code || ERROR_AXTREE_FAILED),
       `domAction ${action} failed in resolved frame ${first.frame_id}: ${String(actionResult.error_detail || "")}; ` +
         `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
     );
-    // Events the in-page action dispatched before it failed were delivered.
-    const eventsDispatched = Array.isArray(actionResult.events_dispatched) ? actionResult.events_dispatched : [];
-    throw eventsDispatched.length > 0 ? errorAfterInput(failure) : failure;
+    throw inputDelivered ? errorAfterInput(failure) : failure;
   }
 
-  // The action ran in the page: every failure below is after delivered input.
-  const createdPopupTabs = await afterInput(createDomActionPopupTabs(selected, before, actionResult));
-  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
-  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
+  // Every failure below comes after the action's dispatched events, if any.
+  const afterAction = (promise) => (inputDelivered ? afterInput(promise) : promise);
+  const createdPopupTabs = await afterAction(createDomActionPopupTabs(selected, before, actionResult));
+  const after = await afterAction(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterAction(tabPageTextState(selected.tabId, suppressPageText));
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,

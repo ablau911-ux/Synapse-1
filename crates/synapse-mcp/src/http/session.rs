@@ -167,7 +167,11 @@ pub(super) async fn require_mcp_session(
                     session_id,
                     "HTTP MCP session rejected because session lifecycle already terminated it"
                 );
-                return session_invalid_for(SessionFailure::Terminated, Some(session_id));
+                return session_invalid_for(
+                    SessionFailure::Terminated,
+                    Some(session_id),
+                    &serde_json::Value::Null,
+                );
             }
             match record_session_request(&state.session_registry, session_id, request).await {
                 Ok(request) => request,
@@ -184,6 +188,7 @@ pub(super) async fn require_mcp_session(
                 return session_invalid_for(
                     SessionFailure::UnknownOrExpired,
                     diagnostic_session_id.as_deref(),
+                    &serde_json::Value::Null,
                 );
             }
             response
@@ -217,7 +222,11 @@ pub(super) async fn release_held_inputs_on_delete(
             reason = ?SessionFailure::UnknownOrExpired,
             "HTTP MCP session delete rejected before held-input cleanup"
         );
-        return session_invalid_for(SessionFailure::UnknownOrExpired, Some(session_id));
+        return session_invalid_for(
+            SessionFailure::UnknownOrExpired,
+            Some(session_id),
+            &serde_json::Value::Null,
+        );
     }
     // #277: a session the lifecycle already terminated (e.g. by adoption) can
     // still be open in rmcp's session manager. Its DELETE still closes it, but
@@ -308,7 +317,7 @@ async fn enforce_session_header(request: Request<Body>) -> Result<Request<Body>,
     if request.method() == Method::POST {
         allow_initialize_without_session(request).await
     } else if request.method() == Method::GET || request.method() == Method::DELETE {
-        Err(session_invalid(SessionFailure::Missing))
+        Err(session_invalid(SessionFailure::Missing, &serde_json::Value::Null))
     } else {
         Ok(request)
     }
@@ -337,7 +346,8 @@ async fn allow_initialize_without_session(
         .map_err(|_| payload_too_large())?;
     let message = jsonrpc_message(&bytes)?;
     if !jsonrpc_method_is_initialize(&message) {
-        return Err(session_invalid(SessionFailure::Missing));
+        let request_id = message.get("id").unwrap_or(&serde_json::Value::Null);
+        return Err(session_invalid(SessionFailure::Missing, request_id));
     }
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
@@ -468,6 +478,7 @@ fn jsonrpc_parse_error(error: &serde_json::Error) -> Response {
         &serde_json::Value::Null,
         ErrorCode::PARSE_ERROR,
         format!("parse error: {error}"),
+        None,
     )
 }
 
@@ -477,24 +488,31 @@ fn invalid_jsonrpc_request(id: &serde_json::Value, message: &str) -> Response {
         id,
         ErrorCode::INVALID_REQUEST,
         format!("invalid request: {message}"),
+        None,
     )
 }
 
-/// A JSON-RPC 2.0 error response the HTTP layer sends for a body that never
-/// reaches rmcp. `id` is `null` when the request id could not be read.
-fn jsonrpc_error_response(
+/// A JSON-RPC 2.0 error response the HTTP layer sends for an /mcp request it
+/// refuses before rmcp sees it (#189, #266). `id` is `null` when the request
+/// id could not be read; `data` carries the refusal's machine-readable fields.
+pub(super) fn jsonrpc_error_response(
     status: StatusCode,
     id: &serde_json::Value,
     code: ErrorCode,
     message: String,
+    data: Option<serde_json::Value>,
 ) -> Response {
+    let mut error = serde_json::json!({
+        "code": code.0,
+        "message": message,
+    });
+    if let Some(data) = data {
+        error["data"] = data;
+    }
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {
-            "code": code.0,
-            "message": message,
-        },
+        "error": error,
     });
     (
         status,
@@ -551,16 +569,22 @@ fn is_mcp_endpoint(path: &str) -> bool {
 
 const SESSION_RECOVERY_HEADER: &str = "mcp-session-recovery";
 
-fn session_invalid(failure: SessionFailure) -> Response {
-    session_invalid_for(failure, None)
+fn session_invalid(failure: SessionFailure, request_id: &serde_json::Value) -> Response {
+    session_invalid_for(failure, None, request_id)
 }
 
 /// Build the 404 session-invalid response with an actionable, machine-matchable
-/// diagnostic (#1360 part 3). The body is JSON carrying the failure class and
-/// the recovery the caller should take, and the `code` field is the literal
-/// `HTTP_SESSION_INVALID` string so existing plaintext sniffers still match.
-/// Status stays 404 so rmcp transports keep treating it as session-expired.
-fn session_invalid_for(failure: SessionFailure, session_id: Option<&str>) -> Response {
+/// diagnostic (#1360 part 3). The body is a JSON-RPC error (#266) whose
+/// `error.data` carries the failure class and the recovery the caller should
+/// take, and whose `error.data.code` is the literal `HTTP_SESSION_INVALID`
+/// string so existing plaintext sniffers still match. Status stays 404 so rmcp
+/// transports keep treating it as session-expired. `request_id` is `null` when
+/// the body was not read.
+fn session_invalid_for(
+    failure: SessionFailure,
+    session_id: Option<&str>,
+    request_id: &serde_json::Value,
+) -> Response {
     tracing::warn!(
         code = synapse_core::error_codes::HTTP_SESSION_INVALID,
         reason = failure.reason(),
@@ -569,7 +593,7 @@ fn session_invalid_for(failure: SessionFailure, session_id: Option<&str>) -> Res
         session_id = session_id.unwrap_or(""),
         "HTTP MCP session rejected"
     );
-    let body = serde_json::json!({
+    let data = serde_json::json!({
         "code": synapse_core::error_codes::HTTP_SESSION_INVALID,
         "reason": failure.reason(),
         // #1360 part 3: a 404 here means the daemon answered, so it is not a
@@ -583,20 +607,22 @@ fn session_invalid_for(failure: SessionFailure, session_id: Option<&str>) -> Res
         "detail": failure.detail(),
         "source_of_truth": "http_session_middleware",
     });
-    let body = serde_json::to_string(&body)
-        .unwrap_or_else(|_| synapse_core::error_codes::HTTP_SESSION_INVALID.to_owned());
-    (
+    let mut response = jsonrpc_error_response(
         StatusCode::NOT_FOUND,
-        [
-            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-            (
-                header::HeaderName::from_static(SESSION_RECOVERY_HEADER),
-                failure.recovery(),
-            ),
-        ],
-        body,
-    )
-        .into_response()
+        request_id,
+        ErrorCode::INVALID_REQUEST,
+        format!(
+            "{}: {}",
+            synapse_core::error_codes::HTTP_SESSION_INVALID,
+            failure.detail()
+        ),
+        Some(data),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static(SESSION_RECOVERY_HEADER),
+        header::HeaderValue::from_static(failure.recovery()),
+    );
+    response
 }
 
 /// 413 for a body over [`MAX_MCP_REQUEST_BYTES`], as a JSON-RPC error that
@@ -609,27 +635,34 @@ fn payload_too_large() -> Response {
         format!(
             "invalid request: the body exceeds the {MAX_MCP_REQUEST_BYTES}-byte limit of an /mcp request"
         ),
+        None,
     )
 }
 
 fn lifecycle_cleanup_failed(error: rmcp::ErrorData) -> Response {
-    (
+    jsonrpc_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        &serde_json::Value::Null,
+        ErrorCode::INTERNAL_ERROR,
         format!(
             "{}: {}",
             synapse_core::error_codes::TOOL_INTERNAL_ERROR,
             error.message
         ),
+        Some(serde_json::json!({
+            "code": synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+        })),
     )
-        .into_response()
 }
 
 fn session_registry_failed() -> Response {
-    (
+    jsonrpc_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        "SESSION_REGISTRY_UNAVAILABLE",
+        &serde_json::Value::Null,
+        ErrorCode::INTERNAL_ERROR,
+        "SESSION_REGISTRY_UNAVAILABLE".to_owned(),
+        Some(serde_json::json!({
+            "code": "SESSION_REGISTRY_UNAVAILABLE",
+        })),
     )
-        .into_response()
 }

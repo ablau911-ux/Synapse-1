@@ -9192,6 +9192,9 @@ async fn force_connection_close(mut response: Response) -> Response {
     response
 }
 
+const DAEMON_RESTARTING_MESSAGE: &str =
+    "daemon is restarting; initialize a new MCP session after the replacement daemon is healthy";
+
 async fn refuse_mcp_while_draining(
     State(state): State<HttpState>,
     request: Request<Body>,
@@ -9217,17 +9220,20 @@ async fn refuse_mcp_while_draining(
         drain = ?snapshot,
         "HTTP MCP request refused because daemon is draining for restart"
     );
-    let mut response = (
+    // #266: an /mcp refusal is a JSON-RPC error; its fields go in error.data.
+    let mut response = session::jsonrpc_error_response(
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
+        &serde_json::Value::Null,
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        DAEMON_RESTARTING_MESSAGE.to_owned(),
+        Some(serde_json::json!({
             "code": synapse_core::error_codes::DAEMON_RESTARTING,
             "retryable": true,
             "path": path,
             "drain": snapshot,
-            "message": "daemon is restarting; initialize a new MCP session after the replacement daemon is healthy"
+            "message": DAEMON_RESTARTING_MESSAGE
         })),
-    )
-        .into_response();
+    );
     response
         .headers_mut()
         .insert(header::CONNECTION, HeaderValue::from_static("close"));

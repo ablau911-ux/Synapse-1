@@ -443,6 +443,9 @@ fn verify_explicit_session_absence(
     }
     let payload: serde_json::Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid JSON body: {error}"))?;
+    // The daemon sends the refusal as a JSON-RPC error with its fields in
+    // error.data (#266); a daemon from before that sends them at top level.
+    let payload = payload.pointer("/error/data").unwrap_or(&payload);
     let code = payload.get("code").and_then(serde_json::Value::as_str);
     let echoed_session_id = payload
         .get("session_id")

@@ -1838,37 +1838,51 @@ fn validate_workspace_run_id(value: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// A workspace key names exactly one row: the key the caller sends is the key
+/// that is stored and matched, never a rewritten form. Leading or trailing
+/// whitespace (including NBSP and U+3000) is refused instead of trimmed, so
+/// "a" and "a " cannot alias one row.
 fn normalize_workspace_key(value: &str) -> Result<String, ErrorData> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_KEY_BYTES {
+    if value.trim().is_empty() || value.len() > MAX_KEY_BYTES {
         return Err(params_error(format!(
             "workspace key must be non-empty and <= {MAX_KEY_BYTES} bytes"
         )));
     }
-    if !trimmed.chars().all(|ch| !ch.is_control()) {
+    if value.trim() != value {
+        return Err(params_error(
+            "workspace key must not start or end with whitespace; keys are stored exactly as sent",
+        ));
+    }
+    if !value.chars().all(|ch| !ch.is_control()) {
         return Err(params_error(
             "workspace key must not contain control characters",
         ));
     }
-    Ok(trimmed.to_owned())
+    Ok(value.to_owned())
 }
 
+/// A prefix is matched byte-exact against stored keys, like the keys
+/// themselves. Keys never start with whitespace, so neither may a prefix.
 fn normalize_workspace_prefix(value: &str, allow_empty: bool) -> Result<String, ErrorData> {
-    let trimmed = value.trim();
-    if !allow_empty && trimmed.is_empty() {
+    if !allow_empty && value.is_empty() {
         return Err(params_error("workspace prefix must not be empty"));
     }
-    if trimmed.len() > MAX_KEY_BYTES {
+    if value.len() > MAX_KEY_BYTES {
         return Err(params_error(format!(
             "workspace prefix must be <= {MAX_KEY_BYTES} bytes"
         )));
     }
-    if !trimmed.chars().all(|ch| !ch.is_control()) {
+    if value.trim_start() != value {
+        return Err(params_error(
+            "workspace prefix must not start with whitespace; keys are stored exactly as sent",
+        ));
+    }
+    if !value.chars().all(|ch| !ch.is_control()) {
         return Err(params_error(
             "workspace prefix must not contain control characters",
         ));
     }
-    Ok(trimmed.to_owned())
+    Ok(value.to_owned())
 }
 
 fn validate_workspace_ttl_ms(ttl_ms: u64) -> Result<(), ErrorData> {

@@ -7912,15 +7912,7 @@ fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
             "reason",
         ));
     }
-    if params.ttl_ms.is_some() {
-        return Err(act_facade_error(
-            ActOperation::Invoke,
-            "act operation=invoke rejects ttl_ms; ttl_ms is only valid with operation=foreground",
-            "remove ttl_ms or call act with operation=foreground",
-            "ttl_ms",
-        ));
-    }
-    Ok(())
+    reject_act_ttl(params, ActOperation::Invoke)
 }
 
 fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {

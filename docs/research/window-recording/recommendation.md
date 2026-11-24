@@ -25,7 +25,7 @@ There is no "moving rectangle" logic and no lossless storage of changing pixels.
 | Royalty | none: "no-charge, royalty-free" patent licence (P67) | open legal question (P55, P61, P66) |
 | Size, interface work | 0.5–0.7 MB per minute | 0.5–1.0 |
 | Size, scrolling | 2.5 MB per minute | 2.7 |
-| Size, real YouTube page | 6.8 MB per minute at closeness 0.9796 | 4.0–4.6 at closeness 0.98 |
+| Size, real YouTube page | 3.4 MB per minute at closeness 0.9703 (quality setting 35); 6.8 at 0.9796 (setting 25) | 4.0–4.6 at closeness 0.98 |
 | CPU | 0.28–0.48 of one core | 0.03–0.15 of one core |
 | RAM (whole ffmpeg program) | 382–412 MB | 327–568 MB |
 | Start-up | about 70 ms | 130 ms (Direct3D 12) to 400 ms (Intel's library) |

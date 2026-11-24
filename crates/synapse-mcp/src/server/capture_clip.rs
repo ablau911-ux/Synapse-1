@@ -696,19 +696,35 @@ mod live {
             }
         };
         // A start the caller is told failed leaves nothing behind: every
-        // failure before the start response is sent (instant zero, or the
-        // response itself) seals the end, releases the recording and
-        // discards what this start made.
-        let mut recording = match Recording::start(plan).and_then(|recording| {
-            let response = recording.response()?;
-            Ok((recording, response))
-        }) {
+        // failure before the start response is sent (the first frame,
+        // instant zero, or the response itself) seals the end first, before
+        // anything of the recording is shut down, then releases the
+        // recording and discards what this start made. `Recording::start`
+        // starts the observer as its last step, so nothing runs when it
+        // fails.
+        let begun = match Recording::start(plan) {
+            Ok(mut recording) => match recording
+                .write_instant_zero()
+                .and_then(|()| recording.response())
+            {
+                Ok(response) => Ok((recording, response)),
+                Err(error) => {
+                    control.seal();
+                    drop(recording);
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                control.seal();
+                Err(error)
+            }
+        };
+        let mut recording = match begun {
             Ok((recording, response)) => {
                 let _ = started.send(Ok(response));
                 recording
             }
             Err(error) => {
-                control.seal();
                 discard_folder(plan, &first_created, root_first_created.as_deref());
                 let _ = started.send(Err(error));
                 return;
@@ -932,6 +948,8 @@ mod live {
         observer: ClipObserver,
         stream: ClipStream,
         disk: DiskGuard,
+        /// Composition time of the first delivered frame (s_0); set by
+        /// `write_instant_zero`.
         origin_hns: i64,
         geometry: ClipGeometry,
         /// Composition time of the frame last handed to the stream; `None`
@@ -946,7 +964,9 @@ mod live {
     }
 
     impl<'a> Recording<'a> {
-        /// Folder, lock, `clip.json`, observer, first frame and instant zero.
+        /// Lock, registry entry, `clip.json`, stream and disk guard, then the
+        /// observer: started last, so a failure here leaves nothing running.
+        /// The first frame and instant zero follow (`write_instant_zero`).
         /// The clip folder exists: `create_clip_folder` made it.
         fn start(plan: &'a ClipPlan) -> Result<Self, ErrorData> {
             let times = RecordingTimes::begin();
@@ -959,35 +979,34 @@ mod live {
             initial_clip_json(plan)
                 .create(&plan.folder)
                 .map_err(internal_error)?;
+            let stream = ClipStream::create(&plan.folder).map_err(internal_error)?;
+            let disk = DiskGuard::new(&plan.folder).map_err(internal_error)?;
             let observer = ClipObserver::start(plan.target, instant_hns()).map_err(|error| {
                 mcp_error(
                     error.code(),
                     format!("screenshot operation=record: {error}"),
                 )
             })?;
-            let origin_hns = wait_for_first_frame(&observer, plan)?;
-            let stream = ClipStream::create(&plan.folder).map_err(internal_error)?;
-            let disk = DiskGuard::new(&plan.folder).map_err(internal_error)?;
-            let mut recording = Self {
+            Ok(Self {
                 plan,
                 observer,
                 stream,
                 disk,
-                origin_hns,
+                origin_hns: 0,
                 geometry: ClipGeometry::default(),
                 last_composed: None,
                 next_instant: 0,
                 excluded_checked_at: Instant::now(),
                 times,
                 _recorder_lock: recorder_lock,
-            };
-            recording.write_instant_zero()?;
-            Ok(recording)
+            })
         }
 
-        /// Instant zero passes the privacy gate before it is written; an
-        /// all-black first frame is an error.
+        /// Waits for the first frame (s_0), then writes instant zero: it
+        /// passes the privacy gate before it is written; an all-black first
+        /// frame is an error.
         fn write_instant_zero(&mut self) -> Result<(), ErrorData> {
+            self.origin_hns = wait_for_first_frame(&self.observer, self.plan)?;
             if let Some(reason) = self.plan.privacy_stop() {
                 return Err(stop_error(reason));
             }

@@ -578,6 +578,7 @@ pub struct EpisodeListParams {
     pub min_duration_ms: Option<u64>,
     /// Maximum episodes to return (default 100, max 500).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 500))]
     pub limit: Option<u32>,
     /// Opaque continuation cursor from a previous response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -650,6 +651,7 @@ pub struct EpisodeGetParams {
     pub start_ts_ns: Option<u64>,
     /// Maximum timeline row refs to return (default 500, max 5000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 5_000))]
     pub refs_limit: Option<u32>,
     /// Opaque continuation cursor from a previous response's
     /// `next_refs_cursor`, to page through a long episode's evidence rows.

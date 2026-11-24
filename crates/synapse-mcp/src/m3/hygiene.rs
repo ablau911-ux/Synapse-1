@@ -85,6 +85,7 @@ pub struct HygieneScanTextParams {
     pub text: String,
     /// Minimum score to return (default 50, max 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 100))]
     pub min_score: Option<u32>,
     /// Persist matches as flag rows. Requires source_cf, source_key_hex, and
     /// source_field so the row links back to a physical Source of Truth.
@@ -106,12 +107,15 @@ pub struct HygieneScanStorageParams {
     pub source_cfs: Option<Vec<String>>,
     /// Maximum source rows scanned this call (default 1000, max 10000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 10_000))]
     pub limit_rows: Option<u32>,
     /// Maximum persisted flags this call (default 200, max 1000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000))]
     pub flag_limit: Option<u32>,
     /// Minimum score to persist/return (default 50, max 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 100))]
     pub min_score: Option<u32>,
     /// Cursor returned by a previous call, formatted as source_cf:key_hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,11 +131,13 @@ pub struct HygieneFlagsParams {
     /// Optional exact source key, hex-encoded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_key_hex: Option<String>,
-    /// Minimum score to return (default 0 for readback).
+    /// Minimum score to return (default 0 for readback, max 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 100))]
     pub min_score: Option<u32>,
     /// Maximum rows returned (default 100, max 1000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000))]
     pub limit: Option<u32>,
     /// Hex-encoded CF_KV key from a previous response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,12 +239,14 @@ pub struct HygieneReportParams {
     pub source_key_hex: Option<String>,
     /// Minimum flag score to include (default 0, max 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 100))]
     pub min_score: Option<u32>,
     /// Restrict to flags whose `detected_at` falls in `[start_ns, end_ns)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_range: Option<HygieneReportTimeRange>,
     /// Maximum flags returned (default 100, max 1000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000))]
     pub limit: Option<u32>,
     /// Hex-encoded `CF_KV` key cursor from a previous response.
     #[serde(default, skip_serializing_if = "Option::is_none")]

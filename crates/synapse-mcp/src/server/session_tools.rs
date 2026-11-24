@@ -55,7 +55,7 @@ pub struct SessionListParams {
     /// Maximum sessions to return. Omit for the default compact page size.
     /// Use `view=full` with an explicit higher limit only when needed.
     #[serde(default)]
-    #[schemars(default)]
+    #[schemars(default, range(min = 1, max = 500))]
     pub limit: Option<usize>,
     /// Include verbose attached-agent registry rows. Counts are always present.
     #[serde(default)]

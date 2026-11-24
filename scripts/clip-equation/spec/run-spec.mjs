@@ -309,6 +309,7 @@ else if (process.argv[2] === 'step5') process.exitCode = await (await import('./
 else if (process.argv[2] === 'd5') process.exitCode = (await import('./d5.mjs')).main(process.argv[3], process.argv[4]);
 else if (process.argv[2] === 'dyn-exact') await import('./dyn-exact.mjs');
 else if (process.argv[2] === 'dyn-moving') await import('./dyn-moving.mjs');
+else if (process.argv[2] === 'av1-probe') await import('./av1-probe.mjs');
 else if (process.argv[2] === 'dyn-motion') await import('./dyn-motion.mjs');
 else if (['dyn-folder', 'dyn-recovery', 'dyn-viewer', 'dyn-youtube', 'dyn-seek', 'dyn-empty-recovery'].includes(process.argv[2])) {
   const [check] = process.argv.splice(2, 1);

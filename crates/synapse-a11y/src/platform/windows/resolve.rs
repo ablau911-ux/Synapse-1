@@ -234,13 +234,16 @@ fn toggle_pattern_action(
     toggle_pattern
         .toggle()
         .map_err(|err| pattern_operation_error(id, "TogglePattern", "toggle", &err))?;
+    // Toggle ran: every error below is after the click reached the element.
     let after_state = toggle_state_label(toggle_pattern.get_toggle_state().map_err(|err| {
         pattern_operation_error(id, "TogglePattern", "ToggleState after Toggle", &err)
+            .after_input()
     })?);
     if before_state == after_state {
         return Err(A11yError::internal(format!(
             "TogglePattern.toggle returned for element {id}, but ToggleState stayed {after_state}"
-        )));
+        ))
+        .after_input());
     }
     Ok(ElementClickAction::Toggled {
         before_state,
@@ -275,13 +278,16 @@ fn selection_item_pattern_action(
     selection_item_pattern
         .select()
         .map_err(|err| pattern_operation_error(id, "SelectionItemPattern", "select", &err))?;
+    // Select ran: every error below is after the click reached the element.
     let is_selected = selection_item_pattern.is_selected().map_err(|err| {
         pattern_operation_error(id, "SelectionItemPattern", "IsSelected after Select", &err)
+            .after_input()
     })?;
     if !is_selected {
         return Err(A11yError::internal(format!(
             "SelectionItemPattern.select returned for element {id}, but IsSelected stayed false"
-        )));
+        ))
+        .after_input());
     }
     Ok(ElementClickAction::Selected {
         was_selected,
@@ -341,6 +347,7 @@ fn expand_pattern_action(
     expand_collapse_pattern
         .expand()
         .map_err(|err| pattern_operation_error(id, "ExpandCollapsePattern", "expand", &err))?;
+    // Expand ran: every error below is after the click reached the element.
     let after_state =
         expand_state_from_uia(expand_collapse_pattern.get_state().map_err(|err| {
             pattern_operation_error(
@@ -349,11 +356,13 @@ fn expand_pattern_action(
                 "ExpandCollapseState after expand",
                 &err,
             )
+            .after_input()
         })?);
     if after_state == before_state {
         return Err(A11yError::internal(format!(
             "ExpandCollapsePattern.expand returned for element {id}, but state stayed {after_state:?}"
-        )));
+        ))
+        .after_input());
     }
     Ok(Some(ElementClickAction::Expanded {
         before_state,
@@ -369,6 +378,7 @@ fn collapse_pattern_action(
     expand_collapse_pattern
         .collapse()
         .map_err(|err| pattern_operation_error(id, "ExpandCollapsePattern", "collapse", &err))?;
+    // Collapse ran: every error below is after the click reached the element.
     let after_state =
         expand_state_from_uia(expand_collapse_pattern.get_state().map_err(|err| {
             pattern_operation_error(
@@ -377,11 +387,13 @@ fn collapse_pattern_action(
                 "ExpandCollapseState after collapse",
                 &err,
             )
+            .after_input()
         })?);
     if after_state == before_state {
         return Err(A11yError::internal(format!(
             "ExpandCollapsePattern.collapse returned for element {id}, but state stayed {after_state:?}"
-        )));
+        ))
+        .after_input());
     }
     Ok(Some(ElementClickAction::Collapsed {
         before_state,
@@ -495,15 +507,16 @@ pub fn set_element_value(id: &ElementId, value: &str) -> A11yResult<ElementValue
             pattern.get_value().map_err(map_uia_error)?
         };
         pattern.set_value(&value).map_err(map_uia_error)?;
+        // SetValue ran: every error below is after the value reached the element.
         let after_password_len = if is_password {
-            Some(password_text_len(&id, &element)?)
+            Some(password_text_len(&id, &element).map_err(A11yError::after_input)?)
         } else {
             None
         };
         let after_value = if is_password {
             String::new()
         } else {
-            pattern.get_value().map_err(map_uia_error)?
+            pattern.get_value().map_err(|err| map_uia_error(err).after_input())?
         };
         Ok(ElementValueSetReadback {
             method: "uia_value_pattern".to_owned(),
@@ -560,15 +573,16 @@ fn set_native_text_value(
         native_text_value(id, hwnd)?
     };
     let expected_after_value = native_set_text(id, hwnd, value)?;
+    // WM_SETTEXT was sent: every error below is after input.
     let after_password_len = if is_password {
-        Some(native_text_len(id, hwnd)?)
+        Some(native_text_len(id, hwnd).map_err(A11yError::after_input)?)
     } else {
         None
     };
     let after_value = if is_password {
         String::new()
     } else {
-        native_text_value(id, hwnd)?
+        native_text_value(id, hwnd).map_err(A11yError::after_input)?
     };
     Ok(ElementValueSetReadback {
         method: "uia_native_window_text_message".to_owned(),
@@ -949,12 +963,14 @@ fn native_replace_element_text_selection(
     let before_selection = native_text_selection(id, hwnd)?;
     let replace_selection = if append {
         native_set_text_selection(id, hwnd, before_len, before_len)?;
-        let selection = native_text_selection(id, hwnd)?;
+        // EM_SETSEL moved the selection: errors below are after input.
+        let selection = native_text_selection(id, hwnd).map_err(A11yError::after_input)?;
         if selection != (before_len, before_len) {
             return Err(A11yError::internal(format!(
                 "native append selection postcondition failed for {id}: requested end {before_len}, read back {}..{}",
                 selection.0, selection.1
-            )));
+            ))
+            .after_input());
         }
         selection
     } else {
@@ -965,40 +981,61 @@ fn native_replace_element_text_selection(
     } else {
         text.to_owned()
     };
+    // In append mode EM_SETSEL above already moved the selection.
+    let after_selection_move = |error: A11yError| {
+        if append {
+            error.after_input()
+        } else {
+            error
+        }
+    };
     let inserted_wide: Vec<u16> = inserted_text.encode_utf16().collect();
     let requested_text_utf16_len =
-        native_text_u32_len(id, text.encode_utf16().count(), "requested text")?;
-    let inserted_text_utf16_len = native_text_u32_len(id, inserted_wide.len(), "inserted text")?;
+        native_text_u32_len(id, text.encode_utf16().count(), "requested text")
+            .map_err(after_selection_move)?;
+    let inserted_text_utf16_len = native_text_u32_len(id, inserted_wide.len(), "inserted text")
+        .map_err(after_selection_move)?;
     let expected_wide = native_text_expected_after_wide(
         id,
         &before_wide,
         &inserted_wide,
         replace_selection.0,
         replace_selection.1,
-    )?;
+    )
+    .map_err(after_selection_move)?;
     let expected_after_text_utf16_len =
-        native_text_u32_len(id, expected_wide.len(), "expected after text")?;
-    native_replace_text_selection(id, hwnd, &inserted_text)?;
-    let after_value = native_text_value(id, hwnd)?;
+        native_text_u32_len(id, expected_wide.len(), "expected after text")
+            .map_err(after_selection_move)?;
+    native_replace_text_selection(id, hwnd, &inserted_text).map_err(after_selection_move)?;
+    // EM_REPLACESEL was sent: every error below is after input.
+    let after_value = native_text_value(id, hwnd).map_err(A11yError::after_input)?;
     let after_wide: Vec<u16> = after_value.encode_utf16().collect();
-    let after_text_utf16_len = native_text_u32_len(id, after_wide.len(), "after text")?;
+    let after_text_utf16_len = native_text_u32_len(id, after_wide.len(), "after text")
+        .map_err(A11yError::after_input)?;
     if after_wide != expected_wide {
         return Err(A11yError::internal(format!(
             "native text insertion postcondition failed for {id}: expected UTF-16 len {expected_after_text_utf16_len}, read back {after_text_utf16_len}"
-        )));
+        ))
+        .after_input());
     }
-    let after_selection = native_text_selection(id, hwnd)?;
+    let after_selection = native_text_selection(id, hwnd).map_err(A11yError::after_input)?;
     let expected_caret = replace_selection
         .0
         .checked_add(inserted_text_utf16_len)
-        .ok_or_else(|| A11yError::ElementValueUnsupported {
-            detail: format!("native text insertion caret offset overflowed u32 for element {id}"),
+        .ok_or_else(|| {
+            A11yError::ElementValueUnsupported {
+                detail: format!(
+                    "native text insertion caret offset overflowed u32 for element {id}"
+                ),
+            }
+            .after_input()
         })?;
     if after_selection != (expected_caret, expected_caret) {
         return Err(A11yError::internal(format!(
             "native text insertion caret postcondition failed for {id}: expected {expected_caret}..{expected_caret}, read back {}..{}",
             after_selection.0, after_selection.1
-        )));
+        ))
+        .after_input());
     }
     let method = if append {
         "native_edit_em_setsel_em_replacesel"
@@ -1271,14 +1308,21 @@ pub fn scroll_element(id: &ElementId, dy: i32, dx: i32) -> A11yResult<ElementScr
         match scroll_pattern {
             Ok(pattern) => {
                 let steps = uia_scroll_steps(dy, dx)?;
-                for step in &steps {
+                for (index, step) in steps.iter().enumerate() {
                     pattern
                         .scroll(step.horizontal, step.vertical)
                         .map_err(|err| {
-                            pattern_operation_error(&id, "ScrollPattern", "scroll", &err)
+                            let error =
+                                pattern_operation_error(&id, "ScrollPattern", "scroll", &err);
+                            // Earlier steps of this call already scrolled.
+                            if index > 0 {
+                                error.after_input()
+                            } else {
+                                error
+                            }
                         })?;
                 }
-                let after = scroll_state_from_element(&element)?;
+                let after = scroll_state_from_element(&element).map_err(A11yError::after_input)?;
                 return Ok(ElementScrollReadback {
                     method: "uia_scroll_pattern".to_owned(),
                     before,
@@ -1297,7 +1341,7 @@ pub fn scroll_element(id: &ElementId, dy: i32, dx: i32) -> A11yResult<ElementScr
                 pattern.scroll_into_view().map_err(|err| {
                     pattern_operation_error(&id, "ScrollItemPattern", "scroll_into_view", &err)
                 })?;
-                let after = scroll_state_from_element(&element)?;
+                let after = scroll_state_from_element(&element).map_err(A11yError::after_input)?;
                 Ok(ElementScrollReadback {
                     method: "uia_scroll_item_pattern".to_owned(),
                     before,

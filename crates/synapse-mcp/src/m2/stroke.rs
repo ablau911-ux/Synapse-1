@@ -295,14 +295,20 @@ pub(crate) async fn act_stroke_cdp_target(
             )
         })?
         .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "act_stroke CDP Input.dispatchMouseEvent failed for target {cdp_target_id:?}: {error}"
+            crate::m2::error_after_a11y_input(
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "act_stroke CDP Input.dispatchMouseEvent failed for target {cdp_target_id:?}: {error}"
+                    ),
                 ),
+                &error,
             )
         })?;
-        boundary.ensure("after_cdp_mouse_stroke_target")?;
+        // The stroke was delivered before this check.
+        boundary
+            .ensure("after_cdp_mouse_stroke_target")
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_TARGET_DISPATCHED",
             cdp_target_id = %dispatch.target_id,

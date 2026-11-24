@@ -39,6 +39,15 @@ pub enum A11yError {
     InvalidElementId { detail: String },
     #[error("accessibility backend failed: {detail}")]
     Internal { detail: String },
+    /// `error` was raised after this call already sent input or ran a
+    /// pattern call (a read-back after the pattern call, a later event of an
+    /// input sequence). `code` is the code of `error`. Built only by
+    /// [`A11yError::after_input`]; read with [`A11yError::input_delivered`].
+    #[error("{error}")]
+    AfterInput {
+        code: &'static str,
+        error: Box<A11yError>,
+    },
 }
 
 impl A11yError {
@@ -66,7 +75,29 @@ impl A11yError {
                 error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND
             }
             Self::InvalidElementId { .. } | Self::Internal { .. } => error_codes::OBSERVE_INTERNAL,
+            Self::AfterInput { code, .. } => *code,
         }
+    }
+
+    /// Records that this error was raised after its call already sent input
+    /// or ran a pattern call. The one writer of the delivery fact of this
+    /// type; marking twice keeps one mark.
+    #[must_use]
+    pub fn after_input(self) -> Self {
+        if self.input_delivered() {
+            return self;
+        }
+        Self::AfterInput {
+            code: self.code(),
+            error: Box::new(self),
+        }
+    }
+
+    /// True when the error was raised after its call already sent input or
+    /// ran a pattern call ([`A11yError::after_input`]).
+    #[must_use]
+    pub const fn input_delivered(&self) -> bool {
+        matches!(self, Self::AfterInput { .. })
     }
 
     #[must_use]

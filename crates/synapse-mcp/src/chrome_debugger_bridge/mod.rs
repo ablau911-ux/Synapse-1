@@ -208,6 +208,9 @@ where
 pub struct ChromeDebuggerBridgeError {
     code: &'static str,
     detail: String,
+    /// The extension reported `delivered: true`: the command already ran
+    /// input events or `insertText` in the page before it failed.
+    input_delivered: bool,
 }
 
 impl ChromeDebuggerBridgeError {
@@ -221,10 +224,18 @@ impl ChromeDebuggerBridgeError {
         &self.detail
     }
 
+    /// True when the extension reported that the failed command already ran
+    /// input in the page (`delivered: true` in its error payload).
+    #[must_use]
+    pub(crate) const fn input_delivered(&self) -> bool {
+        self.input_delivered
+    }
+
     fn unavailable() -> Self {
         let profile_install_state = synapse_chrome_profile_install_state();
         Self {
             code: error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+            input_delivered: false,
             detail: format!(
                 "Chrome debugger extension bridge is not connected; reason=no_active_chrome_bridge_host; repair_guidance={NO_ACTIVE_HOST_REPAIR_GUIDANCE}; {}; {INSTALL_GUIDANCE}",
                 profile_install_state.detail
@@ -235,6 +246,7 @@ impl ChromeDebuggerBridgeError {
     fn timeout(command_kind: &str) -> Self {
         Self {
             code: error_codes::A11Y_CDP_EXTENSION_TIMEOUT,
+            input_delivered: false,
             detail: format!(
                 "Chrome debugger extension command {command_kind:?} timed out after {}s",
                 COMMAND_TIMEOUT.as_secs()
@@ -245,6 +257,7 @@ impl ChromeDebuggerBridgeError {
     fn protocol(detail: impl Into<String>) -> Self {
         Self {
             code: error_codes::A11Y_CDP_ATTACH_FAILED,
+            input_delivered: false,
             detail: detail.into(),
         }
     }
@@ -252,11 +265,12 @@ impl ChromeDebuggerBridgeError {
     fn params_invalid(detail: impl Into<String>) -> Self {
         Self {
             code: error_codes::TOOL_PARAMS_INVALID,
+            input_delivered: false,
             detail: detail.into(),
         }
     }
 
-    fn extension(code: Option<&str>, detail: impl Into<String>) -> Self {
+    fn extension(code: Option<&str>, detail: impl Into<String>, input_delivered: bool) -> Self {
         let code = match code {
             Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE) => {
                 error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE
@@ -306,6 +320,7 @@ impl ChromeDebuggerBridgeError {
         };
         Self {
             code,
+            input_delivered,
             detail: detail.into(),
         }
     }
@@ -313,6 +328,7 @@ impl ChromeDebuggerBridgeError {
     fn queue_wedged(command_kind: &str, host_id: &str, wedge: &HostQueueWedge) -> Self {
         Self {
             code: CHROME_BRIDGE_EXTENSION_QUEUE_WEDGED,
+            input_delivered: false,
             detail: format!(
                 "Chrome bridge refused command {command_kind:?} because host {host_id} is extension_command_queue_wedged: {}; remediation=call browser_debugger.reload_bridge (reloadSelf is still admitted) or wait for the extension worker to reconnect with a new worker boot",
                 wedge.evidence()
@@ -335,6 +351,7 @@ impl ChromeDebuggerBridgeError {
             );
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
+            input_delivered: false,
             detail: format!(
                 "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} setup_repair_guidance={} remediation=run the concrete setup repair command reported by setup status/doctor or call setup operation=repair, then call browser_debugger.reload_bridge through the public facade from a bridge that advertises reloadSelf; if the loaded worker predates reloadSelf, fail closed and wait for a Chrome restart/reload rather than using foreground chrome://extensions automation",
                 host.extension_id.as_deref().unwrap_or("not_seen_yet"),
@@ -368,6 +385,7 @@ impl ChromeDebuggerBridgeError {
         let external_surface_hint = external_chrome_surface_hint();
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            input_delivered: false,
             detail: format!(
                 "Synapse Chrome Bridge refused unsupported attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=only explicit browser_debugger-profile lanes may use chrome.debugger for Runtime.evaluate page eval, Page.addScriptToEvaluateOnNewDocument init scripts, cdpInput target-scoped hover/tap/active-tab drag, viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, mediaEmulation, and networkConditions plus inactive-tab synthetic mouse drag, while this command still requires a dedicated raw-CDP automation profile{external_surface_hint} remediation=run scripts\\install-synapse-chrome-debugger.ps1 and browser_debugger.reload_bridge to ensure the current bridge is installed, then set profile=browser_debugger through the public profile facade with confirm_break_glass=true and a reason for supported browser instrumentation, or use raw CDP from a dedicated Synapse-launched automation profile for full DOM/action CDP or screenshots"
             ),
@@ -1289,6 +1307,7 @@ fn ensure_normal_bridge_external_popup_suppressed(
         );
         return Err(ChromeDebuggerBridgeError {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            input_delivered: false,
             detail: format!(
                 "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=Synapse Chrome Bridge profile still exposes active nativeMessaging permission synapse_chrome_bridge_permission_risk={} remediation=rerun scripts\\install-synapse-chrome-debugger.ps1 so the HKCU ExtensionSettings self-shield blocks nativeMessaging for the Synapse extension ID, then reload the existing bridge through browser_debugger.reload_bridge or keep commands failed closed until Chrome reloads it",
                 format_external_chrome_popup_risks(&self_active_risks)
@@ -4494,6 +4513,10 @@ struct ChromeResponse {
 struct ChromeResponseError {
     code: Option<String>,
     detail: Option<String>,
+    /// Set by the extension when the command already ran input events or
+    /// `insertText` before it failed; absent means not reported.
+    #[serde(default)]
+    delivered: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4897,6 +4920,7 @@ fn fail_pending_response(pending: PendingResponse, id: &str, code: &str, detail:
             result: None,
             error: Some(ChromeResponseError {
                 code: Some(code.to_owned()),
+                delivered: false,
                 detail: Some(detail.to_owned()),
             }),
         });
@@ -5174,6 +5198,7 @@ fn preserve_delivered_mutations_on_transport_loss(
                         result: None,
                         error: Some(ChromeResponseError {
                             code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
+                            delivered: false,
                             detail: Some(detail.to_owned()),
                         }),
                     });
@@ -5196,6 +5221,7 @@ fn preserve_delivered_mutations_on_transport_loss(
                     result: None,
                     error: Some(ChromeResponseError {
                         code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
+                        delivered: false,
                         detail: Some(detail.to_owned()),
                     }),
                 });
@@ -6037,6 +6063,7 @@ impl ChromeDebuggerBridge {
                 if after.extension_stale {
                     return Err(ChromeDebuggerBridgeError {
                         code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
+                        input_delivered: false,
                         detail: format!(
                             "Chrome bridge reconnected after reloadSelf but loaded extension is still stale; before_host_id={} after_host_id={} stale_reasons={} waited_ms={waited_ms}",
                             before.host_id,
@@ -6133,6 +6160,7 @@ impl ChromeDebuggerBridge {
                 if snapshot.extension_stale {
                     return Err(ChromeDebuggerBridgeError {
                         code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
+                        input_delivered: false,
                         detail: format!(
                             "Chrome bridge active host is stale after reconnect wait; host_id={} stale_reasons={}",
                             snapshot.host_id,
@@ -6387,6 +6415,7 @@ impl ChromeDebuggerBridge {
             error
                 .and_then(|error| error.detail.clone())
                 .unwrap_or_else(|| format!("Chrome debugger command {kind:?} failed")),
+            error.is_some_and(|error| error.delivered),
         ))
     }
 
@@ -6755,6 +6784,7 @@ pub async fn drain_mutation_command_owners(
                     result: None,
                     error: Some(ChromeResponseError {
                         code: Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED.to_owned()),
+                        delivered: false,
                         detail: Some(
                             "operator panic canceled Chrome command before extension delivery"
                                 .to_owned(),

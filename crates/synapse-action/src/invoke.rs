@@ -1,8 +1,6 @@
 use synapse_core::{ElementId, MouseButton, Point};
 
-#[cfg(not(windows))]
-use crate::ActionError;
-use crate::{ActionBackend, ActionResult, EmitState};
+use crate::{ActionBackend, ActionError, ActionResult, EmitState};
 
 #[cfg(windows)]
 mod resolver;
@@ -38,6 +36,25 @@ pub struct CoordinateFallbackPlan {
     pub window_point: Point,
 }
 
+/// A failed semantic UIA click. `input_delivered` is true when the click's
+/// pattern call already ran before `error` (its state read-back failed or the
+/// state stayed), so the click reached the element.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElementClickError {
+    pub error: ActionError,
+    pub input_delivered: bool,
+}
+
+#[cfg(windows)]
+impl ElementClickError {
+    fn from_a11y(element_id: &ElementId, error: synapse_a11y::A11yError) -> Self {
+        Self {
+            input_delivered: error.input_delivered(),
+            error: a11y_error_to_action(element_id, error),
+        }
+    }
+}
+
 /// Re-resolves a Synapse accessibility element and dispatches a semantic UIA
 /// click without moving the cursor.
 ///
@@ -51,9 +68,9 @@ pub struct CoordinateFallbackPlan {
 /// `ACTION_ELEMENT_NOT_RESOLVED`. Missing semantic patterns are reported as
 /// `ACTION_ELEMENT_PATTERN_UNSUPPORTED`; no coordinate click is attempted.
 #[cfg(windows)]
-pub fn invoke_element(element_id: &ElementId) -> ActionResult<()> {
+pub fn invoke_element(element_id: &ElementId) -> Result<(), ElementClickError> {
     match synapse_a11y::click_element_action(element_id)
-        .map_err(|error| a11y_error_to_action(element_id, error))?
+        .map_err(|error| ElementClickError::from_a11y(element_id, error))?
     {
         synapse_a11y::ElementClickAction::Invoked
         | synapse_a11y::ElementClickAction::Toggled { .. }
@@ -72,9 +89,14 @@ pub fn invoke_element(element_id: &ElementId) -> ActionResult<()> {
 /// Always returns `ACTION_BACKEND_UNAVAILABLE` because UI Automation
 /// `InvokePattern` dispatch is Windows-only.
 #[cfg(not(windows))]
-pub fn invoke_element(element_id: &ElementId) -> ActionResult<()> {
-    Err(ActionError::BackendUnavailable {
-        detail: format!("UI Automation InvokePattern requires Windows for element {element_id}"),
+pub fn invoke_element(element_id: &ElementId) -> Result<(), ElementClickError> {
+    Err(ElementClickError {
+        error: ActionError::BackendUnavailable {
+            detail: format!(
+                "UI Automation InvokePattern requires Windows for element {element_id}"
+            ),
+        },
+        input_delivered: false,
     })
 }
 
@@ -95,12 +117,12 @@ pub fn click_element_or_fallback<B>(
     _backend: &B,
     _state: &mut EmitState,
     _button: MouseButton,
-) -> ActionResult<ElementClickOutcome>
+) -> Result<ElementClickOutcome, ElementClickError>
 where
     B: ActionBackend,
 {
     match synapse_a11y::click_element_action(element_id)
-        .map_err(|error| a11y_error_to_action(element_id, error))?
+        .map_err(|error| ElementClickError::from_a11y(element_id, error))?
     {
         synapse_a11y::ElementClickAction::Invoked => Ok(ElementClickOutcome::Invoked),
         synapse_a11y::ElementClickAction::Toggled {
@@ -150,12 +172,17 @@ pub fn click_element_or_fallback<B>(
     _backend: &B,
     _state: &mut EmitState,
     _button: MouseButton,
-) -> ActionResult<ElementClickOutcome>
+) -> Result<ElementClickOutcome, ElementClickError>
 where
     B: ActionBackend,
 {
-    Err(ActionError::BackendUnavailable {
-        detail: format!("UI Automation element click requires Windows for element {element_id}"),
+    Err(ElementClickError {
+        error: ActionError::BackendUnavailable {
+            detail: format!(
+                "UI Automation element click requires Windows for element {element_id}"
+            ),
+        },
+        input_delivered: false,
     })
 }
 
@@ -219,6 +246,9 @@ fn a11y_error_to_action(
         }
         synapse_a11y::A11yError::HumanFullscreenForeground { .. } => {
             crate::ActionError::HumanFullscreenForeground { detail }
+        }
+        synapse_a11y::A11yError::AfterInput { error, .. } => {
+            a11y_error_to_action(element_id, *error)
         }
     }
 }

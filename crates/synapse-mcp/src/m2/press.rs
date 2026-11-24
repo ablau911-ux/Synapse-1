@@ -110,11 +110,14 @@ pub(crate) async fn act_press_cdp_target(
     synapse_a11y::cdp_press_key_sequence(endpoint, cdp_target_id, strokes, params.hold_ms)
         .await
         .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "act_press CDP Input.dispatchKeyEvent failed for target {cdp_target_id:?}: {error}"
+            crate::m2::error_after_a11y_input(
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "act_press CDP Input.dispatchKeyEvent failed for target {cdp_target_id:?}: {error}"
+                    ),
                 ),
+                &error,
             )
         })?;
     Ok(ActPressResponse {

@@ -65,7 +65,8 @@ pub use hotkey::{
 };
 pub use humanize::{HumanizeError, HumanizeResult, humanize_timed_path};
 pub use invoke::{
-    CoordinateFallbackPlan, ElementClickOutcome, click_element_or_fallback, invoke_element,
+    CoordinateFallbackPlan, ElementClickError, ElementClickOutcome, click_element_or_fallback,
+    invoke_element,
 };
 pub use lease::{
     DEFAULT_LEASE_TTL_MS, LeaseError, LeaseHandoff, LeaseOutcome, LeaseSafetySnapshot, LeaseStatus,

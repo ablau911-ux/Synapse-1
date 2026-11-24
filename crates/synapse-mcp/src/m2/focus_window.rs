@@ -528,17 +528,20 @@ fn a11y_error_to_focus_mcp(
         detail = %error,
         "act_focus_window a11y operation failed"
     );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!("{TOOL} {operation} failed: {error}"),
-        Some(json!({
-            "code": code,
-            "tool": TOOL,
-            "operation": operation,
-            "source_of_truth": SOURCE_OF_TRUTH,
-            "detail": error.to_string(),
-            "prior_readback": prior_readback,
-        })),
+    super::error_after_a11y_input(
+        ErrorData::new(
+            ErrorCode(-32099),
+            format!("{TOOL} {operation} failed: {error}"),
+            Some(json!({
+                "code": code,
+                "tool": TOOL,
+                "operation": operation,
+                "source_of_truth": SOURCE_OF_TRUTH,
+                "detail": error.to_string(),
+                "prior_readback": prior_readback,
+            })),
+        ),
+        &error,
     )
 }
 

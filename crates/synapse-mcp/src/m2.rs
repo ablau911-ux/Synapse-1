@@ -1271,6 +1271,28 @@ pub(crate) fn error_after_earlier_steps(
     error
 }
 
+/// Carries the delivery fact of an accessibility error into the error built
+/// from it: an `A11yError` raised after its call sent input
+/// (`A11yError::input_delivered`) marks `error` as after delivery. The one
+/// reader of that fact for an `ErrorData`.
+pub(crate) fn error_after_a11y_input(
+    error: ErrorData,
+    source: &synapse_a11y::A11yError,
+) -> ErrorData {
+    error_after_earlier_steps(error, usize::from(source.input_delivered()))
+}
+
+/// Carries the delivery fact of a Chrome bridge error into the error built
+/// from it: a command the extension reported as failed after it ran input in
+/// the page (`ChromeDebuggerBridgeError::input_delivered`) marks `error` as
+/// after delivery. The one reader of that fact for an `ErrorData`.
+pub(crate) fn error_after_bridge_input(
+    error: ErrorData,
+    source: &crate::chrome_debugger_bridge::ChromeDebuggerBridgeError,
+) -> ErrorData {
+    error_after_earlier_steps(error, usize::from(source.input_delivered()))
+}
+
 /// True when the error records that input of its tool call was already
 /// delivered (`data.refused_before_delivery` is false).
 pub(crate) fn error_delivered_input(error: &ErrorData) -> bool {

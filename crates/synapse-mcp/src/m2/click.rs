@@ -360,7 +360,10 @@ async fn execute_cdp_click(
         )
         .await
         .map_err(|err| {
-            let error = action_error_to_mcp(&a11y_to_action_error(&err));
+            let error = crate::m2::error_after_a11y_input(
+                action_error_to_mcp(&a11y_to_action_error(&err)),
+                &err,
+            );
             attach_click_tier_attempts(
                 error,
                 vec![click_tier_failed(

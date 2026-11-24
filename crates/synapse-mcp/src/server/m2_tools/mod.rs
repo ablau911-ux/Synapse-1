@@ -3831,12 +3831,15 @@ impl SynapseService {
             crate::chrome_debugger_bridge::type_active_element(window_hwnd, &cdp_target_id, emitted)
                 .await
                 .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "act_type Chrome bridge active-element typing failed for session target {cdp_target_id:?}: {}",
-                            error.detail()
+                    crate::m2::error_after_bridge_input(
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "act_type Chrome bridge active-element typing failed for session target {cdp_target_id:?}: {}",
+                                error.detail()
+                            ),
                         ),
+                        &error,
                     )
                 })?;
         // The bridge typed the text before this read-back check.

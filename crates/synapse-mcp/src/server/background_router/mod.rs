@@ -4589,10 +4589,15 @@ fn target_act_invoke_uia_element(
     element_id: &ElementId,
 ) -> Result<(), ErrorData> {
     ensure_target_act_operator_panic_boundary(operation)?;
-    synapse_action::invoke_element(element_id).map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!("target_act {operation} failed for element {element_id}: {error}"),
+    synapse_action::invoke_element(element_id).map_err(|failure| {
+        let error = failure.error;
+        // A pattern call that ran before its read-back failed delivered input.
+        crate::m2::error_after_earlier_steps(
+            mcp_error(
+                error.code(),
+                format!("target_act {operation} failed for element {element_id}: {error}"),
+            ),
+            usize::from(failure.input_delivered),
         )
     })
 }
@@ -5504,9 +5509,12 @@ async fn target_act_cdp_dom_primitive(
         synapse_a11y::cdp_dom_primitive_node(&endpoint, &routed_target_id, backend_node_id, action)
             .await
             .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("target_act CDP {action} failed: {error}"),
+                crate::m2::error_after_a11y_input(
+                    mcp_error(
+                        error.code(),
+                        format!("target_act CDP {action} failed: {error}"),
+                    ),
+                    &error,
                 )
             });
     service.audit_action_result_for_session("target_act", &result, &session_id)?;
@@ -5711,7 +5719,12 @@ async fn target_act_browser_dom_action(
         },
     )
     .await
-    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+    .map_err(|error| {
+        crate::m2::error_after_bridge_input(
+            mcp_error(error.code(), error.detail().to_owned()),
+            &error,
+        )
+    });
     if let Ok(value) = result.as_mut() {
         if let Err(error) =
             target_act_register_created_popup_tabs(service, &session_id, window_hwnd, value)
@@ -6745,7 +6758,12 @@ async fn target_act_bridge_cdp_input(
         },
     )
     .await
-    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+    .map_err(|error| {
+        crate::m2::error_after_bridge_input(
+            mcp_error(error.code(), error.detail().to_owned()),
+            &error,
+        )
+    });
     target_act_audit_result_for_session(
         service,
         "chrome_debugger_bridge.cdpInput",
@@ -6917,12 +6935,15 @@ async fn target_act_raw_cdp_click_dispatch(
     )
     .await
     .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!(
-                "target_act {action} Input.dispatchMouseEvent failed for backendNodeId {} in target {:?}: {error}",
-                element.backend_node_id, element.target_id
+        crate::m2::error_after_a11y_input(
+            mcp_error(
+                error.code(),
+                format!(
+                    "target_act {action} Input.dispatchMouseEvent failed for backendNodeId {} in target {:?}: {error}",
+                    element.backend_node_id, element.target_id
+                ),
             ),
+            &error,
         )
     })?;
     Ok(json!({
@@ -6970,11 +6991,14 @@ async fn target_act_touch_tap_dispatch(
         let tap = synapse_a11y::cdp_touch_tap_target(endpoint, cdp_target_id, point)
             .await
             .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "target_act tap Input.dispatchTouchEvent failed for target {cdp_target_id:?}: {error}"
+                crate::m2::error_after_a11y_input(
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "target_act tap Input.dispatchTouchEvent failed for target {cdp_target_id:?}: {error}"
+                        ),
                     ),
+                    &error,
                 )
             })?;
         let mut result = target_act_result(&tap)?;
@@ -7000,12 +7024,15 @@ async fn target_act_touch_tap_dispatch(
     )
     .await
     .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!(
-                "target_act tap Input.dispatchTouchEvent failed for backendNodeId {} in target {:?}: {error}",
-                element.backend_node_id, element.target_id
+        crate::m2::error_after_a11y_input(
+            mcp_error(
+                error.code(),
+                format!(
+                    "target_act tap Input.dispatchTouchEvent failed for backendNodeId {} in target {:?}: {error}",
+                    element.backend_node_id, element.target_id
+                ),
             ),
+            &error,
         )
     })?;
     let mut result = target_act_result(&tap)?;
@@ -8976,9 +9003,12 @@ async fn target_act_insert_or_append_text_native(
         synapse_a11y::replace_element_text_selection(&element_id, &text)
     }
     .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!("target_act native {verb} failed: {error}"),
+        crate::m2::error_after_a11y_input(
+            mcp_error(
+                error.code(),
+                format!("target_act native {verb} failed: {error}"),
+            ),
+            &error,
         )
     });
     service.audit_action_result_for_session("target_act", &result, &session_id)?;

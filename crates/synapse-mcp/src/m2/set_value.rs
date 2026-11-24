@@ -377,25 +377,28 @@ fn a11y_error_to_set_value_mcp(
         detail = %error,
         "act_set_value background value readback operation failed"
     );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!("act_set_value {operation} failed for element {element_id}: {error}"),
-        Some(json!({
-            "code": code,
-            "tool": TOOL,
-            "operation": operation,
-            "source_of_truth": [
-                SOURCE_NATIVE_TEXT,
-                SOURCE_UIA_VALUE,
-                SOURCE_NATIVE_PASSWORD_LENGTH,
-                SOURCE_UIA_PASSWORD_LENGTH
-            ],
-            "backend_router": BACKEND_ROUTER_NATIVE_EDIT_OR_UIA,
-            "element_id": element_id.to_string(),
-            "root_hwnd": root_hwnd,
-            "detail": error.to_string(),
-            "prior_readback": prior_readback,
-        })),
+    super::error_after_a11y_input(
+        ErrorData::new(
+            ErrorCode(-32099),
+            format!("act_set_value {operation} failed for element {element_id}: {error}"),
+            Some(json!({
+                "code": code,
+                "tool": TOOL,
+                "operation": operation,
+                "source_of_truth": [
+                    SOURCE_NATIVE_TEXT,
+                    SOURCE_UIA_VALUE,
+                    SOURCE_NATIVE_PASSWORD_LENGTH,
+                    SOURCE_UIA_PASSWORD_LENGTH
+                ],
+                "backend_router": BACKEND_ROUTER_NATIVE_EDIT_OR_UIA,
+                "element_id": element_id.to_string(),
+                "root_hwnd": root_hwnd,
+                "detail": error.to_string(),
+                "prior_readback": prior_readback,
+            })),
+        ),
+        &error,
     )
 }
 
@@ -438,30 +441,33 @@ fn set_failed_error(
         final_equals_requested,
         "act_set_value background set operation failed; separate target value readback captured after failure"
     );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!(
-            "act_set_value background set operation failed for element {}: {error}",
-            params.element_id
+    super::error_after_a11y_input(
+        ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "act_set_value background set operation failed for element {}: {error}",
+                params.element_id
+            ),
+            Some(json!({
+                "code": code,
+                "tool": TOOL,
+                "operation": "set_value",
+                "source_of_truth": source_of_truth,
+                "backend_router": BACKEND_ROUTER_NATIVE_EDIT_OR_UIA,
+                "element_id": params.element_id.to_string(),
+                "before_len": before_len,
+                "after_len": after_len,
+                "requested_len": requested_len,
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+                "requested_sha256": requested_sha256,
+                "final_equals_requested": final_equals_requested,
+                "set_error_code": error.code(),
+                "set_error": error.to_string(),
+                "after_read_succeeded": after.is_some(),
+            })),
         ),
-        Some(json!({
-            "code": code,
-            "tool": TOOL,
-            "operation": "set_value",
-            "source_of_truth": source_of_truth,
-            "backend_router": BACKEND_ROUTER_NATIVE_EDIT_OR_UIA,
-            "element_id": params.element_id.to_string(),
-            "before_len": before_len,
-            "after_len": after_len,
-            "requested_len": requested_len,
-            "before_sha256": before_sha256,
-            "after_sha256": after_sha256,
-            "requested_sha256": requested_sha256,
-            "final_equals_requested": final_equals_requested,
-            "set_error_code": error.code(),
-            "set_error": error.to_string(),
-            "after_read_succeeded": after.is_some(),
-        })),
+        &error,
     )
 }
 

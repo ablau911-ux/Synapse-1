@@ -544,12 +544,15 @@ impl SynapseService {
         )
         .await
         .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "{TOOL} bridge setFieldValue failed for target {cdp_target_id:?}: {}",
-                    error.detail()
+            crate::m2::error_after_bridge_input(
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "{TOOL} bridge setFieldValue failed for target {cdp_target_id:?}: {}",
+                        error.detail()
+                    ),
                 ),
+                &error,
             )
         })?;
         // The field was set: every failure of the read-back below says so.

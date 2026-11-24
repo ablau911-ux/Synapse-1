@@ -653,6 +653,7 @@ async fn cdp_click_node_owned(
             ))
             .await
             .map_err(|err| dispatch_err(&err))?;
+            // The mouse move above was delivered input.
             dispatch_mouse_click_on_page(
                 &input_endpoint,
                 &page,
@@ -661,7 +662,8 @@ async fn cdp_click_node_owned(
                 click_count.max(1),
                 modifiers,
             )
-            .await?;
+            .await
+            .map_err(A11yError::after_input)?;
             Ok(center)
         },
     )
@@ -744,9 +746,10 @@ pub async fn cdp_type_node(
                     .backend_node_id(BackendNodeId::new(backend_node_id))
                     .build();
                 let _ = page.execute(focus).await;
+                // The click above was delivered input.
                 page.execute(InsertTextParams::new(text))
                     .await
-                    .map_err(|err| dispatch_err(&err))?;
+                    .map_err(|err| dispatch_err(&err).after_input())?;
                 Ok(center)
             },
         )
@@ -790,16 +793,28 @@ const CDP_DOM_PRIMITIVE_FUNCTION: &str = r#"(el, requestedAction) => {
     const beforeElement = elementSummary(el);
     const beforeActiveElement = activeElementSummary(el.ownerDocument, el);
     let actionReadback = {};
-    if (action === "clear") {
-        actionReadback = performClear(el, events);
-    } else if (action === "focus") {
-        actionReadback = performFocus(el, events);
-    } else if (action === "blur") {
-        actionReadback = performBlur(el, events);
-    } else if (action === "select_text") {
-        actionReadback = performSelectText(el, events);
-    } else {
-        throw new Error(`unsupported DOM primitive ${JSON.stringify(requestedAction)}`);
+    try {
+        if (action === "clear") {
+            actionReadback = performClear(el, events);
+        } else if (action === "focus") {
+            actionReadback = performFocus(el, events);
+        } else if (action === "blur") {
+            actionReadback = performBlur(el, events);
+        } else if (action === "select_text") {
+            actionReadback = performSelectText(el, events);
+        } else {
+            throw new Error(`unsupported DOM primitive ${JSON.stringify(requestedAction)}`);
+        }
+    } catch (error) {
+        // Events dispatched before the failure already reached the page:
+        // report the failure with them instead of throwing.
+        if (events.length > 0) {
+            return {
+                failed_after_events: String((error && error.message) || error),
+                events_dispatched: events
+            };
+        }
+        throw error;
     }
     return {
         action,
@@ -1135,10 +1150,23 @@ pub async fn cdp_dom_primitive_node(
         true,
     )
     .await?;
+    // A primitive that failed after its first event returns the failure with
+    // the events it dispatched instead of throwing.
+    if let Some(failure) = result.value.get("failed_after_events").and_then(Value::as_str) {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Runtime.callFunctionOn DOM primitive {normalized} failed after events {}: {failure}",
+                result.value["events_dispatched"]
+            ),
+        }
+        .after_input());
+    }
+    // The primitive ran in the page; a decode failure comes after its events.
     serde_json::from_value::<CdpDomPrimitiveResult>(result.value).map_err(|err| {
         A11yError::CdpAxtreeFailed {
             detail: format!("Runtime.callFunctionOn DOM primitive decode: {err}"),
         }
+        .after_input()
     })
 }
 
@@ -1188,8 +1216,6 @@ pub async fn cdp_set_node_text(
     backend_node_id: i64,
     text: &str,
 ) -> A11yResult<CdpSetNodeTextReadback> {
-    use chromiumoxide::cdp::browser_protocol::dom::FocusParams;
-
     let endpoint = endpoint.to_owned();
     let page_title_hint = page_title_hint.to_owned();
     let target_id_hint = target_id_hint.map(ToOwned::to_owned);
@@ -1211,82 +1237,99 @@ pub async fn cdp_set_node_text(
                 0,
             )
             .await?;
-            // The click already places focus; DOM.focus is best-effort
-            // reinforcement (some AX nodes map to non-focusable wrappers).
-            let focus = FocusParams::builder()
-                .backend_node_id(BackendNodeId::new(backend_node_id))
-                .build();
-            let _ = page.execute(focus).await;
-
-            let resolve = ResolveNodeParams::builder()
-                .backend_node_id(BackendNodeId::new(backend_node_id))
-                .object_group("synapse_set_field_text")
-                .build();
-            let resolved =
-                page.execute(resolve)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
-                    })?;
-            let object_id =
-                resolved
-                    .object
-                    .object_id
-                    .clone()
-                    .ok_or_else(|| A11yError::CdpAxtreeFailed {
-                        detail: format!(
-                            "resolveNode for backendNodeId {backend_node_id} returned no objectId"
-                        ),
-                    })?;
-            let call = CallFunctionOnParams::builder()
-                .function_declaration(CDP_SELECT_ALL_FUNCTION)
-                .object_id(object_id)
-                .return_by_value(true)
-                .silent(true)
-                .build()
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("build Runtime.callFunctionOn select-all params: {err}"),
-                })?;
-            let selection_mode: String = call_function_on_value(&page, call, "select-all").await?;
-            if !matches!(
-                selection_mode.as_str(),
-                "selected_value" | "selected_contenteditable"
-            ) {
-                return Err(A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "cdp_set_node_text refused backendNodeId {backend_node_id}: target is not an editable web node (select-all readback: {selection_mode})"
-                    ),
-                });
-            }
-
-            let cleared_with_delete = text.is_empty();
-            if cleared_with_delete {
-                let delete = CdpKeyStroke {
-                    key: "Delete".to_owned(),
-                    code: "Delete".to_owned(),
-                    windows_virtual_key_code: 46,
-                    native_virtual_key_code: 46,
-                    key_identifier: None,
-                    text: None,
-                    unmodified_text: None,
-                    modifier_bit: 0,
-                    location: None,
-                };
-                dispatch_key_sequence_on_page(&input_endpoint, &page, &[delete], 0).await?;
-            } else {
-                page.execute(InsertTextParams::new(text))
-                    .await
-                    .map_err(|err| dispatch_err(&err))?;
-            }
-            Ok(CdpSetNodeTextReadback {
-                selection_mode,
-                cleared_with_delete,
-            })
+            // The click above was delivered input: every later error is
+            // marked as raised after input.
+            set_node_text_after_click(&input_endpoint, &page, backend_node_id, text)
+                .await
+                .map_err(A11yError::after_input)
             },
         )
         .await
     })
     .await
+}
+
+/// The part of [`cdp_set_node_text`] after its click: focus, select-all and
+/// the replacement.
+async fn set_node_text_after_click(
+    endpoint: &str,
+    page: &chromiumoxide::Page,
+    backend_node_id: i64,
+    text: String,
+) -> A11yResult<CdpSetNodeTextReadback> {
+    use chromiumoxide::cdp::browser_protocol::dom::FocusParams;
+
+    // The click already places focus; DOM.focus is best-effort
+    // reinforcement (some AX nodes map to non-focusable wrappers).
+    let focus = FocusParams::builder()
+        .backend_node_id(BackendNodeId::new(backend_node_id))
+        .build();
+    let _ = page.execute(focus).await;
+
+    let resolve = ResolveNodeParams::builder()
+        .backend_node_id(BackendNodeId::new(backend_node_id))
+        .object_group("synapse_set_field_text")
+        .build();
+    let resolved = page
+        .execute(resolve)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+        })?;
+    let object_id =
+        resolved
+            .object
+            .object_id
+            .clone()
+            .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "resolveNode for backendNodeId {backend_node_id} returned no objectId"
+                ),
+            })?;
+    let call = CallFunctionOnParams::builder()
+        .function_declaration(CDP_SELECT_ALL_FUNCTION)
+        .object_id(object_id)
+        .return_by_value(true)
+        .silent(true)
+        .build()
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("build Runtime.callFunctionOn select-all params: {err}"),
+        })?;
+    let selection_mode: String = call_function_on_value(page, call, "select-all").await?;
+    if !matches!(
+        selection_mode.as_str(),
+        "selected_value" | "selected_contenteditable"
+    ) {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "cdp_set_node_text refused backendNodeId {backend_node_id}: target is not an editable web node (select-all readback: {selection_mode})"
+            ),
+        });
+    }
+
+    let cleared_with_delete = text.is_empty();
+    if cleared_with_delete {
+        let delete = CdpKeyStroke {
+            key: "Delete".to_owned(),
+            code: "Delete".to_owned(),
+            windows_virtual_key_code: 46,
+            native_virtual_key_code: 46,
+            key_identifier: None,
+            text: None,
+            unmodified_text: None,
+            modifier_bit: 0,
+            location: None,
+        };
+        dispatch_key_sequence_on_page(endpoint, page, &[delete], 0).await?;
+    } else {
+        page.execute(InsertTextParams::new(text))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+    }
+    Ok(CdpSetNodeTextReadback {
+        selection_mode,
+        cleared_with_delete,
+    })
 }
 
 /// Dispatches a key sequence to a specific CDP page target without activating
@@ -4826,7 +4869,11 @@ pub async fn cdp_scroll_node(
             };
             let last_index = deltas.len().saturating_sub(1);
             for (index, delta) in deltas.into_iter().enumerate() {
-                let dispatch = dispatch_dom_scroll(&page, backend_node_id, delta).await?;
+                // Earlier deltas of this call were delivered input.
+                let dispatch = after_input_if(
+                    dispatch_dom_scroll(&page, backend_node_id, delta).await,
+                    index > 0,
+                )?;
                 tracing::debug!(
                     code = "A11Y_CDP_DOM_SCROLL_DISPATCHED",
                     backend_node_id,
@@ -5077,9 +5124,11 @@ async fn dispatch_dom_scroll(
     let dispatch: CdpRuntimeScrollDispatch =
         call_function_on_value(page, call, "scroll-dispatch").await?;
     if !dispatch.is_connected {
+        // The function above already dispatched its wheel event.
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!("backendNodeId {backend_node_id} resolved to a detached DOM node"),
-        });
+        }
+        .after_input());
     }
     Ok(dispatch)
 }
@@ -5322,7 +5371,8 @@ async fn dispatch_cdp_mouse_stroke_raw(
                 "move",
                 index,
             )
-            .await?;
+            .await
+            .map_err(A11yError::after_input)?;
         }
         settle_and_close_raw_input_socket(&mut socket).await;
         return Ok(());
@@ -5340,6 +5390,8 @@ async fn dispatch_cdp_mouse_stroke_raw(
         0,
     )
     .await?;
+    // The pre-press move above was delivered input: every error from here on
+    // is marked as raised after input.
     let terminal_point = points
         .last()
         .map_or(first_point, |point| cdp_stroke_action_point(*point));
@@ -5353,7 +5405,8 @@ async fn dispatch_cdp_mouse_stroke_raw(
             click_count: 1,
             modifiers: 0,
         },
-    )?;
+    )
+    .map_err(A11yError::after_input)?;
     if let Err(press_error) = dispatch_raw_mouse_event(
         &mut socket,
         &mut command_id,
@@ -5380,16 +5433,14 @@ async fn dispatch_cdp_mouse_stroke_raw(
         )
         .await;
         return match release {
-            Ok(()) => {
-                resolve_persisted_cdp_mutation_owner(&owner)?;
-                Err(press_error)
-            }
+            Ok(()) => resolve_persisted_cdp_mutation_owner(&owner).and(Err(press_error)),
             Err(release_error) => Err(record_unresolved_input_release(
                 Some(press_error),
                 release_error,
                 "press status and compensating release acknowledgement are both unresolved",
             )),
-        };
+        }
+        .map_err(A11yError::after_input);
     }
 
     let held_buttons = mouse_button_bit(&button);
@@ -5436,12 +5487,13 @@ async fn dispatch_cdp_mouse_stroke_raw(
             dispatch_failure,
             release_error,
             "mouse release acknowledgement was not proven",
-        ));
+        )
+        .after_input());
     }
-    resolve_persisted_cdp_mutation_owner(&owner)?;
+    resolve_persisted_cdp_mutation_owner(&owner).map_err(A11yError::after_input)?;
     settle_and_close_raw_input_socket(&mut socket).await;
     match dispatch_failure {
-        Some(error) => Err(error),
+        Some(error) => Err(error.after_input()),
         None => Ok(()),
     }
 }
@@ -6066,17 +6118,28 @@ async fn dispatch_mouse_click_on_page(
         ))
         .await
         .map_err(|error| dispatch_err(&error));
-    match (press, release) {
+    let delivered = press.is_ok() || release.is_ok();
+    let result = match (press, release) {
         (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner),
         (Err(press_error), Ok(_)) => {
-            resolve_persisted_cdp_mutation_owner(&owner)?;
-            Err(press_error)
+            resolve_persisted_cdp_mutation_owner(&owner).and(Err(press_error))
         }
         (press, Err(release_error)) => Err(record_unresolved_input_release(
             press.err(),
             release_error,
             "mouse click release acknowledgement was not proven",
         )),
+    };
+    after_input_if(result, delivered)
+}
+
+/// Marks the error of `result` as raised after delivered input when an event
+/// of the sequence was acknowledged (`delivered`).
+fn after_input_if<T>(result: A11yResult<T>, delivered: bool) -> A11yResult<T> {
+    if delivered {
+        result.map_err(A11yError::after_input)
+    } else {
+        result
     }
 }
 
@@ -6149,24 +6212,27 @@ async fn dispatch_touch_tap_on_page(
     if start.is_ok() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    let end_event = after_input_if(
+        touch_event(DispatchTouchEventType::TouchEnd, None),
+        start.is_ok(),
+    )?;
     let end = page
-        .execute(touch_event(DispatchTouchEventType::TouchEnd, None)?)
+        .execute(end_event)
         .await
         .map_err(|error| dispatch_err(&error));
-    match (start, end) {
-        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner)?,
+    let delivered = start.is_ok() || end.is_ok();
+    let settled = match (start, end) {
+        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner),
         (Err(start_error), Ok(_)) => {
-            resolve_persisted_cdp_mutation_owner(&owner)?;
-            return Err(start_error);
+            resolve_persisted_cdp_mutation_owner(&owner).and(Err(start_error))
         }
-        (start, Err(end_error)) => {
-            return Err(record_unresolved_input_release(
-                start.err(),
-                end_error,
-                "touchEnd acknowledgement was not proven",
-            ));
-        }
-    }
+        (start, Err(end_error)) => Err(record_unresolved_input_release(
+            start.err(),
+            end_error,
+            "touchEnd acknowledgement was not proven",
+        )),
+    };
+    after_input_if(settled, delivered)?;
     Ok(CdpTouchTapResult {
         target_id: page.target_id().inner().clone(),
         point,
@@ -6205,6 +6271,8 @@ async fn dispatch_key_sequence_on_page(
     let mut modifiers = 0_i64;
     let mut possibly_held = Vec::with_capacity(keys.len());
     let mut primary_error = None;
+    // True once a key event of this sequence was acknowledged.
+    let mut delivered = false;
     for key in keys {
         let key_down_type = if key.text.is_some() {
             DispatchKeyEventType::KeyDown
@@ -6218,7 +6286,10 @@ async fn dispatch_key_sequence_on_page(
         // the compensating release set before awaiting the response.
         possibly_held.push(key);
         match page.execute(params).await {
-            Ok(_) => modifiers = event_modifiers,
+            Ok(_) => {
+                modifiers = event_modifiers;
+                delivered = true;
+            }
             Err(error) => {
                 modifiers = event_modifiers;
                 primary_error = Some(dispatch_err(&error));
@@ -6236,26 +6307,23 @@ async fn dispatch_key_sequence_on_page(
             modifiers &= !key.modifier_bit;
         }
         match cdp_key_event(DispatchKeyEventType::KeyUp, key, modifiers) {
-            Ok(params) => {
-                if let Err(error) = page.execute(params).await {
-                    release_failures.push(dispatch_err(&error).to_string());
-                }
-            }
+            Ok(params) => match page.execute(params).await {
+                Ok(_) => delivered = true,
+                Err(error) => release_failures.push(dispatch_err(&error).to_string()),
+            },
             Err(error) => release_failures.push(error.to_string()),
         }
     }
-    if !release_failures.is_empty() {
-        return Err(record_unresolved_input_release_detail(
+    let settled = if release_failures.is_empty() {
+        resolve_persisted_cdp_mutation_owner(&owner).and(primary_error.map_or(Ok(()), Err))
+    } else {
+        Err(record_unresolved_input_release_detail(
             primary_error,
             release_failures.join(" | "),
             "one or more keyUp acknowledgements were not proven",
-        ));
-    }
-    resolve_persisted_cdp_mutation_owner(&owner)?;
-    match primary_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+        ))
+    };
+    after_input_if(settled, delivered)
 }
 
 async fn read_touch_input_state(page: &chromiumoxide::Page) -> A11yResult<CdpTouchInputState> {
@@ -6450,11 +6518,19 @@ async fn finish_chromiumoxide_handler<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
-        (Err(primary), Err(shutdown_error)) => Err(A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "{operation} failed: {primary}; chromiumoxide handler shutdown also failed: {shutdown_error}"
-            ),
-        }),
+        (Err(primary), Err(shutdown_error)) => {
+            let combined = A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "{operation} failed: {primary}; chromiumoxide handler shutdown also failed: {shutdown_error}"
+                ),
+            };
+            // The combined error keeps the primary error's delivery fact.
+            Err(if primary.input_delivered() {
+                combined.after_input()
+            } else {
+                combined
+            })
+        }
     }
 }
 

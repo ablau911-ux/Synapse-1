@@ -557,18 +557,21 @@ fn cdp_tier_error(
         detail = %error,
         "act_set_field_text CDP web tier operation failed"
     );
-    ErrorData::new(
-        ErrorCode(-32099),
-        format!("{TOOL} CDP {operation} failed for element {element_id}: {error}"),
-        Some(json!({
-            "code": error.code(),
-            "tool": TOOL,
-            "operation": operation,
-            "element_id": element_id.to_string(),
-            "backend_node_id": backend_node_id,
-            "source_of_truth": SOURCE_CDP_NODE_VALUE,
-            "detail": error.to_string(),
-        })),
+    super::error_after_a11y_input(
+        ErrorData::new(
+            ErrorCode(-32099),
+            format!("{TOOL} CDP {operation} failed for element {element_id}: {error}"),
+            Some(json!({
+                "code": error.code(),
+                "tool": TOOL,
+                "operation": operation,
+                "element_id": element_id.to_string(),
+                "backend_node_id": backend_node_id,
+                "source_of_truth": SOURCE_CDP_NODE_VALUE,
+                "detail": error.to_string(),
+            })),
+        ),
+        error,
     )
 }
 

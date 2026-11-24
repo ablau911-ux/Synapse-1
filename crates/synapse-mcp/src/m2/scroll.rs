@@ -272,7 +272,10 @@ async fn execute_cdp_scroll(
         },
     )
     .await
-    .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+    .map_err(|err| {
+        crate::m2::error_after_a11y_input(mcp_error(err.code(), err.to_string()), &err)
+    })?;
+    // The wheel deltas were delivered: errors below are after input.
     let postcondition = if let Some(before) = before {
         tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
         let after = synapse_a11y::cdp_node_scroll_state(
@@ -282,8 +285,11 @@ async fn execute_cdp_scroll(
             backend_node_id,
         )
         .await
-        .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-        let postcondition = verify_cdp_scroll_delta(params.verify_timeout_ms, &before, &after)?;
+        .map_err(|err| {
+            crate::m2::error_after_earlier_steps(mcp_error(err.code(), err.to_string()), 1)
+        })?;
+        let postcondition = verify_cdp_scroll_delta(params.verify_timeout_ms, &before, &after)
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         tracing::info!(
             code = "M2_ACT_SCROLL_CDP_WHEEL",
             kind = "act_scroll",
@@ -331,24 +337,34 @@ async fn execute_uia_scroll(
     boundary.ensure("immediately_before_uia_scroll_element")?;
     let mut readback =
         synapse_a11y::scroll_element(element_id, params.dy, params.dx).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("act_scroll UIA target scroll failed for element {element_id}: {error}"),
+            crate::m2::error_after_a11y_input(
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "act_scroll UIA target scroll failed for element {element_id}: {error}"
+                    ),
+                ),
+                &error,
             )
         })?;
+    // The scroll was delivered: errors below are after input.
     if params.verify_delta {
         tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
         readback.after = synapse_a11y::element_scroll_state(element_id).map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "act_scroll UIA Source-of-Truth readback failed for element {element_id}: {error}"
+            crate::m2::error_after_earlier_steps(
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "act_scroll UIA Source-of-Truth readback failed for element {element_id}: {error}"
+                    ),
                 ),
+                1,
             )
         })?;
     }
 
-    let postcondition = uia_scroll_postcondition(params, &readback)?;
+    let postcondition = uia_scroll_postcondition(params, &readback)
+        .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
     let backend_used = uia_scroll_backend_used(&readback);
     tracing::info!(
         code = "M2_ACT_SCROLL_UIA_PATTERN",

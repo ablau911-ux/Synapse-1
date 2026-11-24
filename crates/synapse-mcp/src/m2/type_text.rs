@@ -266,10 +266,14 @@ impl CdpTypeTransportError {
 
 #[cfg(windows)]
 fn cdp_transport_error(operation: &str, error: CdpTypeTransportError) -> ErrorData {
-    mcp_error(
+    let mcp = mcp_error(
         error.code(),
         format!("act_type CDP {operation} failed: {}", error.detail()),
-    )
+    );
+    match &error {
+        CdpTypeTransportError::Raw(source) => super::error_after_a11y_input(mcp, source),
+        CdpTypeTransportError::Extension(source) => super::error_after_bridge_input(mcp, source),
+    }
 }
 
 #[cfg(windows)]
@@ -514,15 +518,18 @@ async fn verified_set_element_value(
                 verify_timeout_ms,
             )))
             .await;
-            let after = synapse_a11y::element_value(element_id).map_err(a11y_error_to_mcp)?;
+            // Every error of this arm carries the delivery fact of `error`.
+            let after = synapse_a11y::element_value(element_id).map_err(|read_error| {
+                super::error_after_a11y_input(a11y_error_to_mcp(read_error), &error)
+            })?;
             let before_is_password = before.is_password;
             let after_is_password = after.is_password;
             let source_of_truth =
                 value_readback_source_of_truth(before_is_password || after_is_password);
             let before_signature = value_readback_signature(&before);
             let after_signature = value_readback_signature(&after);
-            if uia_readbacks_equivalent(&before, &after) {
-                return Err(no_observed_delta_error(
+            let failure = if uia_readbacks_equivalent(&before, &after) {
+                no_observed_delta_error(
                     "act_type",
                     source_of_truth,
                     verify_timeout_ms,
@@ -540,26 +547,28 @@ async fn verified_set_element_value(
                         "after_password_len": after.password_len,
                         "set_error": error.to_string(),
                     }),
-                ));
-            }
-            Err(postcondition_failed_error(
-                "act_type",
-                source_of_truth,
-                format!("ValuePattern SetValue failed but value changed: {error}"),
-                before_signature,
-                after_signature,
-                json!({
-                    "element_id": element_id.to_string(),
-                    "expected_len": expected_value_len(emitted, before_is_password || after_is_password),
-                    "before_len": value_readback_len(&before),
-                    "after_len": value_readback_len(&after),
-                    "before_is_password": before_is_password,
-                    "after_is_password": after_is_password,
-                    "before_password_len": before.password_len,
-                    "after_password_len": after.password_len,
-                    "set_error": error.to_string(),
-                }),
-            ))
+                )
+            } else {
+                postcondition_failed_error(
+                    "act_type",
+                    source_of_truth,
+                    format!("ValuePattern SetValue failed but value changed: {error}"),
+                    before_signature,
+                    after_signature,
+                    json!({
+                        "element_id": element_id.to_string(),
+                        "expected_len": expected_value_len(emitted, before_is_password || after_is_password),
+                        "before_len": value_readback_len(&before),
+                        "after_len": value_readback_len(&after),
+                        "before_is_password": before_is_password,
+                        "after_is_password": after_is_password,
+                        "before_password_len": before.password_len,
+                        "after_password_len": after.password_len,
+                        "set_error": error.to_string(),
+                    }),
+                )
+            };
+            Err(super::error_after_a11y_input(failure, &error))
         }
     }
 }
@@ -1135,7 +1144,7 @@ fn recorded_ikis(events: &[RecordedInput]) -> Vec<u32> {
 }
 
 fn a11y_error_to_mcp(error: synapse_a11y::A11yError) -> ErrorData {
-    mcp_error(error.code(), error.to_string())
+    super::error_after_a11y_input(mcp_error(error.code(), error.to_string()), &error)
 }
 
 fn type_params_error(requested_linear_ms_per_char: u32, message: impl Into<String>) -> ErrorData {

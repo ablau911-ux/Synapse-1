@@ -136,11 +136,13 @@ pub(super) async fn execute_element_click(
         };
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
-            Err(error) => {
+            Err(synapse_action::ElementClickError {
+                error,
+                input_delivered,
+            }) => {
                 // Earlier clicks of this call, or this click's pattern call
                 // before its read-back failed, already delivered input.
-                let delivered_steps = usize::from(click_index)
-                    + usize::from(uia_pattern_ran_before_error(error.detail()));
+                let delivered_steps = usize::from(click_index) + usize::from(input_delivered);
                 let failure = async {
                     let error_code = error.code().to_owned();
                     let reason_code = click_reason_for_error_code(&error_code);
@@ -682,17 +684,6 @@ fn exposes_text_value_pattern(patterns: &[UiaPattern]) -> bool {
     patterns
         .iter()
         .any(|pattern| matches!(pattern, UiaPattern::Value | UiaPattern::Text))
-}
-
-/// True when a UIA semantic click error was raised after its pattern call ran:
-/// the state read-back after Toggle/Select/Expand/Collapse failed, or the
-/// state stayed (texts of `synapse_a11y` `resolve.rs`). That click was
-/// delivered.
-fn uia_pattern_ran_before_error(detail: &str) -> bool {
-    detail.contains("returned for element")
-        || detail.contains("ToggleState after Toggle")
-        || detail.contains("IsSelected after Select")
-        || detail.contains("ExpandCollapseState after ")
 }
 
 fn selection_item_select_readback_failed(detail: &str) -> bool {

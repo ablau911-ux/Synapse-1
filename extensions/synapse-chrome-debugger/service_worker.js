@@ -7041,16 +7041,20 @@ async function handleDomAction(params) {
     );
   }
   if (!actionResult.ok) {
-    throw bridgeError(
+    const failure = bridgeError(
       String(actionResult.error_code || ERROR_AXTREE_FAILED),
       `domAction ${action} failed in resolved frame ${first.frame_id}: ${String(actionResult.error_detail || "")}; ` +
         `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
     );
+    // Events the in-page action dispatched before it failed were delivered.
+    const eventsDispatched = Array.isArray(actionResult.events_dispatched) ? actionResult.events_dispatched : [];
+    throw eventsDispatched.length > 0 ? errorAfterInput(failure) : failure;
   }
 
-  const createdPopupTabs = await createDomActionPopupTabs(selected, before, actionResult);
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
+  // The action ran in the page: every failure below is after delivered input.
+  const createdPopupTabs = await afterInput(createDomActionPopupTabs(selected, before, actionResult));
+  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
@@ -7300,19 +7304,24 @@ async function handleCdpInputText(
     autoWaitTimeoutMs
   });
   const dispatch = await dispatchCdpTextInput(selected.tabId, action, text);
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
-  const readback = await cdpTextInputTargetScript(selected, action, params, {
-    operation: "read",
-    autoWait: false,
-    autoWaitTimeoutMs: 0
-  });
+  // The text was dispatched: every failure below is after delivered input.
+  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
+  const readback = await afterInput(
+    cdpTextInputTargetScript(selected, action, params, {
+      operation: "read",
+      autoWait: false,
+      autoWaitTimeoutMs: 0
+    })
+  );
   const afterValue = String(readback.after_value ?? "");
   if (action === "set_text" && afterValue !== text) {
-    throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED,
-      `cdpInput set_text postcondition failed: requested_len=${text.length} after_len=${afterValue.length} ` +
-        `resolved_by=${String(readback.resolved_by || prepared.resolved_by)} frame_id=${String(readback.frame_id ?? prepared.frame_id)}`
+    throw errorAfterInput(
+      bridgeError(
+        ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED,
+        `cdpInput set_text postcondition failed: requested_len=${text.length} after_len=${afterValue.length} ` +
+          `resolved_by=${String(readback.resolved_by || prepared.resolved_by)} frame_id=${String(readback.frame_id ?? prepared.frame_id)}`
+      )
     );
   }
   return {
@@ -7963,6 +7972,8 @@ async function dispatchCdpTextInput(tabId, action, text) {
   const debuggee = { tabId };
   const protocolVersion = "1.3";
   let attached = false;
+  // True once a key event of this dispatch was acknowledged.
+  let delivered = false;
   try {
     await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
@@ -7975,6 +7986,7 @@ async function dispatchCdpTextInput(tabId, action, text) {
         nativeVirtualKeyCode: 46,
         commands: ["deleteForward"]
       });
+      delivered = true;
       await sendDebuggerCommand(debuggee, "Input.dispatchKeyEvent", {
         type: "keyUp",
         key: "Delete",
@@ -7995,10 +8007,11 @@ async function dispatchCdpTextInput(tabId, action, text) {
       protocol_version: protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
+    const failure = bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger ${action} text dispatch failed for tab ${tabId}: ${errorMessage(error)}`
     );
+    throw delivered ? errorAfterInput(failure) : failure;
   } finally {
     if (attached) {
       try {
@@ -20059,11 +20072,13 @@ async function handleSetFieldValue(params) {
     );
   }
   if (!result.ok) {
-    throw bridgeError(
+    const failure = bridgeError(
       ERROR_AXTREE_FAILED,
       `setFieldValue failed in resolved frame ${first.frame_id}: code=${String(result.error_code || "UNKNOWN")} ` +
         `detail=${String(result.error_detail || "")}; frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
     );
+    // The in-page replace reports whether its events already reached the page.
+    throw result.delivered === true ? errorAfterInput(failure) : failure;
   }
   return {
     extension_id: chrome.runtime.id,
@@ -20322,6 +20337,8 @@ function setFieldValueInPage(request) {
       ok: false,
       error_code: "CHROME_BEFOREINPUT_CANCELLED",
       error_detail: "a page beforeinput listener cancelled the background replace",
+      // focus and beforeinput already reached the page.
+      delivered: true,
       before_value: beforeValue
     };
   }
@@ -20363,6 +20380,8 @@ function setFieldValueInPage(request) {
       ok: false,
       error_code: "CHROME_SET_FIELD_VALUE_MISMATCH",
       error_detail: `post-set readback diverged from the applied value (expected_len=${expected.length} after_len=${afterValue.length}); a page framework may have reverted it`,
+      // The value was set and input/change were dispatched.
+      delivered: true,
       resolved_by: resolvedBy,
       match_count: matchCount,
       tag_name: tag,
@@ -25053,10 +25072,30 @@ function bridgeError(code, detail) {
   return error;
 }
 
+// Marks an error raised after the command already ran input events or
+// insertText in the page. The one writer of `delivered`; errorPayload sends it
+// to Synapse, which then reports the action as delivered, not refused.
+function errorAfterInput(error) {
+  const marked =
+    error instanceof Error ? error : bridgeError(error?.code || ERROR_ATTACH_FAILED, errorMessage(error));
+  marked.delivered = true;
+  return marked;
+}
+
+// Awaits `promise`; a failure is marked as raised after delivered input.
+async function afterInput(promise) {
+  try {
+    return await promise;
+  } catch (error) {
+    throw errorAfterInput(error);
+  }
+}
+
 function errorPayload(error) {
   return {
     code: error?.code || ERROR_ATTACH_FAILED,
-    detail: errorMessage(error)
+    detail: errorMessage(error),
+    delivered: error?.delivered === true
   };
 }
 

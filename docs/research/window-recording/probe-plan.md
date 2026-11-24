@@ -73,6 +73,9 @@ Added 2026-11-24 so the check-writer and the builder work against the same text.
 
 - `cpu_ns` is the processor time of the whole probe process; `ram_peak` its peak private bytes; `first_encoded_ms` the time from the start of recording to the first encoded picture.
 - Instant 0 is always encoded (it is a key picture). An instant whose picture equals the one before it is `same` and nothing is encoded for it.
+- Parts are numbered from `part-0000`.
+- Still rule, exactly: instant k gets a still if and only if its picture differs from instant k − 1's (instant 0 counts as a change) and the next `settle` instants (k + 1 … k + settle) all show the same picture as k. A recording that ends before k + settle writes no still for k.
+- "The video decodes" means every picture is really decoded (ffprobe `-count_frames`), not only counted.
 
 ## Files
 
@@ -91,8 +94,8 @@ Each check is written first and must fail before the code exists. One round per 
 | Every instant is accounted for | the index has one line per instant of the run; pictures + unchanged instants + named losses = instants |
 | Nothing is lost silently | lost instants in the index = 0, or each has a cause |
 | The video decodes | every encoded picture decodes; picture count = encoded lines in the index |
-| A still is exact | each still equals the captured picture of its instant, pixel for pixel |
-| A still appears when the window settles | on the typing scene, one still within 0.6 s after typing stops |
+| A still is exact | each still equals the captured picture of its instant, pixel for pixel; at least one still exists over the scenes checked |
+| A still appears when the window settles | on the mixed scene (`mix-1920x1080`), the instants marked `still` are exactly the settle points of the still rule, and there is at least one. Corrected 2026-11-24: the first wording named the typing scene, but in that capture the picture never stays unchanged for 0.5 s (longest run 10 instants), so it has no settle point. |
 | Read-back | a picture at an arbitrary time is fetched in under 0.5 s |
 
 Reported, not gated (these are the reason the probe exists):

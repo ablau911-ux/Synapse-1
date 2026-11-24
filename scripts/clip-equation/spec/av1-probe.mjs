@@ -479,6 +479,25 @@ function failedClipReconciled() {
   return verdict(problems, `failed clip, part ${torn} cut to its header: ${missing.length} lines named lost encoder_failed and listed, still failed; a second recovery changed nothing`);
 }
 
+/**
+ * A failed clip that cannot be reconciled (clip.json says fps 0, and its index has a gap at instant 0,
+ * so lost lines would have to be made): recovery refuses it with an error and does not crash.
+ */
+function failedClipZeroFpsRefused() {
+  const got = recovered('killed-text-page', 'failed-zero-fps', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'failed';
+    clip.failure = 'bench: failed with fps 0';
+    clip.fps = 0;
+    fs.writeFileSync(file, JSON.stringify(clip));
+    const index = path.join(dir, 'frames.jsonl');
+    fs.writeFileSync(index, readJsonl(index).slice(1, 2).map(line => `${JSON.stringify(line)}\n`).join(''));
+  });
+  if (!got.error) return verdict(['recovery accepted a failed clip with fps 0']);
+  const refused = /^recovery failed: .*zero fps/.test(got.error);
+  return verdict(refused ? [] : [`recovery did not refuse cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], 'failed clip with fps 0 and a gap at instant 0: recovery refuses it (zero fps) and does not crash');
+}
+
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
 function fetchPicture(folder, instant) {
   const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
@@ -565,6 +584,7 @@ const table = {
   'a line already lost names no missing still': () => lostLineNamesNoMissingStill('crash-lost-line-stale-still', true),
   'recovery names every planned instant': recoveryNamesEveryInstant,
   'recovery makes a failed clip agree with its pictures': failedClipReconciled,
+  'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

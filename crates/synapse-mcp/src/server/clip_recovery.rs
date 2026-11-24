@@ -45,9 +45,6 @@ impl ClipRecovery {
             }
             ClipState::Ready => return Ok(()),
         }
-        if clip.fps == 0 {
-            return Err("recording has zero fps".into());
-        }
         // Instant k is recorded when k / f < end: ceil(end * f / 1000) instants.
         let planned = (clip.end_ms * u64::from(clip.fps)).div_ceil(MILLISECONDS_PER_SECOND);
         let (lines, complete) =
@@ -111,13 +108,18 @@ impl ClipRecovery {
 
     /// Repairs the parts, then rewrites the index (when it changes) by
     /// `repair_index`; `planned` instants are filled up with lost lines.
-    /// Returns the index and each part's count of complete pictures.
+    /// Returns the index and each part's count of complete pictures. A clip
+    /// with zero fps is refused before any file is touched: the time of a
+    /// lost line cannot be computed, for a recording or a failed clip alike.
     fn reconcile(
         folder: &Path,
         planned: Option<u64>,
         fps: u32,
         cause: &str,
     ) -> Result<(Vec<IndexLine>, BTreeMap<u32, u32>), String> {
+        if fps == 0 {
+            return Err("recording has zero fps".into());
+        }
         let complete = Self::repair_parts(folder)?;
         let read = read_index(folder).map_err(|error| error.to_string())?;
         let planned = planned.unwrap_or(read.len() as u64);

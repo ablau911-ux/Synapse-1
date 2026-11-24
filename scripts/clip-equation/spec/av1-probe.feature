@@ -29,8 +29,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed text-page recording made failed in clip.json, its last part cut to the 32-byte header: after product recovery every enc line of that part is lost encoder_failed, index lines after = before, every lost line is in clip.json lost, state = failed; a second recovery leaves frames.jsonl and clip.json byte-equal | Known: true
   Scenario: recovery refuses a failed clip with zero fps
     # Equation: killed text-page recording made failed with fps 0 in clip.json, its index cut to the line of instant 1 only: product recovery ends with the error "zero fps" and exit 0 (no crash) | Known: true
-  Scenario: recovery refuses a clip longer than the longest recording
-    # Equation: killed text-page recording with end_ms = 600000 + 50 in clip.json: product recovery ends with an error naming the longest recording and exit 0; no index line is added | Known: true
+  Scenario: recovery caps a clip longer than the longest recording
+    # Equation: killed text-page recording with end_ms = 600000 + 50 in clip.json: product recovery succeeds, state = ready, index lines = 600000/50 = 12000; each recorded line equals the line a recovery of the unchanged recording makes; every line after the recorded ones is lost | Known: true
   Scenario: a clip with zero fps is refused when it is read
     # Equation: killed text-page recording made ready with fps 0 in clip.json: the product's read of clip.json ends with the error "zero fps" and exit 0 | Known: true
   Scenario: a late picture comes back in time

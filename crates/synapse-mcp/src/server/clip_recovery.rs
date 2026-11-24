@@ -48,20 +48,17 @@ impl ClipRecovery {
         }
         // Instant k is recorded when k / f < end: ceil(end * f / 1000) instants.
         // The recorder makes no clip longer than MAX_DURATION_MS at RECORD_FPS,
-        // so a plan beyond that is not a recording's: it is refused before a
-        // lost line is made for each of its instants.
+        // so a plan beyond that (a clip made before the limit existed, or a
+        // damaged clip.json) is capped there: what is on disk is recovered and
+        // no lost line is made beyond the longest recording. A plan whose
+        // product overflows is beyond it too.
         let longest = MAX_DURATION_MS * u64::from(RECORD_FPS) / MILLISECONDS_PER_SECOND;
         let planned = clip
             .end_ms
             .checked_mul(u64::from(clip.fps))
-            .map(|scaled| scaled.div_ceil(MILLISECONDS_PER_SECOND))
-            .filter(|&planned| planned <= longest)
-            .ok_or_else(|| {
-                format!(
-                    "clip.json plans {} ms at {} instants per second, beyond the longest recording ({MAX_DURATION_MS} ms at {RECORD_FPS})",
-                    clip.end_ms, clip.fps
-                )
-            })?;
+            .map_or(longest, |scaled| {
+                scaled.div_ceil(MILLISECONDS_PER_SECOND).min(longest)
+            });
         let (lines, complete) =
             Self::reconcile(folder, Some(planned), clip.fps, LOST_SERVICE_RESTART)?;
         let parts = Self::parts(folder, &lines, &complete)?;

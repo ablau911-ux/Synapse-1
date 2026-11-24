@@ -70,8 +70,8 @@ pub(super) const RECORD_FPS: u32 = 20;
 
 /// Longest recording, in milliseconds: 10 minutes (owner's decision of
 /// 2026-11-24). `record` and `record_extend` refuse a longer clip, and
-/// recovery refuses a `clip.json` that plans more, so no number in a call or
-/// in a clip folder makes recovery write lost lines without limit.
+/// recovery caps a `clip.json` that plans more at this length, so no number in
+/// a call or in a clip folder makes recovery write lost lines without limit.
 pub(super) const MAX_DURATION_MS: u64 = 600_000;
 
 /// Default parent of clip folders.

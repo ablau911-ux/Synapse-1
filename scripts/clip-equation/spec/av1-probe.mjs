@@ -515,19 +515,31 @@ function zeroFpsRefusedAtRead() {
 }
 
 /**
- * A killed recording whose clip.json plans more than the longest recording (10 minutes): recovery
- * refuses it with an error and does not make the lost lines up to that end.
+ * A killed recording whose clip.json plans more than the longest recording (10 minutes, made before
+ * the limit existed or a damaged clip.json): recovery recovers what is on disk and caps the plan at
+ * the longest recording. The clip is ready with 12000 index lines; its recorded lines are the ones a
+ * recovery of the same recording with its own plan keeps; every line after them is named lost.
  */
-function overlongClipRefused() {
+function overlongClipCapped() {
   const LONGEST_MS = 600_000; // the recorder's longest clip
+  const LONGEST_INSTANTS = LONGEST_MS / INSTANT_MS;
   const got = recovered('killed-text-page', 'crash-overlong', dir => {
     const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
     clip.end_ms = LONGEST_MS + INSTANT_MS;
     fs.writeFileSync(file, JSON.stringify(clip));
   });
-  if (!got.error) return verdict([`recovery accepted a clip planned ${LONGEST_MS + INSTANT_MS} ms long and wrote ${got.lines.length} index lines`]);
-  const refused = /^recovery failed: .*longest recording/.test(got.error);
-  return verdict(refused ? [] : [`recovery did not refuse cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], `clip planned ${LONGEST_MS + INSTANT_MS} ms long: recovery refuses it (beyond the longest recording)`);
+  if (got.error) return verdict([got.error]);
+  const reference = recovered('killed-text-page', 'crash-overlong-reference', () => {});
+  if (reference.error) return verdict([`reference recovery: ${reference.error}`]);
+  const problems = [];
+  if (got.result.state !== 'ready') problems.push(`the clip is ${got.result.state}, not ready`);
+  if (got.lines.length !== LONGEST_INSTANTS) problems.push(`${got.lines.length} index lines after recovery, ${LONGEST_INSTANTS} expected`);
+  const recorded = got.before.length;
+  const changed = got.before.filter(line => JSON.stringify(got.lines[line.instant]) !== JSON.stringify(reference.lines[line.instant]));
+  if (changed.length) problems.push(`${changed.length} of ${recorded} recorded lines differ from the reference recovery (first: instant ${changed[0].instant})`);
+  const unnamed = got.lines.slice(recorded).filter(line => kindOf(line) !== 'lost');
+  if (unnamed.length) problems.push(`${unnamed.length} lines after the recorded ones are not named lost (first: instant ${unnamed[0].instant})`);
+  return verdict(problems, `clip planned ${LONGEST_MS + INSTANT_MS} ms long: recovered ready, ${got.lines.length} index lines (capped at the longest recording), ${recorded} recorded lines kept`);
 }
 
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
@@ -617,7 +629,7 @@ const table = {
   'recovery names every planned instant': recoveryNamesEveryInstant,
   'recovery makes a failed clip agree with its pictures': failedClipReconciled,
   'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
-  'recovery refuses a clip longer than the longest recording': overlongClipRefused,
+  'recovery caps a clip longer than the longest recording': overlongClipCapped,
   'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,

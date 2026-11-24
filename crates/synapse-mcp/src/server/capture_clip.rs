@@ -58,8 +58,44 @@ impl StopReason {
 /// the length recorded so far (published on every instant, not written to disk).
 struct RecordingControl {
     stop: AtomicBool,
+    /// The planned end; `END_SEALED` once the recorder decided the recording
+    /// is over, so no `record_extend` applies any more.
     end_ms: AtomicU64,
     recorded_ms: AtomicU64,
+}
+
+/// `RecordingControl::end_ms` after the recorder decided to stop.
+const END_SEALED: u64 = u64::MAX;
+
+impl RecordingControl {
+    /// The recorder's decision that the instant at `at_ms` is not recorded:
+    /// when the planned end is at or before it, the end is sealed in the same
+    /// atomic step, so an extend is either applied before this decision or
+    /// refused after it, never accepted and ignored.
+    fn ends_at(&self, at_ms: u64) -> bool {
+        self.end_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+                (at_ms >= end).then_some(END_SEALED)
+            })
+            .is_ok()
+    }
+
+    /// Seals the end when the recording stops for any other reason.
+    fn seal(&self) {
+        self.end_ms.store(END_SEALED, Ordering::Relaxed);
+    }
+
+    /// Moves the end by `add_ms`, up to `MAX_DURATION_MS`; returns the new
+    /// end, or the end that refused it (`END_SEALED` when the recorder already
+    /// decided to stop).
+    fn extend(&self, add_ms: u64) -> Result<u64, u64> {
+        self.end_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
+                end.checked_add(add_ms)
+                    .filter(|&end| end <= MAX_DURATION_MS)
+            })
+            .map(|before| before + add_ms)
+    }
 }
 
 /// The one running recording of the service (A2: only one recorder, so the
@@ -284,7 +320,7 @@ pub(super) async fn clip_stop(clip_id: &str) -> Result<ClipStatusResponse, Error
 }
 
 /// `record_extend`: moves the end of a running recording by `add_ms`, up to
-/// `MAX_DURATION_MS` in all.
+/// `MAX_DURATION_MS` in all; refused once the recorder decided to stop.
 pub(super) fn clip_extend(clip_id: &str, add_ms: u64) -> Result<ClipStatusResponse, ErrorData> {
     let (control, folder) = Recorders::find(clip_id).ok_or_else(|| {
         mcp_error(
@@ -292,21 +328,20 @@ pub(super) fn clip_extend(clip_id: &str, add_ms: u64) -> Result<ClipStatusRespon
             format!("clip {clip_id} is not recording; only a running recording can be extended"),
         )
     })?;
-    let end_ms = control
-        .end_ms
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |end| {
-            end.checked_add(add_ms)
-                .filter(|&end| end <= MAX_DURATION_MS)
-        })
-        .map(|before| before + add_ms)
-        .map_err(|end| {
-            mcp_error(
+    let end_ms = control.extend(add_ms).map_err(|end| {
+        if end == END_SEALED {
+            return mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "clip {clip_id} ends at {end} ms; {add_ms} ms more would pass the longest recording ({MAX_DURATION_MS} ms)"
-                ),
-            )
-        })?;
+                format!("clip {clip_id} is finishing; it can no longer be extended"),
+            );
+        }
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "clip {clip_id} ends at {end} ms; {add_ms} ms more would pass the longest recording ({MAX_DURATION_MS} ms)"
+            ),
+        )
+    })?;
     ClipJson::update(&folder, |clip| clip.end_ms = clip.end_ms.max(end_ms))
         .map_err(internal_error)?;
     status_of(&folder, Some(&control))
@@ -637,6 +672,7 @@ mod live {
         let mut recording = match Recording::start(plan) {
             Ok(recording) => recording,
             Err(error) => {
+                control.seal();
                 discard_folder(plan);
                 let _ = started.send(Err(error));
                 return;
@@ -648,11 +684,15 @@ mod live {
             }
             Err(error) => {
                 let _ = started.send(Err(error));
+                control.seal();
                 recording.finish(StopReason::WriteFailed);
                 return;
             }
         }
         let reason = recording.run(control);
+        // Every stop seals the end before the flush: `Completed` sealed it
+        // when it decided (`ends_at`); a stop for any other reason seals it here.
+        control.seal();
         recording.finish(reason);
     }
 
@@ -980,7 +1020,7 @@ mod live {
                 if control.stop.load(Ordering::Relaxed) {
                     return StopReason::StopCall;
                 }
-                if instant_ms(k) >= control.end_ms.load(Ordering::Relaxed) {
+                if control.ends_at(instant_ms(k)) {
                     return StopReason::Completed;
                 }
                 // Instant k is closed once s_{k+1} begins: every frame composed

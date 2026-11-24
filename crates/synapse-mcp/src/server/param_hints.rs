@@ -32,7 +32,8 @@ const DESERIALIZE_PREFIX: &str = "failed to deserialize parameters:";
 
 /// Parsed shape of serde's `unknown field` error: the offending field plus the
 /// list of accepted fields serde already emitted. Both are borrowed from the
-/// raw message.
+/// raw message, except for flattened params, whose accepted fields serde does
+/// not emit and are borrowed from their schema ([`flattened_params_fields`]).
 struct UnknownField<'a> {
     field: &'a str,
     accepted: Vec<&'a str>,
@@ -57,7 +58,12 @@ enum Hint {
 /// letting the caller keep its existing normalization.
 pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> Option<ErrorData> {
     let inner = raw_message.strip_prefix(DESERIALIZE_PREFIX)?.trim();
-    let parsed = parse_unknown_field(inner)?;
+    let schema_fields: Vec<String>;
+    let mut parsed = parse_unknown_field(inner)?;
+    if parsed.accepted.is_empty() {
+        schema_fields = flattened_params_fields(tool);
+        parsed.accepted = schema_fields.iter().map(String::as_str).collect();
+    }
     let hint =
         registry_hint(tool, parsed.field).or_else(|| generic_hint(parsed.field, &parsed.accepted));
 
@@ -146,6 +152,26 @@ fn parse_unknown_field(message: &str) -> Option<UnknownField<'_>> {
         field,
         accepted: accepted.to_vec(),
     })
+}
+
+/// serde cannot name the accepted fields of a params struct that has a
+/// `#[serde(flatten)]` member: its `unknown field` error ends after the field
+/// name (#260). For those facades the accepted fields come from the params'
+/// JSON schema, which lists flattened members as top-level properties.
+fn flattened_params_fields(tool: &str) -> Vec<String> {
+    let schema = match tool {
+        "session" => schemars::schema_for!(super::session_tools::SessionParams),
+        _ => return Vec::new(),
+    };
+    serde_json::to_value(schema)
+        .ok()
+        .and_then(|schema| {
+            schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| properties.keys().cloned().collect())
+        })
+        .unwrap_or_default()
 }
 
 /// Per-facade corrections for mistakes a flat accepted-field list cannot express:

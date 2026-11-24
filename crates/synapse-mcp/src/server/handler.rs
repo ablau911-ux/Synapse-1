@@ -381,9 +381,14 @@ fn finish_routed_tool_call(
     match execution {
         RoutedToolExecution::Completed(Ok(result)) => {
             let effective_target = effective_target_from_tool_result(&result);
-            lifecycle_guard
-                .finish_ok_with_effective_target(effective_target)
-                .map_err(lifecycle_mcp_error)?;
+            match failure_reported_by_tool_result(&result) {
+                Some(failure) => lifecycle_guard
+                    .finish_error_with_effective_target(failure, effective_target)
+                    .map_err(lifecycle_mcp_error)?,
+                None => lifecycle_guard
+                    .finish_ok_with_effective_target(effective_target)
+                    .map_err(lifecycle_mcp_error)?,
+            }
             Ok(result)
         }
         RoutedToolExecution::Completed(Err(error)) => {
@@ -639,6 +644,29 @@ fn effective_target_from_tool_result(result: &CallToolResult) -> Option<Value> {
         .structured_content
         .as_ref()
         .and_then(|value| effective_target_from_value(value, "structured_content"))
+}
+
+/// A completed call whose own result says it failed: MCP `isError`, or
+/// `ok: false` at the top of the structured content or in one of its top-level
+/// objects (a facade's per-operation result, e.g. act's `action`). Returns the
+/// error snapshot the lifecycle ledger records, so `tool_usage` counts the call
+/// in `error_total`, not `ok_total`.
+fn failure_reported_by_tool_result(result: &CallToolResult) -> Option<Value> {
+    let reports_not_ok = |value: &Value| value.get("ok").and_then(Value::as_bool) == Some(false);
+    let failed_part = result.structured_content.as_ref().and_then(|content| {
+        if reports_not_ok(content) {
+            return Some(content);
+        }
+        content.as_object()?.values().find(|member| reports_not_ok(member))
+    });
+    if let Some(part) = failed_part {
+        return Some(json!({
+            "message": "tool result reported ok=false",
+            "status": part.get("status"),
+        }));
+    }
+    (result.is_error == Some(true))
+        .then(|| json!({ "message": "tool result reported isError=true" }))
 }
 
 fn effective_target_from_error_snapshot(error: &Value) -> Option<Value> {

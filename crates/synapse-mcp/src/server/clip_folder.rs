@@ -1024,7 +1024,10 @@ impl ClipRegistry {
     /// when its folder or its id is registered. Once registered, a folder is
     /// not read here again. A folder whose `clip.json` cannot be read is not
     /// registered (its id is unknown): the others are, and the call then
-    /// ends with an error naming it, so the next start reads it again.
+    /// ends with an error naming it, so the next start reads it again. Every
+    /// failure is reported: a listing that breaks off, each unreadable
+    /// `clip.json` and a registry that cannot be written end the call with
+    /// one error naming them all.
     pub(super) fn register_default_folder() -> Result<(), String> {
         let root = clips_root();
         let listing = match std::fs::read_dir(&root) {
@@ -1034,11 +1037,15 @@ impl ClipRegistry {
         };
         let registered = Self::entries()?;
         let mut found: Vec<RegistryEntry> = Vec::new();
-        let mut unreadable = Vec::new();
+        let mut failures = Vec::new();
         for item in listing {
-            let folder = item
-                .map_err(|error| format!("could not list {}: {error}", root.display()))?
-                .path();
+            let folder = match item {
+                Ok(item) => item.path(),
+                Err(error) => {
+                    failures.push(format!("could not list {}: {error}", root.display()));
+                    break;
+                }
+            };
             let known_folder = registered.iter().any(|entry| entry.folder == folder);
             if known_folder || !folder.join(CLIP_JSON_FILE).is_file() {
                 continue;
@@ -1051,7 +1058,7 @@ impl ClipRegistry {
             let clip_id = match clip_id {
                 Ok(clip_id) => clip_id,
                 Err(error) => {
-                    unreadable.push(error);
+                    failures.push(error);
                     continue;
                 }
             };
@@ -1065,7 +1072,7 @@ impl ClipRegistry {
             }
         }
         if !found.is_empty() {
-            Self::change(|entries| {
+            let written = Self::change(|entries| {
                 for entry in found {
                     let known = entries.iter().any(|registered| {
                         registered.clip_id == entry.clip_id || registered.folder == entry.folder
@@ -1074,12 +1081,15 @@ impl ClipRegistry {
                         entries.push(entry);
                     }
                 }
-            })?;
+            });
+            if let Err(error) = written {
+                failures.push(error);
+            }
         }
-        if unreadable.is_empty() {
+        if failures.is_empty() {
             Ok(())
         } else {
-            Err(unreadable.join("; "))
+            Err(failures.join("; "))
         }
     }
 

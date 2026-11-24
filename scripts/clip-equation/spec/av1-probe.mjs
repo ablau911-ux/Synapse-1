@@ -825,6 +825,36 @@ function recoveryFailureReported() {
 }
 
 /**
+ * Recovery at start reports every failure: registering the default folder meets a clip whose clip.json
+ * is not JSON and then cannot write the registry (read-only). The run ends with an error naming both
+ * the unreadable clip.json and the registry.
+ */
+function registerFailuresAllReported() {
+  const appData = path.join(OUT, 'registry-register-failures');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const source = path.join(ROOT, 'killed-text-page');
+  const clips = path.join(appData, 'synapse', 'clips');
+  const broken = path.join(clips, 'clip-broken');
+  fs.cpSync(source, path.join(clips, 'clip-readable'), { recursive: true });
+  fs.mkdirSync(broken, { recursive: true });
+  fs.writeFileSync(path.join(broken, 'clip.json'), 'not json');
+  const registry = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(registry, '[]');
+  fs.chmodSync(registry, 0o444);
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  fs.chmodSync(registry, 0o666);
+  const problems = [];
+  const error = String(got.error);
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('recovery at start reported ok while it could not write the registry');
+  else {
+    if (!error.includes(broken)) problems.push(`the error does not name clip-broken: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+    if (!error.includes(registry)) problems.push(`the error does not name the registry: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  }
+  return verdict(problems, `unreadable clip-broken and a read-only registry: recovery at start ended with an error naming both (${error.replace(/\s+/g, ' ').slice(0, 160)})`);
+}
+
+/**
  * A `record` that failed before its first picture drops its registry entry, and nothing else of the
  * registry: the registry file and its lock file belong to the registry, a store every start shares, so
  * they stay (deleting a lock file lets two writers hold different lock files at once). With a second
@@ -970,6 +1000,7 @@ const table = {
   'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
   'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
   'recovery at start reports a clip it could not recover': recoveryFailureReported,
+  'recovery at start reports every failure of registering the default folder': registerFailuresAllReported,
   'a failed start leaves no registry entry and never deletes the registry or its lock file': failedStartKeepsRegistry,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,

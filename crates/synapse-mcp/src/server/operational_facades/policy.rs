@@ -12,8 +12,9 @@ pub(super) fn session_or_stdio(
     )
 }
 
-/// `remediation` is `tool_profiles::MAINTENANCE_PROFILE_REMEDIATION` or one of
-/// its per-operation variants, the same text the facade contract lists.
+/// `remediation` is the `tool_profiles` remediation constant of the calling
+/// facade (built from `maintenance_profile_remediation!`, naming that tool's
+/// read-only operations), the same text the facade contract lists.
 pub(in crate::server) fn require_maintenance_profile(
     service: &SynapseService,
     request_context: &RequestContext<RoleServer>,

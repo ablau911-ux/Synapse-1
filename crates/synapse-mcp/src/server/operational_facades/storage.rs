@@ -2,7 +2,7 @@ use rmcp::{RoleServer, service::RequestContext};
 
 use crate::server::{
     ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
-    tool_profiles::MAINTENANCE_PROFILE_REMEDIATION,
+    tool_profiles::STORAGE_GC_REMEDIATION,
 };
 
 use super::{
@@ -102,7 +102,7 @@ pub(super) async fn handle(
                 operation.as_str(),
                 &spec.cf_name,
                 STORAGE_SOT,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                STORAGE_GC_REMEDIATION,
             )?;
             service.require_m3_permissions(
                 STORAGE_TOOL,

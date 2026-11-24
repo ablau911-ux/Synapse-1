@@ -1756,7 +1756,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "RocksDB CF row counts + audit retention report rows",
                 Some("CF row-count and GC report readback after pass"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                STORAGE_GC_REMEDIATION,
             ),
         ],
     ),
@@ -1799,7 +1799,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV local model registry row",
                 Some("registry row readback after forced structured probe"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                MODEL_REGISTRY_REMEDIATION,
             ),
             op(
                 "update",
@@ -1808,7 +1808,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV local model registry row",
                 Some("forced structured tool-call probe row readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                MODEL_REGISTRY_REMEDIATION,
             ),
             op(
                 "remove",
@@ -1817,7 +1817,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_KV local model registry row + secret row",
                 Some("removed-row readback plus exact after-row absence check"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                MODEL_REGISTRY_REMEDIATION,
             ),
         ],
     ),
@@ -1876,7 +1876,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "caller text + optional physical source row",
                 Some("CF_KV hygiene flag row readback when persist=true"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "run without persist for read-only scoring or switch to maintenance before persisting flags",
+                HYGIENE_PERSIST_REMEDIATION,
             ),
             op(
                 "scan_storage",
@@ -1885,7 +1885,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "CF_OBSERVATIONS/CF_TIMELINE source rows",
                 Some("CF_KV hygiene flag rows linked to exact source keys"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                MAINTENANCE_PROFILE_REMEDIATION,
+                HYGIENE_PERSIST_REMEDIATION,
             ),
             op(
                 "flags",
@@ -2210,23 +2210,36 @@ const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
 
 /// Remediation for operations gated on `break_glass` / `full_capability`
 /// (`require_maintenance_profile`). There is no "maintenance" profile, so the
-/// text names the real, executable steps. A macro so the per-operation
-/// variants below can extend it with `concat!`.
+/// text names the real, executable steps. A macro so each facade's variant
+/// below can extend it with `concat!`: every variant names the read-only
+/// operations of its own tool that a normal_agent may use first.
 macro_rules! maintenance_profile_remediation {
     () => {
         "requires profile=break_glass (or full_capability): call act operation=lease_acquire, then profile operation=set profile=break_glass confirm_break_glass=true reason=<why>, retry this operation, then restore profile=normal_agent and release the lease"
     };
 }
 
-pub(crate) const MAINTENANCE_PROFILE_REMEDIATION: &str = maintenance_profile_remediation!();
 /// setup repair: the shared steps, and repair runs from an external process.
 pub(crate) const SETUP_REPAIR_REMEDIATION: &str = concat!(
     maintenance_profile_remediation!(),
-    "; run repair from an external process"
+    "; run repair from an external process; normal_agent may use status or doctor first"
 );
 pub(crate) const COST_PRICE_REMEDIATION: &str = concat!(
     maintenance_profile_remediation!(),
     "; normal_agent may use summarize or price_list first"
+);
+pub(crate) const STORAGE_GC_REMEDIATION: &str = concat!(
+    maintenance_profile_remediation!(),
+    "; normal_agent may use inspect or summary first"
+);
+pub(crate) const MODEL_REGISTRY_REMEDIATION: &str = concat!(
+    maintenance_profile_remediation!(),
+    "; normal_agent may use list or status first"
+);
+/// hygiene scan_text with persist=true and scan_storage.
+pub(crate) const HYGIENE_PERSIST_REMEDIATION: &str = concat!(
+    maintenance_profile_remediation!(),
+    "; normal_agent may use scan_text without persist, flags or report first"
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -2268,7 +2281,7 @@ impl ToolProfileKind {
 
     /// Whether this profile may run maintenance mutations (storage GC, model
     /// registry, cost price table, privacy controls). See
-    /// `MAINTENANCE_PROFILE_REMEDIATION` for how a caller obtains one.
+    /// `maintenance_profile_remediation!` for how a caller obtains one.
     pub(crate) const fn allows_maintenance_mutation(self) -> bool {
         matches!(self, Self::BreakGlass | Self::FullCapability)
     }

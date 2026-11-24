@@ -973,8 +973,8 @@ pub struct ActLaunchParams {
     /// `--disable-extensions` so `observe`/`find` can read the browser's DOM
     /// without loading user-profile extensions or surfacing debugger UI.
     /// `Some(false)` = opt out (launch the browser untouched). `Some(true)` =
-    /// force injection even if heuristics would skip it. Ignored for
-    /// non-Chromium targets.
+    /// inject as auto does. Ignored for non-Chromium targets: their launch
+    /// gets no Chromium flags.
     #[serde(default)]
     #[schemars(default)]
     pub cdp_debug: Option<bool>,
@@ -7350,16 +7350,24 @@ struct LaunchedCdp {
 }
 
 /// Decides whether to inject CDP debug flags for this launch. Returns `None` for
-/// non-Chromium targets, when the caller opted out (`cdp_debug = Some(false)`),
-/// or when the caller already specified a debug port / user-data-dir (respect
-/// their intent). Otherwise plans an ephemeral port + dedicated profile.
+/// non-Chromium targets (whatever `cdp_debug` says: Chromium flags go only to a
+/// Chromium executable, #249), when the caller opted out
+/// (`cdp_debug = Some(false)`), or when the caller already specified a debug
+/// port / user-data-dir (respect their intent). Otherwise plans an ephemeral
+/// port + dedicated profile.
 fn chromium_cdp_launch(params: &ActLaunchParams) -> Option<ChromiumCdpLaunch> {
     if params.cdp_debug == Some(false) {
         return None;
     }
-    let is_chromium =
-        synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
-    if !is_chromium && params.cdp_debug != Some(true) {
+    if !synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target)) {
+        if params.cdp_debug == Some(true) {
+            tracing::info!(
+                code = "M4_ACT_LAUNCH_CDP_SKIPPED",
+                reason = "target_not_chromium",
+                target = %params.target,
+                "act_launch ignoring cdp_debug=true for a non-Chromium target"
+            );
+        }
         return None;
     }
     let already_configured = params.args.iter().any(|arg| {

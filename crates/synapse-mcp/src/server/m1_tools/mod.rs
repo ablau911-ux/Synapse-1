@@ -5783,6 +5783,9 @@ impl SynapseService {
         if let Some(target_id) = cdp_target_id_param {
             validate_cdp_target_id(target_id)?;
         }
+        if let Some(window_hwnd) = window_hwnd_param {
+            validate_browser_window(tool, window_hwnd)?;
+        }
         let active_target = self.session_target(Some(session_id))?;
         let owner = cdp_target_id_param
             .map(|target_id| self.cdp_target_owner_for_navigation(tool, session_id, target_id))
@@ -5792,12 +5795,7 @@ impl SynapseService {
             (Some(target_id), _) => target_id.to_owned(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
             (None, Some(SessionTarget::Window { .. }) | None) => {
-                return Err(mcp_error(
-                    error_codes::TARGET_NOT_SET,
-                    format!(
-                        "{tool} requires an active CDP session target or explicit cdp_target_id owned by this session; refusing to use the human foreground tab"
-                    ),
-                ));
+                return Err(missing_cdp_tab_target_error(tool, window_hwnd_param));
             }
         };
         let window_hwnd = window_hwnd_param
@@ -5856,6 +5854,9 @@ impl SynapseService {
         if let Some(target_id) = params.cdp_target_id.as_deref() {
             validate_cdp_target_id(target_id)?;
         }
+        if let Some(window_hwnd) = params.window_hwnd {
+            validate_browser_window("cdp_target_info", window_hwnd)?;
+        }
         let active_target = self.session_target(Some(session_id))?;
         let owner = params
             .cdp_target_id
@@ -5869,10 +5870,7 @@ impl SynapseService {
             (Some(target_id), _) => target_id.clone(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
             (None, Some(SessionTarget::Window { .. }) | None) => {
-                return Err(mcp_error(
-                    error_codes::TARGET_NOT_SET,
-                    "cdp_target_info requires an active CDP session target or explicit cdp_target_id owned by this session; refusing to use the human foreground tab",
-                ));
+                return Err(missing_cdp_tab_target_error("cdp_target_info", params.window_hwnd));
             }
         };
         let window_hwnd = params
@@ -7110,13 +7108,7 @@ impl SynapseService {
                 }
             };
         if !synapse_a11y::is_chromium_family(&context.process_name) {
-            return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "{tool} requires a Chromium browser window; resolved hwnd={:#x} process_name={:?} title={:?}",
-                    context.hwnd, context.process_name, context.window_title
-                ),
-            ));
+            return Err(chromium_window_required_error(tool, &context));
         }
         Ok(BrowserTabsWindowResolution {
             context,
@@ -16631,6 +16623,49 @@ fn validate_target_window_context(tool: &str, hwnd: i64) -> Result<ForegroundCon
             format!("{tool} window_hwnd {hwnd:#x} could not be resolved for perception: {error}"),
         )
     })
+}
+
+/// An explicit browser `window_hwnd` must name a live Chromium-family window:
+/// raw-CDP endpoints and the normal Chrome bridge exist only there. Checked
+/// before any target lookup or bridge call, so a dead or non-browser HWND is
+/// refused as such instead of being ignored or listed through the bridge.
+pub(super) fn validate_browser_window(
+    tool: &str,
+    hwnd: i64,
+) -> Result<ForegroundContext, ErrorData> {
+    let context = validate_target_window_context(tool, hwnd)?;
+    if !synapse_a11y::is_chromium_family(&context.process_name) {
+        return Err(chromium_window_required_error(tool, &context));
+    }
+    Ok(context)
+}
+
+fn chromium_window_required_error(tool: &str, context: &ForegroundContext) -> ErrorData {
+    mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        format!(
+            "{tool} requires a Chromium browser window; resolved hwnd={:#x} process_name={:?} title={:?}",
+            context.hwnd, context.process_name, context.window_title
+        ),
+    )
+}
+
+/// Refusal when a CDP tab tool got no `cdp_target_id` and this session has no
+/// CDP tab target. The human foreground tab is never a fallback, and an
+/// explicit `window_hwnd` alone does not select a tab.
+pub(super) fn missing_cdp_tab_target_error(
+    tool: &str,
+    window_hwnd_param: Option<i64>,
+) -> ErrorData {
+    let message = match window_hwnd_param {
+        Some(hwnd) => format!(
+            "{tool} window_hwnd {hwnd:#x} does not select a tab: pass the cdp_target_id of a tab in that window (browser_tabs operation=list) or bind one with browser_tabs operation=select"
+        ),
+        None => format!(
+            "{tool} requires an active CDP session target or explicit cdp_target_id owned by this session; refusing to use the human foreground tab"
+        ),
+    };
+    mcp_error(error_codes::TARGET_NOT_SET, message)
 }
 
 impl TargetFacadeResponse {

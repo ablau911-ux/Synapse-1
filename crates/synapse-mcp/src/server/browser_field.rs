@@ -979,17 +979,15 @@ impl SynapseService {
         if let Some(target_id) = cdp_target_id_param {
             super::m1_tools::validate_cdp_target_id(target_id)?;
         }
+        if let Some(window_hwnd) = window_hwnd_param {
+            super::m1_tools::validate_browser_window(tool, window_hwnd)?;
+        }
         let active_target = self.session_target(Some(session_id))?;
         let cdp_target_id = match (cdp_target_id_param, active_target.as_ref()) {
             (Some(target_id), _) => target_id.to_owned(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
             (None, _) => {
-                return Err(mcp_error(
-                    error_codes::TARGET_NOT_SET,
-                    format!(
-                        "{tool} requires an active CDP session target or an explicit cdp_target_id owned by this session; refusing the human foreground tab"
-                    ),
-                ));
+                return Err(super::m1_tools::missing_cdp_tab_target_error(tool, window_hwnd_param));
             }
         };
         let window_hwnd = window_hwnd_param

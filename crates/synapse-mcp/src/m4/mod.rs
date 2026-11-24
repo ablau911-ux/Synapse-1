@@ -16,7 +16,7 @@ use rmcp::{
     model::ErrorCode,
     schemars::{JsonSchema, Schema, SchemaGenerator, json_schema},
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
@@ -54,7 +54,7 @@ const MAX_AGENT_SPAWN_PROMPT_BYTES: usize = 128 * 1024;
 /// Upper bound on a spawn `model` id. Generous for provider/version/ARN-style
 /// ids (matches the cost table's `MODEL_PRICE_MAX_ID_CHARS`).
 const MAX_AGENT_SPAWN_MODEL_BYTES: usize = 256;
-const MAX_SHELL_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
 /// Unrestricted shell/launch. **On by default**: Synapse is general local
@@ -116,6 +116,7 @@ const WINDOWS_DEFAULT_PATHEXT: &str =
 const WINDOWS_GIT_SSH_RELATIVE_DIR: &str = r"Git\usr\bin";
 const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
 const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
+const LAUNCH_IDEMPOTENCY_PREFIX: &str = "m4/act_launch/idempotency/v1/";
 const SHELL_JOB_FINALIZING_GRACE_MS: u64 = 30_000;
 const SHELL_REMOTE_TRANSPORT_LOCAL: &str = "local";
 const SHELL_REMOTE_TRANSPORT_SSH: &str = "ssh";
@@ -920,7 +921,7 @@ impl ShellExecutionContext {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct RunShellIdempotencyRow {
+struct IdempotencyRow<R> {
     schema_version: u32,
     tool: String,
     session_id: Option<String>,
@@ -935,7 +936,8 @@ struct RunShellIdempotencyRow {
     matched_pattern: String,
     started_at: String,
     completed_at: Option<String>,
-    response: Option<ActRunShellResponse>,
+    /// The first call's response (`ActRunShellResponse` or `ActLaunchResponse`).
+    response: Option<R>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -1542,7 +1544,7 @@ fn validate_local_model_ref(model_ref: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActLaunchResponse {
     /// PID of the process act_launch freshly spawned.
@@ -1587,7 +1589,7 @@ pub struct ActLaunchResponse {
     pub desktop: Option<ActLaunchDesktopReadback>,
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActLaunchDesktopReadback {
     pub requested: String,
@@ -6726,163 +6728,232 @@ fn shell_job_dashboard_sort_key(job: &ActRunShellJobStatus) -> String {
         .to_owned()
 }
 
-pub fn run_shell_idempotency_row_key(
+/// One tool's place in the shared idempotency store. `act_run_shell` and
+/// `act_launch` keep their rows apart by prefix but replay and refuse by one
+/// rule (`IdempotentRequest::replay`).
+#[derive(Clone, Copy, Debug)]
+struct IdempotentTool {
+    name: &'static str,
+    row_prefix: &'static str,
+    /// Drain reason when a failed call's reservation could not be removed.
+    cleanup_drain_reason: &'static str,
+}
+
+const RUN_SHELL_IDEMPOTENCY: IdempotentTool = IdempotentTool {
+    name: "act_run_shell",
+    row_prefix: RUN_SHELL_IDEMPOTENCY_PREFIX,
+    cleanup_drain_reason: "act_run_shell_idempotency_cleanup_unverified",
+};
+
+const LAUNCH_IDEMPOTENCY: IdempotentTool = IdempotentTool {
+    name: "act_launch",
+    row_prefix: LAUNCH_IDEMPOTENCY_PREFIX,
+    cleanup_drain_reason: "act_launch_idempotency_cleanup_unverified",
+};
+
+/// A keyed request in the idempotency store: the row key it owns and what its
+/// row records. Same key and same request fingerprint replays the first
+/// result without running again; same key with another fingerprint is refused.
+pub struct IdempotentRequest {
+    tool: IdempotentTool,
+    row_key: Vec<u8>,
+    session_id: Option<String>,
+    idempotency_key_sha256: String,
+    request_sha256: String,
+    command_line: String,
+    command_line_sha256: String,
+    command_line_redacted: bool,
+    matched_pattern: String,
+}
+
+impl IdempotentRequest {
+    fn new(
+        tool: IdempotentTool,
+        key: &str,
+        session_id: Option<&str>,
+        request_sha256: String,
+    ) -> Result<Self, ErrorData> {
+        validate_idempotency_key(tool.name, key)?;
+        if let Some(session_id) = session_id {
+            validate_shell_session_id(session_id)?;
+        }
+        let owner = session_id
+            .map(|session_id| format!("session/{}", sha256_hex(session_id.as_bytes())))
+            .unwrap_or_else(|| "sessionless".to_owned());
+        let idempotency_key_sha256 = sha256_hex(key.as_bytes());
+        let row_key = format!("{}{owner}/{idempotency_key_sha256}", tool.row_prefix);
+        Ok(Self {
+            tool,
+            row_key: row_key.into_bytes(),
+            session_id: session_id.map(ToOwned::to_owned),
+            idempotency_key_sha256,
+            request_sha256,
+            command_line: String::new(),
+            command_line_sha256: String::new(),
+            command_line_redacted: false,
+            matched_pattern: String::new(),
+        })
+    }
+
+    #[must_use]
+    pub const fn tool_name(&self) -> &'static str {
+        self.tool.name
+    }
+
+    #[must_use]
+    pub const fn cleanup_drain_reason(&self) -> &'static str {
+        self.tool.cleanup_drain_reason
+    }
+
+    #[must_use]
+    pub fn row_key(&self) -> &[u8] {
+        &self.row_key
+    }
+
+    pub fn reservation_row(&self) -> Result<Vec<u8>, ErrorData> {
+        self.encode_row::<()>("reservation", "in_progress", None)
+    }
+
+    pub fn completed_row<R: Serialize>(&self, response: &R) -> Result<Vec<u8>, ErrorData> {
+        self.encode_row("completion", "ok", Some(response))
+    }
+
+    fn encode_row<R: Serialize>(
+        &self,
+        stage: &str,
+        status: &str,
+        response: Option<&R>,
+    ) -> Result<Vec<u8>, ErrorData> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let row = IdempotencyRow {
+            schema_version: 2,
+            tool: self.tool.name.to_owned(),
+            session_id: self.session_id.clone(),
+            idempotency_key_sha256: self.idempotency_key_sha256.clone(),
+            request_sha256: self.request_sha256.clone(),
+            status: status.to_owned(),
+            command_line: self.command_line.clone(),
+            command_line_sha256: self.command_line_sha256.clone(),
+            command_line_redacted: self.command_line_redacted,
+            matched_pattern: self.matched_pattern.clone(),
+            completed_at: response.is_some().then(|| now.clone()),
+            started_at: now,
+            response,
+        };
+        let tool = self.tool.name;
+        encode_json(&row).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool} idempotency {stage} encode failed: {error}"),
+            )
+        })
+    }
+
+    pub fn replay<R: DeserializeOwned>(&self, row_bytes: &[u8]) -> Result<R, ErrorData> {
+        let tool = self.tool.name;
+        let row = decode_json::<IdempotencyRow<R>>(row_bytes).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool} idempotency row decode failed: {error}"),
+            )
+        })?;
+        if row.schema_version != 2 || row.tool != tool {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool} idempotency row has unexpected schema/tool"),
+            ));
+        }
+        if row.session_id != self.session_id {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool} idempotency row session owner mismatch"),
+            ));
+        }
+        if row.idempotency_key_sha256 != self.idempotency_key_sha256 {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool} idempotency row key hash mismatch"),
+            ));
+        }
+        if row.request_sha256 != self.request_sha256 {
+            return Err(idempotency_error(
+                format!("{tool} idempotency_key was already used for different parameters"),
+                "idempotency_key_conflict",
+                &json!({
+                    "stored_request_sha256": row.request_sha256,
+                    "incoming_request_sha256": self.request_sha256,
+                }),
+            ));
+        }
+        match (row.status.as_str(), row.response) {
+            ("ok", Some(response)) => {
+                tracing::info!(
+                    code = "M4_IDEMPOTENT_REPLAY",
+                    tool,
+                    request_sha256 = %self.request_sha256,
+                    "readback=idempotent_replay after=stored_first_response"
+                );
+                Ok(response)
+            }
+            ("in_progress", _) => Err(idempotency_error(
+                format!("{tool} idempotency_key is already in progress"),
+                "idempotency_in_progress",
+                &json!({ "request_sha256": self.request_sha256 }),
+            )),
+            (status, _) => Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool} idempotency row has unsupported status {status:?}"),
+            )),
+        }
+    }
+}
+
+/// The idempotent identity of an `act_run_shell` request; `None` without a key.
+pub fn run_shell_idempotent_request(
     params: &ActRunShellParams,
+    authorization: &RunShellAuthorization,
     session_id: Option<&str>,
-) -> Result<Option<Vec<u8>>, ErrorData> {
-    let Some(key) = &params.idempotency_key else {
+) -> Result<Option<IdempotentRequest>, ErrorData> {
+    let Some(key) = params.idempotency_key.as_deref() else {
         return Ok(None);
     };
-    validate_run_shell_idempotency_key(key)?;
-    if let Some(session_id) = session_id {
-        validate_shell_session_id(session_id)?;
-    }
-    let owner = session_id
-        .map(|session_id| format!("session/{}", sha256_hex(session_id.as_bytes())))
-        .unwrap_or_else(|| "sessionless".to_owned());
-    Ok(Some(
-        format!(
-            "{RUN_SHELL_IDEMPOTENCY_PREFIX}{owner}/{}",
-            sha256_hex(key.as_bytes())
-        )
-        .into_bytes(),
-    ))
-}
-
-pub fn run_shell_idempotency_reservation_row(
-    params: &ActRunShellParams,
-    authorization: &RunShellAuthorization,
-    session_id: Option<&str>,
-) -> Result<Vec<u8>, ErrorData> {
-    let key_sha256 = params
-        .idempotency_key
-        .as_deref()
-        .map(|key| sha256_hex(key.as_bytes()))
-        .unwrap_or_default();
+    let mut request = IdempotentRequest::new(
+        RUN_SHELL_IDEMPOTENCY,
+        key,
+        session_id,
+        run_shell_request_sha256(params)?,
+    )?;
     let command_metadata = shell_command_metadata(&params.command, &params.args);
-    let row = RunShellIdempotencyRow {
-        schema_version: 2,
-        tool: "act_run_shell".to_owned(),
-        session_id: session_id.map(ToOwned::to_owned),
-        idempotency_key_sha256: key_sha256,
-        request_sha256: run_shell_request_sha256(params)?,
-        status: "in_progress".to_owned(),
-        command_line: command_metadata.command_line,
-        command_line_sha256: command_metadata.command_line_sha256,
-        command_line_redacted: command_metadata.command_line_redacted,
-        matched_pattern: authorization.matched_pattern.clone(),
-        started_at: chrono::Utc::now().to_rfc3339(),
-        completed_at: None,
-        response: None,
-    };
-    encode_json(&row).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell idempotency reservation encode failed: {error}"),
-        )
-    })
+    request.command_line = command_metadata.command_line;
+    request.command_line_sha256 = command_metadata.command_line_sha256;
+    request.command_line_redacted = command_metadata.command_line_redacted;
+    request.matched_pattern.clone_from(&authorization.matched_pattern);
+    Ok(Some(request))
 }
 
-pub fn run_shell_idempotency_completed_row(
-    params: &ActRunShellParams,
-    authorization: &RunShellAuthorization,
-    response: &ActRunShellResponse,
+/// The idempotent identity of an `act_launch` request; `None` without a key.
+/// The launch policy is checked first, so a refused target never reserves a
+/// row.
+pub fn launch_idempotent_request(
+    config: &M4ServiceConfig,
+    params: &ActLaunchParams,
     session_id: Option<&str>,
-) -> Result<Vec<u8>, ErrorData> {
-    let key_sha256 = params
-        .idempotency_key
-        .as_deref()
-        .map(|key| sha256_hex(key.as_bytes()))
-        .unwrap_or_default();
-    let command_metadata = shell_command_metadata(&params.command, &params.args);
-    let now = chrono::Utc::now().to_rfc3339();
-    let row = RunShellIdempotencyRow {
-        schema_version: 2,
-        tool: "act_run_shell".to_owned(),
-        session_id: session_id.map(ToOwned::to_owned),
-        idempotency_key_sha256: key_sha256,
-        request_sha256: run_shell_request_sha256(params)?,
-        status: "ok".to_owned(),
-        command_line: command_metadata.command_line,
-        command_line_sha256: command_metadata.command_line_sha256,
-        command_line_redacted: command_metadata.command_line_redacted,
-        matched_pattern: authorization.matched_pattern.clone(),
-        started_at: now.clone(),
-        completed_at: Some(now),
-        response: Some(response.clone()),
+) -> Result<Option<IdempotentRequest>, ErrorData> {
+    let Some(key) = params.idempotency_key.as_deref() else {
+        return Ok(None);
     };
-    encode_json(&row).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell idempotency completion encode failed: {error}"),
-        )
-    })
-}
-
-pub fn run_shell_idempotency_replay(
-    params: &ActRunShellParams,
-    row_bytes: &[u8],
-    session_id: Option<&str>,
-) -> Result<ActRunShellResponse, ErrorData> {
-    let row = decode_json::<RunShellIdempotencyRow>(row_bytes).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell idempotency row decode failed: {error}"),
-        )
-    })?;
-    if row.schema_version != 2 || row.tool != "act_run_shell" {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell idempotency row has unexpected schema/tool",
-        ));
-    }
-    if row.session_id.as_deref() != session_id {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell idempotency row session owner mismatch",
-        ));
-    }
-    let expected_key_sha256 = params
-        .idempotency_key
-        .as_deref()
-        .map(|key| sha256_hex(key.as_bytes()))
-        .unwrap_or_default();
-    if row.idempotency_key_sha256 != expected_key_sha256 {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell idempotency row key hash mismatch",
-        ));
-    }
-    let request_sha256 = run_shell_request_sha256(params)?;
-    if row.request_sha256 != request_sha256 {
-        return Err(idempotency_error(
-            "act_run_shell idempotency_key was already used for different parameters",
-            "idempotency_key_conflict",
-            &json!({
-                "stored_request_sha256": row.request_sha256,
-                "incoming_request_sha256": request_sha256,
-            }),
-        ));
-    }
-    match (row.status.as_str(), row.response) {
-        ("ok", Some(response)) => {
-            tracing::info!(
-                code = "M4_ACT_RUN_SHELL_IDEMPOTENT_REPLAY",
-                request_sha256 = %request_sha256,
-                "readback=act_run_shell after=idempotent_replay"
-            );
-            Ok(response)
-        }
-        ("in_progress", _) => Err(idempotency_error(
-            "act_run_shell idempotency_key is already in progress",
-            "idempotency_in_progress",
-            &json!({ "request_sha256": request_sha256 }),
-        )),
-        (status, _) => Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_run_shell idempotency row has unsupported status {status:?}"),
-        )),
-    }
+    let matched_pattern = validate_launch_authorized(config, params)?;
+    let mut request = IdempotentRequest::new(
+        LAUNCH_IDEMPOTENCY,
+        key,
+        session_id,
+        launch_request_sha256(params)?,
+    )?;
+    let command_line = launch_command_line(params)?;
+    request.command_line_sha256 = sha256_hex(command_line.as_bytes());
+    request.command_line = command_line;
+    request.matched_pattern = matched_pattern;
+    Ok(Some(request))
 }
 
 fn run_shell_request_sha256(params: &ActRunShellParams) -> Result<String, ErrorData> {
@@ -7811,7 +7882,7 @@ fn validate_run_shell_params(params: &ActRunShellParams) -> Result<(), ErrorData
         ));
     }
     if let Some(key) = &params.idempotency_key {
-        validate_run_shell_idempotency_key(key)?;
+        validate_idempotency_key(RUN_SHELL_IDEMPOTENCY.name, key)?;
     }
     Ok(())
 }
@@ -7971,19 +8042,17 @@ fn first_command_token(command: &str) -> Option<&str> {
         .find_map(|(index, ch)| ch.is_whitespace().then_some(&command[..index]))
 }
 
-fn validate_run_shell_idempotency_key(key: &str) -> Result<(), ErrorData> {
+fn validate_idempotency_key(tool: &str, key: &str) -> Result<(), ErrorData> {
     if key.trim().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "act_run_shell idempotency_key must not be empty",
+            format!("{tool} idempotency_key must not be empty"),
         ));
     }
-    if key.len() > MAX_SHELL_IDEMPOTENCY_KEY_BYTES {
+    if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_run_shell idempotency_key must be <= {MAX_SHELL_IDEMPOTENCY_KEY_BYTES} bytes"
-            ),
+            format!("{tool} idempotency_key must be <= {MAX_IDEMPOTENCY_KEY_BYTES} bytes"),
         ));
     }
     Ok(())
@@ -20230,7 +20299,7 @@ fn shell_tool_error(
 }
 
 fn idempotency_error(
-    message: &'static str,
+    message: String,
     reason: &'static str,
     details: &serde_json::Value,
 ) -> ErrorData {

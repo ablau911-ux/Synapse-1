@@ -4,19 +4,17 @@ use super::{
     ActRunShellStartParams, ActRunShellStartResponse, ActRunShellStatusParams,
     ActRunShellStatusResponse, ActSpawnAgentCli, ActSpawnAgentLogPaths, ActSpawnAgentParams,
     ActSpawnAgentRequest, ActSpawnAgentResponse, ActSpawnAgentTarget, AgentSpawnTaskStartedParams,
-    AgentSpawnTaskStartedResponse, ErrorData, Json, LaunchWindowState,
+    AgentSpawnTaskStartedResponse, ErrorData, IdempotentRequest, Json, LaunchWindowState,
     MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, Parameters, RunShellAuthorization, SessionTarget,
     ShellExecutionContext, SynapseService, TargetWire, assign_owned_process_job,
     authorize_run_shell, authorize_run_shell_start, cancel_shell_job, execute_combo_with_boundary,
-    launch_for_session_with_boundary, launch_process_history_row, launch_process_history_row_key,
-    launch_request_details, mcp_error, prepare_run_shell_params_for_context,
-    prepare_run_shell_start_params_for_context, required_combo_permissions,
-    run_authorized_shell_with_boundary, run_shell_idempotency_completed_row,
-    run_shell_idempotency_replay, run_shell_idempotency_reservation_row,
-    run_shell_idempotency_row_key, run_shell_request_details, run_shell_start_request_details,
-    shell_execution_context_for_session, shell_job_status,
-    start_authorized_shell_job_with_boundary, tool, tool_router, validate_agent_spawn_params,
-    validate_run_shell_execution_plan,
+    launch_for_session_with_boundary, launch_idempotent_request, launch_process_history_row,
+    launch_process_history_row_key, launch_request_details, mcp_error,
+    prepare_run_shell_params_for_context, prepare_run_shell_start_params_for_context,
+    required_combo_permissions, run_authorized_shell_with_boundary, run_shell_idempotent_request,
+    run_shell_request_details, run_shell_start_request_details, shell_execution_context_for_session,
+    shell_job_status, start_authorized_shell_job_with_boundary, tool, tool_router,
+    validate_agent_spawn_params, validate_run_shell_execution_plan,
 };
 
 use std::{
@@ -32,7 +30,7 @@ use std::{
 };
 
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 use synapse_storage::{cf, decode_json};
@@ -1371,8 +1369,92 @@ impl SynapseService {
         } else {
             self.audit_action_started_with_details("act_launch", &command_payload)?;
         }
+        let result = self
+            .launch_with_idempotency(params, session_id.clone(), preflight)
+            .await;
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_launch",
+                    "spawn",
+                    session_id.clone(),
+                    session_id.clone(),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_launch",
+                    "spawn",
+                    session_id.clone(),
+                    session_id.clone(),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        if let Some(session_id) = session_id.as_deref() {
+            self.audit_action_result_for_session("act_launch", &result, session_id)?;
+        } else {
+            self.audit_action_result("act_launch", &result)?;
+        }
+        result
+    }
+
+    /// `act_launch` once per idempotency key (#146): a replay with the same key
+    /// and request returns the first launch's response without launching again,
+    /// and a changed request under the same key is refused.
+    async fn launch_with_idempotency(
+        &self,
+        params: ActLaunchParams,
+        session_id: Option<String>,
+        preflight: &super::action_preflight::ActionPreflightReadback,
+    ) -> Result<ActLaunchResponse, ErrorData> {
+        let Some(request) =
+            launch_idempotent_request(&self.m4_config, &params, session_id.as_deref())?
+        else {
+            return self.launch_and_record(params, session_id, preflight).await;
+        };
+        let runtime = self.reflex_runtime()?;
+        if let Some(response) = reserve_idempotent_request(&runtime, &request)? {
+            return Ok(response);
+        }
+        match self.launch_and_record(params, session_id, preflight).await {
+            Ok(response) => {
+                record_idempotent_response(&runtime, &request, &response)?;
+                Ok(response)
+            }
+            Err(error) => Err(clear_failed_idempotency_reservation(
+                self,
+                &runtime,
+                &request,
+                "act_launch_execution_failed",
+                error,
+            )),
+        }
+    }
+
+    /// One physical launch plus its process job, process history row and
+    /// session resource registration.
+    async fn launch_and_record(
+        &self,
+        params: ActLaunchParams,
+        session_id: Option<String>,
+        preflight: &super::action_preflight::ActionPreflightReadback,
+    ) -> Result<ActLaunchResponse, ErrorData> {
         let boundary = |stage| ensure_m4_physical_mutation_boundary(preflight, stage);
-        let result = match launch_for_session_with_boundary(
+        match launch_for_session_with_boundary(
             &self.m4_config,
             params.clone(),
             session_id.as_deref(),
@@ -1439,14 +1521,14 @@ impl SynapseService {
                         }),
                     ));
                 }
-                if let (Some(session_id), Some(process_job)) = (session_id.clone(), process_job) {
+                if let (Some(session_id), Some(process_job)) = (session_id, process_job) {
                     if let Err(error) = self.register_session_process_resource(
                         super::session_lifecycle::SessionProcessResource::new(
                             session_id,
                             "act_launch",
                             response.pid,
                             None,
-                            params.target.clone(),
+                            params.target,
                             process_job,
                         )
                         .with_desktop_lease(outcome.desktop_lease.take()),
@@ -1467,45 +1549,7 @@ impl SynapseService {
                 Ok(response)
             }
             Err(error) => Err(error),
-        };
-        match &result {
-            Ok(response) => self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "act_launch",
-                    "spawn",
-                    session_id.clone(),
-                    session_id.clone(),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
-                        "response": response,
-                    }),
-                    "ok",
-                ),
-            )?,
-            Err(error) => self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
-                    "act_launch",
-                    "spawn",
-                    session_id.clone(),
-                    session_id.clone(),
-                    command_payload,
-                    command_before,
-                    json!({
-                        "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
-                    }),
-                    "error",
-                )
-                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
-            )?,
-        };
-        if let Some(session_id) = session_id.as_deref() {
-            self.audit_action_result_for_session("act_launch", &result, session_id)?;
-        } else {
-            self.audit_action_result("act_launch", &result)?;
         }
-        result
     }
 }
 
@@ -3810,7 +3854,7 @@ async fn run_shell_with_idempotency(
     validate_run_shell_execution_plan(&params, inline_await_limit_ms)?;
     let session_id = context.map(ShellExecutionContext::session_id);
     let boundary = |stage| ensure_m4_physical_mutation_boundary(preflight, stage);
-    let Some(row_key) = run_shell_idempotency_row_key(&params, session_id)? else {
+    let Some(request) = run_shell_idempotent_request(&params, &authorization, session_id)? else {
         return run_authorized_shell_with_boundary(
             params,
             &authorization,
@@ -3822,38 +3866,21 @@ async fn run_shell_with_idempotency(
     };
 
     let runtime = service.reflex_runtime()?;
-    {
-        let runtime = runtime.lock().map_err(|_error| {
-            mcp_error(
-                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                "reflex runtime lock poisoned while checking act_run_shell idempotency",
-            )
-        })?;
-        if let Some(existing) = runtime
-            .storage_kv_row(&row_key)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?
-        {
-            drop(runtime);
-            return run_shell_idempotency_replay(&params, &existing, session_id);
-        }
-        let reservation =
-            run_shell_idempotency_reservation_row(&params, &authorization, session_id)?;
-        runtime
-            .storage_put_kv_rows(vec![(row_key.clone(), reservation)])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    if let Some(response) = reserve_idempotent_request(&runtime, &request)? {
+        return Ok(response);
     }
 
     if let Err(error) = boundary("act_run_shell_before_idempotent_process_launch") {
-        return Err(clear_failed_run_shell_idempotency_reservation(
+        return Err(clear_failed_idempotency_reservation(
             service,
             &runtime,
-            &row_key,
+            &request,
             "act_run_shell_before_idempotent_process_launch",
             error,
         ));
     }
     let response = match run_authorized_shell_with_boundary(
-        params.clone(),
+        params,
         &authorization,
         inline_await_limit_ms,
         context,
@@ -3863,38 +3890,78 @@ async fn run_shell_with_idempotency(
     {
         Ok(response) => response,
         Err(error) => {
-            return Err(clear_failed_run_shell_idempotency_reservation(
+            return Err(clear_failed_idempotency_reservation(
                 service,
                 &runtime,
-                &row_key,
+                &request,
                 "act_run_shell_authorized_execution_failed",
                 error,
             ));
         }
     };
-    let completed =
-        run_shell_idempotency_completed_row(&params, &authorization, &response, session_id)?;
+    record_idempotent_response(&runtime, &request, &response)?;
+    Ok(response)
+}
+
+fn reserve_idempotent_request<R: DeserializeOwned>(
+    runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
+    request: &IdempotentRequest,
+) -> Result<Option<R>, ErrorData> {
+    let reservation = request.reservation_row()?;
     {
         let runtime = runtime.lock().map_err(|_error| {
             mcp_error(
                 synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                "reflex runtime lock poisoned while recording act_run_shell idempotency",
+                format!(
+                    "reflex runtime lock poisoned while checking {} idempotency",
+                    request.tool_name()
+                ),
             )
         })?;
+        if let Some(existing) = runtime
+            .storage_kv_row(request.row_key())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        {
+            drop(runtime);
+            return request.replay(&existing).map(Some);
+        }
         runtime
-            .storage_put_kv_rows(vec![(row_key, completed)])
+            .storage_put_kv_rows(vec![(request.row_key().to_vec(), reservation)])
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     }
-    Ok(response)
+    Ok(None)
 }
 
-fn clear_failed_run_shell_idempotency_reservation(
+/// Stores the first call's response in `request`'s idempotency row.
+fn record_idempotent_response<R: Serialize>(
+    runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
+    request: &IdempotentRequest,
+    response: &R,
+) -> Result<(), ErrorData> {
+    let completed = request.completed_row(response)?;
+    let runtime = runtime.lock().map_err(|_error| {
+        mcp_error(
+            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "reflex runtime lock poisoned while recording {} idempotency",
+                request.tool_name()
+            ),
+        )
+    })?;
+    runtime
+        .storage_put_kv_rows(vec![(request.row_key().to_vec(), completed)])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+fn clear_failed_idempotency_reservation(
     service: &SynapseService,
     runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
-    row_key: &[u8],
+    request: &IdempotentRequest,
     stage: &'static str,
     error: ErrorData,
 ) -> ErrorData {
+    let tool = request.tool_name();
+    let row_key = request.row_key();
     let mut delete_error = None;
     let mut readback_error = None;
     let mut row_exists_after = None;
@@ -3911,10 +3978,9 @@ fn clear_failed_run_shell_idempotency_reservation(
             }
         }
         Err(_error) => {
-            delete_error = Some(
-                "reflex runtime lock poisoned while deleting failed act_run_shell idempotency reservation"
-                    .to_owned(),
-            );
+            delete_error = Some(format!(
+                "reflex runtime lock poisoned while deleting failed {tool} idempotency reservation"
+            ));
         }
     }
     let cleanup_verified =
@@ -3922,19 +3988,20 @@ fn clear_failed_run_shell_idempotency_reservation(
     let drain = (!cleanup_verified).then(|| {
         service
             .drain_state_handle()
-            .mark_draining("act_run_shell_idempotency_cleanup_unverified")
+            .mark_draining(request.cleanup_drain_reason())
     });
     if !cleanup_verified {
         tracing::error!(
             code = error_codes::ACTION_POSTCONDITION_FAILED,
-            detail_code = "ACT_RUN_SHELL_IDEMPOTENCY_RESERVATION_CLEANUP_UNVERIFIED",
+            detail_code = "IDEMPOTENCY_RESERVATION_CLEANUP_UNVERIFIED",
+            tool,
             stage,
             row_key = %String::from_utf8_lossy(row_key),
             delete_error = ?delete_error,
             readback_error = ?readback_error,
             row_exists_after = ?row_exists_after,
             drain = ?drain,
-            "failed act_run_shell left an idempotency reservation whose physical cleanup could not be verified"
+            "failed {tool} left an idempotency reservation whose physical cleanup could not be verified"
         );
     }
     let mut data = match error.data {

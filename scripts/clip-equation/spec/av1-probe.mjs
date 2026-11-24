@@ -371,11 +371,12 @@ function recovered(fixture, name, damage, held) {
   return { dir, result, before, lines: readJsonl(path.join(dir, 'frames.jsonl')) };
 }
 // Another process holds HOLD_FILE (opened for reading, sharing only delete, as an indexer or antivirus
-// may) while the probe runs with the arguments of HOLD_ARGS (one per line); prints the probe's output.
-const HOLD_AND_RUN = "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Delete'); try { & $env:HOLD_PROBE ($env:HOLD_ARGS -split '\\n') } finally { $f.Close() }";
+// may; HOLD_SHARE in `env` names other sharing) while the probe runs with the arguments of HOLD_ARGS
+// (one per line); prints the probe's output.
+const HOLD_AND_RUN = "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', $env:HOLD_SHARE); try { & $env:HOLD_PROBE ($env:HOLD_ARGS -split '\\n') } finally { $f.Close() }";
 /** Runs the probe with `args` (and `env` added) while another process holds `file`. */
 const runProbeHolding = (file, args, env = {}) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', HOLD_AND_RUN],
-  { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, ...env, HOLD_FILE: file, HOLD_PROBE: PROBE, HOLD_ARGS: args.join('\n') } });
+  { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, HOLD_SHARE: 'Delete', ...env, HOLD_FILE: file, HOLD_PROBE: PROBE, HOLD_ARGS: args.join('\n') } });
 /** The probe's last output line as JSON, or { error }. */
 const probeJson = run => {
   if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
@@ -739,6 +740,33 @@ function failedAtomicWriteRemovesTemp() {
 }
 
 /**
+ * A failed atomic write removes its temp file, or says it could not. Another process holds
+ * `active-clips.json.tmp` (opened for reading, sharing read and write but not delete): the product
+ * writes the temp file, but neither the rename over the registry nor the removal of the temp file can
+ * happen. The change ends with an error that names the temp file it could not remove, and the registry
+ * is byte-equal.
+ */
+function failedTempRemovalReported() {
+  const appData = path.join(OUT, 'registry-temp-held');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const file = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(file, JSON.stringify([{ clip_id: 'clip-a', folder: path.join(clips, 'clip-a'), finished: false }], null, 2));
+  const before = fs.readFileSync(file, 'utf8');
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, '');
+  const got = probeJson(runProbeHolding(temp, ['exp-av1-registry', 'action=mark_finished', 'clip=clip-a'], { LOCALAPPDATA: appData, HOLD_SHARE: 'ReadWrite' }));
+  const problems = [];
+  const error = String(got.error);
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('mark_finished succeeded while its temp file could not be renamed');
+  else if (!error.includes(`could not remove ${temp}`)) problems.push(`the error does not say the temp file could not be removed: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  if (fs.readFileSync(file, 'utf8') !== before) problems.push('the registry changed');
+  return verdict(problems, `temp file held without delete sharing: mark_finished ended with an error naming the temp file it could not remove (${error.replace(/\s+/g, ' ').slice(0, 200)}); the registry is byte-equal`);
+}
+
+/**
  * A clip the earlier code recorded in the default clips folder without registering it, left `recording`
  * by a crash, with no registry at all (here under a LOCALAPPDATA of the bench's own): recovery at start
  * reaches it. The clip is ready afterwards and the registry lists it, finished.
@@ -1029,6 +1057,7 @@ const table = {
   'recovery never deletes a still it could not read': heldStillKept,
   'a registry change never writes from a failed read': registryKeptOnFailedRead,
   'a failed atomic write removes its temp file': failedAtomicWriteRemovesTemp,
+  'a failed atomic write says when it could not remove its temp file': failedTempRemovalReported,
   'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
   'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
   'recovery at start reports a clip it could not recover': recoveryFailureReported,

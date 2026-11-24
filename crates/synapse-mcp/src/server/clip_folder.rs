@@ -810,7 +810,9 @@ pub(super) fn write_atomically(path: &Path, value: &impl Serialize) -> Result<()
 
 /// Writes `bytes` to `<path>.tmp`, flushes it to disk and renames it over `path`.
 /// A write that fails after the temp file was created (a full disk, a
-/// rename refused) removes the temp file, so no partial `.tmp` stays.
+/// rename refused) removes the temp file, so no partial `.tmp` stays; the
+/// removal gets the same brief-hold retries as the rename, and a removal
+/// that still fails is added to the returned error.
 pub(super) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension(format!(
         "{}{TEMP_SUFFIX}",
@@ -830,13 +832,16 @@ pub(super) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), St
         retry_brief_hold(|| std::fs::rename(&temp, path))
             .map_err(|error| format!("could not replace {}: {error}", path.display()))
     });
-    if replaced.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    replaced
+    replaced.map_err(
+        |error| match retry_brief_hold(|| std::fs::remove_file(&temp)) {
+            Ok(()) => error,
+            Err(removal) if removal.kind() == std::io::ErrorKind::NotFound => error,
+            Err(removal) => format!("{error}; could not remove {}: {removal}", temp.display()),
+        },
+    )
 }
 
-/// Runs a file operation (a rename that replaces, a read). When another
+/// Runs a file operation (a rename that replaces, a read, a removal). When another
 /// program holds the file for a moment (antivirus, indexer, or another
 /// process replacing it: `BRIEF_HOLD_OS_ERRORS`), the operation is tried
 /// again, up to `BRIEF_HOLD_ATTEMPTS` times in all and

@@ -290,8 +290,9 @@ pub struct TaskUpdateParams {
     #[serde(default)]
     #[schemars(default)]
     pub reason: Option<String>,
+    /// 1 (highest) .. 5 (lowest).
     #[serde(default)]
-    #[schemars(default)]
+    #[schemars(default, range(min = 1, max = 5))]
     pub priority: Option<u8>,
     #[serde(default)]
     #[schemars(default)]
@@ -497,6 +498,23 @@ fn validate_priority(priority: u8) -> Result<(), ErrorData> {
         return Err(params_error(format!(
             "agent_task priority must be {MIN_PRIORITY}..={MAX_PRIORITY} (1 = highest), got {priority}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_list_max(max: usize) -> Result<(), ErrorData> {
+    if !(1..=MAX_LIST_TASKS).contains(&max) {
+        return Err(params_error(format!(
+            "agent_task list max must be 1..={MAX_LIST_TASKS}, got {max}"
+        )));
+    }
+    Ok(())
+}
+
+/// A cap of 0 would report `at_capacity:0` forever; the schema minimum is 1.
+fn validate_concurrency_cap(concurrency_cap: usize) -> Result<(), ErrorData> {
+    if concurrency_cap == 0 {
+        return Err(params_error("agent_task concurrency_cap must be >= 1, got 0"));
     }
     Ok(())
 }
@@ -1317,6 +1335,7 @@ impl SynapseService {
     }
 
     fn task_list_impl(&self, params: TaskListParams) -> Result<TaskListResponse, ErrorData> {
+        validate_list_max(params.max)?;
         let db = self.agent_task_db()?;
         Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         // Lazy reconcile on read so orphaned in_progress tasks surface even
@@ -1337,6 +1356,7 @@ impl SynapseService {
     }
 
     fn task_next_impl(&self, params: TaskNextParams) -> Result<TaskNextResponse, ErrorData> {
+        validate_concurrency_cap(params.concurrency_cap)?;
         let db = self.agent_task_db()?;
         Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
@@ -1416,6 +1436,7 @@ impl SynapseService {
         params: TaskDispatchOnceParams,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        validate_concurrency_cap(params.concurrency_cap)?;
         let dispatch_activity =
             super::m4_tools::AgentSpawnInFlightGuard::enter("mcp_task_dispatch_outer")?;
         let db = self.agent_task_db()?;
@@ -1638,6 +1659,7 @@ impl SynapseService {
         &self,
         params: TaskDispatchOnceParams,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        validate_concurrency_cap(params.concurrency_cap)?;
         let dispatch_activity =
             super::m4_tools::AgentSpawnInFlightGuard::enter("dashboard_task_dispatch_outer")?;
         let db = self.agent_task_db()?;

@@ -13744,11 +13744,12 @@ fn wait_for_shell_job_remote_metadata(
     paths: &ShellJobPaths,
     timeout: Duration,
 ) -> Result<bool, ErrorData> {
-    // Only an SSH job whose remote pid/pgid are still unknown can gain
-    // metadata by waiting; any other job would sleep the whole timeout and
-    // delay the caller's termination (#283).
+    // Waiting helps only when the spawn installed the remote-metadata emitter
+    // and the remote pid/pgid are still unknown. Any other job (local, SCP,
+    // SFTP, SSH without the emitter) would sleep the whole timeout and delay
+    // the caller's termination (#283).
     let scope = &job.remote_process_scope;
-    if scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+    if !shell_job_remote_metadata_emitter_installed(paths)
         || (scope.remote_process_id.is_some() && scope.remote_process_group_id.is_some())
     {
         return Ok(false);
@@ -13763,6 +13764,14 @@ fn wait_for_shell_job_remote_metadata(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The spawn path installs the remote-metadata emitter exactly when its spawn
+/// plan carries a remote cleanup invocation, and persists that invocation as
+/// the remote-cleanup sidecar; the sidecar is the durable record of that
+/// fact.
+fn shell_job_remote_metadata_emitter_installed(paths: &ShellJobPaths) -> bool {
+    matches!(paths.remote_cleanup_path.try_exists(), Ok(true))
 }
 
 fn verify_shell_job_remote_cleanup_after_terminal(

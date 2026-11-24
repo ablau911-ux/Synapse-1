@@ -189,12 +189,17 @@ fn check_format(folder: &Path) -> Result<(), ErrorData> {
     let header: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
         params_invalid(format!("{} is not valid JSON: {error}", path.display()))
     })?;
-    let version = header.get("schema_version").and_then(serde_json::Value::as_u64);
+    let version = header
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64);
     let method = header.get("method").and_then(serde_json::Value::as_str);
     if version == Some(u64::from(CLIP_SCHEMA_VERSION)) && method == Some(CLIP_METHOD) {
         return Ok(());
     }
-    let format = match (header.get("way").and_then(serde_json::Value::as_str), method) {
+    let format = match (
+        header.get("way").and_then(serde_json::Value::as_str),
+        method,
+    ) {
         (Some(way), _) => format!(
             "the older {way} format (exact zstd rows under frames/ plus H.264 segments under moving/)"
         ),
@@ -409,7 +414,10 @@ impl ViewedClip {
         entries
     }
 
-    fn repeat_entry(&self, (start, end, count, stored): (u64, u64, u64, BTreeSet<u64>)) -> ClipTimelineEntry {
+    fn repeat_entry(
+        &self,
+        (start, end, count, stored): (u64, u64, u64, BTreeSet<u64>),
+    ) -> ClipTimelineEntry {
         let names = stored
             .iter()
             .map(u64::to_string)
@@ -421,7 +429,11 @@ impl ViewedClip {
                 fmt_time(self.t_of(start))
             )
         } else {
-            let stills = if stored.len() == 1 { "the still" } else { "the stills" };
+            let stills = if stored.len() == 1 {
+                "the still"
+            } else {
+                "the stills"
+            };
             format!(
                 "{}-{} settled {count} times again on {stills} of instant {names}, no new picture",
                 fmt_time(self.t_of(start)),
@@ -472,7 +484,14 @@ impl ViewedClip {
             .collect()
     }
 
-    fn entry(&self, kind: &str, start: u64, end: u64, count: u64, text: String) -> ClipTimelineEntry {
+    fn entry(
+        &self,
+        kind: &str,
+        start: u64,
+        end: u64,
+        count: u64,
+        text: String,
+    ) -> ClipTimelineEntry {
         ClipTimelineEntry {
             kind: kind.to_owned(),
             start_ms: self.t_of(start),
@@ -494,9 +513,14 @@ impl ViewedClip {
     fn overview_picks(&self) -> Vec<Pick> {
         let mut picks: Vec<Pick> = Vec::new();
         let first = (0..=self.last_instant()).find(|k| self.is_recorded(*k));
-        let last = (0..=self.last_instant()).rev().find(|k| self.is_recorded(*k));
+        let last = (0..=self.last_instant())
+            .rev()
+            .find(|k| self.is_recorded(*k));
         picks.extend(first.map(|instant| Pick::new(instant, "first")));
-        picks.extend(self.still_instants().map(|instant| Pick::new(instant, "settled")));
+        picks.extend(
+            self.still_instants()
+                .map(|instant| Pick::new(instant, "settled")),
+        );
         picks.extend(
             self.change_entries()
                 .iter()
@@ -554,14 +578,19 @@ fn marks(line: &IndexLine) -> usize {
 }
 
 /// Runs of consecutive lines with the same `Some` key: (first, last, key).
-fn runs<T: PartialEq>(lines: &[IndexLine], key: impl Fn(&IndexLine) -> Option<T>) -> Vec<(u64, u64, T)> {
+fn runs<T: PartialEq>(
+    lines: &[IndexLine],
+    key: impl Fn(&IndexLine) -> Option<T>,
+) -> Vec<(u64, u64, T)> {
     let mut runs: Vec<(u64, u64, T)> = Vec::new();
     for line in lines {
         let Some(value) = key(line) else {
             continue;
         };
         match runs.last_mut() {
-            Some((_, end, last)) if *end + 1 == line.instant && *last == value => *end = line.instant,
+            Some((_, end, last)) if *end + 1 == line.instant && *last == value => {
+                *end = line.instant
+            }
             _ => runs.push((line.instant, line.instant, value)),
         }
     }
@@ -579,7 +608,9 @@ fn timeline_rank(kind: &str) -> u8 {
 }
 
 fn nearest_text(before: Option<u64>, after: Option<u64>) -> String {
-    let side = |instant: Option<u64>| instant.map_or_else(|| "none".to_owned(), |k| format!("instant {k}"));
+    let side = |instant: Option<u64>| {
+        instant.map_or_else(|| "none".to_owned(), |k| format!("instant {k}"))
+    };
     format!(
         "nearest recorded: {} before, {} after",
         side(before),
@@ -669,7 +700,12 @@ impl ClipView {
             )));
         }
         let stills = self.clip.still_instants().count();
-        let lost = self.clip.lines.iter().filter(|line| line.lost.is_some()).count();
+        let lost = self
+            .clip
+            .lines
+            .iter()
+            .filter(|line| line.lost.is_some())
+            .count();
         let _ = writeln!(
             self.text,
             "Clip {}: {} instants over {}, {} changed (video), {stills} settle points (exact stills), {lost} lost; {} key pictures, page {page}/{pages} (every page spreads over the whole clip):",
@@ -709,8 +745,8 @@ impl ClipView {
     }
 
     fn write_timeline(&mut self) {
-        let budget_chars =
-            usize::try_from(OVERVIEW_TEXT_TOKEN_BUDGET).unwrap_or(usize::MAX) * TEXT_CHARS_PER_TOKEN;
+        let budget_chars = usize::try_from(OVERVIEW_TEXT_TOKEN_BUDGET).unwrap_or(usize::MAX)
+            * TEXT_CHARS_PER_TOKEN;
         let mut kept = Vec::new();
         for entry in self.clip.timeline() {
             if self.text.len() + entry.text.len() + 3 > budget_chars {
@@ -783,7 +819,13 @@ impl ClipView {
                 continue;
             };
             let stem = format!("frames_{start}-{end}_{index:02}_f{instant}");
-            self.export(fit(image, long_edge), index, &picture, "range sample", &stem)?;
+            self.export(
+                fit(image, long_edge),
+                index,
+                &picture,
+                "range sample",
+                &stem,
+            )?;
             previous = Some((shown, index));
         }
         Ok(())
@@ -886,7 +928,10 @@ impl ClipView {
             }
         }
         if any_lost {
-            let _ = writeln!(self.text, "- no comparison: a lost instant holds no picture");
+            let _ = writeln!(
+                self.text,
+                "- no comparison: a lost instant holds no picture"
+            );
             return Ok(());
         }
         let [(_, before_source), (_, after_source)] = &sources;
@@ -1084,7 +1129,12 @@ impl ClipView {
         let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
         let mut png = Vec::new();
         PngEncoder::new_with_quality(&mut png, VIEW_PNG_COMPRESSION, FilterType::Adaptive)
-            .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                ExtendedColorType::Rgb8,
+            )
             .map_err(|error| internal(format!("PNG encode failed: {error}")))?;
         std::fs::write(&path, &png)
             .map_err(|error| internal(format!("could not write {path:?}: {error}")))?;
@@ -1186,7 +1236,8 @@ impl ChangedBlocks {
                     .zip(below.chunks_exact(RGBA_BYTES));
                 for (x, (a, b)) in pixels.enumerate() {
                     if a[..RGB_BYTES] != b[..RGB_BYTES]
-                        && let Some(block) = changed.get_mut((y / BLOCK_PX) * columns + x / BLOCK_PX)
+                        && let Some(block) =
+                            changed.get_mut((y / BLOCK_PX) * columns + x / BLOCK_PX)
                     {
                         *block = true;
                     }
@@ -1229,8 +1280,8 @@ impl ChangedBlocks {
                 last = (last.0.max(column), last.1.max(row));
                 let near_rows = row.saturating_sub(gap_rows)..=(row + gap_rows).min(self.rows - 1);
                 for near_row in near_rows {
-                    let near_columns =
-                        column.saturating_sub(gap_columns)..=(column + gap_columns).min(self.columns - 1);
+                    let near_columns = column.saturating_sub(gap_columns)
+                        ..=(column + gap_columns).min(self.columns - 1);
                     for near_column in near_columns {
                         let near = near_row * self.columns + near_column;
                         if self.changed[near] && !seen[near] {

@@ -268,7 +268,9 @@ impl Av1Encoder {
             )
         };
         if code != aom::AOM_CODEC_OK {
-            return Err(format!("aom_codec_enc_init_ver failed: libaom error {code}"));
+            return Err(format!(
+                "aom_codec_enc_init_ver failed: libaom error {code}"
+            ));
         }
         // SAFETY: libaom allocates and owns the picture; checked for null below.
         let image = unsafe {
@@ -291,7 +293,11 @@ impl Av1Encoder {
             return Err("aom_img_alloc failed".to_owned());
         }
         encoder.control_int("AOME_SET_CPUUSED", aom::AOME_SET_CPUUSED, CPU_USED)?;
-        encoder.control_uint("AOME_SET_CQ_LEVEL", aom::AOME_SET_CQ_LEVEL, settings.quality)?;
+        encoder.control_uint(
+            "AOME_SET_CQ_LEVEL",
+            aom::AOME_SET_CQ_LEVEL,
+            settings.quality,
+        )?;
         encoder.control_int(
             "AV1E_SET_TUNE_CONTENT",
             aom::AV1E_SET_TUNE_CONTENT,
@@ -354,7 +360,8 @@ impl Av1Encoder {
             // SAFETY: allocated by `aom_img_alloc` for these dimensions and not
             // shared; each plane holds at least `stride * rows` bytes (rows
             // rounded up to even for U and V).
-            let target = unsafe { std::slice::from_raw_parts_mut(image.planes[plane], stride * rows) };
+            let target =
+                unsafe { std::slice::from_raw_parts_mut(image.planes[plane], stride * rows) };
             for (row, line) in source.chunks_exact(row_bytes).enumerate() {
                 target[row * stride..row * stride + row_bytes].copy_from_slice(line);
             }
@@ -363,7 +370,12 @@ impl Av1Encoder {
     }
 
     /// Encodes one 4:2:0 picture; `pts` is its instant number.
-    fn encode(&mut self, picture: &I420Picture, pts: i64, force_key: bool) -> Result<Packet, String> {
+    fn encode(
+        &mut self,
+        picture: &I420Picture,
+        pts: i64,
+        force_key: bool,
+    ) -> Result<Packet, String> {
         self.fill(picture)?;
         let flags = if force_key {
             aom::AOM_EFLAG_FORCE_KF as aom::aom_enc_frame_flags_t

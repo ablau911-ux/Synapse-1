@@ -98,7 +98,11 @@ impl PictureSource {
     /// gives the exact picture, otherwise the encoded video picture is used.
     /// A lost instant, or an unchanged one that repeats a lost picture, is
     /// lost.
-    pub(super) fn resolve(folder: &Path, lines: &[IndexLine], instant: u64) -> Result<Self, String> {
+    pub(super) fn resolve(
+        folder: &Path,
+        lines: &[IndexLine],
+        instant: u64,
+    ) -> Result<Self, String> {
         let mut current = instant;
         loop {
             let line = find_line(lines, current)
@@ -503,7 +507,9 @@ impl Av1Decoder {
                 DAV1D_OK => {}
                 DAV1D_AGAIN => {
                     if !self.take()? && !self.take()? {
-                        return Err("dav1d refused data and gave no picture to make room".to_owned());
+                        return Err(
+                            "dav1d refused data and gave no picture to make room".to_owned()
+                        );
                     }
                 }
                 code => return check(code, "dav1d_send_data"),
@@ -544,7 +550,11 @@ impl Av1Decoder {
             .sent
             .checked_sub(1)
             .ok_or_else(|| "the AV1 decoder was sent no picture".to_owned())?;
-        while self.held.as_ref().is_none_or(|(number, _)| *number < wanted) {
+        while self
+            .held
+            .as_ref()
+            .is_none_or(|(number, _)| *number < wanted)
+        {
             if !self.take()? {
                 return Err(format!(
                     "dav1d gave {} pictures for {} units; picture {wanted} never came out",
@@ -573,7 +583,9 @@ impl Av1Decoder {
                 picture.p.layout, picture.p.bpc
             ));
         }
-        let size = |value: c_int| usize::try_from(value).map_err(|_| "decoded picture has a negative size".to_owned());
+        let size = |value: c_int| {
+            usize::try_from(value).map_err(|_| "decoded picture has a negative size".to_owned())
+        };
         let (width, height) = (size(picture.p.w)?, size(picture.p.h)?);
         let (chroma_width, chroma_rows) = (width.div_ceil(2), height.div_ceil(2));
         // SAFETY: dav1d sets the sequence header of every picture it outputs;
@@ -586,8 +598,18 @@ impl Av1Decoder {
         // The planes stay valid while `self.held` holds its reference, which
         // outlives this call.
         let luma = Plane::of(picture.data[0], picture.stride[0], width, height)?;
-        let blue = Plane::of(picture.data[1], picture.stride[1], chroma_width, chroma_rows)?;
-        let red = Plane::of(picture.data[2], picture.stride[1], chroma_width, chroma_rows)?;
+        let blue = Plane::of(
+            picture.data[1],
+            picture.stride[1],
+            chroma_width,
+            chroma_rows,
+        )?;
+        let red = Plane::of(
+            picture.data[2],
+            picture.stride[1],
+            chroma_width,
+            chroma_rows,
+        )?;
         i420_to_rgba(width, height, [&luma, &blue, &red], matrix)
     }
 }
@@ -675,7 +697,8 @@ impl YuvMatrix {
     fn rgba(&self, y: u8, u: u8, v: u8) -> [u8; 4] {
         let luma = self.luma * (i32::from(y) - self.luma_offset) + FIXED_ROUND;
         let (u, v) = (i32::from(u) - CHROMA_OFFSET, i32::from(v) - CHROMA_OFFSET);
-        let channel = |value: i32| u8::try_from((value >> FIXED_SHIFT).clamp(0, 255)).unwrap_or(OPAQUE);
+        let channel =
+            |value: i32| u8::try_from((value >> FIXED_SHIFT).clamp(0, 255)).unwrap_or(OPAQUE);
         [
             channel(luma + self.red_v * v),
             channel(luma + self.green_u * u + self.green_v * v),
@@ -708,7 +731,9 @@ impl<'a> Plane<'a> {
         let length = stride * rows.saturating_sub(1) + width;
         // SAFETY: dav1d allocates `stride` bytes for each of the plane's rows;
         // the last row is read only up to `width`.
-        let bytes = unsafe { std::slice::from_raw_parts(pointer.as_ptr().cast::<u8>().cast_const(), length) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(pointer.as_ptr().cast::<u8>().cast_const(), length)
+        };
         Ok(Self { bytes, stride })
     }
 
@@ -741,7 +766,8 @@ fn i420_to_rgba(
             rgba.extend_from_slice(&matrix.rgba(sample, u, v));
         }
     }
-    let size = |value: usize| u32::try_from(value).map_err(|_| "decoded picture is too large".to_owned());
+    let size =
+        |value: usize| u32::try_from(value).map_err(|_| "decoded picture is too large".to_owned());
     RgbaImage::from_raw(size(width)?, size(height)?, rgba)
         .ok_or_else(|| "a decoded picture converted to a buffer of the wrong size".to_owned())
 }

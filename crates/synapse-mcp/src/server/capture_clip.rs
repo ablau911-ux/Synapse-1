@@ -705,7 +705,13 @@ mod live {
 
         /// The one `CLIP_RECORD_TIMING` line of a recording: totals of every
         /// stage, so its processor cost is explained by measurement.
-        fn log(&self, clip_id: &str, observer: &ObserverStats, instants: u64, stream: &StreamTimes) {
+        fn log(
+            &self,
+            clip_id: &str,
+            observer: &ObserverStats,
+            instants: u64,
+            stream: &StreamTimes,
+        ) {
             let video = &stream.video;
             let wall_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let process_cpu_ms =
@@ -875,18 +881,18 @@ mod live {
                 .clip_json
                 .time(|| {
                     ClipJson::update(folder, |clip| {
-                clip.clock = clock;
-                clip.geometry = geometry;
-                clip.observer = ObserverGrant {
-                    cursor_in_picture: settings.cursor_in_picture,
-                    border_hidden: settings.border_hidden,
-                    secondary_windows: settings.secondary_windows,
-                    requested_interval_ms: settings.requested_interval_ms,
-                    dirty_regions: settings.dirty_regions,
-                };
-                clip.encoder = Some(encoder);
-                clip.instants = 1;
-                clip.recorded_ms = instant_ms(1);
+                        clip.clock = clock;
+                        clip.geometry = geometry;
+                        clip.observer = ObserverGrant {
+                            cursor_in_picture: settings.cursor_in_picture,
+                            border_hidden: settings.border_hidden,
+                            secondary_windows: settings.secondary_windows,
+                            requested_interval_ms: settings.requested_interval_ms,
+                            dirty_regions: settings.dirty_regions,
+                        };
+                        clip.encoder = Some(encoder);
+                        clip.instants = 1;
+                        clip.recorded_ms = instant_ms(1);
                     })
                 })
                 .map_err(internal_error)?;
@@ -1046,12 +1052,10 @@ mod live {
                 self.times
                     .clip_json
                     .time(|| ClipJson::update(folder, |clip| clip.parts.extend(parts)))
-                    .map_err(
-                    |error| {
+                    .map_err(|error| {
                         tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
                         StopReason::WriteFailed
-                    },
-                )?;
+                    })?;
             }
             Ok(())
         }
@@ -1100,47 +1104,47 @@ mod live {
             let (instants, stream_times) = (summary.instants, summary.times);
             let reference_hns = HNS_PER_SECOND / i64::from(REFERENCE_REFRESH_HZ);
             let updated = self.times.clip_json.time(|| {
-            ClipJson::update(folder, |clip| -> Result<(), String> {
-                clip.parts.extend(summary.parts);
-                clip.stills = summary.stills;
-                clip.encoder = Some(summary.encoder);
-                clip.instants = summary.instants;
-                clip.recorded_ms = recorded_ms;
-                clip.stop_reason = Some(reason);
-                clip.conditions = Conditions {
-                    capture: Some(ConditionStatus::held(serde_json::json!({
-                        "max_hold_ms": stats.max_hold_hns as f64 / HNS_PER_MS as f64,
-                        "reference_period_ms": reference_hns as f64 / HNS_PER_MS as f64,
-                        "hold_within_reference": stats.max_hold_hns <= reference_hns,
-                        "frames_delivered": stats.frames_delivered
-                    }))),
-                    geometry: Some(ConditionStatus::held(serde_json::json!({
-                        "window_width": geometry.window_width,
-                        "window_height": geometry.window_height,
-                        "scale": PIXEL_SCALE
-                    }))),
-                    quality: Some(ConditionStatus::held(serde_json::json!({
-                        "encoder": clip.encoder.as_ref().map(|encoder| encoder.name.clone()),
-                        "parts": clip.parts.len(),
-                        "stills": clip.stills.len(),
-                        "settle_instants": SETTLE_INSTANTS
-                    }))),
-                    totals: Some(ConditionStatus::held(serde_json::json!({
-                        "length_ms": recorded_ms,
-                        "instants": summary.instants,
-                        "encoded": summary.encoded,
-                        "same": summary.same,
-                        "lost": summary.lost.len(),
-                        "stop_reason": reason.as_str()
-                    }))),
-                };
-                clip.add_lost(summary.lost);
-                if clip.state == ClipState::Recording {
-                    clip.state = ClipState::Ready;
-                }
-                clip.set_total_bytes(folder)
-            })
-            .and_then(|(_, result)| result)
+                ClipJson::update(folder, |clip| -> Result<(), String> {
+                    clip.parts.extend(summary.parts);
+                    clip.stills = summary.stills;
+                    clip.encoder = Some(summary.encoder);
+                    clip.instants = summary.instants;
+                    clip.recorded_ms = recorded_ms;
+                    clip.stop_reason = Some(reason);
+                    clip.conditions = Conditions {
+                        capture: Some(ConditionStatus::held(serde_json::json!({
+                            "max_hold_ms": stats.max_hold_hns as f64 / HNS_PER_MS as f64,
+                            "reference_period_ms": reference_hns as f64 / HNS_PER_MS as f64,
+                            "hold_within_reference": stats.max_hold_hns <= reference_hns,
+                            "frames_delivered": stats.frames_delivered
+                        }))),
+                        geometry: Some(ConditionStatus::held(serde_json::json!({
+                            "window_width": geometry.window_width,
+                            "window_height": geometry.window_height,
+                            "scale": PIXEL_SCALE
+                        }))),
+                        quality: Some(ConditionStatus::held(serde_json::json!({
+                            "encoder": clip.encoder.as_ref().map(|encoder| encoder.name.clone()),
+                            "parts": clip.parts.len(),
+                            "stills": clip.stills.len(),
+                            "settle_instants": SETTLE_INSTANTS
+                        }))),
+                        totals: Some(ConditionStatus::held(serde_json::json!({
+                            "length_ms": recorded_ms,
+                            "instants": summary.instants,
+                            "encoded": summary.encoded,
+                            "same": summary.same,
+                            "lost": summary.lost.len(),
+                            "stop_reason": reason.as_str()
+                        }))),
+                    };
+                    clip.add_lost(summary.lost);
+                    if clip.state == ClipState::Recording {
+                        clip.state = ClipState::Ready;
+                    }
+                    clip.set_total_bytes(folder)
+                })
+                .and_then(|(_, result)| result)
             });
             if let Err(error) = updated {
                 tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);

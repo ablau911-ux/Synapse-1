@@ -81,7 +81,9 @@ pub fn part_path(folder: &Path, part: u32) -> PathBuf {
 
 /// The still that belongs to `instant`: `stills/still-NNNNNNNN.webp`.
 pub fn still_path(folder: &Path, instant: u64) -> PathBuf {
-    folder.join(STILLS_DIR).join(format!("still-{instant:08}.webp"))
+    folder
+        .join(STILLS_DIR)
+        .join(format!("still-{instant:08}.webp"))
 }
 
 /// One line of `frames.jsonl`: one per instant, in order. Exactly one of
@@ -156,8 +158,9 @@ impl IvfWriter {
         height: u32,
         ticks_per_second: u32,
     ) -> Result<Self, String> {
-        let narrow =
-            |value: u32| u16::try_from(value).map_err(|_| format!("IVF cannot hold a size of {value}"));
+        let narrow = |value: u32| {
+            u16::try_from(value).map_err(|_| format!("IVF cannot hold a size of {value}"))
+        };
         let mut header = Vec::with_capacity(usize::from(IVF_HEADER_BYTES));
         header.extend_from_slice(IVF_SIGNATURE);
         header.extend_from_slice(&IVF_VERSION.to_le_bytes());
@@ -220,8 +223,8 @@ pub(super) struct IvfPicture {
 /// Every complete picture of an IVF part, in order; a torn last picture is
 /// left out.
 pub(super) fn read_ivf(path: &Path) -> Result<Vec<IvfPicture>, String> {
-    let bytes =
-        std::fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let (pictures, _) = scan_ivf(&bytes, path)?;
     Ok(pictures)
 }
@@ -230,8 +233,8 @@ pub(super) fn read_ivf(path: &Path) -> Result<Vec<IvfPicture>, String> {
 /// and writes the count of complete pictures into the header. Returns that
 /// count and the file's new size.
 pub(super) fn repair_ivf(path: &Path) -> Result<(u32, u64), String> {
-    let bytes =
-        std::fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let (pictures, end) = scan_ivf(&bytes, path)?;
     let count = u32::try_from(pictures.len())
         .map_err(|_| format!("{} holds too many pictures", path.display()))?;
@@ -434,7 +437,12 @@ fn ivf_picture_size(path: &Path) -> Result<(u32, u32), String> {
     let mut header = [0_u8; IVF_HEADER_BYTES as usize];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut header))
-        .map_err(|error| format!("could not read the IVF header of {}: {error}", path.display()))?;
+        .map_err(|error| {
+            format!(
+                "could not read the IVF header of {}: {error}",
+                path.display()
+            )
+        })?;
     let field = |at: usize| u32::from(u16::from_le_bytes([header[at], header[at + 1]]));
     Ok((field(IVF_WIDTH_OFFSET), field(IVF_HEIGHT_OFFSET)))
 }
@@ -623,9 +631,12 @@ impl ClipJson {
             return;
         }
         let failed: Vec<u64> = self.lost.iter().map(|lost| lost.instant).collect();
-        for condition in [self.conditions.capture.as_mut(), self.conditions.totals.as_mut()]
-            .into_iter()
-            .flatten()
+        for condition in [
+            self.conditions.capture.as_mut(),
+            self.conditions.totals.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
         {
             condition.status = "not_held".to_owned();
             condition.failed_instants.clone_from(&failed);

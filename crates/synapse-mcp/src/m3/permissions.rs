@@ -122,7 +122,7 @@ pub fn authorization_error(tool: &str, missing: Permission) -> ErrorData {
             // #276: say how to obtain the grant. M3 grants come only from
             // startup config here (the runtime overlay is reality-only).
             "remediation": format!(
-                "start the daemon with SYNAPSE_MCP_ALLOWED_PERMISSIONS (env) or --allowed-permissions (CLI) listing {missing}"
+                "set SYNAPSE_MCP_ALLOWED_PERMISSIONS (env) or --allowed-permissions (CLI) to a list that includes {missing} plus every grant already in use, and restart the daemon; an explicit list replaces the read-only default grants instead of adding to them"
             ),
         })),
     )

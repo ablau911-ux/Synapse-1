@@ -40,8 +40,9 @@ pub struct SubscribeParams {
     #[serde(default = "default_snapshot_first")]
     #[schemars(default = "default_snapshot_first")]
     pub snapshot_first: bool,
+    /// Fixed at 4096; any other value is refused.
     #[serde(default = "default_buffer_size")]
-    #[schemars(default = "default_buffer_size")]
+    #[schemars(default = "default_buffer_size", range(min = 4096, max = 4096))]
     pub buffer_size: u32,
 }
 

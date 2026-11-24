@@ -101,6 +101,17 @@ fn nothing_delivered_yet() -> bool {
     })
 }
 
+/// What a refusal may say about delivery. The scope covers one backend
+/// action, so the text never claims more than that: a tool that sends several
+/// actions may have delivered earlier ones.
+fn delivery_note() -> &'static str {
+    if nothing_delivered_yet() {
+        "no input of this action was delivered"
+    } else {
+        "earlier input of this action was already delivered; this batch was not"
+    }
+}
+
 fn current_target() -> Option<InputDeliveryTarget> {
     SCOPE.with(|scope| {
         scope
@@ -297,11 +308,12 @@ fn foreground_mismatch_error(
         );
         return ActionError::HumanFullscreenForeground {
             detail: format!(
-                "code={} {detail}: human foreground root_hwnd={foreground_root_hwnd:#x} pid={foreground_pid} is a protected app (notification_state={state_text}) and not the intended target root_hwnd={:#x} pid={} source={}; no input was delivered",
+                "code={} {detail}: human foreground root_hwnd={foreground_root_hwnd:#x} pid={foreground_pid} is a protected app (notification_state={state_text}) and not the intended target root_hwnd={:#x} pid={} source={}; {}",
                 error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND,
                 target.root_hwnd,
                 target.pid,
-                target.source
+                target.source,
+                delivery_note()
             ),
         };
     }
@@ -323,11 +335,7 @@ fn foreground_mismatch_error(
             target.root_hwnd,
             target.pid,
             target.source,
-            if nothing_delivered_yet() {
-                "no input was delivered"
-            } else {
-                "earlier input of this action was already delivered; this batch was not"
-            }
+            delivery_note()
         ),
     }
 }
@@ -362,10 +370,11 @@ fn ensure_human_not_in_protected_foreground(detail: &str) -> Result<(), ActionEr
         );
         return Err(ActionError::HumanFullscreenForeground {
             detail: format!(
-                "code={} {detail}: pointer input has no intended target window and the human is in a protected foreground app (notification_state={}, foreground_root_hwnd={:#x}); no input was delivered",
+                "code={} {detail}: pointer input has no intended target window and the human is in a protected foreground app (notification_state={}, foreground_root_hwnd={:#x}); {}",
                 error_codes::ACTION_HUMAN_FULLSCREEN_FOREGROUND,
                 state.as_str(),
-                foreground_root.unwrap_or_default()
+                foreground_root.unwrap_or_default(),
+                delivery_note()
             ),
         });
     }

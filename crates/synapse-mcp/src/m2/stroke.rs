@@ -892,7 +892,9 @@ async fn execute_with_modifiers(
             let _release_result =
                 release_pressed_modifiers(handle, &pressed, backend, "modifier_press_cleanup")
                     .await;
-            return Err(action_error_to_mcp(&error));
+            return Err(action_error_to_mcp(
+                &error.after_earlier_steps(pressed.len()),
+            ));
         }
         pressed.push(key.clone());
     }
@@ -917,7 +919,9 @@ async fn execute_with_modifiers(
     let release_result = release_pressed_modifiers(handle, &pressed, backend, release_stage).await;
 
     if let Err(error) = stroke_result {
-        return Err(action_error_to_mcp(&error));
+        return Err(action_error_to_mcp(
+            &error.after_earlier_steps(pressed.len()),
+        ));
     }
     if let Some(error) = boundary_error {
         if let Err(release_error) = &release_result {

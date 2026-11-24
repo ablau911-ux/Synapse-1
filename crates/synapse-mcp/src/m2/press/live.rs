@@ -29,7 +29,9 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
             .await
         {
             release_pressed_keys(&handle, &pressed, backend).await;
-            return Err(action_error_to_mcp(&error));
+            return Err(action_error_to_mcp(
+                &error.after_earlier_steps(pressed.len()),
+            ));
         }
         pressed.push(key.clone());
         maybe_force_panic_after_keydown();

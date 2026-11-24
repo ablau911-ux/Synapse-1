@@ -19,7 +19,7 @@ pub(super) async fn execute_actor_actions(
         handle
             .execute(action)
             .await
-            .map_err(|error| action_error_to_mcp(&error))?;
+            .map_err(|error| action_error_to_mcp(&error.after_earlier_steps(action_index)))?;
         maybe_sleep_between_clicks(action_index, action_count, timing).await;
     }
     Ok(())

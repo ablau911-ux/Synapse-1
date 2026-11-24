@@ -191,6 +191,23 @@ impl ActionError {
         )
     }
 
+    /// Clears "refused before any delivery" for a later step of a multi-step
+    /// tool call (press keys, stroke modifiers, click or scroll actions). The
+    /// backend sees one action at a time; once `earlier_steps_done` steps of
+    /// the same tool call ran, its input was already delivered.
+    #[must_use]
+    pub const fn after_earlier_steps(mut self, earlier_steps_done: usize) -> Self {
+        if earlier_steps_done > 0
+            && let Self::ForegroundLost {
+                before_any_delivery,
+                ..
+            } = &mut self
+        {
+            *before_any_delivery = false;
+        }
+        self
+    }
+
     #[must_use]
     pub const fn retry_after_ms(&self) -> Option<u64> {
         match self {

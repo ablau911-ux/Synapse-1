@@ -31,6 +31,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed text-page recording made failed with fps 0 in clip.json, its index cut to the line of instant 1 only: product recovery ends with the error "zero fps" and exit 0 (no crash) | Known: true
   Scenario: recovery refuses a clip longer than the longest recording
     # Equation: killed text-page recording with end_ms = 600000 + 50 in clip.json: product recovery ends with an error naming the longest recording and exit 0; no index line is added | Known: true
+  Scenario: a clip with zero fps is refused when it is read
+    # Equation: killed text-page recording made ready with fps 0 in clip.json: the product's read of clip.json ends with the error "zero fps" and exit 0 | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

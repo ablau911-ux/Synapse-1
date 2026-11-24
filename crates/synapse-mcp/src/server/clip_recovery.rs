@@ -123,18 +123,15 @@ impl ClipRecovery {
 
     /// Repairs the parts, then rewrites the index (when it changes) by
     /// `repair_index`; `planned` instants are filled up with lost lines.
-    /// Returns the index and each part's count of complete pictures. A clip
-    /// with zero fps is refused before any file is touched: the time of a
-    /// lost line cannot be computed, for a recording or a failed clip alike.
+    /// Returns the index and each part's count of complete pictures. `fps` is
+    /// never 0: `ClipJson::read` refuses such a clip, and the recorder passes
+    /// `RECORD_FPS`.
     fn reconcile(
         folder: &Path,
         planned: Option<u64>,
         fps: u32,
         cause: &str,
     ) -> Result<(Vec<IndexLine>, BTreeMap<u32, u32>), String> {
-        if fps == 0 {
-            return Err("recording has zero fps".into());
-        }
         let complete = Self::repair_parts(folder)?;
         let read = read_index(folder).map_err(|error| error.to_string())?;
         let planned = planned.unwrap_or(read.len() as u64);

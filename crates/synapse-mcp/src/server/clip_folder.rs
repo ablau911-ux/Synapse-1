@@ -607,6 +607,11 @@ impl ClipJson {
                 clip.schema_version
             ));
         }
+        // Every reader divides by fps (index times, part times): a clip that
+        // says 0 is refused here, once, for recovery, status and the viewer.
+        if clip.fps == 0 {
+            return Err(format!("{} has zero fps", path.display()));
+        }
         Ok(clip)
     }
 

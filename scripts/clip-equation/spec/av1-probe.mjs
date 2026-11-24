@@ -499,6 +499,22 @@ function failedClipZeroFpsRefused() {
 }
 
 /**
+ * clip.json is refused where it is read when it says fps 0, whatever the clip's state: every reader
+ * (recovery, status, viewer) divides by fps. A ready clip is the case recovery itself never divided for.
+ */
+function zeroFpsRefusedAtRead() {
+  const got = recovered('killed-text-page', 'ready-zero-fps', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'ready';
+    clip.fps = 0;
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (!got.error) return verdict(['a ready clip with fps 0 was read without an error']);
+  const refused = /^recovery failed: .*zero fps/.test(got.error);
+  return verdict(refused ? [] : [`the clip was not refused cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], 'ready clip with fps 0: refused when clip.json is read (zero fps)');
+}
+
+/**
  * A killed recording whose clip.json plans more than the longest recording (10 minutes): recovery
  * refuses it with an error and does not make the lost lines up to that end.
  */
@@ -602,6 +618,7 @@ const table = {
   'recovery makes a failed clip agree with its pictures': failedClipReconciled,
   'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
   'recovery refuses a clip longer than the longest recording': overlongClipRefused,
+  'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

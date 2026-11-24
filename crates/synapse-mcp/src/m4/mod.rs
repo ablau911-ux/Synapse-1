@@ -672,19 +672,37 @@ pub struct ActRunShellCancelResponse {
     pub termination_attempted: bool,
     pub termination_status: String,
     pub remaining_process_ids: Vec<u32>,
-    /// The local process set `termination_status` and `remaining_process_ids`
-    /// cover (`SHELL_CANCEL_TERMINATION_SCOPE`).
+    /// The process set `termination_status` and `remaining_process_ids` cover:
+    /// the local job tree, plus the remote process group for a tracked SSH job
+    /// (`shell_cancel_termination_scope`).
     pub termination_scope: String,
-    /// What that set leaves out (`SHELL_CANCEL_TERMINATION_SCOPE_NOTE`).
+    /// What that set covers and leaves out.
     pub termination_scope_note: String,
     pub remote_process_scope: ActRunShellRemoteProcessScope,
     pub status: ActRunShellStatusResponse,
 }
 
-/// Cancel terminates and re-checks the job's root process and its descendants
-/// found by parent process id; nothing outside that tree.
-const SHELL_CANCEL_TERMINATION_SCOPE: &str = "job_root_process_and_parent_pid_descendants";
-const SHELL_CANCEL_TERMINATION_SCOPE_NOTE: &str = "termination_status and remaining_process_ids cover only the job's root process and its descendants by parent process id; processes started outside that tree (for example through WMI Win32_Process.Create, the Task Scheduler or a service) are not tracked, not terminated and not listed";
+/// The process set cancel covers, as `(termination_scope,
+/// termination_scope_note)`. Cancel terminates and re-checks the job's local
+/// root process and its descendants found by parent process id. A tracked SSH
+/// job (remote cleanup required) also gets its remote process group cleaned
+/// up, and `termination_status` then includes that result.
+fn shell_cancel_termination_scope(
+    remote_process_scope: &ActRunShellRemoteProcessScope,
+) -> (&'static str, &'static str) {
+    if remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH
+        && remote_process_scope.remote_cleanup_required
+    {
+        return (
+            "job_root_process_and_parent_pid_descendants_and_remote_process_group",
+            "termination_status covers the job's local root process (the SSH client) and its descendants by parent process id, and the remote process group in remote_process_scope (remote_process_group_id); the remote group is signalled only when the record's ownership metadata (boot id, start time, ownership token) matches the live remote process, otherwise it is only probed, and remote_process_scope.remote_cleanup_status says which; remaining_process_ids lists only local processes; processes started outside these (for example through WMI Win32_Process.Create, the Task Scheduler, a service, or a remote process that left its group) are not tracked, not terminated and not listed",
+        );
+    }
+    (
+        "job_root_process_and_parent_pid_descendants",
+        "termination_status and remaining_process_ids cover only the job's root process and its descendants by parent process id; processes started outside that tree (for example through WMI Win32_Process.Create, the Task Scheduler or a service) are not tracked, not terminated and not listed",
+    )
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -3226,6 +3244,8 @@ pub fn cancel_shell_job(
         );
     }
     let remote_process_scope = status.job.remote_process_scope.clone();
+    let (termination_scope, termination_scope_note) =
+        shell_cancel_termination_scope(&remote_process_scope);
     Ok(ActRunShellCancelResponse {
         job_id: params.job_id.clone(),
         before_status,
@@ -3233,8 +3253,8 @@ pub fn cancel_shell_job(
         termination_attempted,
         termination_status,
         remaining_process_ids,
-        termination_scope: SHELL_CANCEL_TERMINATION_SCOPE.to_owned(),
-        termination_scope_note: SHELL_CANCEL_TERMINATION_SCOPE_NOTE.to_owned(),
+        termination_scope: termination_scope.to_owned(),
+        termination_scope_note: termination_scope_note.to_owned(),
         remote_process_scope,
         status,
     })

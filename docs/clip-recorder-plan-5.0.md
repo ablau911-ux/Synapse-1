@@ -52,9 +52,9 @@ Basis:
 
 **Still rule:**
 
-    still at instant k  ⇔  picture(k) ≠ picture(k − 1)  and  picture(j) = picture(k) for every j in (k, k + S]      S = SETTLE_INSTANTS
+    still at instant k  ⇔  picture(k) ≠ picture(k − 1)  and  picture(j) = picture(k) for every j in (k, k + S − 1]      S = SETTLE_INSTANTS
 
-The still is written at instant k + S and belongs to instant k. No second still is written until the picture has changed again.
+So the picture is on screen for S instants in a row, k included (0.5 s at S = 10). The still is written at instant k + S − 1 and belongs to instant k. Instant 0 counts as a change. No second still is written until the picture has changed again.
 
 **End of recording:** the encoder is drained, the last part is closed, `clip.json` is written complete. A `record` call that fails before the first picture removes the folder it created and never touches a folder that existed before the call (#290 comment 1375).
 

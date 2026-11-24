@@ -74,7 +74,8 @@ Added 2026-11-24 so the check-writer and the builder work against the same text.
 - `cpu_ns` is the processor time of the whole probe process; `ram_peak` its peak private bytes; `first_encoded_ms` the time from the start of recording to the first encoded picture.
 - Instant 0 is always encoded (it is a key picture). An instant whose picture equals the one before it is `same` and nothing is encoded for it.
 - Parts are numbered from `part-0000`.
-- Still rule, exactly: instant k gets a still if and only if its picture differs from instant k − 1's (instant 0 counts as a change) and the next `settle` instants (k + 1 … k + settle) all show the same picture as k. A recording that ends before k + settle writes no still for k.
+- Still rule, exactly: instant k gets a still if and only if its picture differs from instant k − 1's (instant 0 counts as a change) and the picture is then shown for `settle` instants in a row, k included: instants k + 1 … k + settle − 1 all show the same picture as k. With the default 10 that is 0.5 s on screen. A recording that ends before instant k + settle − 1 writes no still for k.
+  - Corrected 2026-11-24: an earlier wording required `settle` further instants after k (0.55 s). That was off by one against the accepted rule "unchanged for half a second" and against the measurement behind it (run length of at least 10 pictures: 4 settle points in the mixed scene, 2 in typing).
 - "The video decodes" means every picture is really decoded (ffprobe `-count_frames`), not only counted.
 
 ## Files

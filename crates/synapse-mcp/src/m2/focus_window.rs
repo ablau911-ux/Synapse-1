@@ -109,9 +109,14 @@ pub(crate) async fn act_focus_window_with_boundary(
         .map_err(|error| a11y_error_to_focus_mcp("before_foreground_read", error, None))?;
     let matched = resolve_focus_target(&requested)?;
     let activation = activate_focus_window_once(&before, &matched, boundary)?;
-    let verification = verify_focus_window(&params, &matched, &target_readback, activation).await?;
-    let before_signature = hash_json(&before)?;
-    let after_signature = hash_json(&verification.after)?;
+    // Once an activation request went out, every failure below says so.
+    let activation_sent = usize::from(activation.attempts > 0);
+    let delivered = |error: ErrorData| super::error_after_earlier_steps(error, activation_sent);
+    let verification = verify_focus_window(&params, &matched, &target_readback, activation)
+        .await
+        .map_err(delivered)?;
+    let before_signature = hash_json(&before).map_err(delivered)?;
+    let after_signature = hash_json(&verification.after).map_err(delivered)?;
     let changed = before.hwnd != verification.after.hwnd;
     let matched_hwnd = matched.hwnd;
 

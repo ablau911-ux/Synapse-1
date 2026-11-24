@@ -86,17 +86,22 @@ pub(crate) async fn act_set_value_with_boundary(
         }
     };
 
+    // The value was set: every failure from here on reports delivered input.
     tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
     let after = synapse_a11y::element_value(&params.element_id).map_err(|error| {
-        a11y_error_to_set_value_mcp(
-            &params.element_id,
-            "after_value_read",
-            error,
-            Some(before_readback.clone()),
+        super::error_after_earlier_steps(
+            a11y_error_to_set_value_mcp(
+                &params.element_id,
+                "after_value_read",
+                error,
+                Some(before_readback.clone()),
+            ),
+            1,
         )
     })?;
     let after_sha256 = text_signature(&after.value);
-    let after_len = char_count(&after.value)?;
+    let after_len =
+        char_count(&after.value).map_err(|error| super::error_after_earlier_steps(error, 1))?;
     let changed = !value_readbacks_equivalent(&before, &after);
     let source_of_truth = set_source_of_truth(&set_readback);
     let target_text_integrity = set_text_integrity(&set_readback);
@@ -118,12 +123,15 @@ pub(crate) async fn act_set_value_with_boundary(
             immediate_after_len = set_readback.after_value.chars().count(),
             "act_set_value background set tier returned, but separate target readback did not equal requested text"
         );
-        return Err(postcondition_failed_set_value_error(
-            &params,
-            &before,
-            &after,
-            &set_readback,
-            "separate target readback did not equal requested text after set_value",
+        return Err(super::error_after_earlier_steps(
+            postcondition_failed_set_value_error(
+                &params,
+                &before,
+                &after,
+                &set_readback,
+                "separate target readback did not equal requested text after set_value",
+            ),
+            1,
         ));
     }
 

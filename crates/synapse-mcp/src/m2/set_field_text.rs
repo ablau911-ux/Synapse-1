@@ -414,7 +414,8 @@ pub(crate) async fn act_set_field_text_native(
 /// Builds the verified response for a replace tier from separate before/after
 /// Source-of-Truth reads. Fails closed with `ACTION_POSTCONDITION_FAILED`
 /// (and the full evidence trail) when the after-read does not equal the
-/// requested text.
+/// requested text. Callers run it after the replace was delivered, so every
+/// error it returns reports delivered input.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_replace_response(
     params: &ActSetFieldTextParams,
@@ -427,7 +428,8 @@ pub(crate) fn finish_replace_response(
     after: &str,
     evidence: Value,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
-    let element_id = required_element_id(params)?;
+    let element_id =
+        required_element_id(params).map_err(|error| super::error_after_earlier_steps(error, 1))?;
     let requested_len = u32::try_from(params.text.chars().count()).unwrap_or(u32::MAX);
     let before_len = u32::try_from(before.chars().count()).unwrap_or(u32::MAX);
     let after_len = u32::try_from(after.chars().count()).unwrap_or(u32::MAX);
@@ -452,7 +454,8 @@ pub(crate) fn finish_replace_response(
             requested_sha256,
             "act_set_field_text separate target readback did not equal requested replacement text"
         );
-        return Err(ErrorData::new(
+        return Err(super::error_after_earlier_steps(
+            ErrorData::new(
             ErrorCode(-32099),
             format!(
                 "{TOOL} Source-of-Truth postcondition failed: separate target readback does not equal the requested replacement text"
@@ -473,6 +476,8 @@ pub(crate) fn finish_replace_response(
                 },
                 "evidence": evidence,
             })),
+            ),
+            1,
         ));
     }
 

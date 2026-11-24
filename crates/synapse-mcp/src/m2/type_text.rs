@@ -208,8 +208,11 @@ async fn cdp_type_into_element(
             backend_node_id,
         )
         .await
-        .map_err(|err| cdp_transport_error("node value after readback", err))?;
-        verify_cdp_type_delta(verify_timeout_ms, emitted, before, after)?
+        .map_err(|err| cdp_transport_error("node value after readback", err));
+        // The text was inserted before this read-back.
+        after
+            .and_then(|after| verify_cdp_type_delta(verify_timeout_ms, emitted, before, after))
+            .map_err(|error| super::error_after_earlier_steps(error, 1))?
     } else {
         postcondition_not_requested("act_type", "cdp_node.value")
     };
@@ -399,7 +402,9 @@ pub(crate) async fn act_type_with_handle_and_boundary(
             target_readback_required: !params.verify_delta || !readback_matches,
             minimum_linear_ms_per_char: MIN_SAFE_LINEAR_MS_PER_CHAR,
             postcondition: if params.verify_delta {
-                verify_uia_type_delta(params.verify_timeout_ms, &emitted, &readback)?
+                // The value was set before this read-back check.
+                verify_uia_type_delta(params.verify_timeout_ms, &emitted, &readback)
+                    .map_err(|error| super::error_after_earlier_steps(error, 1))?
             } else {
                 postcondition_not_requested("act_type", set_source_of_truth(&readback))
             },
@@ -464,23 +469,27 @@ async fn verified_set_element_value(
             )))
             .await;
             let after = synapse_a11y::element_value(element_id).map_err(|error| {
-                postcondition_failed_error(
-                    "act_type",
-                    set_source_of_truth(&dispatch_readback),
-                    format!(
-                        "ValuePattern SetValue returned success but separate target value readback failed: {error}"
+                // SetValue returned success: the value was delivered.
+                super::error_after_earlier_steps(
+                    postcondition_failed_error(
+                        "act_type",
+                        set_source_of_truth(&dispatch_readback),
+                        format!(
+                            "ValuePattern SetValue returned success but separate target value readback failed: {error}"
+                        ),
+                        value_readback_signature(&before),
+                        value_set_after_signature(&dispatch_readback),
+                        json!({
+                            "element_id": element_id.to_string(),
+                            "method": dispatch_readback.method.clone(),
+                            "requested_len": emitted.chars().count(),
+                            "before_len": value_readback_len(&before),
+                            "immediate_after_len": value_set_after_len(&dispatch_readback),
+                            "readback_error_code": error.code(),
+                            "readback_error": error.to_string(),
+                        }),
                     ),
-                    value_readback_signature(&before),
-                    value_set_after_signature(&dispatch_readback),
-                    json!({
-                        "element_id": element_id.to_string(),
-                        "method": dispatch_readback.method.clone(),
-                        "requested_len": emitted.chars().count(),
-                        "before_len": value_readback_len(&before),
-                        "immediate_after_len": value_set_after_len(&dispatch_readback),
-                        "readback_error_code": error.code(),
-                        "readback_error": error.to_string(),
-                    }),
+                    1,
                 )
             })?;
             let verified_readback =

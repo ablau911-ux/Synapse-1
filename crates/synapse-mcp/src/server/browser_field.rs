@@ -552,6 +552,8 @@ impl SynapseService {
                 ),
             )
         })?;
+        // The field was set: every failure of the read-back below says so.
+        let verified = async {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_set_value_after_bridge_field_replace",
         )?;
@@ -661,7 +663,7 @@ impl SynapseService {
             "readback=browser_set_value dual_verified=true"
         );
 
-        Ok(BrowserSetValueResponse {
+        Ok::<_, ErrorData>(BrowserSetValueResponse {
             ok: true,
             required_foreground: false,
             transport: "chrome_tabs_extension".to_owned(),
@@ -683,6 +685,9 @@ impl SynapseService {
             status: "verified_state".to_owned(),
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         })
+        }
+        .await;
+        verified.map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
     }
 
     async fn browser_fill_form_run(

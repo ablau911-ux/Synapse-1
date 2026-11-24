@@ -123,7 +123,11 @@ pub(super) async fn execute_element_click(
     let mut backend_used = "software";
     let mut uia_outcomes = Vec::new();
     for click_index in 0..params.clicks {
-        boundary.ensure("immediately_before_uia_element_click")?;
+        boundary
+            .ensure("immediately_before_uia_element_click")
+            .map_err(|error| {
+                crate::m2::error_after_earlier_steps(error, usize::from(click_index))
+            })?;
         let outcome_result = if let Some(recording) = recording {
             click_element_or_fallback(&element.element_id, recording, &mut state, params.button)
         } else {
@@ -133,22 +137,53 @@ pub(super) async fn execute_element_click(
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(error) => {
-                let error_code = error.code().to_owned();
-                let reason_code = click_reason_for_error_code(&error_code);
-                let tier_attempts = vec![click_tier_failed(
-                    CLICK_TIER_UIA,
-                    reason_code,
-                    error_code.clone(),
-                    false,
-                    error.detail().to_owned(),
-                )];
-                if error_code == error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
-                    && params.coordinate_fallback_on_unsupported
-                {
-                    let metadata = element_coordinate_fallback_metadata(&element.element_id)?;
-                    if coordinate_fallback_allowed_for_metadata(&metadata) {
-                        tracing::info!(
-                            code = "M2_ACT_CLICK_COORDINATE_FALLBACK_ON_UNSUPPORTED",
+                // Earlier clicks of this call, or this click's pattern call
+                // before its read-back failed, already delivered input.
+                let delivered_steps = usize::from(click_index)
+                    + usize::from(uia_pattern_ran_before_error(error.detail()));
+                let failure = async {
+                    let error_code = error.code().to_owned();
+                    let reason_code = click_reason_for_error_code(&error_code);
+                    let tier_attempts = vec![click_tier_failed(
+                        CLICK_TIER_UIA,
+                        reason_code,
+                        error_code.clone(),
+                        false,
+                        error.detail().to_owned(),
+                    )];
+                    if error_code == error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+                        && params.coordinate_fallback_on_unsupported
+                    {
+                        let metadata = element_coordinate_fallback_metadata(&element.element_id)?;
+                        if coordinate_fallback_allowed_for_metadata(&metadata) {
+                            tracing::info!(
+                                code = "M2_ACT_CLICK_COORDINATE_FALLBACK_ON_UNSUPPORTED",
+                                kind = "act_click",
+                                element_id = %element.element_id,
+                                role = %metadata.role,
+                                automation_id = metadata.automation_id.as_deref(),
+                                enabled = metadata.enabled,
+                                keyboard_focusable = metadata.keyboard_focusable,
+                                patterns = ?metadata.patterns,
+                                bbox = ?metadata.bbox,
+                                "act_click UIA pattern unsupported; explicit coordinate fallback allowed for focusable edit/document-like element"
+                            );
+                            return execute_coordinate_element_click(
+                                handle,
+                                params,
+                                element,
+                                recording,
+                                timing,
+                                started,
+                                tier_attempts,
+                                "coordinate_fallback_on_unsupported",
+                                foreground_click_policy,
+                                boundary,
+                            )
+                            .await;
+                        }
+                        tracing::warn!(
+                            code = "M2_ACT_CLICK_COORDINATE_FALLBACK_DENIED",
                             kind = "act_click",
                             element_id = %element.element_id,
                             role = %metadata.role,
@@ -157,54 +192,53 @@ pub(super) async fn execute_element_click(
                             keyboard_focusable = metadata.keyboard_focusable,
                             patterns = ?metadata.patterns,
                             bbox = ?metadata.bbox,
-                            "act_click UIA pattern unsupported; explicit coordinate fallback allowed for focusable edit/document-like element"
+                            "act_click UIA pattern unsupported; coordinate fallback denied because element is not an enabled focusable edit/document-like target"
                         );
-                        return execute_coordinate_element_click(
-                            handle,
-                            params,
-                            element,
-                            recording,
-                            timing,
-                            started,
-                            tier_attempts,
-                            "coordinate_fallback_on_unsupported",
-                            foreground_click_policy,
-                            boundary,
-                        )
-                        .await;
                     }
-                    tracing::warn!(
-                        code = "M2_ACT_CLICK_COORDINATE_FALLBACK_DENIED",
-                        kind = "act_click",
-                        element_id = %element.element_id,
-                        role = %metadata.role,
-                        automation_id = metadata.automation_id.as_deref(),
-                        enabled = metadata.enabled,
-                        keyboard_focusable = metadata.keyboard_focusable,
-                        patterns = ?metadata.patterns,
-                        bbox = ?metadata.bbox,
-                        "act_click UIA pattern unsupported; coordinate fallback denied because element is not an enabled focusable edit/document-like target"
-                    );
-                }
-                if error_code == error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
-                    && !params.coordinate_fallback_on_unsupported
-                {
-                    return Err(attach_click_tier_attempts(
-                        element_pattern_unsupported_coordinate_fallback_disabled_error(
-                            &element.element_id,
-                            error.detail(),
-                        ),
-                        tier_attempts,
-                    ));
-                }
-                if error_code == error_codes::ACTION_TARGET_INVALID
-                    && params.coordinate_fallback_on_unsupported
-                    && selection_item_select_readback_failed(error.detail())
-                {
-                    let metadata = element_coordinate_fallback_metadata(&element.element_id)?;
-                    if coordinate_fallback_allowed_after_selection_readback_failure(&metadata) {
-                        tracing::info!(
-                            code = "M2_ACT_CLICK_COORDINATE_FALLBACK_ON_SELECTION_READBACK",
+                    if error_code == error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+                        && !params.coordinate_fallback_on_unsupported
+                    {
+                        return Err(attach_click_tier_attempts(
+                            element_pattern_unsupported_coordinate_fallback_disabled_error(
+                                &element.element_id,
+                                error.detail(),
+                            ),
+                            tier_attempts,
+                        ));
+                    }
+                    if error_code == error_codes::ACTION_TARGET_INVALID
+                        && params.coordinate_fallback_on_unsupported
+                        && selection_item_select_readback_failed(error.detail())
+                    {
+                        let metadata = element_coordinate_fallback_metadata(&element.element_id)?;
+                        if coordinate_fallback_allowed_after_selection_readback_failure(&metadata) {
+                            tracing::info!(
+                                code = "M2_ACT_CLICK_COORDINATE_FALLBACK_ON_SELECTION_READBACK",
+                                kind = "act_click",
+                                element_id = %element.element_id,
+                                role = %metadata.role,
+                                automation_id = metadata.automation_id.as_deref(),
+                                enabled = metadata.enabled,
+                                patterns = ?metadata.patterns,
+                                bbox = ?metadata.bbox,
+                                "act_click UIA SelectionItemPattern.Select returned but IsSelected readback stayed false; explicit coordinate fallback allowed for enabled radio button"
+                            );
+                            return execute_coordinate_element_click(
+                                handle,
+                                params,
+                                element,
+                                recording,
+                                timing,
+                                started,
+                                tier_attempts,
+                                "coordinate_fallback_on_selection_readback_failure",
+                                foreground_click_policy,
+                                boundary,
+                            )
+                            .await;
+                        }
+                        tracing::warn!(
+                            code = "M2_ACT_CLICK_COORDINATE_FALLBACK_DENIED",
                             kind = "act_click",
                             element_id = %element.element_id,
                             role = %metadata.role,
@@ -212,39 +246,21 @@ pub(super) async fn execute_element_click(
                             enabled = metadata.enabled,
                             patterns = ?metadata.patterns,
                             bbox = ?metadata.bbox,
-                            "act_click UIA SelectionItemPattern.Select returned but IsSelected readback stayed false; explicit coordinate fallback allowed for enabled radio button"
+                            "act_click UIA SelectionItemPattern.Select readback failed; coordinate fallback denied because element is not an enabled radio button"
                         );
-                        return execute_coordinate_element_click(
-                            handle,
-                            params,
-                            element,
-                            recording,
-                            timing,
-                            started,
-                            tier_attempts,
-                            "coordinate_fallback_on_selection_readback_failure",
-                            foreground_click_policy,
-                            boundary,
-                        )
-                        .await;
                     }
-                    tracing::warn!(
-                        code = "M2_ACT_CLICK_COORDINATE_FALLBACK_DENIED",
-                        kind = "act_click",
-                        element_id = %element.element_id,
-                        role = %metadata.role,
-                        automation_id = metadata.automation_id.as_deref(),
-                        enabled = metadata.enabled,
-                        patterns = ?metadata.patterns,
-                        bbox = ?metadata.bbox,
-                        "act_click UIA SelectionItemPattern.Select readback failed; coordinate fallback denied because element is not an enabled radio button"
-                    );
+                    let mcp_error = action_error_to_mcp(&error);
+                    if error_has_click_tier_attempts(&mcp_error) {
+                        return Err(mcp_error);
+                    }
+                    Err::<ActClickResponse, ErrorData>(attach_click_tier_attempts(
+                        mcp_error,
+                        tier_attempts,
+                    ))
                 }
-                let mcp_error = action_error_to_mcp(&error);
-                if error_has_click_tier_attempts(&mcp_error) {
-                    return Err(mcp_error);
-                }
-                return Err(attach_click_tier_attempts(mcp_error, tier_attempts));
+                .await;
+                return failure
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, delivered_steps));
             }
         };
 
@@ -359,13 +375,14 @@ pub(super) async fn execute_element_click(
                     screen_y = plan.screen_point.y,
                     "semantic UIA element click returned a coordinate fallback plan; no fallback delivery attempted"
                 );
-                return Err(action_error_to_mcp(
-                    &ActionError::ElementPatternUnsupported {
+                return Err(crate::m2::error_after_earlier_steps(
+                    action_error_to_mcp(&ActionError::ElementPatternUnsupported {
                         element_id: element.element_id.clone(),
                         detail: format!(
                             "semantic UIA click path unexpectedly produced coordinate fallback plan {plan:?}; no fallback delivery was attempted"
                         ),
-                    },
+                    }),
+                    usize::from(click_index),
                 ));
             }
         }
@@ -538,7 +555,10 @@ async fn execute_coordinate_element_click(
                 )
                 .map_err(|error| crate::m2::error_after_earlier_steps(error, postmessage_steps))?;
                 boundary
-                    .ensure("immediately_before_coordinate_element_foreground_fallback_dispatch")?;
+                    .ensure("immediately_before_coordinate_element_foreground_fallback_dispatch")
+                    .map_err(|error| {
+                        crate::m2::error_after_earlier_steps(error, postmessage_steps)
+                    })?;
                 match record::execute_actor_actions(handle, actions, timing, boundary).await {
                     Ok(()) => {
                         tier_attempts.push(click_tier_delivered(
@@ -662,6 +682,17 @@ fn exposes_text_value_pattern(patterns: &[UiaPattern]) -> bool {
     patterns
         .iter()
         .any(|pattern| matches!(pattern, UiaPattern::Value | UiaPattern::Text))
+}
+
+/// True when a UIA semantic click error was raised after its pattern call ran:
+/// the state read-back after Toggle/Select/Expand/Collapse failed, or the
+/// state stayed (texts of `synapse_a11y` `resolve.rs`). That click was
+/// delivered.
+fn uia_pattern_ran_before_error(detail: &str) -> bool {
+    detail.contains("returned for element")
+        || detail.contains("ToggleState after Toggle")
+        || detail.contains("IsSelected after Select")
+        || detail.contains("ExpandCollapseState after ")
 }
 
 fn selection_item_select_readback_failed(detail: &str) -> bool {

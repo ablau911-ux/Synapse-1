@@ -582,35 +582,39 @@ impl SynapseService {
                 )
             });
         let result = match (result, before_text_signature) {
-            (Ok(response), Some(before)) => match self
-                .verify_act_type_response(
-                    response.clone(),
-                    before,
-                    verify_timeout_ms,
-                    &emitted,
-                    browser_url_policy.as_ref(),
-                    session_id.as_deref(),
-                )
-                .await
-            {
-                Ok(response) => Ok(response),
-                Err(error) if act_type_error_allows_visual_delta(&error) => {
-                    match before_visual_signature {
-                        Some(before_visual) => {
-                            self.verify_act_type_visual_delta_response(
-                                response,
-                                before_visual,
-                                verify_timeout_ms,
-                                visual_delta_target_window_hwnd,
-                                &error,
-                            )
-                            .await
+            (Ok(response), Some(before)) => {
+                let verified = match self
+                    .verify_act_type_response(
+                        response.clone(),
+                        before,
+                        verify_timeout_ms,
+                        &emitted,
+                        browser_url_policy.as_ref(),
+                        session_id.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(response) => Ok(response),
+                    Err(error) if act_type_error_allows_visual_delta(&error) => {
+                        match before_visual_signature {
+                            Some(before_visual) => {
+                                self.verify_act_type_visual_delta_response(
+                                    response,
+                                    before_visual,
+                                    verify_timeout_ms,
+                                    visual_delta_target_window_hwnd,
+                                    &error,
+                                )
+                                .await
+                            }
+                            None => Err(error),
                         }
-                        None => Err(error),
                     }
-                }
-                Err(error) => Err(error),
-            },
+                    Err(error) => Err(error),
+                };
+                // The text was delivered before this read-back failed.
+                verified.map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
+            }
             (other, _) => other,
         };
         self.audit_action_result_for_request("act_type", &result, &request_context)?;
@@ -805,7 +809,14 @@ impl SynapseService {
                 "stale_retry",
             ) {
                 Ok(retry_params) => {
-                    let retry_element_id = crate::m2::required_element_id(&retry_params)?.clone();
+                    let retry_element_id = crate::m2::required_element_id(&retry_params)
+                        .map_err(|error| {
+                            crate::m2::error_after_earlier_steps(
+                                error,
+                                usize::from(initial_delivered_input),
+                            )
+                        })?
+                        .clone();
                     if let Err(error) = self.ensure_target_claim_allows_action(
                         "act_set_field_text",
                         element_claim_target(&retry_element_id),
@@ -1257,6 +1268,7 @@ impl SynapseService {
         .await;
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
+                // The keys were delivered before this read-back.
                 self.verify_act_press_response(
                     response,
                     before,
@@ -1264,6 +1276,7 @@ impl SynapseService {
                     foreground_change_policy,
                 )
                 .await
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
             }
             (other, _) => other,
         };
@@ -1558,8 +1571,10 @@ impl SynapseService {
         };
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
+                // The stroke was delivered before this read-back.
                 self.verify_act_stroke_response(response, before, verify_timeout_ms)
                     .await
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
             }
             (other, _) => other,
         };
@@ -1687,8 +1702,10 @@ impl SynapseService {
         let result = act_scroll_with_handle_and_boundary(handle, recording, params, boundary).await;
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
+                // The scroll was delivered before this read-back.
                 self.verify_act_scroll_response(response, before, verify_timeout_ms, point_region)
                     .await
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
             }
             (other, _) => other,
         };
@@ -1699,7 +1716,7 @@ impl SynapseService {
                     .source_of_truth
                     .as_deref()
                     .unwrap_or("act_scroll.background_target");
-                match self.current_audit_foreground() {
+                let guarded = match self.current_audit_foreground() {
                     Ok(after) => {
                         match verify_background_target_not_activated(
                             "act_scroll",
@@ -1717,7 +1734,9 @@ impl SynapseService {
                         source_of_truth,
                         &error,
                     )),
-                }
+                };
+                // The scroll was delivered before this foreground check.
+                guarded.map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
             }
             (other, _, _) => other,
         };
@@ -1782,8 +1801,10 @@ impl SynapseService {
         let result = act_pad_with_handle_and_boundary(handle, recording, params, boundary).await;
         let result = match (result, before_snapshot, snapshot_handle) {
             (Ok(response), Some(before), Some(snapshot_handle)) => {
+                // The pad report was delivered before this read-back.
                 self.verify_act_pad_response(response, before, snapshot_handle, verify_timeout_ms)
                     .await
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
             }
             (other, _, _) => other,
         };
@@ -3283,7 +3304,9 @@ impl SynapseService {
             },
         ];
         for (action_index, action) in actions.into_iter().enumerate() {
-            boundary.ensure("immediately_before_act_type_foreground_fallback_click")?;
+            boundary
+                .ensure("immediately_before_act_type_foreground_fallback_click")
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, action_index))?;
             handle.execute(action).await.map_err(|error| {
                 act_type_foreground_fallback_click_error(target, point, &error, action_index)
             })?;
@@ -3499,7 +3522,9 @@ impl SynapseService {
             },
         ];
         for (action_index, action) in click_actions.into_iter().enumerate() {
-            boundary.ensure("immediately_before_set_field_text_foreground_click")?;
+            boundary
+                .ensure("immediately_before_set_field_text_foreground_click")
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, action_index))?;
             handle.execute(action).await.map_err(|error| {
                 crate::m2::error_after_earlier_steps(
                     set_field_text_foreground_error(
@@ -3533,8 +3558,11 @@ impl SynapseService {
         act_type_foreground_fallback_focus_matches_target(&target, &focus_readback.signature)
             .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
 
-        let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)?;
-        boundary.ensure("immediately_before_set_field_text_select_all")?;
+        let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
+        boundary
+            .ensure("immediately_before_set_field_text_select_all")
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         handle.execute(select_all).await.map_err(|error| {
             crate::m2::error_after_earlier_steps(
                 set_field_text_foreground_error(
@@ -3550,7 +3578,8 @@ impl SynapseService {
         let (method, replace_action) = if params.text.is_empty() {
             (
                 crate::m2::METHOD_FOREGROUND_CLEAR,
-                crate::m2::delete_key_action(40, Backend::Auto)?,
+                crate::m2::delete_key_action(40, Backend::Auto)
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, 2))?,
             )
         } else {
             (
@@ -3564,7 +3593,9 @@ impl SynapseService {
                 },
             )
         };
-        boundary.ensure("immediately_before_set_field_text_replacement_input")?;
+        boundary
+            .ensure("immediately_before_set_field_text_replacement_input")
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 2))?;
         handle.execute(replace_action).await.map_err(|error| {
             crate::m2::error_after_earlier_steps(
                 set_field_text_foreground_error(
@@ -3593,7 +3624,8 @@ impl SynapseService {
         })?;
 
         if before.is_password || after.is_password {
-            return set_field_text_password_response(params, started, method, &before, &after);
+            return set_field_text_password_response(params, started, method, &before, &after)
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, 3));
         }
         crate::m2::finish_replace_response(
             params,
@@ -3807,8 +3839,10 @@ impl SynapseService {
                         ),
                     )
                 })?;
+        // The bridge typed the text before this read-back check.
         let postcondition =
-            act_type_chrome_bridge_type_postcondition(params, emitted, chars_typed, &readback)?;
+            act_type_chrome_bridge_type_postcondition(params, emitted, chars_typed, &readback)
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         tracing::info!(
             code = "M2_ACT_TYPE_CHROME_BRIDGE_ACTIVE_ELEMENT",
             session_id = %session_id,
@@ -4283,17 +4317,21 @@ impl SynapseService {
             act_press_cdp_target(&endpoint, &cdp_target_id, params, boundary).await?;
         if let Some(before) = before {
             tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
-            let after = self
+            // The key events were dispatched before this read-back.
+            response.postcondition = self
                 .capture_cdp_keyboard_delta_signature(&endpoint, &cdp_target_id)
-                .await?;
-            response.postcondition = verify_keyboard_delta_signature(
-                "act_press",
-                "cdp_active_element_value_or_selection",
-                verify_timeout_ms,
-                before,
-                after,
-                "observed CDP target active-element value/selection change after Input.dispatchKeyEvent delivery",
-            )?;
+                .await
+                .and_then(|after| {
+                    verify_keyboard_delta_signature(
+                        "act_press",
+                        "cdp_active_element_value_or_selection",
+                        verify_timeout_ms,
+                        before,
+                        after,
+                        "observed CDP target active-element value/selection change after Input.dispatchKeyEvent delivery",
+                    )
+                })
+                .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         }
         Ok(response)
     }
@@ -4316,9 +4354,11 @@ impl SynapseService {
         };
         let verify_timeout_ms = params.verify_timeout_ms;
         let mut response = act_press_postmessage_target(root_hwnd, params, boundary).await?;
-        tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
-        let after = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
-        response.postcondition = match verify_hwnd_keyboard_delta_signature(
+        // The keys were posted: every failure of the read-back below says so.
+        let postcondition = async {
+            tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
+            let after = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
+            match verify_hwnd_keyboard_delta_signature(
             "act_press",
             "target_hwnd_text_or_selection",
             verify_timeout_ms,
@@ -4326,12 +4366,12 @@ impl SynapseService {
             after,
             expected_effect,
             "observed target HWND text/selection change after PostMessage keyboard delivery",
-        ) {
-            Ok(postcondition) => postcondition,
-            Err(error) if error_code(&error) == Some(error_codes::ACTION_NO_OBSERVED_DELTA) => {
-                let Some(before_visual) = before_visual else {
-                    return Err(error);
-                };
+            ) {
+                Ok(postcondition) => Ok::<_, ErrorData>(postcondition),
+                Err(error) if error_code(&error) == Some(error_codes::ACTION_NO_OBSERVED_DELTA) => {
+                    let Some(before_visual) = before_visual else {
+                        return Err(error);
+                    };
                 tracing::info!(
                     code = "M2_ACT_PRESS_VISUAL_DELTA_AFTER_HWND_NO_TEXT_DELTA",
                     tool = "act_press",
@@ -4340,10 +4380,10 @@ impl SynapseService {
                     semantic_error_detail = %error.message,
                     "act_press target HWND text/selection readback showed no delta; checking target-window UI/pixel SoT"
                 );
-                let after_visual = self
-                    .capture_click_delta_signature(160, Some(root_hwnd))
-                    .await?;
-                verify_captured_action_delta(
+                    let after_visual = self
+                        .capture_click_delta_signature(160, Some(root_hwnd))
+                        .await?;
+                    verify_captured_action_delta(
                     "act_press",
                     "target_window_ui_or_pixels",
                     verify_timeout_ms,
@@ -4351,10 +4391,14 @@ impl SynapseService {
                     after_visual,
                     None,
                     ForegroundChangePolicy::reject(),
-                )?
+                    )
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => return Err(error),
-        };
+        }
+        .await
+        .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
+        response.postcondition = postcondition;
         Ok(response)
     }
 
@@ -7376,7 +7420,8 @@ fn background_result_with_foreground_guard<T>(
     ) {
         Ok(()) => result,
         Err(foreground_error) => match result {
-            Ok(_) => Err(foreground_error),
+            // The background action succeeded, so its input was delivered.
+            Ok(_) => Err(crate::m2::error_after_earlier_steps(foreground_error, 1)),
             Err(error) => Err(attach_background_foreground_guard_error(
                 error,
                 foreground_error,
@@ -7390,7 +7435,8 @@ fn background_result_with_foreground_read_error<T>(
     foreground_error: ErrorData,
 ) -> Result<T, ErrorData> {
     match result {
-        Ok(_) => Err(foreground_error),
+        // The background action succeeded, so its input was delivered.
+        Ok(_) => Err(crate::m2::error_after_earlier_steps(foreground_error, 1)),
         Err(error) => Err(attach_background_foreground_guard_error(
             error,
             foreground_error,

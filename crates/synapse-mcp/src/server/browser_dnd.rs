@@ -301,10 +301,8 @@ impl SynapseService {
             )
         })?;
         // The bridge delivered the drag events before this boundary check.
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_drag_drop_after_bridge_input",
-        )
-        .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
+        super::operator_panic_boundary::ensure_mcp_mutation("browser_drag_drop_after_bridge_input")
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
 
         Ok(BrowserDndResponse {
             ok: true,

@@ -19,7 +19,8 @@ const options = Object.fromEntries(process.argv.slice(3).map(arg => {
 const ROOT = options.root || JSON.parse(fs.readFileSync(path.join(BASE, 'corpus/corpus.json'), 'utf8')).root;
 const OUT = path.resolve(options.out || path.join(BASE, '../../.runs/av1-probe'));
 const PROBE = path.resolve(options.probe || path.join(BASE, 'probe/target/release/clip-probe.exe'));
-const SCENES = ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080'];
+// `scenes=a,b,c` runs other corpus scenes (for example the small and odd-sized ones) through the same checks.
+const SCENES = options.scenes ? options.scenes.split(',') : ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080'];
 // A clip the product recorded on a real page (1904x1012, 40 s, parts of 200 pictures); the fetch checks read it.
 const FETCH_CLIP = path.join(ROOT, 'recorded-real-page');
 const FETCH_GOLDEN = path.join(FETCH_CLIP, 'fetch-reference.json');

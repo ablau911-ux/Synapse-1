@@ -788,6 +788,8 @@ struct ToolSurfaceFingerprint {
 /// but leaves the structured verdict fields (status, counts, schema versions,
 /// timeouts, ...) untouched, so the health conclusion is unchanged — only the
 /// human-readable prose is trimmed. `Full` preserves the `detail` strings.
+/// A subsystem that reports `cf_sizes` keeps one `detail` in `Compact`: the
+/// note that those sizes are estimates.
 ///
 /// The `chrome_bridge` subsystem's only structured information historically
 /// lived inside its concatenated `detail` blob, so in both modes we parse that
@@ -808,7 +810,11 @@ fn apply_health_detail(subsystems: &mut BTreeMap<String, SubsystemHealth>, detai
                 }
             }
         } else if detail == HealthDetail::Compact {
-            subsystem.detail = None;
+            // `cf_sizes` stays in the compact view, so its label stays too.
+            subsystem.detail = subsystem
+                .cf_sizes
+                .as_ref()
+                .map(|_| CF_SIZES_ESTIMATE_NOTE.to_owned());
         }
     }
 }

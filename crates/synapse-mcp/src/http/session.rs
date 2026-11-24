@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    pin::Pin,
+    sync::{Arc, Mutex, PoisonError},
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -24,6 +30,86 @@ tokio::task_local! {
 pub(super) struct SessionRequestState {
     session_registry: crate::server::session_registry::SharedSessionRegistry,
     terminated_sessions: crate::server::session_lifecycle::SharedTerminatedSessions,
+    in_flight_request_ids: SharedInFlightRequestIds,
+}
+
+/// JSON-RPC request ids in flight per session: (session id, id as JSON text).
+type SharedInFlightRequestIds = Arc<Mutex<BTreeSet<(String, String)>>>;
+
+/// One JSON-RPC request id in flight in one session (#243). rmcp routes a
+/// response to its request's stream by the id alone, so a second request with
+/// the same id in the same session takes over the first one's stream: one
+/// caller gets the other's result and the other stream never ends. The id is
+/// held from the request until its response body ends or is dropped.
+struct InFlightRequestId {
+    in_flight: SharedInFlightRequestIds,
+    key: (String, String),
+}
+
+impl InFlightRequestId {
+    /// Claims `message`'s id in `session_id`, or refuses the request with
+    /// -32600 while another request with that id is in flight there. A message
+    /// that is not a request (a notification, a response) claims nothing.
+    fn claim(
+        in_flight: &SharedInFlightRequestIds,
+        session_id: &str,
+        message: &serde_json::Value,
+    ) -> Result<Option<Self>, Response> {
+        let Some(id) = message.get("id") else {
+            return Ok(None);
+        };
+        if !message.get("method").is_some_and(serde_json::Value::is_string) {
+            return Ok(None);
+        }
+        let key = (session_id.to_owned(), id.to_string());
+        let claimed = in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.clone());
+        if !claimed {
+            return Err(invalid_jsonrpc_request(
+                id,
+                "a request with this id is still in flight in this session; use a new id",
+            ));
+        }
+        Ok(Some(Self {
+            in_flight: Arc::clone(in_flight),
+            key,
+        }))
+    }
+
+    /// Keeps the id claimed until `response`'s body ends or is dropped.
+    fn hold_until_body_ends(self, response: Response) -> Response {
+        let (parts, body) = response.into_parts();
+        let body = InFlightBody {
+            data: body.into_data_stream(),
+            _in_flight: self,
+        };
+        Response::from_parts(parts, Body::from_stream(body))
+    }
+}
+
+impl Drop for InFlightRequestId {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+/// A response body that releases its request's in-flight id when dropped.
+struct InFlightBody {
+    data: axum::body::BodyDataStream,
+    _in_flight: InFlightRequestId,
+}
+
+impl futures_util::Stream for InFlightBody {
+    type Item = Result<axum::body::Bytes, axum::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        futures_util::Stream::poll_next(Pin::new(&mut self.get_mut().data), cx)
+    }
 }
 
 #[derive(Clone)]
@@ -105,6 +191,7 @@ impl SessionCleanupState {
         SessionRequestState {
             session_registry,
             terminated_sessions,
+            in_flight_request_ids: Arc::default(),
         }
     }
 
@@ -148,7 +235,7 @@ pub(super) async fn require_mcp_session(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let request = match session_id.as_deref() {
+    let (request, in_flight) = match session_id.as_deref() {
         Some(session_id) => {
             if let Some(failure) =
                 terminated_session_failure(&state.terminated_sessions, session_id)
@@ -172,12 +259,12 @@ pub(super) async fn require_mcp_session(
                 );
                 return session_invalid_for(failure, Some(session_id), &serde_json::Value::Null);
             }
-            match record_session_request(&state.session_registry, session_id, request).await {
-                Ok(request) => request,
+            match record_session_request(&state, session_id, request).await {
+                Ok(recorded) => recorded,
                 Err(response) => return response,
             }
         }
-        None => request,
+        None => (request, None),
     };
     let diagnostic_session_id = session_id.clone();
     CURRENT_MCP_SESSION_ID
@@ -190,7 +277,10 @@ pub(super) async fn require_mcp_session(
                     &serde_json::Value::Null,
                 );
             }
-            response
+            match in_flight {
+                Some(in_flight) => in_flight.hold_until_body_ends(response),
+                None => response,
+            }
         })
         .await
 }
@@ -367,13 +457,13 @@ async fn allow_initialize_without_session(
 }
 
 async fn record_session_request(
-    session_registry: &crate::server::session_registry::SharedSessionRegistry,
+    state: &SessionRequestState,
     session_id: &str,
     request: Request<Body>,
-) -> Result<Request<Body>, Response> {
+) -> Result<(Request<Body>, Option<InFlightRequestId>), Response> {
     if request.method() != Method::POST {
-        record_session_heartbeat(session_registry, session_id, None)?;
-        return Ok(request);
+        record_session_heartbeat(&state.session_registry, session_id, None)?;
+        return Ok((request, None));
     }
 
     let (parts, body) = request.into_parts();
@@ -382,9 +472,9 @@ async fn record_session_request(
         .map_err(|_| payload_too_large())?;
     let message = jsonrpc_message(&bytes);
     let action = message.as_ref().ok().and_then(jsonrpc_action_label);
-    record_session_heartbeat(session_registry, session_id, action)?;
-    message?;
-    Ok(Request::from_parts(parts, Body::from(bytes)))
+    record_session_heartbeat(&state.session_registry, session_id, action)?;
+    let in_flight = InFlightRequestId::claim(&state.in_flight_request_ids, session_id, &message?)?;
+    Ok((Request::from_parts(parts, Body::from(bytes)), in_flight))
 }
 
 /// Checks that a buffered `/mcp` POST body is one JSON-RPC 2.0 message rmcp can

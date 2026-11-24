@@ -2119,7 +2119,9 @@ fn workspace_expired_error(
         ErrorCode(-32099),
         format!("workspace blackboard key {key:?} for run {run_id:?} expired and was deleted"),
         Some(json!({
-            "code": error_codes::STORAGE_READ_FAILED,
+            // An expired row is absent (exists, wait and get absent_ok treat
+            // it so); the detail code keeps the expiry visible.
+            "code": WORKSPACE_KEY_ABSENT,
             "detail_code": "WORKSPACE_ROW_EXPIRED",
             "run_id": run_id,
             "key": key,

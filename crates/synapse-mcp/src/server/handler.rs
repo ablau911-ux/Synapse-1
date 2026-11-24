@@ -646,18 +646,19 @@ fn effective_target_from_tool_result(result: &CallToolResult) -> Option<Value> {
         .and_then(|value| effective_target_from_value(value, "structured_content"))
 }
 
-/// A completed call whose own result says it failed: MCP `isError`, or
-/// `ok: false` at the top of the structured content or in one of its top-level
-/// objects (a facade's per-operation result, e.g. act's `action`). Returns the
-/// error snapshot the lifecycle ledger records, so `tool_usage` counts the call
-/// in `error_total`, not `ok_total`.
+/// A completed call whose own result says it failed: MCP `isError`, `ok: false`
+/// at the top of the structured content, or `ok: false` in `action`, where the
+/// act facade reports its outcome (`TargetActResponse`). Other members with an
+/// `ok` field (per-step or per-check results) do not mean the call failed, so
+/// they are not read. Returns the error snapshot the lifecycle ledger records,
+/// so `tool_usage` counts the call in `error_total`, not `ok_total`.
 fn failure_reported_by_tool_result(result: &CallToolResult) -> Option<Value> {
     let reports_not_ok = |value: &Value| value.get("ok").and_then(Value::as_bool) == Some(false);
     let failed_part = result.structured_content.as_ref().and_then(|content| {
         if reports_not_ok(content) {
             return Some(content);
         }
-        content.as_object()?.values().find(|member| reports_not_ok(member))
+        content.get("action").filter(|action| reports_not_ok(action))
     });
     if let Some(part) = failed_part {
         return Some(json!({

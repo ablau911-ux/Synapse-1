@@ -350,6 +350,10 @@ pub struct AuditLifecycleRowSummary {
     pub line_no: u64,
     pub raw_len_bytes: u64,
     pub raw_sha256: String,
+    /// True when the raw row is longer than `max_line_bytes`. Its text fields
+    /// (`run_id`, `event_kind`, `tool`, `status`, `cause`, `error_code`,
+    /// `detail_code`, `last_tool`, `last_tool_status`) are then null and only
+    /// fixed-size facts (line, length, hashes, numbers, flags) are returned.
     pub oversized: bool,
     pub schema_version: Option<u64>,
     pub run_id: Option<String>,

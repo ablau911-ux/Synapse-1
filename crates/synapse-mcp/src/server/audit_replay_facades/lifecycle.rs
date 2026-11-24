@@ -226,34 +226,40 @@ fn summarize_lifecycle_row(
 ) -> AuditLifecycleRowSummary {
     let last_tool_event = value.get("last_tool_event");
     let mcp_session_id = string_field(value, "mcp_session_id");
+    // A row is usually oversized because one text field is huge, so an
+    // oversized row keeps only fixed-size facts and max_line_bytes still
+    // bounds the response.
+    let text = |field: Option<String>| field.filter(|_| !oversized);
     AuditLifecycleRowSummary {
         line_no,
         raw_len_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         raw_sha256: prefixed_sha256(bytes),
         oversized,
         schema_version: value.get("schema_version").and_then(Value::as_u64),
-        run_id: string_field(value, "run_id"),
+        run_id: text(string_field(value, "run_id")),
         pid: value.get("pid").and_then(Value::as_u64),
         seq: value.get("seq").and_then(Value::as_u64),
-        event_kind: string_field(value, "event_kind"),
-        tool: string_field(value, "tool"),
-        status: string_field(value, "status"),
-        cause: string_field(value, "cause"),
+        event_kind: text(string_field(value, "event_kind")),
+        tool: text(string_field(value, "tool")),
+        status: text(string_field(value, "status")),
+        cause: text(string_field(value, "cause")),
         started_at_unix_ms: value.get("started_at_unix_ms").and_then(Value::as_u64),
         finished_at_unix_ms: value.get("finished_at_unix_ms").and_then(Value::as_u64),
         duration_ms: value.get("duration_ms").and_then(Value::as_u64),
         recorded_at_unix_ms: value.get("recorded_at_unix_ms").and_then(Value::as_u64),
         mcp_session_id_present: mcp_session_id.is_some(),
         mcp_session_id_sha256: mcp_session_id.as_deref().map(sha256_text),
-        error_code: nested_string(value, &["error", "data", "code"])
-            .or_else(|| nested_string(value, &["error", "code"])),
+        error_code: text(
+            nested_string(value, &["error", "data", "code"])
+                .or_else(|| nested_string(value, &["error", "code"])),
+        ),
         panic_present: !value.get("panic").is_none_or(Value::is_null),
-        detail_code: nested_string(value, &["detail", "code"]),
+        detail_code: text(nested_string(value, &["detail", "code"])),
         in_flight_count: value
             .get("in_flight_tool_events")
             .and_then(Value::as_array)
             .map(|items| u64::try_from(items.len()).unwrap_or(u64::MAX)),
-        last_tool: last_tool_event.and_then(|event| string_field(event, "tool")),
-        last_tool_status: last_tool_event.and_then(|event| string_field(event, "status")),
+        last_tool: text(last_tool_event.and_then(|event| string_field(event, "tool"))),
+        last_tool_status: text(last_tool_event.and_then(|event| string_field(event, "status"))),
     }
 }

@@ -20054,12 +20054,15 @@ fn shell_child_command(program: &str, args: &[String]) -> StdCommand {
 }
 
 /// Rust std treats a program whose name ends in `.bat` or `.cmd` (any case) as
-/// a batch file and launches it through `cmd.exe`.
+/// a batch file and launches it through `cmd.exe`. A suffix test on purpose,
+/// not `Path::extension`: a file named only `.bat` or `.cmd` is a batch file
+/// to std too, and `extension()` returns None for such a name, which would
+/// skip the cmd.exe quoting of its arguments.
 #[cfg(windows)]
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_windows_batch_program(program: &str) -> bool {
-    Path::new(program).extension().is_some_and(|extension| {
-        extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-    })
+    let lower = program.to_ascii_lowercase();
+    lower.ends_with(".bat") || lower.ends_with(".cmd")
 }
 
 fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadata {

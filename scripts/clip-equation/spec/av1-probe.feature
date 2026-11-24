@@ -19,6 +19,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed real-page recording, last part cut to 10 bytes: product recovery succeeds; every picture of the earlier parts stays enc and comes back as video; every picture of the torn part is named lost | Known: true
   Scenario: recovery keeps a complete still
     # Equation: killed text-page recording, its part cut to the 32-byte header: after product recovery the still file exists and its instant (and the same instant after it) comes back as exact still | Known: true
+  Scenario: a lost line names no missing still
+    # Equation: killed text-page recording, its part cut to the 32-byte header and the file of its first still deleted: after product recovery that instant is lost and no index line has still or still_of naming the deleted file | Known: true
   Scenario: recovery names every planned instant
     # Equation: killed text-page recording with end_ms 25 ms off the 50 ms grid: index lines after recovery = ceil(end_ms/50), the last one named lost | Known: true
   Scenario: a late picture comes back in time

@@ -6,8 +6,9 @@
 //! header holds none and is removed); every complete part and every still
 //! the index names is kept; index lines whose video picture did not reach the
 //! disk, and the instants never written up to the planned end, are named lost
-//! (`service_restart`), each once. A lost line keeps its still mark: a
-//! complete still is never deleted for a missing video picture. The clip is
+//! (`service_restart`), each once. A lost line keeps its still mark while
+//! the still's file is on disk: a complete still is never deleted for a
+//! missing video picture, and a mark without a file is dropped. The clip is
 //! then `ready`. A recording that fails gets the same index rule at once
 //! (`reconcile_failed`), since recovery never visits a failed clip.
 
@@ -111,7 +112,9 @@ impl ClipRecovery {
         let complete = Self::repair_parts(folder)?;
         let read = read_index(folder).map_err(|error| error.to_string())?;
         let planned = planned.unwrap_or(read.len() as u64);
-        let lines = Self::repair_index(&read, &complete, planned, fps, cause);
+        let lines = Self::repair_index(&read, &complete, planned, fps, cause, |instant| {
+            still_path(folder, instant).is_file()
+        });
         if lines != read {
             let mut text = String::new();
             for line in &lines {
@@ -140,14 +143,17 @@ impl ClipRecovery {
     /// disk, and a `same` line after a line that shows no picture, become
     /// lost (`cause`); the instants never written, up to `planned`, are added
     /// as lost. A line that becomes lost keeps its still mark (`still` or
-    /// `still_of`): the still file is complete and still shows the instant's
-    /// exact picture, so it is never deleted for a missing video picture.
+    /// `still_of`) while that still's file is on disk (`still_on_disk`): the
+    /// still shows the instant's exact picture, so it is never deleted for a
+    /// missing video picture. A mark whose file is gone is dropped, so a lost
+    /// line never names a picture that cannot be shown.
     fn repair_index(
         read: &[IndexLine],
         complete: &BTreeMap<u32, u32>,
         planned: u64,
         fps: u32,
         cause: &str,
+        still_on_disk: impl Fn(u64) -> bool,
     ) -> Vec<IndexLine> {
         let lost_line = |instant: u64| IndexLine {
             instant,
@@ -172,10 +178,13 @@ impl ClipRecovery {
                 .is_some_and(|before| before.lost.is_some() && before.still_file().is_none());
             let shows_missing = line.same.is_some() && previous_shows_nothing;
             if picture_missing || shows_missing {
+                let still_kept = line.still_file().is_some_and(&still_on_disk);
                 lines.push(IndexLine {
                     enc: None,
                     same: None,
                     lost: Some(cause.to_owned()),
+                    still: line.still.filter(|_| still_kept),
+                    still_of: line.still_of.filter(|_| still_kept),
                     ..line.clone()
                 });
             } else {

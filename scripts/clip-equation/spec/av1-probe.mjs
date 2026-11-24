@@ -389,6 +389,24 @@ function stillSurvivesRecovery() {
   return verdict(problems, `video pictures gone, still of instant ${still.instant} kept and returned as exact still`);
 }
 
+/** The video picture and the still of an instant are both gone: no index line may name that still. */
+function lostLinePromisesNoMissingStill() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  let gone;
+  const got = recovered('killed-text-page', 'crash-still-and-video-gone', dir => {
+    fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    gone = readJsonl(path.join(dir, 'frames.jsonl')).find(line => line.still === true)?.instant;
+    if (gone !== undefined) fs.rmSync(path.join(dir, 'stills', `still-${pad(gone, 8)}.webp`));
+  });
+  if (got.error) return verdict([got.error]);
+  if (gone === undefined) return verdict(['the killed recording has no still']);
+  const problems = [];
+  if (kindOf(got.lines[gone] ?? {}) !== 'lost') problems.push(`instant ${gone} is not named lost`);
+  const naming = got.lines.filter(line => (line.still === true && line.instant === gone) || line.still_of === gone);
+  if (naming.length) problems.push(`${naming.length} index lines name the missing still of instant ${gone} (first: instant ${naming[0].instant})`);
+  return verdict(problems, `video picture and still of instant ${gone} gone: the instant is lost and no line names the still`);
+}
+
 /** A planned length off the 50 ms grid: every planned instant has an index line after recovery. */
 function recoveryNamesEveryInstant() {
   const OFF_GRID_MS = 25;
@@ -488,6 +506,7 @@ const table = {
   'a picture after a lost instant is recorded again': () => judge(recordedAgainAfterLoss),
   'a torn last part does not stop recovery': tornLastPart,
   'recovery keeps a complete still': stillSurvivesRecovery,
+  'a lost line names no missing still': lostLinePromisesNoMissingStill,
   'recovery names every planned instant': recoveryNamesEveryInstant,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,

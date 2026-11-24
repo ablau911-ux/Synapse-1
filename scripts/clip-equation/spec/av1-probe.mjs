@@ -883,6 +883,27 @@ function registerFailuresAllReported() {
 }
 
 /**
+ * Registering the default folder reports an entry it cannot read, never skips it silently: the default
+ * clips folder holds clip-loop, a junction that points to itself, so its clip.json cannot be resolved
+ * (an error other than "not found"). Recovery at start ends with an error naming clip-loop.
+ */
+function unreadableEntryReported() {
+  const appData = path.join(OUT, 'registry-unreadable-entry');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const loop = path.join(clips, 'clip-loop');
+  fs.symlinkSync(loop, loop, 'junction');
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  const error = String(got.error);
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('recovery at start reported ok while it could not read clip-loop');
+  else if (!error.includes(path.join(loop, 'clip.json'))) problems.push(`the error does not name the clip.json of clip-loop: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  return verdict(problems, `clip-loop (a junction to itself) in the default folder: recovery at start ended with an error naming its clip.json (${error.replace(/\s+/g, ' ').slice(0, 200)})`);
+}
+
+/**
  * A `record` that failed before its first picture drops its registry entry, and nothing else of the
  * registry: the registry file and its lock file belong to the registry, a store every start shares, so
  * they stay (deleting a lock file lets two writers hold different lock files at once). With a second
@@ -1062,6 +1083,7 @@ const table = {
   'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
   'recovery at start reports a clip it could not recover': recoveryFailureReported,
   'recovery at start reports every failure of registering the default folder': registerFailuresAllReported,
+  'recovery at start reports an entry of the default folder it cannot read': unreadableEntryReported,
   'a failed start leaves no registry entry and never deletes the registry or its lock file': failedStartKeepsRegistry,
   'a clip folder never is or holds the clips folder or the registry': clipFolderNeverHoldsRegistry,
   'a late picture comes back in time': latePictureInTime,

@@ -1088,9 +1088,25 @@ impl ClipRegistry {
                     break;
                 }
             };
-            let known_folder = registered.iter().any(|entry| entry.folder == folder);
-            if known_folder || !folder.join(CLIP_JSON_FILE).is_file() {
+            if registered.iter().any(|entry| entry.folder == folder) {
                 continue;
+            }
+            let clip_json = folder.join(CLIP_JSON_FILE);
+            match std::fs::metadata(&clip_json) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    failures.push(format!("could not read {}: {error}", clip_json.display()));
+                    continue;
+                }
             }
             let clip_id = match ClipJson::other_format(&folder) {
                 Ok(Some(_)) => continue,

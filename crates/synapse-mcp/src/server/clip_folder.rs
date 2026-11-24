@@ -789,6 +789,8 @@ pub(super) fn write_atomically(path: &Path, value: &impl Serialize) -> Result<()
 }
 
 /// Writes `bytes` to `<path>.tmp`, flushes it to disk and renames it over `path`.
+/// A write that fails after the temp file was created (a full disk, a
+/// rename refused) removes the temp file, so no partial `.tmp` stays.
 pub(super) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension(format!(
         "{}{TEMP_SUFFIX}",
@@ -799,12 +801,19 @@ pub(super) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), St
     ));
     let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("could not create {}: {error}", temp.display()))?;
-    file.write_all(bytes)
+    let written = file
+        .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
+        .map_err(|error| format!("could not write {}: {error}", temp.display()));
     drop(file);
-    retry_brief_hold(|| std::fs::rename(&temp, path))
-        .map_err(|error| format!("could not replace {}: {error}", path.display()))
+    let replaced = written.and_then(|()| {
+        retry_brief_hold(|| std::fs::rename(&temp, path))
+            .map_err(|error| format!("could not replace {}: {error}", path.display()))
+    });
+    if replaced.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    replaced
 }
 
 /// Runs a file operation (a rename that replaces, a read). When another

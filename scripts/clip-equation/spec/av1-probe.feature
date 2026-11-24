@@ -47,6 +47,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed text-page recording whose first still is held by another process during product recovery (opened for reading, sharing only delete): recovery ends with an error "could not read" naming the still; every file of the folder before recovery is still there, byte-equal | Known: true
   Scenario: a registry change never writes from a failed read
     # Equation: registry with 2 entries under the bench's own LOCALAPPDATA, held by another process (opened for reading, sharing only delete) while the product marks one clip finished (clip-probe exp-av1-registry): the change ends with an error (ok = false); the registry file is byte-equal | Known: true
+  Scenario: a failed atomic write removes its temp file
+    # Equation: registry listing one clip under the bench's own LOCALAPPDATA, made read-only so the rename of the written temp file over it fails, while the product marks that clip finished (clip-probe exp-av1-registry action=mark_finished): ok = false; the registry file is byte-equal; no active-clips.json.tmp is left | Known: true
   Scenario: recovery at start reaches an unregistered clip in the default folder
     # Equation: killed text-page recording copied to <bench LOCALAPPDATA>\synapse\clips\<its clip_id>, no registry file; the product's recovery at start (clip-probe exp-av1-registry action=recover): clip.json state = ready; the registry lists that clip id with that folder, finished = true | Known: true
   Scenario: recovery at start registers a default-folder clip under the id its clip.json names

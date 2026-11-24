@@ -714,6 +714,31 @@ function registryKeptOnFailedRead() {
 }
 
 /**
+ * A failed atomic write removes its temp file. The registry file is read-only (here under a LOCALAPPDATA
+ * of the bench's own), so the rename of the written temp file over it fails: the change ends with an
+ * error, the registry is byte-equal and no `active-clips.json.tmp` is left.
+ */
+function failedAtomicWriteRemovesTemp() {
+  const appData = path.join(OUT, 'registry-write-failed');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const file = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(file, JSON.stringify([{ clip_id: 'clip-a', folder: path.join(clips, 'clip-a'), finished: false }], null, 2));
+  const before = fs.readFileSync(file, 'utf8');
+  fs.chmodSync(file, 0o444);
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=mark_finished', 'clip=clip-a'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  fs.chmodSync(file, 0o666);
+  const problems = [];
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('mark_finished succeeded while the registry is read-only');
+  if (fs.readFileSync(file, 'utf8') !== before) problems.push('the read-only registry changed');
+  const temp = `${file}.tmp`;
+  if (fs.existsSync(temp)) problems.push(`the failed write left its temp file ${path.basename(temp)}`);
+  return verdict(problems, `read-only registry: mark_finished ended with an error (${String(got.error).replace(/\s+/g, ' ').slice(0, 120)}), the registry is byte-equal and no temp file is left`);
+}
+
+/**
  * A clip the earlier code recorded in the default clips folder without registering it, left `recording`
  * by a crash, with no registry at all (here under a LOCALAPPDATA of the bench's own): recovery at start
  * reaches it. The clip is ready afterwards and the registry lists it, finished.
@@ -941,6 +966,7 @@ const table = {
   'recovery treats an empty still as missing': emptyStillMissing,
   'recovery never deletes a still it could not read': heldStillKept,
   'a registry change never writes from a failed read': registryKeptOnFailedRead,
+  'a failed atomic write removes its temp file': failedAtomicWriteRemovesTemp,
   'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
   'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
   'recovery at start reports a clip it could not recover': recoveryFailureReported,

@@ -11178,22 +11178,37 @@ fn resolve_shell_working_dir(
                     }),
                 ));
             }
-            PathBuf::from(path)
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                // A relative working_dir resolves against the same directory
+                // the call would run in without one: the session cwd, or the
+                // daemon cwd when there is no session (#220).
+                if !path.has_root()
+                    && matches!(path.components().next(), Some(std::path::Component::Prefix(_)))
+                {
+                    return Err(shell_tool_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!(
+                            "{tool_name} working_dir must not be drive-relative (such as C: or C:dir); give an absolute path or a path relative to the session directory"
+                        ),
+                        json!({
+                            "code": error_codes::TOOL_PARAMS_INVALID,
+                            "path": path,
+                            "reason": "working_dir_drive_relative",
+                        }),
+                    ));
+                }
+                match context {
+                    Some(context) => context.default_working_dir().join(path),
+                    None => shell_daemon_current_dir(tool_name)?.join(path),
+                }
+            }
         }
         None => match context {
             Some(context) => context.default_working_dir().to_path_buf(),
-            None => {
-                return Ok(std::env::current_dir().map_err(|error| {
-                    shell_tool_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("{tool_name} failed to read daemon current directory: {error}"),
-                        json!({
-                            "code": error_codes::TOOL_INTERNAL_ERROR,
-                            "reason": "current_dir_read_failed",
-                        }),
-                    )
-                })?);
-            }
+            None => return shell_daemon_current_dir(tool_name),
         },
     };
 
@@ -11220,6 +11235,19 @@ fn resolve_shell_working_dir(
         ));
     }
     Ok(canonical)
+}
+
+fn shell_daemon_current_dir(tool_name: &'static str) -> Result<PathBuf, ErrorData> {
+    std::env::current_dir().map_err(|error| {
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("{tool_name} failed to read daemon current directory: {error}"),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "current_dir_read_failed",
+            }),
+        )
+    })
 }
 
 fn write_shell_job_request(

@@ -3498,17 +3498,21 @@ pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
     include
 }
 
-/// A11y gather depth for one observe call. Interactable mode defaults to the
-/// maximum walk depth (form fields live deep in real trees); everything else
-/// keeps the historical default of 2. An explicit `depth` always wins.
+/// A11y gather depth for one observe call. Interactable mode defaults to
+/// `find`'s snapshot depth, so it lists the controls `find` reaches (form
+/// fields and WebView2 page content live deep in real trees); everything else
+/// keeps the historical default of 2. An explicit `depth` always wins and is
+/// capped at 6.
 #[must_use]
 pub fn observe_gather_depth(params: &ObserveParams) -> u32 {
-    let default_depth = if params.include.contains(&ObserveSlot::Interactable) {
-        6
+    if let Some(depth) = params.depth {
+        return depth.min(6);
+    }
+    if params.include.contains(&ObserveSlot::Interactable) {
+        FIND_SNAPSHOT_DEPTH
     } else {
         2
-    };
-    params.depth.unwrap_or(default_depth).min(6)
+    }
 }
 
 pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, ErrorData> {

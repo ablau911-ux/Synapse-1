@@ -63,7 +63,9 @@ fn validate_exact_spec(
     source_of_truth: &'static str,
 ) -> Result<(), ErrorData> {
     let matching_present = payload_optional.contains(&operation)
-        || specs.iter().any(|(name, present)| *name == operation && *present);
+        || specs
+            .iter()
+            .any(|(name, present)| *name == operation && *present);
     let extra = specs
         .iter()
         .filter_map(|(name, present)| (*present && *name != operation).then_some(*name))

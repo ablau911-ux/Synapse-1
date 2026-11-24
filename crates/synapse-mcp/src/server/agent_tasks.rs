@@ -514,7 +514,9 @@ fn validate_list_max(max: usize) -> Result<(), ErrorData> {
 /// A cap of 0 would report `at_capacity:0` forever; the schema minimum is 1.
 fn validate_concurrency_cap(concurrency_cap: usize) -> Result<(), ErrorData> {
     if concurrency_cap == 0 {
-        return Err(params_error("agent_task concurrency_cap must be >= 1, got 0"));
+        return Err(params_error(
+            "agent_task concurrency_cap must be >= 1, got 0",
+        ));
     }
     Ok(())
 }

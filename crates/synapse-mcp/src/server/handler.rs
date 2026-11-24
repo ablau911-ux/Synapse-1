@@ -658,7 +658,9 @@ fn failure_reported_by_tool_result(result: &CallToolResult) -> Option<Value> {
         if reports_not_ok(content) {
             return Some(content);
         }
-        content.get("action").filter(|action| reports_not_ok(action))
+        content
+            .get("action")
+            .filter(|action| reports_not_ok(action))
     });
     if let Some(part) = failed_part {
         return Some(json!({

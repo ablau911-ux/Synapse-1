@@ -18513,11 +18513,7 @@ fn screenshot_format_from_path(path: &Path) -> Result<CaptureScreenshotFormat, E
 /// `overwrite`, and every existing ancestor must be a directory (a file in
 /// the middle of the path is the caller's mistake, not a storage fault).
 /// Missing parent directories are created.
-fn ensure_output_path_available(
-    tool: &str,
-    path: &Path,
-    overwrite: bool,
-) -> Result<(), ErrorData> {
+fn ensure_output_path_available(tool: &str, path: &Path, overwrite: bool) -> Result<(), ErrorData> {
     if path.try_exists().map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,

@@ -3907,9 +3907,10 @@ async fn run_shell_with_idempotency(
     Ok(response)
 }
 
-/// Replays `request`'s stored row, or reserves one. A stored row is looked up
-/// before anything else, so an identical request with a completed record gets
-/// its stored response before any check that could differ now (#146).
+/// Replays `request`'s stored row, or reserves one. A completion kept in memory
+/// after a failed write, then a stored row, is looked up before anything else,
+/// so an identical request with a completed record gets its stored response
+/// before any check that could differ now (#146).
 /// `authorize` runs only when no row exists, outside the runtime lock (it may
 /// touch the file system); the lookup is repeated under the lock before the
 /// reservation is written, so two identical calls never both reserve.
@@ -3927,6 +3928,9 @@ fn reserve_idempotent_request<R: DeserializeOwned>(
             )
         })
     };
+    if let Some(completed) = take_pending_idempotency_completion(runtime, request) {
+        return request.replay(&completed).map(Some);
+    }
     let stored = lock()?
         .storage_kv_row(request.row_key())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -3949,25 +3953,118 @@ fn reserve_idempotent_request<R: DeserializeOwned>(
     Ok(None)
 }
 
-/// Stores the first call's response in `request`'s idempotency row.
+/// Completed idempotency rows whose write to the store failed, by row key.
+/// The process already ran, so its reservation must not stay `in_progress`:
+/// the next identical call replays the response from here and writes the row
+/// again (#146). Process memory only; a restart before a successful write
+/// leaves the stored reservation `in_progress`.
+static PENDING_IDEMPOTENT_COMPLETIONS: std::sync::Mutex<BTreeMap<Vec<u8>, Vec<u8>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn write_idempotency_completion(
+    runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
+    tool: &str,
+    row_key: &[u8],
+    completed: Vec<u8>,
+) -> Result<(), ErrorData> {
+    let runtime = runtime.lock().map_err(|_error| {
+        mcp_error(
+            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            format!("reflex runtime lock poisoned while recording {tool} idempotency"),
+        )
+    })?;
+    runtime
+        .storage_put_kv_rows(vec![(row_key.to_vec(), completed)])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+/// The completed row a failed completion write left in memory for `request`,
+/// written to the store again now; it stays in memory until a write succeeds.
+fn take_pending_idempotency_completion(
+    runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
+    request: &IdempotentRequest,
+) -> Option<Vec<u8>> {
+    let mut pending = PENDING_IDEMPOTENT_COMPLETIONS.lock().ok()?;
+    let completed = pending.get(request.row_key())?.clone();
+    match write_idempotency_completion(
+        runtime,
+        request.tool_name(),
+        request.row_key(),
+        completed.clone(),
+    ) {
+        Ok(()) => {
+            pending.remove(request.row_key());
+        }
+        Err(error) => tracing::warn!(
+            code = "IDEMPOTENCY_COMPLETION_WRITE_RETRY_FAILED",
+            tool = request.tool_name(),
+            row_key = %String::from_utf8_lossy(request.row_key()),
+            error = %error.message,
+            "replaying the in-memory completion; the stored row is still in_progress"
+        ),
+    }
+    Some(completed)
+}
+
+/// Stores the first call's response in `request`'s idempotency row. When that
+/// write fails the response is kept in memory for the next identical call
+/// (`PENDING_IDEMPOTENT_COMPLETIONS`) and the storage error is reported with
+/// the response the call produced.
 fn record_idempotent_response<R: Serialize>(
     runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
     request: &IdempotentRequest,
     response: &R,
 ) -> Result<(), ErrorData> {
+    let tool = request.tool_name();
     let completed = request.completed_row(response)?;
-    let runtime = runtime.lock().map_err(|_error| {
-        mcp_error(
-            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "reflex runtime lock poisoned while recording {} idempotency",
-                request.tool_name()
-            ),
-        )
-    })?;
-    runtime
-        .storage_put_kv_rows(vec![(request.row_key().to_vec(), completed)])
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+    let Err(error) =
+        write_idempotency_completion(runtime, tool, request.row_key(), completed.clone())
+    else {
+        return Ok(());
+    };
+    let kept_in_memory = PENDING_IDEMPOTENT_COMPLETIONS
+        .lock()
+        .map(|mut pending| pending.insert(request.row_key().to_vec(), completed))
+        .is_ok();
+    tracing::error!(
+        code = "IDEMPOTENCY_COMPLETION_WRITE_FAILED",
+        tool,
+        row_key = %String::from_utf8_lossy(request.row_key()),
+        kept_in_memory,
+        error = %error.message,
+        "{tool} ran but its idempotency completion could not be stored"
+    );
+    let mut data = match error.data {
+        Some(Value::Object(data)) => data,
+        Some(original_data) => {
+            let mut data = Map::new();
+            data.insert("original_data".to_owned(), original_data);
+            data
+        }
+        None => Map::new(),
+    };
+    data.insert(
+        "idempotency_completion".to_owned(),
+        json!({
+            "reason": "idempotency_completion_write_failed",
+            "row_key": String::from_utf8_lossy(request.row_key()),
+            "kept_in_memory": kept_in_memory,
+            "next_identical_call": if kept_in_memory {
+                "replays this response and writes the row again"
+            } else {
+                "gets idempotency_in_progress"
+            },
+            "response": response,
+        }),
+    );
+    Err(ErrorData::new(
+        error.code,
+        format!(
+            "{tool} ran, but its idempotency completion could not be stored: {}",
+            error.message
+        ),
+        Some(Value::Object(data)),
+    ))
 }
 
 fn clear_failed_idempotency_reservation(

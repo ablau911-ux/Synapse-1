@@ -189,7 +189,12 @@ pub struct HygieneStoredFlag {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HygieneScanTextResponse {
+    /// The first matches in text order, at most 1000.
     pub matches: Vec<HygieneTextMatch>,
+    /// Every match at or above min_score, including those not returned.
+    pub matches_total: u64,
+    /// True when matches_total exceeds the returned (and persisted) matches.
+    pub matches_truncated: bool,
     pub flags_written: u64,
     pub persisted_flags: Vec<HygieneStoredFlag>,
     pub elapsed_ms: u64,
@@ -423,7 +428,10 @@ pub fn scan_text_tool(
             "hygiene_scan_text text must be <= {MAX_SCAN_TEXT_BYTES} bytes"
         )));
     }
-    let matches = scan_text(&params.text, min_score);
+    let mut matches = scan_text(&params.text, min_score);
+    let matches_total = matches.len() as u64;
+    matches.truncate(MAX_FLAG_LIMIT as usize);
+    let matches_truncated = matches_total > matches.len() as u64;
     let (flags_written, persisted_flags) = if params.persist {
         let source_cf = params
             .source_cf
@@ -458,6 +466,8 @@ pub fn scan_text_tool(
     };
     Ok(HygieneScanTextResponse {
         matches,
+        matches_total,
+        matches_truncated,
         flags_written,
         persisted_flags,
         elapsed_ms: elapsed_ms(started),

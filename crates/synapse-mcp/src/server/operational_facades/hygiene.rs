@@ -71,8 +71,9 @@ pub(super) async fn handle(
             Ok(Json(hygiene_response(
                 operation,
                 format!(
-                    "matches={} flags_written={}",
+                    "matches={} matches_total={} flags_written={}",
                     response.matches.len(),
+                    response.matches_total,
                     response.flags_written
                 ),
                 |out| out.scan_text = Some(response),

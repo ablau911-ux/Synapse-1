@@ -1206,6 +1206,14 @@ impl SynapseService {
                 validate_cdp_target_id(&cdp_target_id)?;
                 let (title, process) =
                     self.validate_target_window_for_session(&session_id, window_hwnd)?;
+                if !synapse_a11y::is_chromium_family(&process) {
+                    return Err(chromium_window_required_error(
+                        "set_target",
+                        window_hwnd,
+                        &process,
+                        &title,
+                    ));
+                }
                 self.ensure_cdp_target_bindable_for_window(
                     &session_id,
                     window_hwnd,
@@ -7122,7 +7130,12 @@ impl SynapseService {
                 }
             };
         if !synapse_a11y::is_chromium_family(&context.process_name) {
-            return Err(chromium_window_required_error(tool, &context));
+            return Err(chromium_window_required_error(
+                tool,
+                context.hwnd,
+                &context.process_name,
+                &context.window_title,
+            ));
         }
         Ok(BrowserTabsWindowResolution {
             context,
@@ -16649,17 +16662,26 @@ pub(super) fn validate_browser_window(
 ) -> Result<ForegroundContext, ErrorData> {
     let context = validate_target_window_context(tool, hwnd)?;
     if !synapse_a11y::is_chromium_family(&context.process_name) {
-        return Err(chromium_window_required_error(tool, &context));
+        return Err(chromium_window_required_error(
+            tool,
+            context.hwnd,
+            &context.process_name,
+            &context.window_title,
+        ));
     }
     Ok(context)
 }
 
-fn chromium_window_required_error(tool: &str, context: &ForegroundContext) -> ErrorData {
+fn chromium_window_required_error(
+    tool: &str,
+    hwnd: i64,
+    process_name: &str,
+    window_title: &str,
+) -> ErrorData {
     mcp_error(
         error_codes::ACTION_TARGET_INVALID,
         format!(
-            "{tool} requires a Chromium browser window; resolved hwnd={:#x} process_name={:?} title={:?}",
-            context.hwnd, context.process_name, context.window_title
+            "{tool} requires a Chromium browser window; resolved hwnd={hwnd:#x} process_name={process_name:?} title={window_title:?}"
         ),
     )
 }

@@ -393,9 +393,15 @@ impl PartReader {
 
 /// Decodes a lossless WebP still to RGBA.
 pub(super) fn decode_still(path: &Path) -> Result<RgbaImage, String> {
-    let file = std::fs::File::open(path)
+    let bytes = std::fs::read(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    let mut decoder = image_webp::WebPDecoder::new(std::io::BufReader::new(file))
+    decode_still_bytes(&bytes, path)
+}
+
+/// Decodes the bytes of a lossless WebP still (`path` names it in errors) to
+/// RGBA.
+pub(super) fn decode_still_bytes(bytes: &[u8], path: &Path) -> Result<RgbaImage, String> {
+    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes))
         .map_err(|error| format!("{} is not a readable WebP: {error}", path.display()))?;
     let (width, height) = decoder.dimensions();
     let size = decoder

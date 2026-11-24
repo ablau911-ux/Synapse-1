@@ -349,8 +349,12 @@ function recordedAgainAfterLoss(scene) {
   return { note: `${after.length} instants after a loss are recorded again and come back as pictures` };
 }
 
-/** A copy of a killed recording, changed by `damage(dir)`, then recovered by the product: { dir, result, before, lines } or { error }. */
-function recovered(fixture, name, damage) {
+/**
+ * A copy of a killed recording, changed by `damage(dir)`, then recovered by the product: { dir, result, before, lines }
+ * or { error } (with dir and before when the recovery itself failed). `held(dir)`, when given, names a file another
+ * process holds while the recovery runs.
+ */
+function recovered(fixture, name, damage, held) {
   const source = path.join(ROOT, fixture);
   if (!fs.existsSync(path.join(source, 'clip.json'))) return { error: `no killed recording at ${source}` };
   const dir = path.join(OUT, name);
@@ -358,13 +362,20 @@ function recovered(fixture, name, damage) {
   fs.cpSync(source, dir, { recursive: true });
   const before = readJsonl(path.join(dir, 'frames.jsonl'));
   damage(dir);
-  const run = spawnSync(PROBE, ['exp-av1-recover', `folder=${dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  const run = held
+    ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', HOLD_AND_RECOVER], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, HOLD_FILE: held(dir), HOLD_PROBE: PROBE, HOLD_FOLDER: dir } })
+    : spawnSync(PROBE, ['exp-av1-recover', `folder=${dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
   if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
   let result;
   try { result = JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
-  if (!result.ok) return { error: `recovery failed: ${result.error}` };
+  if (!result.ok) return { error: `recovery failed: ${result.error}`, dir, before };
   return { dir, result, before, lines: readJsonl(path.join(dir, 'frames.jsonl')) };
 }
+// Another process holds HOLD_FILE (opened for reading, sharing only delete, as an indexer or antivirus
+// may) while the product's recovery runs on HOLD_FOLDER; prints the recovery's JSON line.
+const HOLD_AND_RECOVER = "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Delete'); try { & $env:HOLD_PROBE exp-av1-recover \"folder=$env:HOLD_FOLDER\" } finally { $f.Close() }";
+/** SHA-256 of every file under `dir`, by relative path. */
+const fileHashes = dir => Object.fromEntries(fs.readdirSync(dir, { recursive: true }).map(String).filter(file => fs.statSync(path.join(dir, file)).isFile()).map(file => [file, crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, file))).digest('hex')]));
 const lastPart = dir => path.join(dir, 'video', fs.readdirSync(path.join(dir, 'video')).filter(f => /^part-\d+\.ivf$/.test(f)).sort().at(-1));
 const verdict = (problems, note) => ({ pass: problems.length === 0, value: '-', measured: problems.length ? problems.join('; ') : note });
 
@@ -649,6 +660,30 @@ function emptyStillMissing() {
 }
 
 /**
+ * A still another process holds while recovery runs (it cannot be opened for reading, but may be deleted):
+ * a still that could not be read is not a missing still. Recovery ends with an error and changes nothing:
+ * every file of the folder is still there with the same bytes, the still among them.
+ */
+function heldStillKept() {
+  let held, filesBefore;
+  const got = recovered('killed-text-page', 'crash-held-still', dir => {
+    const still = readJsonl(path.join(dir, 'frames.jsonl')).find(line => line.still === true);
+    if (!still) return;
+    held = path.join(dir, 'stills', `still-${pad(still.instant, 8)}.webp`);
+    filesBefore = fileHashes(dir);
+  }, () => held);
+  if (held === undefined) return verdict(['the killed recording has no still']);
+  if (!got.dir) return verdict([got.error]);
+  const problems = [];
+  if (!got.error) problems.push('recovery succeeded while it could not read a still');
+  else if (!/^recovery failed: .*could not read .*still-\d{8}\.webp/.test(got.error)) problems.push(`recovery failed for another reason: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  const filesAfter = fileHashes(got.dir);
+  const changed = Object.keys(filesBefore).filter(file => filesAfter[file] !== filesBefore[file]);
+  if (changed.length) problems.push(`recovery removed or changed ${changed.join(', ')}`);
+  return verdict(problems, `still ${path.basename(held)} held by another process: recovery ends with an error and every file of the folder is unchanged`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -760,6 +795,7 @@ const table = {
   'recovery skips a clip of another format quietly': otherFormatSkipped,
   'recovery says a recovered clip needs no more recovery': recoveredClipFinished,
   'recovery treats an empty still as missing': emptyStillMissing,
+  'recovery never deletes a still it could not read': heldStillKept,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

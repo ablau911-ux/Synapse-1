@@ -18,12 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::clip_decoder::decode_still;
+use super::clip_decoder::decode_still_bytes;
 use super::clip_folder::{
     CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
     LOST_SERVICE_RESTART, LostInstant, MAX_DURATION_MS, PartInfo, RECORD_FPS, RecorderLock,
-    STILLS_DIR, StillInfo, StopReason, part_path, read_index, repair_ivf, still_path,
-    write_bytes_atomically,
+    STILLS_DIR, StillInfo, StopReason, part_path, read_index, repair_ivf, retry_brief_hold,
+    still_path, write_bytes_atomically,
 };
 
 const MILLISECONDS_PER_SECOND: u64 = 1_000;
@@ -153,16 +153,18 @@ impl ClipRecovery {
         fps: u32,
         cause: &str,
     ) -> Result<(Vec<IndexLine>, BTreeMap<u32, u32>), String> {
-        let complete = Self::repair_parts(folder)?;
         let read = read_index(folder).map_err(|error| error.to_string())?;
         let planned = planned.unwrap_or(read.len() as u64);
-        // A still is on disk when its file decodes: one that a power loss
-        // left empty or cut counts as missing. Each named still is decoded once.
+        // Each named still is read once, before anything is written: a still
+        // that cannot be read stops recovery of this clip unchanged.
         let named: BTreeSet<u64> = read.iter().filter_map(IndexLine::still_file).collect();
-        let on_disk: BTreeSet<u64> = named
-            .into_iter()
-            .filter(|&instant| decode_still(&still_path(folder, instant)).is_ok())
-            .collect();
+        let mut on_disk = BTreeSet::new();
+        for instant in named {
+            if Self::still_on_disk(&still_path(folder, instant))? {
+                on_disk.insert(instant);
+            }
+        }
+        let complete = Self::repair_parts(folder)?;
         let lines = Self::repair_index(&read, &complete, planned, fps, cause, |instant| {
             on_disk.contains(&instant)
         });
@@ -174,6 +176,18 @@ impl ClipRecovery {
             write_bytes_atomically(&folder.join(FRAMES_FILE), text.as_bytes())?;
         }
         Ok((lines, complete))
+    }
+
+    /// Whether a still is on disk: `false` when its file is absent, or was
+    /// read in full and does not decode (a power loss left it empty or cut).
+    /// A file that cannot be opened or read (another process holds it past
+    /// the brief-hold retries) is an error, never a missing still.
+    fn still_on_disk(path: &Path) -> Result<bool, String> {
+        match retry_brief_hold(|| std::fs::read(path)) {
+            Ok(bytes) => Ok(decode_still_bytes(&bytes, path).is_ok()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("could not read {}: {error}", path.display())),
+        }
     }
 
     /// Repairs every part file `video/part-NNNN.ivf`, numbered from 0000;

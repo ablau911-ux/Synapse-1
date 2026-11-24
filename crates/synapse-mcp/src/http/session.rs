@@ -367,18 +367,19 @@ async fn record_session_request(
 /// route, and answers a JSON-RPC error otherwise (#189): rmcp answers a body it
 /// cannot decode with a plain-text 415, which no JSON-RPC client can match.
 fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
-    let JsonRpcObject(message) = serde_json::from_slice::<JsonRpcObject>(bytes).map_err(|error| {
-        if error.classify() == serde_json::error::Category::Data {
-            invalid_jsonrpc_request(&serde_json::Value::Null, &error.to_string())
-        } else {
-            jsonrpc_error_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::Value::Null,
-                ErrorCode::PARSE_ERROR,
-                format!("parse error: {error}"),
-            )
-        }
-    })?;
+    let JsonRpcObject(message) =
+        serde_json::from_slice::<JsonRpcObject>(bytes).map_err(|error| {
+            if error.classify() == serde_json::error::Category::Data {
+                invalid_jsonrpc_request(&serde_json::Value::Null, &error.to_string())
+            } else {
+                jsonrpc_error_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::Value::Null,
+                    ErrorCode::PARSE_ERROR,
+                    format!("parse error: {error}"),
+                )
+            }
+        })?;
     // A present id that is not a string or an integer (null, object, bool,
     // float, array) fails rmcp's request decode, and rmcp then reads the
     // message as a notification: HTTP 202, never executed, never answered
@@ -396,7 +397,9 @@ fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
     if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
         return Err(invalid_jsonrpc_request(id, "jsonrpc must be \"2.0\""));
     }
-    let has_method = message.get("method").is_some_and(serde_json::Value::is_string);
+    let has_method = message
+        .get("method")
+        .is_some_and(serde_json::Value::is_string);
     let is_response = message.contains_key("id")
         && (message.contains_key("result") || message.contains_key("error"));
     if !has_method && !is_response {
@@ -439,7 +442,9 @@ impl<'de> serde::de::Visitor<'de> for JsonRpcObjectVisitor {
         let mut members = serde_json::Map::new();
         while let Some(name) = map.next_key::<String>()? {
             if members.contains_key(&name) {
-                return Err(serde::de::Error::custom(format_args!("duplicate member `{name}`")));
+                return Err(serde::de::Error::custom(format_args!(
+                    "duplicate member `{name}`"
+                )));
             }
             let value = map.next_value()?;
             members.insert(name, value);
@@ -473,7 +478,12 @@ fn jsonrpc_error_response(
             "message": message,
         },
     });
-    (status, [(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 fn record_session_heartbeat(

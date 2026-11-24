@@ -707,7 +707,8 @@ mod live {
         }
         // Every way the recorder ends sealed the end where it was decided,
         // before the flush: a stop call in `request_stop`, `Completed` in
-        // `ends_at`, a failure or stop condition in `run`.
+        // `ends_at`, a failed read-back in `handle_instant`, any other
+        // failure or stop condition in `run`.
         let reason = recording.run(control);
         recording.finish(reason);
     }
@@ -1102,11 +1103,13 @@ mod live {
                 }
                 let ended = match self.stop_condition() {
                     Some(reason) => Err(reason),
-                    None => self.handle_instant(k),
+                    None => self.handle_instant(k, control),
                 };
                 if let Err(reason) = ended {
-                    // The recorder decides here that the recording ends: the
-                    // end is sealed at once, before anything else runs.
+                    // A stop condition or a failed write ends the recording
+                    // here: the end is sealed at once, before anything else
+                    // runs (a failed read-back sealed it where it was found,
+                    // before its lost line was written).
                     control.seal();
                     return reason;
                 }
@@ -1146,7 +1149,10 @@ mod live {
         /// Instant k: the frame composed in it is read back and handed to the
         /// stream; a frame already handed over is `Unchanged`; a frame the
         /// observer dropped (no free slot) or could not read is a named loss.
-        fn handle_instant(&mut self, k: u64) -> Result<(), StopReason> {
+        /// A frame that could not be read ends the recording: the end is
+        /// sealed before its lost line is written, so no extend is accepted
+        /// once that is decided.
+        fn handle_instant(&mut self, k: u64, control: &RecordingControl) -> Result<(), StopReason> {
             let frame = self.observer.frame_for_instant(to_i64(k));
             let overflowed = self
                 .observer
@@ -1167,6 +1173,7 @@ mod live {
                 Ok(pixels) => pixels,
                 Err(error) => {
                     tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
+                    control.seal();
                     self.last_composed = None;
                     self.feed(k, StreamInput::Lost(LOST_CAPTURE_FAILED), frame.cursor)?;
                     return Err(StopReason::CaptureFailed);

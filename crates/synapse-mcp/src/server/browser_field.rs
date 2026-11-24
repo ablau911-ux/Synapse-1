@@ -408,7 +408,12 @@ impl SynapseService {
             })?;
 
         let locator = validate_locator(&params)?;
-        let (window_hwnd, cdp_target_id) = self.resolve_bridge_target(&session_id, &params)?;
+        let (window_hwnd, cdp_target_id) = self.resolve_bridge_target(
+            TOOL,
+            &session_id,
+            params.cdp_target_id.as_deref(),
+            params.window_hwnd,
+        )?;
 
         if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
             return Err(mcp_error(
@@ -473,15 +478,10 @@ impl SynapseService {
             })?;
         validate_fill_form_params(&params)?;
         let (window_hwnd, cdp_target_id) = self.resolve_bridge_target(
+            "browser_fill_form",
             &session_id,
-            &BrowserSetValueParams {
-                text: String::new(),
-                selector: Some("#__synapse_unused__".to_owned()),
-                element_id: None,
-                active_element: false,
-                cdp_target_id: params.cdp_target_id.clone(),
-                window_hwnd: params.window_hwnd,
-            },
+            params.cdp_target_id.as_deref(),
+            params.window_hwnd,
         )?;
         if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
             return Err(mcp_error(
@@ -971,27 +971,28 @@ impl SynapseService {
 
     fn resolve_bridge_target(
         &self,
+        tool: &str,
         session_id: &str,
-        params: &BrowserSetValueParams,
+        cdp_target_id_param: Option<&str>,
+        window_hwnd_param: Option<i64>,
     ) -> Result<(i64, String), ErrorData> {
-        if let Some(target_id) = params.cdp_target_id.as_deref() {
+        if let Some(target_id) = cdp_target_id_param {
             super::m1_tools::validate_cdp_target_id(target_id)?;
         }
         let active_target = self.session_target(Some(session_id))?;
-        let cdp_target_id = match (params.cdp_target_id.as_ref(), active_target.as_ref()) {
-            (Some(target_id), _) => target_id.clone(),
+        let cdp_target_id = match (cdp_target_id_param, active_target.as_ref()) {
+            (Some(target_id), _) => target_id.to_owned(),
             (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
             (None, _) => {
                 return Err(mcp_error(
                     error_codes::TARGET_NOT_SET,
                     format!(
-                        "{TOOL} requires an active CDP session target or an explicit cdp_target_id owned by this session; refusing the human foreground tab"
+                        "{tool} requires an active CDP session target or an explicit cdp_target_id owned by this session; refusing the human foreground tab"
                     ),
                 ));
             }
         };
-        let window_hwnd = params
-            .window_hwnd
+        let window_hwnd = window_hwnd_param
             .or_else(|| match active_target.as_ref() {
                 Some(SessionTarget::Cdp { window_hwnd, .. }) => Some(*window_hwnd),
                 Some(SessionTarget::Window { hwnd }) => Some(*hwnd),
@@ -1000,13 +1001,13 @@ impl SynapseService {
             .ok_or_else(|| {
                 mcp_error(
                     error_codes::TARGET_NOT_SET,
-                    format!("{TOOL} requires window_hwnd when no active session target is set"),
+                    format!("{tool} requires window_hwnd when no active session target is set"),
                 )
             })?;
-        let window_hwnd = crate::m1::validate_window_hwnd_shape(TOOL, window_hwnd)?;
+        let window_hwnd = crate::m1::validate_window_hwnd_shape(tool, window_hwnd)?;
         // Ownership: an explicit target must match this session's active CDP
         // target. This keeps the tool from acting on another session's tab.
-        if let Some(explicit) = params.cdp_target_id.as_ref() {
+        if let Some(explicit) = cdp_target_id_param {
             let owned = matches!(
                 active_target.as_ref(),
                 Some(SessionTarget::Cdp { cdp_target_id, .. })
@@ -1016,7 +1017,7 @@ impl SynapseService {
                 return Err(mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "{TOOL} refused target {explicit:?}: it is not this session's active CDP target"
+                        "{tool} refused target {explicit:?}: it is not this session's active CDP target"
                     ),
                 ));
             }

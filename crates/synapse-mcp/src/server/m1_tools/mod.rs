@@ -12367,12 +12367,6 @@ pub(super) fn validate_cdp_target_id(cdp_target_id: &str) -> Result<(), ErrorDat
 }
 
 fn validate_browser_tabs_params(params: BrowserTabsParams) -> Result<BrowserTabsParams, ErrorData> {
-    if let Some(cdp_target_id) = params.cdp_target_id.as_deref() {
-        validate_cdp_target_id(cdp_target_id)?;
-    }
-    if let Some(url) = params.url.as_deref() {
-        validate_cdp_tab_url(url)?;
-    }
     match params.operation {
         BrowserTabsOperation::List => {
             if params.cdp_target_id.is_some() {
@@ -12444,6 +12438,14 @@ fn validate_browser_tabs_params(params: BrowserTabsParams) -> Result<BrowserTabs
                 ));
             }
         }
+    }
+    // Formats are checked only after the operation accepted the field, so a
+    // field the operation does not take is refused as such, not by format.
+    if let Some(cdp_target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(cdp_target_id)?;
+    }
+    if let Some(url) = params.url.as_deref() {
+        validate_cdp_tab_url(url)?;
     }
     Ok(params)
 }

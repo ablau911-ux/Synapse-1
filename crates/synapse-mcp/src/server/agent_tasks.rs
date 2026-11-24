@@ -1177,6 +1177,19 @@ impl SynapseService {
             .ok_or_else(|| task_not_found(&params.task_id))?;
         let now = unix_time_ms_now();
 
+        // Terminal states are sinks for fields too, not only for transitions:
+        // a done or cancelled task is a settled record and is never rewritten.
+        if task.state.is_terminal() {
+            return Err(mcp_error(
+                error_codes::AGENT_TASK_INVALID_TRANSITION,
+                format!(
+                    "agent_task {:?} is {} (terminal) and can no longer be updated; create a new task instead",
+                    task.task_id,
+                    task.state.as_str()
+                ),
+            ));
+        }
+
         if let Some(priority) = params.priority {
             validate_priority(priority)?;
             task.priority = priority;

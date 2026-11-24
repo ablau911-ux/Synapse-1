@@ -12,9 +12,10 @@ use super::{
     launch_process_history_row_key, launch_request_details, mcp_error,
     prepare_run_shell_params_for_context, prepare_run_shell_start_params_for_context,
     required_combo_permissions, run_authorized_shell_with_boundary, run_shell_idempotent_request,
-    run_shell_request_details, run_shell_start_request_details, shell_execution_context_for_session,
-    shell_job_status, start_authorized_shell_job_with_boundary, tool, tool_router,
-    validate_agent_spawn_params, validate_run_shell_execution_plan,
+    run_shell_request_details, run_shell_start_request_details,
+    shell_execution_context_for_session, shell_job_status,
+    start_authorized_shell_job_with_boundary, tool, tool_router, validate_agent_spawn_params,
+    validate_run_shell_execution_plan,
 };
 
 use std::{

@@ -676,8 +676,7 @@ pub struct ActRunShellCancelResponse {
 /// Cancel terminates and re-checks the job's root process and its descendants
 /// found by parent process id; nothing outside that tree.
 const SHELL_CANCEL_TERMINATION_SCOPE: &str = "job_root_process_and_parent_pid_descendants";
-const SHELL_CANCEL_TERMINATION_SCOPE_NOTE: &str =
-    "termination_status and remaining_process_ids cover only the job's root process and its descendants by parent process id; processes started outside that tree (for example through WMI Win32_Process.Create, the Task Scheduler or a service) are not tracked, not terminated and not listed";
+const SHELL_CANCEL_TERMINATION_SCOPE_NOTE: &str = "termination_status and remaining_process_ids cover only the job's root process and its descendants by parent process id; processes started outside that tree (for example through WMI Win32_Process.Create, the Task Scheduler or a service) are not tracked, not terminated and not listed";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -6929,7 +6928,9 @@ pub fn run_shell_idempotent_request(
     request.command_line = command_metadata.command_line;
     request.command_line_sha256 = command_metadata.command_line_sha256;
     request.command_line_redacted = command_metadata.command_line_redacted;
-    request.matched_pattern.clone_from(&authorization.matched_pattern);
+    request
+        .matched_pattern
+        .clone_from(&authorization.matched_pattern);
     Ok(Some(request))
 }
 
@@ -20056,8 +20057,9 @@ fn shell_child_command(program: &str, args: &[String]) -> StdCommand {
 /// a batch file and launches it through `cmd.exe`.
 #[cfg(windows)]
 fn is_windows_batch_program(program: &str) -> bool {
-    let lower = program.to_ascii_lowercase();
-    lower.ends_with(".bat") || lower.ends_with(".cmd")
+    Path::new(program).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+    })
 }
 
 fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadata {

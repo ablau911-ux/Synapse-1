@@ -1003,11 +1003,15 @@ impl ClipRegistry {
     }
 
     /// Registers, unfinished, every folder under the default clips folder
-    /// that holds a `clip.json` of this recorder's format (or one that cannot
-    /// be read, for recovery to judge) and is not registered yet: a clip
-    /// recorded there before every clip was registered, which a crash may
-    /// have left `recording`. Its id is its folder name, as `folder_of` finds
-    /// it. Once registered, a folder is not read here again.
+    /// that holds a `clip.json` of this recorder's format and is not
+    /// registered yet: a clip recorded there before every clip was
+    /// registered, which a crash may have left `recording`. Its id is the
+    /// `clip_id` its `clip.json` names (a clip recorded with an explicit
+    /// folder there has a folder name that is not its id); a clip is known
+    /// when its folder or its id is registered. Once registered, a folder is
+    /// not read here again. A folder whose `clip.json` cannot be read is not
+    /// registered (its id is unknown): the others are, and the call then
+    /// ends with an error naming it, so the next start reads it again.
     pub(super) fn register_default_folder() -> Result<(), String> {
         let root = clips_root();
         let listing = match std::fs::read_dir(&root) {
@@ -1016,38 +1020,54 @@ impl ClipRegistry {
             Err(error) => return Err(format!("could not list {}: {error}", root.display())),
         };
         let registered = Self::entries()?;
-        let mut found = Vec::new();
+        let mut found: Vec<RegistryEntry> = Vec::new();
+        let mut unreadable = Vec::new();
         for item in listing {
             let folder = item
                 .map_err(|error| format!("could not list {}: {error}", root.display()))?
                 .path();
-            let Some(clip_id) = folder.file_name().and_then(|name| name.to_str()) else {
+            let known_folder = registered.iter().any(|entry| entry.folder == folder);
+            if known_folder || !folder.join(CLIP_JSON_FILE).is_file() {
                 continue;
+            }
+            let clip_id = match ClipJson::other_format(&folder) {
+                Ok(Some(_)) => continue,
+                Ok(None) => ClipJson::read(&folder).map(|clip| clip.clip_id),
+                Err(error) => Err(error),
             };
-            let known = registered
-                .iter()
-                .any(|entry| entry.clip_id == clip_id || entry.folder == folder);
-            if known || !folder.join(CLIP_JSON_FILE).is_file() {
-                continue;
-            }
-            if !matches!(ClipJson::other_format(&folder), Ok(Some(_))) {
-                found.push((clip_id.to_owned(), folder));
-            }
-        }
-        if found.is_empty() {
-            return Ok(());
-        }
-        Self::change(|entries| {
-            for (clip_id, folder) in found {
-                if !entries.iter().any(|entry| entry.clip_id == clip_id) {
-                    entries.push(RegistryEntry {
-                        clip_id,
-                        folder,
-                        finished: false,
-                    });
+            let clip_id = match clip_id {
+                Ok(clip_id) => clip_id,
+                Err(error) => {
+                    unreadable.push(error);
+                    continue;
                 }
+            };
+            let known = |entry: &RegistryEntry| entry.clip_id == clip_id;
+            if !registered.iter().any(known) && !found.iter().any(known) {
+                found.push(RegistryEntry {
+                    clip_id,
+                    folder,
+                    finished: false,
+                });
             }
-        })
+        }
+        if !found.is_empty() {
+            Self::change(|entries| {
+                for entry in found {
+                    let known = entries.iter().any(|registered| {
+                        registered.clip_id == entry.clip_id || registered.folder == entry.folder
+                    });
+                    if !known {
+                        entries.push(entry);
+                    }
+                }
+            })?;
+        }
+        if unreadable.is_empty() {
+            Ok(())
+        } else {
+            Err(unreadable.join("; "))
+        }
     }
 
     /// Every clip that may need recovery: the entries not marked finished.

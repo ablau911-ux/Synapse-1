@@ -49,6 +49,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: registry with 2 entries under the bench's own LOCALAPPDATA, held by another process (opened for reading, sharing only delete) while the product marks one clip finished (clip-probe exp-av1-registry): the change ends with an error (ok = false); the registry file is byte-equal | Known: true
   Scenario: recovery at start reaches an unregistered clip in the default folder
     # Equation: killed text-page recording copied to <bench LOCALAPPDATA>\synapse\clips\<its clip_id>, no registry file; the product's recovery at start (clip-probe exp-av1-registry action=recover): clip.json state = ready; the registry lists that clip id with that folder, finished = true | Known: true
+  Scenario: recovery at start registers a default-folder clip under the id its clip.json names
+    # Equation: killed text-page recording copied to <bench clips>\clip-other (its own clip_id), the registry already listing clip_id "clip-other" (finished, another folder); a second copy in <bench clips>\explicit-b whose clip.json says clip_id <its id>-b; the product's recovery at start: both clips state = ready; the registry lists <its id> with folder clip-other and <its id>-b with folder explicit-b, both finished; no entry has clip_id "explicit-b" | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

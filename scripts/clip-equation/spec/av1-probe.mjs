@@ -740,6 +740,42 @@ function unregisteredDefaultClipRecovered() {
 }
 
 /**
+ * A clip recorded with an explicit folder under the default clips folder: its folder name is not its
+ * clip id. Recovery at start registers each such clip under the clip_id its clip.json names, also when
+ * its folder name is the id of another registered clip, and never under its folder name.
+ */
+function defaultClipRegisteredByItsId() {
+  const appData = path.join(OUT, 'registry-by-id');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const source = path.join(ROOT, 'killed-text-page');
+  const clipId = JSON.parse(fs.readFileSync(path.join(source, 'clip.json'), 'utf8')).clip_id;
+  const clips = path.join(appData, 'synapse', 'clips');
+  const named = path.join(clips, 'clip-other'), explicit = path.join(clips, 'explicit-b');
+  fs.cpSync(source, named, { recursive: true });
+  fs.cpSync(source, explicit, { recursive: true });
+  const explicitJson = path.join(explicit, 'clip.json');
+  const explicitClip = JSON.parse(fs.readFileSync(explicitJson, 'utf8'));
+  explicitClip.clip_id = `${clipId}-b`;
+  fs.writeFileSync(explicitJson, JSON.stringify(explicitClip));
+  const registry = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(registry, JSON.stringify([{ clip_id: 'clip-other', folder: path.join(appData, 'elsewhere', 'clip-other'), finished: true }], null, 2));
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  if (!got.ok) problems.push(`recovery at start: ${got.error}`);
+  const entries = JSON.parse(fs.readFileSync(registry, 'utf8'));
+  for (const [id, folder] of [[clipId, named], [`${clipId}-b`, explicit]]) {
+    const state = JSON.parse(fs.readFileSync(path.join(folder, 'clip.json'), 'utf8')).state;
+    if (state !== 'ready') problems.push(`${path.basename(folder)} is ${state} after recovery at start, not ready`);
+    const entry = entries.find(e => e.clip_id === id && path.resolve(e.folder) === folder);
+    if (!entry) problems.push(`the registry does not list ${id} with folder ${path.basename(folder)}`);
+    else if (!entry.finished) problems.push(`the registry lists ${id} unfinished`);
+  }
+  const byName = entries.filter(e => e.clip_id === 'explicit-b');
+  if (byName.length) problems.push(`the registry lists a clip under its folder name explicit-b: ${JSON.stringify(byName[0])}`);
+  return verdict(problems, `clips in clip-other (id ${clipId}, folder name registered for another clip) and explicit-b (id ${clipId}-b): both registered under their clip.json id, recovered ready and finished`);
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -854,6 +890,7 @@ const table = {
   'recovery never deletes a still it could not read': heldStillKept,
   'a registry change never writes from a failed read': registryKeptOnFailedRead,
   'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
+  'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

@@ -12,8 +12,8 @@ use synapse_capture::ClipSource;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, StopReason, clips_root,
-    file_size_and_sha256,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, RECORD_FPS, StopReason,
+    clips_root, file_size_and_sha256,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -22,8 +22,6 @@ use crate::m1::{ClipSegmentInfo, mcp_error};
 use crate::m3::SharedM3State;
 use crate::m3::timeline_control::{RecorderControl, SuppressReason};
 
-/// f: recorded instants per second (base rule).
-pub(super) const RECORD_FPS: u32 = 20;
 /// f_r: the reference screen; T_r = 1 / f_r is the hold-time bound (C17).
 pub(super) const REFERENCE_REFRESH_HZ: u32 = 60;
 /// t_def: length of a recording unless the call gives one.

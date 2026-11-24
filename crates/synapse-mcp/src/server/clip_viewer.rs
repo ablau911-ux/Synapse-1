@@ -25,6 +25,7 @@
 //! files stay untouched); the label sits in a band above the picture, never
 //! over it. All decoding and image work runs on a blocking thread.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -347,18 +348,7 @@ impl ViewedClip {
     /// ranges, in time order.
     fn timeline(&self) -> Vec<ClipTimelineEntry> {
         let mut entries = self.change_entries();
-        entries.extend(self.still_instants().map(|instant| {
-            self.entry(
-                "settled",
-                instant,
-                instant,
-                0,
-                format!(
-                    "{} settled: exact still of instant {instant}",
-                    fmt_time(self.t_of(instant))
-                ),
-            )
-        }));
+        entries.extend(self.settle_entries());
         let static_instants = STATIC_REPORT_MS * self.fps() / MS_PER_SECOND;
         for (start, end, ()) in runs(&self.lines, |line| (line.same == Some(true)).then_some(())) {
             if end + 1 - start >= static_instants.max(1) {
@@ -384,6 +374,61 @@ impl ViewedClip {
         }
         entries.sort_by_key(|entry| (entry.start_frame, timeline_rank(&entry.kind)));
         entries
+    }
+
+    /// Settle points: a new exact still is one entry; settles on stills
+    /// stored before (`still_of`) in a row, with no new still between, are
+    /// one entry that names them in words and counts them.
+    fn settle_entries(&self) -> Vec<ClipTimelineEntry> {
+        let mut entries = Vec::new();
+        // (first instant, last instant, count, the stored stills repeated)
+        let mut repeats: Option<(u64, u64, u64, BTreeSet<u64>)> = None;
+        for line in &self.lines {
+            if line.still == Some(true) {
+                entries.extend(repeats.take().map(|run| self.repeat_entry(run)));
+                let instant = line.instant;
+                entries.push(self.entry(
+                    "settled",
+                    instant,
+                    instant,
+                    0,
+                    format!(
+                        "{} settled: exact still of instant {instant}",
+                        fmt_time(self.t_of(instant))
+                    ),
+                ));
+            } else if let Some(stored) = line.still_of {
+                let run =
+                    repeats.get_or_insert_with(|| (line.instant, line.instant, 0, BTreeSet::new()));
+                run.1 = line.instant;
+                run.2 += 1;
+                run.3.insert(stored);
+            }
+        }
+        entries.extend(repeats.map(|run| self.repeat_entry(run)));
+        entries
+    }
+
+    fn repeat_entry(&self, (start, end, count, stored): (u64, u64, u64, BTreeSet<u64>)) -> ClipTimelineEntry {
+        let names = stored
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let text = if count == 1 {
+            format!(
+                "{} settled again on the still of instant {names}",
+                fmt_time(self.t_of(start))
+            )
+        } else {
+            let stills = if stored.len() == 1 { "the still" } else { "the stills" };
+            format!(
+                "{}-{} settled {count} times again on {stills} of instant {names}, no new picture",
+                fmt_time(self.t_of(start)),
+                fmt_time(self.t_of(end + 1))
+            )
+        };
+        self.entry("settled", start, end, 0, text)
     }
 
     /// Changed instants joined into stretches: two changes fewer than
@@ -443,8 +488,9 @@ impl ViewedClip {
     /// Key pictures of the overview, in time order: the first and last
     /// recorded instants, every settle point, the end of every changed
     /// stretch, and one picture per `FLOOR_INTERVAL_MS` where none falls.
-    /// Picks that show the same recorded picture are joined; lost instants
-    /// are never picked.
+    /// Picks that show the same recorded picture are joined; a stored still
+    /// file is shown once, at the first instant that holds it (its repeats
+    /// are named in the timeline); lost instants are never picked.
     fn overview_picks(&self) -> Vec<Pick> {
         let mut picks: Vec<Pick> = Vec::new();
         let first = (0..=self.last_instant()).find(|k| self.is_recorded(*k));
@@ -472,14 +518,20 @@ impl ViewedClip {
             floored.push(next);
         }
         let mut joined: Vec<(u64, Pick)> = Vec::with_capacity(floored.len());
+        let mut shown_files: BTreeSet<u64> = BTreeSet::new();
         for pick in floored {
-            let Some(shown) = self
-                .source(pick.instant)
-                .ok()
-                .and_then(|source| source.shown_instant())
-            else {
+            let Ok(source) = self.source(pick.instant) else {
                 continue;
             };
+            let Some(shown) = source.shown_instant() else {
+                continue;
+            };
+            if let PictureSource::Still { file, .. } = source
+                && !shown_files.insert(file)
+                && joined.last().is_none_or(|(last, _)| *last != shown)
+            {
+                continue;
+            }
             match joined.last_mut() {
                 Some((last_shown, last)) if *last_shown == shown => last.join(&pick.reason),
                 _ => joined.push((shown, pick)),

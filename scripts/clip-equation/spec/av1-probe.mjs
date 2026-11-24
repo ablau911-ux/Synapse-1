@@ -20,6 +20,9 @@ const ROOT = options.root || JSON.parse(fs.readFileSync(path.join(BASE, 'corpus/
 const OUT = path.resolve(options.out || path.join(BASE, '../../.runs/av1-probe'));
 const PROBE = path.resolve(options.probe || path.join(BASE, 'probe/target/release/clip-probe.exe'));
 const SCENES = ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080'];
+// A clip the product recorded on a real page (1904x1012, 40 s, parts of 200 pictures); the fetch checks read it.
+const FETCH_CLIP = path.join(ROOT, 'recorded-real-page');
+const FETCH_GOLDEN = path.join(FETCH_CLIP, 'fetch-reference.json');
 const SETTLE_SCENE = 'mix-1920x1080'; // the scene whose corpus must hold at least one settle point
 const INSTANT_MS = 50;                // 20 instants per second (contract: t_ms = k*50)
 const SETTLE_INSTANTS = 10;           // probe default settle=<instants>: on screen this many instants, the changed one included
@@ -220,15 +223,26 @@ function stillOnSettle(scene) {
     const settles = scene.corpus.filter((row, k) => scene.changed(k) && scene.unchangedAfter(k) >= SETTLE_INSTANTS - 1).length;
     if (settles === 0) bad.push(`corpus has 0 settle points (needs at least 1)`);
   }
-  const wrong = [];
+  // A settle point is marked once: `still:true` (a file of its own) when its picture was never stored
+  // before, else `still_of: j` naming the earlier still with the same pixels. Nothing else is marked.
+  const wrong = [], stored = new Map(); // pixel hash -> instant of the still file that holds it
   scene.corpus.forEach((row, k) => {
+    const line = scene.lines[k] ?? {};
     const expected = scene.changed(k) && scene.unchangedAfter(k) >= SETTLE_INSTANTS - 1;
-    if ((scene.lines[k]?.still === true) !== expected) wrong.push(`${k}${expected ? ' missing' : ' extra'}`);
+    const marked = line.still === true || line.still_of != null;
+    if (line.still === true && line.still_of != null) wrong.push(`${k} has both still and still_of`);
+    else if (marked !== expected) wrong.push(`${k}${expected ? ' missing' : ' extra'}`);
+    else if (expected) {
+      const hash = scene.pictureHash(k), earlier = stored.get(hash);
+      if (earlier === undefined) { if (line.still !== true) wrong.push(`${k} names still_of ${line.still_of}, but no earlier still holds its picture`); else stored.set(hash, k); }
+      else if (line.still_of !== earlier) wrong.push(`${k} should be still_of ${earlier} (same pixels), is ${line.still === true ? 'a second still file' : `still_of ${line.still_of}`}`);
+    }
   });
-  if (wrong.length) bad.push(`still:true wrong at instants ${firstOf(wrong)}`);
+  if (wrong.length) bad.push(`settle marks wrong at instants ${firstOf(wrong)}`);
   if (bad.length) return { problem: bad.join('; ') };
   const stills = scene.lines.filter(line => line.still === true).map(line => line.instant);
-  return { note: `stills at ${stills.length ? firstOf(stills, 5) : 'none (corpus has none)'}` };
+  const reused = scene.lines.filter(line => line.still_of != null).length;
+  return { note: `stills at ${stills.length ? firstOf(stills, 5) : 'none (corpus has none)'}${reused ? `, ${reused} settle points reuse a stored still` : ''}` };
 }
 
 function unchangedCostsNothing(scene) {
@@ -265,6 +279,58 @@ function readBack(scene) {
   return { note: `slowest ${slowest.ms.toFixed(0)} ms (instant ${slowest.instant})` };
 }
 
+/** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
+function fetchPicture(folder, instant) {
+  const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
+  try { return JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
+}
+
+/** The recorded clip of the fetch checks: its index, or the reason it cannot be used. */
+function fetchClip() {
+  const index = path.join(FETCH_CLIP, 'frames.jsonl');
+  if (!fs.existsSync(index)) return { error: `no recorded clip at ${FETCH_CLIP}` };
+  return { enc: readJsonl(index).filter(line => kindOf(line) === 'enc') };
+}
+
+/** The worst place to fetch: the picture with the largest index-in-part (everything before it in the part is decoded). */
+function latePictureInTime() {
+  const clip = fetchClip();
+  if (clip.error) return { pass: false, value: '-', measured: clip.error };
+  const line = clip.enc.reduce((best, candidate) => (candidate.enc[1] > best.enc[1] ? candidate : best));
+  const got = fetchPicture(FETCH_CLIP, line.instant);
+  if (got.error) return { pass: false, value: '-', measured: got.error };
+  const measured = `instant ${line.instant} [${line.enc}]: ${got.total_ms} ms in all (read ${got.read_part_ms}, decode ${got.decode_ms}, convert ${got.convert_ms}), ${got.pictures_decoded} pictures decoded, kind ${got.kind}`;
+  const pass = got.kind === 'video' && got.pictures_decoded === line.enc[1] + 1 && got.total_ms < READ_BACK_MS;
+  return { pass, value: `${got.total_ms} ms`, measured };
+}
+
+/**
+ * A change of decoder must not change a picture: the fetched pixels equal the reference hashes
+ * (first, deepest and last encoded instant). `golden=write` stores the hashes of the current
+ * build as the reference and leaves the check pending for that run.
+ */
+function fetchedPictureIsRecorded() {
+  const clip = fetchClip();
+  if (clip.error) return { pass: false, value: '-', measured: clip.error };
+  const deepest = clip.enc.reduce((best, candidate) => (candidate.enc[1] > best.enc[1] ? candidate : best));
+  const instants = [...new Set([clip.enc[0].instant, deepest.instant, clip.enc.at(-1).instant])];
+  const hashes = {};
+  for (const instant of instants) {
+    const got = fetchPicture(FETCH_CLIP, instant);
+    if (got.error) return { pass: false, value: '-', measured: `instant ${instant}: ${got.error}` };
+    hashes[instant] = got.rgba_sha256;
+  }
+  if (options.golden === 'write') {
+    fs.writeFileSync(FETCH_GOLDEN, `${JSON.stringify(hashes, null, 2)}\n`);
+    return { pass: 'PENDING', value: '-', measured: `reference written for instants ${instants.join(', ')}` };
+  }
+  if (!fs.existsSync(FETCH_GOLDEN)) return { pass: false, value: '-', measured: `no reference at ${FETCH_GOLDEN} (run once with golden=write)` };
+  const golden = JSON.parse(fs.readFileSync(FETCH_GOLDEN, 'utf8'));
+  const differ = instants.filter(instant => golden[instant] !== hashes[instant]);
+  return { pass: differ.length === 0, value: '-', measured: differ.length ? `pixels differ from the reference at instants ${differ.join(', ')}` : `${instants.length} pictures equal the reference (instants ${instants.join(', ')})` };
+}
+
 /** Reported, not judged: one row per scene from probe.json. */
 function printMeasures() {
   console.log('scene | video MB/min | stills MB/min | cpu s per recorded s | peak RAM MB | first_encoded_ms | lost');
@@ -273,7 +339,9 @@ function printMeasures() {
     if (!p) { console.log(`${scene.name} | - | - | - | - | - | -`); continue; }
     const seconds = p.instants / (1000 / INSTANT_MS);
     const perMinute = bytes => (bytes / MB / (seconds / 60)).toFixed(2);
-    console.log(`${scene.name} | ${perMinute(p.bytes_video)} | ${perMinute(p.bytes_stills)} | ${(p.cpu_ns / 1e9 / seconds).toFixed(3)} | ${(p.ram_peak / MB).toFixed(1)} | ${p.first_encoded_ms} | ${p.lost}`);
+    // sizes are read from the files on disk, not from the probe's own count
+    const onDisk = dir => (fs.existsSync(path.join(scene.out, dir)) ? fs.readdirSync(path.join(scene.out, dir)).reduce((sum, f) => sum + fs.statSync(path.join(scene.out, dir, f)).size, 0) : 0);
+    console.log(`${scene.name} | ${perMinute(onDisk('video'))} | ${perMinute(onDisk('stills'))} | ${(p.cpu_ns / 1e9 / seconds).toFixed(3)} | ${(p.ram_peak / MB).toFixed(1)} | ${p.first_encoded_ms} | ${p.lost}`);
   }
 }
 
@@ -289,6 +357,8 @@ const table = {
   'a still appears when the window settles': () => judge(stillOnSettle),
   'unchanged instants cost nothing': () => judge(unchangedCostsNothing),
   'read-back': () => judge(readBack),
+  'a late picture comes back in time': latePictureInTime,
+  'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };
 fs.writeFileSync(path.join(OUT, 'checks.json'), `${JSON.stringify(scenes.map(s => ({ name: s.name, error: s.error, probe: s.probe })), null, 2)}\n`);
 process.exitCode = runFeature('av1-probe', path.join(BASE, 'spec/av1-probe.feature'), table);

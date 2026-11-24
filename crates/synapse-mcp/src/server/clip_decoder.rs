@@ -14,7 +14,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use image::RgbaImage;
 use libaom_sys as aom;
@@ -166,12 +166,31 @@ impl ClipPicture {
     }
 }
 
+/// What the last `ClipDecoder::picture_at` spent, by stage (the
+/// `VIEW_TIMING_CODE` debug lines tell the same): reading the IVF part when it
+/// was opened for this picture, decoding up to the picture (for a still: its
+/// WebP decode), and 4:2:0 to RGBA.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PictureTimes {
+    #[allow(
+        dead_code,
+        reason = "read by the clip-probe bench (exp-av1-fetch); the read_part debug line logs it at open"
+    )]
+    pub(super) read_part: Duration,
+    pub(super) decode: Duration,
+    pub(super) convert: Duration,
+    /// AV1 pictures decoded for this one (0 for a still, or for the picture
+    /// decoded last time).
+    pub(super) pictures_decoded: u32,
+}
+
 /// Reads pictures of one clip folder. Keeps the video part last decoded, so
 /// pictures asked for in time order decode each picture once.
 pub(super) struct ClipDecoder {
     folder: PathBuf,
     lines: Vec<IndexLine>,
     video: Option<PartReader>,
+    times: PictureTimes,
 }
 
 impl ClipDecoder {
@@ -180,7 +199,17 @@ impl ClipDecoder {
             folder: folder.to_path_buf(),
             lines,
             video: None,
+            times: PictureTimes::default(),
         }
+    }
+
+    /// What the last `picture_at` spent, by stage.
+    #[allow(
+        dead_code,
+        reason = "read by the clip-probe bench (exp-av1-fetch), which includes this module"
+    )]
+    pub(super) const fn times(&self) -> PictureTimes {
+        self.times
     }
 
     /// Where the picture of `instant` comes from, without decoding.
@@ -194,8 +223,14 @@ impl ClipDecoder {
             .map(|line| line.t_ms)
             .ok_or_else(|| format!("instant {instant} is outside the clip"))?;
         let source = self.source(instant)?;
+        self.times = PictureTimes::default();
         let image = match &source {
-            PictureSource::Still { file, .. } => Some(decode_still(&still_path(&self.folder, *file))?),
+            PictureSource::Still { file, .. } => {
+                let started = Instant::now();
+                let image = decode_still(&still_path(&self.folder, *file))?;
+                self.times.decode = started.elapsed();
+                Some(image)
+            }
             PictureSource::Video { part, index, .. } => Some(self.video_picture(*part, *index)?),
             PictureSource::Lost { .. } => None,
         };
@@ -214,14 +249,22 @@ impl ClipDecoder {
             .video
             .as_ref()
             .is_some_and(|reader| reader.part == part && reader.can_reach(index));
+        let mut read_part = Duration::ZERO;
         if !reusable {
-            self.video = Some(PartReader::open(&self.folder, part)?);
+            let reader = PartReader::open(&self.folder, part)?;
+            read_part = reader.read_time;
+            self.video = Some(reader);
         }
         let reader = self
             .video
             .as_mut()
             .ok_or_else(|| format!("video part {part} could not be opened"))?;
-        reader.picture(index)
+        let image = reader.picture(index)?;
+        self.times = PictureTimes {
+            read_part,
+            ..reader.times
+        };
+        Ok(image)
     }
 }
 
@@ -236,6 +279,10 @@ struct PartReader {
     next: u32,
     /// The last picture converted, with its index.
     last: Option<(u32, RgbaImage)>,
+    /// Time `open` spent reading the part.
+    read_time: Duration,
+    /// What the last `picture` call spent.
+    times: PictureTimes,
 }
 
 impl PartReader {
@@ -243,12 +290,13 @@ impl PartReader {
         let path = part_path(folder, part);
         let started = Instant::now();
         let pictures = read_ivf(&path)?;
+        let read_time = started.elapsed();
         tracing::debug!(
             code = VIEW_TIMING_CODE,
             stage = "read_part",
             part,
             pictures = pictures.len(),
-            ms = elapsed_ms(started),
+            ms = millis(read_time),
             "clip picture read-back: IVF part read"
         );
         Ok(Self {
@@ -258,6 +306,8 @@ impl PartReader {
             decoder: Av1Decoder::new()?,
             next: 0,
             last: None,
+            read_time,
+            times: PictureTimes::default(),
         })
     }
 
@@ -269,6 +319,7 @@ impl PartReader {
         if let Some((last, image)) = &self.last
             && *last == index
         {
+            self.times = PictureTimes::default();
             return Ok(image.clone());
         }
         let started = Instant::now();
@@ -292,23 +343,30 @@ impl PartReader {
         if self.next == first {
             return Err(format!("{} gave no picture {index}", self.path.display()));
         }
+        let decode = started.elapsed();
+        let started = Instant::now();
+        let image = self.decoder.rgba()?;
+        self.times = PictureTimes {
+            read_part: Duration::ZERO,
+            decode,
+            convert: started.elapsed(),
+            pictures_decoded: self.next - first,
+        };
         tracing::debug!(
             code = VIEW_TIMING_CODE,
             stage = "decode",
             part = self.part,
             index,
-            pictures = self.next - first,
-            ms = elapsed_ms(started),
+            pictures = self.times.pictures_decoded,
+            ms = millis(self.times.decode),
             "clip picture read-back: AV1 pictures decoded up to the one asked for"
         );
-        let started = Instant::now();
-        let image = self.decoder.rgba()?;
         tracing::debug!(
             code = VIEW_TIMING_CODE,
             stage = "convert",
             part = self.part,
             index,
-            ms = elapsed_ms(started),
+            ms = millis(self.times.convert),
             "clip picture read-back: 4:2:0 to RGBA"
         );
         self.last = Some((index, image.clone()));
@@ -347,7 +405,11 @@ fn decode_still(path: &Path) -> Result<RgbaImage, String> {
 
 /// Milliseconds since `started`, for the `VIEW_TIMING_CODE` lines.
 pub(super) fn elapsed_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    millis(started.elapsed())
+}
+
+fn millis(time: Duration) -> u64 {
+    u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// One libaom AV1 decoder context.

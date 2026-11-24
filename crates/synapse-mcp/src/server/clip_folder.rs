@@ -60,6 +60,10 @@ const IVF_PICTURE_COUNT_OFFSET: u64 = 24;
 const IVF_PICTURE_HEADER_BYTES: usize = 12;
 const IVF_SIZE_FIELD_BYTES: usize = 4;
 
+/// f: recorded instants per second (base rule). Owned by the clip format:
+/// it sets every index line's `t_ms` and the video's time base.
+pub(super) const RECORD_FPS: u32 = 20;
+
 /// Default parent of clip folders.
 pub(super) fn clips_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")

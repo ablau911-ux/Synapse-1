@@ -8,8 +8,12 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
   Scenario: a still is exact
     # Equation: still files = still:true instants; bgr24(still-NNNNNNNN.webp)=corpus picture of instant NNNNNNNN, byte for byte; stills compared over all scenes >= 1 | Known: true
   Scenario: a still appears when the window settles
-    # Equation: every scene: still:true iff pixels(k)!=pixels(k-1) (instant 0 counts as a change) and pixels(k+1..k+9)=pixels(k) (settle=10 instants on screen, the changed one included); mix corpus settle points >= 1 | Known: true
+    # Equation: every scene: instant k is marked iff pixels(k)!=pixels(k-1) (instant 0 counts as a change) and pixels(k+1..k+9)=pixels(k) (settle=10 instants on screen, the changed one included); the mark is still:true when no earlier still holds the same pixels, else still_of=<instant of that still>; mix corpus settle points >= 1 | Known: true
   Scenario: unchanged instants cost nothing
     # Equation: same iff pixels(k)=pixels(k-1) (SHA-256 of the corpus B,G,R bytes); instant 0 is enc | Known: true
+  Scenario: a late picture comes back in time
+    # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
+  Scenario: the fetched picture is the recorded one
+    # Equation: sha256(RGBA of the fetched picture) = reference hash, for the first, the deepest and the last encoded instant of the recorded real-page clip | Known: true
   Scenario: read-back
     # Equation: ffmpeg fetch of one picture (first, middle, last enc instant and the enc line with the largest index-in-part, per scene) < 500 ms | Known: true

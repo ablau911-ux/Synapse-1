@@ -1,10 +1,8 @@
-# The probe links the C runtime statically. libaom-sys (exp-av1) always builds libaom with
-# the static runtime (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded, "Match Rust's +crt-static"),
-# so the rest of the probe must use the same runtime or the link fails
-# (undefined __declspec(dllimport) clock and qsort_s). Cargo joins these flags with the
-# repository's own .cargo/config.toml.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+# The probe links the dynamic C runtime (/MD), like the product: no +crt-static. libaom-sys
+# (exp-av1) forces the static runtime on libaom (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded); the
+# repository's CMake toolchain file (cmake/msvc-dynamic-runtime.cmake) moves it to /MD, so the
+# probe and the product build libaom the same way. Cargo joins this file with the repository's
+# own .cargo/config.toml.
 
 # libaom must be compiled with optimization. With no generator named, the cmake crate picks a
 # Visual Studio generator and, for MSVC, overwrites CMAKE_C_FLAGS_RELEASE with the cc flags
@@ -13,3 +11,5 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # Release flags (/O2 /Ob2 /DNDEBUG) in place; Ninja is a single-configuration generator.
 [env]
 CMAKE_GENERATOR = "Ninja"
+# Relative to this probe folder (the parent of .cargo/).
+CMAKE_TOOLCHAIN_FILE = { value = "../../../cmake/msvc-dynamic-runtime.cmake", relative = true }

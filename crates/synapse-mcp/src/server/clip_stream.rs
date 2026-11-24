@@ -24,13 +24,12 @@ use std::time::{Duration, Instant};
 
 use image_webp::{ColorType, WebPEncoder};
 
-use super::capture_clip::RECORD_FPS;
 use super::clip_encoder::{
     BGRA_BYTES, EncoderSettings, VideoPlace, VideoQueue, VideoTimes, encoder_name,
 };
 use super::clip_folder::{
     EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_NO_PICTURE_YET,
-    LOST_WINDOW_RESIZED, LostInstant, PartInfo, STILLS_DIR, StillInfo, still_path,
+    LOST_WINDOW_RESIZED, LostInstant, PartInfo, RECORD_FPS, STILLS_DIR, StillInfo, still_path,
 };
 
 /// `SETTLE_INSTANTS`: 0.5 s on screen, the changed instant included (plan §6).
@@ -55,7 +54,7 @@ const RED: usize = 2;
 #[derive(Clone, Copy, Default)]
 pub(super) struct StageTime {
     pub(super) count: u64,
-    total: Duration,
+    pub(super) total: Duration,
     slowest: Duration,
 }
 

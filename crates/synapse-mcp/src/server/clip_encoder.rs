@@ -21,8 +21,7 @@ use std::time::Instant;
 use libaom_sys as aom;
 use serde_json::json;
 
-use super::capture_clip::RECORD_FPS;
-use super::clip_folder::{IvfWriter, PartInfo, VIDEO_DIR, part_path};
+use super::clip_folder::{IvfWriter, PartInfo, RECORD_FPS, VIDEO_DIR, part_path};
 use super::clip_stream::StageTime;
 
 /// Constant quality level (`-crf`), plan §6.

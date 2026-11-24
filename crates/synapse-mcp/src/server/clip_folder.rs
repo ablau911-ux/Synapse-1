@@ -216,7 +216,6 @@ impl IvfWriter {
 
 /// One complete picture of an IVF part.
 pub(super) struct IvfPicture {
-    pub(super) timestamp: u64,
     pub(super) data: Vec<u8>,
 }
 
@@ -261,15 +260,12 @@ fn scan_ivf(bytes: &[u8], path: &Path) -> Result<(Vec<IvfPicture>, u64), String>
     while bytes.len() >= at + IVF_PICTURE_HEADER_BYTES {
         let mut size = [0_u8; IVF_SIZE_FIELD_BYTES];
         size.copy_from_slice(&bytes[at..at + IVF_SIZE_FIELD_BYTES]);
-        let mut timestamp = [0_u8; IVF_PICTURE_HEADER_BYTES - IVF_SIZE_FIELD_BYTES];
-        timestamp.copy_from_slice(&bytes[at + IVF_SIZE_FIELD_BYTES..at + IVF_PICTURE_HEADER_BYTES]);
         let start = at + IVF_PICTURE_HEADER_BYTES;
         let end = start + u32::from_le_bytes(size) as usize;
         if end > bytes.len() {
             break;
         }
         pictures.push(IvfPicture {
-            timestamp: u64::from_le_bytes(timestamp),
             data: bytes[start..end].to_vec(),
         });
         at = end;

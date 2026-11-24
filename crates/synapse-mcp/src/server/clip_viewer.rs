@@ -589,7 +589,7 @@ fn runs<T: PartialEq>(
         };
         match runs.last_mut() {
             Some((_, end, last)) if *end + 1 == line.instant && *last == value => {
-                *end = line.instant
+                *end = line.instant;
             }
             _ => runs.push((line.instant, line.instant, value)),
         }
@@ -1296,7 +1296,7 @@ impl ChangedBlocks {
                 changed_blocks: count,
             });
         }
-        regions.sort_by(|a, b| b.changed_blocks.cmp(&a.changed_blocks));
+        regions.sort_by_key(|region| std::cmp::Reverse(region.changed_blocks));
         regions
     }
 

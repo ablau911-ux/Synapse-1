@@ -294,7 +294,8 @@ pub struct AuditCommandQueryResponse {
     pub scan_order: String,
     /// True when matches older than this page exist. For newest-first this is an
     /// honest "more history available", not a failure; page older with
-    /// `end_ts_ns = oldest_returned_ts_ns`.
+    /// `end_ts_ns = oldest_returned_ts_ns`. Always false for oldest-first: use
+    /// `complete` and `next_start_key_hex` there.
     pub has_older: bool,
     /// Timestamp of the oldest returned row (newest-first only), for paging older.
     #[serde(skip_serializing_if = "Option::is_none")]

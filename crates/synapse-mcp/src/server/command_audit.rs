@@ -121,12 +121,14 @@ pub(crate) struct CommandAuditQueryResponse {
     /// Iteration direction actually applied. `"newest_first"` is the unwindowed
     /// default (no `start_key_hex`/`start_ts_ns`): it returns the most recent
     /// matches as a complete page. `"oldest_first"` is explicit forward paging
-    /// (a `start_key_hex` or `start_ts_ns` was supplied) and keeps the
-    /// fail-closed partial-page contract. #1550.
+    /// (a `start_key_hex` or `start_ts_ns` was supplied): a page that stops at
+    /// `limit` or `scan_limit` returns its rows with `partial` set and resumes
+    /// at `next_start_key_hex`. #1550.
     pub scan_order: &'static str,
     /// True when matches older than the returned window exist. For newest-first
     /// this is an honest "there is more history", NOT a failure — page older by
-    /// passing `end_ts_ns = oldest_returned_ts_ns`.
+    /// passing `end_ts_ns = oldest_returned_ts_ns`. Always false for
+    /// oldest-first, whose unread rows are newer.
     pub has_older: bool,
     /// Timestamp of the oldest row returned this page (newest-first only), so a
     /// caller can continue older without guessing a `start_ts_ns` a priori.
@@ -418,7 +420,9 @@ impl SynapseService {
             start_key_hex,
             next_start_key_hex,
             scan_order: AUDIT_SCAN_ORDER_OLDEST_FIRST,
-            has_older: partial,
+            // A forward page's unread rows are newer, never older; callers
+            // continue with `partial` and `next_start_key_hex`.
+            has_older: false,
             oldest_returned_ts_ns: None,
             rows: returned,
         })
@@ -429,7 +433,7 @@ impl SynapseService {
     /// `command_audit_snapshot`, walks the most recent `scan_limit` rows from
     /// newest to oldest, and returns up to `limit` matches as a **complete
     /// page** — filling `limit` (or capping `scan_limit`) reports `has_older`
-    /// honestly instead of hard-erroring the way forward paging must.
+    /// instead of the resume cursor that forward paging returns.
     fn command_audit_query_newest_first(
         &self,
         limit: usize,

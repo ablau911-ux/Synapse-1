@@ -12154,24 +12154,29 @@ fn shell_status_replace_in_flight(path: &Path) -> io::Result<bool> {
 
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
     let bytes = read_shell_status_bytes(path).map_err(|error| {
-        let code = if error.kind() == io::ErrorKind::NotFound {
-            error_codes::TOOL_PARAMS_INVALID
-        } else {
-            error_codes::STORAGE_READ_FAILED
-        };
-        let reason = if error.kind() == io::ErrorKind::NotFound {
-            "job_not_found"
-        } else {
-            "job_status_read_failed"
-        };
+        if error.kind() == io::ErrorKind::NotFound {
+            // An unknown job is a caller error: the message names the job, and
+            // the store path and OS error stay in the structured data (#193).
+            return shell_tool_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("act_run_shell job {job_id} was not found"),
+                json!({
+                    "code": error_codes::TOOL_PARAMS_INVALID,
+                    "job_id": job_id,
+                    "path": path,
+                    "reason": "job_not_found",
+                    "detail": error.to_string(),
+                }),
+            );
+        }
         shell_tool_error(
-            code,
+            error_codes::STORAGE_READ_FAILED,
             format!("act_run_shell job status could not be read: {error}"),
             json!({
-                "code": code,
+                "code": error_codes::STORAGE_READ_FAILED,
                 "job_id": job_id,
                 "path": path,
-                "reason": reason,
+                "reason": "job_status_read_failed",
             }),
         )
     })?;

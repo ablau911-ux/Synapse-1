@@ -59,7 +59,10 @@ impl InFlightRequestId {
         let Some(id) = message.get("id") else {
             return Ok(None);
         };
-        if !message.get("method").is_some_and(serde_json::Value::is_string) {
+        if !message
+            .get("method")
+            .is_some_and(serde_json::Value::is_string)
+        {
             return Ok(None);
         }
         let key = (session_id.to_owned(), id.to_string());
@@ -547,7 +550,10 @@ async fn enforce_session_header(request: Request<Body>) -> Result<Request<Body>,
     if request.method() == Method::POST {
         allow_initialize_without_session(request).await
     } else if request.method() == Method::GET || request.method() == Method::DELETE {
-        Err(session_invalid(SessionFailure::Missing, &serde_json::Value::Null))
+        Err(session_invalid(
+            SessionFailure::Missing,
+            &serde_json::Value::Null,
+        ))
     } else {
         Ok(request)
     }

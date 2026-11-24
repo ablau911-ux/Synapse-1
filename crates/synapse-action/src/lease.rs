@@ -116,6 +116,19 @@ impl LeaseStatus {
             expires_in_ms: None,
         }
     }
+
+    /// The owner as messages write it; see [`owner_label`].
+    #[must_use]
+    pub fn owner_label(&self) -> &str {
+        owner_label(self.owner_session_id.as_deref())
+    }
+}
+
+/// How a lease owner is written in messages: the session id, or `none` when
+/// nobody holds the lease.
+#[must_use]
+pub fn owner_label(owner_session_id: Option<&str>) -> &str {
+    owner_session_id.unwrap_or("none")
 }
 
 /// Result of [`try_acquire`].
@@ -150,7 +163,7 @@ pub struct LeaseHandoff {
 pub enum LeaseError {
     #[error(
         "input lease not held by session {session_id}; current holder {}",
-        .holder.as_deref().unwrap_or("none")
+        owner_label(.holder.as_deref())
     )]
     NotHeld {
         session_id: String,

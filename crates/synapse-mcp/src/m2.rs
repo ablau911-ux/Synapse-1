@@ -1051,7 +1051,7 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
         } => {
             let detail = format!(
                 "{tool} requires the foreground input lease, but it is held by session {}; retry_after_ms={retry_after_ms}",
-                holder.owner_session_id.as_deref().unwrap_or("none")
+                holder.owner_label()
             );
             tracing::warn!(
                 code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,
@@ -1074,7 +1074,7 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
         } => {
             let detail = format!(
                 "{tool} requires the foreground input lease, but expired session {} still has pending held-input cleanup; retry_after_ms={retry_after_ms}",
-                expired.owner_session_id.as_deref().unwrap_or("none")
+                expired.owner_label()
             );
             tracing::warn!(
                 code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,

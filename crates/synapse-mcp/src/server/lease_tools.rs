@@ -1490,7 +1490,7 @@ fn lease_busy_error(session_id: &str, holder: &LeaseStatus, retry_after_ms: u64)
         ErrorCode(-32099),
         format!(
             "input lease is held by session {}; retry after {retry_after_ms}ms",
-            holder.owner_session_id.as_deref().unwrap_or("none")
+            holder.owner_label()
         ),
         Some(json!({
             "code": error_codes::ACTION_FOREGROUND_LEASE_BUSY,
@@ -1511,7 +1511,7 @@ fn lease_cleanup_pending_error(
         ErrorCode(-32099),
         format!(
             "input lease expired for session {}; held-input cleanup is pending, retry after {retry_after_ms}ms",
-            expired.owner_session_id.as_deref().unwrap_or("none")
+            expired.owner_label()
         ),
         Some(json!({
             "code": error_codes::ACTION_FOREGROUND_LEASE_BUSY,

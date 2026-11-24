@@ -319,7 +319,7 @@ impl SynapseService {
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
                     "cannot persist input lease for {session_id}: status owner is {}",
-                    status.owner_session_id.as_deref().unwrap_or("none")
+                    status.owner_label()
                 ),
             ));
         }
@@ -374,7 +374,7 @@ impl SynapseService {
                 error_codes::TOOL_INTERNAL_ERROR,
                 format!(
                     "cannot persist input lease handoff to {to_session_id}: status owner is {}",
-                    status.owner_session_id.as_deref().unwrap_or("none")
+                    status.owner_label()
                 ),
             ));
         }

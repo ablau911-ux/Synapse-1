@@ -163,8 +163,9 @@ pub struct ObservedFrame {
     pub dirty: Option<Rect>,
     /// The cursor in this frame's pixels (`frame_cursor`): its screen
     /// position and the frame's top-left, both read when the handler took
-    /// the frame, so the position belongs to this composition (E9, C15);
-    /// `None` when Windows does not report either one.
+    /// the frame (E9, C15); `None` when Windows does not report either one,
+    /// or the top-left was seen to move after the frame was composed
+    /// (`FrameOrigin`), so a cursor is absent rather than possibly wrong.
     pub cursor: Option<(i32, i32)>,
 }
 
@@ -242,14 +243,53 @@ fn cursor_position() -> Option<(i32, i32)> {
     Some((point.x, point.y))
 }
 
-/// The cursor in the pixels of the frame `source` delivers now: its screen
-/// position minus the frame's top-left (`ClipSource::origin`), both read in
-/// this call, never an origin read at another time (#292). `None` when
-/// Windows does not report either one.
-fn frame_cursor(source: ClipSource) -> Option<(i32, i32)> {
+/// The cursor in the pixels of a frame: its screen position, read now,
+/// minus the frame's top-left (`FrameOrigin::for_frame`). `None` when that
+/// top-left is not known or Windows does not report the cursor.
+fn frame_cursor(origin: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    let (left, top) = origin?;
     let (x, y) = cursor_position()?;
-    let (left, top) = source.origin()?;
     Some((x.saturating_sub(left), y.saturating_sub(top)))
+}
+
+/// The captured window's or monitor's top-left as the frame handler last
+/// read it, and the time since which every reading showed it. Windows
+/// Graphics Capture gives a frame its composition time, size and dirty
+/// regions, never its place on the screen, so the place is read when a
+/// frame arrives; a frame composed before the latest change was seen may
+/// show the old place.
+struct FrameOrigin {
+    origin: Option<(i32, i32)>,
+    since_hns: i64,
+}
+
+impl FrameOrigin {
+    /// The first reading, when the handler starts (before any frame).
+    fn read(source: ClipSource) -> Self {
+        let origin = source.origin();
+        Self {
+            origin,
+            since_hns: now_hns(),
+        }
+    }
+
+    /// The top-left of a frame composed at `composed_hns`, read now: `None`
+    /// (unknown) when this reading or an earlier one found it moved after
+    /// that frame was composed, so a frame's cursor is never converted with
+    /// a top-left of another time (#292, #315).
+    fn for_frame(&mut self, source: ClipSource, composed_hns: i64) -> Option<(i32, i32)> {
+        let origin = source.origin();
+        let read_hns = now_hns();
+        if origin != self.origin {
+            self.origin = origin;
+            self.since_hns = read_hns;
+        }
+        if composed_hns >= self.since_hns {
+            self.origin
+        } else {
+            None
+        }
+    }
 }
 
 fn filetime_hns(time: FILETIME) -> i64 {
@@ -558,6 +598,7 @@ struct ClipFrameHandler {
     shared: Arc<Shared>,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    origin: FrameOrigin,
 }
 
 impl GraphicsCaptureApiHandler for ClipFrameHandler {
@@ -576,6 +617,7 @@ impl GraphicsCaptureApiHandler for ClipFrameHandler {
             context: ctx.device_context.clone(),
         });
         Ok(Self {
+            origin: FrameOrigin::read(ctx.flags.source),
             shared: ctx.flags,
             device: ctx.device,
             context: ctx.device_context,
@@ -588,8 +630,10 @@ impl GraphicsCaptureApiHandler for ClipFrameHandler {
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
         let arrived = now_hns();
+        let composed_hns = frame.timestamp().map_or(arrived, |time| time.Duration);
+        let origin = self.origin.for_frame(self.shared.source, composed_hns);
         let observed = ObservedFrame {
-            composed_hns: frame.timestamp().map_or(arrived, |time| time.Duration),
+            composed_hns,
             width: frame.width(),
             height: frame.height(),
             dirty: if self.shared.dirty_regions {
@@ -597,7 +641,7 @@ impl GraphicsCaptureApiHandler for ClipFrameHandler {
             } else {
                 None
             },
-            cursor: frame_cursor(self.shared.source),
+            cursor: frame_cursor(origin),
         };
         {
             // The table stays locked while the copy is issued, so the reader

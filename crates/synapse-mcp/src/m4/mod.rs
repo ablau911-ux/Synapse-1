@@ -3136,6 +3136,7 @@ pub fn cancel_shell_job(
     let mut termination_attempted = false;
     let mut termination_status = "already_terminal".to_owned();
     let mut remaining_process_ids = Vec::new();
+    let mut cancel_checked_remote_scope = false;
 
     if shell_job_live_status(&job.status) {
         cancel_requested = true;
@@ -3180,8 +3181,7 @@ pub fn cancel_shell_job(
                 &termination_status,
             );
         }
-        termination_status =
-            remote_aware_termination_status(&termination_status, &job.remote_process_scope);
+        cancel_checked_remote_scope = true;
         write_shell_job_reconciliation_status(&paths, job)?;
     } else if job.remote_process_scope.remote_cleanup_required
         && !job.remote_process_scope.remote_cleanup_verified
@@ -3203,13 +3203,16 @@ pub fn cancel_shell_job(
                 &termination_status,
             );
         }
-        termination_status =
-            remote_aware_termination_status(&termination_status, &job.remote_process_scope);
+        cancel_checked_remote_scope = true;
         // `job` was read before the monitor may have recorded a verified remote
         // cleanup; latest-terminal-wins keeps that newer record (#174).
         write_shell_job_reconciliation_status(&paths, job)?;
     }
 
+    // The answer is built from the stored record: reconciliation may have kept
+    // a newer one than cancel's own copy (#174), and the status read starts
+    // from it, so the remote part of termination_status comes from the job
+    // this answer returns, never from the copy reconciliation may have dropped.
     let status = shell_job_status(
         &ActRunShellStatusParams {
             job_id: params.job_id.clone(),
@@ -3217,6 +3220,10 @@ pub fn cancel_shell_job(
         },
         session_id,
     )?;
+    if cancel_checked_remote_scope {
+        termination_status =
+            remote_aware_termination_status(&termination_status, &status.job.remote_process_scope);
+    }
     tracing::info!(
         code = "M4_ACT_RUN_SHELL_JOB_CANCEL_READBACK",
         job_id = %params.job_id,

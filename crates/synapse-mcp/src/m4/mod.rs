@@ -774,6 +774,10 @@ pub struct ActRunShellJobStatus {
     #[serde(default)]
     #[schemars(!default)]
     pub command_line_sha256: String,
+    /// Set when `command_line` is not the line the child got: a batch file
+    /// std ran through its own `cmd.exe` wrapper. Says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_line_not_reproduced: Option<String>,
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_dir: Option<String>,
@@ -1828,6 +1832,7 @@ pub fn authorize_run_shell(
                 "args_original_bytes": command_metadata.args_original_bytes,
                 "args_sha256": command_metadata.args_sha256,
                 "command_line": command_metadata.command_line,
+                "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
                 "command_line_redacted": command_metadata.command_line_redacted,
                 "command_line_original_bytes": command_metadata.command_line_original_bytes,
                 "command_line_sha256": command_metadata.command_line_sha256,
@@ -2028,6 +2033,7 @@ pub fn run_shell_request_details(
         "args_original_bytes": command_metadata.args_original_bytes,
         "args_sha256": command_metadata.args_sha256,
         "command_line": command_metadata.command_line,
+        "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
         "command_line_redacted": command_metadata.command_line_redacted,
         "command_line_original_bytes": command_metadata.command_line_original_bytes,
         "command_line_sha256": command_metadata.command_line_sha256,
@@ -2079,6 +2085,7 @@ pub fn run_shell_start_request_details(params: &ActRunShellStartParams) -> serde
         "args_original_bytes": command_metadata.args_original_bytes,
         "args_sha256": command_metadata.args_sha256,
         "command_line": command_metadata.command_line,
+        "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
         "command_line_redacted": command_metadata.command_line_redacted,
         "command_line_original_bytes": command_metadata.command_line_original_bytes,
         "command_line_sha256": command_metadata.command_line_sha256,
@@ -8550,6 +8557,7 @@ fn run_shell_chromium_debug_error(
             "args_original_bytes": command_metadata.args_original_bytes,
             "args_sha256": command_metadata.args_sha256,
             "command_line": command_metadata.command_line,
+            "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
             "command_line_redacted": command_metadata.command_line_redacted,
             "command_line_original_bytes": command_metadata.command_line_original_bytes,
             "command_line_sha256": command_metadata.command_line_sha256,
@@ -11378,6 +11386,7 @@ fn write_shell_job_request(
         "args_original_bytes": command_metadata.args_original_bytes,
         "args_sha256": command_metadata.args_sha256,
         "command_line": command_metadata.command_line,
+        "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
         "command_line_redacted": command_metadata.command_line_redacted,
         "command_line_original_bytes": command_metadata.command_line_original_bytes,
         "command_line_sha256": command_metadata.command_line_sha256,
@@ -15645,6 +15654,7 @@ fn shell_job_status_record(
         args_sha256: String::new(),
         command_line_original_bytes: 0,
         command_line_sha256: String::new(),
+        command_line_not_reproduced: None,
         working_dir: params.working_dir.clone(),
         session_dir: context.map(|context| path_string(context.session_dir())),
         effective_working_dir: params.working_dir.clone(),
@@ -15821,6 +15831,7 @@ fn spawn_shell_job_child(
                     "args_original_bytes": command_metadata.args_original_bytes,
                     "args_sha256": command_metadata.args_sha256,
                     "command_line": command_metadata.command_line,
+                    "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
                     "command_line_redacted": command_metadata.command_line_redacted,
                     "command_line_original_bytes": command_metadata.command_line_original_bytes,
                     "command_line_sha256": command_metadata.command_line_sha256,
@@ -19316,6 +19327,7 @@ fn spawn_shell_child(
                 "args_original_bytes": command_metadata.args_original_bytes,
                 "args_sha256": command_metadata.args_sha256,
                 "command_line": command_metadata.command_line,
+                "command_line_not_reproduced": command_metadata.command_line_not_reproduced,
                 "command_line_redacted": command_metadata.command_line_redacted,
                 "command_line_original_bytes": command_metadata.command_line_original_bytes,
                 "command_line_sha256": command_metadata.command_line_sha256,
@@ -20012,6 +20024,7 @@ struct ShellCommandMetadata {
     args_sha256: String,
     command_line_original_bytes: usize,
     command_line_sha256: String,
+    command_line_not_reproduced: Option<&'static str>,
 }
 
 fn default_shell_command_metadata_policy() -> String {
@@ -20021,7 +20034,9 @@ fn default_shell_command_metadata_policy() -> String {
 /// The command line a shell child gets: Rust std writes the program name in
 /// quotes and `shell_child_command` appends each argument as
 /// `quote_command_part` renders it. The policy line (`shell_command_line`)
-/// keeps the program unquoted so allowlist patterns stay as written.
+/// keeps the program unquoted so allowlist patterns stay as written. A batch
+/// file gets std's `cmd.exe` wrapper line instead, which this does not
+/// rebuild; see `shell_command_line_not_reproduced`.
 fn shell_spawned_command_line(command: &str, args: &[String]) -> String {
     std::iter::once(shell_spawned_program_part(command))
         .chain(args.iter().map(|arg| quote_command_part(arg)))
@@ -20063,6 +20078,23 @@ fn shell_child_command(program: &str, args: &[String]) -> StdCommand {
 fn is_windows_batch_program(program: &str) -> bool {
     let lower = program.to_ascii_lowercase();
     lower.ends_with(".bat") || lower.ends_with(".cmd")
+}
+
+/// `None` when `command_line` is the line the child got. For a batch file std
+/// spawns `cmd.exe /e:ON /v:OFF /d /c ""<script>" <args>"`, where `<script>`
+/// is the path std resolved itself and `<args>` use std's batch quoting; that
+/// line is not rebuilt here, so the record says its line is not the one the
+/// process got instead of passing it off as such.
+#[cfg(windows)]
+fn shell_command_line_not_reproduced(command: &str) -> Option<&'static str> {
+    is_windows_batch_program(command).then_some(
+        "batch_file_cmd_exe_wrapper: std ran this .bat/.cmd as cmd.exe /e:ON /v:OFF /d /c with the script path it resolved and its own batch-argument quoting; command_line and command_line_sha256 show the program and arguments, not that line",
+    )
+}
+
+#[cfg(not(windows))]
+fn shell_command_line_not_reproduced(_command: &str) -> Option<&'static str> {
+    None
 }
 
 fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadata {
@@ -20112,6 +20144,7 @@ fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadat
         args_sha256,
         command_line_original_bytes: raw_command_line.len(),
         command_line_sha256,
+        command_line_not_reproduced: shell_command_line_not_reproduced(command),
     }
 }
 
@@ -20199,6 +20232,9 @@ fn shell_job_status_with_safe_command_metadata(
     safe.args_sha256 = metadata.args_sha256;
     safe.command_line_original_bytes = metadata.command_line_original_bytes;
     safe.command_line_sha256 = metadata.command_line_sha256;
+    safe.command_line_not_reproduced = metadata
+        .command_line_not_reproduced
+        .map(ToOwned::to_owned);
     safe
 }
 

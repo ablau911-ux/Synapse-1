@@ -487,6 +487,9 @@ function failedClipReconciled() {
   if (unlisted.length) problems.push(`${unlisted.length} lost lines are not in the lost list of clip.json (first: instant ${unlisted[0].instant})`);
   const [clipBefore, indexBefore] = [fs.readFileSync(clipFile, 'utf8'), fs.readFileSync(indexFile, 'utf8')];
   const clipWrittenBefore = fs.statSync(clipFile).mtimeMs;
+  const videoDir = path.join(got.dir, 'video');
+  const partTimes = () => Object.fromEntries(fs.readdirSync(videoDir).filter(f => /^part-\d+\.ivf$/.test(f)).map(f => [f, fs.statSync(path.join(videoDir, f)).mtimeMs]));
+  const partsWrittenBefore = partTimes();
   const again = spawnSync(PROBE, ['exp-av1-recover', `folder=${got.dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
   let second = null;
   try { second = JSON.parse(again.stdout.trim().split(/\r?\n/).pop()); } catch { /* reported below as a failed second recovery */ }
@@ -495,8 +498,11 @@ function failedClipReconciled() {
     if (fs.readFileSync(indexFile, 'utf8') !== indexBefore) problems.push('a second recovery changed frames.jsonl');
     if (fs.readFileSync(clipFile, 'utf8') !== clipBefore) problems.push('a second recovery changed clip.json');
     else if (fs.statSync(clipFile).mtimeMs !== clipWrittenBefore) problems.push('a second recovery wrote clip.json again (same bytes, new modified time)');
+    const partsWrittenAfter = partTimes();
+    const rewritten = Object.keys(partsWrittenBefore).filter(part => partsWrittenAfter[part] !== partsWrittenBefore[part]);
+    if (rewritten.length) problems.push(`a second recovery wrote ${rewritten.length} of ${Object.keys(partsWrittenBefore).length} parts again (new modified time; first: ${rewritten[0]})`);
   }
-  return verdict(problems, `failed clip, part ${torn} cut to its header: ${missing.length} lines named lost encoder_failed and listed, still failed; a second recovery changed nothing and wrote no file`);
+  return verdict(problems, `failed clip, part ${torn} cut to its header: ${missing.length} lines named lost encoder_failed and listed, still failed; a second recovery changed nothing and wrote no file (clip.json, frames.jsonl, ${Object.keys(partsWrittenBefore).length} parts)`);
 }
 
 /**

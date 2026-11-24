@@ -62,7 +62,7 @@ const IVF_VERSION: u16 = 0;
 const IVF_HEADER_BYTES: u16 = 32;
 const IVF_AV1_FOURCC: &[u8; 4] = b"AV01";
 const IVF_TIME_SCALE: u32 = 1;
-const IVF_PICTURE_COUNT_OFFSET: u64 = 24;
+const IVF_PICTURE_COUNT_OFFSET: usize = 24;
 /// Where the IVF header holds the part's picture width and height (u16 each).
 const IVF_WIDTH_OFFSET: usize = 12;
 const IVF_HEIGHT_OFFSET: usize = 14;
@@ -225,7 +225,7 @@ impl IvfWriter {
     /// Writes the picture count into the header; returns the file's size.
     pub(super) fn close(mut self) -> Result<u64, String> {
         self.file
-            .seek(SeekFrom::Start(IVF_PICTURE_COUNT_OFFSET))
+            .seek(SeekFrom::Start(IVF_PICTURE_COUNT_OFFSET as u64))
             .and_then(|_| self.file.write_all(&self.pictures.to_le_bytes()))
             .and_then(|()| self.file.flush())
             .map_err(|error| format!("could not write the IVF picture count: {error}"))?;
@@ -251,7 +251,8 @@ pub(super) fn read_ivf(path: &Path) -> Result<Vec<IvfPicture>, String> {
 /// and writes the count of complete pictures into the header. Returns that
 /// count and the file's new size. A part shorter than its header (its writer
 /// died while writing the header) holds no picture: it is left as it is and
-/// counts 0, so recovery removes it.
+/// counts 0, so recovery removes it. A part that already ends after its
+/// last complete picture and holds its count is not written.
 pub(super) fn repair_ivf(path: &Path) -> Result<(u32, u64), String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -261,12 +262,16 @@ pub(super) fn repair_ivf(path: &Path) -> Result<(u32, u64), String> {
     let (pictures, end) = scan_ivf(&bytes, path)?;
     let count = u32::try_from(pictures.len())
         .map_err(|_| format!("{} holds too many pictures", path.display()))?;
+    let stored = &bytes[IVF_PICTURE_COUNT_OFFSET..IVF_PICTURE_COUNT_OFFSET + size_of::<u32>()];
+    if bytes.len() as u64 == end && stored == count.to_le_bytes() {
+        return Ok((count, end));
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     file.set_len(end)
-        .and_then(|()| file.seek(SeekFrom::Start(IVF_PICTURE_COUNT_OFFSET)))
+        .and_then(|()| file.seek(SeekFrom::Start(IVF_PICTURE_COUNT_OFFSET as u64)))
         .and_then(|_| file.write_all(&count.to_le_bytes()))
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("could not repair {}: {error}", path.display()))?;

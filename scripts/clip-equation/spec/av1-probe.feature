@@ -28,7 +28,7 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
   Scenario: recovery names every planned instant
     # Equation: killed text-page recording with end_ms 25 ms off the 50 ms grid: index lines after recovery = ceil(end_ms/50), the last one named lost | Known: true
   Scenario: recovery makes a failed clip agree with its pictures
-    # Equation: killed text-page recording made failed in clip.json, its last part cut to the 32-byte header: after product recovery every enc line of that part is lost encoder_failed, index lines after = before, every lost line is in clip.json lost, state = failed; a second recovery leaves frames.jsonl and clip.json byte-equal and does not write clip.json (its modified time is unchanged) | Known: true
+    # Equation: killed text-page recording made failed in clip.json, its last part cut to the 32-byte header: after product recovery every enc line of that part is lost encoder_failed, index lines after = before, every lost line is in clip.json lost, state = failed; a second recovery leaves frames.jsonl and clip.json byte-equal and writes neither clip.json nor any part (their modified times are unchanged) | Known: true
   Scenario: recovery names the losses of a clip whose recorder ended
     # Equation: killed text-page recording made failed in clip.json as a recorder thread that ended without finishing leaves it (lost_cause recorder_ended), its last part cut to the 32-byte header: after product recovery every enc line of that part is lost recorder_ended, every lost instant in clip.json has cause recorder_ended, state = failed | Known: true
   Scenario: recovery refuses a failed clip with zero fps

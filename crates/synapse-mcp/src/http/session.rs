@@ -87,24 +87,11 @@ impl InFlightRequestId {
     }
 
     /// Keeps the id claimed until rmcp ends `response`'s body, also when the
-    /// client stops reading it first. An SSE body that ends without this
-    /// request's response gets a JSON-RPC error as its last event (#258).
+    /// client stops reading it first.
     fn hold_until_request_ends(self, response: Response) -> Response {
-        let is_event_stream = response.status() == StatusCode::OK
-            && response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/event-stream"));
-        let reply_watch = is_event_stream.then(|| SseReplyWatch::new(self.request_id.clone()));
-        let (parts, body) = response.into_parts();
-        let body = InFlightBody {
-            data: body.into_data_stream(),
-            in_flight: Some(self),
-            reply_watch,
-            finished: false,
-        };
-        Response::from_parts(parts, Body::from_stream(body))
+        let request_id = self.request_id.clone();
+        let session_id = self.key.0.clone();
+        InFlightBody::wrap(response, request_id, Some(session_id), Some(self))
     }
 }
 
@@ -124,9 +111,41 @@ struct InFlightBody {
     /// `None` once `Drop` handed the claim to the task that reads the rest of
     /// rmcp's stream.
     in_flight: Option<InFlightRequestId>,
+    /// The request's session; `None` for an initialize that has none yet.
+    session_id: Option<String>,
     /// `None` when the body is not an SSE stream.
     reply_watch: Option<SseReplyWatch>,
     finished: bool,
+}
+
+impl InFlightBody {
+    /// Wraps `response`'s body for the request `request_id`. An SSE body that
+    /// ends without that request's response gets a JSON-RPC error as its last
+    /// event (#258). `in_flight` is the request's id claim, `None` for an
+    /// initialize, which opens its session and so cannot share an id there.
+    fn wrap(
+        response: Response,
+        request_id: serde_json::Value,
+        session_id: Option<String>,
+        in_flight: Option<InFlightRequestId>,
+    ) -> Response {
+        let is_event_stream = response.status() == StatusCode::OK
+            && response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"));
+        let reply_watch = is_event_stream.then(|| SseReplyWatch::new(request_id));
+        let (parts, body) = response.into_parts();
+        let body = Self {
+            data: body.into_data_stream(),
+            in_flight,
+            session_id,
+            reply_watch,
+            finished: false,
+        };
+        Response::from_parts(parts, Body::from_stream(body))
+    }
 }
 
 impl futures_util::Stream for InFlightBody {
@@ -146,10 +165,7 @@ impl futures_util::Stream for InFlightBody {
             }
             Poll::Ready(None) => {
                 this.finished = true;
-                let session_id = this
-                    .in_flight
-                    .as_ref()
-                    .map_or("", |in_flight| in_flight.key.0.as_str());
+                let session_id = this.session_id.as_deref();
                 if let Some(event) = this
                     .reply_watch
                     .take()
@@ -252,13 +268,13 @@ impl SseReplyWatch {
 
     /// The SSE event that ends an unanswered stream: a JSON-RPC error for the
     /// request, `None` when the response was sent.
-    fn missing_reply_event(self, session_id: &str) -> Option<axum::body::Bytes> {
+    fn missing_reply_event(self, session_id: Option<&str>) -> Option<axum::body::Bytes> {
         if self.answered {
             return None;
         }
         tracing::warn!(
             code = "MCP_HTTP_RESPONSE_STREAM_ENDED_WITHOUT_REPLY",
-            session_id,
+            session_id = session_id.unwrap_or_default(),
             request_id = %self.request_id,
             "HTTP MCP response stream ended before the request's response; sent a JSON-RPC error instead"
         );
@@ -397,8 +413,8 @@ pub(super) async fn require_mcp_session(
         return next.run(request).await;
     }
     let session_id = session_id_from_header(&request);
-    let request = match enforce_session_header(request).await {
-        Ok(request) => request,
+    let (request, initialize_id) = match enforce_session_header(request).await {
+        Ok(admitted) => admitted,
         Err(response) => return response,
     };
     let (request, in_flight) = match session_id.as_deref() {
@@ -443,9 +459,18 @@ pub(super) async fn require_mcp_session(
                     &serde_json::Value::Null,
                 );
             }
-            match in_flight {
-                Some(in_flight) => in_flight.hold_until_request_ends(response),
-                None => response,
+            match (in_flight, initialize_id) {
+                (Some(in_flight), _) => in_flight.hold_until_request_ends(response),
+                (None, Some(initialize_id)) => {
+                    // rmcp names the new session in the initialize response.
+                    let new_session_id = response
+                        .headers()
+                        .get(SESSION_ID_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    InFlightBody::wrap(response, initialize_id, new_session_id, None)
+                }
+                (None, None) => response,
             }
         })
         .await
@@ -580,9 +605,13 @@ fn parse_idle_timeout(raw: &str) -> anyhow::Result<u64> {
     Ok(seconds)
 }
 
-async fn enforce_session_header(request: Request<Body>) -> Result<Request<Body>, Response> {
+/// Admits a request with a session header, or an initialize POST without one;
+/// the second value is the initialize request's id.
+async fn enforce_session_header(
+    request: Request<Body>,
+) -> Result<(Request<Body>, Option<serde_json::Value>), Response> {
     if has_session_header(&request) {
-        return Ok(request);
+        return Ok((request, None));
     }
     if request.method() == Method::POST {
         allow_initialize_without_session(request).await
@@ -592,7 +621,7 @@ async fn enforce_session_header(request: Request<Body>) -> Result<Request<Body>,
             &serde_json::Value::Null,
         ))
     } else {
-        Ok(request)
+        Ok((request, None))
     }
 }
 
@@ -612,7 +641,7 @@ fn session_id_from_header(request: &Request<Body>) -> Option<String> {
 
 async fn allow_initialize_without_session(
     request: Request<Body>,
-) -> Result<Request<Body>, Response> {
+) -> Result<(Request<Body>, Option<serde_json::Value>), Response> {
     let (parts, body) = request.into_parts();
     let bytes = to_bytes(body, MAX_MCP_REQUEST_BYTES)
         .await
@@ -622,7 +651,8 @@ async fn allow_initialize_without_session(
         let request_id = message.get("id").unwrap_or(&serde_json::Value::Null);
         return Err(session_invalid(SessionFailure::Missing, request_id));
     }
-    Ok(Request::from_parts(parts, Body::from(bytes)))
+    let initialize_id = message.get("id").cloned();
+    Ok((Request::from_parts(parts, Body::from(bytes)), initialize_id))
 }
 
 async fn record_session_request(

@@ -6879,6 +6879,8 @@ fn run_shell_request_sha256(params: &ActRunShellParams) -> Result<String, ErrorD
         "working_dir": params.working_dir,
         "env": params.env,
         "timeout_ms": params.timeout_ms,
+        "execution_mode": params.execution_mode,
+        "durable_timeout_ms": params.durable_timeout_ms,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|error| {
         mcp_error(

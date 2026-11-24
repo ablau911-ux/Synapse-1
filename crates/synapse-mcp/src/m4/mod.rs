@@ -13624,6 +13624,15 @@ fn wait_for_shell_job_remote_metadata(
     paths: &ShellJobPaths,
     timeout: Duration,
 ) -> Result<bool, ErrorData> {
+    // Only an SSH job whose remote pid/pgid are still unknown can gain
+    // metadata by waiting; any other job would sleep the whole timeout and
+    // delay the caller's termination (#283).
+    let scope = &job.remote_process_scope;
+    if scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || (scope.remote_process_id.is_some() && scope.remote_process_group_id.is_some())
+    {
+        return Ok(false);
+    }
     let started = Instant::now();
     loop {
         if refresh_shell_job_remote_metadata_from_outputs(job, paths)? {
@@ -17540,7 +17549,7 @@ fn local_identity_sysinfo_start_time(
 fn shell_job_process_tree_identities(
     expected_root: &ActRunShellLocalProcessIdentity,
 ) -> Result<Vec<ActRunShellLocalProcessIdentity>, String> {
-    use sysinfo::{Pid, ProcessesToUpdate, System};
+    use sysinfo::Pid;
 
     match local_process_identity_state(expected_root) {
         LocalProcessIdentityState::Match => {}
@@ -17564,8 +17573,7 @@ fn shell_job_process_tree_identities(
         }
     }
 
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    let system = shell_process_ancestry_snapshot();
     let root_pid = Pid::from_u32(expected_root.pid);
     let root_process = system.process(root_pid).ok_or_else(|| {
         format!(
@@ -17623,8 +17631,7 @@ fn shell_job_process_tree_identities(
     // process-table walk and identity capture. A rebound process is authorized
     // only if it is now still a descendant of the same verified root; otherwise
     // the entire destructive transition fails closed.
-    let mut ancestry_readback = System::new_all();
-    ancestry_readback.refresh_processes(ProcessesToUpdate::All, true);
+    let ancestry_readback = shell_process_ancestry_snapshot();
     let root_process = ancestry_readback.process(root_pid).ok_or_else(|| {
         format!(
             "root pid {} disappeared before ancestry readback",
@@ -17999,11 +18006,25 @@ fn terminate_shell_job_process_tree_platform(
     }
 }
 
-fn shell_job_process_tree_ids(root_pid: u32) -> Vec<u32> {
-    use sysinfo::{Pid, ProcessesToUpdate, System};
+/// Process table for shell-job ancestry walks. The walks read only pid,
+/// parent and start time, which sysinfo collects for every listed process
+/// with an empty refresh kind. `System::new_all()` also read every process's
+/// command line, environment and working directory, so each cancel spent
+/// seconds on snapshots before it terminated anything (#283).
+fn shell_process_ancestry_snapshot() -> sysinfo::System {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system
+}
 
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+fn shell_job_process_tree_ids(root_pid: u32) -> Vec<u32> {
+    use sysinfo::Pid;
+
+    let system = shell_process_ancestry_snapshot();
     let mut ids = vec![root_pid];
     let Some(root_process) = system.process(Pid::from_u32(root_pid)) else {
         return ids;

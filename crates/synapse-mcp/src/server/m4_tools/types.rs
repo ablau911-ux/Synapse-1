@@ -277,7 +277,10 @@ pub struct ProcessParams {
     #[serde(default)]
     pub command_line_contains: Option<String>,
     #[serde(default)]
-    #[schemars(range(min = 1, max = 1000))]
+    #[schemars(
+        range(min = 1, max = 1000),
+        description = "Row limit for list (1..=1000, default 100) or history (1..=200, default 20)."
+    )]
     pub limit: Option<usize>,
     #[serde(default)]
     #[schemars(default)]

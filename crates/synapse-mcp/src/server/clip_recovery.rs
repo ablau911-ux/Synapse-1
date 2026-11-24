@@ -41,9 +41,13 @@ impl ClipRecovery {
             ClipState::Recording => {}
             // Its reconcile at failure can itself have failed
             // (CAPTURE_CLIP_RECONCILE_FAILED): the same rule again. An index
-            // that already agrees is left as it is.
+            // that already agrees is left as it is, and clip.json is written
+            // only when it does not list a lost instant yet.
             ClipState::Failed => {
                 let lost = Self::reconcile_failed(folder, clip.fps, clip.failed_lost_cause())?;
+                if lost.iter().all(|lost| clip.lists_lost(lost.instant)) {
+                    return Ok(());
+                }
                 return ClipJson::update(folder, |clip| clip.add_lost(lost)).map(|_| ());
             }
             ClipState::Ready => return Ok(()),

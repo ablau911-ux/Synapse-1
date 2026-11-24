@@ -650,12 +650,17 @@ impl ClipJson {
         self.lost_cause.as_deref().unwrap_or(LOST_ENCODER_FAILED)
     }
 
+    /// `true` when `instant` is in the lost list.
+    pub(super) fn lists_lost(&self, instant: u64) -> bool {
+        self.lost.iter().any(|known| known.instant == instant)
+    }
+
     /// Adds lost instants (an instant already listed keeps its first cause),
     /// so each lost instant is listed exactly once, and carries the list
     /// into the `capture` and `totals` conditions where they exist.
     pub(super) fn add_lost(&mut self, more: impl IntoIterator<Item = LostInstant>) {
         for lost in more {
-            if !self.lost.iter().any(|known| known.instant == lost.instant) {
+            if !self.lists_lost(lost.instant) {
                 self.lost.push(lost);
             }
         }

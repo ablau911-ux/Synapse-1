@@ -58,12 +58,18 @@ enum Hint {
 /// letting the caller keep its existing normalization.
 pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> Option<ErrorData> {
     let inner = raw_message.strip_prefix(DESERIALIZE_PREFIX)?.trim();
-    let schema_fields: Vec<String>;
-    let mut parsed = parse_unknown_field(inner)?;
-    if parsed.accepted.is_empty() {
-        schema_fields = flattened_params_fields(tool);
-        parsed.accepted = schema_fields.iter().map(String::as_str).collect();
-    }
+    // A flattened params struct gets no field list from serde: its message
+    // ends right after the caller's field name, which may itself hold
+    // backticks, so its accepted fields come only from its schema (#260).
+    let schema_fields = flattened_params_fields(tool);
+    let parsed = if schema_fields.is_empty() {
+        parse_unknown_field(inner)?
+    } else {
+        UnknownField {
+            field: inner.strip_prefix("unknown field `")?.strip_suffix('`')?,
+            accepted: schema_fields.iter().map(String::as_str).collect(),
+        }
+    };
     let hint =
         registry_hint(tool, parsed.field).or_else(|| generic_hint(parsed.field, &parsed.accepted));
 
@@ -133,24 +139,27 @@ pub(super) fn enrich_param_deserialize_error(tool: &str, raw_message: &str) -> O
 ///
 /// serde formats the accepted set with arity-dependent phrasing (`there are no
 /// fields`, `expected \`a\``, `expected \`a\` or \`b\``, `expected one of \`a\`,
-/// \`b\`, \`c\``). Rather than match each phrasing we extract every
-/// backtick-delimited token: the first is the offending field and the rest are
-/// the accepted fields. This is robust to all arities and to nested failures
-/// (where the accepted list is the nested struct's fields).
+/// \`b\`, \`c\``), always after the offending field. The caller's field name
+/// may itself hold backticks or those phrases, while serde's accepted names
+/// (Rust field names) never hold a backtick, so the message is split at the
+/// *last* separator: everything before it is the field, and the accepted
+/// fields are the backtick-delimited names after it (#260). This is robust to
+/// all arities and to nested failures (where the accepted list is the nested
+/// struct's fields).
 fn parse_unknown_field(message: &str) -> Option<UnknownField<'_>> {
-    let rest = message.strip_prefix("unknown field ")?;
-    let mut tokens = Vec::new();
-    let mut remaining = rest;
-    while let Some(open) = remaining.find('`') {
-        let after = &remaining[open + 1..];
-        let close = after.find('`')?;
-        tokens.push(&after[..close]);
-        remaining = &after[close + 1..];
-    }
-    let (field, accepted) = tokens.split_first()?;
+    let rest = message.strip_prefix("unknown field `")?;
+    let (at, separator) = ["`, expected ", "`, there are no fields"]
+        .into_iter()
+        .filter_map(|separator| rest.rfind(separator).map(|at| (at, separator)))
+        .max_by_key(|(at, _)| *at)?;
+    let accepted = rest[at + separator.len()..]
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .collect();
     Some(UnknownField {
-        field,
-        accepted: accepted.to_vec(),
+        field: &rest[..at],
+        accepted,
     })
 }
 

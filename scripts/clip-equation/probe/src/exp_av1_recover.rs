@@ -4,7 +4,8 @@
 //!
 //!   clip-probe exp-av1-recover folder=<clip folder>
 //!
-//! Prints one JSON line: ok, error, state, stop_reason, instants (from clip.json after),
+//! Prints one JSON line: ok, error, finished (recovery's answer: the clip needs no more
+//! recovery), state, stop_reason, instants (from clip.json after),
 //! index_lines, lost, lost_causes (from frames.jsonl after), stills_on_disk (instants),
 //! parts_on_disk (part numbers). A recovery error is reported with ok=false and the run
 //! still exits 0: the check judges it.
@@ -33,6 +34,7 @@ pub fn run() -> Result<()> {
     let lost_causes: BTreeSet<&str> = lines.iter().filter_map(|line| line.lost.as_deref()).collect();
     let line = json!({
         "ok": outcome.is_ok(),
+        "finished": outcome.as_ref().ok(),
         "error": outcome.err(),
         "state": clip.as_ref().map(|clip| clip.state.as_str()),
         "stop_reason": clip.as_ref().and_then(|clip| clip.stop_reason).map(|reason| reason.as_str()),

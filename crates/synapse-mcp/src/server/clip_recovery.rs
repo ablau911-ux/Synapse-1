@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::clip_folder::{
-    ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
     LOST_SERVICE_RESTART, LostInstant, MAX_DURATION_MS, PartInfo, RECORD_FPS, RecorderLock,
     STILLS_DIR, StillInfo, StopReason, part_path, read_index, repair_ivf, still_path,
     write_bytes_atomically,
@@ -30,17 +30,26 @@ const MILLISECONDS_PER_SECOND: u64 = 1_000;
 pub(super) struct ClipRecovery;
 
 impl ClipRecovery {
-    pub(super) fn run(folder: &Path) -> Result<(), String> {
+    /// Recovers one clip folder. Returns `true` once the clip needs no more
+    /// recovery (recovered now, `ready`, `failed` with an index that agrees,
+    /// of another format, or without `clip.json`), `false` while a recorder
+    /// holds it.
+    pub(super) fn run(folder: &Path) -> Result<bool, String> {
+        // The recorder lock is held across recovery, so a second recovery waits
+        // out. The recorder takes it before the clip is registered.
+        if RecorderLock::held(folder) {
+            return Ok(false);
+        }
+        // A start that ended before its clip.json existed recorded nothing.
+        if !folder.join(CLIP_JSON_FILE).is_file() {
+            return Ok(true);
+        }
         // A clip of another (older) format is no recording of this recorder:
         // it needs no recovery and is skipped quietly, before anything is
         // written in its folder.
         if let Some(format) = ClipJson::other_format(folder)? {
             tracing::debug!(code = "CLIP_RECOVERY_SKIPPED_FORMAT", folder = %folder.display(), format = %format);
-            return Ok(());
-        }
-        // The recorder lock is held across recovery, so a second recovery waits out.
-        if RecorderLock::held(folder) {
-            return Ok(());
+            return Ok(true);
         }
         let _lock = RecorderLock::acquire(folder)?;
         let clip = ClipJson::read(folder)?;
@@ -53,11 +62,11 @@ impl ClipRecovery {
             ClipState::Failed => {
                 let lost = Self::reconcile_failed(folder, clip.fps, clip.failed_lost_cause())?;
                 if lost.iter().all(|lost| clip.lists_lost(lost.instant)) {
-                    return Ok(());
+                    return Ok(true);
                 }
-                return ClipJson::update(folder, |clip| clip.add_lost(lost)).map(|_| ());
+                return ClipJson::update(folder, |clip| clip.add_lost(lost)).map(|_| true);
             }
-            ClipState::Ready => return Ok(()),
+            ClipState::Ready => return Ok(true),
         }
         // Instant k is recorded when k / f < end: ceil(end * f / 1000) instants.
         // The recorder makes no clip longer than MAX_DURATION_MS at RECORD_FPS,
@@ -106,6 +115,7 @@ impl ClipRecovery {
             clip.set_total_bytes(folder)
         })
         .and_then(|(_, result)| result)
+        .map(|()| true)
     }
 
     /// Makes the index of a recording that failed (its encoder stopped)
@@ -297,9 +307,18 @@ pub(crate) fn recover_clips_on_start() {
     let started = std::thread::Builder::new()
         .name("synapse-clip-recovery".into())
         .spawn(|| {
-            for folder in ClipRegistry::all_folders() {
-                if let Err(error) = ClipRecovery::run(&folder) {
-                    tracing::warn!(code = "CLIP_RECOVERY_FAILED", folder = %folder.display(), error = %error);
+            for entry in ClipRegistry::unfinished() {
+                let folder = &entry.folder;
+                match ClipRecovery::run(folder) {
+                    Ok(true) => {
+                        if let Err(error) = ClipRegistry::mark_finished(&entry.clip_id) {
+                            tracing::warn!(code = "CLIP_REGISTRY_WRITE_FAILED", folder = %folder.display(), error = %error);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(code = "CLIP_RECOVERY_FAILED", folder = %folder.display(), error = %error);
+                    }
                 }
             }
         });

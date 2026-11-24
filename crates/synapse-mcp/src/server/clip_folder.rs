@@ -23,8 +23,7 @@ pub(super) const FRAMES_FILE: &str = "frames.jsonl";
 pub(super) const VIDEO_DIR: &str = "video";
 pub(super) const STILLS_DIR: &str = "stills";
 pub(super) const VIEWS_DIR: &str = "views";
-/// Lists clips whose folder is not under the default clips folder; entries
-/// stay after the clip is ready or failed.
+/// Lists every clip (`ClipRegistry`); entries stay after the clip finished.
 const REGISTRY_FILE: &str = "active-clips.json";
 const LOCK_SUFFIX: &str = ".lock";
 /// Held by the recorder for the life of a recording (`RecorderLock`).
@@ -899,12 +898,21 @@ pub(super) fn file_size_and_sha256(path: &Path) -> std::io::Result<(u64, String)
 pub(super) struct RegistryEntry {
     pub(super) clip_id: String,
     pub(super) folder: PathBuf,
+    /// The clip needs no more recovery (`ClipRecovery::run` said so); set
+    /// by recovery at service start, so a clip is visited once after it
+    /// finished. Absent in an older registry: such an entry is visited once
+    /// more.
+    #[serde(default)]
+    pub(super) finished: bool,
 }
 
-/// The active-clip registry under the default clips folder. An entry stays
-/// after the clip is ready or failed, so `record_status` and `record_stop`
-/// still find a clip in another folder by its id; recovery skips clips in a
-/// terminal state.
+/// The clip registry under the default clips folder: every clip, listed
+/// before its `clip.json` exists. An entry stays after the clip finished,
+/// so `record_status` and `record_stop` still find a clip in another folder
+/// by its id; recovery at start visits only unfinished entries, so its work
+/// does not grow with finished clips. The default clips folder is not
+/// scanned: a clip recorded there before every clip was registered is not
+/// visited.
 pub(super) struct ClipRegistry;
 
 impl ClipRegistry {
@@ -912,7 +920,7 @@ impl ClipRegistry {
         clips_root().join(REGISTRY_FILE)
     }
 
-    /// Every registered clip folder outside the default folder.
+    /// Every registered clip.
     pub(super) fn entries() -> Vec<RegistryEntry> {
         std::fs::read_to_string(Self::path())
             .ok()
@@ -920,17 +928,24 @@ impl ClipRegistry {
             .unwrap_or_default()
     }
 
-    /// Lists a clip whose folder is not under the default clips folder.
+    /// Lists a clip, unfinished.
     pub(super) fn add(clip_id: &str, folder: &Path) -> Result<(), String> {
-        if folder.parent() == Some(clips_root().as_path()) {
-            return Ok(());
-        }
         Self::change(|entries| {
             entries.retain(|entry| entry.clip_id != clip_id);
             entries.push(RegistryEntry {
                 clip_id: clip_id.to_owned(),
                 folder: folder.to_path_buf(),
+                finished: false,
             });
+        })
+    }
+
+    /// Marks a clip finished (see `RegistryEntry::finished`).
+    pub(super) fn mark_finished(clip_id: &str) -> Result<(), String> {
+        Self::change(|entries| {
+            for entry in entries.iter_mut().filter(|entry| entry.clip_id == clip_id) {
+                entry.finished = true;
+            }
         })
     }
 
@@ -954,8 +969,9 @@ impl ClipRegistry {
         write_atomically(&path, &entries)
     }
 
-    /// The folder of a clip id: the registry, then the default folder. A
-    /// registered folder that no longer holds a `clip.json` is skipped.
+    /// The folder of a clip id: the registry, then the default folder (a clip
+    /// recorded there before every clip was registered). A registered folder
+    /// that no longer holds a `clip.json` is skipped.
     pub(super) fn folder_of(clip_id: &str) -> Option<PathBuf> {
         Self::entries()
             .into_iter()
@@ -967,22 +983,11 @@ impl ClipRegistry {
             })
     }
 
-    /// Every clip folder that may need work: the registry plus every folder
-    /// under the default clips folder.
-    pub(super) fn all_folders() -> Vec<PathBuf> {
-        let mut folders: Vec<PathBuf> = Self::entries()
+    /// Every clip that may need recovery: the entries not marked finished.
+    pub(super) fn unfinished() -> Vec<RegistryEntry> {
+        Self::entries()
             .into_iter()
-            .map(|entry| entry.folder)
-            .collect();
-        if let Ok(read) = std::fs::read_dir(clips_root()) {
-            folders.extend(
-                read.filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .filter(|path| path.join(CLIP_JSON_FILE).is_file()),
-            );
-        }
-        folders.sort();
-        folders.dedup();
-        folders
+            .filter(|entry| !entry.finished)
+            .collect()
     }
 }

@@ -600,6 +600,24 @@ function otherFormatSkipped() {
   return verdict(problems, 'clip.json without method (an older format): recovery skips it without an error and changes no file');
 }
 
+/**
+ * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
+ * and recovery at the next start does not visit it. A recovered killed recording needs none, and
+ * neither does the ready clip on a second recovery.
+ */
+function recoveredClipFinished() {
+  const got = recovered('killed-text-page', 'finished-recovered', () => {});
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  if (got.result.finished !== true) problems.push(`recovery of a killed recording answered finished = ${got.result.finished}, not true`);
+  const again = spawnSync(PROBE, ['exp-av1-recover', `folder=${got.dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  let second = null;
+  try { second = JSON.parse(again.stdout.trim().split(/\r?\n/).pop()); } catch { /* reported below */ }
+  if (again.error || again.status !== 0 || !second?.ok) problems.push(`second recovery: ${again.error?.message || again.stderr.trim() || second?.error || `exit ${again.status}`}`);
+  else if (second.finished !== true) problems.push(`second recovery of the ready clip answered finished = ${second.finished}, not true`);
+  return verdict(problems, 'killed recording: recovery answered finished; the ready clip on a second recovery answered finished');
+}
+
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
 function fetchPicture(folder, instant) {
   const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
@@ -691,6 +709,7 @@ const table = {
   'recovery caps a clip longer than the longest recording': overlongClipCapped,
   'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,
   'recovery skips a clip of another format quietly': otherFormatSkipped,
+  'recovery says a recovered clip needs no more recovery': recoveredClipFinished,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

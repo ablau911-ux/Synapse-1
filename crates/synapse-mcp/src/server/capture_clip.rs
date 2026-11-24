@@ -864,10 +864,12 @@ mod live {
             // Taken before `clip.json` exists, so recovery never sees this
             // clip `recording` without a live recorder.
             let recorder_lock = RecorderLock::acquire(&plan.folder).map_err(internal_error)?;
+            // Registered before `clip.json` exists, so recovery at start
+            // visits every clip that can say `recording`.
+            ClipRegistry::add(&plan.clip_id, &plan.folder).map_err(internal_error)?;
             initial_clip_json(plan)
                 .create(&plan.folder)
                 .map_err(internal_error)?;
-            ClipRegistry::add(&plan.clip_id, &plan.folder).map_err(internal_error)?;
             let observer = ClipObserver::start(plan.target, instant_hns()).map_err(|error| {
                 mcp_error(
                     error.code(),

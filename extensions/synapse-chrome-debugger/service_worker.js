@@ -7256,8 +7256,9 @@ async function handleCdpInput(params) {
     modifiers: normalizeClickModifiers(params.modifiers, "cdpInput"),
     clickCount: normalizeClickCount(params.clicks)
   });
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
+  // The input events were acknowledged: every failure below is after delivered input.
+  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
@@ -11803,8 +11804,10 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
   } else {
     dispatch = await dispatchHtml5DragDrop(selected.tabId, sourceSelector, targetSelector, params);
   }
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
+  // Every drag lane delivered its events once it returned: every failure
+  // below is after delivered input.
+  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
@@ -11979,6 +11982,8 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
   const protocolVersion = "1.3";
   let attached = false;
   let touchEmulationEnabled = false;
+  // True once an input event of this dispatch was acknowledged.
+  let delivered = false;
   try {
     await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
@@ -12006,6 +12011,7 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
       await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x: point.x, y: point.y, button: "none", modifiers, pointerType: "mouse"
       });
+      delivered = true;
       dispatched.push("mouseMoved");
       const pairs = action === "dblclick" ? 2 : 1;
       for (let clickCount = 1; clickCount <= pairs; clickCount += 1) {
@@ -12039,6 +12045,7 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
         id: 1
       }]
     });
+    delivered = true;
     await sendDebuggerCommand(debuggee, "Input.dispatchTouchEvent", {
       type: "touchEnd",
       touchPoints: []
@@ -12053,10 +12060,11 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
       protocol_version: protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
+    const failure = bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger ${action} dispatch failed for tab ${tabId}: ${errorMessage(error)}`
     );
+    throw delivered ? errorAfterInput(failure) : failure;
   } finally {
     if (attached) {
       if (touchEmulationEnabled) {
@@ -12137,10 +12145,12 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
       protocol_version: protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
+    const failure = bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger drag dispatch failed for tab ${tabId}: ${errorMessage(error)}`
     );
+    // Each entry of `dispatched` is an acknowledged, so delivered, event.
+    throw dispatched.length > 0 ? errorAfterInput(failure) : failure;
   } finally {
     if (attached) {
       try {
@@ -12170,10 +12180,10 @@ async function dispatchRealHtml5Drop(tabId, targetPoint, params) {
   const debuggee = { tabId };
   const protocolVersion = "1.3";
   let attached = false;
+  const dispatched = [];
   try {
     await chrome.debugger.attach(debuggee, protocolVersion);
     attached = true;
-    const dispatched = [];
     for (const type of ["dragEnter", "dragOver", "drop"]) {
       await sendDebuggerCommand(debuggee, "Input.dispatchDragEvent", {
         type,
@@ -12191,10 +12201,12 @@ async function dispatchRealHtml5Drop(tabId, targetPoint, params) {
       protocol_version: protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
+    const failure = bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger html5_real_drag dispatch failed for tab ${tabId}: ${errorMessage(error)}`
     );
+    // Each entry of `dispatched` is an acknowledged, so delivered, event.
+    throw dispatched.length > 0 ? errorAfterInput(failure) : failure;
   } finally {
     if (attached) {
       try {
@@ -14467,9 +14479,11 @@ async function handleCoordinateClick(params) {
     );
   }
 
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
-  const activeElement = await tabActiveElementState(selected.tabId);
+  // The in-page click dispatched its events: every failure below is after
+  // delivered input.
+  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
+  const activeElement = await afterInput(tabActiveElementState(selected.tabId));
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,

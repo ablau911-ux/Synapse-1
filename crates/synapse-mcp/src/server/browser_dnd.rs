@@ -288,18 +288,23 @@ impl SynapseService {
         )
         .await
         .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "{tool} bridge {} failed for target {cdp_target_id:?}: {}",
-                    dnd.mode.bridge_action(),
-                    error.detail()
+            crate::m2::error_after_bridge_input(
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "{tool} bridge {} failed for target {cdp_target_id:?}: {}",
+                        dnd.mode.bridge_action(),
+                        error.detail()
+                    ),
                 ),
+                &error,
             )
         })?;
+        // The bridge delivered the drag events before this boundary check.
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_drag_drop_after_bridge_input",
-        )?;
+        )
+        .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
 
         Ok(BrowserDndResponse {
             ok: true,

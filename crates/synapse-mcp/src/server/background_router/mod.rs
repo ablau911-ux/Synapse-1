@@ -5969,7 +5969,12 @@ async fn target_act_coordinate_click(
                 },
             )
             .await
-            .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+            .map_err(|error| {
+                crate::m2::error_after_bridge_input(
+                    mcp_error(error.code(), error.detail().to_owned()),
+                    &error,
+                )
+            });
             target_act_audit_result_for_session(
                 service,
                 "chrome_debugger_bridge.coordinateClick",

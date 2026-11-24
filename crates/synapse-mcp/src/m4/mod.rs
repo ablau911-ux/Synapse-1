@@ -2768,7 +2768,12 @@ fn write_shell_job_status_readback(
         || persisted.exit_code != candidate_exit_code
         || persisted.completed_at != candidate_completed_at;
     if !terminal_won {
-        return Ok((persisted, candidate_running, stdout_len_bytes, stderr_len_bytes));
+        return Ok((
+            persisted,
+            candidate_running,
+            stdout_len_bytes,
+            stderr_len_bytes,
+        ));
     }
 
     // The lengths were measured while the job still looked live, so output
@@ -11196,7 +11201,10 @@ fn resolve_shell_working_dir(
                 // the call would run in without one: the session cwd, or the
                 // daemon cwd when there is no session (#220).
                 if !path.has_root()
-                    && matches!(path.components().next(), Some(std::path::Component::Prefix(_)))
+                    && matches!(
+                        path.components().next(),
+                        Some(std::path::Component::Prefix(_))
+                    )
                 {
                     return Err(shell_tool_error(
                         error_codes::TOOL_PARAMS_INVALID,

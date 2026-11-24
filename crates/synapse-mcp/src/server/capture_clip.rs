@@ -710,8 +710,9 @@ mod live {
         };
         // Every way the recorder ends sealed the end where it was decided,
         // before the flush: a stop call in `request_stop`, `Completed` in
-        // `ends_at`, a failed read-back in `handle_instant`, any other
-        // failure or stop condition in `run`.
+        // `ends_at`, a failure (a disk check, a write, a read-back) where it
+        // was found and before its warning, any other stop condition in
+        // `run`.
         let reason = recording.run(control);
         recording.finish(reason);
     }
@@ -1115,15 +1116,15 @@ mod live {
                 if control.stop.load(Ordering::Relaxed) {
                     return StopReason::StopCall;
                 }
-                let ended = match self.stop_condition() {
+                let ended = match self.stop_condition(control) {
                     Some(reason) => Err(reason),
                     None => self.handle_instant(k, control),
                 };
                 if let Err(reason) = ended {
-                    // A stop condition or a failed write ends the recording
-                    // here: the end is sealed at once, before anything else
-                    // runs (a failed read-back sealed it where it was found,
-                    // before its lost line was written).
+                    // A stop condition ends the recording here: the end is
+                    // sealed at once, before anything else runs. A failure
+                    // (a disk check, a write, a read-back) sealed it where it
+                    // was found, before its warning was logged.
                     control.seal();
                     return reason;
                 }
@@ -1136,8 +1137,9 @@ mod live {
         }
 
         /// The target closed, the privacy gate pauses, an excluded app shows on
-        /// the monitor, or the disk rule stops the clip.
-        fn stop_condition(&mut self) -> Option<StopReason> {
+        /// the monitor, or the disk rule stops the clip. A disk check that
+        /// fails seals the end before its warning is logged.
+        fn stop_condition(&mut self, control: &RecordingControl) -> Option<StopReason> {
             if self.observer.closed() || self.window_closed() {
                 return Some(StopReason::TargetLost);
             }
@@ -1154,6 +1156,7 @@ mod live {
                 Ok(true) => None,
                 Ok(false) => Some(StopReason::DiskPressure),
                 Err(error) => {
+                    control.seal();
                     tracing::warn!(code = "CAPTURE_CLIP_DISK_CHECK_FAILED", error = %error);
                     Some(StopReason::WriteFailed)
                 }
@@ -1164,8 +1167,8 @@ mod live {
         /// stream; a frame already handed over is `Unchanged`; a frame the
         /// observer dropped (no free slot) or could not read is a named loss.
         /// A frame that could not be read ends the recording: the end is
-        /// sealed before its lost line is written, so no extend is accepted
-        /// once that is decided.
+        /// sealed first (before its warning and its lost line), so no extend
+        /// is accepted once that is decided.
         fn handle_instant(&mut self, k: u64, control: &RecordingControl) -> Result<(), StopReason> {
             let frame = self.observer.frame_for_instant(to_i64(k));
             let overflowed = self
@@ -1177,19 +1180,24 @@ mod live {
                 Some(frame) if !overflowed => frame,
                 _ => {
                     self.last_composed = None;
-                    return self.feed(k, StreamInput::Lost(LOST_SLOT_OVERFLOW), None);
+                    return self.feed(k, StreamInput::Lost(LOST_SLOT_OVERFLOW), None, control);
                 }
             };
             if self.last_composed == Some(frame.composed_hns) {
-                return self.feed(k, StreamInput::Unchanged, frame.cursor);
+                return self.feed(k, StreamInput::Unchanged, frame.cursor, control);
             }
             let pixels = match self.observer.read_back(&frame) {
                 Ok(pixels) => pixels,
                 Err(error) => {
-                    tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
                     control.seal();
+                    tracing::warn!(code = "CAPTURE_CLIP_READBACK_FAILED", error = %error);
                     self.last_composed = None;
-                    self.feed(k, StreamInput::Lost(LOST_CAPTURE_FAILED), frame.cursor)?;
+                    self.feed(
+                        k,
+                        StreamInput::Lost(LOST_CAPTURE_FAILED),
+                        frame.cursor,
+                        control,
+                    )?;
                     return Err(StopReason::CaptureFailed);
                 }
             };
@@ -1201,6 +1209,7 @@ mod live {
                     height: pixels.height,
                 },
                 frame.cursor,
+                control,
             )?;
             self.last_composed = Some(frame.composed_hns);
             Ok(())
@@ -1208,14 +1217,18 @@ mod live {
 
         /// Hands instant k to the stream, with the cursor sampled with its
         /// frame (`ObservedFrame::cursor`; `None` without a frame); a closed
-        /// video part is published in `clip.json` at once.
+        /// video part is published in `clip.json` at once. A failed write
+        /// ends the recording: the end is sealed before its warning is
+        /// logged.
         fn feed(
             &mut self,
             k: u64,
             input: StreamInput,
             cursor: Option<(i32, i32)>,
+            control: &RecordingControl,
         ) -> Result<(), StopReason> {
             let written = self.stream.instant(k, input, cursor).map_err(|error| {
+                control.seal();
                 tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", instant = k, error = %error);
                 StopReason::WriteFailed
             })?;
@@ -1227,6 +1240,7 @@ mod live {
                     .clip_json
                     .time(|| ClipJson::update(folder, |clip| clip.parts.extend(parts)))
                     .map_err(|error| {
+                        control.seal();
                         tracing::warn!(code = "CAPTURE_CLIP_WRITE_FAILED", error = %error);
                         StopReason::WriteFailed
                     })?;

@@ -1622,6 +1622,7 @@ fn launch_agent_spawn_with_terminal_capture(
     );
     Ok(ActLaunchResponse {
         pid: spawned.process_id,
+        command_line: None,
         hwnd: None,
         window_owner_pid: None,
         reused_existing_window: false,

@@ -1560,6 +1560,12 @@ fn validate_local_model_ref(model_ref: &str) -> Result<(), ErrorData> {
 pub struct ActLaunchResponse {
     /// PID of the process act_launch freshly spawned.
     pub pid: u32,
+    /// The command line the spawned process got, including the Chromium
+    /// debugging, profile and accessibility flags act_launch injected. Absent
+    /// when the spawner builds the line itself (act_spawn_agent's terminal)
+    /// and in responses stored before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
     pub hwnd: Option<i64>,
     /// PID that actually OWNS `hwnd`. Equals `pid` for a normal launch where the
     /// spawned process showed its own window. Differs from `pid` when act_launch
@@ -1656,7 +1662,7 @@ pub fn launch_process_history_row(
         "idempotency_key_present": params.idempotency_key.is_some(),
         "windows_new_console": launch_target_needs_new_console(&params.target),
         "request_sha256": launch_request_sha256(params).ok(),
-        "command_line": launch_command_line(params).ok(),
+        "command_line": response.command_line,
         "pid": response.pid,
         "hwnd": response.hwnd,
         "matched_title": response.matched_title,
@@ -7099,7 +7105,6 @@ pub(crate) async fn launch_for_session_with_boundary(
     boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActLaunchOutcome, ErrorData> {
     let matched_pattern = validate_launch_authorized(config, &params)?;
-    let command_line = launch_command_line(&params)?;
     let wait_regex = params
         .wait_for_window_title_regex
         .as_ref()
@@ -7216,7 +7221,7 @@ pub(crate) async fn launch_for_session_with_boundary(
     let launched_at = chrono::Utc::now().to_rfc3339();
     tracing::info!(
         code = "M4_ACT_LAUNCH_EXECUTED",
-        command_line = %command_line,
+        command_line = %spawned.command_line,
         matched_pattern = %matched_pattern,
         pid,
         hwnd = ?window.hwnd,
@@ -7247,6 +7252,7 @@ pub(crate) async fn launch_for_session_with_boundary(
     Ok(ActLaunchOutcome {
         response: ActLaunchResponse {
             pid,
+            command_line: Some(spawned.command_line),
             window_owner_pid,
             reused_existing_window,
             hwnd: window.hwnd,
@@ -8723,6 +8729,9 @@ fn validate_console_launch_visibility(params: &ActLaunchParams) -> Result<(), Er
 
 struct SpawnedLaunchChild {
     pid: u32,
+    /// The command line the spawn used, built from the spawn params (injected
+    /// Chromium flags included).
+    command_line: String,
     desktop_lease: Option<LaunchDesktopLease>,
 }
 
@@ -8749,6 +8758,7 @@ fn spawn_launch_child(
             ));
         }
         let needs_new_console = launch_target_needs_new_console(&params.target);
+        let command_line = launch_command_line(params)?;
 
         let mut command = StdCommand::new(&params.target);
         command.args(&params.args);
@@ -8781,6 +8791,7 @@ fn spawn_launch_child(
         })?;
         Ok(SpawnedLaunchChild {
             pid: child.id(),
+            command_line,
             desktop_lease: None,
         })
     }
@@ -8905,6 +8916,7 @@ fn spawn_windows_child(
             let _ = unsafe { CloseHandle(process_info.hProcess) };
             Ok(SpawnedLaunchChild {
                 pid,
+                command_line,
                 desktop_lease: desktop.map(|desktop| desktop.lease),
             })
         }

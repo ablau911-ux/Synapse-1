@@ -1268,6 +1268,19 @@ impl SynapseService {
                 "agent_task claim session_id must not be empty",
             ));
         }
+        // The attempt is bound to a session that reconcile checks for
+        // liveness; a session that is not live now would be orphaned by the
+        // next reconcile, so it is refused here. This also bounds the id's
+        // size, since only registered session ids can match.
+        if !self
+            .live_session_ids(unix_time_ms_now())?
+            .contains(&params.session_id)
+        {
+            return Err(params_error(format!(
+                "agent_task claim session_id is not a live MCP session ({} bytes); pass the claiming agent's live session id",
+                params.session_id.len()
+            )));
+        }
         let db = self.agent_task_db()?;
         let task = Self::claim_internal(&db, &params.task_id, &params.session_id, None, None)?;
         let written_row = TaskRowReadback {

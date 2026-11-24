@@ -715,8 +715,7 @@ fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
         .get("method")
         .is_some_and(serde_json::Value::is_string);
     let has_id = message.contains_key("id");
-    let is_response =
-        has_id && (message.contains_key("result") || message.contains_key("error"));
+    let is_response = has_id && (message.contains_key("result") || message.contains_key("error"));
     if !has_method && !is_response {
         return Err(invalid_jsonrpc_request(
             id,

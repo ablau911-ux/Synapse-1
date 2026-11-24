@@ -27,7 +27,7 @@ impl ServerHandler for SynapseService {
         let operation = tool_operation_from_arguments(&tool_name, request.arguments.as_ref());
         let lifecycle_guard = self.begin_daemon_lifecycle_tool_call(
             &tool_name,
-            operation,
+            operation.clone(),
             mcp_session_id.as_deref(),
         )?;
         if let Some(session_id) = mcp_session_id.as_deref()
@@ -107,6 +107,7 @@ impl ServerHandler for SynapseService {
         let child_lifecycle_owner = Arc::clone(&lifecycle_owner);
         let child_service = self.clone();
         let child_tool_name = tool_name.clone();
+        let child_operation = operation;
         let child_mcp_session_id = mcp_session_id.clone();
         let (result_sender, mut result_receiver) = oneshot::channel();
         let authority_completion = match self.spawn_cooperative_authority_transaction(
@@ -158,6 +159,7 @@ impl ServerHandler for SynapseService {
                                 let result = finish_routed_tool_call(
                                     lifecycle_guard,
                                     &child_tool_name,
+                                    child_operation.as_deref(),
                                     child_mcp_session_id.as_deref(),
                                     execution,
                                 );
@@ -375,6 +377,7 @@ where
 fn finish_routed_tool_call(
     lifecycle_guard: crate::daemon_lifecycle::ToolCallGuard,
     tool_name: &str,
+    operation: Option<&str>,
     mcp_session_id: Option<&str>,
     execution: RoutedToolExecution<Result<CallToolResult, ErrorData>>,
 ) -> Result<CallToolResult, ErrorData> {
@@ -392,7 +395,7 @@ fn finish_routed_tool_call(
             Ok(result)
         }
         RoutedToolExecution::Completed(Err(error)) => {
-            let error = normalize_tool_error(tool_name, error);
+            let error = normalize_tool_error(tool_name, operation, error);
             let error_snapshot = error_snapshot(&error);
             let effective_target = effective_target_from_error_snapshot(&error_snapshot);
             lifecycle_guard
@@ -588,7 +591,7 @@ fn tool_operation_from_arguments(
     }
 }
 
-fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
+fn normalize_tool_error(tool_name: &str, operation: Option<&str>, error: ErrorData) -> ErrorData {
     if error.data.is_none() && error.message == "tool not found" {
         return mcp_error(
             synapse_core::error_codes::TOOL_NOT_FOUND,
@@ -612,7 +615,43 @@ fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
             crate::m1::echoed_text(&error.message),
         );
     }
-    error
+    public_permission_denial(tool_name, operation, error)
+}
+
+/// #219: a permission denial names the public tool and operation the caller
+/// used. The M3 gate runs inside the implementation route a facade delegates
+/// to and names that hidden route, so the public boundary restates the
+/// denial; the route stays in the error data (`tool` / `cause`) for diagnosis.
+fn public_permission_denial(
+    tool_name: &str,
+    operation: Option<&str>,
+    error: ErrorData,
+) -> ErrorData {
+    if error_code(&error) != Some(error_codes::SAFETY_PERMISSION_DENIED) {
+        return error;
+    }
+    let Some(missing) = error.data.as_ref().and_then(missing_permission) else {
+        return error;
+    };
+    let message = operation.map_or_else(
+        || format!("tool {tool_name} requires permission {missing}"),
+        |operation| format!("{tool_name} operation={operation} requires permission {missing}"),
+    );
+    ErrorData::new(error.code, message, error.data)
+}
+
+/// The gate's `missing_permission`, read from its own data or from the
+/// `cause` a facade envelope keeps it in (pass-through: `cause`; wrapping:
+/// `cause.data`).
+fn missing_permission(data: &Value) -> Option<String> {
+    [
+        "/missing_permission",
+        "/cause/missing_permission",
+        "/cause/data/missing_permission",
+    ]
+    .into_iter()
+    .find_map(|pointer| data.pointer(pointer).and_then(Value::as_str))
+    .map(ToOwned::to_owned)
 }
 
 fn session_target_value(target: &SessionTarget) -> Value {

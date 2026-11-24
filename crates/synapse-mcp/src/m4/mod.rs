@@ -3087,7 +3087,11 @@ pub fn cancel_shell_job(
             &paths,
             Duration::from_millis(SHELL_REMOTE_METADATA_WAIT_MS),
         )?;
-        write_shell_job_status(&paths.status_path, &job)?;
+        // `job` was read before the monitor may have finished the job (for
+        // example on its timeout cap). Writes from cancel go through the
+        // latest-terminal-wins reconciliation so a stale cancel_requested copy
+        // never replaces the monitor's terminal status (#174).
+        job = write_shell_job_reconciliation_status(&paths, job)?;
         if job.pid.is_some() {
             let termination = terminate_shell_job_from_status(&job);
             termination_attempted = termination.attempted;
@@ -3116,7 +3120,7 @@ pub fn cancel_shell_job(
         }
         termination_status =
             remote_aware_termination_status(&termination_status, &job.remote_process_scope);
-        write_shell_job_status(&paths.status_path, &job)?;
+        write_shell_job_reconciliation_status(&paths, job)?;
     } else if job.remote_process_scope.remote_cleanup_required
         && !job.remote_process_scope.remote_cleanup_verified
     {

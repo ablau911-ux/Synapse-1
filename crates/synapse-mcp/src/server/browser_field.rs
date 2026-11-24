@@ -277,6 +277,24 @@ impl SynapseService {
     ) -> Result<Json<BrowserFormResponse>, ErrorData> {
         let mut params = params.0;
         let operation = params.operation;
+        // The shared cdp_target_id validator runs before any id is merged or
+        // echoed (alias conflict, source_id), like every other browser tool.
+        for target_id in [
+            params.cdp_target_id.as_deref(),
+            params
+                .set_value
+                .as_ref()
+                .and_then(|spec| spec.cdp_target_id.as_deref()),
+            params
+                .fill
+                .as_ref()
+                .and_then(|spec| spec.cdp_target_id.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            super::m1_tools::validate_cdp_target_id(target_id)?;
+        }
         // #1551: fold top-level cdp_target_id/window_hwnd aliases into the nested
         // operation spec(s) before source/validation so the effective target is
         // resolved identically to the equivalent nested-spec form.
@@ -956,6 +974,9 @@ impl SynapseService {
         session_id: &str,
         params: &BrowserSetValueParams,
     ) -> Result<(i64, String), ErrorData> {
+        if let Some(target_id) = params.cdp_target_id.as_deref() {
+            super::m1_tools::validate_cdp_target_id(target_id)?;
+        }
         let active_target = self.session_target(Some(session_id))?;
         let cdp_target_id = match (params.cdp_target_id.as_ref(), active_target.as_ref()) {
             (Some(target_id), _) => target_id.clone(),

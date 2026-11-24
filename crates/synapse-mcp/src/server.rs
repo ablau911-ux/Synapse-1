@@ -1694,6 +1694,9 @@ pub(crate) fn explicit_action_target(
     let explicit_cdp_target_id = explicit_cdp_target_id
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    if let Some(cdp_target_id) = explicit_cdp_target_id {
+        m1_tools::validate_cdp_target_id(cdp_target_id)?;
+    }
     match (explicit_window_hwnd, explicit_cdp_target_id) {
         (Some(window_hwnd), Some(cdp_target_id)) => Ok(Some(SessionTarget::Cdp {
             window_hwnd,

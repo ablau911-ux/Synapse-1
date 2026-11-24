@@ -9,6 +9,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_STALE_AFTER_MS: u64 = 5 * 60 * 1000;
+/// Closed sessions the registry keeps for `session list include_closed` and
+/// the dashboard; older closed entries are dropped (#184).
+const MAX_RETAINED_CLOSED_SESSIONS: usize = 256;
 
 pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 
@@ -273,7 +276,33 @@ impl SessionRegistry {
         entry.last_seen_unix_ms = now_unix_ms;
         entry.closed_at_unix_ms = Some(now_unix_ms);
         entry.last_reason_code = reason_code.map(ToOwned::to_owned);
+        if transitioned {
+            self.prune_closed();
+        }
         transitioned
+    }
+
+    /// Drops the oldest closed entries beyond [`MAX_RETAINED_CLOSED_SESSIONS`]
+    /// (#184, #186): the registry holds every open session plus a bounded
+    /// history of closed ones, not every session ever opened.
+    fn prune_closed(&mut self) {
+        let mut closed: Vec<(u64, String)> = self
+            .entries
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .closed_at_unix_ms
+                    .map(|closed_at| (closed_at, entry.session_id.clone()))
+            })
+            .collect();
+        let excess = closed.len().saturating_sub(MAX_RETAINED_CLOSED_SESSIONS);
+        if excess == 0 {
+            return;
+        }
+        closed.sort_unstable();
+        for (_closed_at, session_id) in closed.into_iter().take(excess) {
+            self.entries.remove(&session_id);
+        }
     }
 
     pub(crate) fn record_spawned_agent(

@@ -19,6 +19,13 @@ pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 pub(crate) struct SessionRegistry {
     stale_after_ms: u64,
     entries: BTreeMap<String, SessionRegistryEntry>,
+    /// Every session id recorded closed and not initialized again, kept when
+    /// its row is pruned (#184, #186): a session closes once, so a late close
+    /// or request for a pruned session neither recreates its row nor journals
+    /// a second exit. Only the id is kept, for the daemon's lifetime, like the
+    /// lifecycle's terminated-session map; no bound here can drop the id of a
+    /// session whose lifecycle cleanup is still to come.
+    closed_session_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +157,7 @@ impl Default for SessionRegistry {
         Self {
             stale_after_ms: DEFAULT_STALE_AFTER_MS,
             entries: BTreeMap::new(),
+            closed_session_ids: BTreeSet::new(),
         }
     }
 }
@@ -180,6 +188,7 @@ impl SessionRegistry {
         let client_name = state.initialize_params.client_info.name.clone();
         let client_version = state.initialize_params.client_info.version.clone();
         let protocol_version = Some(format!("{:?}", state.initialize_params.protocol_version));
+        self.closed_session_ids.remove(session_id);
         let mut newly_visible = false;
         let entry = self
             .entries
@@ -218,6 +227,9 @@ impl SessionRegistry {
         action: Option<String>,
         now_unix_ms: u64,
     ) {
+        if self.is_pruned_closed(session_id) {
+            return;
+        }
         let entry = self
             .entries
             .entry(session_id.to_owned())
@@ -247,14 +259,19 @@ impl SessionRegistry {
     }
 
     /// Records a session as closed. Returns `true` when this call actually
-    /// transitioned the entry to closed (it was open or unknown before), so
-    /// callers journal exactly one `exited` event per session (#897).
+    /// transitioned the entry to closed (it was open, or unknown and never
+    /// closed), so callers journal exactly one `exited` event per session
+    /// (#897).
     pub(crate) fn record_closed_with_reason(
         &mut self,
         session_id: &str,
         now_unix_ms: u64,
         reason_code: Option<&str>,
     ) -> bool {
+        if self.is_pruned_closed(session_id) {
+            return false;
+        }
+        self.closed_session_ids.insert(session_id.to_owned());
         let entry = self
             .entries
             .entry(session_id.to_owned())
@@ -280,6 +297,11 @@ impl SessionRegistry {
             self.prune_closed();
         }
         transitioned
+    }
+
+    /// Whether `session_id` was closed and its row pruned since.
+    fn is_pruned_closed(&self, session_id: &str) -> bool {
+        !self.entries.contains_key(session_id) && self.closed_session_ids.contains(session_id)
     }
 
     /// Drops the oldest closed entries beyond [`MAX_RETAINED_CLOSED_SESSIONS`]

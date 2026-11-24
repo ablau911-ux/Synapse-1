@@ -25,6 +25,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: killed text-page recording whose index already holds its first still's line as lost with still:true, the still file deleted: after product recovery no lost line has still or still_of naming the deleted file, and a same line after it is lost | Known: true
   Scenario: recovery names every planned instant
     # Equation: killed text-page recording with end_ms 25 ms off the 50 ms grid: index lines after recovery = ceil(end_ms/50), the last one named lost | Known: true
+  Scenario: recovery makes a failed clip agree with its pictures
+    # Equation: killed text-page recording made failed in clip.json, its last part cut to the 32-byte header: after product recovery every enc line of that part is lost encoder_failed, index lines after = before, every lost line is in clip.json lost, state = failed; a second recovery leaves frames.jsonl and clip.json byte-equal | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

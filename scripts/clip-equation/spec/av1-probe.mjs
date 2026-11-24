@@ -437,6 +437,46 @@ function recoveryNamesEveryInstant() {
   return verdict(problems, `${planned} planned instants, ${got.lines.length} index lines, the last one named lost`);
 }
 
+/**
+ * A failed clip whose index was never made to agree with the disk (the reconcile at failure itself
+ * failed): recovery on start names every line whose picture is not on disk lost (encoder_failed),
+ * adds no instant, lists the lost lines in clip.json and leaves the clip failed. A second recovery
+ * of the now agreeing clip changes neither frames.jsonl nor clip.json.
+ */
+function failedClipReconciled() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  let torn;
+  const got = recovered('killed-text-page', 'failed-unreconciled', dir => {
+    torn = Number(path.basename(lastPart(dir)).match(/\d+/)[0]);
+    fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'failed';
+    clip.failure = 'bench: the encoder failed and the reconcile at failure failed too';
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const missing = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] === torn);
+  if (!missing.length) return verdict([`part ${torn} has no enc line`]);
+  const problems = [];
+  const unnamed = missing.filter(line => (got.lines[line.instant] ?? {}).lost !== 'encoder_failed');
+  if (unnamed.length) problems.push(`${unnamed.length} of ${missing.length} lines whose picture is not on disk are not named lost encoder_failed (first: instant ${unnamed[0].instant} is ${kindOf(got.lines[unnamed[0].instant] ?? {})})`);
+  if (got.lines.length !== got.before.length) problems.push(`${got.lines.length} index lines after recovery, ${got.before.length} before`);
+  const clipFile = path.join(got.dir, 'clip.json'), indexFile = path.join(got.dir, 'frames.jsonl');
+  const clip = JSON.parse(fs.readFileSync(clipFile, 'utf8'));
+  if (clip.state !== 'failed') problems.push(`the clip is ${clip.state}, not failed`);
+  const listed = new Set((clip.lost ?? []).map(lost => lost.instant));
+  const unlisted = got.lines.filter(line => kindOf(line) === 'lost' && !listed.has(line.instant));
+  if (unlisted.length) problems.push(`${unlisted.length} lost lines are not in the lost list of clip.json (first: instant ${unlisted[0].instant})`);
+  const [clipBefore, indexBefore] = [fs.readFileSync(clipFile, 'utf8'), fs.readFileSync(indexFile, 'utf8')];
+  const again = spawnSync(PROBE, ['exp-av1-recover', `folder=${got.dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  if (again.error || again.status !== 0) problems.push(`second recovery: ${again.error?.message || again.stderr.trim() || `exit ${again.status}`}`);
+  else {
+    if (fs.readFileSync(indexFile, 'utf8') !== indexBefore) problems.push('a second recovery changed frames.jsonl');
+    if (fs.readFileSync(clipFile, 'utf8') !== clipBefore) problems.push('a second recovery changed clip.json');
+  }
+  return verdict(problems, `failed clip, part ${torn} cut to its header: ${missing.length} lines named lost encoder_failed and listed, still failed; a second recovery changed nothing`);
+}
+
 /** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
 function fetchPicture(folder, instant) {
   const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
@@ -522,6 +562,7 @@ const table = {
   'a lost line names no missing still': () => lostLineNamesNoMissingStill('crash-still-and-video-gone', false),
   'a line already lost names no missing still': () => lostLineNamesNoMissingStill('crash-lost-line-stale-still', true),
   'recovery names every planned instant': recoveryNamesEveryInstant,
+  'recovery makes a failed clip agree with its pictures': failedClipReconciled,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

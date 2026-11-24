@@ -10,15 +10,16 @@
 //! the still's file is on disk: a complete still is never deleted for a
 //! missing video picture, and a mark without a file is dropped. The clip is
 //! then `ready`. A recording that fails gets the same index rule at once
-//! (`reconcile_failed`), since recovery never visits a failed clip.
+//! (`reconcile_failed`, cause `encoder_failed`); recovery applies it again to
+//! every `failed` clip, which stays `failed`, in case that reconcile failed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::clip_folder::{
     ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
-    LOST_SERVICE_RESTART, LostInstant, PartInfo, RecorderLock, STILLS_DIR, StillInfo, StopReason,
-    part_path, read_index, repair_ivf, still_path, write_bytes_atomically,
+    LOST_ENCODER_FAILED, LOST_SERVICE_RESTART, LostInstant, PartInfo, RecorderLock, STILLS_DIR,
+    StillInfo, StopReason, part_path, read_index, repair_ivf, still_path, write_bytes_atomically,
 };
 
 const MILLISECONDS_PER_SECOND: u64 = 1_000;
@@ -33,8 +34,16 @@ impl ClipRecovery {
         }
         let _lock = RecorderLock::acquire(folder)?;
         let clip = ClipJson::read(folder)?;
-        if clip.state != ClipState::Recording {
-            return Ok(());
+        match clip.state {
+            ClipState::Recording => {}
+            // Its reconcile at failure can itself have failed
+            // (CAPTURE_CLIP_RECONCILE_FAILED): the same rule again. An index
+            // that already agrees is left as it is.
+            ClipState::Failed => {
+                let lost = Self::reconcile_failed(folder, clip.fps, LOST_ENCODER_FAILED)?;
+                return ClipJson::update(folder, |clip| clip.add_lost(lost)).map(|_| ());
+            }
+            ClipState::Ready => return Ok(()),
         }
         if clip.fps == 0 {
             return Err("recording has zero fps".into());
@@ -79,7 +88,7 @@ impl ClipRecovery {
 
     /// Makes the index of a recording that failed (its encoder stopped)
     /// agree with the pictures on disk, before the clip is published
-    /// `failed` (recovery never visits a failed clip): every line whose video
+    /// `failed`, and again on recovery of a failed clip: every line whose video
     /// picture did not reach the disk is named lost (`cause`), by the rule
     /// recovery uses. No instant is added. Returns every lost instant of the
     /// index, for `clip.json`.

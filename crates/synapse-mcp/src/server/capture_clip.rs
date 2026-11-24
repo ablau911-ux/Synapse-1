@@ -1096,8 +1096,9 @@ mod live {
                 Ok(summary) => summary,
                 Err(error) => {
                     tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
-                    // Recovery never visits a failed clip, so the index is made
-                    // to agree with the pictures on disk now, by its rule.
+                    // The index is made to agree with the pictures on disk now,
+                    // by recovery's rule; if this fails, recovery on the next
+                    // service start applies it to the failed clip.
                     let lost = ClipRecovery::reconcile_failed(
                         folder,
                         RECORD_FPS,

@@ -1732,7 +1732,7 @@ impl SynapseService {
     ) -> Result<CaptureScreenshotResponse, ErrorData> {
         let output_path = screenshot_output_path(&params.path)?;
         let format = screenshot_format_from_path(&output_path)?;
-        ensure_screenshot_path_available(&output_path, params.overwrite)?;
+        ensure_output_path_available("capture_screenshot", &output_path, params.overwrite)?;
         let captured = self.hidden_desktop_capture_for_session(
             session_id,
             hwnd,
@@ -1788,7 +1788,7 @@ impl SynapseService {
             })?;
         let output_path = screenshot_output_path(&params.path)?;
         let format = screenshot_format_from_path(&output_path)?;
-        ensure_screenshot_path_available(&output_path, params.overwrite)?;
+        ensure_output_path_available("capture_screenshot", &output_path, params.overwrite)?;
         let target_context = resolve_capture_target_window_context(window_hwnd).ok();
         if is_chrome_debugger_endpoint(&endpoint) {
             let captured = crate::chrome_debugger_bridge::capture_visible_tab(
@@ -1920,7 +1920,11 @@ impl SynapseService {
                 ),
             ));
         }
-        ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
+        ensure_output_path_available(
+            "capture_screenshot",
+            &validation.output_path,
+            params.overwrite,
+        )?;
         let mut bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
         // Chrome not foreground (e.g. a fullscreen game): capture in the
         // background through the debugger and never touch OS focus.
@@ -2102,7 +2106,11 @@ impl SynapseService {
                 ),
             ));
         }
-        ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
+        ensure_output_path_available(
+            "capture_screenshot",
+            &validation.output_path,
+            params.overwrite,
+        )?;
         let bridge_payload = browser_pdf_bridge_payload(params);
         super::operator_panic_boundary::ensure_mcp_mutation("browser_pdf_before_print_to_pdf")?;
         let captured =
@@ -12510,7 +12518,7 @@ fn validate_browser_downloads_params(
             }
             params.state = Some("complete".to_owned());
             let output_path = browser_download_output_path(path)?;
-            ensure_download_output_path_available(&output_path, params.overwrite)?;
+            ensure_output_path_available("browser_downloads", &output_path, params.overwrite)?;
             Some(output_path)
         }
     };
@@ -17010,7 +17018,7 @@ fn capture_screen_screenshot_to_file(
     validate_screenshot_region(region)?;
     let output_path = screenshot_output_path(&params.path)?;
     let format = screenshot_format_from_path(&output_path)?;
-    ensure_screenshot_path_available(&output_path, params.overwrite)?;
+    ensure_output_path_available("capture_screenshot", &output_path, params.overwrite)?;
     let captured = synapse_capture::screen_region_to_bgra_bitmap(region).map_err(|error| {
         mcp_error(
             error.code(),
@@ -17037,7 +17045,7 @@ fn capture_target_window_screenshot_to_file(
     validate_screenshot_region(region)?;
     let output_path = screenshot_output_path(&params.path)?;
     let format = screenshot_format_from_path(&output_path)?;
-    ensure_screenshot_path_available(&output_path, params.overwrite)?;
+    ensure_output_path_available("capture_screenshot", &output_path, params.overwrite)?;
     let captured = synapse_capture::window_region_to_bgra_bitmap(
         window_hwnd,
         region,
@@ -18498,12 +18506,21 @@ fn screenshot_format_from_path(path: &Path) -> Result<CaptureScreenshotFormat, E
     }
 }
 
-fn ensure_screenshot_path_available(path: &Path, overwrite: bool) -> Result<(), ErrorData> {
+/// Checks a caller-chosen output file path for `tool` before anything is
+/// written: the path must not be a directory, must not exist unless
+/// `overwrite`, and every existing ancestor must be a directory (a file in
+/// the middle of the path is the caller's mistake, not a storage fault).
+/// Missing parent directories are created.
+fn ensure_output_path_available(
+    tool: &str,
+    path: &Path,
+    overwrite: bool,
+) -> Result<(), ErrorData> {
     if path.try_exists().map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,
             format!(
-                "capture_screenshot output path existence check failed for {}: {error}",
+                "{tool} output path existence check failed for {}: {error}",
                 path.display()
             ),
         )
@@ -18511,17 +18528,14 @@ fn ensure_screenshot_path_available(path: &Path, overwrite: bool) -> Result<(), 
         if path.is_dir() {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "capture_screenshot output path is a directory: {}",
-                    path.display()
-                ),
+                format!("{tool} output path is a directory: {}", path.display()),
             ));
         }
         if !overwrite {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
-                    "capture_screenshot output file already exists and overwrite=false: {}",
+                    "{tool} output file already exists and overwrite=false: {}",
                     path.display()
                 ),
             ));
@@ -18531,57 +18545,24 @@ fn ensure_screenshot_path_available(path: &Path, overwrite: bool) -> Result<(), 
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
+        if let Some(file_ancestor) = parent
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .filter(|ancestor| !ancestor.is_dir())
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "{tool} output path parent is not a directory: {} is a file",
+                    file_ancestor.display()
+                ),
+            ));
+        }
         std::fs::create_dir_all(parent).map_err(|error| {
             mcp_error(
                 error_codes::STORAGE_WRITE_FAILED,
                 format!(
-                    "capture_screenshot failed to create parent directory {}: {error}",
-                    parent.display()
-                ),
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn ensure_download_output_path_available(path: &Path, overwrite: bool) -> Result<(), ErrorData> {
-    if path.try_exists().map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "browser_downloads output path existence check failed for {}: {error}",
-                path.display()
-            ),
-        )
-    })? {
-        if path.is_dir() {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "browser_downloads output path is a directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        if !overwrite {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "browser_downloads output file already exists and overwrite=false: {}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "browser_downloads failed to create parent directory {}: {error}",
+                    "{tool} failed to create parent directory {}: {error}",
                     parent.display()
                 ),
             )
@@ -18730,7 +18711,7 @@ fn copy_or_move_download_file(
             ),
         ));
     }
-    ensure_download_output_path_available(output_path, overwrite)?;
+    ensure_output_path_available("browser_downloads", output_path, overwrite)?;
     let temp_path = screenshot_temp_path(output_path);
     if temp_path.try_exists().map_err(|error| {
         mcp_error(

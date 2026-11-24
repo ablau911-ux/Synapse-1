@@ -4,9 +4,6 @@ use synapse_core::error_codes;
 
 use crate::server::{ErrorData, tool_profiles::ToolProfileKind};
 
-/// Facade wrapper for delegated failures (shared envelope, see `delegate_errors`).
-pub(super) use crate::server::delegate_errors::wrapped_delegate_error as facade_delegate_error;
-
 pub(super) fn missing_spec(tool: &'static str, operation: &'static str) -> ErrorData {
     ErrorData::new(
         ErrorCode(-32099),

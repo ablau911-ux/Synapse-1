@@ -17,12 +17,15 @@ use std::os::windows::process::CommandExt;
 
 use crate::{
     chrome_debugger_bridge,
-    server::{ErrorData, Json, Parameters, SynapseService, mcp_error},
+    server::{
+        ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+        mcp_error,
+    },
 };
 
 use super::{
     SETUP_SOT, SETUP_TOOL,
-    errors::{facade_delegate_error, missing_spec},
+    errors::missing_spec,
     policy::require_maintenance_profile,
     response::setup_response,
     types::{FileReadback, SetupOperation, SetupParams, SetupResponse, SetupStatusResponse},
@@ -48,7 +51,7 @@ pub(super) async fn handle(
     match operation {
         SetupOperation::Status | SetupOperation::Doctor => {
             let status = setup_status(service).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         SETUP_TOOL,
                         operation.as_str(),
                         "setup_status",
@@ -116,7 +119,7 @@ pub(super) async fn handle(
             }
             let launched = launch_setup_repair(service, &spec.reason, &chrome_bridge_preflight)?;
             let status = setup_status(service).map_err(|error| {
-                facade_delegate_error(
+                wrapped_delegate_error(
                     SETUP_TOOL,
                     operation.as_str(),
                     "setup_status_after_repair_launch",

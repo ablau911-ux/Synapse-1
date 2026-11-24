@@ -34,9 +34,10 @@ use synapse_core::types::{
 };
 use synapse_storage::{Db, cf, decode_json, routines as routine_codec};
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
-use super::episodes::{decode_episode_row, hex_encode, key_after, local_day_start, now_ts_ns};
+use super::episodes::{decode_episode_row, key_after, local_day_start, now_ts_ns};
 use super::{
     M3ToolStub,
     permissions::{Permission, RequiredPermissions, required},

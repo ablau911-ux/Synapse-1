@@ -11,6 +11,8 @@ use axum::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::hex::hex_encode;
+
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 const BRIDGE_REGISTER_TOKEN_HEADER: &str = "x-synapse-bridge-register-token";
@@ -278,17 +280,7 @@ fn derive_bridge_register_token(token: &str) -> String {
     hasher.update(BRIDGE_REGISTER_TOKEN_DOMAIN);
     hasher.update([0]);
     hasher.update(token.as_bytes());
-    hex_lower(&hasher.finalize())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[(byte >> 4) as usize]));
-        output.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    output
+    hex_encode(&hasher.finalize())
 }
 
 fn unauthorized(failure: AuthFailure) -> Response {

@@ -10,8 +10,9 @@ use super::{
     ProfileCompatibilitySummary, ProfileQualityContribution, ProfileQualityCounts,
     ProfileQualityRates, ProfileQualityRealityEvidence, ProfileQualityRedaction,
     ProfileQualityRefreshParams, ProfileQualityRuntimeEvidence, ProfileQualityScore,
-    ProfileQualitySnapshot, ProfileQualitySource, ProfileQualityVersionSummary, hex_encode,
+    ProfileQualitySnapshot, ProfileQualitySource, ProfileQualityVersionSummary,
 };
+use crate::hex::hex_encode;
 
 const QUALITY_SCHEMA_VERSION: u32 = 3;
 const FUTURE_SKEW_NS: u64 = 60 * 1_000_000_000;

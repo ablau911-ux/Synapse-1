@@ -36,6 +36,7 @@ use synapse_core::types::{RoutineFeedbackOutcome, RoutineGranularity, RoutineLif
 use synapse_core::{SCHEMA_VERSION, StoredEvent};
 use synapse_storage::{Db, cf, decode_json, encode_json};
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::episodes::{key_after, now_ts_ns};
@@ -443,16 +444,6 @@ fn event_scan_start_key(ts_ns: u64) -> Vec<u8> {
 fn event_key_ts_ns(key: &[u8]) -> Option<u64> {
     let bytes: [u8; 8] = key.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

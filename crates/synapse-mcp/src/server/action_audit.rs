@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::SynapseService;
-use crate::m1::mcp_error;
+use crate::m1::{error_code, mcp_error};
 use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 static ACTION_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -72,7 +72,7 @@ impl SynapseService {
         if let Err(audit_error) = self.write_action_audit_row(
             tool,
             "denied",
-            error_data_code(error),
+            error_code(error),
             &json!({
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
@@ -100,7 +100,7 @@ impl SynapseService {
         if let Err(audit_error) = self.write_action_audit_row(
             tool,
             "denied",
-            error_data_code(error),
+            error_code(error),
             &json!({
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
@@ -142,7 +142,7 @@ impl SynapseService {
         if let Err(audit_error) = self.write_action_audit_row(
             tool,
             "denied",
-            error_data_code(error),
+            error_code(error),
             &json!({
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
@@ -178,7 +178,7 @@ impl SynapseService {
             Err(error) => self.write_action_audit_row(
                 tool,
                 "error",
-                error_data_code(error),
+                error_code(error),
                 &json!({
                     "message": error.message.to_string(),
                     "data": error.data.clone(),
@@ -220,7 +220,7 @@ impl SynapseService {
             Err(error) => self.write_action_audit_row(
                 tool,
                 "error",
-                error_data_code(error),
+                error_code(error),
                 &json!({
                     "message": error.message.to_string(),
                     "data": error.data.clone(),
@@ -271,7 +271,7 @@ impl SynapseService {
         self.write_action_audit_row(
             tool,
             "error",
-            error_data_code(error),
+            error_code(error),
             &json!({
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
@@ -291,7 +291,7 @@ impl SynapseService {
         self.write_action_audit_row(
             tool,
             "error",
-            error_data_code(error),
+            error_code(error),
             &json!({
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
@@ -417,7 +417,7 @@ impl SynapseService {
                 })
             }
             Err(error) => json!({
-                "read_error_code": error_data_code(&error),
+                "read_error_code": error_code(&error),
                 "read_error_message": error.message.to_string(),
             }),
         }
@@ -456,7 +456,7 @@ impl SynapseService {
                 "status": "read_error",
                 "persisted_row_key": persisted_row_key,
                 "no_human_os_foreground_fallback": true,
-                "read_error_code": error_data_code(&error),
+                "read_error_code": error_code(&error),
                 "read_error_message": error.message.to_string(),
             }),
         }
@@ -540,7 +540,7 @@ impl SynapseService {
                 "status": "read_error",
                 "explicit_real_foreground_lease": false,
                 "no_human_os_foreground_fallback": true,
-                "read_error_code": error_data_code(&error),
+                "read_error_code": error_code(&error),
                 "read_error_message": error.message.to_string(),
             }),
         }
@@ -746,14 +746,6 @@ fn action_audit_key(ts_ns: u64, seq: u32) -> Vec<u8> {
     key.extend_from_slice(&ts_ns.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
-}
-
-fn error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }
 
 fn non_empty(value: &str) -> Option<String> {

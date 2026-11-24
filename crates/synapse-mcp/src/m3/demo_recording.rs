@@ -36,6 +36,7 @@ use synapse_storage::{
     timeline::{decode_timeline_key, timeline_key, timeline_scan_start},
 };
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
@@ -874,14 +875,4 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }

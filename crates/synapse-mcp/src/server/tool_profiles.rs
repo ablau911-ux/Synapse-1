@@ -15,6 +15,7 @@ use synapse_core::error_codes;
 use synapse_storage::cf;
 
 use super::{Json, Parameters, SynapseService, empty_input_schema, mcp_error, tool, tool_router};
+use crate::hex::hex_encode;
 
 const TOOL_PROFILE_PREFIX: &str = "mcp/tool-profile/v1/";
 const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<session_id>";
@@ -3730,7 +3731,7 @@ impl SynapseService {
         };
         Ok(Some(ToolProfileRowReadback {
             cf_name: cf::CF_SESSIONS,
-            key_hex: hex_lower(&read_key),
+            key_hex: hex_encode(&read_key),
             value_len_bytes: value.len() as u64,
             value_sha256: sha256_hex(&value),
             record,
@@ -5180,16 +5181,7 @@ fn sha256_json_hex<T: Serialize>(value: &T) -> Result<String, ErrorData> {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{}", hex_lower(&hasher.finalize()))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+    format!("sha256:{}", hex_encode(&hasher.finalize()))
 }
 
 fn unix_ms_now() -> u64 {

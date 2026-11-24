@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use synapse_storage::cf;
 
 use super::SynapseService;
-use crate::m1::mcp_error;
+use crate::hex::hex_encode;
+use crate::m1::{error_code, mcp_error};
 
 const COMMAND_AUDIT_ROW_KIND: &str = "command_audit";
 const COMMAND_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -635,7 +636,7 @@ impl SynapseService {
 
 pub(super) fn command_audit_error_from_error_data(error: &ErrorData) -> CommandAuditError {
     CommandAuditError {
-        code: error_data_code(error).map(str::to_owned),
+        code: error_code(error).map(str::to_owned),
         message: error.message.to_string(),
         data: error.data.clone(),
     }
@@ -1023,22 +1024,4 @@ fn decode_command_audit_key(key: &[u8]) -> Option<(u64, u32)> {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{}", hex_encode(digest.as_ref()))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
-fn error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }

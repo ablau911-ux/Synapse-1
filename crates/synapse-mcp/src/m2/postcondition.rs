@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 
+use crate::hex::hex_encode;
+
 pub const DEFAULT_VERIFY_TIMEOUT_MS: u32 = 250;
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -163,14 +165,4 @@ pub fn hash_json<T: Serialize>(value: &T) -> Result<String, ErrorData> {
 
 pub fn text_signature(value: &str) -> String {
     hex_encode(&Sha256::digest(value.as_bytes()))
-}
-
-pub fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }

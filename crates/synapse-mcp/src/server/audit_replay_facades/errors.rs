@@ -7,8 +7,6 @@ use synapse_core::error_codes;
 use crate::server::ErrorData;
 
 use super::{AUDIT_SOT, AUDIT_TOOL, REPLAY_SOT, REPLAY_TOOL};
-/// Facade wrapper for delegated failures (shared envelope, see `delegate_errors`).
-pub(super) use crate::server::delegate_errors::wrapped_delegate_error as delegate_error;
 
 pub(super) fn invalid_operation(
     tool: &'static str,

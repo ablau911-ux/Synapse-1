@@ -23,6 +23,7 @@ use super::{
     tool, tool_router,
     url_redaction::redact_url_for_public_readback,
 };
+use crate::m1::error_code;
 
 const ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH: &str = "session_registry spawned_agent rows + agent_state tracker rows + OS process table live-pid probe + visible top-level window enumeration";
 const SESSION_TARGET_ROW_PREFIX: &str = "mcp/session-target/v1/";
@@ -1031,12 +1032,7 @@ impl SynapseService {
                 process_name: None,
                 process_path: None,
                 window_title: None,
-                read_error_code: error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("code"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                read_error_code: error_code(&error).map(str::to_owned),
                 read_error_message: Some(error.message.to_string()),
             },
         }
@@ -1123,11 +1119,7 @@ fn persisted_cdp_target_owner_live_readback(
             stale_orphan: true,
             window_title: None,
             process_name: None,
-            read_error_code: error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
+            read_error_code: error_code(&error)
                 .map(str::to_owned),
             read_error_message: Some(error.message.to_string()),
         },

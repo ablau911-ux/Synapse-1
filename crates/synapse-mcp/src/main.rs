@@ -59,6 +59,7 @@ mod daemon_lifecycle;
 mod desktop_worker;
 mod doctor;
 mod emitter_shutdown;
+mod hex;
 mod http;
 mod local_agent;
 mod m1;

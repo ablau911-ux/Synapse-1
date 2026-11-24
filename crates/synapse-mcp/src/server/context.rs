@@ -7,6 +7,8 @@ use super::{
     activate_profile, apply_profile_runtime_config_in_state, authorization_error, error_codes,
     mcp_error,
 };
+use crate::hex::hex_encode;
+use crate::m1::error_code;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -301,7 +303,7 @@ impl SynapseService {
                 // scope against the active profile and continue. Foreground-driving
                 // tools and every other error kind (forced no-perception, forced
                 // internal, any non-A11Y_NO_FOREGROUND failure) stay fail-closed.
-                if error_data_code(&error) == Some(synapse_core::error_codes::A11Y_NO_FOREGROUND)
+                if error_code(&error) == Some(synapse_core::error_codes::A11Y_NO_FOREGROUND)
                     && !super::action_preflight::tool_requires_live_foreground(tool)
                 {
                     tracing::info!(
@@ -1066,27 +1068,6 @@ impl SynapseService {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// Extract the structured `code` string an `mcp_error` carries in its data
-/// payload, used by the action gate to distinguish `A11Y_NO_FOREGROUND` from
-/// other failure kinds before degrading gracefully (#1061).
-fn error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-}
-
 fn act_type_foreground_lost_error(
     expected: &ForegroundProof,
     actual: Option<&ForegroundContext>,
@@ -1553,10 +1534,7 @@ fn foreground_event_data(foreground: &ForegroundContext) -> serde_json::Value {
 fn reflex_denial_from_error(error: &ErrorData) -> ReflexActionPermissionDenied {
     let data = error.data.as_ref();
     ReflexActionPermissionDenied {
-        policy_code: data
-            .and_then(|value| value.get("code"))
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
+        policy_code: error_code(error).map(ToOwned::to_owned),
         policy_reason: data
             .and_then(|value| value.get("reason"))
             .and_then(serde_json::Value::as_str)

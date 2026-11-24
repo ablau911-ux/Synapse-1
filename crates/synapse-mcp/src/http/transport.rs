@@ -61,9 +61,11 @@ use crate::{
         M2EmitterOwner, ShutdownTaskOwner, drain_m2_emitter_owner, take_m2_emitter_owner,
         wait_for_m2_emitter_done,
     },
+    hex::hex_encode,
     http::auth::{self, HttpAuth},
     http::session,
     http::sse::{self, SseState},
+    m1::error_code,
     m2::M2ServiceConfig,
     m3::M3ServiceConfig,
     m4::M4ServiceConfig,
@@ -6297,7 +6299,7 @@ fn dashboard_agent_event_rows(
             matched_rows += 1;
             if rows.len() < limit {
                 rows.push(DashboardAgentEventRow {
-                    key_hex: dashboard_hex_encode(key),
+                    key_hex: hex_encode(key),
                     ts_ns,
                     seq,
                     kind: kind_label.to_owned(),
@@ -8334,11 +8336,7 @@ fn dashboard_error_response(
 }
 
 fn dashboard_error_code(error: &rmcp::ErrorData) -> String {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str)
+    error_code(error)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{:?}", error.code))
 }
@@ -8366,14 +8364,6 @@ fn dashboard_key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
-}
-
-fn dashboard_hex_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }
 
 fn dashboard_context_resolve_live_session_id(

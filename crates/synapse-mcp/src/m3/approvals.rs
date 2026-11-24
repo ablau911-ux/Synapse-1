@@ -22,6 +22,7 @@ use synapse_core::{SCHEMA_VERSION, error_codes};
 use synapse_storage::{Db, cf, decode_json, encode_json};
 use uuid::Uuid;
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
@@ -1730,16 +1731,6 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn url_encode(value: &str) -> String {

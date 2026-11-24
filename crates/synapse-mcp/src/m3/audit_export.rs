@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
 };
 
 use chrono::Utc;
@@ -15,10 +15,11 @@ use synapse_core::{ProfileId, SCHEMA_VERSION, error_codes};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, encode_json};
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
-    M3ToolStub,
+    M3ToolStub, lock_runtime_while,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -251,7 +252,7 @@ pub fn export_audit_bundle(
 
     let output_dir = required_output_dir(&params.output_path)?;
     let consent_key = consent_key(&params.profile_id);
-    let runtime = lock_runtime(reflex_runtime, "exporting redacted audit bundle")?;
+    let runtime = lock_runtime_while(reflex_runtime, "exporting redacted audit bundle")?;
     let consent_bytes = write_audit_export_consent_row(
         &runtime,
         &params.profile_id,
@@ -791,16 +792,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{}", hex_encode(&hasher.finalize()))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 const fn default_max_export_rows() -> u32 {
     DEFAULT_MAX_EXPORT_ROWS
 }
@@ -811,18 +802,6 @@ const fn default_max_row_bytes() -> u64 {
 
 fn default_redaction_policy() -> String {
     STRICT_POLICY.to_owned()
-}
-
-fn lock_runtime<'a>(
-    reflex_runtime: &'a Arc<Mutex<ReflexRuntime>>,
-    context: &str,
-) -> Result<MutexGuard<'a, ReflexRuntime>, ErrorData> {
-    reflex_runtime.lock().map_err(|_error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("reflex runtime lock poisoned while {context}"),
-        )
-    })
 }
 
 #[expect(

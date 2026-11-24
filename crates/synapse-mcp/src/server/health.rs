@@ -1,4 +1,5 @@
 use super::{BTreeMap, ErrorData, Health, SubsystemHealth, SynapseService};
+use crate::hex::hex_encode;
 use rmcp::model::Tool;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -336,7 +337,7 @@ impl SynapseService {
         hasher.update(bytes);
         ToolSurfaceFingerprint {
             names,
-            sha256: hex_lower(&hasher.finalize()),
+            sha256: hex_encode(&hasher.finalize()),
             error: None,
         }
     }
@@ -894,15 +895,6 @@ fn canonical_json_value(value: Value) -> Value {
         }
         scalar => scalar,
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
 
 fn backend_resolution_health(

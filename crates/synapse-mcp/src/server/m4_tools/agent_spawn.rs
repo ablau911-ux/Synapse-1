@@ -552,11 +552,7 @@ pub(super) fn resolve_spawn_local_model_api_key(
             Ok(Some((env_var, value)))
         }
         Err(error) => {
-            let code = error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(serde_json::Value::as_str);
+            let code = error_code(&error);
             let (refusal_code, reason): (&'static str, &'static str) = match code {
                 Some(error_codes::MODEL_API_KEY_DECRYPT_FAILED) => (
                     error_codes::MODEL_API_KEY_DECRYPT_FAILED,

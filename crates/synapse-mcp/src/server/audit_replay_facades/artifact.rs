@@ -6,12 +6,12 @@ use synapse_core::error_codes;
 
 use crate::{
     m3::permissions::{normalize_replay_path, replay_root},
-    server::ErrorData,
+    server::{ErrorData, delegate_errors::wrapped_delegate_error},
 };
 
 use super::{
     REPLAY_SOT, REPLAY_TOOL,
-    errors::{delegate_error, io_error, replay_artifact_corrupt_error},
+    errors::{io_error, replay_artifact_corrupt_error},
     types::{
         ReplayArtifactInspectParams, ReplayArtifactInspectResponse, ReplayArtifactLineSummary,
     },
@@ -24,7 +24,7 @@ pub(super) fn inspect_replay_artifact(
     validate_replay_artifact_params(params)?;
     let path =
         normalize_replay_path(&replay_root(), Some(params.path.as_str())).map_err(|error| {
-            delegate_error(
+            wrapped_delegate_error(
                 REPLAY_TOOL,
                 "artifact_inspect",
                 "path",

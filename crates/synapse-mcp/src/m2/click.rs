@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use synapse_action::{ActionError, ActionHandle, RecordingBackend, cached_double_click_timing};
 use synapse_core::{Action, Backend, ButtonAction, ElementId, MouseTarget, Point, error_codes};
 
-use crate::m1::mcp_error;
+use crate::m1::{error_code, mcp_error};
 
 #[cfg(windows)]
 use windows::Win32::{
@@ -666,11 +666,7 @@ fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
 }
 
 pub(crate) fn click_error_code(error: &ErrorData) -> String {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
+    error_code(error)
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned()
 }
@@ -730,7 +726,7 @@ pub(super) fn acquire_click_foreground_lease(
     ) {
         Ok(guard) => Ok(guard),
         Err(error) => {
-            let error_code = click_error_data_code(&error)
+            let error_code = error_code(&error)
                 .unwrap_or(error_codes::ACTION_FOREGROUND_LEASE_BUSY)
                 .to_owned();
             tier_attempts.push(click_tier_failed(
@@ -743,14 +739,6 @@ pub(super) fn acquire_click_foreground_lease(
             Err(attach_click_tier_attempts(error, tier_attempts.clone()))
         }
     }
-}
-
-fn click_error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }
 
 fn log_click_tier_attempt(attempt: &ActClickTierAttempt) {

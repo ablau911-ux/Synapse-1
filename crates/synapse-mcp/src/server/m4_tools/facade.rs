@@ -4,6 +4,7 @@
 use super::types::*;
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::hex::hex_encode;
 
 pub(super) fn shell_facade_error(
     operation: ShellOperation,
@@ -605,7 +606,7 @@ pub(super) fn process_history_response(
         let decoded = decode_json::<Value>(&value).map_err(|error| {
             process_facade_error(
                 ProcessOperation::History,
-                hex_lower(&key),
+                hex_encode(&key),
                 format!("CF_PROCESS_HISTORY row decode failed: {error}"),
                 "inspect the exact process history row bytes and fix the writer",
             )
@@ -613,14 +614,14 @@ pub(super) fn process_history_response(
         let row_json = serde_json::to_string(&decoded).map_err(|error| {
             process_facade_error(
                 ProcessOperation::History,
-                hex_lower(&key),
+                hex_encode(&key),
                 format!("CF_PROCESS_HISTORY row JSON render failed: {error}"),
                 "inspect the decoded process history row",
             )
         })?;
         let row = ProcessHistoryRow {
             key: String::from_utf8_lossy(&key).into_owned(),
-            key_hex: hex_lower(&key),
+            key_hex: hex_encode(&key),
             value_len_bytes: u64::try_from(value.len()).unwrap_or(u64::MAX),
             row_json,
             pid: json_u32_field(&decoded, "pid"),
@@ -657,14 +658,4 @@ pub(super) fn json_string_field(value: &Value, field: &str) -> Option<String> {
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-}
-
-pub(super) fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }

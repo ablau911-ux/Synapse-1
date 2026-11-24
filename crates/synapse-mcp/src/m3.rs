@@ -30,16 +30,17 @@ pub mod timeline;
 pub mod timeline_control;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use rmcp::ErrorData;
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use synapse_action::ActionHandle;
 use synapse_audio::{AudioConfig, AudioError, AudioRuntime, DEFAULT_RING_SECONDS};
-use synapse_core::{Event, SCHEMA_VERSION, SessionId, StoredProfileHistoryEntry};
+use synapse_core::{Event, SCHEMA_VERSION, SessionId, StoredProfileHistoryEntry, error_codes};
 use synapse_profiles::{ProfileError, ProfileRuntime, bundled_profiles_dir};
 use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
@@ -54,6 +55,7 @@ use self::demo_recording::DemoRecordControl;
 use self::permissions::{PermissionGrants, configured_grants_from_parts};
 use self::timeline_control::RecorderControl;
 use crate::http::sse::SseState;
+use crate::m1::mcp_error;
 
 const DB_ENV: &str = "SYNAPSE_DB";
 const PROFILE_DIR_ENV: &str = "SYNAPSE_PROFILE_DIR";
@@ -817,6 +819,31 @@ fn audio_event_sink(event_bus: EventBus) -> synapse_audio::AudioEventSink {
             dropped = report.dropped,
             "audio detector event published to event bus"
         );
+    })
+}
+
+/// Locks the shared reflex runtime; a poisoned lock becomes a `TOOL_INTERNAL_ERROR`.
+pub(crate) fn lock_runtime(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+) -> Result<MutexGuard<'_, ReflexRuntime>, ErrorData> {
+    runtime.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "reflex runtime lock poisoned",
+        )
+    })
+}
+
+/// Locks the shared reflex runtime; a poisoned lock names what the caller was doing (`context`).
+pub(crate) fn lock_runtime_while<'a>(
+    runtime: &'a Arc<Mutex<ReflexRuntime>>,
+    context: &str,
+) -> Result<MutexGuard<'a, ReflexRuntime>, ErrorData> {
+    runtime.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("reflex runtime lock poisoned while {context}"),
+        )
     })
 }
 

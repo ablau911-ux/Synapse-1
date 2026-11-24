@@ -16,7 +16,7 @@
 
 use super::browser_facades::merge_top_level_target;
 use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
-use crate::m1::mcp_error;
+use crate::m1::{error_code, mcp_error};
 use crate::m2::postcondition::text_signature;
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
@@ -1192,13 +1192,7 @@ fn fill_form_error_data(
     delegated_tool: &str,
     error: ErrorData,
 ) -> BrowserFillFormFieldOutcome {
-    let error_code = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("TOOL_ERROR")
-        .to_owned();
+    let error_code = error_code(&error).unwrap_or("TOOL_ERROR").to_owned();
     BrowserFillFormFieldOutcome {
         index,
         name: field.name.clone(),

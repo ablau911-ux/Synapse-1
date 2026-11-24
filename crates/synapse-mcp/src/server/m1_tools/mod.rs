@@ -1,3 +1,4 @@
+use super::capture_gif;
 use super::{
     BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
     BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserAdoptActiveTabParams,
@@ -38,10 +39,11 @@ use super::{
     set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
     tool_router,
 };
+use crate::hex::hex_encode;
 use crate::m1::{
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
     CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
-    hidden_desktop_input_from_worker_snapshot,
+    error_code, hidden_desktop_input_from_worker_snapshot,
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
 use crate::server::session_continuity::PersistedCdpTargetOwner;
@@ -16918,21 +16920,28 @@ fn validate_screenshot_gif_facade_params(params: &ScreenshotParams) -> Result<()
         ));
     }
     if let Some(duration_ms) = params.duration_ms
-        && !(100..=60_000).contains(&duration_ms)
+        && !(capture_gif::MIN_INTERVAL_MS..=capture_gif::MAX_DURATION_MS).contains(&duration_ms)
     {
         return Err(screenshot_facade_error(
             ScreenshotOperation::Gif,
-            format!("screenshot operation=gif duration_ms must be 100..=60000; got {duration_ms}"),
+            format!(
+                "screenshot operation=gif duration_ms must be {}..={}; got {duration_ms}",
+                capture_gif::MIN_INTERVAL_MS,
+                capture_gif::MAX_DURATION_MS
+            ),
             "pass duration_ms between 100 and 60000, or omit it for the default",
             "duration_ms",
         ));
     }
     if let Some(interval_ms) = params.interval_ms
-        && interval_ms < 100
+        && interval_ms < capture_gif::MIN_INTERVAL_MS
     {
         return Err(screenshot_facade_error(
             ScreenshotOperation::Gif,
-            format!("screenshot operation=gif interval_ms must be >=100; got {interval_ms}"),
+            format!(
+                "screenshot operation=gif interval_ms must be >={}; got {interval_ms}",
+                capture_gif::MIN_INTERVAL_MS
+            ),
             "pass interval_ms >= 100, or omit it for the default",
             "interval_ms",
         ));
@@ -16968,11 +16977,7 @@ fn screenshot_facade_error(
 
 fn hidden_worker_target_miss(error: &ErrorData) -> bool {
     matches!(
-        error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("code"))
-            .and_then(serde_json::Value::as_str),
+        error_code(error),
         Some(error_codes::TARGET_WINDOW_NOT_FOUND)
     )
 }
@@ -19140,7 +19145,7 @@ impl SynapseService {
         let runtime = self.reflex_runtime()?;
 
         {
-            let runtime = lock_reflex_runtime(&runtime)?;
+            let runtime = crate::m3::lock_runtime_while(&runtime, "accessing OCR cache")?;
             if let Some(row) = read_ocr_cache_row(
                 &runtime,
                 &cache_key,
@@ -19201,7 +19206,7 @@ impl SynapseService {
             )
         })?;
         {
-            let runtime = lock_reflex_runtime(&runtime)?;
+            let runtime = crate::m3::lock_runtime_while(&runtime, "accessing OCR cache")?;
             if !runtime.storage_pressure_permits_write(cf::CF_OCR_CACHE) {
                 return Err(mcp_error(
                     error_codes::STORAGE_WRITE_FAILED,
@@ -19506,18 +19511,6 @@ fn ocr_cache_key(
         bitmap_height,
         bitmap_sha256
     )
-}
-
-#[cfg(windows)]
-fn lock_reflex_runtime(
-    runtime: &std::sync::Arc<std::sync::Mutex<ReflexRuntime>>,
-) -> Result<std::sync::MutexGuard<'_, ReflexRuntime>, ErrorData> {
-    runtime.lock().map_err(|_error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "reflex runtime lock poisoned while accessing OCR cache",
-        )
-    })
 }
 
 #[cfg(windows)]
@@ -19968,16 +19961,6 @@ fn non_empty_string(value: Option<&str>) -> Option<String> {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_encode(&digest)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 #[cfg(windows)]

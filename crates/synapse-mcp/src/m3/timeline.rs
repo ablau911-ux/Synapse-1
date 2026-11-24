@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc, Mutex,
     atomic::{AtomicU32, Ordering},
 };
 
@@ -30,11 +30,14 @@ use synapse_core::types::{TimelineActor, TimelineKind, TimelineRecord};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, timeline as timeline_codec};
 
+use crate::hex::{hex_decode, hex_encode};
 use crate::m1::mcp_error;
 use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 use super::{
     M3ToolStub,
+    episodes::{key_after, now_ts_ns},
+    lock_runtime,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -1007,11 +1010,6 @@ pub(crate) fn write_cleaning_audit_row(
     Ok(hex_encode(&key))
 }
 
-fn now_ts_ns() -> u64 {
-    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    u64::try_from(nanos).unwrap_or(0)
-}
-
 fn validate(params: &TimelineSearchParams, op: &str) -> Result<Filters, ErrorData> {
     let start_ts_ns = params.start_ts_ns.unwrap_or(0);
     let end_ts_ns = params.end_ts_ns.unwrap_or(u64::MAX);
@@ -1174,44 +1172,6 @@ fn kind_name(kind: TimelineKind) -> String {
     )
 }
 
-fn key_after(key: &[u8]) -> Vec<u8> {
-    let mut next = key.to_vec();
-    next.push(0);
-    next
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    let text = text.trim();
-    if text.is_empty() || !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(text.get(index..index + 2)?, 16).ok())
-        .collect()
-}
-
 fn invalid(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, detail.into())
-}
-
-fn lock_runtime(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
-) -> Result<MutexGuard<'_, ReflexRuntime>, ErrorData> {
-    runtime.lock().map_err(|_err| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "reflex runtime lock poisoned",
-        )
-    })
 }

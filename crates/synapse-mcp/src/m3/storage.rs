@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
 };
 
 use rmcp::{ErrorData, schemars::JsonSchema};
@@ -11,6 +11,7 @@ use synapse_core::error_codes;
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{DiskPressureLevel, GcReport, PressureReport, cf};
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
@@ -19,6 +20,7 @@ use super::{
         AUDIT_RETENTION_MODE, AuditRetentionPolicy, AuditRetentionReport, AuditRetentionRunConfig,
         audit_retention_policies, run_audit_retention, validate_audit_retention_config,
     },
+    lock_runtime,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -459,16 +461,6 @@ fn classify_value_encoding(bytes: &[u8]) -> String {
     "utf8_non_json".to_owned()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{}", hex_encode(digest.as_ref()))
@@ -791,15 +783,4 @@ fn pressure_level(level: DiskPressureLevel) -> StoragePressureLevel {
 
 fn cf_count(counts: &BTreeMap<String, u64>, cf_name: &str) -> u64 {
     counts.get(cf_name).copied().unwrap_or_default()
-}
-
-fn lock_runtime(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
-) -> Result<MutexGuard<'_, ReflexRuntime>, ErrorData> {
-    runtime.lock().map_err(|_err| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "reflex runtime lock poisoned",
-        )
-    })
 }

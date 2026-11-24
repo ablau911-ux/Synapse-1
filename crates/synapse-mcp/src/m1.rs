@@ -4693,6 +4693,15 @@ pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
     )
 }
 
+/// Reads the Synapse error code (`data.code`) that `mcp_error` stores on an error.
+pub(crate) fn error_code(error: &ErrorData) -> Option<&str> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+}
+
 /// Rejects malformed native window handles before target resolution or any
 /// hidden-desktop worker dispatch. This deliberately validates only the handle
 /// shape: a canonical HWND owned by another Windows desktop must be checked for

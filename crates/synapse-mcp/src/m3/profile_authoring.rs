@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,10 +15,11 @@ use synapse_profiles::{ProfileError, ProfileRuntime, ProfileStatus};
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{Db, cf, decode_json, encode_json};
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
-    M3ToolStub,
+    M3ToolStub, lock_runtime_while,
     permissions::{Permission, RequiredPermissions, normalize_replay_path, replay_root, required},
     plan::{PlanDocument, RoutineCompilePlanParams, compile_routine_plan},
     routines::{load_routine_record, validate_routine_id_param},
@@ -425,7 +426,7 @@ pub fn generate_profile_authoring_candidate(
         },
     };
     let encoded = encode_candidate(&candidate)?;
-    let runtime = lock_runtime(reflex_runtime, "writing profile authoring candidate")?;
+    let runtime = lock_runtime_while(reflex_runtime, "writing profile authoring candidate")?;
     runtime
         .storage_put_profile_rows(vec![(row_key.as_bytes().to_vec(), encoded)])
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -565,7 +566,7 @@ pub fn generate_routine_automation_candidate(
         },
     };
     let encoded = encode_candidate(&candidate)?;
-    let runtime = lock_runtime(reflex_runtime, "writing routine automation candidate")?;
+    let runtime = lock_runtime_while(reflex_runtime, "writing routine automation candidate")?;
     runtime
         .storage_put_profile_rows(vec![(row_key.as_bytes().to_vec(), encoded)])
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -626,7 +627,7 @@ pub fn list_profile_authoring_candidates(
     params: &ProfileAuthoringListParams,
 ) -> Result<ProfileAuthoringListResponse, ErrorData> {
     let limit = validate_list_limit(params.limit)?;
-    let runtime = lock_runtime(reflex_runtime, "listing profile authoring candidates")?;
+    let runtime = lock_runtime_while(reflex_runtime, "listing profile authoring candidates")?;
     let rows = runtime
         .storage_cf_prefix_rows(cf::CF_PROFILES, CANDIDATE_PREFIX.as_bytes(), usize::MAX)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -676,7 +677,7 @@ pub fn inspect_profile_authoring_candidate(
 ) -> Result<ProfileAuthoringInspectResponse, ErrorData> {
     let candidate_id = normalized_candidate_id(&params.candidate_id)?;
     let row_key = candidate_key(&candidate_id);
-    let runtime = lock_runtime(reflex_runtime, "inspecting profile authoring candidate")?;
+    let runtime = lock_runtime_while(reflex_runtime, "inspecting profile authoring candidate")?;
     let row = runtime
         .storage_profile_row(row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -1771,7 +1772,7 @@ fn audit_rows(
     if max_audit_rows == 0 {
         return Ok(Vec::new());
     }
-    let runtime = lock_runtime(reflex_runtime, "reading profile authoring audit evidence")?;
+    let runtime = lock_runtime_while(reflex_runtime, "reading profile authoring audit evidence")?;
     runtime
         .storage_cf_tail_rows(cf::CF_ACTION_LOG, max_audit_rows as usize)
         .map_err(|error| mcp_error(error.code(), error.to_string()))
@@ -2070,7 +2071,7 @@ fn read_candidate_required(
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
     row_key: &str,
 ) -> Result<(ProfileAuthoringCandidate, String), ErrorData> {
-    let runtime = lock_runtime(reflex_runtime, "reading profile authoring candidate")?;
+    let runtime = lock_runtime_while(reflex_runtime, "reading profile authoring candidate")?;
     let row = runtime
         .storage_profile_row(row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -2093,7 +2094,7 @@ fn write_candidate(
     candidate: &ProfileAuthoringCandidate,
 ) -> Result<(), ErrorData> {
     let encoded = encode_candidate(candidate)?;
-    let runtime = lock_runtime(reflex_runtime, "writing profile authoring candidate state")?;
+    let runtime = lock_runtime_while(reflex_runtime, "writing profile authoring candidate state")?;
     runtime
         .storage_put_profile_rows(vec![(row_key.as_bytes().to_vec(), encoded)])
         .map_err(|error| mcp_error(error.code(), error.to_string()))
@@ -2155,18 +2156,6 @@ fn authoring_error(code: &'static str, message: impl Into<String>, data: Value) 
     )
 }
 
-fn lock_runtime<'a>(
-    runtime: &'a Arc<Mutex<ReflexRuntime>>,
-    operation: &str,
-) -> Result<MutexGuard<'a, ReflexRuntime>, ErrorData> {
-    runtime.lock().map_err(|_error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("reflex runtime lock poisoned while {operation}"),
-        )
-    })
-}
-
 fn normalize_key(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -2177,14 +2166,4 @@ fn now_ns() -> u64 {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     u64::try_from(nanos).unwrap_or(u64::MAX)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }

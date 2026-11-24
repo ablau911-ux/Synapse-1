@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -28,11 +28,13 @@ use synapse_storage::{
     timeline as timeline_codec,
 };
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
     episodes::decode_episode_row,
+    lock_runtime_while,
     permissions::{Permission, RequiredPermissions, required},
     profile_authoring::ProfileAuthoringCandidate,
 };
@@ -440,7 +442,7 @@ pub fn scan_text_tool(
             &params.text,
             &matches,
         );
-        let runtime = lock_runtime(runtime)?;
+        let runtime = lock_runtime_while(runtime, "running hygiene scanner")?;
         ensure_source_row_exists(&runtime, &source_cf, &source_key)?;
         write_flag_records(&runtime, records)?
     } else {
@@ -475,7 +477,7 @@ pub fn scan_storage(
     let min_score =
         validate_min_score(params.min_score, DEFAULT_MIN_SCORE, "hygiene_scan_storage")?;
     let cursor = parse_storage_cursor(params.cursor.as_deref())?;
-    let runtime = lock_runtime(runtime)?;
+    let runtime = lock_runtime_while(runtime, "running hygiene scanner")?;
 
     let mut scanned_rows = 0_u64;
     let mut invalid_rows = 0_u64;
@@ -637,7 +639,7 @@ pub fn query_flags(
         None => prefix.as_bytes().to_vec(),
     };
 
-    let runtime = lock_runtime(runtime)?;
+    let runtime = lock_runtime_while(runtime, "running hygiene scanner")?;
     let mut flags = Vec::new();
     let mut scanned_rows = 0_u64;
     let mut next_cursor = None;
@@ -759,7 +761,7 @@ pub fn report(
         None => prefix.as_bytes().to_vec(),
     };
 
-    let runtime = lock_runtime(runtime)?;
+    let runtime = lock_runtime_while(runtime, "running hygiene scanner")?;
 
     // 1. Page over flag rows applying min_score + optional detected_at window.
     let mut page: Vec<HygieneStoredFlag> = Vec::new();
@@ -1479,7 +1481,7 @@ pub fn redact(
     }
     let selector = redact_selector(params)?;
 
-    let guard = lock_runtime(runtime)?;
+    let guard = lock_runtime_while(runtime, "running hygiene scanner")?;
     let flags = resolve_clean_flags(&guard, &selector)?;
     let matched_flags = flags.len() as u64;
 
@@ -3338,16 +3340,6 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
@@ -3381,17 +3373,6 @@ fn safe_slice(text: &str, start: usize, end: usize) -> &str {
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-fn lock_runtime(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
-) -> Result<MutexGuard<'_, ReflexRuntime>, ErrorData> {
-    runtime.lock().map_err(|_error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "reflex runtime lock poisoned while running hygiene scanner",
-        )
-    })
 }
 
 fn invalid(detail: impl Into<String>) -> ErrorData {

@@ -22,7 +22,7 @@ use super::{
 use crate::daemon_lifecycle::consume_panic_payload;
 use crate::m1::{
     CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
-    CdpTargetInfoParams, ObserveParams, mcp_error,
+    CdpTargetInfoParams, ObserveParams, error_code, mcp_error,
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
@@ -3617,7 +3617,7 @@ fn act_foreground_action_diagnostics(
 
 fn act_foreground_error_diagnostics(error: &ErrorData) -> Value {
     json!({
-        "code": target_act_error_code(error).unwrap_or(error_codes::TOOL_INTERNAL_ERROR),
+        "code": error_code(error).unwrap_or(error_codes::TOOL_INTERNAL_ERROR),
         "message": error.message.to_string(),
         "data": error.data.clone(),
     })
@@ -4265,7 +4265,7 @@ fn target_act_hidden_notepad_snapshot(
 
 fn target_act_hidden_worker_target_miss(error: &ErrorData) -> bool {
     matches!(
-        target_act_error_code(error),
+        error_code(error),
         Some(error_codes::TARGET_WINDOW_NOT_FOUND)
     )
 }
@@ -4615,7 +4615,7 @@ fn target_act_notepad_tabs_signature(tabs: &[TargetActNotepadTabReadback]) -> St
         })
         .collect::<Vec<_>>()
         .join("\n");
-    crate::m2::postcondition::hex_encode(&Sha256::digest(payload.as_bytes()))
+    crate::hex::hex_encode(&Sha256::digest(payload.as_bytes()))
 }
 
 fn target_act_cleanup_notepad_tabs_postcondition_error(
@@ -4944,7 +4944,7 @@ fn target_act_file_snapshot(path: &Path) -> Result<TargetActFileSnapshot, ErrorD
     })?;
     Ok(TargetActFileSnapshot {
         len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        sha256: crate::m2::postcondition::hex_encode(&Sha256::digest(&bytes)),
+        sha256: crate::hex::hex_encode(&Sha256::digest(&bytes)),
         bytes,
     })
 }
@@ -8165,7 +8165,7 @@ fn target_act_audit_result_for_session(
             )
         }
         Err(error) => {
-            let code = target_act_error_code(error).map(str::to_owned);
+            let code = error_code(error).map(str::to_owned);
             let safe = target_act_secret_safe_error_result_ref(delegated_tool, error);
             service.audit_action_redacted_result_for_session(
                 "target_act",
@@ -8247,7 +8247,7 @@ fn target_act_secret_safe_error_result_ref(
     delegated_tool: &'static str,
     error: &ErrorData,
 ) -> Value {
-    let code = target_act_error_code(error)
+    let code = error_code(error)
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned();
     let message = error.message.to_string();
@@ -8417,10 +8417,7 @@ fn target_act_secret_safe_redacted_scalar(value: &Value) -> Result<Value, ErrorD
 fn target_act_secret_safe_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!(
-        "sha256:{}",
-        crate::m2::postcondition::hex_encode(&hasher.finalize())
-    )
+    format!("sha256:{}", crate::hex::hex_encode(&hasher.finalize()))
 }
 
 fn target_act_secret_safe_path_segment(segment: &str) -> String {
@@ -9930,7 +9927,7 @@ fn target_act_rect_contains_point(rect: Rect, point: Point) -> bool {
 }
 
 fn target_act_error_result(delegated_tool: &'static str, error: ErrorData) -> Value {
-    let code = target_act_error_code(&error)
+    let code = error_code(&error)
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned();
     json!({
@@ -9992,7 +9989,7 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
     // refusal, not a verify-needed outcome. Post-action readbacks raise the
     // same code after input *was* delivered and keep verify_needed (#234,
     // upstream #1830).
-    if target_act_error_code(error) == Some(error_codes::ACTION_FOREGROUND_LOST)
+    if error_code(error) == Some(error_codes::ACTION_FOREGROUND_LOST)
         && error
             .data
             .as_ref()
@@ -10002,7 +9999,7 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
     {
         return TARGET_ACT_STATUS_REFUSED;
     }
-    match target_act_error_code(error) {
+    match error_code(error) {
         Some(
             error_codes::ACTION_NO_OBSERVED_DELTA
             | error_codes::ACTION_FOREGROUND_LOST
@@ -10034,12 +10031,4 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
         ) => TARGET_ACT_STATUS_REFUSED,
         _ => TARGET_ACT_STATUS_ERROR,
     }
-}
-
-fn target_act_error_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }

@@ -37,6 +37,7 @@ use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 use synapse_storage::{cf, decode_json};
 
+use crate::m1::error_code;
 use crate::m3::local_models::{
     LocalModelApiShape, LocalModelProbeParams, LocalModelRegistryRow, ResolvedApiKey,
 };
@@ -1037,7 +1038,7 @@ impl SynapseService {
             "source_of_truth": "durable shell registry/log files/process table",
             "status_readback": before_status.as_ref().ok(),
             "status_error": before_status.as_ref().err().map(|error| json!({
-                "code": error.data.as_ref().and_then(|data| data.get("code")).and_then(Value::as_str),
+                "code": error_code(error),
                 "message": error.message.to_string(),
             })),
         });
@@ -1067,8 +1068,8 @@ impl SynapseService {
         )
         .await;
         match &result {
-            Ok(response) => self.command_audit_final(
-                super::command_audit::CommandAuditInput::mcp(
+            Ok(response) => {
+                self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
                     "act_run_shell_cancel",
                     "kill",
                     Some(session_id.clone()),
@@ -1080,13 +1081,13 @@ impl SynapseService {
                         "response": response,
                         "status_readback": after_status.as_ref().ok(),
                         "status_error": after_status.as_ref().err().map(|error| json!({
-                            "code": error.data.as_ref().and_then(|data| data.get("code")).and_then(Value::as_str),
+                            "code": error_code(error),
                             "message": error.message.to_string(),
                         })),
                     }),
                     "ok",
-                ),
-            )?,
+                ))?
+            }
             Err(error) => self.command_audit_final(
                 super::command_audit::CommandAuditInput::mcp(
                     "act_run_shell_cancel",
@@ -1099,13 +1100,15 @@ impl SynapseService {
                         "source_of_truth": "durable shell registry/log files/process table",
                         "status_readback": after_status.as_ref().ok(),
                         "status_error": after_status.as_ref().err().map(|error| json!({
-                            "code": error.data.as_ref().and_then(|data| data.get("code")).and_then(Value::as_str),
+                            "code": error_code(error),
                             "message": error.message.to_string(),
                         })),
                     }),
                     "error",
                 )
-                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(error),
+                ),
             )?,
         };
         self.audit_action_result_for_session("act_run_shell_cancel", &result, &session_id)?;
@@ -3499,11 +3502,7 @@ impl SynapseService {
             .and_then(|data| data.get("reason"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("agent_spawn_failed");
-        let error_code = error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("code"))
-            .and_then(serde_json::Value::as_str);
+        let error_code = error_code(error);
         let mut record = synapse_core::AgentEventRecord::new(
             super::agent_events::unix_time_ns_now(),
             synapse_core::AgentEventKind::Exited,

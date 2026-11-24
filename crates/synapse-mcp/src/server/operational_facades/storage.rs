@@ -1,10 +1,12 @@
 use rmcp::{RoleServer, service::RequestContext};
 
-use crate::server::{ErrorData, Json, Parameters, SynapseService};
+use crate::server::{
+    ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+};
 
 use super::{
     STORAGE_SOT, STORAGE_TOOL,
-    errors::{facade_delegate_error, missing_spec},
+    errors::missing_spec,
     policy::require_maintenance_profile,
     response::storage_response,
     types::{StorageOperation, StorageParams, StorageResponse},
@@ -31,7 +33,7 @@ pub(super) async fn handle(
                 &crate::m3::storage::required_permissions_inspect(&spec),
             )?;
             let runtime = service.reflex_runtime().map_err(|error| {
-                facade_delegate_error(
+                wrapped_delegate_error(
                     STORAGE_TOOL,
                     operation.as_str(),
                     "reflex_runtime",
@@ -42,7 +44,7 @@ pub(super) async fn handle(
             })?;
             let response =
                 crate::m3::storage::inspect_storage(&runtime, &spec).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         STORAGE_TOOL,
                         operation.as_str(),
                         "storage_inspect",
@@ -68,7 +70,7 @@ pub(super) async fn handle(
                 &crate::m3::storage::required_permissions_inspect(&spec),
             )?;
             let response = service.storage_summary_snapshot().map_err(|error| {
-                facade_delegate_error(
+                wrapped_delegate_error(
                     STORAGE_TOOL,
                     operation.as_str(),
                     "storage_summary",
@@ -107,7 +109,7 @@ pub(super) async fn handle(
             let runtime = service.reflex_runtime()?;
             let response =
                 crate::m3::storage::run_storage_gc_once(&runtime, &spec).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         STORAGE_TOOL,
                         operation.as_str(),
                         &spec.cf_name,

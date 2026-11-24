@@ -10,7 +10,8 @@ use super::{
     action_preflight::{ActionPreflightReadback, ForegroundProof},
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
-use crate::m1::{FindParams, FindResult, FindResultKind, FindScope, mcp_error};
+use crate::hex::hex_encode;
+use crate::m1::{FindParams, FindResult, FindResultKind, FindScope, error_code, mcp_error};
 use crate::m2::postcondition::{
     ActPostcondition, hash_json as verify_hash_json,
     no_observed_delta_error as source_no_observed_delta_error, postcondition_failed_error,
@@ -2722,11 +2723,7 @@ impl SynapseService {
             act_clipboard_session_buffer(params, session_id, self.session_clipboards_ref());
         if let Err(error) = &result {
             tracing::error!(
-                code = error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("code"))
-                    .and_then(|value| value.as_str())
+                code = error_code(error)
                     .unwrap_or(error_codes::TOOL_INTERNAL_ERROR),
                 session_id,
                 source_of_truth,
@@ -2825,10 +2822,10 @@ impl SynapseService {
                     Ok(response) => return Ok(response),
                     Err(verify_error) => {
                         tracing::warn!(
-                            code = click_error_data_code(&verify_error)
+                            code = error_code(&verify_error)
                                 .unwrap_or(error_codes::ACTION_POSTCONDITION_FAILED),
                             kind = "act_click",
-                            original_error_code = click_error_data_code(&error)
+                            original_error_code = error_code(&error)
                                 .unwrap_or(error_codes::ACTION_TARGET_INVALID),
                             detail = %verify_error.message,
                             "act_click post-dispatch UIA readback error was not reconciled by target-window SoT; considering next eligible delivery tier"
@@ -2997,7 +2994,7 @@ impl SynapseService {
                 Ok(response)
             }
             Err(error) => {
-                let error_code = click_error_data_code(&error)
+                let error_code = error_code(&error)
                     .unwrap_or(error_codes::ACTION_NO_OBSERVED_DELTA)
                     .to_owned();
                 // #1360: a DELIVERED click that closed its own target window
@@ -4075,7 +4072,7 @@ impl SynapseService {
             tool = "act_type",
             target_window_hwnd,
             source_of_truth,
-            semantic_error_code = click_error_data_code(semantic_error)
+            semantic_error_code = error_code(semantic_error)
                 .unwrap_or(error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE),
             semantic_error_detail = %semantic_error.message,
             "act_type semantic text readback could not prove the delivered input; visual target-window SoT changed after delivery"
@@ -4284,9 +4281,7 @@ impl SynapseService {
             "observed target HWND text/selection change after PostMessage keyboard delivery",
         ) {
             Ok(postcondition) => postcondition,
-            Err(error)
-                if click_error_data_code(&error) == Some(error_codes::ACTION_NO_OBSERVED_DELTA) =>
-            {
+            Err(error) if error_code(&error) == Some(error_codes::ACTION_NO_OBSERVED_DELTA) => {
                 let Some(before_visual) = before_visual else {
                     return Err(error);
                 };
@@ -5243,7 +5238,7 @@ fn can_route_click_element_background_first(
 }
 
 fn should_try_next_click_tier(error: &ErrorData) -> bool {
-    match click_error_data_code(error) {
+    match error_code(error) {
         Some(
             error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
             | error_codes::ACTION_NO_OBSERVED_DELTA
@@ -5293,14 +5288,6 @@ fn should_try_click_foreground_tier(tier_attempts: &[ActClickTierAttempt]) -> bo
 
 fn click_tier_attempted(tier_attempts: &[ActClickTierAttempt], tier: &str) -> bool {
     tier_attempts.iter().any(|attempt| attempt.tier == tier)
-}
-
-fn click_error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }
 
 fn click_tier_attempts_from_error(error: &ErrorData) -> Vec<ActClickTierAttempt> {
@@ -5954,16 +5941,6 @@ fn non_empty_sha256(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| hex_encode(&Sha256::digest(trimmed.as_bytes())))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
 fn foreground_identity_changed(before: &ClickDeltaSignature, after: &ClickDeltaSignature) -> bool {
     before.foreground_hwnd != after.foreground_hwnd
         || before.foreground_pid != after.foreground_pid
@@ -6142,7 +6119,7 @@ fn verify_act_type_text_response(
 }
 
 fn act_type_error_allows_visual_delta(error: &ErrorData) -> bool {
-    match click_error_data_code(error) {
+    match error_code(error) {
         Some(error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE) => true,
         Some(error_codes::ACTION_NO_OBSERVED_DELTA) => {
             act_type_no_observed_delta_has_no_text_surface(error)
@@ -6381,11 +6358,7 @@ fn act_type_foreground_fallback_click_error(
             point.x, point.y, error
         ),
         Some(json!({
-            "code": mapped
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
+            "code": error_code(&mapped)
                 .unwrap_or(error_codes::ACTION_BACKEND_UNAVAILABLE),
             "tool": "act_type",
             "reason": "chromium_foreground_fallback_click_failed",
@@ -7202,16 +7175,8 @@ fn set_field_text_error_is_stale(
 ) -> bool {
     matches!(
         result,
-        Err(error) if mcp_error_data_code(error) == Some(error_codes::A11Y_ELEMENT_STALE)
+        Err(error) if error_code(error) == Some(error_codes::A11Y_ELEMENT_STALE)
     )
-}
-
-fn mcp_error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }
 
 fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
@@ -7401,11 +7366,7 @@ fn attach_background_foreground_guard_error(
     data.insert(
         "background_foreground_guard".to_owned(),
         json!({
-            "code": foreground_error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
+            "code": error_code(&foreground_error)
                 .unwrap_or(error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED),
             "message": foreground_error.message.to_string(),
             "data": foreground_error.data,

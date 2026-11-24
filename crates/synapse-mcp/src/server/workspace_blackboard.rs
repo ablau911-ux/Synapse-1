@@ -28,6 +28,7 @@ use super::{
     ErrorData, Json, Parameters, SynapseService, mcp_error, session_registry::unix_time_ms_now,
     session_tools::validate_session_id, tool, tool_router,
 };
+use crate::hex::hex_encode;
 
 const SCHEMA_VERSION: u32 = 1;
 const WORKSPACE_PREFIX: &str = "workspace-blackboard/v1";
@@ -2064,7 +2065,7 @@ fn sha256_file(path: &Path) -> Result<String, ErrorData> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("sha256:{}", hex_bytes(&hasher.finalize())))
+    Ok(format!("sha256:{}", hex_encode(&hasher.finalize())))
 }
 
 fn workspace_publish_report(event_seq: u64, report: PublishReport) -> WorkspaceEventPublishReport {
@@ -2495,7 +2496,7 @@ fn require_workspace_session_id(
 fn workspace_run_prefix(run_id: &str) -> String {
     format!(
         "{WORKSPACE_PREFIX}/run_hex/{}/key_hex/",
-        hex_bytes(run_id.as_bytes())
+        hex_encode(run_id.as_bytes())
     )
 }
 
@@ -2503,23 +2504,13 @@ fn workspace_row_key(run_id: &str, key: &str) -> String {
     format!(
         "{}{}",
         workspace_run_prefix(run_id),
-        hex_bytes(key.as_bytes())
+        hex_encode(key.as_bytes())
     )
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("sha256:{}", hex_bytes(&digest))
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+    format!("sha256:{}", hex_encode(&digest))
 }
 
 const fn default_workspace_ttl_ms() -> u64 {

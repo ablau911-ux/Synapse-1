@@ -53,6 +53,7 @@ use super::notify_tools::{
 };
 use super::session_registry::unix_time_ms_now;
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
+use crate::hex::hex_encode;
 use crate::m3::approvals::{
     ApprovalAllow, ApprovalAuditRecord, ApprovalItemRecord, ApprovalKind, ApprovalStatus,
     ApprovalTimeoutDecision, ApprovalToastState,
@@ -734,7 +735,7 @@ fn write_orphan_toast_cleanup_audit(
             ),
         )
     })?;
-    Ok(Some(hex_encode_bytes(&row_key)))
+    Ok(Some(hex_encode(&row_key)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1806,15 +1807,6 @@ fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     let digest = outer.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-fn hex_encode_bytes(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }

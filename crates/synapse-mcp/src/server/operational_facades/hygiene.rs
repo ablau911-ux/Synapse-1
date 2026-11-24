@@ -1,10 +1,12 @@
 use rmcp::{RoleServer, service::RequestContext};
 
-use crate::server::{ErrorData, Json, Parameters, SynapseService};
+use crate::server::{
+    ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+};
 
 use super::{
     HYGIENE_SOT, HYGIENE_TOOL,
-    errors::{facade_delegate_error, missing_spec},
+    errors::missing_spec,
     policy::require_maintenance_profile,
     response::hygiene_response,
     types::{HygieneOperation, HygieneParams, HygieneResponse},
@@ -24,7 +26,7 @@ pub(super) async fn handle(
         "tool.invocation kind=hygiene"
     );
     let runtime = service.reflex_runtime().map_err(|error| {
-        facade_delegate_error(
+        wrapped_delegate_error(
             HYGIENE_TOOL,
             operation.as_str(),
             "reflex_runtime",
@@ -55,7 +57,7 @@ pub(super) async fn handle(
             )?;
             let response =
                 crate::m3::hygiene::scan_text_tool(&runtime, &spec).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         HYGIENE_TOOL,
                         operation.as_str(),
                         spec.source_key_hex.as_deref().unwrap_or("text_only"),
@@ -92,7 +94,7 @@ pub(super) async fn handle(
                 &crate::m3::hygiene::required_permissions_scan_storage(&spec),
             )?;
             let response = crate::m3::hygiene::scan_storage(&runtime, &spec).map_err(|error| {
-                facade_delegate_error(
+                wrapped_delegate_error(
                     HYGIENE_TOOL,
                     operation.as_str(),
                     "storage_scan",
@@ -117,7 +119,7 @@ pub(super) async fn handle(
                 &crate::m3::hygiene::required_permissions_flags(&spec),
             )?;
             let response = crate::m3::hygiene::query_flags(&runtime, &spec).map_err(|error| {
-                facade_delegate_error(
+                wrapped_delegate_error(
                     HYGIENE_TOOL,
                     operation.as_str(),
                     spec.source_key_hex.as_deref().unwrap_or("flag_prefix"),
@@ -143,7 +145,7 @@ pub(super) async fn handle(
                 &crate::m3::hygiene::required_permissions_report(&spec),
             )?;
             let response = crate::m3::hygiene::report(&runtime, &spec).map_err(|error| {
-                facade_delegate_error(
+                wrapped_delegate_error(
                     HYGIENE_TOOL,
                     operation.as_str(),
                     spec.source_key_hex.as_deref().unwrap_or("report"),

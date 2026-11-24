@@ -30,7 +30,7 @@ use synapse_storage::{decode_json, encode_json};
 use tokio::{io::AsyncReadExt, process::Command as TokioCommand};
 
 use crate::{
-    m1::mcp_error,
+    m1::{error_code, mcp_error},
     m2::{ActPressParams, action_from_press_params},
     m3::permissions::{RequiredPermissions, add_action_permissions},
 };
@@ -16580,11 +16580,7 @@ fn run_shell_start_request_sha256(params: &ActRunShellStartParams) -> Result<Str
 }
 
 fn extract_error_code(error: &ErrorData) -> String {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str)
+    error_code(error)
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned()
 }

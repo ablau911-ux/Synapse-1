@@ -18,7 +18,7 @@ use synapse_core::{
     StrokeMotionModel, StrokeTiming, VelocityProfile, error_codes,
 };
 
-use crate::m1::mcp_error;
+use crate::m1::{error_code, mcp_error};
 use crate::m2::postcondition::{
     ActPostcondition, default_verify_timeout_ms, postcondition_not_requested,
 };
@@ -399,9 +399,7 @@ pub fn act_stroke_validation_failure_details(params: &ActStrokeParams, error: &E
 pub fn act_stroke_error_details(error: &ErrorData) -> Value {
     let data = error.data.as_ref();
     json!({
-        "code": data
-            .and_then(|data| data.get("code"))
-            .and_then(Value::as_str),
+        "code": error_code(error),
         "message": error.message.to_string(),
         "data": error.data.clone(),
         "point_index": data

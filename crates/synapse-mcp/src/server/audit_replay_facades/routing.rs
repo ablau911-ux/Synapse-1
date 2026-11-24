@@ -12,6 +12,7 @@ use crate::{
         ErrorData, Json, Parameters, SynapseService,
         command_audit::{CommandAuditInput, command_audit_error_from_error_data},
         context::mcp_session_id_from_request_context,
+        delegate_errors::wrapped_delegate_error,
         tool, tool_router,
     },
 };
@@ -21,7 +22,7 @@ use super::{
     REPLAY_TOOL,
     artifact::inspect_replay_artifact,
     command_query::summarize_command_query,
-    errors::{delegate_error, missing_spec},
+    errors::missing_spec,
     lifecycle::{lifecycle_path, read_lifecycle_tail},
     response::{audit_response, replay_response},
     types::{
@@ -54,7 +55,7 @@ impl SynapseService {
                     .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
                 let response = self
                     .command_audit_query(spec.into())
-                    .map_err(|error| delegate_error(AUDIT_TOOL, operation.as_str(), "CF_ACTION_LOG", AUDIT_SOT, error, "tighten the audit filters or repair CF_ACTION_LOG before retrying command_query"))?;
+                    .map_err(|error| wrapped_delegate_error(AUDIT_TOOL, operation.as_str(), "CF_ACTION_LOG", AUDIT_SOT, error, "tighten the audit filters or repair CF_ACTION_LOG before retrying command_query"))?;
                 let sanitized = summarize_command_query(response)?;
                 Ok(Json(audit_response(
                     operation,
@@ -105,7 +106,7 @@ impl SynapseService {
                     &crate::m3::profile_registry::required_permissions_audit(&spec),
                 )?;
                 let reflex_runtime = self.reflex_runtime().map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         AUDIT_TOOL,
                         operation.as_str(),
                         "reflex_runtime",
@@ -115,7 +116,7 @@ impl SynapseService {
                     )
                 })?;
                 let response = query_audit_intelligence(&reflex_runtime, &spec).map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         AUDIT_TOOL,
                         operation.as_str(),
                         &spec.profile_id,
@@ -143,7 +144,7 @@ impl SynapseService {
                     &crate::m3::audit_export::required_permissions_bundle(&spec),
                 )?;
                 let reflex_runtime = self.reflex_runtime().map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         AUDIT_TOOL,
                         operation.as_str(),
                         "reflex_runtime",
@@ -153,7 +154,7 @@ impl SynapseService {
                     )
                 })?;
                 let response = export_audit_bundle(&reflex_runtime, &spec).map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         AUDIT_TOOL,
                         operation.as_str(),
                         &spec.profile_id,
@@ -200,7 +201,7 @@ impl SynapseService {
                     &crate::m3::replay::required_permissions(&spec),
                 )?;
                 let sse_state = self.sse_state().map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         REPLAY_TOOL,
                         operation.as_str(),
                         "sse_state",
@@ -212,7 +213,7 @@ impl SynapseService {
                 let response = record_replay(self.m1_state.clone(), sse_state, &spec)
                     .await
                     .map_err(|error| {
-                        delegate_error(
+                        wrapped_delegate_error(
                             REPLAY_TOOL,
                             operation.as_str(),
                             spec.path.as_deref().unwrap_or("default_replay_path"),
@@ -241,7 +242,7 @@ impl SynapseService {
             ReplayOperation::DemoStatus => {
                 let _spec = params.0.demo_status.unwrap_or_default();
                 let status = demo_record_status_snapshot(&self.m3_state).map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         REPLAY_TOOL,
                         operation.as_str(),
                         "timeline/demo-record/v1",
@@ -331,7 +332,7 @@ impl SynapseService {
                     }
                 }
                 let response = result.map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         REPLAY_TOOL,
                         operation.as_str(),
                         &spec.profile_id,
@@ -418,7 +419,7 @@ impl SynapseService {
                     }
                 }
                 let response = result.map_err(|error| {
-                    delegate_error(
+                    wrapped_delegate_error(
                         REPLAY_TOOL,
                         operation.as_str(),
                         spec.demo_id.as_deref().unwrap_or("active_demo_recording"),

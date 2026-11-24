@@ -23,6 +23,7 @@ use super::{
     populate_audio_summary, populate_clipboard_summary, populate_fs_recent, tool, tool_router,
 };
 use crate::{
+    hex::hex_encode,
     m1::{ObserveSlot, mcp_error},
     m3::permissions::{Permission, RequiredPermissions, required},
 };
@@ -3319,17 +3320,7 @@ where
 fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{}", hex_lower(&hasher.finalize()))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
+    format!("sha256:{}", hex_encode(&hasher.finalize()))
 }
 
 fn json_size_estimate<T>(value: &T) -> Result<(u32, u32), ErrorData>

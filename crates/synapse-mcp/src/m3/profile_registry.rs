@@ -20,10 +20,11 @@ use synapse_profiles::{
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, encode_json};
 
+use crate::hex::hex_encode;
 use crate::m1::mcp_error;
 
 use super::{
-    M3ToolStub,
+    M3ToolStub, lock_runtime_while,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -881,7 +882,7 @@ fn search_registry(
     if let Some(kind) = &params.row_kind {
         validate_non_empty("row_kind", kind)?;
     }
-    let runtime = lock_runtime(reflex_runtime, "searching profile registry")?;
+    let runtime = lock_runtime_while(reflex_runtime, "searching profile registry")?;
     let rows = runtime
         .storage_cf_prefix_rows(cf::CF_PROFILES, REGISTRY_PREFIX.as_bytes(), usize::MAX)
         .map_err(storage_error)?;
@@ -922,7 +923,7 @@ fn inspect_registry(
     params: &ProfileRegistryQueryParams,
 ) -> Result<ProfileRegistryInspectResponse, ErrorData> {
     let (cf_name, key) = inspect_key(params)?;
-    let runtime = lock_runtime(reflex_runtime, "inspecting profile registry")?;
+    let runtime = lock_runtime_while(reflex_runtime, "inspecting profile registry")?;
     let value = if cf_name == cf::CF_KV {
         runtime.storage_kv_row(key.as_bytes())
     } else {
@@ -951,7 +952,7 @@ fn report_profile_registry(
     params: &ProfileRegistryQueryParams,
 ) -> Result<ProfileRegistryReportResponse, ErrorData> {
     validate_report_params(params)?;
-    let runtime = lock_runtime(reflex_runtime, "reporting profile registry state")?;
+    let runtime = lock_runtime_while(reflex_runtime, "reporting profile registry state")?;
     let storage_path = runtime.storage_path().display().to_string();
     let row_counts = runtime.storage_cf_row_counts().map_err(storage_error)?;
     let registry_rows = runtime
@@ -1197,7 +1198,8 @@ pub fn install_registry_package(
                 &updated_at,
                 &failure,
             );
-            let runtime = lock_runtime(reflex_runtime, "quarantining failed profile package")?;
+            let runtime =
+                lock_runtime_while(reflex_runtime, "quarantining failed profile package")?;
             runtime
                 .storage_put_profile_rows(vec![encoded_row(quarantine_key.clone(), &row)?])
                 .map_err(storage_error)?;
@@ -1228,7 +1230,7 @@ pub fn install_registry_package(
     }
     let package_key = package_key(&manifest.package_id, &manifest.package_version);
     let updated_at = Utc::now().to_rfc3339();
-    let runtime = lock_runtime(reflex_runtime, "installing profile registry package")?;
+    let runtime = lock_runtime_while(reflex_runtime, "installing profile registry package")?;
     if let Some(existing) = runtime
         .storage_profile_row(package_key.as_bytes())
         .map_err(storage_error)?
@@ -1369,7 +1371,7 @@ pub fn disable_registry_profile(
 ) -> Result<ProfileRegistryDisableResponse, ErrorData> {
     validate_disabled_state(&params.state)?;
     let key = installed_key(&params.profile_id);
-    let runtime = lock_runtime(reflex_runtime, "disabling profile registry package")?;
+    let runtime = lock_runtime_while(reflex_runtime, "disabling profile registry package")?;
     let existing = runtime
         .storage_profile_row(key.as_bytes())
         .map_err(storage_error)?
@@ -1441,7 +1443,7 @@ pub fn export_registry(
         ));
     }
     let output_path = required_path("output_path", &params.output_path)?;
-    let runtime = lock_runtime(reflex_runtime, "exporting profile registry")?;
+    let runtime = lock_runtime_while(reflex_runtime, "exporting profile registry")?;
     let inputs = registry_export_inputs(&runtime, params, bundle_kind.as_str())?;
     drop(runtime);
     let (mut bundle_rows, summaries) = collect_export_bundle_rows(
@@ -1589,7 +1591,7 @@ pub fn import_registry(
         summaries.push(row_summary(cf::CF_PROFILES, key.as_bytes(), &encoded));
         profile_rows.push((key.clone().into_bytes(), encoded));
     }
-    let runtime = lock_runtime(reflex_runtime, "importing profile registry")?;
+    let runtime = lock_runtime_while(reflex_runtime, "importing profile registry")?;
     let duplicate_rows =
         filter_duplicate_or_conflicting_rows(&runtime, &mut profile_rows, &mut kv_rows)?;
     let profile_count = profile_rows.len() as u64;
@@ -1779,7 +1781,7 @@ pub fn rollback_registry_profile(
     }
     let installed_key = installed_key(&params.profile_id);
     let updated_at = Utc::now().to_rfc3339();
-    let runtime = lock_runtime(reflex_runtime, "rolling back profile registry package")?;
+    let runtime = lock_runtime_while(reflex_runtime, "rolling back profile registry package")?;
     let installed_bytes = runtime
         .storage_profile_row(installed_key.as_bytes())
         .map_err(storage_error)?
@@ -2014,7 +2016,7 @@ pub fn query_audit_intelligence(
     params: &AuditIntelligenceQueryParams,
 ) -> Result<AuditIntelligenceQueryResponse, ErrorData> {
     validate_limit(params.max_rows)?;
-    let runtime = lock_runtime(reflex_runtime, "querying audit intelligence")?;
+    let runtime = lock_runtime_while(reflex_runtime, "querying audit intelligence")?;
     let action_rows = runtime
         .storage_cf_tail_rows(cf::CF_ACTION_LOG, params.max_rows as usize)
         .map_err(storage_error)?;
@@ -4360,18 +4362,6 @@ fn normalized_query(value: Option<&str>) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-fn lock_runtime<'a>(
-    reflex_runtime: &'a Arc<Mutex<ReflexRuntime>>,
-    context: &str,
-) -> Result<MutexGuard<'a, ReflexRuntime>, ErrorData> {
-    reflex_runtime.lock().map_err(|_error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("reflex runtime lock poisoned while {context}"),
-        )
-    })
-}
-
 fn set_object_field(value: &mut Value, field: &str, next: Value) {
     if let Value::Object(object) = value {
         object.insert(field.to_owned(), next);
@@ -4497,16 +4487,6 @@ fn head_key(source_id: &str) -> String {
 
 fn quality_key(profile_id: &str) -> String {
     format!("profile_quality/v1/{profile_id}")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

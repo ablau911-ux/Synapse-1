@@ -11,6 +11,7 @@ use synapse_action::{
 use synapse_core::error_codes;
 use tokio::runtime::Handle;
 
+use crate::m1::error_code;
 use crate::m3::SharedM3State;
 use crate::server::SynapseService;
 
@@ -859,11 +860,7 @@ fn handle_operator_hotkey(
                 }
                 Err(error) => {
                     synapse_action::record_operator_panic_safety_incident();
-                    let error_code = error
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("code"))
-                        .and_then(serde_json::Value::as_str);
+                    let error_code = error_code(&error);
                     let detail = format!(
                         "K2 fleet kill failed: error_code={error_code:?}; detail={}",
                         error.message

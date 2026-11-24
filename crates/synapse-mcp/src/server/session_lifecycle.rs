@@ -21,7 +21,7 @@ use synapse_storage::{Db, cf};
 
 use crate::{
     http::sse::SseState,
-    m1::mcp_error,
+    m1::{error_code, mcp_error},
     m2::SharedSessionClipboardBuffers,
     m3::SharedM3State,
     m4::{self, OwnedProcessJob},
@@ -2124,12 +2124,7 @@ fn cleanup_shell_jobs(session_id: &str, reason: &str) -> SessionShellCleanupRepo
         },
         Err(error) => SessionShellCleanupReport {
             failed: 1,
-            error_code: error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
+            error_code: error_code(&error).map(ToOwned::to_owned),
             error_message: Some(error.message.to_string()),
             ..SessionShellCleanupReport::default()
         },

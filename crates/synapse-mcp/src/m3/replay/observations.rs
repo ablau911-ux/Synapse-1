@@ -3,7 +3,7 @@ use synapse_core::error_codes;
 use synapse_perception::{ObservationAssembler, ObserveInclude};
 use tokio::io::AsyncWrite;
 
-use crate::m1::{SharedM1State, current_input, mcp_error};
+use crate::m1::{SharedM1State, current_input, error_code, mcp_error};
 
 use super::{ReplayRecordLine, ReplayTarget, serializer::write_json_line};
 
@@ -82,10 +82,5 @@ impl ObservationWrite {
 }
 
 fn is_no_perception_error(error: &ErrorData) -> bool {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str)
-        == Some(error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE)
+    error_code(error) == Some(error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE)
 }

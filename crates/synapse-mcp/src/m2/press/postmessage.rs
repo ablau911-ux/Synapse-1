@@ -5,6 +5,7 @@ use synapse_action::ActionError;
 use synapse_core::Key;
 
 use super::{action_error_to_mcp, key_label};
+use crate::hex::hex_encode;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -793,14 +794,4 @@ fn hwnd_from_i64(hwnd: i64) -> Result<windows::Win32::Foundation::HWND, ActionEr
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: windows::Win32::Foundation::HWND) -> i64 {
     synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }

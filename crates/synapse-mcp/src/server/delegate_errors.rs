@@ -16,6 +16,7 @@ use rmcp::model::ErrorCode;
 use serde_json::{Map, Value, json};
 use synapse_core::error_codes;
 
+use crate::m1::error_code;
 use crate::server::ErrorData;
 
 /// The delegate's own remediation, when it carried one. Empty or
@@ -42,11 +43,7 @@ fn remediation_from(error: &ErrorData) -> Option<String> {
 
 /// The delegate's canonical error code (`data.code`), or `TOOL_INTERNAL_ERROR`.
 pub(crate) fn delegate_code(error: &ErrorData) -> String {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
+    error_code(error)
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned()
 }

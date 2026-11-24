@@ -5,12 +5,12 @@ use serde_json::Value;
 use rmcp::{RoleServer, model::Tool, service::RequestContext};
 
 use crate::server::{
-    ErrorData, Json, Parameters, SynapseService, tool_profiles::ToolProfileSnapshot,
+    ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+    tool_profiles::ToolProfileSnapshot,
 };
 
 use super::{
     TELEMETRY_SOT, TELEMETRY_TOOL,
-    errors::facade_delegate_error,
     types::{
         AgentEventIngressStats, TelemetryParams, TelemetryResponse, TelemetryStatusResponse,
         ToolSurfacePayloadContributor, ToolSurfacePayloadTelemetry, ToolSurfaceTelemetry,
@@ -34,7 +34,7 @@ pub(super) async fn handle(
     let snapshot = service
         .tool_profile_snapshot(session_id.as_deref())
         .map_err(|error| {
-            facade_delegate_error(
+            wrapped_delegate_error(
                 TELEMETRY_TOOL,
                 operation.as_str(),
                 "tool_profile_snapshot",
@@ -44,7 +44,7 @@ pub(super) async fn handle(
             )
         })?;
     let storage_summary = service.storage_summary_snapshot().map_err(|error| {
-        facade_delegate_error(
+        wrapped_delegate_error(
             TELEMETRY_TOOL,
             operation.as_str(),
             "storage_summary",
@@ -58,7 +58,7 @@ pub(super) async fn handle(
     let visible_tools = service
         .tools_for_session_profile(session_id.as_deref())
         .map_err(|error| {
-            facade_delegate_error(
+            wrapped_delegate_error(
                 TELEMETRY_TOOL,
                 operation.as_str(),
                 "tools_for_session_profile",

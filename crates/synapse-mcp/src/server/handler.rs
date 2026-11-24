@@ -2,6 +2,7 @@ use super::{
     ErrorData, Implementation, ServerCapabilities, ServerHandler, ServerInfo, SessionTarget,
     SynapseService, mcp_error, tool_handler,
 };
+use crate::m1::error_code;
 use futures_util::FutureExt as _;
 use rmcp::model::{CallToolResult, ErrorCode};
 use serde_json::{Value, json};
@@ -563,9 +564,7 @@ fn error_snapshot(error: &ErrorData) -> Value {
         "rmcp_code": error.code.0,
         "message": error.message.to_string(),
         "data": error.data.clone(),
-        "synapse_code": error.data.as_ref()
-            .and_then(|data| data.get("code"))
-            .and_then(Value::as_str),
+        "synapse_code": error_code(error),
     })
 }
 
@@ -698,12 +697,7 @@ fn parse_hwnd_literal(value: &str) -> Option<i64> {
 }
 
 fn profile_policy_denied(error: &ErrorData) -> bool {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        == Some(error_codes::TOOL_PROFILE_POLICY_DENIED)
+    error_code(error) == Some(error_codes::TOOL_PROFILE_POLICY_DENIED)
 }
 
 fn daemon_restarting_mcp_error(

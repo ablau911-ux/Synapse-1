@@ -5,7 +5,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rmcp::ErrorData;
-use serde_json::{Value, json};
+use serde_json::json;
 use synapse_core::{
     EventSource, ForegroundContext, Observation, Profile, ProfileBackends, ProfileId,
     SCHEMA_VERSION, SessionId, StoredAppContext, StoredAuditContext, StoredBackendPolicy,
@@ -14,7 +14,10 @@ use synapse_core::{
 };
 
 use super::SynapseService;
-use crate::{m1::mcp_error, m3::AuditSessionState};
+use crate::{
+    m1::{error_code, mcp_error},
+    m3::AuditSessionState,
+};
 
 static EVENT_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 static OBSERVATION_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -133,7 +136,7 @@ impl SynapseService {
             kind: "profile.activation_denied".to_owned(),
             data: json!({
                 "profile_id": profile_id,
-                "error_code": error_data_code(error),
+                "error_code": error_code(error),
                 "message": error.message.to_string(),
                 "data": error.data.clone(),
             }),
@@ -725,12 +728,4 @@ fn now_ts_ns() -> u64 {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     u64::try_from(nanos).unwrap_or(u64::MAX)
-}
-
-fn error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
 }

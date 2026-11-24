@@ -52,9 +52,10 @@ use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json};
 
 use super::{ErrorData, Json, Parameters, SynapseService, mcp_error, tool, tool_router};
+use crate::hex::hex_encode;
 use crate::m3::episodes::{
-    EpisodeListParams, EpisodeView, MAX_LIST_LIMIT, hex_encode, key_after, list_episodes,
-    local_day_start, next_local_day_start,
+    EpisodeListParams, EpisodeView, MAX_LIST_LIMIT, key_after, list_episodes, local_day_start,
+    next_local_day_start,
 };
 use crate::m3::permissions::{Permission, RequiredPermissions, required};
 

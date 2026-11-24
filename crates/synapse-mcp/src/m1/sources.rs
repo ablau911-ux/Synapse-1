@@ -18,6 +18,8 @@ use synapse_core::{
 };
 use synapse_perception::ObservationInput;
 
+use crate::hex::hex_encode;
+
 pub const TIMELINE_CLIPBOARD_ENV: &str = "SYNAPSE_TIMELINE_CLIPBOARD";
 pub const TIMELINE_FILE_ACTIVITY_ENV: &str = "SYNAPSE_TIMELINE_FILE_ACTIVITY";
 const FS_WATCH_ROOT_ENV: &str = "SYNAPSE_FS_WATCH_ROOT";
@@ -237,17 +239,7 @@ fn len_to_u32(value: usize) -> u32 {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("sha256:{}", hex_lower(&digest))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+    format!("sha256:{}", hex_encode(&digest))
 }
 
 pub struct FsRecentTracker {

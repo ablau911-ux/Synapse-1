@@ -14,7 +14,8 @@ use synapse_core::{SCHEMA_VERSION, error_codes};
 use synapse_storage::{Db, cf};
 use uuid::Uuid;
 
-use crate::m1::mcp_error;
+use crate::hex::hex_encode;
+use crate::m1::{error_code, mcp_error};
 
 use super::{
     M3ToolStub,
@@ -732,7 +733,7 @@ pub enum ResolvedApiKey {
 
 fn secret_row_key(name: &str) -> Result<String, ErrorData> {
     let name = normalize_name(name)?;
-    Ok(format!("{SECRET_PREFIX}{}", hex_lower(name.as_bytes())))
+    Ok(format!("{SECRET_PREFIX}{}", hex_encode(name.as_bytes())))
 }
 
 fn read_secret_row_optional(
@@ -805,7 +806,7 @@ pub fn put_model_secret(
         schema_version: SCHEMA_VERSION,
         row_key: row_key.clone(),
         name: normalize_name(name)?,
-        ciphertext_hex: hex_lower(&ciphertext),
+        ciphertext_hex: hex_encode(&ciphertext),
         created_at_unix_ms,
         updated_at_unix_ms: now,
         updated_by_session: by_session.to_owned(),
@@ -1017,11 +1018,7 @@ async fn probe_row(
             request = request.bearer_auth(value);
         }
         Err(error) => {
-            let code = error
-                .data
-                .as_ref()
-                .and_then(|data| data.get("code"))
-                .and_then(serde_json::Value::as_str);
+            let code = error_code(&error);
             let code = match code {
                 Some(error_codes::MODEL_API_KEY_DECRYPT_FAILED) => {
                     error_codes::MODEL_API_KEY_DECRYPT_FAILED
@@ -1502,7 +1499,7 @@ fn write_probe_evidence(
     action: &str,
     by_session: &str,
 ) -> Result<LocalModelStorageReadback, ErrorData> {
-    let name_hex = hex_lower(row.name.as_bytes());
+    let name_hex = hex_encode(row.name.as_bytes());
     let evidence_key = format!(
         "{PROBE_EVIDENCE_PREFIX}{name_hex}/{:020}-{}",
         probe.observed_at_unix_ms,
@@ -1675,7 +1672,7 @@ fn readback_exact_row(db: &Arc<Db>, row_key: &str) -> Result<LocalModelStorageRe
 
 fn registry_row_key(name: &str) -> Result<String, ErrorData> {
     let name = normalize_name(name)?;
-    Ok(format!("{REGISTRY_PREFIX}{}", hex_lower(name.as_bytes())))
+    Ok(format!("{REGISTRY_PREFIX}{}", hex_encode(name.as_bytes())))
 }
 
 fn validate_register_params(params: &LocalModelRegisterParams) -> Result<(), ErrorData> {
@@ -1944,11 +1941,7 @@ fn sha256_bytes(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value);
     let digest = hasher.finalize();
-    hex_lower(&digest)
-}
-
-fn hex_lower(value: &[u8]) -> String {
-    value.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex_encode(&digest)
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, ErrorData> {

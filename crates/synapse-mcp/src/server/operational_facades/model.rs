@@ -2,12 +2,14 @@ use rmcp::{RoleServer, service::RequestContext};
 
 use crate::{
     m3::local_models::{LocalModelListParams, LocalModelListResponse},
-    server::{ErrorData, Json, Parameters, SynapseService},
+    server::{
+        ErrorData, Json, Parameters, SynapseService, delegate_errors::wrapped_delegate_error,
+    },
 };
 
 use super::{
     MODEL_SOT, MODEL_TOOL,
-    errors::{facade_delegate_error, missing_spec},
+    errors::missing_spec,
     policy::{require_maintenance_profile, session_or_stdio},
     response::model_response,
     types::{ModelOperation, ModelParams, ModelResponse, ModelStatusResponse},
@@ -28,7 +30,7 @@ pub(super) async fn handle(
     );
     let by_session = session_or_stdio(&request_context)?;
     let db = service.m3_storage().map_err(|error| {
-        facade_delegate_error(
+        wrapped_delegate_error(
             MODEL_TOOL,
             operation.as_str(),
             "m3_storage",
@@ -50,7 +52,7 @@ pub(super) async fn handle(
             )?;
             let response =
                 crate::m3::local_models::list_local_models(&db, &spec).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         MODEL_TOOL,
                         operation.as_str(),
                         spec.name.as_deref().unwrap_or("registry"),
@@ -82,7 +84,7 @@ pub(super) async fn handle(
             )?;
             let list =
                 crate::m3::local_models::list_local_models(&db, &list_params).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         MODEL_TOOL,
                         operation.as_str(),
                         "registry_status",
@@ -114,7 +116,7 @@ pub(super) async fn handle(
                     crate::m3::local_models::probe_local_model(&db, &spec, &by_session)
                         .await
                         .map_err(|error| {
-                            facade_delegate_error(
+                            wrapped_delegate_error(
                                 MODEL_TOOL,
                                 operation.as_str(),
                                 &spec.name,
@@ -153,7 +155,7 @@ pub(super) async fn handle(
                     crate::m3::local_models::register_local_model(&db, spec, &by_session)
                         .await
                         .map_err(|error| {
-                            facade_delegate_error(
+                            wrapped_delegate_error(
                                 MODEL_TOOL,
                                 operation.as_str(),
                                 "register",
@@ -188,7 +190,7 @@ pub(super) async fn handle(
             let response = crate::m3::local_models::update_local_model(&db, spec, &by_session)
                     .await
                     .map_err(|error| {
-                        facade_delegate_error(
+                        wrapped_delegate_error(
                             MODEL_TOOL,
                             operation.as_str(),
                             "update",
@@ -222,7 +224,7 @@ pub(super) async fn handle(
             )?;
             let response =
                 crate::m3::local_models::remove_local_model(&db, &spec).map_err(|error| {
-                    facade_delegate_error(
+                    wrapped_delegate_error(
                         MODEL_TOOL,
                         operation.as_str(),
                         &spec.name,

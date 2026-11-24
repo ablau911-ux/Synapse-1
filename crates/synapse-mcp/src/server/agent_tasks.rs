@@ -46,6 +46,7 @@ use super::{
     ErrorData, Json, Parameters, SynapseService, mcp_error, session_registry::unix_time_ms_now,
     tool, tool_router,
 };
+use crate::m1::error_code;
 use crate::m4::{
     ActSpawnAgentRequest, default_agent_spawn_hold_open_ms, default_agent_spawn_mcp_url,
     default_agent_spawn_wait_timeout_ms,
@@ -472,12 +473,7 @@ fn task_not_found(task_id: &str) -> ErrorData {
 }
 
 fn error_code_str(error: &ErrorData) -> &str {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("UNKNOWN")
+    error_code(error).unwrap_or("UNKNOWN")
 }
 
 fn is_kebab_id(value: &str) -> bool {

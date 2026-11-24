@@ -26,6 +26,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::m1::error_code;
+
 const SYNAPSE_TOOL_CATALOG: &str = "synapse_tool_catalog";
 const SYNAPSE_TOOL_CALL: &str = "synapse_tool";
 const INTERNALIZED_TOOL_CALL_ENVELOPE: &str = "tool_call";
@@ -4261,12 +4263,7 @@ fn classify_synapse_tool_call_failure(
 }
 
 fn mcp_error_data_code(error: &ErrorData) -> Option<&str> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .filter(|code| is_low_cardinality_error_code(code))
+    error_code(error).filter(|code| is_low_cardinality_error_code(code))
 }
 
 fn is_low_cardinality_error_code(code: &str) -> bool {

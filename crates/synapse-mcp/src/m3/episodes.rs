@@ -31,10 +31,11 @@ use synapse_storage::{
     cf, decode_json, encode_json, episodes as episode_codec, timeline as timeline_codec,
 };
 
+use crate::hex::{hex_decode, hex_encode};
 use crate::m1::mcp_error;
 
 use super::{
-    M3ToolStub,
+    M3ToolStub, lock_runtime,
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -126,31 +127,10 @@ fn internal(detail: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_INTERNAL_ERROR, detail.into())
 }
 
-fn lock_runtime(
-    runtime: &Arc<Mutex<ReflexRuntime>>,
-) -> Result<MutexGuard<'_, ReflexRuntime>, ErrorData> {
-    runtime.lock().map_err(|_err| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "reflex runtime lock poisoned",
-        )
-    })
-}
-
 pub(crate) fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
-}
-
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0F)]));
-    }
-    output
 }
 
 /// Local midnight at or before `ts_ns`, as ns since epoch.
@@ -735,17 +715,6 @@ pub fn required_permissions_list(_params: &EpisodeListParams) -> RequiredPermiss
 #[must_use]
 pub fn required_permissions_get(_params: &EpisodeGetParams) -> RequiredPermissions {
     required([Permission::ReadStorage])
-}
-
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    let text = text.trim();
-    if text.is_empty() || !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(text.get(index..index + 2)?, 16).ok())
-        .collect()
 }
 
 /// `human` or `agent:<session_id>`, matching `timeline_search` output.

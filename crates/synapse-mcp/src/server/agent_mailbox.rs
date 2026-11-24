@@ -27,6 +27,7 @@ use super::{
     session_tools::validate_session_id,
     tool, tool_router,
 };
+use crate::hex::hex_encode;
 
 const SCHEMA_VERSION: u32 = 1;
 const MESSAGE_PREFIX: &str = "agent-mailbox/v1/recipient_hex/";
@@ -1023,12 +1024,13 @@ impl SynapseService {
     ) -> Result<AgentSendBroadcastResponse, ErrorData> {
         validate_session_id(from_session)?;
         validate_broadcast_target(&params.to)?;
-        validate_kind(&params.kind, "agent_send_broadcast")?;
-        validate_ttl_ms(params.ttl_ms, "agent_send_broadcast")?;
-        validate_payload_size(&params.payload, "agent_send_broadcast")?;
-        if let Some(artifact_handle) = &params.artifact_handle {
-            validate_artifact_handle(artifact_handle, "agent_send_broadcast")?;
-        }
+        validate_message_fields(
+            &params.kind,
+            params.ttl_ms,
+            &params.payload,
+            params.artifact_handle.as_deref(),
+            "agent_send_broadcast",
+        )?;
 
         let mut outcomes = Vec::new();
         let mut skipped_count = 0_usize;
@@ -1593,11 +1595,29 @@ fn dashboard_json_readback(value: impl Serialize) -> Result<Value, ErrorData> {
 
 fn validate_send_params(params: &AgentSendParams) -> Result<(), ErrorData> {
     validate_session_id(&params.to_session)?;
-    validate_kind(&params.kind, "agent_send")?;
-    validate_ttl_ms(params.ttl_ms, "agent_send")?;
-    validate_payload_size(&params.payload, "agent_send")?;
-    if let Some(artifact_handle) = &params.artifact_handle {
-        validate_artifact_handle(artifact_handle, "agent_send")?;
+    validate_message_fields(
+        &params.kind,
+        params.ttl_ms,
+        &params.payload,
+        params.artifact_handle.as_deref(),
+        "agent_send",
+    )
+}
+
+/// The message checks `agent_send` and `agent_send_broadcast` share; `op` names the tool in
+/// every error.
+fn validate_message_fields(
+    kind: &str,
+    ttl_ms: u64,
+    payload: &Value,
+    artifact_handle: Option<&str>,
+    op: &str,
+) -> Result<(), ErrorData> {
+    validate_kind(kind, op)?;
+    validate_ttl_ms(ttl_ms, op)?;
+    validate_payload_size(payload, op)?;
+    if let Some(artifact_handle) = artifact_handle {
+        validate_artifact_handle(artifact_handle, op)?;
     }
     Ok(())
 }
@@ -1784,13 +1804,13 @@ fn write_read_receipts(
 }
 
 fn from_session_tag(session_id: &str) -> String {
-    hex_bytes(session_id.as_bytes())
+    hex_encode(session_id.as_bytes())
 }
 
 fn receipt_recipient_prefix(session_id: &str) -> String {
     format!(
         "{RECEIPT_PREFIX}/owner_hex/{}/rcpt/",
-        hex_bytes(session_id.as_bytes())
+        hex_encode(session_id.as_bytes())
     )
 }
 
@@ -1975,7 +1995,7 @@ fn require_mailbox_session_id(
 }
 
 fn mailbox_recipient_prefix(session_id: &str) -> String {
-    format!("{MESSAGE_PREFIX}{}/msg/", hex_bytes(session_id.as_bytes()))
+    format!("{MESSAGE_PREFIX}{}/msg/", hex_encode(session_id.as_bytes()))
 }
 
 fn mailbox_row_key(session_id: &str, sent_at_unix_ms: u64, seq: u64, message_id: &str) -> String {
@@ -1985,19 +2005,9 @@ fn mailbox_row_key(session_id: &str, sent_at_unix_ms: u64, seq: u64, message_id:
     )
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
 pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("sha256:{}", hex_bytes(digest.as_ref()))
+    format!("sha256:{}", hex_encode(digest.as_ref()))
 }
 
 const fn default_message_ttl_ms() -> u64 {

@@ -11,7 +11,7 @@ use synapse_core::{error_codes, types::RoutineFeedbackOutcome};
 
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 
-use crate::m1::CdpOpenTabParams;
+use crate::m1::{CdpOpenTabParams, error_code};
 use crate::m3::approvals::{
     ApprovalKind, ApprovalRequestParams, ApprovalTimeoutDecision, request_approval,
 };
@@ -1116,12 +1116,7 @@ fn step_report(
 }
 
 fn error_data_code(error: &ErrorData) -> Option<String> {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    error_code(error).map(ToOwned::to_owned)
 }
 
 fn is_refusal_code(code: Option<&str>) -> bool {

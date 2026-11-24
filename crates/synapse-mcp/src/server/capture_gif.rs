@@ -27,9 +27,9 @@ use super::{
 use crate::m1::{mcp_error, validate_window_hwnd_shape};
 
 const DEFAULT_DURATION_MS: u64 = 3_000;
-const MAX_DURATION_MS: u64 = 60_000;
+pub(super) const MAX_DURATION_MS: u64 = 60_000;
 const DEFAULT_INTERVAL_MS: u64 = 500;
-const MIN_INTERVAL_MS: u64 = 100;
+pub(super) const MIN_INTERVAL_MS: u64 = 100;
 const DEFAULT_MAX_LONG_EDGE: u32 = 800;
 const FRAME_TIMEOUT_MS: u64 = 1_500;
 

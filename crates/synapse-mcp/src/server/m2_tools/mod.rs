@@ -1702,10 +1702,12 @@ impl SynapseService {
         let result = act_scroll_with_handle_and_boundary(handle, recording, params, boundary).await;
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
-                // The scroll was delivered before this read-back.
+                // The wheel events sent (none for dx = dy = 0) were
+                // delivered before this read-back.
+                let delivered_events = usize::try_from(response.wheel_event_count).unwrap_or(1);
                 self.verify_act_scroll_response(response, before, verify_timeout_ms, point_region)
                     .await
-                    .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, delivered_events))
             }
             (other, _) => other,
         };
@@ -1716,6 +1718,7 @@ impl SynapseService {
                     .source_of_truth
                     .as_deref()
                     .unwrap_or("act_scroll.background_target");
+                let delivered_events = usize::try_from(response.wheel_event_count).unwrap_or(1);
                 let guarded = match self.current_audit_foreground() {
                     Ok(after) => {
                         match verify_background_target_not_activated(
@@ -1735,8 +1738,9 @@ impl SynapseService {
                         &error,
                     )),
                 };
-                // The scroll was delivered before this foreground check.
-                guarded.map_err(|error| crate::m2::error_after_earlier_steps(error, 1))
+                // The wheel events sent were delivered before this foreground check.
+                guarded
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, delivered_events))
             }
             (other, _, _) => other,
         };

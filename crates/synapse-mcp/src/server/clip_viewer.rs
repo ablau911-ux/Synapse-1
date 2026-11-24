@@ -366,7 +366,7 @@ impl ViewedClip {
                 entries.push(self.entry("static", start, end, 0, text));
             }
         }
-        for (start, end, cause) in runs(&self.lines, |line| line.lost.clone()) {
+        for (start, end, cause) in runs(&self.lines, shows_lost) {
             let (before, after) = self.nearest_recorded(start);
             let mut text = format!(
                 "{}-{} lost: {} instants ({cause}), no picture recorded",
@@ -565,6 +565,13 @@ impl ViewedClip {
     }
 }
 
+/// The loss cause of a line that shows no picture. A lost line that keeps a
+/// still (recovery found its video picture missing) shows its exact still,
+/// so the timeline counts it as a settle point, not as lost.
+fn shows_lost(line: &IndexLine) -> Option<String> {
+    line.lost.clone().filter(|_| line.still_file().is_none())
+}
+
 /// How many of `enc`, `same` and `lost` an index line holds.
 fn marks(line: &IndexLine) -> usize {
     [
@@ -704,7 +711,7 @@ impl ClipView {
             .clip
             .lines
             .iter()
-            .filter(|line| line.lost.is_some())
+            .filter(|line| shows_lost(line).is_some())
             .count();
         let _ = writeln!(
             self.text,

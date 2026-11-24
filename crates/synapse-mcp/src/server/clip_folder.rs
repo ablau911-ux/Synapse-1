@@ -47,6 +47,8 @@ pub(super) const LOST_SLOT_OVERFLOW: &str = "slot_overflow";
 pub(super) const LOST_ENCODER_BEHIND: &str = "encoder_behind";
 pub(super) const LOST_CAPTURE_FAILED: &str = "capture_failed";
 pub(super) const LOST_SERVICE_RESTART: &str = "service_restart";
+/// The encoder failed: the instant's picture never reached the video.
+pub(super) const LOST_ENCODER_FAILED: &str = "encoder_failed";
 
 /// IVF container (the AV1 parts): a 32-byte file header, then per picture a
 /// 12-byte header (size, timestamp) and the picture's bytes.
@@ -91,7 +93,9 @@ pub fn still_path(folder: &Path, instant: u64) -> PathBuf {
 /// `same` (unchanged: shows the picture before it) and `lost` (with its
 /// cause) is present; `still` marks the instant whose lossless still exists,
 /// `still_of: k` an instant whose settled picture equals the still of instant
-/// k (no second file is written).
+/// k (no second file is written). A `lost` line can keep its still mark:
+/// recovery found its video picture missing, but its complete still shows the
+/// instant's exact picture.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexLine {
     pub instant: u64,
@@ -230,10 +234,15 @@ pub(super) fn read_ivf(path: &Path) -> Result<Vec<IvfPicture>, String> {
 
 /// Makes an IVF part whose writer died readable: cuts a torn last picture
 /// and writes the count of complete pictures into the header. Returns that
-/// count and the file's new size.
+/// count and the file's new size. A part shorter than its header (its writer
+/// died while writing the header) holds no picture: it is left as it is and
+/// counts 0, so recovery removes it.
 pub(super) fn repair_ivf(path: &Path) -> Result<(u32, u64), String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if bytes.len() < usize::from(IVF_HEADER_BYTES) {
+        return Ok((0, bytes.len() as u64));
+    }
     let (pictures, end) = scan_ivf(&bytes, path)?;
     let count = u32::try_from(pictures.len())
         .map_err(|_| format!("{} holds too many pictures", path.display()))?;

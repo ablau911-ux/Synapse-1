@@ -97,7 +97,8 @@ impl PictureSource {
     /// is on screen: a still there (or on any unchanged instant between)
     /// gives the exact picture, otherwise the encoded video picture is used.
     /// A lost instant, or an unchanged one that repeats a lost picture, is
-    /// lost.
+    /// lost, unless its line keeps a still whose file is on disk (recovery
+    /// found the video picture missing; the still shows the exact picture).
     pub(super) fn resolve(
         folder: &Path,
         lines: &[IndexLine],
@@ -107,14 +108,6 @@ impl PictureSource {
         loop {
             let line = find_line(lines, current)
                 .ok_or_else(|| format!("frames.jsonl has no line for instant {current}"))?;
-            if let Some(cause) = &line.lost {
-                let cause = if current == instant {
-                    cause.clone()
-                } else {
-                    format!("unchanged since instant {current}, which was lost ({cause})")
-                };
-                return Ok(Self::Lost { cause });
-            }
             if let Some(file) = line.still_file()
                 && still_path(folder, file).is_file()
             {
@@ -122,6 +115,14 @@ impl PictureSource {
                     instant: current,
                     file,
                 });
+            }
+            if let Some(cause) = &line.lost {
+                let cause = if current == instant {
+                    cause.clone()
+                } else {
+                    format!("unchanged since instant {current}, which was lost ({cause})")
+                };
+                return Ok(Self::Lost { cause });
             }
             if let Some((part, index)) = line.enc {
                 return Ok(Self::Video {

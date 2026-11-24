@@ -269,7 +269,10 @@ impl ClipStream {
                         bgra.len()
                     ));
                 }
-                let shown = self.shown.as_ref();
+                // After a lost instant a picture is always a change: `same`
+                // would point back to the loss, so the first picture after it
+                // goes into the video again even when its pixels repeat.
+                let shown = self.shown.as_ref().filter(|_| self.previous_lost.is_none());
                 let same = self.compare.time(|| {
                     shown.is_some_and(|shown| {
                         (shown.width, shown.height) == (width, height) && shown.bgra == bgra
@@ -323,13 +326,17 @@ impl ClipStream {
     /// Writes the waiting index lines (an open still is not written: the
     /// recording ended before its picture settled), lets the encoder thread
     /// encode every queued picture and closes the last part. An encoder error
-    /// is returned, so the clip fails instead of turning ready.
+    /// is returned, so the clip fails instead of turning ready. The encoder
+    /// thread is always joined, also when the last index lines fail to write;
+    /// that error is returned after it.
     pub(super) fn finish(mut self) -> Result<StreamSummary, String> {
-        self.index.write_decided(None)?;
+        let flushed = self.index.write_decided(None);
+        let video = self.video.take().map(VideoQueue::finish);
+        flushed?;
         let encoder = self.encoder_info();
-        let (parts, video_times) = match self.video.take() {
-            Some(video) => {
-                let (written, times) = video.finish()?;
+        let (parts, video_times) = match video {
+            Some(finished) => {
+                let (written, times) = finished?;
                 (written.closed_parts, times)
             }
             None => (Vec::new(), VideoTimes::default()),

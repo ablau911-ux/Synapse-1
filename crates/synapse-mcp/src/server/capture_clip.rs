@@ -582,8 +582,9 @@ mod live {
     use super::super::clip_folder::{
         CLIP_METHOD, CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry,
         ClipState, ClipTargetInfo, ConditionStatus, Conditions, LOST_CAPTURE_FAILED,
-        LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason,
+        LOST_ENCODER_FAILED, LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason,
     };
+    use super::super::clip_recovery::ClipRecovery;
     use super::super::clip_stream::{
         ClipStream, SETTLE_INSTANTS, StageTime, StreamInput, StreamTimes,
     };
@@ -613,6 +614,11 @@ mod live {
     /// One clip. Sends the start result as soon as `clip.json` and instant
     /// zero are written.
     pub(super) fn record(plan: &ClipPlan, control: &RecordingControl, started: StartSender) {
+        if let Err(error) = create_clip_folder(plan) {
+            // Nothing of this recording exists: nothing is removed.
+            let _ = started.send(Err(error));
+            return;
+        }
         let mut recording = match Recording::start(plan) {
             Ok(recording) => recording,
             Err(error) => {
@@ -638,6 +644,29 @@ mod live {
     /// A `record` that fails before its first picture removes the folder it
     /// created (plan §3; #290). `capture_clip_plan` refuses a folder that
     /// existed before the call, so this never touches one.
+    /// Applies the Windows build rule (owned by the observer) before anything
+    /// exists, so an old Windows leaves nothing behind, then creates the clip
+    /// folder exclusively: a folder that exists by now (another process made
+    /// it after the plan's check) is refused, never taken over, so a failed
+    /// start removes only a folder this recording created.
+    fn create_clip_folder(plan: &ClipPlan) -> Result<(), ErrorData> {
+        synapse_capture::check_windows_build().map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("screenshot operation=record: {error}"),
+            )
+        })?;
+        let could_not_create = |path: &Path, error: std::io::Error| {
+            internal_error(format!("could not create {}: {error}", path.display()))
+        };
+        if let Some(parent) = plan.folder.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| could_not_create(parent, error))?;
+        }
+        std::fs::create_dir(&plan.folder).map_err(|error| could_not_create(&plan.folder, error))
+    }
+
+    /// Removes the clip folder this recording created (`create_clip_folder`)
+    /// and its registry entry, after a start that failed before its first picture.
     fn discard_folder(plan: &ClipPlan) {
         match std::fs::remove_dir_all(&plan.folder) {
             Ok(()) => {}
@@ -773,22 +802,9 @@ mod live {
 
     impl<'a> Recording<'a> {
         /// Folder, lock, `clip.json`, observer, first frame and instant zero.
+        /// The clip folder exists: `create_clip_folder` made it.
         fn start(plan: &'a ClipPlan) -> Result<Self, ErrorData> {
             let times = RecordingTimes::begin();
-            // The observer owns the Windows build rule; applied before the
-            // clip folder exists, so an old Windows leaves nothing behind.
-            synapse_capture::check_windows_build().map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("screenshot operation=record: {error}"),
-                )
-            })?;
-            std::fs::create_dir_all(&plan.folder).map_err(|error| {
-                internal_error(format!(
-                    "could not create {}: {error}",
-                    plan.folder.display()
-                ))
-            })?;
             // Taken before `clip.json` exists, so recovery never sees this
             // clip `recording` without a live recorder.
             let recorder_lock = RecorderLock::acquire(&plan.folder).map_err(internal_error)?;
@@ -1080,10 +1096,22 @@ mod live {
                 Ok(summary) => summary,
                 Err(error) => {
                     tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
+                    // Recovery never visits a failed clip, so the index is made
+                    // to agree with the pictures on disk now, by its rule.
+                    let lost = ClipRecovery::reconcile_failed(
+                        folder,
+                        RECORD_FPS,
+                        LOST_ENCODER_FAILED,
+                    )
+                    .unwrap_or_else(|reconcile| {
+                        tracing::warn!(code = "CAPTURE_CLIP_RECONCILE_FAILED", error = %reconcile);
+                        Vec::new()
+                    });
                     let _ = self.times.clip_json.time(|| {
                         ClipJson::update(folder, |clip| {
                             clip.state = ClipState::Failed;
                             clip.failure = Some(error);
+                            clip.add_lost(lost);
                         })
                     });
                     let stats = self.observer.stop();

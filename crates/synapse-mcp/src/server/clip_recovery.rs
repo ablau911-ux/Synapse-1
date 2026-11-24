@@ -2,10 +2,14 @@
 //!
 //! A clip whose recorder no longer holds its lock and whose `clip.json`
 //! still says `recording` is made readable: every IVF part is cut to its last
-//! complete picture and gets its picture count; every complete part and
-//! every still the index names is kept; index lines whose picture did not
-//! reach the disk, and the instants never written up to the planned end,
-//! are named lost (`service_restart`), each once. The clip is then `ready`.
+//! complete picture and gets its picture count (a part killed inside its
+//! header holds none and is removed); every complete part and every still
+//! the index names is kept; index lines whose video picture did not reach the
+//! disk, and the instants never written up to the planned end, are named lost
+//! (`service_restart`), each once. A lost line keeps its still mark: a
+//! complete still is never deleted for a missing video picture. The clip is
+//! then `ready`. A recording that fails gets the same index rule at once
+//! (`reconcile_failed`), since recovery never visits a failed clip.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -34,17 +38,10 @@ impl ClipRecovery {
         if clip.fps == 0 {
             return Err("recording has zero fps".into());
         }
-        let complete = Self::repair_parts(folder)?;
-        let read = read_index(folder).map_err(|error| error.to_string())?;
-        let planned = clip.end_ms * u64::from(clip.fps) / MILLISECONDS_PER_SECOND;
-        let lines = Self::repair_index(&read, &complete, planned, clip.fps);
-        if lines != read {
-            let mut text = String::new();
-            for line in &lines {
-                text.push_str(&line.text()?);
-            }
-            write_bytes_atomically(&folder.join(FRAMES_FILE), text.as_bytes())?;
-        }
+        // Instant k is recorded when k / f < end: ceil(end * f / 1000) instants.
+        let planned = (clip.end_ms * u64::from(clip.fps)).div_ceil(MILLISECONDS_PER_SECOND);
+        let (lines, complete) =
+            Self::reconcile(folder, Some(planned), clip.fps, LOST_SERVICE_RESTART)?;
         let parts = Self::parts(folder, &lines, &complete)?;
         let stills = Self::stills(folder, &lines)?;
         let lost: Vec<LostInstant> = lines
@@ -79,6 +76,52 @@ impl ClipRecovery {
         .and_then(|(_, result)| result)
     }
 
+    /// Makes the index of a recording that failed (its encoder stopped)
+    /// agree with the pictures on disk, before the clip is published
+    /// `failed` (recovery never visits a failed clip): every line whose video
+    /// picture did not reach the disk is named lost (`cause`), by the rule
+    /// recovery uses. No instant is added. Returns every lost instant of the
+    /// index, for `clip.json`.
+    pub(super) fn reconcile_failed(
+        folder: &Path,
+        fps: u32,
+        cause: &str,
+    ) -> Result<Vec<LostInstant>, String> {
+        let (lines, _) = Self::reconcile(folder, None, fps, cause)?;
+        Ok(lines
+            .iter()
+            .filter_map(|line| {
+                line.lost.as_ref().map(|cause| LostInstant {
+                    instant: line.instant,
+                    cause: cause.clone(),
+                })
+            })
+            .collect())
+    }
+
+    /// Repairs the parts, then rewrites the index (when it changes) by
+    /// `repair_index`; `planned` instants are filled up with lost lines.
+    /// Returns the index and each part's count of complete pictures.
+    fn reconcile(
+        folder: &Path,
+        planned: Option<u64>,
+        fps: u32,
+        cause: &str,
+    ) -> Result<(Vec<IndexLine>, BTreeMap<u32, u32>), String> {
+        let complete = Self::repair_parts(folder)?;
+        let read = read_index(folder).map_err(|error| error.to_string())?;
+        let planned = planned.unwrap_or(read.len() as u64);
+        let lines = Self::repair_index(&read, &complete, planned, fps, cause);
+        if lines != read {
+            let mut text = String::new();
+            for line in &lines {
+                text.push_str(&line.text()?);
+            }
+            write_bytes_atomically(&folder.join(FRAMES_FILE), text.as_bytes())?;
+        }
+        Ok((lines, complete))
+    }
+
     /// Repairs every part file `video/part-NNNN.ivf`, numbered from 0000;
     /// returns each part's count of complete pictures.
     fn repair_parts(folder: &Path) -> Result<BTreeMap<u32, u32>, String> {
@@ -92,22 +135,26 @@ impl ClipRecovery {
         Ok(complete)
     }
 
-    /// The index after the recorder's death: in order from instant 0 with no
-    /// gap; an `enc` line whose picture is not complete on disk, and a `same`
-    /// line after a lost one, become lost; the instants never written, up to
-    /// the planned end, are added as lost.
+    /// The index after the recorder's death or failure: in order from
+    /// instant 0 with no gap; an `enc` line whose picture is not complete on
+    /// disk, and a `same` line after a line that shows no picture, become
+    /// lost (`cause`); the instants never written, up to `planned`, are added
+    /// as lost. A line that becomes lost keeps its still mark (`still` or
+    /// `still_of`): the still file is complete and still shows the instant's
+    /// exact picture, so it is never deleted for a missing video picture.
     fn repair_index(
         read: &[IndexLine],
         complete: &BTreeMap<u32, u32>,
         planned: u64,
         fps: u32,
+        cause: &str,
     ) -> Vec<IndexLine> {
         let lost_line = |instant: u64| IndexLine {
             instant,
             t_ms: instant * MILLISECONDS_PER_SECOND / u64::from(fps),
             enc: None,
             same: None,
-            lost: Some(LOST_SERVICE_RESTART.to_owned()),
+            lost: Some(cause.to_owned()),
             still: None,
             still_of: None,
         };
@@ -119,10 +166,18 @@ impl ClipRecovery {
             let picture_missing = line
                 .enc
                 .is_some_and(|(part, index)| complete.get(&part).is_none_or(|&held| index >= held));
-            let previous_lost = lines.last().is_some_and(|before| before.lost.is_some());
-            let shows_missing = line.same.is_some() && previous_lost;
+            // A lost line with a still still shows a picture: the one of its still.
+            let previous_shows_nothing = lines
+                .last()
+                .is_some_and(|before| before.lost.is_some() && before.still_file().is_none());
+            let shows_missing = line.same.is_some() && previous_shows_nothing;
             if picture_missing || shows_missing {
-                lines.push(lost_line(line.instant));
+                lines.push(IndexLine {
+                    enc: None,
+                    same: None,
+                    lost: Some(cause.to_owned()),
+                    ..line.clone()
+                });
             } else {
                 lines.push(line.clone());
             }

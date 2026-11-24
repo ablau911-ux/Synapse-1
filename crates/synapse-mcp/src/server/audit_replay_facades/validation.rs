@@ -62,15 +62,15 @@ fn validate_exact_spec(
     payload_optional: &[&'static str],
     source_of_truth: &'static str,
 ) -> Result<(), ErrorData> {
-    let matching_present = payload_optional.contains(&operation)
-        || specs
-            .iter()
-            .any(|(name, present)| *name == operation && *present);
+    let matching_present = specs
+        .iter()
+        .any(|(name, present)| *name == operation && *present);
+    let matching_satisfied = matching_present || payload_optional.contains(&operation);
     let extra = specs
         .iter()
         .filter_map(|(name, present)| (*present && *name != operation).then_some(*name))
         .collect::<Vec<_>>();
-    if matching_present && extra.is_empty() {
+    if matching_satisfied && extra.is_empty() {
         return Ok(());
     }
     Err(ErrorData::new(

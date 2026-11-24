@@ -468,10 +468,14 @@ impl VideoWritten {
     }
 }
 
-/// The encoder thread's side: one AV1 encoder, a new IVF part at each key picture.
+/// The encoder thread's side: one AV1 encoder, a new IVF part at each key
+/// picture. libaom encodes one size per encoder, so a picture of a new size
+/// (always a planned key picture) gets a new encoder and opens a new part.
 struct ClipEncoder {
     folder: PathBuf,
     encoder: Av1Encoder,
+    settings: EncoderSettings,
+    /// The size of the current encoder and part.
     width: u32,
     height: u32,
     part: Option<OpenPart>,
@@ -489,6 +493,7 @@ impl ClipEncoder {
         Ok(Self {
             folder: folder.to_owned(),
             encoder: Av1Encoder::create(width, height, settings)?,
+            settings,
             width,
             height,
             part: None,
@@ -501,6 +506,21 @@ impl ClipEncoder {
     /// recorder said, because the index already names that place.
     fn encode(&mut self, job: Job) -> Result<VideoWritten, String> {
         let pts = i64::try_from(job.instant).map_err(|_| "instant out of range".to_owned())?;
+        let size = (
+            u32::try_from(job.picture.width).map_err(|_| "picture too wide".to_owned())?,
+            u32::try_from(job.picture.height).map_err(|_| "picture too tall".to_owned())?,
+        );
+        if size != (self.width, self.height) {
+            if !job.force_key {
+                return Err(format!(
+                    "instant {}: the picture size changed without a planned key picture",
+                    job.instant
+                ));
+            }
+            // The key picture below closes the part of the old size and opens one of this size.
+            self.encoder = Av1Encoder::create(size.0, size.1, self.settings)?;
+            (self.width, self.height) = size;
+        }
         let started = Instant::now();
         let packet = self.encoder.encode(&job.picture, pts, job.force_key)?;
         let took = started.elapsed();
@@ -611,14 +631,15 @@ fn encode_queued(
 
 /// The clip's video behind a bounded queue (plan §6). On the recorder thread
 /// it converts each changed picture to 4:2:0, gives it its place [part,
-/// index] (a new part at every key picture, `key_instants` apart) and queues
-/// it; the encoder thread encodes the pictures in order and checks each
-/// place. A full queue refuses the picture at once: the recorder never waits
-/// for an encode.
+/// index] (a new part at every key picture: `key_instants` apart, and at the
+/// first picture of a new window size) and queues it; the encoder thread
+/// encodes the pictures in order and checks each place. A full queue refuses
+/// the picture at once: the recorder never waits for an encode.
 pub(super) struct VideoQueue {
-    width: u32,
-    height: u32,
+    /// Converts pictures of the size it was made for; replaced when the size changes.
     converter: I420Converter,
+    /// The size of the last queued picture.
+    queued_size: Option<(u32, u32)>,
     key_instants: u64,
     last_key: Option<u64>,
     /// The place of the last queued picture.
@@ -664,9 +685,8 @@ impl VideoQueue {
             })
             .map_err(|error| format!("could not start the encoder thread: {error}"))?;
         Ok(Self {
-            width,
-            height,
             converter: I420Converter::new(width, height),
+            queued_size: None,
             key_instants: settings.key_instants,
             last_key: None,
             last_place: None,
@@ -678,16 +698,25 @@ impl VideoQueue {
         })
     }
 
-    pub(super) const fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// Converts and queues the picture of `instant` (B,G,R,A rows); returns
-    /// its place, or `None` when the queue is full (the encoder is behind).
-    pub(super) fn submit(&mut self, instant: u64, bgra: &[u8]) -> Result<Option<VideoPlace>, String> {
-        let force_key = self
-            .last_key
-            .is_none_or(|key| instant >= key + self.key_instants);
+    /// Converts and queues the picture of `instant` (B,G,R,A rows of `width`
+    /// x `height`); returns its place, or `None` when the queue is full (the
+    /// encoder is behind). The first picture of a new size is a key picture
+    /// that starts a new part.
+    pub(super) fn submit(
+        &mut self,
+        instant: u64,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Option<VideoPlace>, String> {
+        let resized = self.queued_size.is_some_and(|size| size != (width, height));
+        let force_key = resized
+            || self
+                .last_key
+                .is_none_or(|key| instant >= key + self.key_instants);
+        if (self.converter.width, self.converter.height) != (width as usize, height as usize) {
+            self.converter = I420Converter::new(width, height);
+        }
         let place = match self.last_place {
             Some((part, index)) if !force_key => (part, index + 1),
             Some((part, _)) => (part + 1, 0),
@@ -724,6 +753,7 @@ impl VideoQueue {
             self.last_key = Some(instant);
         }
         self.last_place = Some(place);
+        self.queued_size = Some((width, height));
         Ok(Some(place))
     }
 

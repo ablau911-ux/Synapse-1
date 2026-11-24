@@ -42,7 +42,6 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Loss causes named in `frames.jsonl` and `clip.json`.
 pub(super) const LOST_NO_PICTURE_YET: &str = "no_picture_yet";
-pub(super) const LOST_WINDOW_RESIZED: &str = "window_resized";
 pub(super) const LOST_SLOT_OVERFLOW: &str = "slot_overflow";
 /// The encoder queue was full: the changed picture could not be queued.
 pub(super) const LOST_ENCODER_BEHIND: &str = "encoder_behind";
@@ -57,6 +56,9 @@ const IVF_HEADER_BYTES: u16 = 32;
 const IVF_AV1_FOURCC: &[u8; 4] = b"AV01";
 const IVF_TIME_SCALE: u32 = 1;
 const IVF_PICTURE_COUNT_OFFSET: u64 = 24;
+/// Where the IVF header holds the part's picture width and height (u16 each).
+const IVF_WIDTH_OFFSET: usize = 12;
+const IVF_HEIGHT_OFFSET: usize = 14;
 const IVF_PICTURE_HEADER_BYTES: usize = 12;
 const IVF_SIZE_FIELD_BYTES: usize = 4;
 
@@ -378,7 +380,9 @@ pub(super) struct EncoderInfo {
     pub(super) settings: serde_json::Value,
 }
 
-/// One complete video part, read back after it was closed.
+/// One complete video part, read back after it was closed. A window can
+/// change size while it is recorded; every part holds pictures of one size,
+/// and a new size starts a new part.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PartInfo {
     pub(super) part: u32,
@@ -387,12 +391,19 @@ pub(super) struct PartInfo {
     pub(super) first_instant: u64,
     pub(super) last_instant: u64,
     pub(super) pictures: u32,
+    /// The part's picture size. Absent in a `clip.json` written before parts
+    /// had their own size: `ClipJson::read` fills in the clip's geometry.
+    #[serde(default)]
+    pub(super) width: u32,
+    #[serde(default)]
+    pub(super) height: u32,
     pub(super) bytes: u64,
     pub(super) sha256: String,
 }
 
 impl PartInfo {
-    /// Reads a closed part back: its size and SHA-256.
+    /// Reads a closed part back: its picture size (from its IVF header), its
+    /// size on disk and SHA-256.
     pub(super) fn read_back(
         folder: &Path,
         part: u32,
@@ -401,6 +412,7 @@ impl PartInfo {
         pictures: u32,
     ) -> Result<Self, String> {
         let path = part_path(folder, part);
+        let (width, height) = ivf_picture_size(&path)?;
         let (bytes, sha256) = file_size_and_sha256(&path)
             .map_err(|error| format!("could not read back {}: {error}", path.display()))?;
         Ok(Self {
@@ -409,10 +421,22 @@ impl PartInfo {
             first_instant,
             last_instant,
             pictures,
+            width,
+            height,
             bytes,
             sha256,
         })
     }
+}
+
+/// The picture width and height an IVF part's header names.
+fn ivf_picture_size(path: &Path) -> Result<(u32, u32), String> {
+    let mut header = [0_u8; IVF_HEADER_BYTES as usize];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|error| format!("could not read the IVF header of {}: {error}", path.display()))?;
+    let field = |at: usize| u32::from(u16::from_le_bytes([header[at], header[at + 1]]));
+    Ok((field(IVF_WIDTH_OFFSET), field(IVF_HEIGHT_OFFSET)))
 }
 
 /// One lossless still.
@@ -550,8 +574,13 @@ impl ClipJson {
         let path = folder.join(CLIP_JSON_FILE);
         let text = retry_brief_hold(|| std::fs::read_to_string(&path))
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        let clip: Self = serde_json::from_str(&text)
+        let mut clip: Self = serde_json::from_str(&text)
             .map_err(|error| format!("{} is not valid: {error}", path.display()))?;
+        // Parts written before parts had their own size hold the clip's size.
+        let geometry = (clip.geometry.recorded_width, clip.geometry.recorded_height);
+        for part in clip.parts.iter_mut().filter(|part| part.width == 0) {
+            (part.width, part.height) = geometry;
+        }
         if clip.schema_version != CLIP_SCHEMA_VERSION {
             return Err(format!(
                 "{} schema_version {} is not supported (expected {CLIP_SCHEMA_VERSION})",

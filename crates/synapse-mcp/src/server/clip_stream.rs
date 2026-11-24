@@ -28,8 +28,8 @@ use super::clip_encoder::{
     BGRA_BYTES, EncoderSettings, VideoPlace, VideoQueue, VideoTimes, encoder_name,
 };
 use super::clip_folder::{
-    EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_NO_PICTURE_YET,
-    LOST_WINDOW_RESIZED, LostInstant, PartInfo, RECORD_FPS, STILLS_DIR, StillInfo, still_path,
+    EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_NO_PICTURE_YET, LostInstant,
+    PartInfo, RECORD_FPS, STILLS_DIR, StillInfo, still_path,
 };
 
 /// `SETTLE_INSTANTS`: 0.5 s on screen, the changed instant included (plan §6).
@@ -278,13 +278,8 @@ impl ClipStream {
                 if same {
                     return Ok(Decision::Same);
                 }
-                if self
-                    .video
-                    .as_ref()
-                    .is_some_and(|video| video.size() != (width, height))
-                {
-                    return Ok(Decision::Lost(LOST_WINDOW_RESIZED));
-                }
+                // A new window size is a change like any other: the video
+                // starts a new part at that size.
                 Ok(match self.queue(instant, bgra, width, height)? {
                     Some(place) => Decision::Enc(place),
                     None => Decision::Lost(LOST_ENCODER_BEHIND),
@@ -311,7 +306,7 @@ impl ClipStream {
                 self.settings,
             )?),
         };
-        let Some(place) = video.submit(instant, bgra)? else {
+        let Some(place) = video.submit(instant, bgra, width, height)? else {
             return Ok(None);
         };
         let shown = self.shown.get_or_insert_with(|| Shown {

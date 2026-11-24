@@ -330,12 +330,8 @@ fn status_of(
                 sha256: part.sha256.clone(),
                 start_ms: part.first_instant * 1_000 / u64::from(clip.fps),
                 end_ms: (part.last_instant + 1) * 1_000 / u64::from(clip.fps),
-                rect: [
-                    0,
-                    0,
-                    clip.geometry.window_width,
-                    clip.geometry.window_height,
-                ],
+                // Each part holds pictures of its own size (a resize starts a new part).
+                rect: [0, 0, part.width, part.height],
                 frames: part.pictures,
             })
             .collect(),

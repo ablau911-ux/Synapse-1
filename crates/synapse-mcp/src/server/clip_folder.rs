@@ -967,57 +967,29 @@ impl ClipRegistry {
     }
 
     /// Drops a clip from the registry (a `record` that failed before its
-    /// first picture removed its folder). A failed start leaves the disk as
-    /// it was: when that start created the default clips folder
-    /// (`root_created`) and no entry is left, the registry file and then its
-    /// lock file are removed, so the folder is empty again for the start to
-    /// remove.
-    pub(super) fn remove(clip_id: &str, root_created: bool) -> Result<(), String> {
+    /// first picture removed its folder). The registry file and its lock
+    /// file stay: they belong to the registry, which every start shares, and
+    /// a lock file deleted while another process waits on it would let two
+    /// writers hold different lock files at once.
+    pub(super) fn remove(clip_id: &str) -> Result<(), String> {
         if !Self::entries()?
             .iter()
             .any(|entry| entry.clip_id == clip_id)
         {
             return Ok(());
         }
-        let path = Self::path();
-        let lock_path = Self::lock_path();
-        let emptied = {
-            let _lock = FolderLock::on(&lock_path)?;
-            let mut entries = Self::entries()?;
-            entries.retain(|entry| entry.clip_id != clip_id);
-            if root_created && entries.is_empty() {
-                retry_brief_hold(|| std::fs::remove_file(&path))
-                    .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
-                true
-            } else {
-                write_atomically(&path, &entries)?;
-                false
-            }
-        };
-        if emptied {
-            match retry_brief_hold(|| std::fs::remove_file(&lock_path)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("could not remove {}: {error}", lock_path.display()));
-                }
-            }
-        }
-        Ok(())
+        Self::change(|entries| entries.retain(|entry| entry.clip_id != clip_id))
     }
 
     fn change(edit: impl FnOnce(&mut Vec<RegistryEntry>)) -> Result<(), String> {
         let root = clips_root();
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("could not create {}: {error}", root.display()))?;
-        let _lock = FolderLock::on(&Self::lock_path())?;
+        let path = Self::path();
+        let _lock = FolderLock::on(&path.with_extension(format!("json{LOCK_SUFFIX}")))?;
         let mut entries = Self::entries()?;
         edit(&mut entries);
-        write_atomically(&Self::path(), &entries)
-    }
-
-    fn lock_path() -> PathBuf {
-        Self::path().with_extension(format!("json{LOCK_SUFFIX}"))
+        write_atomically(&path, &entries)
     }
 
     /// The folder of a clip id: the registry, then the default folder (a clip

@@ -758,13 +758,13 @@ mod live {
     /// A `record` that fails before its first picture removes the folder it
     /// created (plan §3; #290). `capture_clip_plan` refuses a folder that
     /// existed before the call, so this never touches one.
-    /// After a start that failed before its first picture, the disk is left
-    /// as it was: the clip folder this recording created
-    /// (`create_clip_folder`) is removed, then its registry entry (with the
-    /// registry file and its lock file when this start created the default
-    /// clips folder and no other clip is listed), then the parents this
-    /// start created: those of the clip folder up to `first_created`, and the
-    /// default clips folder up to `root_first_created`.
+    /// After a start that failed before its first picture, the clip folder
+    /// this recording created (`create_clip_folder`) is removed, then its
+    /// registry entry, then every folder this start created that is then
+    /// empty: the parents of the clip folder up to `first_created`, and the
+    /// default clips folder up to `root_first_created`. The registry file and
+    /// its lock file stay (`ClipRegistry::remove`), so a clips folder that
+    /// holds them stays.
     fn discard_folder(plan: &ClipPlan, first_created: &Path, root_first_created: Option<&Path>) {
         match std::fs::remove_dir_all(&plan.folder) {
             Ok(()) => {}
@@ -775,7 +775,7 @@ mod live {
                 error = %error
             ),
         }
-        if let Err(error) = ClipRegistry::remove(&plan.clip_id, root_first_created.is_some()) {
+        if let Err(error) = ClipRegistry::remove(&plan.clip_id) {
             tracing::warn!(code = "CAPTURE_CLIP_DISCARD_FAILED", error = %error);
         }
         remove_created_parents(&plan.folder, first_created);

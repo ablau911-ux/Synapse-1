@@ -33,6 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 use rmcp::{RoleServer, service::RequestContext};
@@ -57,6 +58,10 @@ use crate::m4::{
 const TASK_NAMESPACE: &str = "agent-task/v1";
 const TASK_SCHEMA_VERSION: u32 = 1;
 const TASK_SEQUENCE_KEY: &str = "agent-task/v1/meta/last_enqueue_seq";
+/// Held by every read-check-write of task rows (and the sequence watermark),
+/// so a writer only changes the row it checked: a stale snapshot never
+/// overwrites a concurrent cancel, and exactly one create of a `task_id` wins.
+static TASK_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 const MAX_TASK_ID_CHARS: usize = 200;
 const MAX_TITLE_CHARS: usize = 500;
@@ -471,6 +476,15 @@ fn task_not_found(task_id: &str) -> ErrorData {
         error_codes::AGENT_TASK_NOT_FOUND,
         format!("agent_task not found: no task with id {task_id:?}"),
     )
+}
+
+fn task_write_lock() -> Result<MutexGuard<'static, ()>, ErrorData> {
+    TASK_WRITE_LOCK.lock().map_err(|_error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "agent_task write lock poisoned",
+        )
+    })
 }
 
 fn error_code_str(error: &ErrorData) -> &str {
@@ -939,6 +953,7 @@ impl SynapseService {
     }
 
     fn prune_terminal_tasks(db: &Db, now: u64) -> Result<usize, ErrorData> {
+        let _write_guard = task_write_lock()?;
         Self::ensure_enqueue_seq_watermark(db)?;
         let rows = Self::scan_task_rows(db)?;
         Self::prune_terminal_task_rows(db, now, &rows)
@@ -991,6 +1006,7 @@ impl SynapseService {
         now: u64,
         spawn_log_root: Option<&Path>,
     ) -> Result<(usize, Vec<String>), ErrorData> {
+        let _write_guard = task_write_lock()?;
         let tasks = Self::read_all_tasks(db)?;
         let mut scanned = 0usize;
         let mut flagged = Vec::new();
@@ -1060,9 +1076,9 @@ impl SynapseService {
 
     /// Shared claim primitive: transitions a `todo` task to `in_progress` and
     /// appends a `Pending` attempt bound to `session_id`. Rejects a claim on a
-    /// task that is not `todo` (duplicate-claim race protection — the daemon's
-    /// storage path is serialized so the first claim wins and the second sees
-    /// `in_progress`).
+    /// task that is not `todo` (duplicate-claim race protection — the task
+    /// write lock covers the read and the write, so the first claim wins and
+    /// the second sees `in_progress`).
     fn claim_internal(
         db: &Db,
         task_id: &str,
@@ -1070,6 +1086,7 @@ impl SynapseService {
         spawn_id: Option<String>,
         template_version: Option<u32>,
     ) -> Result<AgentTask, ErrorData> {
+        let _write_guard = task_write_lock()?;
         let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
         if task.state != TaskState::Todo {
             return Err(mcp_error(
@@ -1193,6 +1210,7 @@ impl SynapseService {
         params: TaskUpdateParams,
     ) -> Result<TaskMutationResponse, ErrorData> {
         let db = self.agent_task_db()?;
+        let _write_guard = task_write_lock()?;
         let mut task = Self::read_task(&db, &params.task_id)?
             .ok_or_else(|| task_not_found(&params.task_id))?;
         let now = unix_time_ms_now();
@@ -1406,6 +1424,7 @@ impl SynapseService {
         task_id: &str,
         reason: String,
     ) -> Result<AgentTask, ErrorData> {
+        let _write_guard = task_write_lock()?;
         let mut task = Self::read_task(db, task_id)?.ok_or_else(|| task_not_found(task_id))?;
         if task.state != TaskState::Todo {
             return Err(mcp_error(

@@ -714,21 +714,49 @@ fn jsonrpc_message(bytes: &[u8]) -> Result<serde_json::Value, Response> {
     let has_method = message
         .get("method")
         .is_some_and(serde_json::Value::is_string);
-    // rmcp decodes an `error` member as its `ErrorData` (an integer `code`, a
-    // string `message`); any other `error` fails rmcp's decode and gets its
-    // plain-text 415 (#189).
-    let error_decodes = message
-        .get("error")
-        .map(|error| <rmcp::model::ErrorData as serde::Deserialize>::deserialize(error).is_ok());
-    let is_response = message.contains_key("id")
-        && (message.contains_key("result") || error_decodes == Some(true));
+    let has_id = message.contains_key("id");
+    let is_response =
+        has_id && (message.contains_key("result") || message.contains_key("error"));
     if !has_method && !is_response {
-        let detail = if error_decodes == Some(false) {
-            "`error` must be an object with an integer `code` and a string `message`"
-        } else {
-            "a message needs a string `method`, or an `id` with `result` or `error`"
-        };
-        return Err(invalid_jsonrpc_request(id, detail));
+        return Err(invalid_jsonrpc_request(
+            id,
+            "a message needs a string `method`, or an `id` with `result` or `error`",
+        ));
+    }
+    // rmcp decodes the raw body as its typed `ClientJsonRpcMessage` (rmcp
+    // 1.7.0 `expect_json`) and answers a failure with a plain-text 415 (#189).
+    // The checks above read a parsed `Value`, which keeps the last of two
+    // nested members with one name where the typed decode refuses them, so
+    // the same typed decode runs here on the same raw bytes.
+    match serde_json::from_slice::<rmcp::model::ClientJsonRpcMessage>(bytes) {
+        Err(error) if !has_method && message.contains_key("error") => {
+            return Err(invalid_jsonrpc_request(
+                id,
+                &format!(
+                    "`error` must be an object with an integer `code` and a string `message`: {error}"
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(invalid_jsonrpc_request(
+                id,
+                &format!("the message does not decode as an MCP message: {error}"),
+            ));
+        }
+        // rmcp reads a message with an id and a method that does not decode as
+        // a request as a notification: HTTP 202, never run, never answered
+        // (#264).
+        Ok(decoded)
+            if has_method
+                && has_id
+                && !matches!(&decoded, rmcp::model::JsonRpcMessage::Request(_)) =>
+        {
+            return Err(invalid_jsonrpc_request(
+                id,
+                "the message does not decode as an MCP request for its `method`; check its `params`",
+            ));
+        }
+        Ok(_) => {}
     }
     Ok(serde_json::Value::Object(message))
 }

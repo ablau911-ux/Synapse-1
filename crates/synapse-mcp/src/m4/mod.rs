@@ -8820,16 +8820,20 @@ fn spawn_launch_child(
         }
 
         let child = command.spawn().map_err(|error| {
-            let not_found = error.kind() == io::ErrorKind::NotFound;
+            let working_dir = params.working_dir.as_deref();
+            let failure = CommandSpawnFailure::from_spawn_error(
+                error.kind() == io::ErrorKind::NotFound,
+                working_dir,
+            );
             launch_tool_error(
                 error_codes::ACTION_TARGET_INVALID,
-                command_spawn_failure_message("act_launch", &params.target, not_found, &error),
+                failure.message("act_launch", &params.target, working_dir, &error),
                 json!({
                     "code": error_codes::ACTION_TARGET_INVALID,
                     "target": params.target,
                     "args": params.args,
                     "working_dir": params.working_dir,
-                    "reason": command_spawn_failure_reason(not_found),
+                    "reason": failure.reason(),
                 }),
             )
         })?;
@@ -8965,16 +8969,20 @@ fn spawn_windows_child(
             })
         }
         Err(error) => {
-            let not_found = windows_error_is_not_found(&error);
+            let working_dir = params.working_dir.as_deref();
+            let failure = CommandSpawnFailure::from_spawn_error(
+                windows_error_is_not_found(&error),
+                working_dir,
+            );
             Err(launch_tool_error(
                 error_codes::ACTION_TARGET_INVALID,
-                command_spawn_failure_message("act_launch", &params.target, not_found, &error),
+                failure.message("act_launch", &params.target, working_dir, &error),
                 json!({
                     "code": error_codes::ACTION_TARGET_INVALID,
                     "target": params.target,
                     "args": params.args,
                     "working_dir": params.working_dir,
-                    "reason": command_spawn_failure_reason(not_found),
+                    "reason": failure.reason(),
                     "desktop": params.desktop,
                     "source_error": error.to_string(),
                 }),
@@ -15874,15 +15882,14 @@ fn spawn_shell_job_child(
         .spawn()
         .map_err(|error| {
             let command_metadata = shell_command_metadata(&params.command, &params.args);
-            let not_found = error.kind() == io::ErrorKind::NotFound;
+            let working_dir = params.working_dir.as_deref();
+            let failure = CommandSpawnFailure::from_spawn_error(
+                error.kind() == io::ErrorKind::NotFound,
+                working_dir,
+            );
             shell_tool_error(
                 error_codes::ACTION_TARGET_INVALID,
-                command_spawn_failure_message(
-                    "act_run_shell_start",
-                    &params.command,
-                    not_found,
-                    &error,
-                ),
+                failure.message("act_run_shell_start", &params.command, working_dir, &error),
                 json!({
                     "code": error_codes::ACTION_TARGET_INVALID,
                     "command": params.command,
@@ -15900,7 +15907,7 @@ fn spawn_shell_job_child(
                     "command_line_original_bytes": command_metadata.command_line_original_bytes,
                     "command_line_sha256": command_metadata.command_line_sha256,
                     "working_dir": params.working_dir,
-                    "reason": command_spawn_failure_reason(not_found),
+                    "reason": failure.reason(),
                 }),
             )
         })
@@ -19375,10 +19382,14 @@ fn spawn_shell_child(
 
     let mut child = command.spawn().map_err(|error| {
         let command_metadata = shell_command_metadata(&params.command, &params.args);
-        let not_found = error.kind() == io::ErrorKind::NotFound;
+        let working_dir = params.working_dir.as_deref();
+        let failure = CommandSpawnFailure::from_spawn_error(
+            error.kind() == io::ErrorKind::NotFound,
+            working_dir,
+        );
         shell_tool_error(
             error_codes::ACTION_TARGET_INVALID,
-            command_spawn_failure_message("act_run_shell", &params.command, not_found, &error),
+            failure.message("act_run_shell", &params.command, working_dir, &error),
             json!({
                 "code": error_codes::ACTION_TARGET_INVALID,
                 "command": params.command,
@@ -19396,7 +19407,7 @@ fn spawn_shell_child(
                 "command_line_original_bytes": command_metadata.command_line_original_bytes,
                 "command_line_sha256": command_metadata.command_line_sha256,
                 "working_dir": params.working_dir,
-                "reason": command_spawn_failure_reason(not_found),
+                "reason": failure.reason(),
             }),
         )
     })?;
@@ -20326,16 +20337,18 @@ fn resolve_launch_target_for_policy(target: &str) -> Result<String, ErrorData> {
         // The policy resolves a path-like target to its long name before
         // spawning; a target that is not an existing file fails here, so this
         // answer is the spawn failure for that target (#194).
-        let not_found = error
-            .downcast_ref::<windows::core::Error>()
-            .is_some_and(windows_error_is_not_found);
+        let failure = CommandSpawnFailure::for_program_path(
+            error
+                .downcast_ref::<windows::core::Error>()
+                .is_some_and(windows_error_is_not_found),
+        );
         launch_tool_error(
             error_codes::ACTION_TARGET_INVALID,
-            command_spawn_failure_message("act_launch", target, not_found, &format!("{error:#}")),
+            failure.message("act_launch", target, None, &format!("{error:#}")),
             json!({
                 "code": error_codes::ACTION_TARGET_INVALID,
                 "target": target,
-                "reason": command_spawn_failure_reason(not_found),
+                "reason": failure.reason(),
                 "detail_reason": "launch_target_path_resolution_failed",
             }),
         )
@@ -20428,31 +20441,84 @@ fn quote_command_part(part: &str) -> String {
     quoted
 }
 
-/// The message for a command that could not be started: it names the command
-/// (#194), says when the program was not found, and hints at a command line
-/// packed into the program field.
-fn command_spawn_failure_message(
-    tool: &str,
-    command: &str,
-    not_found: bool,
-    error: &dyn std::fmt::Display,
-) -> String {
-    if !not_found {
-        return format!("{tool} could not start '{command}': {error}");
-    }
-    let hint = if command.contains([' ', '\t']) {
-        "; put only the program in this field and its arguments in args"
-    } else {
-        ""
-    };
-    format!("{tool} could not start '{command}': program not found ({error}){hint}")
+/// What a command that could not be started is blamed on (#194). An OS "not
+/// found" from a spawn is also what a missing working directory gives (chdir
+/// in the child on Unix), so it names the program only once the working
+/// directory is known to exist, and names both when that cannot be told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandSpawnFailure {
+    ProgramNotFound,
+    WorkingDirNotFound,
+    ProgramOrWorkingDirNotFound,
+    Other,
 }
 
-const fn command_spawn_failure_reason(not_found: bool) -> &'static str {
-    if not_found {
-        "command_not_found"
-    } else {
-        "spawn_failed"
+impl CommandSpawnFailure {
+    /// Classifies a spawn error: `not_found` is the OS "not found" verdict,
+    /// `working_dir` the directory the spawn was given (`None` = inherited,
+    /// which exists).
+    fn from_spawn_error(not_found: bool, working_dir: Option<&str>) -> Self {
+        if !not_found {
+            return Self::Other;
+        }
+        let Some(working_dir) = working_dir else {
+            return Self::ProgramNotFound;
+        };
+        match fs::metadata(working_dir) {
+            Ok(metadata) if metadata.is_dir() => Self::ProgramNotFound,
+            Ok(_) => Self::WorkingDirNotFound,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::WorkingDirNotFound,
+            Err(_) => Self::ProgramOrWorkingDirNotFound,
+        }
+    }
+
+    /// A failure of resolving the program path itself: "not found" there can
+    /// only be the program.
+    #[cfg(windows)]
+    const fn for_program_path(not_found: bool) -> Self {
+        if not_found {
+            Self::ProgramNotFound
+        } else {
+            Self::Other
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ProgramNotFound => "command_not_found",
+            Self::WorkingDirNotFound => "working_dir_not_found",
+            Self::ProgramOrWorkingDirNotFound => "command_or_working_dir_not_found",
+            Self::Other => "spawn_failed",
+        }
+    }
+
+    /// The message: it names the command, says what was not found, and hints
+    /// at a command line packed into the program field.
+    fn message(
+        self,
+        tool: &str,
+        command: &str,
+        working_dir: Option<&str>,
+        error: &dyn std::fmt::Display,
+    ) -> String {
+        let hint = if command.contains([' ', '\t']) {
+            "; put only the program in this field and its arguments in args"
+        } else {
+            ""
+        };
+        let working_dir = working_dir.unwrap_or_default();
+        match self {
+            Self::Other => format!("{tool} could not start '{command}': {error}"),
+            Self::ProgramNotFound => {
+                format!("{tool} could not start '{command}': program not found ({error}){hint}")
+            }
+            Self::WorkingDirNotFound => format!(
+                "{tool} could not start '{command}': working directory '{working_dir}' does not exist or is not a directory ({error})"
+            ),
+            Self::ProgramOrWorkingDirNotFound => format!(
+                "{tool} could not start '{command}': not found ({error}); either the program or the working directory '{working_dir}' is missing{hint}"
+            ),
+        }
     }
 }
 

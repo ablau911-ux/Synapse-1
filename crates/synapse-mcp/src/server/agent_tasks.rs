@@ -1146,6 +1146,9 @@ impl SynapseService {
         let db = self.agent_task_db()?;
         let now = unix_time_ms_now();
         Self::prune_terminal_tasks(&db, now)?;
+        // Held from the existence check through the write: two concurrent
+        // creates of one `task_id` cannot both pass the check.
+        let _write_guard = task_write_lock()?;
         if Self::read_task(&db, &params.task_id)?.is_some() {
             // detail_code tells a create-race loser "someone else created it"
             // apart from "my parameters are invalid" without parsing text.

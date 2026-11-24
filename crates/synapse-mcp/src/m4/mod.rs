@@ -12310,6 +12310,27 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
             }),
         )
     })?;
+    let on_disk_job_id = shell_job_dir_on_disk_name(path);
+    if let Some(on_disk_job_id) = on_disk_job_id.filter(|name| name.as_str() != job_id) {
+        // Job ids are exact; a case-insensitive store (Windows) opens the
+        // directory of another job for a case variant. When the directory's
+        // real name differs from the requested id, the requested job does not
+        // exist (#265). A record that disagrees with its own directory stays
+        // the storage error below.
+        return Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_run_shell job {job_id} was not found; job ids are case-sensitive and job {on_disk_job_id} exists"
+            ),
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "job_id": job_id,
+                "on_disk_job_id": on_disk_job_id,
+                "path": path,
+                "reason": "job_not_found",
+            }),
+        ));
+    }
     let mut job: ActRunShellJobStatus = serde_json::from_slice(&bytes).map_err(|error| {
         shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
@@ -12322,25 +12343,6 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
             }),
         )
     })?;
-    if job.job_id != job_id && job.job_id.eq_ignore_ascii_case(job_id) {
-        // Job ids are exact; a case-insensitive store (Windows) resolves a
-        // case variant to the directory of another job. That is an unknown
-        // job for this id, not a corrupt store (#265).
-        return Err(shell_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_run_shell job {job_id} was not found; job ids are case-sensitive and job {} exists",
-                job.job_id
-            ),
-            json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
-                "job_id": job_id,
-                "persisted_job_id": job.job_id,
-                "path": path,
-                "reason": "job_not_found",
-            }),
-        ));
-    }
     if job.job_id != job_id {
         return Err(shell_tool_error(
             error_codes::STORAGE_READ_FAILED,
@@ -12359,6 +12361,14 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
     }
     normalize_shell_job_remote_process_scope(&mut job);
     Ok(shell_job_status_with_safe_command_metadata(&job))
+}
+
+/// The name the job directory holding `status_path` has on disk. The
+/// canonical path carries the stored spelling, so on a case-insensitive store
+/// `JOB-A` resolves to the real `job-a`.
+fn shell_job_dir_on_disk_name(status_path: &Path) -> Option<String> {
+    let canonical = fs::canonicalize(status_path.parent()?).ok()?;
+    canonical.file_name()?.to_str().map(ToOwned::to_owned)
 }
 
 /// Persist a durable status and then perform a distinct store read to prove the

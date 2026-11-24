@@ -46,7 +46,10 @@ pub(crate) const SPAWNED_AGENT_PROCESS_EXITED_REASON: &str = "spawned_agent_proc
 
 pub(crate) type SharedSessionProcessResources =
     Arc<Mutex<BTreeMap<String, BTreeMap<u32, SessionProcessResource>>>>;
-pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeSet<String>>>;
+/// Every session the lifecycle tore down, with the reason of its first
+/// teardown. The HTTP layer reads the reason to tell an idle expiry
+/// ([`HTTP_STALE_REASON`]) from an intentional termination (#277).
+pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeMap<String, String>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTeardownOptions {
@@ -929,10 +932,8 @@ impl SessionLifecycleState {
             })
     }
 
-    pub(crate) fn is_session_terminated(&self, session_id: &str) -> bool {
-        self.terminated_sessions
-            .lock()
-            .is_ok_and(|terminated| terminated.contains(session_id))
+    pub(crate) const fn terminated_sessions(&self) -> &SharedTerminatedSessions {
+        &self.terminated_sessions
     }
 
     pub(crate) async fn teardown_session(
@@ -1580,8 +1581,11 @@ impl SessionLifecycleState {
     fn mark_terminated_session(&self, report: &mut SessionTeardownReport) {
         match self.terminated_sessions.lock() {
             Ok(mut terminated) => {
-                report.already_terminated = terminated.contains(&report.session_id);
-                report.marked_terminated = terminated.insert(report.session_id.clone());
+                report.already_terminated = terminated.contains_key(&report.session_id);
+                report.marked_terminated = !report.already_terminated;
+                terminated
+                    .entry(report.session_id.clone())
+                    .or_insert_with(|| report.reason.clone());
             }
             Err(_error) => {
                 report.termination_marker_failed = true;

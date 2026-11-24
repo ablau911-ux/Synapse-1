@@ -150,8 +150,10 @@ pub(super) async fn require_mcp_session(
     };
     let request = match session_id.as_deref() {
         Some(session_id) => {
-            if session_is_terminated(&state.terminated_sessions, session_id) {
-                if request.method() == Method::DELETE {
+            if let Some(failure) =
+                terminated_session_failure(&state.terminated_sessions, session_id)
+            {
+                if failure == SessionFailure::Terminated && request.method() == Method::DELETE {
                     tracing::info!(
                         code = "MCP_HTTP_SESSION_DELETE_ALREADY_TERMINATED",
                         session_id,
@@ -165,13 +167,10 @@ pub(super) async fn require_mcp_session(
                 tracing::warn!(
                     code = synapse_core::error_codes::HTTP_SESSION_INVALID,
                     session_id,
+                    reason = failure.reason(),
                     "HTTP MCP session rejected because session lifecycle already terminated it"
                 );
-                return session_invalid_for(
-                    SessionFailure::Terminated,
-                    Some(session_id),
-                    &serde_json::Value::Null,
-                );
+                return session_invalid_for(failure, Some(session_id), &serde_json::Value::Null);
             }
             match record_session_request(&state.session_registry, session_id, request).await {
                 Ok(request) => request,
@@ -205,10 +204,17 @@ pub(super) async fn release_held_inputs_on_delete(
         && is_mcp_endpoint(request.uri().path()))
     .then(|| session_id_from_header(&request))
     .flatten();
+    // #277: DELETE of a terminated session is an idempotent 200; DELETE of an
+    // unknown or idle-expired one is 404, also after the stale reaper ran.
+    let terminated_sessions = state.lifecycle.terminated_sessions();
+    let terminated_failure = cleanup_session_id
+        .as_deref()
+        .and_then(|session_id| terminated_session_failure(terminated_sessions, session_id));
+    let already_terminated = terminated_failure == Some(SessionFailure::Terminated);
     if let Some(session_id) = cleanup_session_id.as_deref()
         && !session_is_active(&state.session_manager, session_id).await
     {
-        if state.lifecycle.is_session_terminated(session_id) {
+        if already_terminated {
             tracing::info!(
                 code = "MCP_HTTP_SESSION_DELETE_ALREADY_CLOSED_NOOP",
                 session_id,
@@ -231,9 +237,6 @@ pub(super) async fn release_held_inputs_on_delete(
     // #277: a session the lifecycle already terminated (e.g. by adoption) can
     // still be open in rmcp's session manager. Its DELETE still closes it, but
     // answers like every other DELETE of a terminated session.
-    let already_terminated = cleanup_session_id
-        .as_deref()
-        .is_some_and(|session_id| state.lifecycle.is_session_terminated(session_id));
     let response = next.run(request).await;
     let Some(session_id) = cleanup_session_id else {
         return response;
@@ -281,13 +284,24 @@ async fn session_is_active(session_manager: &LocalSessionManager, session_id: &s
         .contains_key(session_id)
 }
 
-fn session_is_terminated(
+/// The failure class of a session the lifecycle tore down, `None` when it did
+/// not (#277). The stale reaper's teardown (`HTTP_STALE_REASON`) only reclaims
+/// what an idle-expired or pre-restart session left behind, so that session
+/// stays `UnknownOrExpired`, the answer it got before the reaper ran. Any other
+/// teardown (DELETE, `session_end`, `agent_kill`, adoption, an exited spawned
+/// agent) is an intentional `Terminated`.
+fn terminated_session_failure(
     terminated_sessions: &crate::server::session_lifecycle::SharedTerminatedSessions,
     session_id: &str,
-) -> bool {
-    terminated_sessions
-        .lock()
-        .is_ok_and(|terminated| terminated.contains(session_id))
+) -> Option<SessionFailure> {
+    let terminated = terminated_sessions.lock().ok()?;
+    let reason = terminated.get(session_id)?;
+    let failure = if reason == crate::server::session_lifecycle::HTTP_STALE_REASON {
+        SessionFailure::UnknownOrExpired
+    } else {
+        SessionFailure::Terminated
+    };
+    Some(failure)
 }
 
 fn session_idle_timeout_secs() -> anyhow::Result<u64> {

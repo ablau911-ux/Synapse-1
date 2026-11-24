@@ -426,7 +426,7 @@ impl SynapseService {
     pub(super) fn session_is_terminated(&self, session_id: &str) -> Result<bool, ErrorData> {
         self.terminated_sessions
             .lock()
-            .map(|terminated| terminated.contains(session_id))
+            .map(|terminated| terminated.contains_key(session_id))
             .map_err(|_error| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,

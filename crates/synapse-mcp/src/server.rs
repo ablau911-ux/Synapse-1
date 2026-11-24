@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     future::Future,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
@@ -725,7 +725,7 @@ impl SynapseService {
             session_authority_gates: Arc::new(Mutex::new(HashMap::new())),
             authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
-            terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            terminated_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -768,7 +768,7 @@ impl SynapseService {
             session_authority_gates: Arc::new(Mutex::new(HashMap::new())),
             authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
-            terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            terminated_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -811,7 +811,7 @@ impl SynapseService {
             session_authority_gates: Arc::new(Mutex::new(HashMap::new())),
             authority_finalizers: AuthorityFinalizerSupervisor::default(),
             session_processes: Arc::new(Mutex::new(BTreeMap::new())),
-            terminated_sessions: Arc::new(Mutex::new(BTreeSet::new())),
+            terminated_sessions: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 

@@ -15882,14 +15882,7 @@ async fn monitor_shell_job(
             terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
                 .to_owned();
         let timeout_ms = status.timeout_ms.unwrap_or_default();
-        // A real exit code means the process exited on its own after outrunning
-        // the cap, before any termination: never claim it was terminated.
-        let outcome = match status.exit_code {
-            Some(code) => format!(
-                "the process ran past it and exited on its own with exit code {code}; it was not terminated"
-            ),
-            None => "the process tree was terminated".to_owned(),
-        };
+        let outcome = timeout_outcome(status.exit_code);
         status.error_code = Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned());
         status.error_message = Some(format!(
             "durable job timeout_ms cap expired after {timeout_ms} ms; {outcome}. \
@@ -18217,15 +18210,7 @@ fn shell_budget_error(
              client-call budget"
         ),
     };
-    // A real exit code means the process exited on its own after outrunning the
-    // budget, before any termination: never claim it was terminated. The
-    // timeout path keeps exit_code None whenever it did terminate the tree.
-    let outcome = match exit_code {
-        Some(code) => format!(
-            "the process ran past it and exited on its own with exit code {code}; it was not terminated"
-        ),
-        None => "the process tree was terminated".to_owned(),
-    };
+    let outcome = timeout_outcome(exit_code);
     (
         Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned()),
         Some(format!(
@@ -18235,6 +18220,19 @@ fn shell_budget_error(
              time: {remediation}."
         )),
     )
+}
+
+/// What happened to a process that outran a timeout. A real exit code means
+/// it exited on its own after outrunning the limit, before any termination:
+/// never claim it was terminated. The timeout path keeps `exit_code` None
+/// whenever it did terminate the tree.
+fn timeout_outcome(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!(
+            "the process ran past it and exited on its own with exit code {code}; it was not terminated"
+        ),
+        None => "the process tree was terminated".to_owned(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

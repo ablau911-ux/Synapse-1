@@ -28,8 +28,9 @@ use super::clip_encoder::{
     BGRA_BYTES, EncoderSettings, VideoPlace, VideoQueue, VideoTimes, encoder_name,
 };
 use super::clip_folder::{
-    EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_NO_PICTURE_YET, LostInstant,
-    PartInfo, RECORD_FPS, STILLS_DIR, StillInfo, still_path,
+    EncoderInfo, FRAMES_FILE, IndexLine, LOST_ENCODER_BEHIND, LOST_ENCODER_FAILED,
+    LOST_INDEX_WRITE_FAILED, LOST_NO_PICTURE_YET, LostInstant, PartInfo, RECORD_FPS, STILLS_DIR,
+    StillInfo, still_path,
 };
 
 /// `SETTLE_INSTANTS`: 0.5 s on screen, the changed instant included (plan §6).
@@ -129,6 +130,13 @@ pub(super) struct StreamSummary {
     pub(super) stills: Vec<StillInfo>,
     pub(super) encoder: EncoderInfo,
     pub(super) times: StreamTimes,
+}
+
+/// Why a stream could not finish: the loss cause of the pictures it could
+/// not keep (`LOST_*`) and the error.
+pub(super) struct StreamFailure {
+    pub(super) cause: &'static str,
+    pub(super) error: String,
 }
 
 /// The decision for one instant.
@@ -327,20 +335,31 @@ impl ClipStream {
     /// recording ended before its picture settled), lets the encoder thread
     /// encode every queued picture and closes the last part. An encoder error
     /// is returned, so the clip fails instead of turning ready. The encoder
-    /// thread is always joined, also when the last index lines fail to write;
-    /// that error is returned after it.
-    pub(super) fn finish(mut self) -> Result<StreamSummary, String> {
+    /// thread is always joined, also when the last index lines fail to write.
+    /// The failure names the cause of the pictures it lost: the encoder's
+    /// when the video failed (an index error is added to its text), else the
+    /// index write's.
+    pub(super) fn finish(mut self) -> Result<StreamSummary, StreamFailure> {
         let flushed = self.index.write_decided(None);
         let video = self.video.take().map(VideoQueue::finish);
-        flushed?;
-        let encoder = self.encoder_info();
         let (parts, video_times) = match video {
-            Some(finished) => {
-                let (written, times) = finished?;
-                (written.closed_parts, times)
+            Some(Ok((written, times))) => (written.closed_parts, times),
+            Some(Err(error)) => {
+                return Err(StreamFailure {
+                    cause: LOST_ENCODER_FAILED,
+                    error: match flushed {
+                        Ok(_) => error,
+                        Err(index) => format!("{error}; {index}"),
+                    },
+                });
             }
             None => (Vec::new(), VideoTimes::default()),
         };
+        flushed.map_err(|error| StreamFailure {
+            cause: LOST_INDEX_WRITE_FAILED,
+            error,
+        })?;
+        let encoder = self.encoder_info();
         let times = StreamTimes {
             compare: self.compare,
             stills: self.stills.time,

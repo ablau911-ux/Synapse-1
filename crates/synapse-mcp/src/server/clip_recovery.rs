@@ -10,16 +10,18 @@
 //! the still's file is on disk: a complete still is never deleted for a
 //! missing video picture, and a mark without a file is dropped. The clip is
 //! then `ready`. A recording that fails gets the same index rule at once
-//! (`reconcile_failed`, cause `encoder_failed`); recovery applies it again to
-//! every `failed` clip, which stays `failed`, in case that reconcile failed.
+//! (`reconcile_failed`, with the cause of its failure, `lost_cause` in
+//! `clip.json`); recovery applies it again to every `failed` clip, with that
+//! cause, which stays `failed`, in case that reconcile failed or never ran
+//! (a recorder thread that ended without finishing).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::clip_folder::{
     ClipJson, ClipRegistry, ClipState, ConditionStatus, FRAMES_FILE, IndexLine,
-    LOST_ENCODER_FAILED, LOST_SERVICE_RESTART, LostInstant, MAX_DURATION_MS, PartInfo, RECORD_FPS,
-    RecorderLock, STILLS_DIR, StillInfo, StopReason, part_path, read_index, repair_ivf, still_path,
+    LOST_SERVICE_RESTART, LostInstant, MAX_DURATION_MS, PartInfo, RECORD_FPS, RecorderLock,
+    STILLS_DIR, StillInfo, StopReason, part_path, read_index, repair_ivf, still_path,
     write_bytes_atomically,
 };
 
@@ -41,7 +43,7 @@ impl ClipRecovery {
             // (CAPTURE_CLIP_RECONCILE_FAILED): the same rule again. An index
             // that already agrees is left as it is.
             ClipState::Failed => {
-                let lost = Self::reconcile_failed(folder, clip.fps, LOST_ENCODER_FAILED)?;
+                let lost = Self::reconcile_failed(folder, clip.fps, clip.failed_lost_cause())?;
                 return ClipJson::update(folder, |clip| clip.add_lost(lost)).map(|_| ());
             }
             ClipState::Ready => return Ok(()),

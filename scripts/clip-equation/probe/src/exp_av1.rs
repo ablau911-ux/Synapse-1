@@ -60,7 +60,8 @@ pub fn run() -> Result<()> {
     let started_hns = clock::now_hns();
     let mut stream = ClipStream::create(&out)?;
     let replayed = replay(&mut corpus, &mut stream, started_hns)?;
-    report(&out, stream.finish()?, replayed)
+    let summary = stream.finish().map_err(|failure| failure.error)?;
+    report(&out, summary, replayed)
 }
 
 /// What the replay itself measured.

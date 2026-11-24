@@ -12,8 +12,8 @@ use synapse_capture::ClipSource;
 use synapse_core::error_codes;
 
 use super::clip_folder::{
-    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, MAX_DURATION_MS, RECORD_FPS,
-    StopReason, clips_root, file_size_and_sha256,
+    CLIP_JSON_FILE, ClipJson, ClipRegistry, ClipState, FRAMES_FILE, LOST_RECORDER_ENDED,
+    MAX_DURATION_MS, RECORD_FPS, StopReason, clips_root, file_size_and_sha256,
 };
 use super::{
     CaptureClipParams, CaptureClipResponse, ClipStatusResponse, ErrorData, SynapseService,
@@ -440,6 +440,7 @@ impl Drop for RecorderClaim<'_> {
                 if clip.state == ClipState::Recording {
                     clip.state = ClipState::Failed;
                     clip.failure = Some("the recorder thread ended without finishing".to_owned());
+                    clip.lost_cause = Some(LOST_RECORDER_ENDED.to_owned());
                 }
             });
         }
@@ -632,11 +633,11 @@ mod live {
     use super::super::clip_folder::{
         CLIP_METHOD, CLIP_SCHEMA_VERSION, ClipClock, ClipGeometry, ClipJson, ClipRegistry,
         ClipState, ClipTargetInfo, ConditionStatus, Conditions, LOST_CAPTURE_FAILED,
-        LOST_ENCODER_FAILED, LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason,
+        LOST_SLOT_OVERFLOW, ObserverGrant, RecorderLock, StopReason,
     };
     use super::super::clip_recovery::ClipRecovery;
     use super::super::clip_stream::{
-        ClipStream, SETTLE_INSTANTS, StageTime, StreamInput, StreamTimes,
+        ClipStream, SETTLE_INSTANTS, StageTime, StreamFailure, StreamInput, StreamTimes,
     };
     use super::super::{CaptureClipResponse, ErrorData};
     use super::{
@@ -1149,16 +1150,12 @@ mod live {
             let folder = &self.plan.folder;
             let summary = match self.stream.finish() {
                 Ok(summary) => summary,
-                Err(error) => {
+                Err(StreamFailure { cause, error }) => {
                     tracing::warn!(code = "CAPTURE_CLIP_FINISH_FAILED", error = %error);
                     // The index is made to agree with the pictures on disk now,
                     // by recovery's rule; if this fails, recovery on the next
                     // service start applies it to the failed clip.
-                    let lost = ClipRecovery::reconcile_failed(
-                        folder,
-                        RECORD_FPS,
-                        LOST_ENCODER_FAILED,
-                    )
+                    let lost = ClipRecovery::reconcile_failed(folder, RECORD_FPS, cause)
                     .unwrap_or_else(|reconcile| {
                         tracing::warn!(code = "CAPTURE_CLIP_RECONCILE_FAILED", error = %reconcile);
                         Vec::new()
@@ -1167,6 +1164,7 @@ mod live {
                         ClipJson::update(folder, |clip| {
                             clip.state = ClipState::Failed;
                             clip.failure = Some(error);
+                            clip.lost_cause = Some(cause.to_owned());
                             clip.add_lost(lost);
                         })
                     });
@@ -1253,6 +1251,7 @@ mod live {
             synapse_version: env!("CARGO_PKG_VERSION").to_owned(),
             state: ClipState::Recording,
             failure: None,
+            lost_cause: None,
             stop_reason: None,
             fps: RECORD_FPS,
             end_ms: plan.end_ms,

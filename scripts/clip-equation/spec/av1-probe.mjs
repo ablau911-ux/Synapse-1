@@ -480,6 +480,38 @@ function failedClipReconciled() {
 }
 
 /**
+ * A clip failed by a recorder thread that ended without finishing (RecorderClaim::drop writes
+ * state failed and lost_cause recorder_ended, with no reconcile): recovery on start names every line
+ * whose picture is not on disk lost with that cause, in frames.jsonl and in clip.json, never
+ * encoder_failed.
+ */
+function failedByRecorderEndNamed() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  const CAUSE = 'recorder_ended';
+  let torn;
+  const got = recovered('killed-text-page', 'failed-recorder-ended', dir => {
+    torn = Number(path.basename(lastPart(dir)).match(/\d+/)[0]);
+    fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'failed';
+    clip.failure = 'the recorder thread ended without finishing';
+    clip.lost_cause = CAUSE;
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const missing = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] === torn);
+  if (!missing.length) return verdict([`part ${torn} has no enc line`]);
+  const problems = [];
+  const misnamed = missing.filter(line => (got.lines[line.instant] ?? {}).lost !== CAUSE);
+  if (misnamed.length) problems.push(`${misnamed.length} of ${missing.length} lines whose picture is not on disk are not named lost ${CAUSE} (first: instant ${misnamed[0].instant} is ${JSON.stringify(got.lines[misnamed[0].instant] ?? {})})`);
+  const clip = JSON.parse(fs.readFileSync(path.join(got.dir, 'clip.json'), 'utf8'));
+  if (clip.state !== 'failed') problems.push(`the clip is ${clip.state}, not failed`);
+  const listedOther = (clip.lost ?? []).filter(lost => lost.cause !== CAUSE);
+  if (listedOther.length) problems.push(`${listedOther.length} lost instants in clip.json have another cause (first: instant ${listedOther[0].instant} ${listedOther[0].cause})`);
+  return verdict(problems, `clip failed by a recorder that ended without finishing, part ${torn} cut to its header: ${missing.length} lines named lost ${CAUSE} in frames.jsonl and clip.json`);
+}
+
+/**
  * A failed clip that cannot be reconciled (clip.json says fps 0, and its index has a gap at instant 0,
  * so lost lines would have to be made): recovery refuses it with an error and does not crash.
  */
@@ -628,6 +660,7 @@ const table = {
   'a line already lost names no missing still': () => lostLineNamesNoMissingStill('crash-lost-line-stale-still', true),
   'recovery names every planned instant': recoveryNamesEveryInstant,
   'recovery makes a failed clip agree with its pictures': failedClipReconciled,
+  'recovery names the losses of a clip whose recorder ended': failedByRecorderEndNamed,
   'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
   'recovery caps a clip longer than the longest recording': overlongClipCapped,
   'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,

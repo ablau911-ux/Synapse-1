@@ -49,6 +49,12 @@ pub(super) const LOST_CAPTURE_FAILED: &str = "capture_failed";
 pub(super) const LOST_SERVICE_RESTART: &str = "service_restart";
 /// The encoder failed: the instant's picture never reached the video.
 pub(super) const LOST_ENCODER_FAILED: &str = "encoder_failed";
+/// `frames.jsonl` could not be written at the end of the recording (the
+/// video finished): the clip failed.
+pub(super) const LOST_INDEX_WRITE_FAILED: &str = "index_write_failed";
+/// The recorder thread ended without finishing (a panic): the instant's
+/// picture never reached the video.
+pub(super) const LOST_RECORDER_ENDED: &str = "recorder_ended";
 
 /// IVF container (the AV1 parts): a 32-byte file header, then per picture a
 /// 12-byte header (size, timestamp) and the picture's bytes.
@@ -537,6 +543,11 @@ pub(super) struct ClipJson {
     pub(super) state: ClipState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) failure: Option<String>,
+    /// A failed clip: the cause (`LOST_*`) its lost instants get when its
+    /// index is made to agree with the pictures on disk; read through
+    /// `failed_lost_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lost_cause: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) stop_reason: Option<StopReason>,
     pub(super) fps: u32,
@@ -631,6 +642,12 @@ impl ClipJson {
         let result = change(&mut clip);
         write_atomically(&folder.join(CLIP_JSON_FILE), &clip)?;
         Ok((clip, result))
+    }
+
+    /// The cause the lost instants of a failed clip get: its `lost_cause`;
+    /// a clip that failed before that field existed failed in the encoder.
+    pub(super) fn failed_lost_cause(&self) -> &str {
+        self.lost_cause.as_deref().unwrap_or(LOST_ENCODER_FAILED)
     }
 
     /// Adds lost instants (an instant already listed keeps its first cause),

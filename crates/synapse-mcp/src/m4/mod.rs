@@ -16443,11 +16443,16 @@ fn shell_job_terminal_status(status: &str) -> bool {
     )
 }
 
-/// True when the job process ran to its own exit (`ok` or `exit_nonzero`).
-/// Every other ending (timed out, cancelled, killed, lost or unobserved) did
-/// not complete normally.
-pub(crate) fn shell_job_completed_normally(status: &str) -> bool {
-    matches!(status, "ok" | "exit_nonzero")
+/// True when the job process ran to its own exit: status `ok` or
+/// `exit_nonzero` with an exit code. `exit_nonzero` without one is a process
+/// ended by a signal (Unix `status.code() == None`) or a failed wait, and did
+/// not complete normally, like every other ending (timed out, cancelled,
+/// killed, lost or unobserved).
+pub(crate) fn shell_job_completed_normally(job: &ActRunShellJobStatus) -> bool {
+    match job.status.as_str() {
+        "ok" | "exit_nonzero" => job.exit_code.is_some(),
+        _ => false,
+    }
 }
 
 fn elapsed_ms_since_rfc3339(started_at: &str) -> Option<u64> {

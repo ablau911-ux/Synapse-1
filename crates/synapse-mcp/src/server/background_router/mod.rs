@@ -8547,11 +8547,11 @@ async fn target_act_run_shell(
             );
         }
         // A job that did not run to its own exit (killed by its timeout_ms
-        // cap, cancelled, lost or unobserved) did not complete: report it as
-        // not ok. The process was launched, so the delivery state stays
+        // cap or a signal, cancelled, lost or unobserved) did not complete:
+        // report it as not ok. The process was launched, so the delivery state stays
         // "delivered" (verify_needed) and a caller does not blindly re-run a
         // command that may already have had side effects.
-        if status.0.job.timed_out || !shell_job_completed_normally(&status.0.job.status) {
+        if status.0.job.timed_out || !shell_job_completed_normally(&status.0.job) {
             return Ok((
                 "act_run_shell_start+act_run_shell_status",
                 false,

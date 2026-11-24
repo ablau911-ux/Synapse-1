@@ -44,6 +44,7 @@ type SharedInFlightRequestIds = Arc<Mutex<BTreeSet<(String, String)>>>;
 struct InFlightRequestId {
     in_flight: SharedInFlightRequestIds,
     key: (String, String),
+    request_id: serde_json::Value,
 }
 
 impl InFlightRequestId {
@@ -75,15 +76,27 @@ impl InFlightRequestId {
         Ok(Some(Self {
             in_flight: Arc::clone(in_flight),
             key,
+            request_id: id.clone(),
         }))
     }
 
-    /// Keeps the id claimed until `response`'s body ends or is dropped.
+    /// Keeps the id claimed until `response`'s body ends or is dropped. An SSE
+    /// body that ends without this request's response gets a JSON-RPC error as
+    /// its last event (#258).
     fn hold_until_body_ends(self, response: Response) -> Response {
+        let is_event_stream = response.status() == StatusCode::OK
+            && response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"));
+        let reply_watch = is_event_stream.then(|| SseReplyWatch::new(self.request_id.clone()));
         let (parts, body) = response.into_parts();
         let body = InFlightBody {
             data: body.into_data_stream(),
-            _in_flight: self,
+            in_flight: self,
+            reply_watch,
+            finished: false,
         };
         Response::from_parts(parts, Body::from_stream(body))
     }
@@ -101,14 +114,127 @@ impl Drop for InFlightRequestId {
 /// A response body that releases its request's in-flight id when dropped.
 struct InFlightBody {
     data: axum::body::BodyDataStream,
-    _in_flight: InFlightRequestId,
+    in_flight: InFlightRequestId,
+    /// `None` when the body is not an SSE stream.
+    reply_watch: Option<SseReplyWatch>,
+    finished: bool,
 }
 
 impl futures_util::Stream for InFlightBody {
     type Item = Result<axum::body::Bytes, axum::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        futures_util::Stream::poll_next(Pin::new(&mut self.get_mut().data), cx)
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        let polled = futures_util::Stream::poll_next(Pin::new(&mut this.data), cx);
+        match &polled {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(watch) = this.reply_watch.as_mut() {
+                    watch.observe(chunk);
+                }
+            }
+            Poll::Ready(None) => {
+                this.finished = true;
+                if let Some(event) = this
+                    .reply_watch
+                    .take()
+                    .and_then(|watch| watch.missing_reply_event(&this.in_flight.key.0))
+                {
+                    return Poll::Ready(Some(Ok(event)));
+                }
+            }
+            Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+        }
+        polled
+    }
+}
+
+/// Watches one request's SSE response stream for that request's response
+/// (#258). rmcp ends the stream without any message when the session closes
+/// (DELETE, idle expiry), the daemon stops, or the client cancels the request,
+/// so the caller got HTTP 200 with no result and no error and could not tell
+/// whether the call ran.
+struct SseReplyWatch {
+    request_id: serde_json::Value,
+    /// The current SSE line, up to its `\n`.
+    line: Vec<u8>,
+    answered: bool,
+}
+
+/// The members of an SSE `data:` message that tell whether it answers a request.
+#[derive(serde::Deserialize)]
+struct SseReply {
+    id: Option<serde_json::Value>,
+    result: Option<serde::de::IgnoredAny>,
+    error: Option<serde::de::IgnoredAny>,
+}
+
+impl SseReplyWatch {
+    const fn new(request_id: serde_json::Value) -> Self {
+        Self {
+            request_id,
+            line: Vec::new(),
+            answered: false,
+        }
+    }
+
+    fn observe(&mut self, mut chunk: &[u8]) {
+        if self.answered {
+            return;
+        }
+        while let Some(end) = chunk.iter().position(|byte| *byte == b'\n') {
+            self.line.extend_from_slice(&chunk[..end]);
+            self.answered = Self::answers(&self.line, &self.request_id);
+            self.line.clear();
+            if self.answered {
+                return;
+            }
+            chunk = &chunk[end + 1..];
+        }
+        self.line.extend_from_slice(chunk);
+    }
+
+    /// Whether `line` is an SSE `data:` line holding the response or error for
+    /// `request_id`.
+    fn answers(line: &[u8], request_id: &serde_json::Value) -> bool {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return false;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        serde_json::from_slice::<SseReply>(data).is_ok_and(|reply| {
+            reply.id.as_ref() == Some(request_id)
+                && (reply.result.is_some() || reply.error.is_some())
+        })
+    }
+
+    /// The SSE event that ends an unanswered stream: a JSON-RPC error for the
+    /// request, `None` when the response was sent.
+    fn missing_reply_event(self, session_id: &str) -> Option<axum::body::Bytes> {
+        if self.answered {
+            return None;
+        }
+        tracing::warn!(
+            code = "MCP_HTTP_RESPONSE_STREAM_ENDED_WITHOUT_REPLY",
+            session_id,
+            request_id = %self.request_id,
+            "HTTP MCP response stream ended before the request's response; sent a JSON-RPC error instead"
+        );
+        let detail = "the response stream ended before this request's response was sent (the session closed, the daemon stopped, or the request was cancelled); the request may or may not have run";
+        let body = jsonrpc_error_body(
+            &self.request_id,
+            ErrorCode::INTERNAL_ERROR,
+            format!("internal error: {detail}"),
+            Some(serde_json::json!({
+                "reason": "response_stream_ended_without_reply",
+                "outcome": "unknown",
+                "session_id": session_id,
+                "source_of_truth": "http_session_middleware",
+            })),
+        );
+        Some(axum::body::Bytes::from(format!("data: {body}\n\n")))
     }
 }
 
@@ -606,6 +732,22 @@ pub(super) fn jsonrpc_error_response(
     message: String,
     data: Option<serde_json::Value>,
 ) -> Response {
+    let body = jsonrpc_error_body(id, code, message, data);
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// A JSON-RPC 2.0 error message for request `id`.
+fn jsonrpc_error_body(
+    id: &serde_json::Value,
+    code: ErrorCode,
+    message: String,
+    data: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut error = serde_json::json!({
         "code": code.0,
         "message": message,
@@ -613,17 +755,11 @@ pub(super) fn jsonrpc_error_response(
     if let Some(data) = data {
         error["data"] = data;
     }
-    let body = serde_json::json!({
+    serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": error,
-    });
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    })
 }
 
 fn record_session_heartbeat(

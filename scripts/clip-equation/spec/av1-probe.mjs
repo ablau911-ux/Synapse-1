@@ -469,7 +469,9 @@ function failedClipReconciled() {
   if (unlisted.length) problems.push(`${unlisted.length} lost lines are not in the lost list of clip.json (first: instant ${unlisted[0].instant})`);
   const [clipBefore, indexBefore] = [fs.readFileSync(clipFile, 'utf8'), fs.readFileSync(indexFile, 'utf8')];
   const again = spawnSync(PROBE, ['exp-av1-recover', `folder=${got.dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
-  if (again.error || again.status !== 0) problems.push(`second recovery: ${again.error?.message || again.stderr.trim() || `exit ${again.status}`}`);
+  let second = null;
+  try { second = JSON.parse(again.stdout.trim().split(/\r?\n/).pop()); } catch { /* reported below as a failed second recovery */ }
+  if (again.error || again.status !== 0 || !second?.ok) problems.push(`second recovery: ${again.error?.message || again.stderr.trim() || second?.error || `exit ${again.status}`}`);
   else {
     if (fs.readFileSync(indexFile, 'utf8') !== indexBefore) problems.push('a second recovery changed frames.jsonl');
     if (fs.readFileSync(clipFile, 'utf8') !== clipBefore) problems.push('a second recovery changed clip.json');

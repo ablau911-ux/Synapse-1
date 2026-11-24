@@ -15,6 +15,9 @@
 //!   clip-probe exp-encoders  experiments step 1a: every H.264, HEVC and AV1 encoder
 //!   clip-probe exp-corpus    experiments step 1b: the fixed lossless frame corpus
 //!   clip-probe exp-z         experiments steps 2 and 3, way Z: one zstd way on one corpus folder
+//!   clip-probe exp-av1       window recording: AV1 video plus lossless stills when the window
+//!                            settles (docs/research/window-recording/probe-plan.md);
+//!                            out=<dir> folder=<corpus scene> | out=<dir> seconds=<n> hwnd=<handle>
 //!
 //! Windows are only ever the probe's own; see `probe_window.rs` and, for
 //! package 0b, `chrome_window.rs`.
@@ -51,6 +54,9 @@ mod delivery;
 mod disk;
 mod encoder;
 mod exp_corpus;
+mod exp_av1;
+mod exp_av1_live;
+mod exp_av1_video;
 mod exp_cpu;
 mod exp_d;
 mod exp_dyn;
@@ -206,8 +212,9 @@ fn main() {
         "exp-dyn" => exp_dyn::run(),
         "exp-encoder-start" => encoder_start(),
         "exp-rate" => exp_meter::run_rate(),
+        "exp-av1" => exp_av1::run(),
         _ => Err(format!(
-            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus or exp-z"
+            "unknown command '{command}'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders, exp-corpus, exp-z or exp-av1"
         )),
     };
     if let Err(error) = outcome {

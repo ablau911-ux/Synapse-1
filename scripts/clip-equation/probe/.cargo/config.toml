@@ -1,0 +1,7 @@
+# The probe links the C runtime statically. libaom-sys (exp-av1) always builds libaom with
+# the static runtime (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded, "Match Rust's +crt-static"),
+# so the rest of the probe must use the same runtime or the link fails
+# (undefined __declspec(dllimport) clock and qsort_s). Cargo joins these flags with the
+# repository's own .cargo/config.toml.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

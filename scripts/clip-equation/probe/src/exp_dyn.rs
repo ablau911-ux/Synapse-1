@@ -21,28 +21,28 @@ const MILLISECONDS_PER_SECOND: u64 = 1_000;
 const BGR_CHANNELS: usize = 3;
 
 #[derive(Deserialize, Serialize)]
-struct CorpusLine {
-    instant: u64,
+pub(crate) struct CorpusLine {
+    pub(crate) instant: u64,
     #[serde(default)]
     t_ms: u64,
     new: bool,
     frame: u32,
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     x: Option<ExactRef>,
 }
 
-struct Corpus {
+pub(crate) struct Corpus {
     folder: PathBuf,
-    lines: Vec<CorpusLine>,
+    pub(crate) lines: Vec<CorpusLine>,
     decoder: zstd::bulk::Decompressor<'static>,
     cached: Option<u32>,
-    picture: Vec<u8>,
+    pub(crate) picture: Vec<u8>,
 }
 
 impl Corpus {
-    fn open(folder: &Path) -> Result<Self> {
+    pub(crate) fn open(folder: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(folder.join("frames.jsonl")).map_err(|e| e.to_string())?;
         let mut lines = text
@@ -76,7 +76,7 @@ impl Corpus {
         })
     }
 
-    fn load(&mut self, index: usize) -> Result<()> {
+    pub(crate) fn load(&mut self, index: usize) -> Result<()> {
         let line = &self.lines[index];
         if self.cached != Some(line.frame) {
             let packed = std::fs::read(self.folder.join(format!("frame-{:04}.zst", line.frame)))

@@ -4,6 +4,9 @@
 //!   picture changed                      → encoded into the AV1 video (`enc`)
 //!   on screen for `SETTLE_INSTANTS` in a row, the changed instant included
 //!                                        → one lossless still for the changed instant
+//!                                          (none when the same picture is stored
+//!                                          already: `still_of`; none when the
+//!                                          last minute's still budget is spent)
 //!   no picture known                     → `lost`, with its cause
 //!   changed, but the encoder queue full  → `lost` (`encoder_behind`)
 //!
@@ -32,6 +35,14 @@ use super::clip_folder::{
 
 /// `SETTLE_INSTANTS`: 0.5 s on screen, the changed instant included (plan §6).
 pub(super) const SETTLE_INSTANTS: u64 = 10;
+/// `STILL_BUDGET_BYTES_PER_MINUTE`: the still bytes written during the last
+/// 60 s may not exceed this. The plan's total target is single-digit MB per
+/// minute of video; 20 MiB keeps stills from dominating and far under the
+/// owner's 100 MB per minute limit.
+pub(super) const STILL_BUDGET_BYTES_PER_MINUTE: u64 = 20 * 1024 * 1024;
+const SECONDS_PER_MINUTE: u64 = 60;
+/// The budget's window: one minute of instants (1200 at 20 per second).
+const STILL_BUDGET_WINDOW_INSTANTS: u64 = SECONDS_PER_MINUTE * RECORD_FPS as u64;
 const MS_PER_SECOND: u64 = 1_000;
 const RGB_BYTES: usize = 3;
 /// Channel positions in a B,G,R,A pixel.
@@ -76,7 +87,11 @@ impl StageTime {
 #[derive(Clone, Copy, Default)]
 pub(super) struct StreamTimes {
     pub(super) compare: StageTime,
+    /// Every settle decision (new still, repeat or over budget).
     pub(super) stills: StageTime,
+    pub(super) stills_written: u64,
+    pub(super) stills_reused: u64,
+    pub(super) stills_skipped_budget: u64,
     pub(super) index: StageTime,
     pub(super) video: VideoTimes,
 }
@@ -222,8 +237,14 @@ impl ClipStream {
                 .shown
                 .as_ref()
                 .ok_or_else(|| "a still is due before any picture".to_owned())?;
-            written.bytes += self.stills.write(settled, shown)?;
-            self.index.mark_still(settled)?;
+            match self.stills.settle(settled, instant, shown)? {
+                Settled::Written(bytes) => {
+                    written.bytes += bytes;
+                    self.index.mark_still(settled, None)?;
+                }
+                Settled::Repeats(stored) => self.index.mark_still(settled, Some(stored))?,
+                Settled::OverBudget => {}
+            }
         }
         written.bytes += self.index.write_decided(self.still_rule.open())?;
         Ok(written)
@@ -322,6 +343,9 @@ impl ClipStream {
         let times = StreamTimes {
             compare: self.compare,
             stills: self.stills.time,
+            stills_written: self.stills.written.len() as u64,
+            stills_reused: self.stills.reused,
+            stills_skipped_budget: self.stills.skipped_budget,
             index: self.index.time,
             video: video_times,
         };
@@ -347,6 +371,7 @@ fn line_of(instant: u64, decision: Decision) -> IndexLine {
         same: None,
         lost: None,
         still: None,
+        still_of: None,
     };
     match decision {
         Decision::Enc(place) => line.enc = Some(place),
@@ -401,12 +426,32 @@ impl StillRule {
     }
 }
 
-/// Lossless WebP stills of the whole window.
+/// What a settled picture got from `Stills`.
+enum Settled {
+    /// A new still file of this many bytes.
+    Written(u64),
+    /// No file: the picture equals the still of this earlier instant.
+    Repeats(u64),
+    /// No still: the budget of the last minute is spent; the picture stays
+    /// available as video.
+    OverBudget,
+}
+
+/// Lossless WebP stills of the whole window. Owns two rules: the same
+/// picture is never stored twice, and the still bytes written in the last
+/// minute stay inside `STILL_BUDGET_BYTES_PER_MINUTE`.
 struct Stills {
     folder: PathBuf,
     rgb: Vec<u8>,
     written: Vec<StillInfo>,
-    /// Conversion, WebP encoding and file write of each still.
+    /// SHA-256 of each written still's picture (size and pixels), with the
+    /// instant whose file holds it.
+    hashes: Vec<([u8; 32], u64)>,
+    /// (instant it was written at, bytes) of the stills inside the budget window.
+    recent: VecDeque<(u64, u64)>,
+    reused: u64,
+    skipped_budget: u64,
+    /// Every settle decision: hash, and for a new still its WebP encoding and file write.
     time: StageTime,
 }
 
@@ -419,19 +464,59 @@ impl Stills {
             folder: folder.to_owned(),
             rgb: Vec::new(),
             written: Vec::new(),
+            hashes: Vec::new(),
+            recent: VecDeque::new(),
+            reused: 0,
+            skipped_budget: 0,
             time: StageTime::default(),
         })
     }
 
-    /// Writes the still of `instant`; returns its bytes.
-    fn write(&mut self, instant: u64, picture: &Shown) -> Result<u64, String> {
+    /// The still of the picture that settled at instant `settled`, decided
+    /// at instant `now`.
+    fn settle(&mut self, settled: u64, now: u64, picture: &Shown) -> Result<Settled, String> {
         let started = Instant::now();
-        let bytes = self.encode_and_write(instant, picture)?;
+        let result = self.decide(settled, now, picture);
         self.time.add(started.elapsed());
-        Ok(bytes)
+        result
     }
 
-    fn encode_and_write(&mut self, instant: u64, picture: &Shown) -> Result<u64, String> {
+    fn decide(&mut self, settled: u64, now: u64, picture: &Shown) -> Result<Settled, String> {
+        let hash = picture_hash(picture);
+        if let Some(&(_, stored)) = self.hashes.iter().find(|(seen, _)| *seen == hash) {
+            self.reused += 1;
+            return Ok(Settled::Repeats(stored));
+        }
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(at, _)| at + STILL_BUDGET_WINDOW_INSTANTS <= now)
+        {
+            self.recent.pop_front();
+        }
+        let spent: u64 = self.recent.iter().map(|&(_, bytes)| bytes).sum();
+        if spent >= STILL_BUDGET_BYTES_PER_MINUTE {
+            self.skipped_budget += 1;
+            return Ok(Settled::OverBudget);
+        }
+        let encoded = self.encode(settled, picture)?;
+        let bytes = encoded.len() as u64;
+        if spent + bytes > STILL_BUDGET_BYTES_PER_MINUTE {
+            self.skipped_budget += 1;
+            return Ok(Settled::OverBudget);
+        }
+        let path = still_path(&self.folder, settled);
+        std::fs::write(&path, &encoded)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        self.written
+            .push(StillInfo::new(&self.folder, settled, bytes));
+        self.hashes.push((hash, settled));
+        self.recent.push_back((now, bytes));
+        Ok(Settled::Written(bytes))
+    }
+
+    /// The lossless WebP of `picture`, the still of `instant`.
+    fn encode(&mut self, instant: u64, picture: &Shown) -> Result<Vec<u8>, String> {
         self.rgb.clear();
         self.rgb.extend(
             picture
@@ -444,14 +529,18 @@ impl Stills {
         WebPEncoder::new(&mut encoded)
             .encode(&self.rgb, picture.width, picture.height, ColorType::Rgb8)
             .map_err(|error| format!("WebP still of instant {instant}: {error}"))?;
-        let path = still_path(&self.folder, instant);
-        std::fs::write(&path, &encoded)
-            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
-        let bytes = encoded.len() as u64;
-        self.written
-            .push(StillInfo::new(&self.folder, instant, bytes));
-        Ok(bytes)
+        Ok(encoded)
     }
+}
+
+/// SHA-256 of a picture's size and B,G,R,A pixels: equal pictures, equal hash.
+fn picture_hash(picture: &Shown) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(picture.width.to_le_bytes());
+    hasher.update(picture.height.to_le_bytes());
+    hasher.update(&picture.bgra);
+    hasher.finalize().into()
 }
 
 /// `frames.jsonl`: one line per instant, in order. A line waits while its
@@ -484,13 +573,18 @@ impl Index {
         self.waiting.push_back(line);
     }
 
-    fn mark_still(&mut self, instant: u64) -> Result<(), String> {
+    /// Marks the settle point `instant`: its own still (`still`), or with
+    /// `still_of` the earlier still that holds the same picture.
+    fn mark_still(&mut self, instant: u64, still_of: Option<u64>) -> Result<(), String> {
         let line = self
             .waiting
             .iter_mut()
             .find(|line| line.instant == instant)
             .ok_or_else(|| format!("index line {instant} was written before its still"))?;
-        line.still = Some(true);
+        match still_of {
+            Some(stored) => line.still_of = Some(stored),
+            None => line.still = Some(true),
+        }
         Ok(())
     }
 

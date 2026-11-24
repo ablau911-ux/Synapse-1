@@ -287,7 +287,7 @@ impl ViewedClip {
     fn still_instants(&self) -> impl Iterator<Item = u64> + '_ {
         self.lines
             .iter()
-            .filter(|line| line.still == Some(true))
+            .filter(|line| line.still_file().is_some())
             .map(|line| line.instant)
     }
 

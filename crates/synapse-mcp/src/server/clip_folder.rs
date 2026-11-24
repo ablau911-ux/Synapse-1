@@ -81,7 +81,9 @@ pub fn still_path(folder: &Path, instant: u64) -> PathBuf {
 /// One line of `frames.jsonl`: one per instant, in order. Exactly one of
 /// `enc` (the picture's place in the video: part, index in the part),
 /// `same` (unchanged: shows the picture before it) and `lost` (with its
-/// cause) is present; `still` marks the instant whose lossless still exists.
+/// cause) is present; `still` marks the instant whose lossless still exists,
+/// `still_of: k` an instant whose settled picture equals the still of instant
+/// k (no second file is written).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexLine {
     pub instant: u64,
@@ -94,9 +96,22 @@ pub struct IndexLine {
     pub lost: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub still: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub still_of: Option<u64>,
 }
 
 impl IndexLine {
+    /// The instant whose still file holds this instant's settled picture:
+    /// its own (`still`) or the one it repeats (`still_of`); `None` when the
+    /// instant is no settle point with a still.
+    pub(super) fn still_file(&self) -> Option<u64> {
+        if self.still == Some(true) {
+            Some(self.instant)
+        } else {
+            self.still_of
+        }
+    }
+
     /// The line as written to `frames.jsonl`, newline included.
     pub(super) fn text(&self) -> Result<String, String> {
         serde_json::to_string(self)

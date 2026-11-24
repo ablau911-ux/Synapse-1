@@ -70,8 +70,10 @@ impl PictureKind {
 /// Where the picture shown at one instant comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PictureSource {
-    /// The lossless still that belongs to `instant`.
-    Still { instant: u64 },
+    /// The lossless still of the picture on screen at `instant`, stored in
+    /// the still file of instant `file` (`instant` itself, or the earlier
+    /// instant its `still_of` names).
+    Still { instant: u64, file: u64 },
     /// Picture `index` of video part `part`, encoded at `instant`.
     Video { instant: u64, part: u32, index: u32 },
     /// No picture: `cause` names why.
@@ -98,8 +100,13 @@ impl PictureSource {
                 };
                 return Ok(Self::Lost { cause });
             }
-            if line.still == Some(true) && still_path(folder, current).is_file() {
-                return Ok(Self::Still { instant: current });
+            if let Some(file) = line.still_file()
+                && still_path(folder, file).is_file()
+            {
+                return Ok(Self::Still {
+                    instant: current,
+                    file,
+                });
             }
             if let Some((part, index)) = line.enc {
                 return Ok(Self::Video {
@@ -130,7 +137,7 @@ impl PictureSource {
     /// The instant whose recording is shown; `None` when lost.
     pub(super) const fn shown_instant(&self) -> Option<u64> {
         match self {
-            Self::Still { instant } | Self::Video { instant, .. } => Some(*instant),
+            Self::Still { instant, .. } | Self::Video { instant, .. } => Some(*instant),
             Self::Lost { .. } => None,
         }
     }
@@ -188,7 +195,7 @@ impl ClipDecoder {
             .ok_or_else(|| format!("instant {instant} is outside the clip"))?;
         let source = self.source(instant)?;
         let image = match &source {
-            PictureSource::Still { instant } => Some(decode_still(&still_path(&self.folder, *instant))?),
+            PictureSource::Still { file, .. } => Some(decode_still(&still_path(&self.folder, *file))?),
             PictureSource::Video { part, index, .. } => Some(self.video_picture(*part, *index)?),
             PictureSource::Lost { .. } => None,
         };

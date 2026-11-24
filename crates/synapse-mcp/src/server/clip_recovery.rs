@@ -7,7 +7,7 @@
 //! reach the disk, and the instants never written up to the planned end,
 //! are named lost (`service_restart`), each once. The clip is then `ready`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::clip_folder::{
@@ -109,6 +109,7 @@ impl ClipRecovery {
             same: None,
             lost: Some(LOST_SERVICE_RESTART.to_owned()),
             still: None,
+            still_of: None,
         };
         let mut lines: Vec<IndexLine> = Vec::with_capacity(read.len());
         for (expected, line) in (0_u64..).zip(read) {
@@ -161,15 +162,17 @@ impl ClipRecovery {
         Ok(parts)
     }
 
-    /// The stills the index names; a still file without its index line (its
-    /// line had not been written when the recorder died) is removed, so the
-    /// folder holds exactly the files of plan §3.
+    /// The stills the index names: each `still` line's own file and every
+    /// file a `still_of` line points to. A still file the index does not name
+    /// (its line had not been written when the recorder died) is removed, so
+    /// the folder holds exactly the files of plan §3.
     fn stills(folder: &Path, lines: &[IndexLine]) -> Result<Vec<StillInfo>, String> {
+        let named: BTreeSet<u64> = lines.iter().filter_map(IndexLine::still_file).collect();
         let mut stills = Vec::new();
-        for line in lines.iter().filter(|line| line.still == Some(true)) {
-            let path = still_path(folder, line.instant);
+        for instant in named {
+            let path = still_path(folder, instant);
             if let Ok(metadata) = std::fs::metadata(&path) {
-                stills.push(StillInfo::new(folder, line.instant, metadata.len()));
+                stills.push(StillInfo::new(folder, instant, metadata.len()));
             }
         }
         let directory = folder.join(STILLS_DIR);

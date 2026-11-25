@@ -371,6 +371,9 @@ impl SynapseService {
                 "observe max_elements must be at least 1; got 0",
             ));
         }
+        if let Some(subtree_root) = params.0.subtree_root.as_ref() {
+            crate::m1::validate_element_id_hwnd_shape("observe", "subtree_root hwnd", subtree_root)?;
+        }
         let include = observe_include(&params.0);
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
@@ -578,6 +581,9 @@ impl SynapseService {
                 "find limit must be at least 1; got 0",
             ));
         }
+        if let Some(in_window) = params.0.in_window.as_ref() {
+            crate::m1::validate_element_id_hwnd_shape("find", "in_window hwnd", in_window)?;
+        }
         let explicit_hwnd = params.0.window_hwnd;
         let target_hwnd = perception_window_hwnd("find", &target, explicit_hwnd)?;
         let cdp_target_id_hint = if explicit_hwnd.is_some() {
@@ -635,6 +641,9 @@ impl SynapseService {
         );
         if let Some(hwnd) = params.0.window_hwnd {
             crate::m1::validate_window_hwnd_shape("read_text", hwnd)?;
+        }
+        if let Some(element_id) = params.0.element_id.as_ref() {
+            crate::m1::validate_element_id_hwnd_shape("read_text", "element_id hwnd", element_id)?;
         }
         // #703: a web element id (cdcd sentinel) is not a UIA element, so the
         // element-bounds path cannot resolve it. OCR it from a CDP

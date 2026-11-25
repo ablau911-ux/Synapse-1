@@ -4769,6 +4769,24 @@ pub(crate) fn validate_window_hwnd_shape(tool: &str, hwnd: i64) -> Result<i64, E
     validate_hwnd_shape(tool, "window_hwnd", hwnd)
 }
 
+/// Applies the same canonical-HWND shape check to the HWND half of an input
+/// element id (`subtree_root`, `element_id`, `in_window`), so a negative or
+/// zero handle is a typed parameter error instead of an internal error, a
+/// no-text error or a silently empty result.
+pub(crate) fn validate_element_id_hwnd_shape(
+    tool: &str,
+    field: &'static str,
+    element_id: &ElementId,
+) -> Result<(), ErrorData> {
+    let parts = element_id.parts().map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} {field}: {error}"),
+        )
+    })?;
+    validate_hwnd_shape(tool, field, parts.hwnd).map(|_| ())
+}
+
 /// Validates the canonical Win32 USER-handle wire representation for an HWND
 /// field whose public name may differ (for example `act_focus_window.hwnd`).
 pub(crate) fn validate_hwnd_shape(

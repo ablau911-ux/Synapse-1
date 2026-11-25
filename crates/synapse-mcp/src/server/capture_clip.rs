@@ -700,10 +700,11 @@ mod live {
         // instant zero, or the response itself) seals the end first, before
         // anything of the recording is shut down, then stops every writer of
         // the folder (`Recording::abandon`) and only then discards what this
-        // start made. `Recording::start` starts the observer as its last
-        // step, so nothing runs when it fails.
-        let begun = match Recording::start(plan) {
-            Ok(mut recording) => match recording
+        // start made. `Recording::start` seals before it returns a failure
+        // and starts the observer as its last step, so nothing runs when it
+        // fails.
+        let begun = Recording::start(plan, control).and_then(|mut recording| {
+            match recording
                 .write_instant_zero()
                 .and_then(|()| recording.response())
             {
@@ -713,12 +714,8 @@ mod live {
                     recording.abandon();
                     Err(error)
                 }
-            },
-            Err(error) => {
-                control.seal();
-                Err(error)
             }
-        };
+        });
         let mut recording = match begun {
             Ok((recording, response)) => {
                 let _ = started.send(Ok(response));
@@ -967,26 +964,43 @@ mod live {
         /// Lock, registry entry, `clip.json`, stream and disk guard, then the
         /// observer: started last, so a failure here leaves nothing running.
         /// The first frame and instant zero follow (`write_instant_zero`).
-        /// The clip folder exists: `create_clip_folder` made it.
-        fn start(plan: &'a ClipPlan) -> Result<Self, ErrorData> {
+        /// The clip folder exists: `create_clip_folder` made it. A failure
+        /// seals the end in `failed`, while everything made so far is still
+        /// held, so no `record_extend` is accepted once the start failed.
+        fn start(plan: &'a ClipPlan, control: &RecordingControl) -> Result<Self, ErrorData> {
+            let failed = |error: ErrorData| {
+                control.seal();
+                error
+            };
             let times = RecordingTimes::begin();
             // Taken before `clip.json` exists, so recovery never sees this
             // clip `recording` without a live recorder.
-            let recorder_lock = RecorderLock::acquire(&plan.folder).map_err(internal_error)?;
+            let recorder_lock = RecorderLock::acquire(&plan.folder)
+                .map_err(internal_error)
+                .map_err(failed)?;
             // Registered before `clip.json` exists, so recovery at start
             // visits every clip that can say `recording`.
-            ClipRegistry::add(&plan.clip_id, &plan.folder).map_err(internal_error)?;
+            ClipRegistry::add(&plan.clip_id, &plan.folder)
+                .map_err(internal_error)
+                .map_err(failed)?;
             initial_clip_json(plan)
                 .create(&plan.folder)
-                .map_err(internal_error)?;
-            let stream = ClipStream::create(&plan.folder).map_err(internal_error)?;
-            let disk = DiskGuard::new(&plan.folder).map_err(internal_error)?;
-            let observer = ClipObserver::start(plan.target, instant_hns()).map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!("screenshot operation=record: {error}"),
-                )
-            })?;
+                .map_err(internal_error)
+                .map_err(failed)?;
+            let stream = ClipStream::create(&plan.folder)
+                .map_err(internal_error)
+                .map_err(failed)?;
+            let disk = DiskGuard::new(&plan.folder)
+                .map_err(internal_error)
+                .map_err(failed)?;
+            let observer = ClipObserver::start(plan.target, instant_hns())
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("screenshot operation=record: {error}"),
+                    )
+                })
+                .map_err(failed)?;
             Ok(Self {
                 plan,
                 observer,

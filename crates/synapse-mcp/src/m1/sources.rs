@@ -848,7 +848,7 @@ pub fn window_input_from_hwnd(
                     FocusSupplementScope::TargetWindow(hwnd),
                 )?;
                 input.is_minimized = true;
-                mark_sparse_minimized_target_a11y(&mut input);
+                mark_sparse_minimized_target_a11y(&mut input, depth);
                 input
             }
             Err(error) => {
@@ -909,7 +909,7 @@ pub fn window_input_from_hwnd(
         FocusSupplementScope::TargetWindow(hwnd),
     )?;
     input.is_minimized = false;
-    mark_sparse_target_a11y(&mut input);
+    mark_sparse_target_a11y(&mut input, depth);
     Ok(input)
 }
 
@@ -1014,7 +1014,12 @@ fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInp
 }
 
 #[cfg(windows)]
-fn mark_sparse_minimized_target_a11y(input: &mut ObservationInput) {
+fn mark_sparse_minimized_target_a11y(input: &mut ObservationInput, gather_depth: u32) {
+    // A depth-0 gather holds only the root by the caller's choice; no child
+    // content is a depth cut, not a sensor failure.
+    if gather_depth == 0 {
+        return;
+    }
     let has_accessible_content = input
         .elements
         .iter()
@@ -1035,7 +1040,12 @@ fn mark_sparse_minimized_target_a11y(input: &mut ObservationInput) {
 }
 
 #[cfg(windows)]
-fn mark_sparse_target_a11y(input: &mut ObservationInput) {
+fn mark_sparse_target_a11y(input: &mut ObservationInput, gather_depth: u32) {
+    // A depth-0 gather holds only the root by the caller's choice; no child
+    // content is a depth cut, not a sensor failure.
+    if gather_depth == 0 {
+        return;
+    }
     let has_accessible_content = input
         .elements
         .iter()
@@ -1165,6 +1175,7 @@ pub fn hidden_desktop_input_from_worker_snapshot(
     foreground: ForegroundContext,
     mode: PerceptionMode,
 ) -> ObservationInput {
+    let gather_depth = tree.max_depth;
     rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
     let focused = tree
         .nodes
@@ -1180,7 +1191,7 @@ pub fn hidden_desktop_input_from_worker_snapshot(
     if mode != PerceptionMode::Auto {
         input.mode_override = Some(mode);
     }
-    mark_sparse_target_a11y(&mut input);
+    mark_sparse_target_a11y(&mut input, gather_depth);
     input
 }
 

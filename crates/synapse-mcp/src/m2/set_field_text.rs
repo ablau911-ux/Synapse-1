@@ -209,6 +209,14 @@ pub(crate) fn set_field_text_route(element_id: &ElementId) -> Result<SetFieldTex
             )
         })?
         .hwnd;
+    // A dead element window gets the one action-tool answer before any
+    // context readback, whose own error would name a missing foreground.
+    crate::m1::element_root_window(
+        TOOL,
+        "element_id",
+        element_id,
+        error_codes::ACTION_TARGET_INVALID,
+    )?;
     let context = synapse_a11y::foreground_context(root_hwnd).map_err(|error| {
         mcp_error(
             error.code(),

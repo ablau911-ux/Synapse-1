@@ -1626,6 +1626,7 @@ fn launch_agent_spawn_with_terminal_capture(
         command_line: None,
         hwnd: None,
         window_owner_pid: None,
+        window_owner_process_name: None,
         reused_existing_window: false,
         matched_title: None,
         launched_at: chrono::Utc::now().to_rfc3339(),

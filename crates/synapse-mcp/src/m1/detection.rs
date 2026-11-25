@@ -130,6 +130,19 @@ pub fn populate_detection_from_state(
         input.detection_status = SensorStatus::Disabled;
         return;
     }
+    // A minimized target has no pixels: its bounds sit off screen, so a
+    // screen capture would only feed black to the model and report a healthy
+    // sensor on nothing (#225). Skip detection, as capture is skipped.
+    if input.is_minimized {
+        input.detection_status = SensorStatus::DegradedSensorFailed {
+            reason_code: error_codes::DETECTION_NO_FRAME.to_owned(),
+        };
+        tracing::info!(
+            code = "M1_DETECTION_TARGET_MINIMIZED",
+            "target window is minimized; detection skipped"
+        );
+        return;
+    }
     if input.foreground.window_bounds.w <= 0 || input.foreground.window_bounds.h <= 0 {
         input.detection_status = SensorStatus::DegradedSensorFailed {
             reason_code: error_codes::DETECTION_NO_FRAME.to_owned(),

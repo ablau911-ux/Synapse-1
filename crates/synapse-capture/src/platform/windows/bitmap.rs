@@ -11,6 +11,7 @@ use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
     Storage::Streams::DataWriter,
     Win32::Graphics::{
+        Direct3D11::D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION,
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
@@ -93,6 +94,7 @@ pub fn window_region_to_bgra_bitmap(
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     validate_bitmap_region(region)?;
     refuse_minimized_wgc_window(hwnd)?;
+    refuse_oversized_wgc_window(hwnd)?;
     match graphics_capture_window_region_to_bgra_bitmap(hwnd, region, timeout_ms) {
         Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
             bitmap: capture.bitmap,
@@ -149,6 +151,7 @@ pub fn window_full_frame_to_bgra_bitmap(
     timeout_ms: u64,
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     refuse_minimized_wgc_window(hwnd)?;
+    refuse_oversized_wgc_window(hwnd)?;
     match graphics_capture_window_full_frame_to_bgra_bitmap(hwnd, timeout_ms) {
         Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
             bitmap: capture.bitmap,
@@ -432,6 +435,24 @@ fn refuse_minimized_wgc_window(hwnd: i64) -> Result<(), CaptureError> {
         return Err(CaptureError::TargetInvalid {
             detail: format!(
                 "target window {hwnd:#x} is minimized; Windows Graphics Capture delivers no frames for a minimized window, so restore the window before capturing it"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// WGC captures the whole window into one Direct3D 11 texture, so a window
+/// wider or taller than the largest texture Direct3D 11 allows fails deep in
+/// the capture thread with a bare Windows API error. Refuse it up front with
+/// a typed error that names the size, the limit and what to do instead. A
+/// region does not help: the full window frame is captured before cropping.
+fn refuse_oversized_wgc_window(hwnd: i64) -> Result<(), CaptureError> {
+    let (width, height) = window_capture_extent(hwnd_from_i64(hwnd)?)?;
+    let limit = i32::try_from(D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION).unwrap_or(i32::MAX);
+    if width > limit || height > limit {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!(
+                "target window {hwnd:#x} is {width}x{height} pixels, larger than the {limit}x{limit} Direct3D 11 texture limit of Windows Graphics Capture; resize the window to at most {limit}x{limit} before capturing it (a region does not help, because the whole window frame is captured first)"
             ),
         });
     }

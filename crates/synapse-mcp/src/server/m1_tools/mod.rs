@@ -372,7 +372,11 @@ impl SynapseService {
             ));
         }
         if let Some(subtree_root) = params.0.subtree_root.as_ref() {
-            crate::m1::validate_element_id_hwnd_shape("observe", "subtree_root hwnd", subtree_root)?;
+            crate::m1::validate_element_id_hwnd_shape(
+                "observe",
+                "subtree_root hwnd",
+                subtree_root,
+            )?;
         }
         let include = observe_include(&params.0);
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;

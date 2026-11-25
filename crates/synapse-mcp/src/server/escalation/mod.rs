@@ -47,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::agent_state::{AgentLifecycleState, AgentStateRead, StateTransition};
+use crate::m3::permissions::{Permission, required};
 use super::notify_tools::{
     NotifyHumanParams, NotifyKind, ToastCleanupReport, ToastRemovalOutcome, remove_internal_toast,
     remove_orphaned_escalation_toasts, run_internal_toast, toast_tag_for,
@@ -2134,6 +2135,11 @@ impl SynapseService {
             kind = "escalation_config_set",
             "tool.invocation kind=escalation_config_set"
         );
+        // Default-deny (upstream #342, #1539): writing the policy row needs WRITE_STORAGE.
+        self.require_m3_permissions(
+            "escalation_config_set",
+            &required([Permission::ReadStorage, Permission::WriteStorage]),
+        )?;
         validate_config(&params)?;
         let db = self.m3_storage()?;
         let mut policy = load_policy(&db)?;

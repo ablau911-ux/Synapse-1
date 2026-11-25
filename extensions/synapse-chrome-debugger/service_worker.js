@@ -5185,13 +5185,15 @@ async function handlePageScreenshotBackground(params) {
   const needsRenderPaint = visibilityBefore !== "visible";
   try {
     // A hidden page does not paint, so a direct capture would hang. An inactive
-    // tab has no live render view at all, so move it into its own unfocused
-    // window where it becomes that window's active tab -- but an active tab is
-    // never moved: the only tab of a window is always active, and moving it out
-    // would close the user's window. An active-but-occluded tab keeps its live
-    // view and is captured in place. In both cases the screencast below forces
-    // the compositor to paint while the page is hidden.
-    if (needsRenderPaint && !before.active) {
+    // tab has no live render view, so it is moved into its own unfocused window
+    // where it becomes that window's active tab; an active-but-occluded tab
+    // keeps its live view and is captured in place. moveTabToRenderWindow makes
+    // that decision on a fresh read taken immediately before it mutates (never
+    // moving an active tab or the only tab of a window, which would change what
+    // the user sees or close the user's window) and returns null when the tab
+    // must be captured in place. In both cases the screencast below forces the
+    // compositor to paint while the page is hidden.
+    if (needsRenderPaint) {
       renderWindow = await moveTabToRenderWindow(selected.tabId);
     }
     // Attach before measuring: the debugger infobar can shrink the viewport.
@@ -5279,7 +5281,13 @@ async function handlePageScreenshotBackground(params) {
       });
     }
   } finally {
-    if (setup?.ok) {
+    // Run cleanup whenever the in-page setup ran, even when it returned ok:false
+    // (a later mask/clip failure after earlier mask overlays were appended):
+    // otherwise those overlays and any scroll/background change stay on the
+    // user's page, now visible because active tabs are captured in place. setup
+    // is null only when executeScript never ran, so nothing was mutated. Cleanup
+    // removes masks by token and restores scroll/background, and is idempotent.
+    if (setup) {
       try {
         await runPageScreenshotCleanup(selected.tabId, {
           token,
@@ -5475,12 +5483,13 @@ async function startRenderWindowScreencast(debuggee) {
 
 // Confirms the render screencast is stopped before the screenshot command
 // returns. A leaked screencast keeps a capturer count that forces the user's
-// own tab to keep painting, so swallowing a failed stop is not safe -- and when
-// the debugger attachment is a reused persistent one (shouldDetach=false) the
-// handler would not detach either. Page.stopScreencast is retried once; if it
-// still fails the debugger is detached, which ends the CDP session and with it
-// the screencast. The outcome is returned so the caller can report it, never
-// hide it.
+// own tab to keep painting, so swallowing a failed stop is not safe.
+// Page.stopScreencast is retried once. If it still fails, the debugger is
+// detached only when this command attached the session itself; detaching a
+// borrowed persistent session (shouldDetach=false) would break the bindings,
+// init scripts and interception its owner registered, so that session is left
+// attached and the unstoppable screencast is reported as an error naming the
+// tab. The outcome is returned so the caller can report it, never hide it.
 async function stopRenderWindowScreencast(attachment) {
   let stopError = null;
   for (let attemptNo = 0; attemptNo < 2; attemptNo += 1) {
@@ -5491,15 +5500,23 @@ async function stopRenderWindowScreencast(attachment) {
       stopError = errorMessage(error);
     }
   }
-  try {
-    await chrome.debugger.detach(attachment.debuggee);
-    return { ok: true, method: "detach_fallback", stop_error: stopError };
-  } catch (detachError) {
-    return {
-      ok: false,
-      error: `Page.stopScreencast failed twice (${stopError}) and the detach fallback failed (${errorMessage(detachError)})`
-    };
+  const tabId = attachment.debuggee?.tabId;
+  if (attachment.shouldDetach) {
+    try {
+      await chrome.debugger.detach(attachment.debuggee);
+      return { ok: true, method: "detach_fallback", stop_error: stopError };
+    } catch (detachError) {
+      return {
+        ok: false,
+        error: `Page.stopScreencast failed twice on tab ${tabId} (${stopError}) and the detach fallback failed (${errorMessage(detachError)})`
+      };
+    }
   }
+  return {
+    ok: false,
+    borrowed_session: true,
+    error: `Page.stopScreencast failed twice on tab ${tabId} (${stopError}); the debugger session is shared, so it was left attached and the screencast may still be running on the tab`
+  };
 }
 
 // Moves the tab into a new unfocused window so it becomes that window's active
@@ -5515,16 +5532,26 @@ async function stopRenderWindowScreencast(attachment) {
 async function moveTabToRenderWindow(tabId) {
   const tab = await chrome.tabs.get(tabId);
   const origin = await chrome.windows.get(tab.windowId);
-  const originActive = await activeTabForWindow(tab.windowId);
   const width = Math.max(800, Math.min(1600, Number(origin.width) || 1280));
   const height = Math.max(600, Math.min(1000, Number(origin.height) || 900));
   const placements = renderWindowPlacements(origin, width, height, await tabWorkArea(tabId));
+  // Decide on a fresh read taken immediately before mutating: the active flag
+  // and the window's tab count can have changed since the caller's pre-read.
+  // Never move a tab that is now active or the only tab of its window -- moving
+  // the last tab out closes the user's window and moving the active tab out
+  // changes what the user sees. Return null so the caller captures in place.
+  const fresh = await chrome.tabs.get(tabId);
+  const windowTabCount = (await chrome.tabs.query({ windowId: fresh.windowId })).length;
+  if (fresh.active || windowTabCount <= 1) {
+    return null;
+  }
+  const originActive = await activeTabForWindow(fresh.windowId);
   const record = {
     tabId,
     windowId: null,
-    originWindowId: tab.windowId,
-    originIndex: tab.index,
-    originWasActive: Boolean(tab.active),
+    originWindowId: fresh.windowId,
+    originIndex: fresh.index,
+    originWasActive: Boolean(fresh.active),
     originActiveTabId: Number.isInteger(originActive?.id) ? originActive.id : null,
     width,
     height,
@@ -5917,7 +5944,22 @@ function remainingPageScreenshotBudgetMs(deadlineMs, phase) {
 }
 
 function pageScreenshotSetupInPage(request) {
-  const fail = (code, detail) => ({ ok: false, error_code: code, error_detail: detail });
+  const beforeScrollX = Number(window.scrollX || 0);
+  const beforeScrollY = Number(window.scrollY || 0);
+  const token = String(request.token || "");
+  let backgroundRestore = null;
+  // A failed setup still carries what cleanup needs to undo any partial
+  // mutation: mask overlays are removed by token, and scroll and background are
+  // restored from these values on every failure path.
+  const fail = (code, detail) => ({
+    ok: false,
+    error_code: code,
+    error_detail: detail,
+    token,
+    before_scroll_x: beforeScrollX,
+    before_scroll_y: beforeScrollY,
+    background_restore: backgroundRestore
+  });
   const finite = (value) => Number.isFinite(Number(value));
   const rectToPlain = (rect) => ({
     x: Number(rect.left + window.scrollX),
@@ -5986,8 +6028,6 @@ function pageScreenshotSetupInPage(request) {
     return node;
   };
   try {
-    const beforeScrollX = Number(window.scrollX || 0);
-    const beforeScrollY = Number(window.scrollY || 0);
     let clip = null;
     let element_rect = null;
     if (request.scope === "viewport") {
@@ -6015,7 +6055,6 @@ function pageScreenshotSetupInPage(request) {
     if (!clip || !finite(clip.x) || !finite(clip.y) || !finite(clip.w) || !finite(clip.h) || clip.w <= 0 || clip.h <= 0) {
       return fail("CAPTURE_TARGET_INVALID", `pageScreenshot resolved an empty/invalid clip ${JSON.stringify(clip)}`);
     }
-    const token = String(request.token || "");
     const masks = [];
     for (const [index, mask] of Array.from(request.masks || []).entries()) {
       const target = mask.elementPath ? elementByPath(mask.elementPath) : document.querySelector(String(mask.selector || ""));
@@ -6043,7 +6082,6 @@ function pageScreenshotSetupInPage(request) {
       document.documentElement.appendChild(overlay);
       masks.push({ index, selector: mask.selector || null, element_path: mask.elementPath || null, color: String(mask.color || "#ff00ff"), rect: plain });
     }
-    let backgroundRestore = null;
     if (request.omitBackground) {
       const doc = document.documentElement;
       const body = document.body;

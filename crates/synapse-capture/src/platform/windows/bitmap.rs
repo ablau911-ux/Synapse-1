@@ -92,6 +92,7 @@ pub fn window_region_to_bgra_bitmap(
     timeout_ms: u64,
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     validate_bitmap_region(region)?;
+    refuse_minimized_wgc_window(hwnd)?;
     match graphics_capture_window_region_to_bgra_bitmap(hwnd, region, timeout_ms) {
         Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
             bitmap: capture.bitmap,
@@ -147,6 +148,7 @@ pub fn window_full_frame_to_bgra_bitmap(
     hwnd: i64,
     timeout_ms: u64,
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
+    refuse_minimized_wgc_window(hwnd)?;
     match graphics_capture_window_full_frame_to_bgra_bitmap(hwnd, timeout_ms) {
         Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
             bitmap: capture.bitmap,
@@ -419,6 +421,21 @@ where
         Ok(()) => result.map_err(WgcWindowFrameAttemptError::Other),
         Err(error) => Err(WgcWindowFrameAttemptError::Other(error)),
     }
+}
+
+/// WGC delivers no frames for a minimized (iconic) window, so a WGC window
+/// capture of one would only burn every bounded frame-timeout retry and then
+/// report a transient timeout with retry advice. Refuse it up front with a
+/// typed error that says what to do instead.
+fn refuse_minimized_wgc_window(hwnd: i64) -> Result<(), CaptureError> {
+    if unsafe { IsIconic(hwnd_from_i64(hwnd)?) }.as_bool() {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!(
+                "target window {hwnd:#x} is minimized; Windows Graphics Capture delivers no frames for a minimized window, so restore the window before capturing it"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn graphics_capture_window_region_to_bgra_bitmap(

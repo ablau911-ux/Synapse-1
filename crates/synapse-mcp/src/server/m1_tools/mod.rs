@@ -17649,6 +17649,16 @@ fn capture_target_window_screenshot_error(
     foreground: Option<&ForegroundContext>,
     error: synapse_capture::CaptureError,
 ) -> ErrorData {
+    // An invalid target (for example a minimized window) is not transient:
+    // no retry advice and no startup-stub guess.
+    if matches!(error, synapse_capture::CaptureError::TargetInvalid { .. }) {
+        return mcp_error(
+            error.code(),
+            format!(
+                "capture_screenshot cannot capture target window {window_hwnd:#x} region {region:?}: {error}"
+            ),
+        );
+    }
     let target_detail = foreground
         .map(|context| {
             format!(

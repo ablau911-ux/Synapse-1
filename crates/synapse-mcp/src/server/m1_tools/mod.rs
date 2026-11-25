@@ -11893,7 +11893,7 @@ fn cdp_target_perception_error(tool: &str, window_hwnd: i64, cdp_target_id: &str
     mcp_error(
         error_codes::TARGET_CDP_UNRESOLVED,
         format!(
-            "{tool} cannot use session CDP target {cdp_target_id:?} in browser window {window_hwnd:#x} through the window/foreground perception path; refusing to downgrade the tab target to the browser HWND because that can read the human foreground tab. Use a true target-specific browser readback surface or pass an explicit window_hwnd intentionally."
+            "{tool} cannot use session CDP target {cdp_target_id:?} in browser window {window_hwnd:#x} through the window/foreground perception path; refusing to downgrade the tab target to the browser HWND because that can read the human foreground tab (#1508). To capture this exact tab use screenshot operation=capture without window_hwnd (Page.captureScreenshot of the session CDP tab) or browser_capture operation=screenshot (browser_screenshot); or pass an explicit window_hwnd intentionally."
         ),
     )
 }

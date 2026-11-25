@@ -222,6 +222,7 @@ fn text_region(
                     hwnd,
                 )?;
             }
+            fail_if_element_window_minimized(element_id)?;
             // No OCR ran yet: keep the accessibility code (stale, invalid id).
             let region = synapse_a11y::element_bounding_rect(element_id).map_err(|err| {
                 mcp_error(
@@ -339,6 +340,49 @@ fn fail_if_minimized_target_needs_window_capture(_hwnd: i64) -> Result<(), Error
         error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
         "read_text target-window OCR requires Windows window capture",
     ))
+}
+
+/// An element of a minimized window has off-screen bounds (around -32000),
+/// so a screen OCR of them reads no pixels and would report a false
+/// `no_text`. Refused with the same code as the whole-window minimized check.
+#[cfg(windows)]
+fn fail_if_element_window_minimized(element_id: &synapse_core::ElementId) -> Result<(), ErrorData> {
+    let element_hwnd = element_id
+        .parts()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("read_text element_id: {error}"),
+            )
+        })?
+        .hwnd;
+    let window = synapse_a11y::top_level_root_hwnd(element_hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::A11Y_ELEMENT_STALE,
+            format!(
+                "read_text element_id {element_id} names hwnd {element_hwnd:#x}, which is not a live window: {error}"
+            ),
+        )
+    })?;
+    if synapse_a11y::is_window_minimized(window).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("read_text could not determine minimized state for hwnd {window:#x}: {error}"),
+        )
+    })? {
+        return Err(mcp_error(
+            error_codes::A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
+            format!(
+                "read_text element_id {element_id} belongs to window {window:#x}, which is minimized; its element bounds are off screen, so there are no pixels to OCR; restore the window first"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn fail_if_element_window_minimized(_element_id: &synapse_core::ElementId) -> Result<(), ErrorData> {
+    Ok(())
 }
 
 pub fn effective_ocr_backend(backend: OcrBackend) -> Result<OcrBackend, ErrorData> {

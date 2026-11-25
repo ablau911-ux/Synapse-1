@@ -975,7 +975,7 @@ fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInp
                 "minimized target capture extent could not be resolved"
             );
             input.capture_status = SensorStatus::DegradedSensorFailed {
-                reason_code: format!("A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_{}", error.code()),
+                reason_code: error.code().to_owned(),
             };
             return;
         }
@@ -1007,7 +1007,7 @@ fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInp
                 "minimized target UIA is unavailable and target-window capture probe also failed"
             );
             input.capture_status = SensorStatus::DegradedSensorFailed {
-                reason_code: format!("A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_{}", error.code()),
+                reason_code: error.code().to_owned(),
             };
         }
     }

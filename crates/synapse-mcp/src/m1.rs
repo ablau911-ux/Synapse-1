@@ -324,6 +324,11 @@ pub struct ReadTextParams {
 #[serde(deny_unknown_fields)]
 pub struct CaptureScreenshotParams {
     pub path: String,
+    /// Capture region. With `window_hwnd` or this MCP session's active window
+    /// target, this is window-client-relative and must fit inside the client
+    /// area (no title bar or borders), which is smaller than the
+    /// `native_width`/`native_height` of a whole-window capture. With no
+    /// target, this is an absolute screen region.
     #[serde(default)]
     pub region: Option<Rect>,
     /// Explicit per-call window override (HWND). Takes precedence over the

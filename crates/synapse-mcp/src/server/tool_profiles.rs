@@ -3255,7 +3255,12 @@ impl SynapseService {
         &self,
         session_id: &str,
     ) -> Result<RealityWriteGrantResponse, ErrorData> {
-        let lease_proof = break_glass_lease_proof(session_id, ToolProfileKind::BreakGlass);
+        // De-escalation needs no lease (upstream PR #1567), so the readback says
+        // the lease is not required; held/owner are the current lease state only.
+        let lease_proof = ToolProfileLeaseProof {
+            required: false,
+            ..break_glass_lease_proof(session_id, ToolProfileKind::BreakGlass)
+        };
         let command_payload = json!({ "operation": "revoke_reality_write" });
         let command_before = json!({ "source_of_truth": REALITY_WRITE_GRANT_SOURCE_OF_TRUTH });
         let intent_audit = audit_readback(self.command_audit_intent(

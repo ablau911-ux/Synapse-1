@@ -2229,6 +2229,11 @@ impl SynapseService {
             escalation_id = %params.escalation_id,
             "tool.invocation kind=escalation_ack"
         );
+        // Default-deny (upstream #342, #1539): the ack writes the item and audit rows.
+        self.require_m3_permissions(
+            "escalation_ack",
+            &required([Permission::ReadStorage, Permission::WriteStorage]),
+        )?;
         let db = self.m3_storage()?;
         let was_pending = read_item(&db, &params.escalation_id)?
             .map(|item| item.status == EscalationStatus::Pending)

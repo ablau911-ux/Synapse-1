@@ -7484,9 +7484,11 @@ fn params_with_chromium_launch_args(
 fn append_caller_args_merging_disable_features(args: &mut Vec<String>, caller_args: &[String]) {
     const SWITCH: &str = "--disable-features";
     const FLAG: &str = "--disable-features=";
+    /// Value of a `--disable-features` switch; a bare switch (no `=`) is empty.
+    fn switch_value(arg: &str) -> &str {
+        arg.strip_prefix(FLAG).unwrap_or("")
+    }
     let is_switch = |arg: &str| arg == SWITCH || arg.starts_with(FLAG);
-    // Value of a `--disable-features` switch; a bare switch (no `=`) is empty.
-    let switch_value = |arg: &str| arg.strip_prefix(FLAG).unwrap_or("");
 
     let Some(injected_idx) = args.iter().position(|arg| arg.starts_with(FLAG)) else {
         args.extend(caller_args.iter().cloned());

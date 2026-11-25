@@ -116,6 +116,12 @@ pub struct ActPressResponse {
     pub backend_tier_used: String,
     pub required_foreground: bool,
     pub postcondition: ActPostcondition,
+    /// Set when a WM_KEYUP was not posted because the matching WM_KEYDOWN closed
+    /// its window (e.g. Enter in an address bar navigated the page). The press
+    /// was delivered; a key-up in a window that no longer exists is unnecessary,
+    /// so this is not a backend failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_up_not_posted_window_closed: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

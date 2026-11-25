@@ -17,19 +17,17 @@ pub(crate) struct HwndKeyboardTargetState {
     pub text_sha256: Option<String>,
     pub selection_start: Option<u32>,
     pub selection_end: Option<u32>,
-    /// Set when a WM_KEYUP was not posted because the matching WM_KEYDOWN
-    /// destroyed the target window (e.g. Enter in an address bar navigated the
-    /// page). The press was delivered; a key-up in a window that no longer
-    /// exists is unnecessary, so this is not a backend failure.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_up_not_posted_window_closed: Option<String>,
 }
 
 /// Outcome of a PostMessage key sequence delivered to a root window.
 #[derive(Clone, Debug)]
 pub(crate) enum PostKeySequenceOutcome {
     /// The target window is still live; the post-delivery readback succeeded.
-    Readback,
+    /// `key_up_not_posted_window_closed` records a key-up skipped because the
+    /// key-down closed a child window (the root stayed live).
+    Readback {
+        key_up_not_posted_window_closed: Option<String>,
+    },
     /// The key-down closed the target root window. The press was delivered and
     /// there is no live window to read back; `detail` names the closed window.
     TargetWindowClosed { detail: String },
@@ -184,7 +182,7 @@ async fn post_key_sequence_impl(
     // Input was already posted before this readback. When the key-down closed
     // the target root window there is no live window to read back; the press was
     // delivered, so report the closed window instead of failing the readback.
-    if let Some(detail) = key_up_window_closed
+    if let Some(detail) = key_up_window_closed.clone()
         && !root_is_window(root_hwnd)
     {
         return Ok(PostKeySequenceOutcome::TargetWindowClosed { detail });
@@ -193,7 +191,9 @@ async fn post_key_sequence_impl(
     best_keyboard_target(root_hwnd)
         .and_then(target_state)
         .map_err(|error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1))?;
-    Ok(PostKeySequenceOutcome::Readback)
+    Ok(PostKeySequenceOutcome::Readback {
+        key_up_not_posted_window_closed: key_up_window_closed,
+    })
 }
 
 /// True when `root_hwnd` still names a live top-level window.
@@ -540,7 +540,6 @@ fn target_state(target: WindowCandidate) -> Result<HwndKeyboardTargetState, Acti
         text_sha256: Some(hex_encode(&Sha256::digest(text.as_bytes()))),
         selection_start: selection.map(|(start, _end)| start),
         selection_end: selection.map(|(_start, end)| end),
-        key_up_not_posted_window_closed: None,
     })
 }
 

@@ -74,6 +74,7 @@ pub(crate) async fn act_press_with_handle_and_boundary(
         backend_tier_used: "foreground".to_owned(),
         required_foreground: true,
         postcondition: press_postcondition_not_requested(),
+        key_up_not_posted_window_closed: None,
     })
 }
 
@@ -128,6 +129,7 @@ pub(crate) async fn act_press_cdp_target(
         backend_tier_used: "cdp".to_owned(),
         required_foreground: false,
         postcondition: press_postcondition_not_requested(),
+        key_up_not_posted_window_closed: None,
     })
 }
 
@@ -154,12 +156,18 @@ pub(crate) async fn act_press_postmessage_target(
         )
     })?;
     validate_hold_ms(params.hold_ms)?;
-    let delivery =
+    let (key_up_not_posted_window_closed, delivery) =
         match postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await? {
-            postmessage::PostKeySequenceOutcome::Readback => PostKeyDelivery::VerifyReadback,
-            postmessage::PostKeySequenceOutcome::TargetWindowClosed { detail } => {
-                PostKeyDelivery::TargetWindowClosed { detail }
-            }
+            postmessage::PostKeySequenceOutcome::Readback {
+                key_up_not_posted_window_closed,
+            } => (
+                key_up_not_posted_window_closed,
+                PostKeyDelivery::VerifyReadback,
+            ),
+            postmessage::PostKeySequenceOutcome::TargetWindowClosed { detail } => (
+                Some(detail.clone()),
+                PostKeyDelivery::TargetWindowClosed { detail },
+            ),
         };
     Ok((
         ActPressResponse {
@@ -170,6 +178,7 @@ pub(crate) async fn act_press_postmessage_target(
             backend_tier_used: "postmessage".to_owned(),
             required_foreground: false,
             postcondition: press_postcondition_not_requested(),
+            key_up_not_posted_window_closed,
         },
         delivery,
     ))

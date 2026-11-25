@@ -185,6 +185,7 @@ pub struct BrowserNetworkRequestsParams {
     pub since_seq: Option<u64>,
     /// Maximum records to return after filtering. Defaults to 100, max 1000.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 1_000))]
     pub limit: Option<usize>,
     /// Case-insensitive substring filter against request URL.
     #[serde(default)]
@@ -197,9 +198,11 @@ pub struct BrowserNetworkRequestsParams {
     pub resource_type: Option<String>,
     /// Minimum HTTP status, inclusive.
     #[serde(default)]
+    #[schemars(range(min = 0, max = 999))]
     pub status_min: Option<i64>,
     /// Maximum HTTP status, inclusive.
     #[serde(default)]
+    #[schemars(range(min = 0, max = 999))]
     pub status_max: Option<i64>,
 }
 
@@ -261,6 +264,7 @@ pub struct BrowserNetworkWebSocketsParams {
     pub since_seq: Option<u64>,
     /// Maximum sockets to return after filtering. Defaults to 100, max 1000.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 1_000))]
     pub limit: Option<usize>,
     /// Exact CDP request id filter.
     #[serde(default)]
@@ -575,6 +579,7 @@ pub struct BrowserNetworkHarParams {
     /// Maximum entries to record/replay. Defaults to 100 for record and all HAR
     /// entries for replay, capped at 1000.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 1_000))]
     pub limit: Option<usize>,
     /// Case-insensitive substring filter against request URL while recording.
     #[serde(default)]
@@ -587,9 +592,11 @@ pub struct BrowserNetworkHarParams {
     pub resource_type: Option<String>,
     /// Minimum HTTP status, inclusive, while recording.
     #[serde(default)]
+    #[schemars(range(min = 0, max = 999))]
     pub status_min: Option<i64>,
     /// Maximum HTTP status, inclusive, while recording.
     #[serde(default)]
+    #[schemars(range(min = 0, max = 999))]
     pub status_max: Option<i64>,
     /// Include retained response bodies in recorded HAR content. Defaults true.
     #[serde(default)]

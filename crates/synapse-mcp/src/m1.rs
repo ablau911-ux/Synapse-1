@@ -735,6 +735,7 @@ pub struct BrowserDownloadsParams {
     pub since_event_seq: Option<u64>,
     /// Maximum matching rows/events to return. Default 50, max 500.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 500))]
     pub limit: Option<u32>,
     /// Wait budget for `wait`, `save`, and `move`. Default 30000, max 300000.
     #[serde(default)]

@@ -280,6 +280,7 @@ pub struct ApprovalListParams {
     #[serde(default)]
     pub include_terminal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 200))]
     pub limit: Option<u32>,
     /// Hex-encoded item key from a previous response.
     #[serde(default, skip_serializing_if = "Option::is_none")]

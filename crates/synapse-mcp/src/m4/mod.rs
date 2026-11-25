@@ -7469,35 +7469,48 @@ fn params_with_chromium_launch_args(
 }
 
 /// Appends the caller's `caller_args` to `args`, folding any caller
-/// `--disable-features=` value into a `--disable-features=` already present in
-/// `args` (our injected occlusion flag) rather than letting the caller's own
-/// list silently override it (#334). Chrome honours only the last
-/// `--disable-features=`, and the caller's args follow our injected ones, so the
-/// caller's copy is merged in and dropped instead of appended; if `args` has no
-/// injected `--disable-features=` (nothing was injected), the caller's args —
-/// including any `--disable-features=` — are appended unchanged.
+/// `--disable-features` into the `--disable-features=` already present in `args`
+/// (our injected occlusion flag) rather than letting the caller's own list
+/// silently override it (#334). Chrome honours only the LAST `--disable-features`
+/// switch and the caller's args follow our injected one, so the caller's
+/// effective value — the value of its last `--disable-features` switch, empty
+/// when that one is bare or `=` — is merged into ours (never duplicating a
+/// feature name) and every caller `--disable-features` switch is dropped, so
+/// exactly one such switch survives. A bare `--disable-features` is a switch with
+/// an empty value: Chrome does not read the following token as its value, so that
+/// token (like any non-switch arg) passes through unchanged. If `args` has no
+/// injected `--disable-features=` (a non-CDP launch injected nothing), the
+/// caller's args are appended verbatim.
 fn append_caller_args_merging_disable_features(args: &mut Vec<String>, caller_args: &[String]) {
+    const SWITCH: &str = "--disable-features";
     const FLAG: &str = "--disable-features=";
+    let is_switch = |arg: &str| arg == SWITCH || arg.starts_with(FLAG);
+    // Value of a `--disable-features` switch; a bare switch (no `=`) is empty.
+    let switch_value = |arg: &str| arg.strip_prefix(FLAG).unwrap_or("");
+
     let Some(injected_idx) = args.iter().position(|arg| arg.starts_with(FLAG)) else {
         args.extend(caller_args.iter().cloned());
         return;
     };
-    // Chrome would have used the caller's last --disable-features=, so fold that
-    // value in and append every other caller arg unchanged.
     if let Some(caller_value) = caller_args
         .iter()
-        .filter_map(|arg| arg.strip_prefix(FLAG))
-        .filter(|value| !value.is_empty())
-        .next_back()
+        .rfind(|arg| is_switch(arg.as_str()))
+        .map(|arg| switch_value(arg.as_str()))
     {
-        let injected_value = args[injected_idx]
-            .strip_prefix(FLAG)
-            .unwrap_or_default()
-            .to_owned();
-        args[injected_idx] = format!("{FLAG}{injected_value},{caller_value}");
+        let injected_value = switch_value(args[injected_idx].as_str()).to_owned();
+        let mut features: Vec<&str> = injected_value
+            .split(',')
+            .filter(|f| !f.is_empty())
+            .collect();
+        for feature in caller_value.split(',').filter(|f| !f.is_empty()) {
+            if !features.contains(&feature) {
+                features.push(feature);
+            }
+        }
+        args[injected_idx] = format!("{FLAG}{}", features.join(","));
     }
     for arg in caller_args {
-        if !arg.starts_with(FLAG) {
+        if !is_switch(arg.as_str()) {
             args.push(arg.clone());
         }
     }

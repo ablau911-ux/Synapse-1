@@ -7136,18 +7136,16 @@ fn set_field_text_locator_window_hwnd(
         return crate::m1::validate_window_hwnd_shape("act_set_field_text", window_hwnd);
     }
     if let Some(element_id) = params.element_id.as_ref() {
-        let hwnd = element_id
-            .parts()
-            .map_err(|error| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "act_set_field_text locator could not use element_id HWND hint from {element_id}: {error}"
-                    ),
-                )
-            })?
-            .hwnd;
-        let window_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).or(Ok(hwnd))?;
+        element_id.parts().map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "act_set_field_text locator could not use element_id HWND hint from {element_id}: {error}"
+                ),
+            )
+        })?;
+        let window_hwnd =
+            crate::m1::element_root_window("act_set_field_text", "element_id", element_id)?;
         return crate::m1::validate_window_hwnd_shape("act_set_field_text", window_hwnd);
     }
     Err(mcp_error(

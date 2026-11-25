@@ -15,8 +15,8 @@ use uiautomation::{
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::{
-        ES_MULTILINE, GWL_STYLE, GetWindowLongW, IsWindow, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
-        WM_GETTEXTLENGTH, WM_SETTEXT,
+        ES_MULTILINE, GWL_STYLE, GetWindowLongW, IsWindow, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+        WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
     },
 };
 

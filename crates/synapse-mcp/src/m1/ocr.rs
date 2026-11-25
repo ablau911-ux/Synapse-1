@@ -381,7 +381,9 @@ fn fail_if_element_window_minimized(element_id: &synapse_core::ElementId) -> Res
 }
 
 #[cfg(not(windows))]
-fn fail_if_element_window_minimized(_element_id: &synapse_core::ElementId) -> Result<(), ErrorData> {
+fn fail_if_element_window_minimized(
+    _element_id: &synapse_core::ElementId,
+) -> Result<(), ErrorData> {
     Ok(())
 }
 

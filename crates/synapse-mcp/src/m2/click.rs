@@ -545,28 +545,20 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
         .transpose()?;
     match &params.target {
         ActClickTarget::Element(element) => {
-            let parsed_hwnd = element
-                .element_id
-                .parts()
-                .map_err(|error| {
-                    mcp_error(
-                        error_codes::ACTION_TARGET_INVALID,
-                        format!(
-                            "act_click element id {} could not be parsed for target-window verification: {error}",
-                            element.element_id
-                        ),
-                    )
-                })?
-                .hwnd;
-            let hwnd = verified_top_level_hwnd(parsed_hwnd).map_err(|detail| {
+            element.element_id.parts().map_err(|error| {
                 mcp_error(
                     error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "act_click element id {} could not be normalized for target-window verification: {detail}",
+                        "act_click element id {} could not be parsed for target-window verification: {error}",
                         element.element_id
                     ),
                 )
             })?;
+            let hwnd = crate::m1::element_root_window(
+                "act_click",
+                "target.element_id",
+                &element.element_id,
+            )?;
             if let Some(expected) = verify_target_window_hwnd {
                 let expected_root = verified_top_level_hwnd(expected).map_err(|detail| {
                     mcp_error(
@@ -620,15 +612,11 @@ pub(crate) fn click_target_foreground_guard_hwnds(
                     )
                 })?
                 .hwnd;
-            let root_hwnd = verified_top_level_hwnd(element_hwnd).map_err(|detail| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "act_click element id {} HWND 0x{element_hwnd:x} could not be normalized for foreground guard: {detail}",
-                        element.element_id
-                    ),
-                )
-            })?;
+            let root_hwnd = crate::m1::element_root_window(
+                "act_click",
+                "target.element_id",
+                &element.element_id,
+            )?;
             Ok(Some((element_hwnd, root_hwnd)))
         }
         ActClickTarget::Point(_) => Ok(None),

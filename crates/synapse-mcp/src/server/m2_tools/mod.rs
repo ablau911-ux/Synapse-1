@@ -667,7 +667,10 @@ impl SynapseService {
         ) {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
         }
-        let foreground_guard = match act_set_value_target_foreground_guard(&params.element_id) {
+        let foreground_guard = match act_set_value_target_foreground_guard(
+            "act_set_value",
+            &params.element_id,
+        ) {
             Ok(guard) => guard,
             Err(error) => {
                 let result: Result<ActSetValueResponse, ErrorData> = Err(error);
@@ -3349,7 +3352,8 @@ impl SynapseService {
         >,
     {
         let element_id = crate::m2::required_element_id(params)?;
-        let foreground_guard = act_set_value_target_foreground_guard(element_id)?;
+        let foreground_guard =
+            act_set_value_target_foreground_guard("act_set_field_text", element_id)?;
         let foreground_before = self
             .current_audit_foreground()
             .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
@@ -7098,24 +7102,18 @@ impl BackgroundTargetForegroundGuard {
 }
 
 fn act_set_value_target_foreground_guard(
+    tool: &'static str,
     element_id: &ElementId,
 ) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
     let hwnd = element_id.parts().map_err(|error| {
         mcp_error(
             error_codes::ACTION_TARGET_INVALID,
             format!(
-                "act_set_value element id {element_id} could not be parsed for foreground guard: {error}"
+                "{tool} element id {element_id} could not be parsed for foreground guard: {error}"
             ),
         )
     })?.hwnd;
-    let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!(
-                "act_set_value element id {element_id} HWND 0x{hwnd:x} could not be normalized to a live top-level target root for foreground guard: {error}"
-            ),
-        )
-    })?;
+    let root_hwnd = crate::m1::element_root_window(tool, "element_id", element_id)?;
     Ok(BackgroundTargetForegroundGuard {
         element_hwnd: hwnd,
         root_hwnd,
@@ -7323,15 +7321,8 @@ fn act_scroll_target_foreground_guard(
             )
         })?
         .hwnd;
-    let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!(
-                "act_scroll element id {} HWND 0x{hwnd:x} could not be normalized to a live top-level target root for foreground guard: {error}",
-                target.element_id
-            ),
-        )
-    })?;
+    let root_hwnd =
+        crate::m1::element_root_window("act_scroll", "target.element_id", &target.element_id)?;
     Ok(BackgroundTargetForegroundGuard {
         element_hwnd: hwnd,
         root_hwnd,

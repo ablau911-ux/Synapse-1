@@ -19,6 +19,20 @@ pub(crate) struct HwndKeyboardTargetState {
     pub selection_end: Option<u32>,
 }
 
+/// Outcome of a PostMessage key sequence delivered to a root window.
+#[derive(Clone, Debug)]
+pub(crate) enum PostKeySequenceOutcome {
+    /// The target window is still live; the post-delivery readback succeeded.
+    /// `key_up_not_posted_window_closed` records a key-up skipped because the
+    /// key-down closed a child window (the root stayed live).
+    Readback {
+        key_up_not_posted_window_closed: Option<String>,
+    },
+    /// The key-down closed the target root window. The press was delivered and
+    /// there is no live window to read back; `detail` names the closed window.
+    TargetWindowClosed { detail: String },
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 struct WindowCandidate {
@@ -46,7 +60,7 @@ pub(crate) async fn post_key_sequence(
     keys: &[Key],
     hold_ms: u32,
     boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
+) -> Result<PostKeySequenceOutcome, ErrorData> {
     post_key_sequence_impl(root_hwnd, keys, hold_ms, boundary).await
 }
 
@@ -56,7 +70,7 @@ async fn post_key_sequence_impl(
     keys: &[Key],
     hold_ms: u32,
     boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
+) -> Result<PostKeySequenceOutcome, ErrorData> {
     let key_specs = keys
         .iter()
         .map(key_spec)
@@ -125,18 +139,29 @@ async fn post_key_sequence_impl(
         .err();
     let target = hwnd_from_i64(target_hwnd).map_err(|error| action_error_to_mcp(&error))?;
     let mut release_error = None;
+    let mut key_up_window_closed = None;
     if release_keys {
         for spec in key_specs.iter().rev() {
-            if let Err(error) = post_key_message(
-                target,
-                windows::Win32::UI::WindowsAndMessaging::WM_KEYUP,
-                spec,
-            ) && release_error.is_none()
-            {
-                release_error = Some(crate::m2::error_after_earlier_steps(
-                    action_error_to_mcp(&error),
-                    key_specs.len(),
-                ));
+            match post_key_up(target, spec) {
+                KeyUpRelease::Released => {}
+                KeyUpRelease::WindowClosed => {
+                    // The key-down closed the target window; the press was
+                    // delivered. Remaining key-ups (held modifiers) would target
+                    // the same destroyed window and need no release.
+                    key_up_window_closed = Some(format!(
+                        "key-up for {} not posted: the key-down closed target window 0x{:x} (ERROR_INVALID_WINDOW_HANDLE); the press was delivered and keys held in a destroyed window need no release",
+                        spec.label,
+                        hwnd_to_i64(target)
+                    ));
+                    break;
+                }
+                KeyUpRelease::Failed(error) if release_error.is_none() => {
+                    release_error = Some(crate::m2::error_after_earlier_steps(
+                        action_error_to_mcp(&error),
+                        key_specs.len(),
+                    ));
+                }
+                KeyUpRelease::Failed(_) => {}
             }
         }
     }
@@ -154,10 +179,28 @@ async fn post_key_sequence_impl(
     if let Some(error) = release_error {
         return Err(error);
     }
-    // Input was already posted before this readback.
+    // Input was already posted before this readback. When the key-down closed
+    // the target root window there is no live window to read back; the press was
+    // delivered, so report the closed window instead of failing the readback.
+    if let Some(detail) = key_up_window_closed.clone()
+        && !root_is_window(root_hwnd)
+    {
+        return Ok(PostKeySequenceOutcome::TargetWindowClosed { detail });
+    }
+    // Liveness gate: a dead root without a skipped key-up is still an error.
     best_keyboard_target(root_hwnd)
         .and_then(target_state)
-        .map_err(|error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1))
+        .map_err(|error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1))?;
+    Ok(PostKeySequenceOutcome::Readback {
+        key_up_not_posted_window_closed: key_up_window_closed,
+    })
+}
+
+/// True when `root_hwnd` still names a live top-level window.
+#[cfg(windows)]
+fn root_is_window(root_hwnd: i64) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    hwnd_from_i64(root_hwnd).is_ok_and(|hwnd| unsafe { IsWindow(Some(hwnd)) }.as_bool())
 }
 
 #[cfg(not(windows))]
@@ -166,7 +209,7 @@ async fn post_key_sequence_impl(
     _keys: &[Key],
     _hold_ms: u32,
     _boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
+) -> Result<PostKeySequenceOutcome, ErrorData> {
     Err(action_error_to_mcp(&ActionError::BackendUnavailable {
         detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
     }))
@@ -652,11 +695,29 @@ fn post_key_message(
     message: u32,
     key: &KeySpec,
 ) -> Result<(), ActionError> {
+    use windows::Win32::{Foundation::WPARAM, UI::WindowsAndMessaging::PostMessageW};
+
+    let lparam = key_event_lparam(message, key);
+    unsafe { PostMessageW(Some(hwnd), message, WPARAM(usize::from(key.vk)), lparam) }.map_err(
+        |error| ActionError::BackendUnavailable {
+            detail: format!(
+                "PostMessageW act_press keyboard message 0x{message:x} failed for hwnd 0x{:x}: {error}",
+                hwnd_to_i64(hwnd)
+            ),
+        },
+    )
+}
+
+/// Builds the lparam of a `WM_KEYDOWN`/`WM_KEYUP` for `key`: repeat count 1,
+/// the hardware scan code, and (for key-up) the transition and previous-state
+/// bits Windows expects.
+#[cfg(windows)]
+fn key_event_lparam(message: u32, key: &KeySpec) -> windows::Win32::Foundation::LPARAM {
     use windows::Win32::{
-        Foundation::{LPARAM, WPARAM},
+        Foundation::LPARAM,
         UI::{
             Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW},
-            WindowsAndMessaging::{PostMessageW, WM_KEYUP},
+            WindowsAndMessaging::WM_KEYUP,
         },
     };
 
@@ -666,15 +727,58 @@ fn post_key_message(
         bits |= 1 << 30;
         bits |= 1 << 31;
     }
-    let lparam = LPARAM(isize::try_from(bits).unwrap_or(isize::MAX));
-    unsafe { PostMessageW(Some(hwnd), message, WPARAM(usize::from(key.vk)), lparam) }.map_err(
-        |error| ActionError::BackendUnavailable {
+    LPARAM(isize::try_from(bits).unwrap_or(isize::MAX))
+}
+
+/// Outcome of releasing a held key with `WM_KEYUP`.
+#[cfg(windows)]
+enum KeyUpRelease {
+    /// The key-up was posted.
+    Released,
+    /// The target window no longer exists because the matching key-down closed
+    /// it; the press was delivered and the key-up is unnecessary.
+    WindowClosed,
+    /// The key-up could not be posted and the window still exists.
+    Failed(ActionError),
+}
+
+/// Posts the `WM_KEYUP` that releases a held key.
+///
+/// The matching `WM_KEYDOWN` can destroy the target window (e.g. Enter in an
+/// address bar navigates the page). When the handle is already invalid the
+/// press was delivered and the key-up is moot; a held key cannot outlive the
+/// window that received its key-down, so nothing else needs releasing.
+#[cfg(windows)]
+fn post_key_up(hwnd: windows::Win32::Foundation::HWND, key: &KeySpec) -> KeyUpRelease {
+    use windows::Win32::{
+        Foundation::WPARAM,
+        UI::WindowsAndMessaging::{IsWindow, PostMessageW, WM_KEYUP},
+    };
+
+    let lparam = key_event_lparam(WM_KEYUP, key);
+    match unsafe { PostMessageW(Some(hwnd), WM_KEYUP, WPARAM(usize::from(key.vk)), lparam) } {
+        Ok(()) => KeyUpRelease::Released,
+        Err(error)
+            if is_invalid_window_handle_error(&error)
+                && !unsafe { IsWindow(Some(hwnd)) }.as_bool() =>
+        {
+            KeyUpRelease::WindowClosed
+        }
+        Err(error) => KeyUpRelease::Failed(ActionError::BackendUnavailable {
             detail: format!(
-                "PostMessageW act_press keyboard message 0x{message:x} failed for hwnd 0x{:x}: {error}",
+                "PostMessageW act_press keyboard message 0x{:x} failed for hwnd 0x{:x}: {error}",
+                WM_KEYUP,
                 hwnd_to_i64(hwnd)
             ),
-        },
-    )
+        }),
+    }
+}
+
+/// True when a Win32 call failed with `ERROR_INVALID_WINDOW_HANDLE`.
+#[cfg(windows)]
+const fn is_invalid_window_handle_error(error: &windows::core::Error) -> bool {
+    // ERROR_INVALID_WINDOW_HANDLE (1400) surfaced through HRESULT_FROM_WIN32.
+    u32::from_ne_bytes(error.code().0.to_ne_bytes()) == 0x8007_0578
 }
 
 #[cfg(windows)]

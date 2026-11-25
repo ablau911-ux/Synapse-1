@@ -108,7 +108,12 @@ pub(crate) async fn act_focus_window_with_boundary(
     let before = synapse_a11y::current_foreground_context()
         .map_err(|error| a11y_error_to_focus_mcp("before_foreground_read", error, None))?;
     let matched = resolve_focus_target(&requested)?;
-    let activation = activate_focus_window_once(&before, &matched, boundary)?;
+    // focus_window_with_intent runs synchronous, blocking Win32 (SetForegroundWindow,
+    // the fullscreen-guard re-read with its bounded sleep). block_in_place keeps that
+    // blocking work off this reactor worker, the crate's pattern for blocking Win32 on
+    // the async path.
+    let activation =
+        tokio::task::block_in_place(|| activate_focus_window_once(&before, &matched, boundary))?;
     // Once an activation request went out, every failure below says so.
     let activation_sent = usize::from(activation.attempts > 0);
     let delivered = |error: ErrorData| super::error_after_earlier_steps(error, activation_sent);

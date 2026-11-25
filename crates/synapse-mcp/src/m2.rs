@@ -62,7 +62,7 @@ pub use press::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
 };
 pub(crate) use press::{
-    HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
+    HwndKeyboardTargetState, PostKeyDelivery, ResolvedKeymapPress, act_keymap_response_from_press,
     act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
     act_press_with_handle_and_boundary, delete_key_action, hwnd_keyboard_target_state,
     resolve_keymap_press, select_all_chord_action,

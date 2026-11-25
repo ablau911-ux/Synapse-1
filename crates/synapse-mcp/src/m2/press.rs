@@ -74,6 +74,7 @@ pub(crate) async fn act_press_with_handle_and_boundary(
         backend_tier_used: "foreground".to_owned(),
         required_foreground: true,
         postcondition: press_postcondition_not_requested(),
+        key_up_not_posted_window_closed: None,
     })
 }
 
@@ -128,14 +129,25 @@ pub(crate) async fn act_press_cdp_target(
         backend_tier_used: "cdp".to_owned(),
         required_foreground: false,
         postcondition: press_postcondition_not_requested(),
+        key_up_not_posted_window_closed: None,
     })
+}
+
+/// How the caller of a PostMessage key press finishes building the answer.
+pub(crate) enum PostKeyDelivery {
+    /// The target window is live; verify the delta by reading it back.
+    VerifyReadback,
+    /// The key-down closed the target window; the press was delivered and there
+    /// is no live window to read back. What closed rides the answer's
+    /// `key_up_not_posted_window_closed`.
+    TargetWindowClosed,
 }
 
 pub(crate) async fn act_press_postmessage_target(
     root_hwnd: i64,
     params: ActPressParams,
     boundary: super::OperatorPanicActionBoundary,
-) -> Result<ActPressResponse, ErrorData> {
+) -> Result<(ActPressResponse, PostKeyDelivery), ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
     let key_count = u32::try_from(keys.len()).map_err(|_err| {
@@ -145,16 +157,31 @@ pub(crate) async fn act_press_postmessage_target(
         )
     })?;
     validate_hold_ms(params.hold_ms)?;
-    postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await?;
-    Ok(ActPressResponse {
-        ok: true,
-        keys_pressed: key_count,
-        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-        backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
-        backend_tier_used: "postmessage".to_owned(),
-        required_foreground: false,
-        postcondition: press_postcondition_not_requested(),
-    })
+    let (key_up_not_posted_window_closed, delivery) =
+        match postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await? {
+            postmessage::PostKeySequenceOutcome::Readback {
+                key_up_not_posted_window_closed,
+            } => (
+                key_up_not_posted_window_closed,
+                PostKeyDelivery::VerifyReadback,
+            ),
+            postmessage::PostKeySequenceOutcome::TargetWindowClosed { detail } => {
+                (Some(detail), PostKeyDelivery::TargetWindowClosed)
+            }
+        };
+    Ok((
+        ActPressResponse {
+            ok: true,
+            keys_pressed: key_count,
+            elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
+            backend_tier_used: "postmessage".to_owned(),
+            required_foreground: false,
+            postcondition: press_postcondition_not_requested(),
+            key_up_not_posted_window_closed,
+        },
+        delivery,
+    ))
 }
 
 pub(crate) fn hwnd_keyboard_target_state(

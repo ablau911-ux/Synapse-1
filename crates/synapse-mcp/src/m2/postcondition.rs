@@ -54,13 +54,16 @@ pub fn postcondition_observed_delta(
     }
 }
 
-/// #1360: a DELIVERED act_click that closed its own target window (a dialog
-/// Open/OK/Cancel button) makes the post-delivery Source-of-Truth readback fail
-/// because the window is gone — but the click succeeded: the window
-/// disappearing IS the observed delta and the click's intended effect. Verified
-/// via target-window liveness, not reported as a false-negative refusal.
+/// #1360: a DELIVERED action (a click, a key-down) that closed its own target
+/// window (a dialog Open/OK/Cancel button, Enter in an address bar) makes the
+/// post-delivery Source-of-Truth readback fail because the window is gone — but
+/// the action succeeded: the window disappearing IS the observed delta and the
+/// action's intended effect. Verified via target-window liveness, not reported
+/// as a false-negative refusal. `delivered_action` names what was delivered so
+/// the text matches the caller (a click for act_click, a key-down for act_press).
 pub fn postcondition_target_window_closed(
     tool: &str,
+    delivered_action: &str,
     detail: impl Into<String>,
 ) -> ActPostcondition {
     ActPostcondition {
@@ -70,7 +73,7 @@ pub fn postcondition_target_window_closed(
         before_signature: Some("target_window_live".to_owned()),
         after_signature: Some("target_window_closed".to_owned()),
         detail: Some(format!(
-            "{tool} verify_delta: target window closed after a delivered click (the click dismissed it); {}",
+            "{tool} verify_delta: target window closed after a delivered {delivered_action} (the {delivered_action} dismissed it); {}",
             detail.into()
         )),
     }

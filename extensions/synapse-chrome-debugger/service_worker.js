@@ -137,6 +137,12 @@ const DIALOG_DEBUGGER_SESSIONS = new Map();
 const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
+// Tab ids whose render-window screencast could not be stopped on a BORROWED
+// debugger session (shouldDetach=false, which must never be detached). The owed
+// Page.stopScreencast is retried by an owned path -- at the start of the next
+// pageScreenshot for the tab and from the reconnect alarm tick -- and the id is
+// cleared on a successful stop, tab removal, or debugger detach.
+const RENDER_SCREENCAST_OWED_STOPS = new Set();
 let DURABLE_MUTATION_OWNERS_ENABLED = true;
 let DURABLE_MUTATION_DISABLE_SEQUENCE = 0;
 let COMMAND_EXECUTION_TAIL = Promise.resolve();
@@ -2477,6 +2483,10 @@ function handleReconnectWakeAlarm(alarm) {
   if (alarm?.name !== RECONNECT_WAKE_ALARM_NAME || permanentlyDisabled) {
     return;
   }
+  // Reuse this existing periodic tick (no new alarm/timer) to retry any render
+  // screencast a borrowed session still owes a stop. Fire-and-forget; each
+  // retry clears its own id on success.
+  retryAllOwedRenderScreencastStops();
   loadMaintenanceReconnectPause("reconnectWakeAlarm")
     .then(() => {
       if (permanentlyDisabled) {
@@ -2612,6 +2622,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordTabRemovedForPageEvents(tabId);
+  RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
@@ -2628,6 +2639,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 if (chrome.debugger?.onDetach?.addListener) {
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (Number.isInteger(source?.tabId)) {
+      RENDER_SCREENCAST_OWED_STOPS.delete(source.tabId);
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
       markBindingDebuggerDetached(source.tabId);
       markDialogDebuggerDetached(source.tabId);
@@ -5155,11 +5167,19 @@ async function handlePageScreenshot(params) {
 // high-DPI displays.
 const PAGE_SCREENSHOT_BACKGROUND_CHUNK_CSS = 4096;
 
+// Timeouts for the CDP screencast that forces an occluded render window to
+// paint (see startRenderWindowScreencast / handlePageScreenshotBackground).
+const PAGE_SCREENSHOT_SCREENCAST_SETUP_TIMEOUT_MS = 3000;
+const PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS = 2000;
+
 // Background capture for when Chrome is not the OS foreground (for example a
 // fullscreen game). Page.captureScreenshot renders the tab itself, so the
 // window is never focused and the user's active tab never changes.
 async function handlePageScreenshotBackground(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
+  // Before touching this tab, clear any render screencast a previous
+  // borrowed-session capture could not stop on it (owned retry, never a detach).
+  await retryOwedRenderScreencastStop(selected.tabId);
   const request = normalizePageScreenshotRequest(params, selected.tabId);
   const commandStartedAtMs = Date.now();
   const commandDeadlineMs =
@@ -5175,16 +5195,31 @@ async function handlePageScreenshotBackground(params) {
   let attachment = null;
   let renderWindow = null;
   let renderWindowRestore = null;
+  let screencastStop = null;
   const visibilityBefore = await pageVisibilityState(selected.tabId);
+  const needsRenderPaint = visibilityBefore !== "visible";
   try {
-    // Chrome does not paint hidden pages (inactive tab, or a window covered by
-    // a fullscreen app), so a capture would hang. Render it in a temporary
-    // unfocused window on an uncovered display instead.
-    if (visibilityBefore !== "visible") {
-      renderWindow = await moveTabToRenderWindow(selected.tabId, commandDeadlineMs);
+    // A hidden page does not paint, so a direct capture would hang. An inactive
+    // tab has no live render view, so it is moved into its own unfocused window
+    // where it becomes that window's active tab; an active-but-occluded tab
+    // keeps its live view and is captured in place. moveTabToRenderWindow makes
+    // that decision on a fresh read taken immediately before it mutates (never
+    // moving an active tab or the only tab of a window, which would change what
+    // the user sees or close the user's window) and returns null when the tab
+    // must be captured in place. In both cases the screencast below forces the
+    // compositor to paint while the page is hidden.
+    if (needsRenderPaint) {
+      renderWindow = await moveTabToRenderWindow(selected.tabId);
     }
     // Attach before measuring: the debugger infobar can shrink the viewport.
     attachment = await attachDebuggerForCommand(selected.tabId);
+    // Chrome's native occlusion tracker stops a hidden/occluded page from
+    // painting. A CDP screencast holds a capturer count on the tab, forcing the
+    // compositor to produce frames so the capture reads real pixels. Confirmed
+    // stopped in the finally block; never changes the OS foreground.
+    if (needsRenderPaint) {
+      await startRenderWindowScreencast(attachment.debuggee);
+    }
     setup = await runPageScreenshotSetup(selected.tabId, { ...request, token });
     if (!setup.ok) {
       throw bridgeError(
@@ -5261,7 +5296,13 @@ async function handlePageScreenshotBackground(params) {
       });
     }
   } finally {
-    if (setup?.ok) {
+    // Run cleanup whenever the in-page setup ran, even when it returned ok:false
+    // (a later mask/clip failure after earlier mask overlays were appended):
+    // otherwise those overlays and any scroll/background change stay on the
+    // user's page, now visible because active tabs are captured in place. setup
+    // is null only when executeScript never ran, so nothing was mutated. Cleanup
+    // removes masks by token and restores scroll/background, and is idempotent.
+    if (setup) {
       try {
         await runPageScreenshotCleanup(selected.tabId, {
           token,
@@ -5272,6 +5313,9 @@ async function handlePageScreenshotBackground(params) {
       } catch (error) {
         console.warn(`Synapse background pageScreenshot cleanup failed for tab ${selected.tabId}: ${errorMessage(error)}`);
       }
+    }
+    if (attachment && needsRenderPaint) {
+      screencastStop = await stopRenderWindowScreencast(attachment);
     }
     if (attachment?.shouldDetach) {
       try {
@@ -5289,6 +5333,13 @@ async function handlePageScreenshotBackground(params) {
       ERROR_ATTACH_FAILED,
       `pageScreenshot captured tab ${selected.tabId} but could not return it to window ` +
         `${renderWindow.originWindowId} index ${renderWindow.originIndex}: ${renderWindowRestore.error}`
+    );
+  }
+  if (screencastStop && !screencastStop.ok) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `pageScreenshot captured tab ${selected.tabId} but could not stop its render screencast; ` +
+        `the tab's debugger session may still be forcing it to paint: ${screencastStop.error}`
     );
   }
   const after = await tabPageState(selected.tabId, selected.target);
@@ -5335,6 +5386,7 @@ async function handlePageScreenshotBackground(params) {
     render_window: renderWindow
       ? { ...renderWindow, restore: renderWindowRestore }
       : null,
+    render_screencast_stop: screencastStop,
     readback_backend: "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot(captureBeyondViewport)",
     backend_tier_used: "chrome_debugger_background_capture",
     required_foreground: false,
@@ -5355,57 +5407,257 @@ async function pageVisibilityState(tabId) {
   }
 }
 
-// Moves the tab into a new unfocused window placed beside the tab's own
-// window, trying each side until Chrome reports the page visible (that is,
-// the spot is not covered). Never focuses anything.
-async function moveTabToRenderWindow(tabId, deadlineMs) {
-  const tab = await chrome.tabs.get(tabId);
-  const origin = await chrome.windows.get(tab.windowId);
-  const originActive = await activeTabForWindow(tab.windowId);
-  const width = Math.max(800, Math.min(1600, Number(origin.width) || 1280));
-  const height = Math.max(600, Math.min(1000, Number(origin.height) || 900));
+// Reads the work area (screen minus taskbar) of the display that holds the
+// tab's own window, from the tab's own page. The manifest has no
+// "system.display" permission, so the page's screen.avail* is the only source.
+// Returns null when the script cannot run (e.g. a restricted page), which makes
+// moveTabToRenderWindow fall back to the beside-origin placements only.
+async function tabWorkArea(tabId) {
+  try {
+    const injected = await quarantineGuardedExecuteScript({
+      target: { tabId },
+      func: () => ({
+        left: screen.availLeft,
+        top: screen.availTop,
+        width: screen.availWidth,
+        height: screen.availHeight
+      })
+    });
+    const area = injected?.[0]?.result;
+    if (
+      area &&
+      Number.isFinite(area.left) &&
+      Number.isFinite(area.top) &&
+      Number.isFinite(area.width) &&
+      area.width > 0 &&
+      Number.isFinite(area.height) &&
+      area.height > 0
+    ) {
+      return { left: area.left, top: area.top, width: area.width, height: area.height };
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Orders the spots the render window will try. The beside-origin spots come
+// first (correct when a second display sits beside the origin window); Chrome
+// rejects any that fall less than 50% on a screen, and moveTabToRenderWindow
+// records and skips those. When the work area is known, the window shrunk to
+// fit the work area and pinned to each of its four corners follows; those lie
+// fully inside the display, so with one display and a wide origin window (where
+// every beside spot is off screen) Chrome accepts them.
+function renderWindowPlacements(origin, width, height, workArea) {
   const left0 = Number(origin.left) || 0;
   const top0 = Number(origin.top) || 0;
-  const candidates = [
-    { side: "right", left: left0 + (Number(origin.width) || width) + 40, top: top0 + 40 },
-    { side: "left", left: left0 - width - 40, top: top0 + 40 },
-    { side: "below", left: left0 + 40, top: top0 + (Number(origin.height) || height) + 40 },
-    { side: "above", left: left0 + 40, top: top0 - height - 40 }
+  const originWidth = Number(origin.width) || width;
+  const originHeight = Number(origin.height) || height;
+  const placements = [
+    { side: "right", left: left0 + originWidth + 40, top: top0 + 40, width, height },
+    { side: "left", left: left0 - width - 40, top: top0 + 40, width, height },
+    { side: "below", left: left0 + 40, top: top0 + originHeight + 40, width, height },
+    { side: "above", left: left0 + 40, top: top0 - height - 40, width, height }
   ];
+  if (workArea) {
+    const fitWidth = Math.min(width, workArea.width);
+    const fitHeight = Math.min(height, workArea.height);
+    const maxLeft = workArea.left + workArea.width - fitWidth;
+    const maxTop = workArea.top + workArea.height - fitHeight;
+    placements.push(
+      { side: "work-top-left", left: workArea.left, top: workArea.top, width: fitWidth, height: fitHeight },
+      { side: "work-top-right", left: maxLeft, top: workArea.top, width: fitWidth, height: fitHeight },
+      { side: "work-bottom-left", left: workArea.left, top: maxTop, width: fitWidth, height: fitHeight },
+      { side: "work-bottom-right", left: maxLeft, top: maxTop, width: fitWidth, height: fitHeight }
+    );
+  }
+  return placements;
+}
+
+// Holds a capturer count on the attached tab via a tiny CDP screencast so an
+// occluded render window still paints. Chrome's native window occlusion tracker
+// marks an unfocused window that sits under another app as hidden, which stops
+// the compositor; a live capturer forces frames regardless of occlusion.
+// Page.startScreencast needs the Page domain enabled first and its frames are
+// ignored. Best-effort: if it fails the capture simply needs an unoccluded
+// window, so a failure must not abort the screenshot. Released by
+// Page.stopScreencast in the handler's finally block.
+async function startRenderWindowScreencast(debuggee) {
+  try {
+    await sendDebuggerCommand(debuggee, "Page.enable", {}, PAGE_SCREENSHOT_SCREENCAST_SETUP_TIMEOUT_MS);
+    await sendDebuggerCommand(
+      debuggee,
+      "Page.startScreencast",
+      { format: "png", maxWidth: 64, maxHeight: 64, everyNthFrame: 1 },
+      PAGE_SCREENSHOT_SCREENCAST_SETUP_TIMEOUT_MS
+    );
+  } catch (error) {
+    console.warn(`Synapse pageScreenshot render-window screencast start failed: ${errorMessage(error)}`);
+  }
+}
+
+// Retries a Page.stopScreencast that a borrowed debugger session still owes
+// (see stopRenderWindowScreencast). The owner's session stays attached, so the
+// command can still reach the tab; the id is dropped on success and kept for a
+// later attempt on failure. Never detaches -- the borrowed session is not ours
+// to end. The onRemoved/onDetach handlers clear ids whose tab or session is
+// gone.
+async function retryOwedRenderScreencastStop(tabId) {
+  if (!RENDER_SCREENCAST_OWED_STOPS.has(tabId)) {
+    return;
+  }
+  try {
+    await sendDebuggerCommand({ tabId }, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
+    RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
+  } catch (error) {
+    console.warn(`Synapse render screencast owed-stop retry failed for tab ${tabId}: ${errorMessage(error)}`);
+  }
+}
+
+// Alarm-driven entry: the reconnect tick carries no command admission context,
+// so sendDebuggerCommand would reject (assertPhysicalMutationAdmission needs
+// one). Route each owed stop through the serialized background-mutation
+// admission -- which sets that context, persists ordering, and runs one at a
+// time -- mirroring the dialogAutoHandle event path. Errors are contained so a
+// tick never produces an unhandled rejection.
+function retryAllOwedRenderScreencastStops() {
+  for (const tabId of Array.from(RENDER_SCREENCAST_OWED_STOPS)) {
+    enqueuePersistedBackgroundMutation(
+      "renderScreencastStop",
+      () => retryOwedRenderScreencastStop(tabId)
+    ).catch((error) => {
+      console.warn(`Synapse render screencast owed-stop tick failed for tab ${tabId}: ${errorMessage(error)}`);
+    });
+  }
+}
+
+// Confirms the render screencast is stopped before the screenshot command
+// returns. A leaked screencast keeps a capturer count that forces the user's
+// own tab to keep painting, so swallowing a failed stop is not safe.
+// Page.stopScreencast is retried once. If it still fails, the debugger is
+// detached only when this command attached the session itself; a borrowed
+// persistent session (shouldDetach=false) must never be detached -- that would
+// break the bindings, init scripts and interception its owner registered -- so
+// its tab is recorded as owing a stop (retried by retryOwedRenderScreencastStop
+// on the next capture and from the reconnect tick) and reported as an error
+// naming the tab. The outcome is returned so the caller can report it.
+async function stopRenderWindowScreencast(attachment) {
+  const tabId = attachment.debuggee?.tabId;
+  let stopError = null;
+  for (let attemptNo = 0; attemptNo < 2; attemptNo += 1) {
+    try {
+      await sendDebuggerCommand(attachment.debuggee, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
+      if (Number.isInteger(tabId)) {
+        RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
+      }
+      return { ok: true, method: attemptNo === 0 ? "stop" : "stop_retry" };
+    } catch (error) {
+      stopError = errorMessage(error);
+    }
+  }
+  if (attachment.shouldDetach) {
+    try {
+      await chrome.debugger.detach(attachment.debuggee);
+      if (Number.isInteger(tabId)) {
+        RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
+      }
+      return { ok: true, method: "detach_fallback", stop_error: stopError };
+    } catch (detachError) {
+      return {
+        ok: false,
+        error: `Page.stopScreencast failed twice on tab ${tabId} (${stopError}) and the detach fallback failed (${errorMessage(detachError)})`
+      };
+    }
+  }
+  if (Number.isInteger(tabId)) {
+    RENDER_SCREENCAST_OWED_STOPS.add(tabId);
+  }
+  return {
+    ok: false,
+    borrowed_session: true,
+    error: `Page.stopScreencast failed twice on tab ${tabId} (${stopError}); the debugger session is shared, so it was left attached and the screencast may still be running on the tab; the stop will be retried on the next capture of this tab and from the reconnect tick`
+  };
+}
+
+// Moves the tab into a new unfocused window so it becomes that window's active
+// tab -- a background tab has no live render view, so this move is required
+// before any capture can read pixels. The window is created once at the first
+// placement Chrome accepts (>= 50% on screen); beside-origin spots are tried
+// first and a placement Chrome rejects for off-screen bounds is recorded and
+// skipped. It is never repositioned afterwards: chrome.windows.update with
+// bounds raises Chrome's whole window group and steals the OS foreground from
+// the user's app, which must never happen. Remaining occlusion by the user's
+// foreground window is expected and defeated by the caller's screencast, not by
+// finding an uncovered spot. Never focuses anything.
+async function moveTabToRenderWindow(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const origin = await chrome.windows.get(tab.windowId);
+  const width = Math.max(800, Math.min(1600, Number(origin.width) || 1280));
+  const height = Math.max(600, Math.min(1000, Number(origin.height) || 900));
+  const placements = renderWindowPlacements(origin, width, height, await tabWorkArea(tabId));
+  // Decide on a fresh read taken immediately before mutating: the active flag
+  // and the window's tab count can have changed since the caller's pre-read.
+  // Never move a tab that is now active or the only tab of its window -- moving
+  // the last tab out closes the user's window and moving the active tab out
+  // changes what the user sees. Return null so the caller captures in place.
+  const fresh = await chrome.tabs.get(tabId);
+  const windowTabCount = (await chrome.tabs.query({ windowId: fresh.windowId })).length;
+  if (fresh.active || windowTabCount <= 1) {
+    return null;
+  }
+  const originActive = await activeTabForWindow(fresh.windowId);
   const record = {
     tabId,
     windowId: null,
-    originWindowId: tab.windowId,
-    originIndex: tab.index,
-    originWasActive: Boolean(tab.active),
+    originWindowId: fresh.windowId,
+    originIndex: fresh.index,
+    originWasActive: Boolean(fresh.active),
     originActiveTabId: Number.isInteger(originActive?.id) ? originActive.id : null,
     width,
     height,
     placements: []
   };
   assertPhysicalMutationAdmission(`chrome.windows.create:renderWindow:tab=${tabId}`);
-  const first = candidates[0];
-  const created = await chrome.windows.create({
-    tabId,
-    focused: false,
-    state: "normal",
-    type: "normal",
-    left: first.left,
-    top: first.top,
-    width,
-    height
-  });
-  record.windowId = created.id;
-  for (const [index, candidate] of candidates.entries()) {
-    if (index > 0) {
-      await chrome.windows.update(created.id, { left: candidate.left, top: candidate.top, focused: false });
+  for (const candidate of placements) {
+    let created;
+    try {
+      created = await chrome.windows.create({
+        tabId,
+        focused: false,
+        state: "normal",
+        type: "normal",
+        // Match the tab's profile; moving an incognito tab into a normal window
+        // fails. (incognito defaults to the current profile when omitted.)
+        incognito: tab.incognito,
+        left: candidate.left,
+        top: candidate.top,
+        width: candidate.width,
+        height: candidate.height
+      });
+    } catch (error) {
+      // Chrome throws for bounds less than 50% on a screen. Record the rejected
+      // placement and try the next one instead of failing the screenshot.
+      record.placements.push({
+        side: candidate.side,
+        left: candidate.left,
+        top: candidate.top,
+        width: candidate.width,
+        height: candidate.height,
+        visibility: "rejected",
+        error: errorMessage(error)
+      });
+      continue;
     }
-    const placed = await chrome.windows.get(created.id);
-    const waitUntil = Math.min(Date.now() + 1500, deadlineMs - 3000);
-    let visibility = await pageVisibilityState(tabId);
-    while (visibility !== "visible" && Date.now() < waitUntil) {
-      await sleep(100);
-      visibility = await pageVisibilityState(tabId);
+    // The tab has now left its window. Nothing below may throw out of this
+    // function, or the caller would never receive the record and its finally
+    // could not restore the tab. The post-create read is only for recording
+    // placement coordinates, so fall back to the requested bounds if it fails.
+    record.windowId = created.id;
+    let placed;
+    try {
+      placed = await chrome.windows.get(record.windowId);
+    } catch (_) {
+      placed = { left: candidate.left, top: candidate.top, width: candidate.width, height: candidate.height };
     }
     record.placements.push({
       side: candidate.side,
@@ -5413,16 +5665,14 @@ async function moveTabToRenderWindow(tabId, deadlineMs) {
       top: placed.top,
       width: placed.width,
       height: placed.height,
-      visibility
+      visibility: "render_window_created"
     });
-    if (visibility === "visible") {
-      return record;
-    }
+    return record;
   }
   const restore = await restoreTabFromRenderWindow(record);
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `pageScreenshot found no uncovered display spot to render hidden tab ${tabId}; ` +
+    `pageScreenshot found no on-screen spot to place a render window for hidden tab ${tabId}; ` +
       `tried ${JSON.stringify(record.placements)}; tab returned=${restore.ok}. ` +
       `Use browser_dom (content/aria_snapshot) for page state instead.`
   );
@@ -5754,7 +6004,22 @@ function remainingPageScreenshotBudgetMs(deadlineMs, phase) {
 }
 
 function pageScreenshotSetupInPage(request) {
-  const fail = (code, detail) => ({ ok: false, error_code: code, error_detail: detail });
+  const beforeScrollX = Number(window.scrollX || 0);
+  const beforeScrollY = Number(window.scrollY || 0);
+  const token = String(request.token || "");
+  let backgroundRestore = null;
+  // A failed setup still carries what cleanup needs to undo any partial
+  // mutation: mask overlays are removed by token, and scroll and background are
+  // restored from these values on every failure path.
+  const fail = (code, detail) => ({
+    ok: false,
+    error_code: code,
+    error_detail: detail,
+    token,
+    before_scroll_x: beforeScrollX,
+    before_scroll_y: beforeScrollY,
+    background_restore: backgroundRestore
+  });
   const finite = (value) => Number.isFinite(Number(value));
   const rectToPlain = (rect) => ({
     x: Number(rect.left + window.scrollX),
@@ -5823,8 +6088,6 @@ function pageScreenshotSetupInPage(request) {
     return node;
   };
   try {
-    const beforeScrollX = Number(window.scrollX || 0);
-    const beforeScrollY = Number(window.scrollY || 0);
     let clip = null;
     let element_rect = null;
     if (request.scope === "viewport") {
@@ -5852,7 +6115,6 @@ function pageScreenshotSetupInPage(request) {
     if (!clip || !finite(clip.x) || !finite(clip.y) || !finite(clip.w) || !finite(clip.h) || clip.w <= 0 || clip.h <= 0) {
       return fail("CAPTURE_TARGET_INVALID", `pageScreenshot resolved an empty/invalid clip ${JSON.stringify(clip)}`);
     }
-    const token = String(request.token || "");
     const masks = [];
     for (const [index, mask] of Array.from(request.masks || []).entries()) {
       const target = mask.elementPath ? elementByPath(mask.elementPath) : document.querySelector(String(mask.selector || ""));
@@ -5880,7 +6142,6 @@ function pageScreenshotSetupInPage(request) {
       document.documentElement.appendChild(overlay);
       masks.push({ index, selector: mask.selector || null, element_path: mask.elementPath || null, color: String(mask.color || "#ff00ff"), rect: plain });
     }
-    let backgroundRestore = null;
     if (request.omitBackground) {
       const doc = document.documentElement;
       const body = document.body;
@@ -6633,6 +6894,93 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
   return created;
 }
 
+// #327: records the latest main-frame (frameId 0) navigation error Chrome
+// reports for a tab while a navigate/reload/back/forward runs, so a navigation
+// that ends on a Chrome error page fails loudly instead of returning a normal
+// result. dispose() removes the listener and must run on every exit path.
+function watchMainFrameNavigationError(tabId) {
+  let lastError = null;
+  const listener = (details) => {
+    if (details.tabId === tabId && details.frameId === 0) {
+      lastError = { url: details.url, error: details.error };
+    }
+  };
+  let attached = false;
+  if (chrome.webNavigation?.onErrorOccurred?.addListener) {
+    chrome.webNavigation.onErrorOccurred.addListener(listener);
+    attached = true;
+  }
+  return {
+    latest: () => lastError,
+    dispose: () => {
+      if (attached) {
+        chrome.webNavigation.onErrorOccurred.removeListener(listener);
+        attached = false;
+      }
+    }
+  };
+}
+
+// #327: decides whether the settled navigation left the tab on a Chrome error
+// page, returning the bridge error the daemon maps to a tool error or null on
+// success. The authority is the tab's FINAL main-frame state from
+// chrome.webNavigation.getFrame (errorOccurred + url, both documented fields),
+// read after the navigation settled — not the raw onErrorOccurred stream, whose
+// events can belong to an earlier, superseded navigation of the same tab, and
+// which can be silent for a back/forward onto a cached error entry. The watcher
+// only supplies Chrome's net:: error name for the message, and only when its
+// captured event belongs to the final navigation (its url matches the final
+// frame url or the requested url) and is not ERR_ABORTED (a download or a
+// superseded navigation). When getFrame is unavailable or throws, fall back to
+// today's coarser watcher-only decision.
+async function mainFrameNavigationFailure(tabId, watcher, requestedUrl) {
+  let frame = null;
+  if (chrome.webNavigation?.getFrame) {
+    try {
+      frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 });
+    } catch (_) {
+      frame = null;
+    }
+  }
+  if (!frame) {
+    // getFrame unavailable, threw, or no main frame: watcher-only decision. It
+    // cannot tell a superseded navigation's error from the final one's, so any
+    // non-ERR_ABORTED main-frame error seen during the command is a failure.
+    const captured = watcher.latest();
+    if (!captured || captured.error === "net::ERR_ABORTED") {
+      return null;
+    }
+    return mainFrameErrorPageBridgeError(requestedUrl || captured.url, captured.error, captured.url);
+  }
+  if (!frame.errorOccurred) {
+    // The final main-frame navigation committed without an error, even if the
+    // watcher saw an error from an earlier, superseded navigation.
+    return null;
+  }
+  const captured = watcher.latest();
+  const networkError =
+    captured &&
+    captured.error !== "net::ERR_ABORTED" &&
+    (captured.url === frame.url || captured.url === requestedUrl)
+      ? captured.error
+      : null;
+  return mainFrameErrorPageBridgeError(requestedUrl || frame.url, networkError, frame.url);
+}
+
+// #327: builds the bridge error for a main-frame navigation that ended on a
+// Chrome error page. `networkError` is Chrome's net:: error name when it is
+// known for the final navigation, otherwise null.
+function mainFrameErrorPageBridgeError(contextUrl, networkError, errorUrl) {
+  const where = contextUrl ? JSON.stringify(contextUrl) : "the requested page";
+  const reported = networkError
+    ? `Chrome reported ${networkError} and the tab now shows Chrome's error page`
+    : "the tab now shows Chrome's error page";
+  return bridgeError(
+    ERROR_AXTREE_FAILED,
+    `navigation to ${where} failed: ${reported}; error_url=${JSON.stringify(errorUrl)}`
+  );
+}
+
 async function handleNavigateTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
@@ -6647,6 +6995,10 @@ async function handleNavigateTab(params) {
   // the download-event sequence before the navigate so we can detect a download
   // that this navigate started and report it as a structured outcome instead.
   let downloadSeqBefore = null;
+  // #327: watch the main frame for a navigation that ends on a Chrome error
+  // page (a name that does not resolve, a refused connection, a bad cert). The
+  // listener is removed on every exit path below.
+  const mainFrameError = watchMainFrameNavigationError(selected.tabId);
   try {
     if (action === "navigate") {
       markAgentNavigation(selected.tabId, {
@@ -6697,6 +7049,7 @@ async function handleNavigateTab(params) {
       };
     }
   } catch (error) {
+    mainFrameError.dispose();
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.${tabsNavigationMethod(action)}(${selected.tabId}) failed: ${errorMessage(error)}; ` +
@@ -6708,18 +7061,27 @@ async function handleNavigateTab(params) {
   // started by this navigate. A matching download is a valid outcome, reported
   // structurally instead of a navigation timeout.
   if (action === "navigate") {
-    const outcome = await waitForNavigateOrDownload(
-      selected.tabId,
-      selected.target,
-      waitTimeoutMs,
-      readbackExpectation,
-      downloadSeqBefore,
-      requestedUrl,
-      before.url
-    );
+    let outcome;
+    try {
+      outcome = await waitForNavigateOrDownload(
+        selected.tabId,
+        selected.target,
+        waitTimeoutMs,
+        readbackExpectation,
+        downloadSeqBefore,
+        requestedUrl,
+        before.url
+      );
+    } catch (error) {
+      mainFrameError.dispose();
+      throw error;
+    }
     if (outcome.kind === "download") {
       const dl = outcome.download;
       const after = outcome.state || before;
+      // A download aborts the main-frame navigation with ERR_ABORTED; that is a
+      // valid outcome, not a failed page.
+      mainFrameError.dispose();
       return {
         extension_id: chrome.runtime.id,
         target_id: after.target_id || selected.target.id,
@@ -6749,6 +7111,11 @@ async function handleNavigateTab(params) {
       };
     }
     const after = outcome.state;
+    const pageFailure = await mainFrameNavigationFailure(selected.tabId, mainFrameError, requestedUrl);
+    mainFrameError.dispose();
+    if (pageFailure) {
+      throw pageFailure;
+    }
     return {
       extension_id: chrome.runtime.id,
       target_id: after.target_id || selected.target.id,
@@ -6770,7 +7137,18 @@ async function handleNavigateTab(params) {
       target_selection_reason: selected.selectionReason
     };
   }
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, readbackExpectation);
+  let after;
+  try {
+    after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, readbackExpectation);
+  } catch (error) {
+    mainFrameError.dispose();
+    throw error;
+  }
+  const pageFailure = await mainFrameNavigationFailure(selected.tabId, mainFrameError, requestedUrl);
+  mainFrameError.dispose();
+  if (pageFailure) {
+    throw pageFailure;
+  }
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,

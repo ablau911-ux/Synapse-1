@@ -6774,21 +6774,63 @@ function watchMainFrameNavigationError(tabId) {
   };
 }
 
-// #327: turns a captured main-frame navigation error into the bridge error the
-// daemon maps to a tool error, or null when the navigation did not fail. A
-// Chrome error page is a failed main-frame navigation (Playwright's page.goto
-// contract). ERR_ABORTED is a download or a superseding navigation, not a
-// failure, so is_download handling stays as it is.
-function mainFrameNavigationFailure(watcher, contextUrl) {
-  const captured = watcher.latest();
-  if (!captured || captured.error === "net::ERR_ABORTED") {
+// #327: decides whether the settled navigation left the tab on a Chrome error
+// page, returning the bridge error the daemon maps to a tool error or null on
+// success. The authority is the tab's FINAL main-frame state from
+// chrome.webNavigation.getFrame (errorOccurred + url, both documented fields),
+// read after the navigation settled — not the raw onErrorOccurred stream, whose
+// events can belong to an earlier, superseded navigation of the same tab, and
+// which can be silent for a back/forward onto a cached error entry. The watcher
+// only supplies Chrome's net:: error name for the message, and only when its
+// captured event belongs to the final navigation (its url matches the final
+// frame url or the requested url) and is not ERR_ABORTED (a download or a
+// superseded navigation). When getFrame is unavailable or throws, fall back to
+// today's coarser watcher-only decision.
+async function mainFrameNavigationFailure(tabId, watcher, requestedUrl) {
+  let frame = null;
+  if (chrome.webNavigation?.getFrame) {
+    try {
+      frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 });
+    } catch (_) {
+      frame = null;
+    }
+  }
+  if (!frame) {
+    // getFrame unavailable, threw, or no main frame: watcher-only decision. It
+    // cannot tell a superseded navigation's error from the final one's, so any
+    // non-ERR_ABORTED main-frame error seen during the command is a failure.
+    const captured = watcher.latest();
+    if (!captured || captured.error === "net::ERR_ABORTED") {
+      return null;
+    }
+    return mainFrameErrorPageBridgeError(requestedUrl || captured.url, captured.error, captured.url);
+  }
+  if (!frame.errorOccurred) {
+    // The final main-frame navigation committed without an error, even if the
+    // watcher saw an error from an earlier, superseded navigation.
     return null;
   }
+  const captured = watcher.latest();
+  const networkError =
+    captured &&
+    captured.error !== "net::ERR_ABORTED" &&
+    (captured.url === frame.url || captured.url === requestedUrl)
+      ? captured.error
+      : null;
+  return mainFrameErrorPageBridgeError(requestedUrl || frame.url, networkError, frame.url);
+}
+
+// #327: builds the bridge error for a main-frame navigation that ended on a
+// Chrome error page. `networkError` is Chrome's net:: error name when it is
+// known for the final navigation, otherwise null.
+function mainFrameErrorPageBridgeError(contextUrl, networkError, errorUrl) {
   const where = contextUrl ? JSON.stringify(contextUrl) : "the requested page";
+  const reported = networkError
+    ? `Chrome reported ${networkError} and the tab now shows Chrome's error page`
+    : "the tab now shows Chrome's error page";
   return bridgeError(
     ERROR_AXTREE_FAILED,
-    `navigation to ${where} failed: Chrome reported ${captured.error} and the tab now shows Chrome's ` +
-      `error page; error_url=${JSON.stringify(captured.url)}`
+    `navigation to ${where} failed: ${reported}; error_url=${JSON.stringify(errorUrl)}`
   );
 }
 
@@ -6922,7 +6964,7 @@ async function handleNavigateTab(params) {
       };
     }
     const after = outcome.state;
-    const pageFailure = mainFrameNavigationFailure(mainFrameError, requestedUrl);
+    const pageFailure = await mainFrameNavigationFailure(selected.tabId, mainFrameError, requestedUrl);
     mainFrameError.dispose();
     if (pageFailure) {
       throw pageFailure;
@@ -6955,7 +6997,7 @@ async function handleNavigateTab(params) {
     mainFrameError.dispose();
     throw error;
   }
-  const pageFailure = mainFrameNavigationFailure(mainFrameError, before.url);
+  const pageFailure = await mainFrameNavigationFailure(selected.tabId, mainFrameError, requestedUrl);
   mainFrameError.dispose();
   if (pageFailure) {
     throw pageFailure;

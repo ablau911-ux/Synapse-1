@@ -211,6 +211,12 @@ pub struct BrowserEmulateResponse {
 struct NormalizedBrowserEmulateParams {
     operation: BrowserEmulateOperation,
     domains: Vec<BrowserEmulateDomain>,
+    /// True for a reset whose caller omitted `domains`, so the domain list was
+    /// expanded to every domain rather than named. Such an implicit reset does
+    /// not fail on a domain the normal bridge cannot reset because it was never
+    /// set (e.g. locale, which Chrome refuses for an extension debugger); an
+    /// explicit `domains` list that names that domain still errors (#331).
+    reset_implicit_all_domains: bool,
     viewport: Option<BrowserEmulateViewport>,
     device: Option<BrowserEmulateDevice>,
     geolocation: Option<BrowserEmulateGeolocation>,
@@ -708,9 +714,9 @@ impl SynapseService {
                         "browser_emulate_before_bridge_reset_domain",
                     )?;
                     let result = match domain {
-                        BrowserEmulateDomain::Viewport => domain_result(
+                        BrowserEmulateDomain::Viewport => reset_domain_result(
                             *domain,
-                            params.operation,
+                            params.reset_implicit_all_domains,
                             crate::chrome_debugger_bridge::viewport_emulation(
                                 crate::chrome_debugger_bridge::ChromeDebuggerViewportEmulationRequest {
                                     hwnd: window_hwnd,
@@ -723,12 +729,11 @@ impl SynapseService {
                                     wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
                                 },
                             )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
+                            .await,
                         )?,
-                        BrowserEmulateDomain::Device => domain_result(
+                        BrowserEmulateDomain::Device => reset_domain_result(
                             *domain,
-                            params.operation,
+                            params.reset_implicit_all_domains,
                             crate::chrome_debugger_bridge::device_emulation(
                                 crate::chrome_debugger_bridge::ChromeDebuggerDeviceEmulationRequest {
                                     hwnd: window_hwnd,
@@ -744,12 +749,11 @@ impl SynapseService {
                                     wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
                                 },
                             )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
+                            .await,
                         )?,
-                        BrowserEmulateDomain::Geolocation => domain_result(
+                        BrowserEmulateDomain::Geolocation => reset_domain_result(
                             *domain,
-                            params.operation,
+                            params.reset_implicit_all_domains,
                             crate::chrome_debugger_bridge::geolocation_emulation(
                                 crate::chrome_debugger_bridge::ChromeDebuggerGeolocationEmulationRequest {
                                     hwnd: window_hwnd,
@@ -766,12 +770,11 @@ impl SynapseService {
                                     wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
                                 },
                             )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
+                            .await,
                         )?,
-                        BrowserEmulateDomain::Locale => domain_result(
+                        BrowserEmulateDomain::Locale => reset_domain_result(
                             *domain,
-                            params.operation,
+                            params.reset_implicit_all_domains,
                             crate::chrome_debugger_bridge::locale_emulation(
                                 crate::chrome_debugger_bridge::ChromeDebuggerLocaleEmulationRequest {
                                     hwnd: window_hwnd,
@@ -782,12 +785,11 @@ impl SynapseService {
                                     wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
                                 },
                             )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
+                            .await,
                         )?,
-                        BrowserEmulateDomain::Media => domain_result(
+                        BrowserEmulateDomain::Media => reset_domain_result(
                             *domain,
-                            params.operation,
+                            params.reset_implicit_all_domains,
                             crate::chrome_debugger_bridge::media_emulation(
                                 crate::chrome_debugger_bridge::ChromeDebuggerMediaEmulationRequest {
                                     hwnd: window_hwnd,
@@ -799,12 +801,11 @@ impl SynapseService {
                                     wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
                                 },
                             )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
+                            .await,
                         )?,
-                        BrowserEmulateDomain::Network => domain_result(
+                        BrowserEmulateDomain::Network => reset_domain_result(
                             *domain,
-                            params.operation,
+                            params.reset_implicit_all_domains,
                             crate::chrome_debugger_bridge::network_conditions(
                                 crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsRequest {
                                     hwnd: window_hwnd,
@@ -818,8 +819,7 @@ impl SynapseService {
                                     wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
                                 },
                             )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
+                            .await,
                         )?,
                     };
                     super::operator_panic_boundary::ensure_mcp_mutation(
@@ -926,6 +926,7 @@ fn validate_browser_emulate_set_params(
     Ok(NormalizedBrowserEmulateParams {
         operation: BrowserEmulateOperation::Set,
         domains,
+        reset_implicit_all_domains: false,
         viewport: params.viewport.clone(),
         device: params.device.clone(),
         geolocation: params.geolocation.clone(),
@@ -949,7 +950,8 @@ fn validate_browser_emulate_reset_params(
             "override sections are only valid for operation=set",
         ));
     }
-    let domains = if params.domains.is_empty() {
+    let reset_implicit_all_domains = params.domains.is_empty();
+    let domains = if reset_implicit_all_domains {
         BrowserEmulateDomain::all()
     } else {
         let mut seen = BTreeSet::new();
@@ -966,6 +968,7 @@ fn validate_browser_emulate_reset_params(
     Ok(NormalizedBrowserEmulateParams {
         operation: BrowserEmulateOperation::Reset,
         domains,
+        reset_implicit_all_domains,
         viewport: None,
         device: None,
         geolocation: None,
@@ -1257,6 +1260,41 @@ fn domain_result(
             )
         })?,
     })
+}
+
+/// The text Chrome returns when a normal bridge tab, running chrome.debugger as
+/// an untrusted client, refuses to reset an emulation domain (e.g. locale via
+/// `Emulation.setLocaleOverride`) that it will only let trusted clients touch.
+const UNTRUSTED_RESET_REFUSAL: &str = "only available to trusted clients";
+
+/// Turns one domain's reset outcome into its result entry. On success the entry
+/// carries the bridge readback. When the caller omitted `domains` (an implicit
+/// all-domains reset) and Chrome refuses the domain only because a normal bridge
+/// tab is an untrusted client, the entry records that the domain is unavailable
+/// here (keeping Chrome's own text) and the call as a whole still answers ok.
+/// Any other failure, and an explicit `domains` list that named the domain,
+/// stays an error of the whole call (#331).
+fn reset_domain_result(
+    domain: BrowserEmulateDomain,
+    reset_implicit_all_domains: bool,
+    outcome: Result<impl Serialize, crate::chrome_debugger_bridge::ChromeDebuggerBridgeError>,
+) -> Result<BrowserEmulateDomainResult, ErrorData> {
+    match outcome {
+        Ok(result) => domain_result(domain, BrowserEmulateOperation::Reset, result),
+        Err(error)
+            if reset_implicit_all_domains && error.detail().contains(UNTRUSTED_RESET_REFUSAL) =>
+        {
+            domain_result(
+                domain,
+                BrowserEmulateOperation::Reset,
+                json!({
+                    "status": "unavailable_on_normal_bridge_tab",
+                    "detail": error.detail(),
+                }),
+            )
+        }
+        Err(error) => Err(emulate_bridge_error(domain, error)),
+    }
 }
 
 fn emulate_error(domain: BrowserEmulateDomain, error: synapse_a11y::A11yError) -> ErrorData {

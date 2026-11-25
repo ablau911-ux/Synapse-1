@@ -8761,6 +8761,23 @@ fn ensure_target_act_key_press_has_input_target(
     ))
 }
 
+/// The text step of `append_text` types through the `act_type` foreground
+/// keyboard tier, which refuses unless this session's intended target is the
+/// OS foreground (#323). The same rule runs before the Ctrl+End caret move, so
+/// a call whose text step would be refused moves nothing first.
+fn ensure_target_act_text_target_is_foreground(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(), ErrorData> {
+    let (handle, recording, _cancel) = service.m2_action_context_for_request(request_context)?;
+    if recording.is_some() {
+        return Ok(());
+    }
+    handle
+        .ensure_keyboard_target_is_foreground("append_text before move_caret_to_end")
+        .map_err(|error| crate::m2::error_before_delivery(crate::m2::action_error_to_mcp(&error)))
+}
+
 async fn target_act_insert_or_append_text(
     service: &SynapseService,
     params: &TargetActParams,
@@ -8827,9 +8844,15 @@ async fn target_act_insert_or_append_text(
         let press_params =
             target_act_press_params(vec!["ctrl".to_owned(), "end".to_owned()], None, verb)?;
         ensure_target_act_operator_panic_boundary("append_text_before_move_caret_to_end")?;
-        let key_response = service
-            .act_press(Parameters(press_params), request_context.clone())
-            .await
+        let key_response =
+            match ensure_target_act_text_target_is_foreground(service, request_context) {
+                Ok(()) => {
+                    service
+                        .act_press(Parameters(press_params), request_context.clone())
+                        .await
+                }
+                Err(error) => Err(error),
+            }
             .map_err(|error| crate::m2::error_after_earlier_steps(error, steps.len()));
         let (tool, ok, status, result) = target_act_delegate_response("act_press", key_response)?;
         steps.push(json!({
@@ -10067,18 +10090,12 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
     if crate::m2::error_delivered_input(error) {
         return TARGET_ACT_STATUS_VERIFY_NEEDED;
     }
-    // A foreground refusal raised before any input batch was delivered is a
-    // refusal, not a verify-needed outcome. Post-action readbacks raise the
-    // same code after input *was* delivered and keep verify_needed (#234,
-    // upstream #1830).
-    if error_code(error) == Some(error_codes::ACTION_FOREGROUND_LOST)
-        && error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("refused_before_delivery"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
+    // An error that records it was raised before any input was delivered (a
+    // foreground refusal, or a pre-delivery verify readback that failed) is
+    // a refusal, not a verify-needed outcome, whatever its code. Post-action
+    // readbacks raise the same codes after input *was* delivered and keep
+    // verify_needed (#234, #323, upstream #1830).
+    if crate::m2::error_refused_before_delivery(error) {
         return TARGET_ACT_STATUS_REFUSED;
     }
     match error_code(error) {

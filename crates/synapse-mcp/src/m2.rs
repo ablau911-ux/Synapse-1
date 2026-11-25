@@ -1250,13 +1250,22 @@ pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
 /// delivered, so `data.refused_before_delivery` becomes false, whatever the
 /// kind of error. The one place that writes this rule: input loops pass their
 /// step count, composites the count of steps that ran before.
-pub(crate) fn error_after_earlier_steps(
-    mut error: ErrorData,
-    earlier_steps_done: usize,
-) -> ErrorData {
+pub(crate) fn error_after_earlier_steps(error: ErrorData, earlier_steps_done: usize) -> ErrorData {
     if earlier_steps_done == 0 {
         return error;
     }
+    error_with_delivery_fact(error, false)
+}
+
+/// Marks an error raised before its tool call handed any input to the OS (a
+/// pre-delivery check or pre-delivery readback failed):
+/// `data.refused_before_delivery` becomes true, so the caller reports that
+/// nothing was delivered instead of a delivered, unverified action (#323).
+pub(crate) fn error_before_delivery(error: ErrorData) -> ErrorData {
+    error_with_delivery_fact(error, true)
+}
+
+fn error_with_delivery_fact(mut error: ErrorData, refused_before_delivery: bool) -> ErrorData {
     let mut data = match error.data.take() {
         Some(Value::Object(map)) => map,
         Some(other) => {
@@ -1266,7 +1275,10 @@ pub(crate) fn error_after_earlier_steps(
         }
         None => serde_json::Map::new(),
     };
-    data.insert("refused_before_delivery".to_owned(), Value::Bool(false));
+    data.insert(
+        "refused_before_delivery".to_owned(),
+        Value::Bool(refused_before_delivery),
+    );
     error.data = Some(Value::Object(data));
     error
 }
@@ -1296,12 +1308,21 @@ pub(crate) fn error_after_bridge_input(
 /// True when the error records that input of its tool call was already
 /// delivered (`data.refused_before_delivery` is false).
 pub(crate) fn error_delivered_input(error: &ErrorData) -> bool {
+    error_delivery_fact(error) == Some(false)
+}
+
+/// True when the error records that its tool call was stopped before any
+/// input was delivered (`data.refused_before_delivery` is true).
+pub(crate) fn error_refused_before_delivery(error: &ErrorData) -> bool {
+    error_delivery_fact(error) == Some(true)
+}
+
+fn error_delivery_fact(error: &ErrorData) -> Option<bool> {
     error
         .data
         .as_ref()
         .and_then(|data| data.get("refused_before_delivery"))
         .and_then(Value::as_bool)
-        == Some(false)
 }
 
 pub struct M2State {

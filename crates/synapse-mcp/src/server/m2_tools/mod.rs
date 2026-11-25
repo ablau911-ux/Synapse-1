@@ -450,6 +450,22 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
+        // #323: the foreground keyboard tier types into, and verify_delta reads
+        // its surface from, the focused control of the OS foreground window.
+        // Before any readback or input, that window must be this call's
+        // intended target, so the verify surface is the target's and a call
+        // aimed at a background target is refused with nothing delivered.
+        if params.into_element.is_none()
+            && recording.is_none()
+            && let Err(error) =
+                handle.ensure_keyboard_target_is_foreground("act_type foreground keyboard tier")
+        {
+            let result: Result<ActTypeResponse, ErrorData> = Err(crate::m2::error_before_delivery(
+                crate::m2::action_error_to_mcp(&error),
+            ));
+            self.audit_action_result_for_request("act_type", &result, &request_context)?;
+            return result.map(Json);
+        }
         if requires_foreground_route
             && let Err(error) = self.ensure_act_type_foreground(&preflight, recording.as_ref())
         {
@@ -536,7 +552,9 @@ impl SynapseService {
             {
                 Ok(signature) => Some(signature),
                 Err(error) => {
-                    let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                    // The before-read runs ahead of any input: nothing was typed.
+                    let result: Result<ActTypeResponse, ErrorData> =
+                        Err(crate::m2::error_before_delivery(error));
                     self.audit_action_result_for_request("act_type", &result, &request_context)?;
                     return result.map(Json);
                 }

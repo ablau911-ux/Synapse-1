@@ -160,6 +160,40 @@ impl ActionHandle {
             })
     }
 
+    /// Applies the software backend's keyboard delivery rule to this handle's
+    /// intended target right now: a target must be known and its root window
+    /// must be the OS foreground. A tool calls this before it reads a
+    /// pre-delivery surface of the foreground keyboard tier (so that surface
+    /// is the target's) or before an earlier step of a composite whose
+    /// keyboard step would be refused; the backend still re-checks before
+    /// every batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_INPUT_TARGET_REQUIRED` with no intended target,
+    /// `ACTION_FOREGROUND_LOST` (nothing delivered) or
+    /// `ACTION_HUMAN_FULLSCREEN_FOREGROUND` when another window is foreground,
+    /// and `ACTION_BACKEND_UNAVAILABLE` if the session target map is poisoned.
+    #[cfg(windows)]
+    pub fn ensure_keyboard_target_is_foreground(&self, detail: &str) -> ActionResult<()> {
+        crate::backend::software::delivery_guard::ensure_keyboard_target(
+            self.delivery_target()?.as_ref(),
+            detail,
+        )
+    }
+
+    /// The non-Windows software backend has no foreground delivery rule, so
+    /// only the target lookup itself is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ACTION_BACKEND_UNAVAILABLE` if the session target map is
+    /// poisoned.
+    #[cfg(not(windows))]
+    pub fn ensure_keyboard_target_is_foreground(&self, _detail: &str) -> ActionResult<()> {
+        self.delivery_target().map(|_target| ())
+    }
+
     /// Records `target` as this session's intended OS-input window after an
     /// explicit, verified focus of that window. Returns `false` (and records
     /// nothing) for an unscoped handle.

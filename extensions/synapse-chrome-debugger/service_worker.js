@@ -5355,23 +5355,85 @@ async function pageVisibilityState(tabId) {
   }
 }
 
-// Moves the tab into a new unfocused window placed beside the tab's own
-// window, trying each side until Chrome reports the page visible (that is,
-// the spot is not covered). Never focuses anything.
+// Reads the work area (screen minus taskbar) of the display that holds the
+// tab's own window, from the tab's own page. The manifest has no
+// "system.display" permission, so the page's screen.avail* is the only source.
+// Returns null when the script cannot run (e.g. a restricted page), which makes
+// moveTabToRenderWindow fall back to the beside-origin placements only.
+async function tabWorkArea(tabId) {
+  try {
+    const injected = await quarantineGuardedExecuteScript({
+      target: { tabId },
+      func: () => ({
+        left: screen.availLeft,
+        top: screen.availTop,
+        width: screen.availWidth,
+        height: screen.availHeight
+      })
+    });
+    const area = injected?.[0]?.result;
+    if (
+      area &&
+      Number.isFinite(area.left) &&
+      Number.isFinite(area.top) &&
+      Number.isFinite(area.width) &&
+      area.width > 0 &&
+      Number.isFinite(area.height) &&
+      area.height > 0
+    ) {
+      return { left: area.left, top: area.top, width: area.width, height: area.height };
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Orders the spots the render window will try. The beside-origin spots come
+// first (correct when a second display sits beside the origin window); Chrome
+// rejects any that fall less than 50% on a screen, and moveTabToRenderWindow
+// records and skips those. When the work area is known, the window shrunk to
+// fit the work area and pinned to each of its four corners follows; those lie
+// fully inside the display, so with one display and a wide origin window (where
+// every beside spot is off screen) Chrome accepts them.
+function renderWindowPlacements(origin, width, height, workArea) {
+  const left0 = Number(origin.left) || 0;
+  const top0 = Number(origin.top) || 0;
+  const originWidth = Number(origin.width) || width;
+  const originHeight = Number(origin.height) || height;
+  const placements = [
+    { side: "right", left: left0 + originWidth + 40, top: top0 + 40, width, height },
+    { side: "left", left: left0 - width - 40, top: top0 + 40, width, height },
+    { side: "below", left: left0 + 40, top: top0 + originHeight + 40, width, height },
+    { side: "above", left: left0 + 40, top: top0 - height - 40, width, height }
+  ];
+  if (workArea) {
+    const fitWidth = Math.min(width, workArea.width);
+    const fitHeight = Math.min(height, workArea.height);
+    const maxLeft = workArea.left + workArea.width - fitWidth;
+    const maxTop = workArea.top + workArea.height - fitHeight;
+    placements.push(
+      { side: "work-top-left", left: workArea.left, top: workArea.top, width: fitWidth, height: fitHeight },
+      { side: "work-top-right", left: maxLeft, top: workArea.top, width: fitWidth, height: fitHeight },
+      { side: "work-bottom-left", left: workArea.left, top: maxTop, width: fitWidth, height: fitHeight },
+      { side: "work-bottom-right", left: maxLeft, top: maxTop, width: fitWidth, height: fitHeight }
+    );
+  }
+  return placements;
+}
+
+// Moves the tab into a new unfocused window placed on an uncovered spot, trying
+// each placement until Chrome reports the page visible (that is, the spot is
+// not covered). Beside-origin spots come first; a placement Chrome rejects for
+// bounds off screen is recorded and skipped, and the render window is created
+// with the first placement Chrome accepts. Never focuses anything.
 async function moveTabToRenderWindow(tabId, deadlineMs) {
   const tab = await chrome.tabs.get(tabId);
   const origin = await chrome.windows.get(tab.windowId);
   const originActive = await activeTabForWindow(tab.windowId);
   const width = Math.max(800, Math.min(1600, Number(origin.width) || 1280));
   const height = Math.max(600, Math.min(1000, Number(origin.height) || 900));
-  const left0 = Number(origin.left) || 0;
-  const top0 = Number(origin.top) || 0;
-  const candidates = [
-    { side: "right", left: left0 + (Number(origin.width) || width) + 40, top: top0 + 40 },
-    { side: "left", left: left0 - width - 40, top: top0 + 40 },
-    { side: "below", left: left0 + 40, top: top0 + (Number(origin.height) || height) + 40 },
-    { side: "above", left: left0 + 40, top: top0 - height - 40 }
-  ];
+  const placements = renderWindowPlacements(origin, width, height, await tabWorkArea(tabId));
   const record = {
     tabId,
     windowId: null,
@@ -5384,23 +5446,45 @@ async function moveTabToRenderWindow(tabId, deadlineMs) {
     placements: []
   };
   assertPhysicalMutationAdmission(`chrome.windows.create:renderWindow:tab=${tabId}`);
-  const first = candidates[0];
-  const created = await chrome.windows.create({
-    tabId,
-    focused: false,
-    state: "normal",
-    type: "normal",
-    left: first.left,
-    top: first.top,
-    width,
-    height
-  });
-  record.windowId = created.id;
-  for (const [index, candidate] of candidates.entries()) {
-    if (index > 0) {
-      await chrome.windows.update(created.id, { left: candidate.left, top: candidate.top, focused: false });
+  for (const candidate of placements) {
+    let placed;
+    try {
+      if (record.windowId === null) {
+        const created = await chrome.windows.create({
+          tabId,
+          focused: false,
+          state: "normal",
+          type: "normal",
+          left: candidate.left,
+          top: candidate.top,
+          width: candidate.width,
+          height: candidate.height
+        });
+        record.windowId = created.id;
+      } else {
+        await chrome.windows.update(record.windowId, {
+          left: candidate.left,
+          top: candidate.top,
+          width: candidate.width,
+          height: candidate.height,
+          focused: false
+        });
+      }
+      placed = await chrome.windows.get(record.windowId);
+    } catch (error) {
+      // Chrome throws for bounds less than 50% on a screen. Record the rejected
+      // placement and try the next one instead of failing the screenshot.
+      record.placements.push({
+        side: candidate.side,
+        left: candidate.left,
+        top: candidate.top,
+        width: candidate.width,
+        height: candidate.height,
+        visibility: "rejected",
+        error: errorMessage(error)
+      });
+      continue;
     }
-    const placed = await chrome.windows.get(created.id);
     const waitUntil = Math.min(Date.now() + 1500, deadlineMs - 3000);
     let visibility = await pageVisibilityState(tabId);
     while (visibility !== "visible" && Date.now() < waitUntil) {

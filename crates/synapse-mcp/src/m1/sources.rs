@@ -1553,7 +1553,8 @@ fn a11y_error(err: &synapse_a11y::A11yError) -> ErrorData {
             synapse_core::error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
             err.to_string(),
         ),
-        synapse_a11y::A11yError::UiaWorkerTimeout { .. } => {
+        synapse_a11y::A11yError::UiaWorkerTimeout { .. }
+        | synapse_a11y::A11yError::ElementStale { .. } => {
             crate::m1::mcp_error(err.code(), err.to_string())
         }
         _ => crate::m1::mcp_error(synapse_core::error_codes::OBSERVE_INTERNAL, err.to_string()),

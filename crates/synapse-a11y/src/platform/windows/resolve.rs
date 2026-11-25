@@ -15,7 +15,7 @@ use uiautomation::{
 use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::{
-        ES_MULTILINE, GWL_STYLE, GetWindowLongW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
+        ES_MULTILINE, GWL_STYLE, GetWindowLongW, IsWindow, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_GETTEXT,
         WM_GETTEXTLENGTH, WM_SETTEXT,
     },
 };
@@ -76,6 +76,17 @@ pub(super) fn re_resolve_on_worker(
             u32::MAX
         ),
     })?;
+    // A handle that is no live window cannot hold the element; UIA would
+    // answer it with a raw COM error instead of "not found".
+    // SAFETY: IsWindow accepts any handle value and only reads USER state.
+    if !unsafe { IsWindow(Some(HWND(hwnd as *mut c_void))) }.as_bool() {
+        return Err(A11yError::ElementStale {
+            detail: format!(
+                "element id {id} names hwnd 0x{:x}, which is not a live window",
+                parts.hwnd
+            ),
+        });
+    }
     if let Some(found) = find_by_runtime_id_hex(
         automation,
         hwnd,

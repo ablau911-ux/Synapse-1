@@ -1331,6 +1331,22 @@ impl SessionLifecycleState {
         }
     }
 
+    /// Periodic sweep of closed registry rows (#186; upstream #2128 item 5):
+    /// closed rows past the retention window go even when no further session
+    /// closes.
+    pub(crate) fn prune_closed_session_registry(&self, now_unix_ms: u64) {
+        match self.session_registry.lock() {
+            Ok(mut registry) => registry.prune_closed(now_unix_ms),
+            Err(poisoned) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned during closed-entry pruning; recovering ownership"
+                );
+                poisoned.into_inner().prune_closed(now_unix_ms);
+            }
+        }
+    }
+
     pub(crate) fn stale_session_candidates(
         &self,
         active_sessions: &BTreeSet<String>,

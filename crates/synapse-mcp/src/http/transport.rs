@@ -3020,6 +3020,8 @@ async fn cleanup_stale_session_resources_once(
             }
         }
     }
+    session_lifecycle
+        .prune_closed_session_registry(crate::server::session_registry::unix_time_ms_now());
 }
 
 async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {

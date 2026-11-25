@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_STALE_AFTER_MS: u64 = 5 * 60 * 1000;
 /// Closed sessions the registry keeps for `session list include_closed` and
-/// the dashboard; older closed entries are dropped (#184).
+/// the dashboard: closed entries stay five minutes, at most 256 of them; older
+/// closed entries are dropped (#184; upstream #2128 item 5, `505d97bd`).
+const CLOSED_SESSION_RETENTION_MS: u64 = 5 * 60 * 1000;
 const MAX_RETAINED_CLOSED_SESSIONS: usize = 256;
 
 pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
@@ -294,7 +296,7 @@ impl SessionRegistry {
         entry.closed_at_unix_ms = Some(now_unix_ms);
         entry.last_reason_code = reason_code.map(ToOwned::to_owned);
         if transitioned {
-            self.prune_closed();
+            self.prune_closed(now_unix_ms);
         }
         transitioned
     }
@@ -304,10 +306,19 @@ impl SessionRegistry {
         !self.entries.contains_key(session_id) && self.closed_session_ids.contains(session_id)
     }
 
-    /// Drops the oldest closed entries beyond [`MAX_RETAINED_CLOSED_SESSIONS`]
-    /// (#184, #186): the registry holds every open session plus a bounded
-    /// history of closed ones, not every session ever opened.
-    fn prune_closed(&mut self) {
+    /// Drops closed entries older than [`CLOSED_SESSION_RETENTION_MS`] and the
+    /// oldest closed entries beyond [`MAX_RETAINED_CLOSED_SESSIONS`] (#184,
+    /// #186): the registry holds every open session plus a bounded history of
+    /// closed ones, not every session ever opened. Runs on close and on the
+    /// periodic stale-session sweep. A dropped row's id stays in
+    /// `closed_session_ids`, so the session still closes once.
+    pub(crate) fn prune_closed(&mut self, now_unix_ms: u64) {
+        let cutoff = now_unix_ms.saturating_sub(CLOSED_SESSION_RETENTION_MS);
+        self.entries.retain(|_session_id, entry| {
+            entry
+                .closed_at_unix_ms
+                .is_none_or(|closed_at| closed_at >= cutoff)
+        });
         let mut closed: Vec<(u64, String)> = self
             .entries
             .values()

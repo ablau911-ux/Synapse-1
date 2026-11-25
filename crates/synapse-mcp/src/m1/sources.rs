@@ -975,7 +975,7 @@ fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInp
                 "minimized target capture extent could not be resolved"
             );
             input.capture_status = SensorStatus::DegradedSensorFailed {
-                reason_code: format!("A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_{}", error.code()),
+                reason_code: error.code().to_owned(),
             };
             return;
         }
@@ -1007,7 +1007,7 @@ fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInp
                 "minimized target UIA is unavailable and target-window capture probe also failed"
             );
             input.capture_status = SensorStatus::DegradedSensorFailed {
-                reason_code: format!("A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_{}", error.code()),
+                reason_code: error.code().to_owned(),
             };
         }
     }
@@ -1102,12 +1102,7 @@ fn window_metadata_node(foreground: &ForegroundContext) -> AccessibleNode {
 
 #[cfg(windows)]
 fn validate_live_target_hwnd(hwnd: i64) -> Result<(), ErrorData> {
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        crate::m1::mcp_error(
-            synapse_core::error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("target window_hwnd {hwnd:#x} is not a live window: {error}"),
-        )
-    })
+    crate::m1::validate_live_target_window("target window_hwnd", hwnd)
 }
 
 #[cfg(windows)]

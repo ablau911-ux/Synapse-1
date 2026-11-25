@@ -324,6 +324,11 @@ pub struct ReadTextParams {
 #[serde(deny_unknown_fields)]
 pub struct CaptureScreenshotParams {
     pub path: String,
+    /// Capture region. With `window_hwnd` or this MCP session's active window
+    /// target, this is window-client-relative and must fit inside the client
+    /// area (no title bar or borders), which is smaller than the
+    /// `native_width`/`native_height` of a whole-window capture. With no
+    /// target, this is an absolute screen region.
     #[serde(default)]
     pub region: Option<Rect>,
     /// Explicit per-call window override (HWND). Takes precedence over the
@@ -421,6 +426,11 @@ pub struct ScreenshotParams {
     /// Required for `capture` and `gif`; `record` takes `folder` instead.
     #[serde(default)]
     pub path: String,
+    /// Capture region for `capture` and `gif`. With `window_hwnd` or this MCP
+    /// session's active window target, this is window-client-relative and must
+    /// fit inside the client area (no title bar or borders), which is smaller
+    /// than the `native_width`/`native_height` of a whole-window capture. With
+    /// no target, this is an absolute screen region.
     #[serde(default)]
     pub region: Option<Rect>,
     /// Explicit per-call window override (HWND). Takes precedence over the
@@ -5067,6 +5077,36 @@ pub(crate) fn validate_window_hwnd_shape(tool: &str, hwnd: i64) -> Result<i64, E
     validate_hwnd_shape(tool, "window_hwnd", hwnd)
 }
 
+/// The one liveness check for a perception target window (`window_hwnd` or a
+/// session window target): the handle must name a live top-level window. A
+/// child control's HWND is not a window target (WGC cannot capture it and its
+/// UIA root is the control, not the window), so every tool refuses it with the
+/// same code as a dead handle. `subject` names the caller and field, for
+/// example `"read_text window_hwnd"`.
+pub(crate) fn validate_live_target_window(subject: &str, hwnd: i64) -> Result<(), ErrorData> {
+    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("{subject} {hwnd:#x} is not a live window: {error}"),
+        )
+    })?;
+    let top_level = synapse_a11y::is_top_level_window(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("{subject} {hwnd:#x} could not be checked as a top-level window: {error}"),
+        )
+    })?;
+    if !top_level {
+        return Err(mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!(
+                "{subject} {hwnd:#x} is a child control, not a top-level window; pass the HWND of its top-level window (target operation=list) and address the control by element_id"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Applies the same canonical-HWND shape check to the HWND half of an input
 /// element id (`subtree_root`, `element_id`, `in_window`), so a negative or
 /// zero handle is a typed parameter error instead of an internal error, a
@@ -5109,6 +5149,7 @@ pub(crate) fn ensure_element_in_target_window(
             format!("{tool} {field} {element_id} names hwnd {element_hwnd:#x}, which is not a live window: {error}"),
         )
     })?;
+    validate_live_target_window(&format!("{tool} target window"), target_hwnd)?;
     let target_root = synapse_a11y::top_level_root_hwnd(target_hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,

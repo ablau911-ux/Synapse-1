@@ -110,6 +110,14 @@ impl SynapseService {
                     };
                     frames.push(frame);
                 }
+                // An invalid target (for example a minimized window) stays
+                // invalid for the whole recording: fail now with its own code.
+                Err(error @ synapse_capture::CaptureError::TargetInvalid { .. }) => {
+                    return Err(mcp_error(
+                        error.code(),
+                        format!("capture_gif cannot record hwnd {window_hwnd:#x}: {error}"),
+                    ));
+                }
                 Err(error) => {
                     last_error = Some(error.to_string());
                 }

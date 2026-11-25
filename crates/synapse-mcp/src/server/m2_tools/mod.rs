@@ -3094,8 +3094,11 @@ impl SynapseService {
                         detail = %error.message,
                         "act_click delivered; target window closed afterward (dialog dismissed) — verified via window disappearance"
                     );
-                    response.postcondition =
-                        postcondition_target_window_closed("act_click", error.message.to_string());
+                    response.postcondition = postcondition_target_window_closed(
+                        "act_click",
+                        "click",
+                        error.message.to_string(),
+                    );
                     return Ok(response);
                 }
                 let mut tier_attempts = response.tier_attempts.clone();
@@ -4386,10 +4389,15 @@ impl SynapseService {
         let verify_timeout_ms = params.verify_timeout_ms;
         let (mut response, delivery) =
             act_press_postmessage_target(root_hwnd, params, boundary).await?;
-        if let PostKeyDelivery::TargetWindowClosed { detail } = delivery {
+        if let PostKeyDelivery::TargetWindowClosed { .. } = delivery {
             // The key-down closed the target window; the press was delivered and
-            // there is no live window to verify against (mirrors act_click).
-            response.postcondition = postcondition_target_window_closed("act_press", detail);
+            // there is no live window to verify against (mirrors act_click). The
+            // specifics ride response.key_up_not_posted_window_closed.
+            response.postcondition = postcondition_target_window_closed(
+                "act_press",
+                "key-down",
+                "no post-delivery readback: the target window is gone",
+            );
             return Ok(response);
         }
         // The keys were posted: every failure of the read-back below says so.

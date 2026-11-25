@@ -20,6 +20,7 @@ use synapse_storage::{Db, cf};
 
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 use crate::m1::{CdpTargetInfoParams, mcp_error};
+use crate::m3::permissions::{Permission, required};
 use crate::server::url_redaction::redact_url_for_public_readback;
 
 const AUDIT_PREFIX: &str = "verification/audit/v1/";
@@ -517,6 +518,8 @@ impl SynapseService {
             source = %params.source,
             "tool.invocation kind=verification_bind"
         );
+        // Default-deny (upstream #342, #1539): the binding row is a CF_KV write.
+        self.require_m3_permissions("verification_bind", &required([Permission::WriteStorage]))?;
         if params.source.trim().is_empty() {
             return Err(mcp_error(
                 synapse_core::error_codes::TOOL_PARAMS_INVALID,

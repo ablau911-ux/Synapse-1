@@ -156,8 +156,13 @@ pub const fn routine_mine() -> M3ToolStub {
 }
 
 #[must_use]
-pub fn required_permissions(_params: &RoutineMineParams) -> RequiredPermissions {
-    required([Permission::ReadStorage, Permission::WriteStorage])
+pub fn required_permissions(params: &RoutineMineParams) -> RequiredPermissions {
+    // dry_run mutates nothing, so it needs no write permission (#190).
+    if params.dry_run {
+        required([Permission::ReadStorage])
+    } else {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    }
 }
 
 fn invalid(detail: impl Into<String>) -> ErrorData {

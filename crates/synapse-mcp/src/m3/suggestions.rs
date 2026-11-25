@@ -414,8 +414,14 @@ impl From<SuggestionConfig> for SuggestionConfigEcho {
     }
 }
 
-pub fn required_permissions_tick(_params: &SuggestionTickParams) -> RequiredPermissions {
-    required([Permission::ReadStorage, Permission::WriteStorage])
+pub fn required_permissions_tick(params: &SuggestionTickParams) -> RequiredPermissions {
+    // dry_run computes decisions without persisting, so it needs no write
+    // permission (#190).
+    if params.dry_run {
+        required([Permission::ReadStorage])
+    } else {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    }
 }
 
 fn storage_error(error: impl std::fmt::Display) -> ErrorData {
@@ -1509,8 +1515,14 @@ pub struct SuggestionAcceptResponse {
     pub execution: PlanExecutionRecord,
 }
 
-pub fn required_permissions_accept(_params: &SuggestionAcceptParams) -> RequiredPermissions {
-    required([Permission::ReadStorage, Permission::WriteStorage])
+pub fn required_permissions_accept(params: &SuggestionAcceptParams) -> RequiredPermissions {
+    // dry_run returns the routing report without mutating storage or
+    // launching anything, so it needs no write permission (#190).
+    if params.dry_run {
+        required([Permission::ReadStorage])
+    } else {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    }
 }
 
 pub fn list_suggestions(

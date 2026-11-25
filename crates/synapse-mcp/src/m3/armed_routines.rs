@@ -297,8 +297,14 @@ pub const fn armed_routine_tick() -> super::M3ToolStub {
 }
 
 #[must_use]
-pub fn required_permissions_tick(_params: &ArmedRoutineTickParams) -> RequiredPermissions {
-    required([Permission::ReadStorage, Permission::WriteStorage])
+pub fn required_permissions_tick(params: &ArmedRoutineTickParams) -> RequiredPermissions {
+    // dry_run mutates nothing and launches nothing, so it needs no write
+    // permission (#190).
+    if params.dry_run {
+        required([Permission::ReadStorage])
+    } else {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    }
 }
 
 pub fn validate_arm_config(config: ArmRoutineConfig) -> Result<(), ErrorData> {

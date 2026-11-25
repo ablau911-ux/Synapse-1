@@ -627,7 +627,7 @@ impl SynapseService {
         )
         .await;
         super::enrich_input_with_browser_ocr(&mut input, super::find_cdp_max_nodes());
-        let mut response = super::match_find_input(&input, &params.0);
+        let mut response = super::match_find_input(&input, &params.0)?;
         attach_find_hygiene_annotations(&mut response);
         Ok(Json(response))
     }

@@ -964,7 +964,7 @@ impl SynapseService {
             let mut state = self.m1_state()?;
             crate::m1::build_find_input(&mut state, &find_params, Some(window_hwnd))?
         };
-        let response = crate::m1::match_find_input(&input, &find_params);
+        let response = crate::m1::match_find_input(&input, &find_params)?;
         let results = response
             .results
             .into_iter()

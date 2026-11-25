@@ -29,7 +29,7 @@ pub use ocr::{
 };
 #[cfg(windows)]
 pub use ocr::{read_text_request_for_captured_bitmap, read_text_request_from_bgra};
-use search::{element_match, entity_match};
+use search::{InWindowScope, element_match, entity_match};
 pub use sources::{
     ClipboardTimelineSample, FsRecentTracker, FsTimelineEvent,
     hidden_desktop_input_from_worker_snapshot, populate_clipboard_summary, populate_fs_recent,
@@ -4846,18 +4846,42 @@ pub const fn find_snapshot_depth() -> u32 {
 }
 
 /// Matches a prepared input against the `find` query.
-#[must_use]
-pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindResponse {
+///
+/// # Errors
+///
+/// Returns `A11Y_ELEMENT_STALE` when elements are searched and `in_window`
+/// names no node of the snapshot, so an unusable scope is not reported as
+/// "no match".
+pub fn match_find_input(
+    input: &ObservationInput,
+    params: &FindParams,
+) -> Result<FindResponse, ErrorData> {
     let limit = params.limit.unwrap_or(5).clamp(1, 20);
     let mut results = Vec::new();
     if matches!(
         params.scope.unwrap_or_default(),
         FindScope::Elements | FindScope::Both
     ) {
+        let in_window = params
+            .in_window
+            .as_ref()
+            .map(|root| {
+                InWindowScope::new(&input.elements, root).ok_or_else(|| {
+                    mcp_error(
+                        error_codes::A11Y_ELEMENT_STALE,
+                        format!(
+                            "find in_window {root} is not an element of the snapshot of window {:#x} (stale, foreign, or deeper than the find snapshot)",
+                            input.foreground.hwnd
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
         results.extend(
             input
                 .elements
                 .iter()
+                .filter(|node| in_window.as_ref().is_none_or(|scope| scope.contains(node)))
                 .filter_map(|node| element_match(node, params)),
         );
     }
@@ -4874,11 +4898,11 @@ pub fn match_find_input(input: &ObservationInput, params: &FindParams) -> FindRe
     }
     results.sort_by(|left, right| right.score.total_cmp(&left.score));
     results.truncate(limit);
-    FindResponse {
+    Ok(FindResponse {
         results,
         perceived_text_notice: None,
         suspected_injection: Vec::new(),
-    }
+    })
 }
 
 pub fn set_capture_target_in_state(

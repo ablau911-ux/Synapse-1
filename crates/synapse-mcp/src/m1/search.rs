@@ -1,11 +1,45 @@
-use synapse_core::{AccessibleNode, DetectedEntity};
+use std::collections::HashMap;
+
+use synapse_core::{AccessibleNode, DetectedEntity, ElementId};
 
 use crate::m1::{FindParams, FindResult, FindResultKind};
 
-pub fn element_match(node: &AccessibleNode, params: &FindParams) -> Option<FindResult> {
-    if params.in_window.is_some() && params.in_window.as_ref() != node.parent.as_ref() {
-        return None;
+/// The `find` `in_window` scope: every snapshot node below the named element,
+/// at any depth (not only its direct children).
+pub struct InWindowScope<'a> {
+    root: &'a ElementId,
+    parents: HashMap<&'a ElementId, Option<&'a ElementId>>,
+}
+
+impl<'a> InWindowScope<'a> {
+    /// `None` when `root` is not a node of `elements`: the id is bogus, stale,
+    /// foreign or deeper than the snapshot, so no scope can be drawn.
+    #[must_use]
+    pub fn new(elements: &'a [AccessibleNode], root: &'a ElementId) -> Option<Self> {
+        let parents: HashMap<_, _> = elements
+            .iter()
+            .map(|node| (&node.element_id, node.parent.as_ref()))
+            .collect();
+        parents.contains_key(root).then_some(Self { root, parents })
     }
+
+    /// True when `node` sits below the scope root. The walk is bounded by the
+    /// node count, so a malformed parent chain cannot loop.
+    #[must_use]
+    pub fn contains(&self, node: &AccessibleNode) -> bool {
+        let mut parent = node.parent.as_ref();
+        for _ in 0..=self.parents.len() {
+            match parent {
+                Some(id) if id == self.root => return true,
+                Some(id) => parent = self.parents.get(id).copied().flatten(),
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
+pub fn element_match(node: &AccessibleNode, params: &FindParams) -> Option<FindResult> {
     if let Some(role) = &params.role
         && !node.role.eq_ignore_ascii_case(role)
     {

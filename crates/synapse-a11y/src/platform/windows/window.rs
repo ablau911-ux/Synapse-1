@@ -1,5 +1,7 @@
 use std::{ffi::c_void, mem, path::Path};
 
+use std::time::{Duration, Instant};
+
 use synapse_core::{
     AccessibleSubtree, ForegroundContext, Point, Rect,
     win32_hwnd::{hwnd_from_wire, hwnd_to_wire, native_hwnds_equal},
@@ -79,10 +81,7 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
     // OS-input safety: never steal focus from a human in a protected
     // fullscreen/busy/presentation app (e.g. a game) that is not the target.
     let target_identity = super::human_guard::window_root_identity(hwnd_to_wire(hwnd.0 as isize))?;
-    super::human_guard::ensure_human_foreground_allows_focus_change(
-        target_identity,
-        intent.caller(),
-    )?;
+    ensure_human_foreground_allows_focus_change_stable(target_identity, intent.caller())?;
     restore_window_for_focus(hwnd);
     let _ = unsafe { SetForegroundWindow(hwnd) };
     if native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize) {
@@ -101,10 +100,7 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
         // target's own process (re-checked immediately before delivery), and
         // re-run the fullscreen guard so a human who entered a game since the
         // first check is never disturbed.
-        super::human_guard::ensure_human_foreground_allows_focus_change(
-            target_identity,
-            intent.caller(),
-        )?;
+        ensure_human_foreground_allows_focus_change_stable(target_identity, intent.caller())?;
         match super::human_guard::foreground_root_identity() {
             Ok(foreground_identity) if foreground_identity.pid == target_identity.pid => {
                 if let Err(error) = send_foreground_activation_nudge() {
@@ -157,6 +153,35 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
                 "SetForegroundWindow returned false for hwnd 0x{:x}",
                 hwnd.0 as isize
             )))
+        }
+    }
+}
+
+/// Reads the human-foreground guard for a focus activation, tolerating a
+/// transient null foreground.
+///
+/// Windows reports a null foreground window for a short time while it switches
+/// the foreground window. A focus activation requested through
+/// `act_focus_window` must not take one such transient read as its final
+/// answer, so the guard is re-read for a short bounded time before
+/// `A11Y_NO_FOREGROUND` becomes the answer. A guard refusal
+/// (`ACTION_HUMAN_FULLSCREEN_FOREGROUND`) is final and returned at once. The
+/// re-read cadence mirrors the focus-verification poll (25 ms); only the focus
+/// path uses this, so the general foreground reader keeps reporting a real null
+/// to perception at once.
+fn ensure_human_foreground_allows_focus_change_stable(
+    target: crate::WindowRootIdentity,
+    caller: &'static str,
+) -> A11yResult<crate::WindowRootIdentity> {
+    const FOREGROUND_READBACK_POLL: Duration = Duration::from_millis(25);
+    const FOREGROUND_READBACK_WINDOW: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + FOREGROUND_READBACK_WINDOW;
+    loop {
+        match super::human_guard::ensure_human_foreground_allows_focus_change(target, caller) {
+            Err(A11yError::NoForeground { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(FOREGROUND_READBACK_POLL);
+            }
+            other => return other,
         }
     }
 }

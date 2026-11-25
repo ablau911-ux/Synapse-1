@@ -5058,6 +5058,47 @@ pub(crate) fn validate_element_id_hwnd_shape(
     validate_hwnd_shape(tool, field, parts.hwnd).map(|_| ())
 }
 
+/// Refuses an input element id (`element_id`, `subtree_root`) whose top-level
+/// window is not the call's target window, so an explicit `window_hwnd` or a
+/// session target is never silently swapped for the element's own window.
+pub(crate) fn ensure_element_in_target_window(
+    tool: &str,
+    field: &'static str,
+    element_id: &ElementId,
+    target_hwnd: i64,
+) -> Result<(), ErrorData> {
+    let element_hwnd = element_id
+        .parts()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{tool} {field}: {error}"),
+            )
+        })?
+        .hwnd;
+    let element_root = synapse_a11y::top_level_root_hwnd(element_hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::A11Y_ELEMENT_STALE,
+            format!("{tool} {field} {element_id} names hwnd {element_hwnd:#x}, which is not a live window: {error}"),
+        )
+    })?;
+    let target_root = synapse_a11y::top_level_root_hwnd(target_hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("{tool} target window {target_hwnd:#x} is not a live window: {error}"),
+        )
+    })?;
+    if element_root != target_root {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{tool} {field} {element_id} belongs to window {element_root:#x}, not to the target window {target_hwnd:#x}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates the canonical Win32 USER-handle wire representation for an HWND
 /// field whose public name may differ (for example `act_focus_window.hwnd`).
 pub(crate) fn validate_hwnd_shape(

@@ -214,6 +214,9 @@ fn text_region(
     }
     if let Some(element_id) = &params.element_id {
         if state.synthetic.is_none() {
+            if let Some(hwnd) = target_hwnd {
+                crate::m1::ensure_element_in_target_window("read_text", "element_id", element_id, hwnd)?;
+            }
             let region = synapse_a11y::element_bounding_rect(element_id).map_err(|err| {
                 mcp_error(
                     error_codes::OCR_NO_TEXT,

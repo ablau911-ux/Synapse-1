@@ -632,13 +632,13 @@ fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
     })?;
     let seed = HWND(native as *mut std::ffi::c_void);
     if seed.0.is_null() || !unsafe { IsWindow(Some(seed)) }.as_bool() {
-        return Err(format!("element HWND 0x{hwnd:x} is not a live window"));
+        return Err(format!("HWND 0x{hwnd:x} is not a live window"));
     }
     let root = unsafe { GetAncestor(seed, GA_ROOT) };
     let root = if root.0.is_null() { seed } else { root };
     if !unsafe { IsWindow(Some(root)) }.as_bool() {
         return Err(format!(
-            "top-level root HWND 0x{:x} for element HWND 0x{hwnd:x} is not live",
+            "top-level root HWND 0x{:x} for HWND 0x{hwnd:x} is not live",
             root.0 as usize
         ));
     }

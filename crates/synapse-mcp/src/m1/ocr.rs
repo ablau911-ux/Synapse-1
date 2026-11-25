@@ -287,12 +287,7 @@ fn target_window_region_capture_source(
     hwnd: i64,
     client_region: Rect,
 ) -> Result<ReadTextCaptureSource, ErrorData> {
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("read_text window_hwnd {hwnd:#x} is not a live window: {error}"),
-        )
-    })?;
+    crate::m1::validate_live_target_window("read_text window_hwnd", hwnd)?;
     let window_region =
         synapse_capture::client_region_to_window_region(hwnd, client_region).map_err(|error| {
             mcp_error(
@@ -321,12 +316,7 @@ fn target_window_region_capture_source(
 
 #[cfg(windows)]
 fn fail_if_minimized_target_needs_window_capture(hwnd: i64) -> Result<(), ErrorData> {
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("read_text window_hwnd {hwnd:#x} is not a live window: {error}"),
-        )
-    })?;
+    crate::m1::validate_live_target_window("read_text window_hwnd", hwnd)?;
     if synapse_a11y::is_window_minimized(hwnd).map_err(|error| {
         mcp_error(
             error.code(),

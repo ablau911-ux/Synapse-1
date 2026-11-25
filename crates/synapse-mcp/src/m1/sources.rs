@@ -1102,12 +1102,7 @@ fn window_metadata_node(foreground: &ForegroundContext) -> AccessibleNode {
 
 #[cfg(windows)]
 fn validate_live_target_hwnd(hwnd: i64) -> Result<(), ErrorData> {
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        crate::m1::mcp_error(
-            synapse_core::error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("target window_hwnd {hwnd:#x} is not a live window: {error}"),
-        )
-    })
+    crate::m1::validate_live_target_window("target window_hwnd", hwnd)
 }
 
 #[cfg(windows)]

@@ -16744,12 +16744,7 @@ fn validate_target_window_context(tool: &str, hwnd: i64) -> Result<ForegroundCon
     // callers all classify nonpositive HWNDs identically before touching the
     // capture/UIA backends.
     crate::m1::validate_window_hwnd_shape(tool, hwnd)?;
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("{tool} window_hwnd {hwnd:#x} is not a live window: {error}"),
-        )
-    })?;
+    crate::m1::validate_live_target_window(&format!("{tool} window_hwnd"), hwnd)?;
     synapse_a11y::foreground_context(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
@@ -17564,12 +17559,7 @@ fn hidden_worker_target_miss(error: &ErrorData) -> bool {
 }
 
 fn resolve_capture_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
-    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!("capture_screenshot window_hwnd {hwnd:#x} is not a live window: {error}"),
-        )
-    })?;
+    crate::m1::validate_live_target_window("capture_screenshot window_hwnd", hwnd)?;
     synapse_a11y::foreground_context(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,

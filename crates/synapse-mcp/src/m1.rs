@@ -426,6 +426,11 @@ pub struct ScreenshotParams {
     /// Required for `capture` and `gif`; `record` takes `folder` instead.
     #[serde(default)]
     pub path: String,
+    /// Capture region for `capture` and `gif`. With `window_hwnd` or this MCP
+    /// session's active window target, this is window-client-relative and must
+    /// fit inside the client area (no title bar or borders), which is smaller
+    /// than the `native_width`/`native_height` of a whole-window capture. With
+    /// no target, this is an absolute screen region.
     #[serde(default)]
     pub region: Option<Rect>,
     /// Explicit per-call window override (HWND). Takes precedence over the

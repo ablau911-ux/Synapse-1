@@ -87,46 +87,73 @@ pub(super) fn clips_root() -> PathBuf {
         .join("clips")
 }
 
-/// `path` as the file system names it, also a path that does not exist yet:
+/// A path as the file system names it, also a path that does not exist yet:
 /// absolute with `.` and `..` resolved, its deepest existing ancestor
 /// canonicalised (links, short names, the names on disk) with the rest
-/// appended as written. An existing ancestor that cannot be read or
-/// canonicalised (a dangling link, a link to itself, no access) is an error
-/// naming it, never skipped: what it points to is unknown.
-fn resolved_path(path: &Path) -> Result<PathBuf, String> {
-    let absolute = std::path::absolute(path)
-        .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
-    for ancestor in absolute.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("could not read {}: {error}", ancestor.display())),
-            Ok(_) => {
-                let canonical = std::fs::canonicalize(ancestor).map_err(|error| {
-                    format!("could not resolve {}: {error}", ancestor.display())
-                })?;
-                let rest = absolute.strip_prefix(ancestor).map_err(|error| {
-                    format!(
-                        "{} is not below {}: {error}",
-                        absolute.display(),
-                        ancestor.display()
-                    )
-                })?;
-                return Ok(canonical.join(rest));
-            }
-        }
-    }
-    Ok(absolute)
+/// appended as written. Its first `existing` components exist.
+struct ResolvedPath {
+    path: PathBuf,
+    existing: usize,
 }
 
-/// True when the resolved `inner` is `outer` or lies below it: name by name,
-/// each pair compared as the file system compares names (`same_name`).
-fn is_within(inner: &Path, outer: &Path) -> bool {
-    let mut inner = inner.components();
-    outer.components().all(|name| {
-        inner
-            .next()
-            .is_some_and(|other| same_name(name.as_os_str(), other.as_os_str()))
-    })
+impl ResolvedPath {
+    /// An existing ancestor that cannot be read or canonicalised (a dangling
+    /// link, a link to itself, no access) is an error naming it, never
+    /// skipped: what it points to is unknown.
+    fn resolve(path: &Path) -> Result<Self, String> {
+        let absolute = std::path::absolute(path)
+            .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
+        for ancestor in absolute.ancestors() {
+            match std::fs::symlink_metadata(ancestor) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("could not read {}: {error}", ancestor.display()));
+                }
+                Ok(_) => {
+                    let canonical = std::fs::canonicalize(ancestor).map_err(|error| {
+                        format!("could not resolve {}: {error}", ancestor.display())
+                    })?;
+                    let rest = absolute.strip_prefix(ancestor).map_err(|error| {
+                        format!(
+                            "{} is not below {}: {error}",
+                            absolute.display(),
+                            ancestor.display()
+                        )
+                    })?;
+                    return Ok(Self {
+                        existing: canonical.components().count(),
+                        path: canonical.join(rest),
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            path: absolute,
+            existing: 0,
+        })
+    }
+
+    /// True when `self` is `outer` or lies below it, name by name. Two paths
+    /// are the same folder only when the file system says so: a name that
+    /// exists on either side carries its name on disk, so it is compared
+    /// exactly (in a folder with per-directory case sensitivity `A` and `a`
+    /// are two folders; in any other folder the same folder written in
+    /// another case has the same name on disk, and a name that exists beside
+    /// one that does not differs from it in more than case). Names that
+    /// exist on neither side are compared as Windows compares names
+    /// (`same_name`).
+    fn is_within(&self, outer: &Self) -> bool {
+        let mut inner = self.path.components();
+        outer.path.components().enumerate().all(|(index, name)| {
+            inner.next().is_some_and(|other| {
+                if index < self.existing.max(outer.existing) {
+                    name.as_os_str() == other.as_os_str()
+                } else {
+                    same_name(name.as_os_str(), other.as_os_str())
+                }
+            })
+        })
+    }
 }
 
 /// Windows compares file names ordinally without case, by its own upper-case
@@ -1008,7 +1035,7 @@ impl ClipRegistry {
     /// registry: a start that fails removes its clip folder with everything
     /// in it. Refused however the folder is written (another letter case,
     /// `.` or `..`, a relative path, a link or short name in the part that
-    /// exists); two names are the same only when Windows says so. A path
+    /// exists); two names are the same only when the file system says so. A path
     /// with an existing part that cannot be resolved is refused, since it
     /// can come to hold them.
     pub(super) fn check_clip_folder(folder: &Path) -> Result<(), String> {
@@ -1020,10 +1047,10 @@ impl ClipRegistry {
                 clips_root().display()
             )
         };
-        if is_within(
-            &resolved_path(&registry).map_err(unknown)?,
-            &resolved_path(folder).map_err(unknown)?,
-        ) {
+        if ResolvedPath::resolve(&registry)
+            .map_err(unknown)?
+            .is_within(&ResolvedPath::resolve(folder).map_err(unknown)?)
+        {
             return Err(format!(
                 "{} is or holds the default clips folder {} and its registry; a failed start removes its clip folder with everything in it",
                 folder.display(),

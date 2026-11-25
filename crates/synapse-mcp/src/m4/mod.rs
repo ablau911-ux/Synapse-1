@@ -7435,6 +7435,13 @@ fn chromium_cdp_launch(params: &ActLaunchParams) -> Option<ChromiumCdpLaunch> {
         "--disable-extensions".to_owned(),
         "--no-first-run".to_owned(),
         "--no-default-browser-check".to_owned(),
+        // Keep this window's pages live when it is covered (#334): Chrome
+        // otherwise marks an occluded window's pages hidden and silently drops
+        // trusted input dispatched to them. Any caller-supplied
+        // `--disable-features=` is folded into ours during arg assembly (Chrome
+        // honours only the last one).
+        "--disable-backgrounding-occluded-windows".to_owned(),
+        "--disable-features=CalculateNativeWinOcclusion".to_owned(),
     ];
     Some(ChromiumCdpLaunch {
         user_data_dir,
@@ -7456,9 +7463,44 @@ fn params_with_chromium_launch_args(
     if let Some(arg) = force_renderer_accessibility {
         args.push(arg);
     }
-    args.extend(params.args.iter().cloned());
+    append_caller_args_merging_disable_features(&mut args, &params.args);
     spawn_params.args = args;
     spawn_params
+}
+
+/// Appends the caller's `caller_args` to `args`, folding any caller
+/// `--disable-features=` value into a `--disable-features=` already present in
+/// `args` (our injected occlusion flag) rather than letting the caller's own
+/// list silently override it (#334). Chrome honours only the last
+/// `--disable-features=`, and the caller's args follow our injected ones, so the
+/// caller's copy is merged in and dropped instead of appended; if `args` has no
+/// injected `--disable-features=` (nothing was injected), the caller's args —
+/// including any `--disable-features=` — are appended unchanged.
+fn append_caller_args_merging_disable_features(args: &mut Vec<String>, caller_args: &[String]) {
+    const FLAG: &str = "--disable-features=";
+    let Some(injected_idx) = args.iter().position(|arg| arg.starts_with(FLAG)) else {
+        args.extend(caller_args.iter().cloned());
+        return;
+    };
+    // Chrome would have used the caller's last --disable-features=, so fold that
+    // value in and append every other caller arg unchanged.
+    if let Some(caller_value) = caller_args
+        .iter()
+        .filter_map(|arg| arg.strip_prefix(FLAG))
+        .filter(|value| !value.is_empty())
+        .next_back()
+    {
+        let injected_value = args[injected_idx]
+            .strip_prefix(FLAG)
+            .unwrap_or_default()
+            .to_owned();
+        args[injected_idx] = format!("{FLAG}{injected_value},{caller_value}");
+    }
+    for arg in caller_args {
+        if !arg.starts_with(FLAG) {
+            args.push(arg.clone());
+        }
+    }
 }
 
 /// Dedicated, non-default automation profile dir. Honors

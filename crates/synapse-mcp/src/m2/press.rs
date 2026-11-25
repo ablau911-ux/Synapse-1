@@ -138,8 +138,9 @@ pub(crate) enum PostKeyDelivery {
     /// The target window is live; verify the delta by reading it back.
     VerifyReadback,
     /// The key-down closed the target window; the press was delivered and there
-    /// is no live window to read back.
-    TargetWindowClosed { detail: String },
+    /// is no live window to read back. What closed rides the answer's
+    /// `key_up_not_posted_window_closed`.
+    TargetWindowClosed,
 }
 
 pub(crate) async fn act_press_postmessage_target(
@@ -164,10 +165,9 @@ pub(crate) async fn act_press_postmessage_target(
                 key_up_not_posted_window_closed,
                 PostKeyDelivery::VerifyReadback,
             ),
-            postmessage::PostKeySequenceOutcome::TargetWindowClosed { detail } => (
-                Some(detail.clone()),
-                PostKeyDelivery::TargetWindowClosed { detail },
-            ),
+            postmessage::PostKeySequenceOutcome::TargetWindowClosed { detail } => {
+                (Some(detail), PostKeyDelivery::TargetWindowClosed)
+            }
         };
     Ok((
         ActPressResponse {

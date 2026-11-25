@@ -4389,7 +4389,7 @@ impl SynapseService {
         let verify_timeout_ms = params.verify_timeout_ms;
         let (mut response, delivery) =
             act_press_postmessage_target(root_hwnd, params, boundary).await?;
-        if let PostKeyDelivery::TargetWindowClosed { .. } = delivery {
+        if matches!(delivery, PostKeyDelivery::TargetWindowClosed) {
             // The key-down closed the target window; the press was delivered and
             // there is no live window to verify against (mirrors act_click). The
             // specifics ride response.key_up_not_posted_window_closed.

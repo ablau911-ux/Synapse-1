@@ -48,6 +48,7 @@ use super::{
     tool, tool_router,
 };
 use crate::m1::error_code;
+use crate::m3::permissions::{Permission, required};
 use crate::m4::{
     ActSpawnAgentRequest, default_agent_spawn_hold_open_ms, default_agent_spawn_mcp_url,
     default_agent_spawn_wait_timeout_ms,
@@ -1969,6 +1970,12 @@ impl SynapseService {
             kind = "task_reconcile",
             "tool.invocation kind=task_reconcile"
         );
+        // Default-deny (upstream #342, #1539): reconcile moves other sessions'
+        // in_progress rows to review, so it needs WRITE_STORAGE.
+        self.require_m3_permissions(
+            "task_reconcile",
+            &required([Permission::ReadStorage, Permission::WriteStorage]),
+        )?;
         self.task_reconcile_impl().map(Json)
     }
 

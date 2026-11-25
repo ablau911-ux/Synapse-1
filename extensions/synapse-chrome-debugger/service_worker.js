@@ -6981,6 +6981,62 @@ function mainFrameErrorPageBridgeError(contextUrl, networkError, errorUrl) {
   );
 }
 
+// #330: Chrome's goBack/goForward fail with "Cannot find a … page in history."
+// when the adjacent entry got no user activation; recognize exactly that refusal
+// so only it falls back to the debugger history lane.
+function isNoAdjacentHistoryEntryError(error) {
+  return errorMessage(error).includes("page in history");
+}
+
+// #330: move the tab one entry through its real session history when Chrome's own
+// back/forward refused a skippable (no-user-activation) entry. Reads the history
+// over the debugger lane the extension already uses (Page.getNavigationHistory)
+// and, when an adjacent entry exists, goes to it with Page.navigateToHistoryEntry;
+// otherwise raises a clear Synapse error (not Chrome's wording). A session this
+// command attached is detached again; a borrowed persistent session is left as-is.
+async function navigateToAdjacentHistoryEntry(tabId, action) {
+  const direction = action === "back" ? -1 : 1;
+  let attachment = null;
+  try {
+    attachment = await attachDebuggerForCommand(tabId);
+    const history = await sendDebuggerCommand(attachment.debuggee, "Page.getNavigationHistory", {});
+    const entries = Array.isArray(history?.entries) ? history.entries : [];
+    const currentIndex = Number.isInteger(history?.currentIndex) ? history.currentIndex : -1;
+    const targetIndex = currentIndex + direction;
+    const targetEntry =
+      targetIndex >= 0 && targetIndex < entries.length ? entries[targetIndex] : null;
+    if (!targetEntry || !Number.isInteger(targetEntry.id)) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        action === "back"
+          ? `browser_nav back: the tab is at the oldest entry in its session history (current index ${currentIndex} of ${entries.length} entries); there is no earlier entry to go back to`
+          : `browser_nav forward: the tab is at the newest entry in its session history (current index ${currentIndex} of ${entries.length} entries); there is no later entry to go forward to`
+      );
+    }
+    await sendDebuggerCommand(attachment.debuggee, "Page.navigateToHistoryEntry", {
+      entryId: targetEntry.id
+    });
+  } catch (error) {
+    if (error && error.code) {
+      throw error;
+    }
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `browser_nav ${action}: moving one entry through the tab's session history via the debugger failed: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attachment?.shouldDetach) {
+      try {
+        await chrome.debugger.detach(attachment.debuggee);
+      } catch (detachError) {
+        console.warn(
+          `Synapse chrome.debugger detach failed for browser_nav ${action} history fallback tab ${tabId}: ${errorMessage(detachError)}`
+        );
+      }
+    }
+  }
+}
+
 async function handleNavigateTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
@@ -6990,6 +7046,10 @@ async function handleNavigateTab(params) {
   const ignoreCache = Boolean(params.ignoreCache);
   const before = await tabPageState(selected.tabId, selected.target);
   let readbackExpectation = null;
+  // #330: set when Chrome refuses back/forward because the adjacent history
+  // entry got no user activation, so we move one entry through the session
+  // history via the debugger lane after the chrome.tabs attempt.
+  let needsHistoryFallback = false;
   // #1344: a navigate to a URL that triggers a Chrome download leaves the tab on
   // its current URL, so the url-change readback would (wrongly) time out. Snapshot
   // the download-event sequence before the navigate so we can detect a download
@@ -7023,30 +7083,33 @@ async function handleNavigateTab(params) {
       });
       assertPhysicalMutationAdmission(`chrome.tabs.reload:navigate:tab=${selected.tabId}`);
       await chrome.tabs.reload(selected.tabId, { bypassCache: ignoreCache });
-    } else if (action === "back") {
+    } else if (action === "back" || action === "forward") {
       markAgentNavigation(selected.tabId, {
         action,
         requestedUrl: null,
         sessionId: agentSessionId
       });
-      assertPhysicalMutationAdmission(`chrome.tabs.goBack:tab=${selected.tabId}`);
-      await chrome.tabs.goBack(selected.tabId);
       readbackExpectation = {
-        description: `tab url to change after chrome.tabs.goBack from ${JSON.stringify(before.url)}`,
+        description: `tab url to change after chrome.tabs.${tabsNavigationMethod(action)} from ${JSON.stringify(before.url)}`,
         matches: (state) => state.url !== before.url
       };
-    } else if (action === "forward") {
-      markAgentNavigation(selected.tabId, {
-        action,
-        requestedUrl: null,
-        sessionId: agentSessionId
-      });
-      assertPhysicalMutationAdmission(`chrome.tabs.goForward:tab=${selected.tabId}`);
-      await chrome.tabs.goForward(selected.tabId);
-      readbackExpectation = {
-        description: `tab url to change after chrome.tabs.goForward from ${JSON.stringify(before.url)}`,
-        matches: (state) => state.url !== before.url
-      };
+      assertPhysicalMutationAdmission(`chrome.tabs.${tabsNavigationMethod(action)}:tab=${selected.tabId}`);
+      try {
+        if (action === "back") {
+          await chrome.tabs.goBack(selected.tabId);
+        } else {
+          await chrome.tabs.goForward(selected.tabId);
+        }
+      } catch (error) {
+        // #330: Chrome's goBack/goForward skip history entries that got no user
+        // activation and fail with "Cannot find a … page in history.". Only that
+        // refusal falls back to the debugger history lane; any other failure
+        // stays a loud navigation error via the outer catch.
+        if (!isNoAdjacentHistoryEntryError(error)) {
+          throw error;
+        }
+        needsHistoryFallback = true;
+      }
     }
   } catch (error) {
     mainFrameError.dispose();
@@ -7136,6 +7199,14 @@ async function handleNavigateTab(params) {
       target_candidate_count: selected.targetCandidateCount,
       target_selection_reason: selected.selectionReason
     };
+  }
+  if (needsHistoryFallback) {
+    try {
+      await navigateToAdjacentHistoryEntry(selected.tabId, action);
+    } catch (error) {
+      mainFrameError.dispose();
+      throw error;
+    }
   }
   let after;
   try {

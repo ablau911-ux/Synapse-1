@@ -347,23 +347,7 @@ fn fail_if_minimized_target_needs_window_capture(_hwnd: i64) -> Result<(), Error
 /// `no_text`. Refused with the same code as the whole-window minimized check.
 #[cfg(windows)]
 fn fail_if_element_window_minimized(element_id: &synapse_core::ElementId) -> Result<(), ErrorData> {
-    let element_hwnd = element_id
-        .parts()
-        .map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("read_text element_id: {error}"),
-            )
-        })?
-        .hwnd;
-    let window = synapse_a11y::top_level_root_hwnd(element_hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::A11Y_ELEMENT_STALE,
-            format!(
-                "read_text element_id {element_id} names hwnd {element_hwnd:#x}, which is not a live window: {error}"
-            ),
-        )
-    })?;
+    let window = crate::m1::element_root_window("read_text", "element_id", element_id)?;
     if synapse_a11y::is_window_minimized(window).map_err(|error| {
         mcp_error(
             error.code(),

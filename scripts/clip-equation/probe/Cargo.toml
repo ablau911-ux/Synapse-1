@@ -47,6 +47,8 @@ features = [
     "Security_Cryptography",
     "Storage_Streams",
     "Win32_Foundation",
+    # The product's clip folder check compares file names as Windows does.
+    "Win32_Globalization",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dwm",

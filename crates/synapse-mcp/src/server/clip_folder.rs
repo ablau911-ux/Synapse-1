@@ -87,24 +87,64 @@ pub(super) fn clips_root() -> PathBuf {
         .join("clips")
 }
 
-/// `path` in one form for comparing paths, also paths that do not exist
-/// yet: absolute with `.` and `..` resolved, its deepest existing ancestor
-/// canonicalised (links, short names, the letter case on disk) with the rest
-/// appended, all in lower case (Windows compares names without case).
-fn comparable_path(path: &Path) -> Result<PathBuf, String> {
+/// `path` as the file system names it, also a path that does not exist yet:
+/// absolute with `.` and `..` resolved, its deepest existing ancestor
+/// canonicalised (links, short names, the names on disk) with the rest
+/// appended as written. An existing ancestor that cannot be read or
+/// canonicalised (a dangling link, a link to itself, no access) is an error
+/// naming it, never skipped: what it points to is unknown.
+fn resolved_path(path: &Path) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(path)
         .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
-    let resolved = absolute
-        .ancestors()
-        .find_map(|ancestor| {
-            let canonical = std::fs::canonicalize(ancestor).ok()?;
-            let rest = absolute.strip_prefix(ancestor).ok()?;
-            Some(canonical.join(rest))
-        })
-        .unwrap_or(absolute);
-    Ok(PathBuf::from(
-        resolved.as_os_str().to_string_lossy().to_lowercase(),
-    ))
+    for ancestor in absolute.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not read {}: {error}", ancestor.display())),
+            Ok(_) => {
+                let canonical = std::fs::canonicalize(ancestor).map_err(|error| {
+                    format!("could not resolve {}: {error}", ancestor.display())
+                })?;
+                let rest = absolute.strip_prefix(ancestor).map_err(|error| {
+                    format!(
+                        "{} is not below {}: {error}",
+                        absolute.display(),
+                        ancestor.display()
+                    )
+                })?;
+                return Ok(canonical.join(rest));
+            }
+        }
+    }
+    Ok(absolute)
+}
+
+/// True when the resolved `inner` is `outer` or lies below it: name by name,
+/// each pair compared as the file system compares names (`same_name`).
+fn is_within(inner: &Path, outer: &Path) -> bool {
+    let mut inner = inner.components();
+    outer.components().all(|name| {
+        inner
+            .next()
+            .is_some_and(|other| same_name(name.as_os_str(), other.as_os_str()))
+    })
+}
+
+/// Windows compares file names ordinally without case, by its own upper-case
+/// table (`CompareStringOrdinal`); a Unicode lower-casing would merge names it
+/// keeps apart, such as `İ` and `i̇`.
+#[cfg(windows)]
+fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+    let a: Vec<u16> = a.encode_wide().collect();
+    let b: Vec<u16> = b.encode_wide().collect();
+    // SAFETY: both slices are live UTF-16 buffers for the whole call.
+    unsafe { CompareStringOrdinal(&a, &b, true) == CSTR_EQUAL }
+}
+
+#[cfg(not(windows))]
+fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    a == b
 }
 
 /// The file of video part `part`: `video/part-NNNN.ivf`.
@@ -968,10 +1008,22 @@ impl ClipRegistry {
     /// registry: a start that fails removes its clip folder with everything
     /// in it. Refused however the folder is written (another letter case,
     /// `.` or `..`, a relative path, a link or short name in the part that
-    /// exists).
+    /// exists); two names are the same only when Windows says so. A path
+    /// with an existing part that cannot be resolved is refused, since it
+    /// can come to hold them.
     pub(super) fn check_clip_folder(folder: &Path) -> Result<(), String> {
         let registry = Self::path();
-        if comparable_path(&registry)?.starts_with(comparable_path(folder)?) {
+        let unknown = |reason: String| {
+            format!(
+                "{reason}; so it is not known whether {} is, holds or can come to hold the default clips folder {} and its registry",
+                folder.display(),
+                clips_root().display()
+            )
+        };
+        if is_within(
+            &resolved_path(&registry).map_err(unknown)?,
+            &resolved_path(folder).map_err(unknown)?,
+        ) {
             return Err(format!(
                 "{} is or holds the default clips folder {} and its registry; a failed start removes its clip folder with everything in it",
                 folder.display(),

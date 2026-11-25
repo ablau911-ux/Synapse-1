@@ -964,6 +964,67 @@ function clipFolderNeverHoldsRegistry() {
 }
 
 /**
+ * Two paths are the same folder only when the file system says so. Windows keeps `İ` (U+0130) and
+ * `i̇` (U+0069 U+0307) apart (both folders are created side by side); lower-casing them in Unicode
+ * makes them equal. With LOCALAPPDATA = <bench>\i̇, the clips folder is refused, while <bench>\İ and a
+ * clips folder below it are accepted.
+ */
+function clipFolderNamesWindowsKeepsApart() {
+  const bench = path.join(OUT, 'clip-folder-names');
+  if (fs.existsSync(bench)) return verdict([`output folder exists: ${bench}`]);
+  const appData = path.join(bench, 'i̇');
+  const other = path.join(bench, 'İ');
+  fs.mkdirSync(appData, { recursive: true });
+  fs.mkdirSync(other);
+  const problems = [];
+  if (fs.readdirSync(bench).length !== 2) problems.push(`the file system merged ${appData} and ${other}`);
+  const cases = [
+    ['the clips folder', path.join(appData, 'synapse', 'clips'), false],
+    ['the folder named U+0130', other, true],
+    ['a clips folder below the folder named U+0130', path.join(other, 'synapse', 'clips'), true],
+  ];
+  for (const [name, folder, accepted] of cases) {
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=check_folder', `folder=${folder}`], { cwd: bench, encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (got.ok === undefined) problems.push(`${name}: probe: ${String(got.error).replace(/\s+/g, ' ').slice(0, 160)}`);
+    else if (got.ok !== accepted) problems.push(`${name} (${folder}) was ${got.ok ? 'accepted' : `refused: ${got.error}`}`);
+  }
+  return verdict(problems, `with LOCALAPPDATA = <bench>\\i̇ the clips folder is refused; <bench>\\İ and a clips folder below it are accepted`);
+}
+
+/**
+ * A clip folder never can come to hold the clips folder or the registry: when an existing part of its
+ * path cannot be resolved, the check refuses it and names that part, never guesses. <bench>\link is a
+ * dangling junction to <appdata>\synapse (not made yet: once it is, the link holds the registry);
+ * <bench>\loop is a junction to itself. The link, a folder below it and a folder below the loop are
+ * refused naming the junction; a folder elsewhere is accepted.
+ */
+function unresolvableClipFolderRefused() {
+  const bench = path.join(OUT, 'clip-folder-unresolved');
+  if (fs.existsSync(bench)) return verdict([`output folder exists: ${bench}`]);
+  const appData = path.join(bench, 'appdata');
+  fs.mkdirSync(appData, { recursive: true });
+  const link = path.join(bench, 'link');
+  fs.symlinkSync(path.join(appData, 'synapse'), link, 'junction');
+  const loop = path.join(bench, 'loop');
+  fs.symlinkSync(loop, loop, 'junction');
+  const cases = [
+    ['a dangling junction to the synapse folder', link, link],
+    ['a folder below the dangling junction', path.join(link, 'clips'), link],
+    ['a folder below a junction to itself', path.join(loop, 'clip'), loop],
+    ['a folder elsewhere', path.join(bench, 'elsewhere', 'clip'), null],
+  ];
+  const problems = [];
+  for (const [name, folder, named] of cases) {
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=check_folder', `folder=${folder}`], { cwd: bench, encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (got.ok === undefined) problems.push(`${name}: probe: ${String(got.error).replace(/\s+/g, ' ').slice(0, 160)}`);
+    else if (got.ok !== (named === null)) problems.push(`${name} (${folder}) was ${got.ok ? 'accepted' : `refused: ${got.error}`}`);
+    else if (named !== null && !String(got.error).includes(named)) problems.push(`${name}: the error does not name ${named}: ${got.error}`);
+  }
+  if (fs.existsSync(path.join(appData, 'synapse'))) problems.push('the check created the synapse folder');
+  return verdict(problems, 'the dangling junction, a folder below it and a folder below a junction to itself are refused naming the junction; a folder elsewhere is accepted');
+}
+
+/**
  * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
  * and recovery at the next start does not visit it. A recovered killed recording needs none, and
  * neither does the ready clip on a second recovery.
@@ -1086,6 +1147,8 @@ const table = {
   'recovery at start reports an entry of the default folder it cannot read': unreadableEntryReported,
   'a failed start leaves no registry entry and never deletes the registry or its lock file': failedStartKeepsRegistry,
   'a clip folder never is or holds the clips folder or the registry': clipFolderNeverHoldsRegistry,
+  'two folder names Windows keeps apart are never the same clip folder': clipFolderNamesWindowsKeepsApart,
+  'a clip folder whose existing part cannot be resolved is refused': unresolvableClipFolderRefused,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,
 };

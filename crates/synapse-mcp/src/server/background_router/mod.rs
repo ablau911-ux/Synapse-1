@@ -9478,6 +9478,7 @@ fn target_act_native_element_target(
         &format!("target_act verb={verb}"),
         "element_id",
         element_id,
+        error_codes::ACTION_TARGET_INVALID,
     )?;
     Ok((
         element_hwnd,

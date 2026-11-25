@@ -558,6 +558,7 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
                 "act_click",
                 "target.element_id",
                 &element.element_id,
+                error_codes::ACTION_TARGET_INVALID,
             )?;
             if let Some(expected) = verify_target_window_hwnd {
                 let expected_root = verified_top_level_hwnd(expected).map_err(|detail| {
@@ -616,6 +617,7 @@ pub(crate) fn click_target_foreground_guard_hwnds(
                 "act_click",
                 "target.element_id",
                 &element.element_id,
+                error_codes::ACTION_TARGET_INVALID,
             )?;
             Ok(Some((element_hwnd, root_hwnd)))
         }

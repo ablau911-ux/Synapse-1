@@ -667,17 +667,19 @@ impl SynapseService {
         ) {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
         }
-        let foreground_guard = match act_set_value_target_foreground_guard(
-            "act_set_value",
-            &params.element_id,
-        ) {
-            Ok(guard) => guard,
-            Err(error) => {
-                let result: Result<ActSetValueResponse, ErrorData> = Err(error);
-                self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
-                return result.map(Json);
-            }
-        };
+        let foreground_guard =
+            match act_set_value_target_foreground_guard("act_set_value", &params.element_id) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let result: Result<ActSetValueResponse, ErrorData> = Err(error);
+                    self.audit_action_result_for_request(
+                        "act_set_value",
+                        &result,
+                        &request_context,
+                    )?;
+                    return result.map(Json);
+                }
+            };
         let foreground_before = match self.current_audit_foreground() {
             Ok(foreground) => foreground,
             Err(error) => {
@@ -7113,7 +7115,12 @@ fn act_set_value_target_foreground_guard(
             ),
         )
     })?.hwnd;
-    let root_hwnd = crate::m1::element_root_window(tool, "element_id", element_id)?;
+    let root_hwnd = crate::m1::element_root_window(
+        tool,
+        "element_id",
+        element_id,
+        error_codes::ACTION_TARGET_INVALID,
+    )?;
     Ok(BackgroundTargetForegroundGuard {
         element_hwnd: hwnd,
         root_hwnd,
@@ -7144,8 +7151,12 @@ fn set_field_text_locator_window_hwnd(
                 ),
             )
         })?;
-        let window_hwnd =
-            crate::m1::element_root_window("act_set_field_text", "element_id", element_id)?;
+        let window_hwnd = crate::m1::element_root_window(
+            "act_set_field_text",
+            "element_id",
+            element_id,
+            error_codes::ACTION_TARGET_INVALID,
+        )?;
         return crate::m1::validate_window_hwnd_shape("act_set_field_text", window_hwnd);
     }
     Err(mcp_error(
@@ -7319,8 +7330,12 @@ fn act_scroll_target_foreground_guard(
             )
         })?
         .hwnd;
-    let root_hwnd =
-        crate::m1::element_root_window("act_scroll", "target.element_id", &target.element_id)?;
+    let root_hwnd = crate::m1::element_root_window(
+        "act_scroll",
+        "target.element_id",
+        &target.element_id,
+        error_codes::ACTION_TARGET_INVALID,
+    )?;
     Ok(BackgroundTargetForegroundGuard {
         element_hwnd: hwnd,
         root_hwnd,

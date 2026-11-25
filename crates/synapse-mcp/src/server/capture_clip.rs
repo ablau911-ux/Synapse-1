@@ -86,6 +86,16 @@ impl RecordingControl {
         self.end_ms.store(END_SEALED, Ordering::Relaxed);
     }
 
+    /// The error conversion of a failure path: it seals the end first, then
+    /// builds the error with `convert`, so nothing runs between the failure
+    /// and the seal.
+    fn sealing<E>(&self, convert: impl FnOnce(E) -> ErrorData) -> impl FnOnce(E) -> ErrorData {
+        move |error| {
+            self.seal();
+            convert(error)
+        }
+    }
+
     /// A stop call: the end is sealed before the recorder is told to stop,
     /// so an extend that comes after the stop call is refused, never
     /// accepted for a recording that is ending.
@@ -965,42 +975,33 @@ mod live {
         /// observer: started last, so a failure here leaves nothing running.
         /// The first frame and instant zero follow (`write_instant_zero`).
         /// The clip folder exists: `create_clip_folder` made it. A failure
-        /// seals the end in `failed`, while everything made so far is still
-        /// held, so no `record_extend` is accepted once the start failed.
+        /// seals the end before its error is built (`RecordingControl::
+        /// sealing`), while everything made so far is still held, so no
+        /// `record_extend` is accepted once the start failed.
         fn start(plan: &'a ClipPlan, control: &RecordingControl) -> Result<Self, ErrorData> {
-            let failed = |error: ErrorData| {
-                control.seal();
-                error
-            };
             let times = RecordingTimes::begin();
             // Taken before `clip.json` exists, so recovery never sees this
             // clip `recording` without a live recorder.
-            let recorder_lock = RecorderLock::acquire(&plan.folder)
-                .map_err(internal_error)
-                .map_err(failed)?;
+            let recorder_lock =
+                RecorderLock::acquire(&plan.folder).map_err(control.sealing(internal_error))?;
             // Registered before `clip.json` exists, so recovery at start
             // visits every clip that can say `recording`.
             ClipRegistry::add(&plan.clip_id, &plan.folder)
-                .map_err(internal_error)
-                .map_err(failed)?;
+                .map_err(control.sealing(internal_error))?;
             initial_clip_json(plan)
                 .create(&plan.folder)
-                .map_err(internal_error)
-                .map_err(failed)?;
-            let stream = ClipStream::create(&plan.folder)
-                .map_err(internal_error)
-                .map_err(failed)?;
-            let disk = DiskGuard::new(&plan.folder)
-                .map_err(internal_error)
-                .map_err(failed)?;
-            let observer = ClipObserver::start(plan.target, instant_hns())
-                .map_err(|error| {
+                .map_err(control.sealing(internal_error))?;
+            let stream =
+                ClipStream::create(&plan.folder).map_err(control.sealing(internal_error))?;
+            let disk = DiskGuard::new(&plan.folder).map_err(control.sealing(internal_error))?;
+            let observer = ClipObserver::start(plan.target, instant_hns()).map_err(
+                control.sealing(|error: synapse_capture::CaptureError| {
                     mcp_error(
                         error.code(),
                         format!("screenshot operation=record: {error}"),
                     )
-                })
-                .map_err(failed)?;
+                }),
+            )?;
             Ok(Self {
                 plan,
                 observer,

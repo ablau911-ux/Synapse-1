@@ -992,6 +992,37 @@ function clipFolderNamesWindowsKeepsApart() {
 }
 
 /**
+ * Two existing folders are the same only when the file system says so, also in a folder with NTFS
+ * per-directory case sensitivity: there <bench>\a and <bench>\A are two folders. With
+ * LOCALAPPDATA = <bench>\a, the clips folder is refused, while <bench>\A and a clips folder below it
+ * are accepted.
+ */
+function clipFolderCaseSensitiveNamesApart() {
+  const bench = path.join(OUT, 'clip-folder-case');
+  if (fs.existsSync(bench)) return verdict([`output folder exists: ${bench}`]);
+  fs.mkdirSync(bench, { recursive: true });
+  const flag = spawnSync('fsutil', ['file', 'setCaseSensitiveInfo', bench, 'enable'], { encoding: 'utf8' });
+  if (flag.error || flag.status !== 0) return verdict([`could not make ${bench} case sensitive: ${flag.error?.message || flag.stdout.trim() || flag.stderr.trim()}`]);
+  const appData = path.join(bench, 'a');
+  const other = path.join(bench, 'A');
+  fs.mkdirSync(appData);
+  fs.mkdirSync(other);
+  const problems = [];
+  if (fs.readdirSync(bench).length !== 2) problems.push(`the file system merged ${appData} and ${other}`);
+  const cases = [
+    ['the clips folder', path.join(appData, 'synapse', 'clips'), false],
+    ['the folder A beside it', other, true],
+    ['a clips folder below the folder A', path.join(other, 'synapse', 'clips'), true],
+  ];
+  for (const [name, folder, accepted] of cases) {
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=check_folder', `folder=${folder}`], { cwd: bench, encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (got.ok === undefined) problems.push(`${name}: probe: ${String(got.error).replace(/\s+/g, ' ').slice(0, 160)}`);
+    else if (got.ok !== accepted) problems.push(`${name} (${folder}) was ${got.ok ? 'accepted' : `refused: ${got.error}`}`);
+  }
+  return verdict(problems, 'in a case-sensitive folder with LOCALAPPDATA = <bench>\\a the clips folder is refused; <bench>\\A and a clips folder below it are accepted');
+}
+
+/**
  * A clip folder never can come to hold the clips folder or the registry: when an existing part of its
  * path cannot be resolved, the check refuses it and names that part, never guesses. <bench>\link is a
  * dangling junction to <appdata>\synapse (not made yet: once it is, the link holds the registry);
@@ -1148,6 +1179,7 @@ const table = {
   'a failed start leaves no registry entry and never deletes the registry or its lock file': failedStartKeepsRegistry,
   'a clip folder never is or holds the clips folder or the registry': clipFolderNeverHoldsRegistry,
   'two folder names Windows keeps apart are never the same clip folder': clipFolderNamesWindowsKeepsApart,
+  'two folders a case-sensitive folder keeps apart are never the same clip folder': clipFolderCaseSensitiveNamesApart,
   'a clip folder whose existing part cannot be resolved is refused': unresolvableClipFolderRefused,
   'a late picture comes back in time': latePictureInTime,
   'the fetched picture is the recorded one': fetchedPictureIsRecorded,

@@ -65,6 +65,8 @@ Feature: AV1 window-recording probe (docs/research/window-recording/probe-plan.m
     # Equation: bench clips folder holding a registry that lists the failed start's clip, and the registry's lock file; the product drops that entry (clip-probe exp-av1-registry action=remove): ok; the registry file holds [] and the lock file stays. Same with a second clip listed: ok; the registry lists exactly the second clip and the lock file stays | Known: true
   Scenario: a clip folder never is or holds the clips folder or the registry
     # Equation: under the bench's own LOCALAPPDATA with no synapse folder, the product's clip folder check (clip-probe exp-av1-registry action=check_folder): the clips folder, it in other letter case with a `..` and a trailing separator, the clips folder as a path relative to the working folder, the synapse folder above it, and the registry path are each refused (ok = false, the error says it is or holds the clips folder); <clips>\clip-new and <bench>\elsewhere\clip are accepted (ok) | Known: true
+  Scenario: two folder names Windows keeps apart are never the same clip folder
+    # Equation: folders <bench>\i̇ (U+0069 U+0307) and <bench>\İ (U+0130) created side by side (the file system keeps them apart); LOCALAPPDATA = <bench>\i̇; the product's clip folder check (clip-probe exp-av1-registry action=check_folder): <bench>\i̇\synapse\clips refused (ok = false); <bench>\İ and <bench>\İ\synapse\clips accepted (ok) | Known: true
   Scenario: a late picture comes back in time
     # Equation: product decoder (clip-probe exp-av1-fetch) on the recorded real-page clip, the enc line with the largest index-in-part: total_ms < 500, pictures_decoded = index+1, kind = video | Known: true
   Scenario: the fetched picture is the recorded one

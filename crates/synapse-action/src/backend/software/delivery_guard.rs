@@ -123,7 +123,20 @@ fn current_target() -> Option<InputDeliveryTarget> {
 
 /// Verifies a keyboard/text press batch may be delivered right now.
 pub(super) fn ensure_keyboard_press(detail: &str) -> Result<(), ActionError> {
-    let Some(target) = current_target() else {
+    ensure_keyboard_target(current_target().as_ref(), detail)
+}
+
+/// The keyboard delivery rule: `target` must be known and its root window
+/// must be the OS foreground right now. Called by every key batch (with the
+/// scope's target) and, through `ActionHandle::ensure_keyboard_target_is_foreground`,
+/// before a tool reads a pre-delivery surface or runs an earlier step of a
+/// composite; outside a backend scope a refusal reports that nothing was
+/// delivered.
+pub fn ensure_keyboard_target(
+    target: Option<&InputDeliveryTarget>,
+    detail: &str,
+) -> Result<(), ActionError> {
+    let Some(target) = target else {
         let foreground = describe_foreground();
         tracing::warn!(
             code = error_codes::ACTION_INPUT_TARGET_REQUIRED,
@@ -138,7 +151,7 @@ pub(super) fn ensure_keyboard_press(detail: &str) -> Result<(), ActionError> {
             ),
         });
     };
-    ensure_foreground_is_target(&target, detail)
+    ensure_foreground_is_target(target, detail)
 }
 
 /// Verifies a pointer batch may be delivered right now.

@@ -4,7 +4,7 @@ use synapse_core::{Action, ComboInput, Point};
 
 use crate::{ActionBackend, ActionError, EmitState, recovery};
 
-mod delivery_guard;
+pub(crate) mod delivery_guard;
 mod input;
 mod keyboard;
 mod mouse;

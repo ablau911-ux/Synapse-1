@@ -6981,6 +6981,142 @@ function mainFrameErrorPageBridgeError(contextUrl, networkError, errorUrl) {
   );
 }
 
+// #330: Chrome's goBack/goForward fail with "Cannot find a … page in history."
+// when the adjacent entry got no user activation; recognize exactly that refusal
+// so only it falls back to the debugger history lane.
+function isNoAdjacentHistoryEntryError(error) {
+  return errorMessage(error).includes("page in history");
+}
+
+// #330: run a back/forward over the tab's real session history. Tries Chrome's
+// own chrome.tabs.goBack/goForward first (it honors Chrome's skippable-entry
+// rules). The extension debugger is an aid, not a precondition:
+//   - When it attaches, confirm the move by a change in the history currentIndex
+//     (Page.getNavigationHistory), and when Chrome refuses a skippable
+//     (no-user-activation) entry with "Cannot find a … page in history.", reach
+//     it via Page.navigateToHistoryEntry. The index confirmation works even when
+//     the destination shares the current URL (e.g. the same page reached twice
+//     via chrome.tabs.update, which either path can land on) and proves the
+//     navigation committed. Returns { arrivalConfirmed: true }.
+//   - When it cannot attach (DevTools already attached, a restricted page, any
+//     refusal), run Chrome's own call and let the caller use the pre-f705efca
+//     URL-change readback (arrivalConfirmed: false). If Chrome then refuses a
+//     skippable entry, that entry cannot be reached without the debugger, so
+//     report it plainly with the attach error — no silent success, no hang.
+// Only the attach itself is treated as "cannot attach"; a later failure in the
+// navigation is not. A session this command attached is detached on every path;
+// a borrowed persistent session is left.
+async function navigateTabHistory(tabId, action, waitTimeoutMs) {
+  const direction = action === "back" ? -1 : 1;
+  const method = tabsNavigationMethod(action);
+  let attachment = null;
+  let attachError = null;
+  try {
+    attachment = await attachDebuggerForCommand(tabId);
+  } catch (error) {
+    attachError = error;
+  }
+  if (!attachment) {
+    // Debugger unavailable: Chrome's own call with the caller's URL-change
+    // readback (pre-f705efca behaviour). A skippable entry cannot be reached
+    // here, so a refusal is reported with the attach error, not swallowed.
+    assertPhysicalMutationAdmission(`chrome.tabs.${method}:tab=${tabId}`);
+    try {
+      if (action === "back") {
+        await chrome.tabs.goBack(tabId);
+      } else {
+        await chrome.tabs.goForward(tabId);
+      }
+    } catch (error) {
+      if (isNoAdjacentHistoryEntryError(error)) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `browser_nav ${action}: Chrome skipped the adjacent history entry because it got no user activation, and the entry cannot be reached because the extension debugger could not attach to the tab: ${errorMessage(attachError)}`
+        );
+      }
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `chrome.tabs.${method}(${tabId}) failed: ${errorMessage(error)}`
+      );
+    }
+    return { arrivalConfirmed: false };
+  }
+  try {
+    const history = await sendDebuggerCommand(attachment.debuggee, "Page.getNavigationHistory", {});
+    const entries = Array.isArray(history?.entries) ? history.entries : [];
+    const beforeIndex = Number.isInteger(history?.currentIndex) ? history.currentIndex : -1;
+    const targetIndex = beforeIndex + direction;
+    if (targetIndex < 0 || targetIndex >= entries.length) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        action === "back"
+          ? `browser_nav back: the tab is at the oldest entry in its session history (current index ${beforeIndex} of ${entries.length} entries); there is no earlier entry to go back to`
+          : `browser_nav forward: the tab is at the newest entry in its session history (current index ${beforeIndex} of ${entries.length} entries); there is no later entry to go forward to`
+      );
+    }
+    assertPhysicalMutationAdmission(`chrome.tabs.${method}:tab=${tabId}`);
+    try {
+      if (action === "back") {
+        await chrome.tabs.goBack(tabId);
+      } else {
+        await chrome.tabs.goForward(tabId);
+      }
+    } catch (error) {
+      if (!isNoAdjacentHistoryEntryError(error)) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `chrome.tabs.${method}(${tabId}) failed: ${errorMessage(error)}`
+        );
+      }
+      const targetEntry = entries[targetIndex];
+      if (!Number.isInteger(targetEntry?.id)) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `browser_nav ${action}: the target history entry (index ${targetIndex}) has no id to navigate to`
+        );
+      }
+      await sendDebuggerCommand(attachment.debuggee, "Page.navigateToHistoryEntry", {
+        entryId: targetEntry.id
+      });
+    }
+    await waitForHistoryIndexMove(attachment.debuggee, beforeIndex, waitTimeoutMs);
+    return { arrivalConfirmed: true };
+  } finally {
+    if (attachment.shouldDetach) {
+      try {
+        await chrome.debugger.detach(attachment.debuggee);
+      } catch (detachError) {
+        console.warn(
+          `Synapse chrome.debugger detach failed for browser_nav ${action} history nav tab ${tabId}: ${errorMessage(detachError)}`
+        );
+      }
+    }
+  }
+}
+
+// #330 follow-up: poll the tab's session history until its currentIndex leaves
+// the pre-navigation index, confirming the back/forward committed by history
+// position instead of a URL change (which never comes when the destination entry
+// shares the current URL). Any move off beforeIndex counts: Chrome's own
+// goBack/goForward may skip no-activation entries and land more than one step
+// away, while the debugger fallback lands on the exact adjacent entry.
+async function waitForHistoryIndexMove(debuggee, beforeIndex, waitTimeoutMs) {
+  const started = Date.now();
+  let lastIndex = beforeIndex;
+  while (Date.now() - started <= waitTimeoutMs) {
+    const history = await sendDebuggerCommand(debuggee, "Page.getNavigationHistory", {});
+    lastIndex = Number.isInteger(history?.currentIndex) ? history.currentIndex : lastIndex;
+    if (lastIndex !== beforeIndex) {
+      return lastIndex;
+    }
+    await sleep(100);
+  }
+  throw bridgeError(
+    ERROR_EXTENSION_TIMEOUT,
+    `history navigation did not commit within ${waitTimeoutMs} ms; history currentIndex stayed at ${beforeIndex}`
+  );
+}
+
 async function handleNavigateTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
@@ -6990,6 +7126,10 @@ async function handleNavigateTab(params) {
   const ignoreCache = Boolean(params.ignoreCache);
   const before = await tabPageState(selected.tabId, selected.target);
   let readbackExpectation = null;
+  // #330: back/forward run through navigateTabHistory after the admission/try
+  // block below (it owns the debugger attach, Chrome's own goBack/goForward, the
+  // no-user-activation fallback, and the history-index arrival check).
+  let needsHistoryNav = false;
   // #1344: a navigate to a URL that triggers a Chrome download leaves the tab on
   // its current URL, so the url-change readback would (wrongly) time out. Snapshot
   // the download-event sequence before the navigate so we can detect a download
@@ -7023,30 +7163,16 @@ async function handleNavigateTab(params) {
       });
       assertPhysicalMutationAdmission(`chrome.tabs.reload:navigate:tab=${selected.tabId}`);
       await chrome.tabs.reload(selected.tabId, { bypassCache: ignoreCache });
-    } else if (action === "back") {
+    } else if (action === "back" || action === "forward") {
       markAgentNavigation(selected.tabId, {
         action,
         requestedUrl: null,
         sessionId: agentSessionId
       });
-      assertPhysicalMutationAdmission(`chrome.tabs.goBack:tab=${selected.tabId}`);
-      await chrome.tabs.goBack(selected.tabId);
-      readbackExpectation = {
-        description: `tab url to change after chrome.tabs.goBack from ${JSON.stringify(before.url)}`,
-        matches: (state) => state.url !== before.url
-      };
-    } else if (action === "forward") {
-      markAgentNavigation(selected.tabId, {
-        action,
-        requestedUrl: null,
-        sessionId: agentSessionId
-      });
-      assertPhysicalMutationAdmission(`chrome.tabs.goForward:tab=${selected.tabId}`);
-      await chrome.tabs.goForward(selected.tabId);
-      readbackExpectation = {
-        description: `tab url to change after chrome.tabs.goForward from ${JSON.stringify(before.url)}`,
-        matches: (state) => state.url !== before.url
-      };
+      // #330: completed after this block by navigateTabHistory. readbackExpectation
+      // stays null so the shared readback only waits for load-complete — arrival is
+      // confirmed there by the history index, which works for same-URL entries.
+      needsHistoryNav = true;
     }
   } catch (error) {
     mainFrameError.dispose();
@@ -7136,6 +7262,25 @@ async function handleNavigateTab(params) {
       target_candidate_count: selected.targetCandidateCount,
       target_selection_reason: selected.selectionReason
     };
+  }
+  if (needsHistoryNav) {
+    let historyNav;
+    try {
+      historyNav = await navigateTabHistory(selected.tabId, action, waitTimeoutMs);
+    } catch (error) {
+      mainFrameError.dispose();
+      throw error;
+    }
+    if (!historyNav.arrivalConfirmed) {
+      // #330 follow-up 2: the debugger could not attach, so Chrome's own call ran
+      // without the history-index confirmation. Fall back to the pre-f705efca
+      // URL-change readback (it cannot confirm a same-URL destination, matching
+      // the behaviour before the debugger lane existed).
+      readbackExpectation = {
+        description: `tab url to change after chrome.tabs.${tabsNavigationMethod(action)} from ${JSON.stringify(before.url)}`,
+        matches: (state) => state.url !== before.url
+      };
+    }
   }
   let after;
   try {

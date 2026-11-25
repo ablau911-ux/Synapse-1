@@ -5125,15 +5125,18 @@ pub(crate) fn validate_element_id_hwnd_shape(
     validate_hwnd_shape(tool, field, parts.hwnd).map(|_| ())
 }
 
-/// Refuses an input element id (`element_id`, `subtree_root`) whose top-level
-/// window is not the call's target window, so an explicit `window_hwnd` or a
-/// session target is never silently swapped for the element's own window.
-pub(crate) fn ensure_element_in_target_window(
+/// Reads the top-level root window of an input element id's hwnd. An hwnd
+/// that is not a live window gets `dead_window_code`, with the hwnd as
+/// written and nothing else; any other failure keeps its own code and text.
+/// Perception tools pass `A11Y_ELEMENT_STALE`; action tools pass
+/// `ACTION_TARGET_INVALID`, the code upstream gives there (owner decision,
+/// #318).
+pub(crate) fn element_root_window(
     tool: &str,
     field: &'static str,
     element_id: &ElementId,
-    target_hwnd: i64,
-) -> Result<(), ErrorData> {
+    dead_window_code: &'static str,
+) -> Result<i64, ErrorData> {
     let element_hwnd = element_id
         .parts()
         .map_err(|error| {
@@ -5143,12 +5146,33 @@ pub(crate) fn ensure_element_in_target_window(
             )
         })?
         .hwnd;
-    let element_root = synapse_a11y::top_level_root_hwnd(element_hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::A11Y_ELEMENT_STALE,
-            format!("{tool} {field} {element_id} names hwnd {element_hwnd:#x}, which is not a live window: {error}"),
-        )
-    })?;
+    synapse_a11y::top_level_root_hwnd(element_hwnd).map_err(|error| {
+        // The window lookup reports an hwnd that is not a live window as
+        // `A11Y_NO_FOREGROUND`; that fragment does not apply here.
+        if error.code() == error_codes::A11Y_NO_FOREGROUND {
+            mcp_error(
+                dead_window_code,
+                format!(
+                    "{tool} {field} {element_id} names hwnd {element_hwnd:#x}, which is not a live window"
+                ),
+            )
+        } else {
+            mcp_error(error.code(), format!("{tool} {field} {element_id}: {error}"))
+        }
+    })
+}
+
+/// Refuses an input element id (`element_id`, `subtree_root`) whose top-level
+/// window is not the call's target window, so an explicit `window_hwnd` or a
+/// session target is never silently swapped for the element's own window.
+pub(crate) fn ensure_element_in_target_window(
+    tool: &str,
+    field: &'static str,
+    element_id: &ElementId,
+    target_hwnd: i64,
+) -> Result<(), ErrorData> {
+    let element_root =
+        element_root_window(tool, field, element_id, error_codes::A11Y_ELEMENT_STALE)?;
     validate_live_target_window(&format!("{tool} target window"), target_hwnd)?;
     let target_root = synapse_a11y::top_level_root_hwnd(target_hwnd).map_err(|error| {
         mcp_error(

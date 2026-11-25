@@ -9474,14 +9474,12 @@ fn target_act_native_element_target(
             )
         })?
         .hwnd;
-    let root_hwnd = synapse_a11y::top_level_root_hwnd(element_hwnd).map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!(
-                "target_act verb={verb} element HWND 0x{element_hwnd:x} root readback failed: {error}"
-            ),
-        )
-    })?;
+    let root_hwnd = crate::m1::element_root_window(
+        &format!("target_act verb={verb}"),
+        "element_id",
+        element_id,
+        error_codes::ACTION_TARGET_INVALID,
+    )?;
     Ok((
         element_hwnd,
         root_hwnd,

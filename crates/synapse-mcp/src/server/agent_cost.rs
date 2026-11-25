@@ -451,6 +451,9 @@ pub struct AgentFleetCost {
     pub spawns_total: usize,
     pub spawns_complete: usize,
     pub spawns_incomplete: usize,
+    /// Usage of the complete spawns only; the `spawns_incomplete` spawns
+    /// have no terminal usage row and are left out of `usage`,
+    /// `total_tokens` and both costs.
     pub usage: BillableUsage,
     pub total_tokens: u64,
     /// Sum of locally-computed cost across all priced spawns, micro-USD.
@@ -514,7 +517,11 @@ pub struct AgentCostResponse {
     pub query_strategy: String,
     /// True when the server supplied the default fleet window.
     pub default_window_applied: bool,
-    /// Honest completeness marker. This is never "partial".
+    /// Honest completeness marker. The scan is never truncated (a scan over
+    /// budget fails instead), so this is `exact` when every spawn found is
+    /// counted, and `partial` when `fleet.spawns_incomplete > 0`: those spawns
+    /// have no terminal usage row, and their usage (including any per-turn
+    /// usage in their transcript) is left out of every total.
     pub completeness: String,
     /// Timestamp-index schema version used for indexed fleet windows.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1363,7 +1370,12 @@ impl SynapseService {
             now_ns: plan.now_ns,
             query_strategy: plan.query_strategy,
             default_window_applied: plan.default_window_applied,
-            completeness: "exact".to_owned(),
+            completeness: if fleet.spawns_incomplete == 0 {
+                "exact"
+            } else {
+                "partial"
+            }
+            .to_owned(),
             transcript_index_version: plan.use_timestamp_index.then_some(COST_TS_INDEX_VERSION),
             scanned_index_rows,
             since_ns: params.since_ns,

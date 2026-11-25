@@ -5180,23 +5180,27 @@ async function handlePageScreenshotBackground(params) {
   let attachment = null;
   let renderWindow = null;
   let renderWindowRestore = null;
+  let screencastStop = null;
   const visibilityBefore = await pageVisibilityState(selected.tabId);
+  const needsRenderPaint = visibilityBefore !== "visible";
   try {
-    // Chrome does not paint hidden pages (inactive tab, or a window covered by
-    // another app), so a direct capture would hang. Move the tab into its own
-    // unfocused window where it becomes the active tab; the occlusion that
-    // remains is handled by the screencast started below.
-    if (visibilityBefore !== "visible") {
+    // A hidden page does not paint, so a direct capture would hang. An inactive
+    // tab has no live render view at all, so move it into its own unfocused
+    // window where it becomes that window's active tab -- but an active tab is
+    // never moved: the only tab of a window is always active, and moving it out
+    // would close the user's window. An active-but-occluded tab keeps its live
+    // view and is captured in place. In both cases the screencast below forces
+    // the compositor to paint while the page is hidden.
+    if (needsRenderPaint && !before.active) {
       renderWindow = await moveTabToRenderWindow(selected.tabId);
     }
     // Attach before measuring: the debugger infobar can shrink the viewport.
     attachment = await attachDebuggerForCommand(selected.tabId);
-    // The render window is unfocused and sits beneath the user's foreground
-    // window, so Chrome's native occlusion tracker keeps the page hidden and it
-    // never paints. A CDP screencast holds a capturer count on the tab, forcing
-    // the compositor to produce frames while occluded so the capture reads real
-    // pixels. Stopped in the finally block; never changes the OS foreground.
-    if (renderWindow) {
+    // Chrome's native occlusion tracker stops a hidden/occluded page from
+    // painting. A CDP screencast holds a capturer count on the tab, forcing the
+    // compositor to produce frames so the capture reads real pixels. Confirmed
+    // stopped in the finally block; never changes the OS foreground.
+    if (needsRenderPaint) {
       await startRenderWindowScreencast(attachment.debuggee);
     }
     setup = await runPageScreenshotSetup(selected.tabId, { ...request, token });
@@ -5287,12 +5291,8 @@ async function handlePageScreenshotBackground(params) {
         console.warn(`Synapse background pageScreenshot cleanup failed for tab ${selected.tabId}: ${errorMessage(error)}`);
       }
     }
-    if (attachment && renderWindow) {
-      try {
-        await sendDebuggerCommand(attachment.debuggee, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
-      } catch (_) {
-        // The capture already read back; releasing the screencast is hygiene.
-      }
+    if (attachment && needsRenderPaint) {
+      screencastStop = await stopRenderWindowScreencast(attachment);
     }
     if (attachment?.shouldDetach) {
       try {
@@ -5310,6 +5310,13 @@ async function handlePageScreenshotBackground(params) {
       ERROR_ATTACH_FAILED,
       `pageScreenshot captured tab ${selected.tabId} but could not return it to window ` +
         `${renderWindow.originWindowId} index ${renderWindow.originIndex}: ${renderWindowRestore.error}`
+    );
+  }
+  if (screencastStop && !screencastStop.ok) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `pageScreenshot captured tab ${selected.tabId} but could not stop its render screencast; ` +
+        `the tab's debugger session may still be forcing it to paint: ${screencastStop.error}`
     );
   }
   const after = await tabPageState(selected.tabId, selected.target);
@@ -5356,6 +5363,7 @@ async function handlePageScreenshotBackground(params) {
     render_window: renderWindow
       ? { ...renderWindow, restore: renderWindowRestore }
       : null,
+    render_screencast_stop: screencastStop,
     readback_backend: "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot(captureBeyondViewport)",
     backend_tier_used: "chrome_debugger_background_capture",
     required_foreground: false,
@@ -5465,6 +5473,35 @@ async function startRenderWindowScreencast(debuggee) {
   }
 }
 
+// Confirms the render screencast is stopped before the screenshot command
+// returns. A leaked screencast keeps a capturer count that forces the user's
+// own tab to keep painting, so swallowing a failed stop is not safe -- and when
+// the debugger attachment is a reused persistent one (shouldDetach=false) the
+// handler would not detach either. Page.stopScreencast is retried once; if it
+// still fails the debugger is detached, which ends the CDP session and with it
+// the screencast. The outcome is returned so the caller can report it, never
+// hide it.
+async function stopRenderWindowScreencast(attachment) {
+  let stopError = null;
+  for (let attemptNo = 0; attemptNo < 2; attemptNo += 1) {
+    try {
+      await sendDebuggerCommand(attachment.debuggee, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
+      return { ok: true, method: attemptNo === 0 ? "stop" : "stop_retry" };
+    } catch (error) {
+      stopError = errorMessage(error);
+    }
+  }
+  try {
+    await chrome.debugger.detach(attachment.debuggee);
+    return { ok: true, method: "detach_fallback", stop_error: stopError };
+  } catch (detachError) {
+    return {
+      ok: false,
+      error: `Page.stopScreencast failed twice (${stopError}) and the detach fallback failed (${errorMessage(detachError)})`
+    };
+  }
+}
+
 // Moves the tab into a new unfocused window so it becomes that window's active
 // tab -- a background tab has no live render view, so this move is required
 // before any capture can read pixels. The window is created once at the first
@@ -5502,6 +5539,9 @@ async function moveTabToRenderWindow(tabId) {
         focused: false,
         state: "normal",
         type: "normal",
+        // Match the tab's profile; moving an incognito tab into a normal window
+        // fails. (incognito defaults to the current profile when omitted.)
+        incognito: tab.incognito,
         left: candidate.left,
         top: candidate.top,
         width: candidate.width,
@@ -5521,8 +5561,17 @@ async function moveTabToRenderWindow(tabId) {
       });
       continue;
     }
+    // The tab has now left its window. Nothing below may throw out of this
+    // function, or the caller would never receive the record and its finally
+    // could not restore the tab. The post-create read is only for recording
+    // placement coordinates, so fall back to the requested bounds if it fails.
     record.windowId = created.id;
-    const placed = await chrome.windows.get(record.windowId);
+    let placed;
+    try {
+      placed = await chrome.windows.get(record.windowId);
+    } catch (_) {
+      placed = { left: candidate.left, top: candidate.top, width: candidate.width, height: candidate.height };
+    }
     record.placements.push({
       side: candidate.side,
       left: placed.left,

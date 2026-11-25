@@ -230,6 +230,15 @@ fn text_region(
                     format!("element_id has no live visible OCR region: {err}"),
                 )
             })?;
+            // With a target window, OCR that window's own frame (#320): the
+            // element bounds are screen pixels, so a screen OCR would read
+            // whatever window covers that area. Convert them to the target
+            // window's client coordinates and reuse the explicit-region path.
+            if let Some(hwnd) = target_hwnd {
+                let client_region = element_screen_rect_to_client_region(hwnd, region)?;
+                let capture_source = target_window_region_capture_source(hwnd, client_region)?;
+                return Ok((client_region, capture_source));
+            }
             return Ok((region, ReadTextCaptureSource::Screen));
         }
         let input = current_input(state, 2)?;
@@ -313,6 +322,32 @@ fn target_window_region_capture_source(
         error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
         "read_text target-window OCR requires Windows window capture",
     ))
+}
+
+/// Moves an element's screen bounds into `hwnd`'s client coordinates, the
+/// space the explicit `region` parameter uses for a target window.
+fn element_screen_rect_to_client_region(hwnd: i64, screen_rect: Rect) -> Result<Rect, ErrorData> {
+    let origin = synapse_capture::screen_to_window(
+        synapse_core::Point {
+            x: screen_rect.x,
+            y: screen_rect.y,
+        },
+        hwnd,
+    )
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "read_text could not convert element screen bounds {screen_rect:?} into client coordinates of hwnd {hwnd:#x}: {error}"
+            ),
+        )
+    })?;
+    Ok(Rect {
+        x: origin.x,
+        y: origin.y,
+        w: screen_rect.w,
+        h: screen_rect.h,
+    })
 }
 
 #[cfg(windows)]

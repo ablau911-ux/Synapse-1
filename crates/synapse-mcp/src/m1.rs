@@ -275,6 +275,18 @@ pub enum FindResultKind {
     Entity,
 }
 
+/// Published `read_text.backend` values: only backends a read can run on.
+/// `crnn` stays a core `OcrBackend` value (profiles parse it), but no CRNN
+/// runtime is wired, so a read with it always fails `OCR_BACKEND_UNAVAILABLE`
+/// and the schema does not offer it.
+fn read_text_backend_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["winrt", "auto"],
+        "default": "auto"
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadTextParams {
@@ -292,6 +304,7 @@ pub struct ReadTextParams {
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
+    #[schemars(schema_with = "read_text_backend_schema")]
     pub backend: OcrBackend,
     #[serde(default)]
     pub lang_hint: Option<String>,

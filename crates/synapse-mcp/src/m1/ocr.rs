@@ -352,7 +352,7 @@ pub fn effective_ocr_backend(backend: OcrBackend) -> Result<OcrBackend, ErrorDat
 fn crnn_unavailable_error() -> ErrorData {
     mcp_error(
         error_codes::OCR_BACKEND_UNAVAILABLE,
-        "CRNN OCR backend is declared in schema but no CRNN runtime/model provider is wired on this host; request backend=winrt or backend=auto",
+        "CRNN OCR backend is not offered by the read_text schema: no CRNN runtime/model provider is wired on this host; request backend=winrt or backend=auto",
     )
 }
 

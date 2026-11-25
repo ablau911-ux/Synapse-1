@@ -1,0 +1,8 @@
+   Compiling ort-sys v2.0.0-rc.12
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+   Compiling ort v2.0.0-rc.12
+   Compiling synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+   Compiling synapse-models v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-models)
+   Compiling synapse-audio v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-audio)
+   Compiling synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+    Finished `release` profile [optimized] target(s) in 7m 30s

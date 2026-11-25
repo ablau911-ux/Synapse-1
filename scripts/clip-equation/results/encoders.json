@@ -1,0 +1,15 @@
+[
+  {"codec": "H.264", "name": "IntelÂ® Quick Sync Video H.264 Encoder MFT", "vendor_id": "VEN_8086", "hardware_url": "AA243E5D-2F73-48c7-97F7-F6FA17651651", "hardware": true, "transform_flags": 4, "clsid": "{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}", "adapter_luid": ""},
+  {"codec": "H.264", "name": "NVIDIA H.264 Encoder MFT", "vendor_id": "VEN_10DE", "hardware_url": "NVIDIA H.264 Encoder MFT", "hardware": true, "transform_flags": 4, "clsid": "{60F44560-5A20-4857-BFEF-D29773CB8040}", "adapter_luid": ""},
+  {"codec": "H.264", "name": "H264 Encoder MFT", "vendor_id": "", "hardware_url": "", "hardware": false, "transform_flags": 1, "clsid": "{6CA50344-051A-4DED-9779-A43305165E35}", "adapter_luid": ""},
+  {"codec": "H.264", "name": "IntelÂ® Quick Sync Video H.264 Encoder MFT", "vendor_id": "VEN_8086", "hardware_url": "AA243E5D-2F73-48c7-97F7-F6FA17651651", "hardware": true, "transform_flags": 4, "clsid": "{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}", "adapter_luid": ""},
+  {"codec": "H.264", "name": "Microsoft AVC DX12 Encoder", "vendor_id": "VEN_1414", "hardware_url": "Microsoft AVC DX12 Encoder", "hardware": true, "transform_flags": 6, "clsid": "", "adapter_luid": ""},
+  {"codec": "HEVC", "name": "NVIDIA HEVC Encoder MFT", "vendor_id": "VEN_10DE", "hardware_url": "NVIDIA HEVC Encoder MFT", "hardware": true, "transform_flags": 4, "clsid": "{966F107C-8EA2-425D-B822-E4A71BEF01D7}", "adapter_luid": ""},
+  {"codec": "HEVC", "name": "IntelÂ® Hardware H265 Encoder MFT", "vendor_id": "VEN_8086", "hardware_url": "AA243E5D-2F73-48c7-97F7-F6FA17651651", "hardware": true, "transform_flags": 4, "clsid": "{BC10864D-2B34-408F-912A-102B1B867B6C}", "adapter_luid": ""},
+  {"codec": "HEVC", "name": "IntelÂ® Hardware H265 Encoder MFT", "vendor_id": "VEN_8086", "hardware_url": "AA243E5D-2F73-48c7-97F7-F6FA17651651", "hardware": true, "transform_flags": 4, "clsid": "{BC10864D-2B34-408F-912A-102B1B867B6C}", "adapter_luid": ""},
+  {"codec": "HEVC", "name": "HEVCVideoExtensionEncoder", "vendor_id": "", "hardware_url": "", "hardware": false, "transform_flags": 1, "clsid": "", "adapter_luid": ""},
+  {"codec": "HEVC", "name": "Microsoft HEVC DX12 Encoder", "vendor_id": "VEN_1414", "hardware_url": "Microsoft HEVC DX12 Encoder", "hardware": true, "transform_flags": 6, "clsid": "", "adapter_luid": ""},
+  {"codec": "AV1", "name": "IntelÂ® Hardware Accelerated AV1 Encoder MFT", "vendor_id": "VEN_8086", "hardware_url": "AA243E5D-2F73-48c7-97F7-F6FA17651651", "hardware": true, "transform_flags": 4, "clsid": "{62C053CE-5357-4794-8C5A-FBEFFEFFB82D}", "adapter_luid": ""},
+  {"codec": "AV1", "name": "NVIDIA AV1 Encoder MFT", "vendor_id": "VEN_10DE", "hardware_url": "NVIDIA AV1 Encoder MFT", "hardware": true, "transform_flags": 4, "clsid": "{80B80715-8C5A-420D-B346-1A9DC40A5880}", "adapter_luid": ""},
+  {"codec": "AV1", "name": "IntelÂ® Hardware Accelerated AV1 Encoder MFT", "vendor_id": "VEN_8086", "hardware_url": "AA243E5D-2F73-48c7-97F7-F6FA17651651", "hardware": true, "transform_flags": 4, "clsid": "{62C053CE-5357-4794-8C5A-FBEFFEFFB82D}", "adapter_luid": ""}
+]

@@ -1,0 +1,8 @@
+keep=0 thread=other
+encoder=1 width=64 height=64 creation_ms=221.994
+encoder=2 width=640 height=368 creation_ms=92.727
+encoder=3 width=1920 height=1080 creation_ms=93.303
+encoder=4 width=64 height=64 creation_ms=84.932
+encoder=5 width=1920 height=1080 creation_ms=92.834
+encoder=6 width=640 height=368 creation_ms=93.253
+exit=0

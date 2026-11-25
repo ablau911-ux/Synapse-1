@@ -1,0 +1,104 @@
+<!doctype html>
+<!--
+  Clip recorder package 0b, scenario "video" (docs/clip-recorder-plan.md, M10).
+  A canvas animation that stands in for a playing video: smooth moving colour
+  gradients and soft shapes (like a photograph) plus fine grain that changes
+  on every frame (like camera noise), redrawn on every screen refresh. It needs
+  no input and no video file. Open the file directly.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>clip0b video</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+  const GRAIN_TILE = 256;
+  const GRAIN_TILES = 8;
+  const GRAIN_ALPHA = 0.10;
+  const BLOBS = 7;
+
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d');
+  const resize = () => { canvas.width = innerWidth; canvas.height = innerHeight; };
+  addEventListener('resize', resize);
+  resize();
+
+  // Driven by the recording's instant count, never by wall time: step k is
+  // the number of whole 50 ms instants since the start (?start=<Unix ms>, or
+  // the first refresh without it); the picture is a pure function of k and
+  // a fixed seed, so two captures on the same instant grid are identical.
+  const INSTANT_MS = 50;
+  const SEED = 20261122;
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  let startPerf = START > 0 ? START - performance.timeOrigin : null;
+  // Park-Miller generator from a seed: the same numbers on every run.
+  const generator = (seed) => {
+    let s = seed % 2147483647 || 1;
+    return () => (s = (s * 16807) % 2147483647) / 2147483647;
+  };
+
+  // Pre-made grain tiles: per-pixel noise from the fixed seed, cycled so every step differs.
+  const grainRandom = generator(SEED);
+  const grains = Array.from({ length: GRAIN_TILES }, () => {
+    const tile = document.createElement('canvas');
+    tile.width = tile.height = GRAIN_TILE;
+    const g = tile.getContext('2d');
+    const image = g.createImageData(GRAIN_TILE, GRAIN_TILE);
+    for (let i = 0; i < image.data.length; i += 4) {
+      const v = Math.floor(grainRandom() * 256);
+      image.data[i] = image.data[i + 1] = image.data[i + 2] = v;
+      image.data[i + 3] = 255;
+    }
+    g.putImageData(image, 0, 0);
+    return ctx.createPattern(tile, 'repeat');
+  });
+
+  function draw(k) {
+    const t = k * INSTANT_MS / 1000;
+    const { width: w, height: h } = canvas;
+    const sky = ctx.createLinearGradient(0, 0, w * (0.5 + 0.5 * Math.sin(t * 0.3)), h);
+    sky.addColorStop(0, 'hsl(' + (200 + 30 * Math.sin(t * 0.2)) + ', 60%, 55%)');
+    sky.addColorStop(0.6, 'hsl(' + (30 + 20 * Math.sin(t * 0.25)) + ', 70%, 60%)');
+    sky.addColorStop(1, 'hsl(' + (120 + 25 * Math.cos(t * 0.15)) + ', 35%, 25%)');
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, w, h);
+    for (let i = 0; i < BLOBS; i++) {
+      const x = w * (0.5 + 0.4 * Math.sin(t * (0.3 + i * 0.07) + i));
+      const y = h * (0.5 + 0.35 * Math.cos(t * (0.25 + i * 0.05) + i * 2));
+      const r = Math.min(w, h) * (0.15 + 0.08 * Math.sin(t + i));
+      const blob = ctx.createRadialGradient(x, y, 0, x, y, r);
+      blob.addColorStop(0, 'hsla(' + ((i * 53 + t * 20) % 360) + ', 70%, 65%, 0.85)');
+      blob.addColorStop(1, 'hsla(' + ((i * 53 + t * 20) % 360) + ', 70%, 40%, 0)');
+      ctx.fillStyle = blob;
+      ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+    const offset = generator(SEED + 7919 * (k + 1));
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.globalAlpha = GRAIN_ALPHA;
+    ctx.save();
+    ctx.translate(Math.floor(offset() * GRAIN_TILE), Math.floor(offset() * GRAIN_TILE));
+    ctx.fillStyle = grains[k % GRAIN_TILES];
+    ctx.fillRect(-GRAIN_TILE, -GRAIN_TILE, w + GRAIN_TILE, h + GRAIN_TILE);
+    ctx.restore();
+  }
+
+  let shown = -1;
+  function frame(now) {
+    if (startPerf === null) startPerf = now;
+    const k = Math.max(0, Math.floor((now - startPerf) / INSTANT_MS));
+    if (k !== shown) { draw(k); shown = k; }
+    requestAnimationFrame(frame);
+  }
+  addEventListener('resize', () => draw(Math.max(shown, 0)));
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

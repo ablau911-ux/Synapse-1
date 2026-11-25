@@ -1,0 +1,153 @@
+<!doctype html>
+<!--
+  Clip recorder experiments, scenario "UI demo" (docs/clip-recorder-experiments-plan.md, F7).
+  An application-like window that drives itself by instant count with a fixed
+  seed, so the probe needs no input: a menu bar whose menus open and close
+  with a moving highlight, a list whose selection moves, a dialog that fades
+  in and out, and a spinner next to a label that changes. Open the file
+  directly; it needs no server.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>clip ui demo</title>
+<style>
+  body { margin: 0; font: 15px/1.5 "Segoe UI", sans-serif; background: #f6f7fb; color: #23232b; overflow: hidden; }
+  #bar { display: flex; gap: 4px; padding: 4px 10px; background: #fff; border-bottom: 1px solid #dde0ea; }
+  .menu { position: relative; padding: 3px 12px; border-radius: 6px; }
+  .menu.open { background: #e6ebf7; }
+  .drop { position: absolute; top: 30px; left: 0; min-width: 170px; background: #fff; border-radius: 8px;
+          box-shadow: 0 6px 22px rgba(40, 50, 90, .16); padding: 4px; display: none; z-index: 5; }
+  .menu.open .drop { display: block; }
+  .item { padding: 4px 10px; border-radius: 5px; white-space: nowrap; }
+  .item.hot { background: #3a6fd8; color: #fff; }
+  #main { display: flex; gap: 18px; padding: 14px 18px; }
+  #list { width: 46%; background: #fff; border-radius: 10px; padding: 6px; box-shadow: 0 2px 10px rgba(40, 50, 90, .07); }
+  .row { padding: 5px 10px; border-radius: 6px; }
+  .row.sel { background: #dfe7fb; color: #17306b; font-weight: 600; }
+  #side { flex: 1; }
+  #status { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #fff; border-radius: 10px; }
+  #spin { width: 22px; height: 22px; border-radius: 50%; border: 3px solid #d5dcf0; border-top-color: #3a6fd8; }
+  #details { margin-top: 12px; padding: 10px 12px; background: #fff; border-radius: 10px; }
+  #dialog { position: fixed; left: 50%; top: 42%; transform: translate(-50%, -50%); width: 320px; padding: 16px 18px;
+            background: #fff; border-radius: 12px; box-shadow: 0 10px 40px rgba(30, 40, 80, .25); opacity: 0; }
+  #dialog b { display: block; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<div id="bar"></div>
+<div id="main">
+  <div id="list"></div>
+  <div id="side">
+    <div id="status"><div id="spin"></div><span id="label">Loading</span></div>
+    <div id="details"></div>
+  </div>
+</div>
+<div id="dialog"><b>Save changes?</b>The file Report 2026.txt has unsaved edits. Save them before closing?</div>
+<script>
+  // Timeline in recording instants, never wall time: step n is the number of
+  // whole 50 ms instants since the start (?start=<Unix ms>, or the first
+  // refresh without it). Every step is applied in order, so the seeded list
+  // moves the same way on every run, and the picture at step n is the same.
+  const INSTANT_MS = 50;
+  const MENU_PERIOD = 50;      // a menu opens every 50 steps (2.5 s)
+  const MENU_OPEN = 30;        // and stays open for 30
+  const MENU_STEP = 4;         // its highlight moves every 4 steps
+  const LIST_STEP = 12;        // the list selection moves every 12 steps
+  const LABEL_STEP = 10;       // the label changes every 10 steps
+  const DIALOG_PERIOD = 120;   // a dialog every 120 steps (6 s)
+  const DIALOG_FADE = 8;       // fades in and out over 8 steps
+  const DIALOG_HOLD = 30;      // and is fully shown for 30
+  const SPIN_DEG = 27;         // spinner degrees per step
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  let startPerf = START > 0 ? START - performance.timeOrigin : null;
+
+  let seed = 20261122;
+  const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+
+  const MENUS = {
+    File: ['New window', 'Open file', 'Save', 'Save as', 'Print', 'Close'],
+    Edit: ['Undo typing', 'Redo', 'Cut', 'Copy', 'Paste', 'Find and replace'],
+    View: ['Zoom in', 'Zoom out', 'Full screen', 'Side panel', 'Status bar'],
+    Help: ['Documentation', 'Keyboard shortcuts', 'Check for updates', 'About'],
+  };
+  const NAMES = ['Invoice March', 'Holiday photos', 'Budget sheet', 'Meeting notes', 'Project plan',
+    'Travel booking', 'Design review', 'Quarterly report', 'Recipe ideas', 'Reading list',
+    'Garden layout', 'Tax documents', 'Team roster', 'Release checklist'];
+
+  const bar = document.getElementById('bar');
+  const menus = Object.entries(MENUS).map(([name, items]) => {
+    const menu = document.createElement('div');
+    menu.className = 'menu';
+    menu.textContent = name;
+    const drop = document.createElement('div');
+    drop.className = 'drop';
+    const rows = items.map((text) => {
+      const row = document.createElement('div');
+      row.className = 'item';
+      row.textContent = text;
+      drop.appendChild(row);
+      return row;
+    });
+    menu.appendChild(drop);
+    bar.appendChild(menu);
+    return { menu, rows };
+  });
+  const list = document.getElementById('list');
+  const rows = NAMES.map((name, i) => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.textContent = (i + 1) + '. ' + name + '  ' + (12 + Math.floor(random() * 880)) + ' KB';
+    list.appendChild(row);
+    return row;
+  });
+  const label = document.getElementById('label');
+  const details = document.getElementById('details');
+  const spin = document.getElementById('spin');
+  const dialog = document.getElementById('dialog');
+
+  let n = 0;
+  let selected = 0;
+  function frame(now) {
+    if (startPerf === null) startPerf = now;
+    const k = Math.max(0, Math.floor((now - startPerf) / INSTANT_MS));
+    while (n < k) { n += 1; step(); }
+    requestAnimationFrame(frame);
+  }
+  function step() {
+    // Menus: one at a time, in order, with a moving highlight.
+    const cycle = Math.floor(n / MENU_PERIOD);
+    const inCycle = n % MENU_PERIOD;
+    menus.forEach(({ menu, rows: items }, i) => {
+      const open = i === cycle % menus.length && inCycle < MENU_OPEN;
+      menu.classList.toggle('open', open);
+      const hot = open ? Math.floor(inCycle / MENU_STEP) % items.length : -1;
+      items.forEach((row, j) => row.classList.toggle('hot', j === hot));
+    });
+    // List: the selection moves by a seeded step.
+    if (n % LIST_STEP === 0) {
+      rows[selected].classList.remove('sel');
+      selected = (selected + 1 + Math.floor(random() * 3)) % rows.length;
+      rows[selected].classList.add('sel');
+      details.textContent = 'Selected: ' + rows[selected].textContent + '. Modified ' +
+        (1 + Math.floor(random() * 28)) + ' November 2026.';
+    }
+    // Label beside the spinner.
+    const step = Math.floor(n / LABEL_STEP);
+    label.textContent = 'Loading item ' + (step % 40 + 1) + ' of 40';
+    spin.style.transform = 'rotate(' + ((n * SPIN_DEG) % 360) + 'deg)';
+    // Dialog fade.
+    const d = n % DIALOG_PERIOD;
+    const fadeOutStart = DIALOG_FADE + DIALOG_HOLD;
+    let opacity = 0;
+    if (d < DIALOG_FADE) opacity = d / DIALOG_FADE;
+    else if (d < fadeOutStart) opacity = 1;
+    else if (d < fadeOutStart + DIALOG_FADE) opacity = 1 - (d - fadeOutStart) / DIALOG_FADE;
+    dialog.style.opacity = opacity.toFixed(3);
+  }
+  rows[0].classList.add('sel');
+  step();
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

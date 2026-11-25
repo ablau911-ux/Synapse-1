@@ -460,6 +460,10 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
     };
 
+    #[cfg(windows)]
+    if matches!(cli.mode, Mode::Stdio | Mode::Http) {
+        server::recover_clips_on_start();
+    }
     match cli.mode {
         Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,
         Mode::Http => {

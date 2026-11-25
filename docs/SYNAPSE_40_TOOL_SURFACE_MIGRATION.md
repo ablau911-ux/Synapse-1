@@ -49,7 +49,7 @@ Removed status means removed from the normal public surface. It does not always 
 | `observe` | `current` |
 | `find` | `elements` |
 | `read_text` | `text` |
-| `screenshot` | `capture`, `gif` |
+| `screenshot` | `capture`, `gif`, `record`, `clip_overview`, `clip_frames`, `clip_frame`, `clip_diff` |
 | `target` | `get`, `list`, `set`, `clear`, `claim`, `status`, `adopt`, `release` |
 | `act` | `invoke`, `foreground` |
 | `shell` | `run`, `start`, `status`, `cancel` |

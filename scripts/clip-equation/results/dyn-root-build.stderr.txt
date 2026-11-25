@@ -1,0 +1,34 @@
+   Compiling ort-sys v2.0.0-rc.12
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+   Compiling ort v2.0.0-rc.12
+   Compiling synapse-overlay v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-overlay)
+   Compiling synapse-models v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-models)
+   Compiling synapse-audio v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-audio)
+   Compiling synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+   Compiling synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+error: linking with `rust-lld` failed: exit code: 1
+  |
+  = note: "rust-lld" "-flavor" "link" "/NOLOGO" "<2512 object files omitted>" "ntdll.lib" "C:\\Users\\Adam\\Synapse-clip\\target\\release\\deps\\rustcroFlic/{libort_sys-3efc55b7418c8c83,liblibrocksdb_sys-50c2c0aee338bc40,libzstd_sys-d291a085752e76b5,liblz4_sys-c393c3ac0ed21a40,libwhich-b1775784248a6188,libwindows-76722eff14cbc903,libwindows_core-730e67481f16778f,libwindows_strings-85724a2bb37063d8,libwindows_result-b94bde51f5b9a401,libaws_lc_sys-f20ed91942517a29,libgetrandom-57c2d34fb0de8915,libchrono-704c89d2d26a2e64,libgetrandom-dcf4e96617175951,libwindows_registry-9c0f98df2163406c,libwindows_sys-05eb9cd7e659038b,libparking_lot_core-cc1db66c28ba91f1,libwindows-399644928075b8aa,libwindows_future-e9f5188ed5b1d270,libwindows_threading-5a6326888153d9a3,libwindows_core-bdcdce372561894b,libwindows_strings-4e45d25454704822,libwindows_result-d12ff1bf7a1068fb,libstd-b821e8e7d5c9d821}.rlib" "<sysroot>\\lib\\rustlib\\x86_64-pc-windows-msvc\\lib/libcompiler_builtins-*.rlib" "rpcrt4.lib" "shlwapi.lib" "ntdll.lib" "advapi32.lib" "cfgmgr32.lib" "comctl32.lib" "credui.lib" "gdi32.lib" "kernel32.lib" "msimg32.lib" "opengl32.lib" "secur32.lib" "setupapi.lib" "synchronization.lib" "user32.lib" "winspool.lib" "ws2_32.lib" "xinput.lib" "legacy_stdio_definitions.lib" "kernel32.lib" "kernel32.lib" "kernel32.lib" "ntdll.lib" "userenv.lib" "ws2_32.lib" "dbghelp.lib" "/defaultlib:msvcrt" "/NXCOMPAT" "/LIBPATH:C:\\Users\\Adam\\Synapse-clip\\target\\release\\build\\aws-lc-sys-d66858d1c6dae9de\\out" "/LIBPATH:C:\\Users\\Adam\\Synapse-clip\\target\\release\\build\\librocksdb-sys-e4e43fd19c45c048\\out" "/LIBPATH:C:\\Users\\Adam\\Synapse-clip\\target\\release\\build\\lz4-sys-179cd4420e5df644\\out" "/LIBPATH:C:\\Users\\Adam\\Synapse-clip\\target\\release\\build\\zstd-sys-5c8496a93d49b73b\\out" "/LIBPATH:C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\atlmfc\\lib\\x64" "/OUT:C:\\Users\\Adam\\Synapse-clip\\target\\release\\deps\\synapse_mcp.exe" "/OPT:REF,ICF" "/DEBUG" "/PDBALTPATH:%_PDB%" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\intrinsic.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\liballoc.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libcore.natvis" "/NATVIS:<sysroot>\\lib\\rustlib\\etc\\libstd.natvis" "/NATVIS:C:\\Users\\Adam\\Synapse-clip\\target\\release\\deps\\rustcroFlic\\synapse_mcp-0.natvis" "/NATVIS:C:\\Users\\Adam\\Synapse-clip\\target\\release\\deps\\rustcroFlic\\synapse_mcp-1.natvis" "/NATVIS:C:\\Users\\Adam\\Synapse-clip\\target\\release\\deps\\rustcroFlic\\synapse_mcp-2.natvis"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: rust-lld: warning: C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\um\x64\xinput.lib: skipping imported DllMain symbol [importeddllmain]
+          NOTE: this might be a mistake when the DLL/library was produced.
+          
+          rust-lld: error: undefined symbol: OrtGetApiBase
+          >>> referenced by C:\Users\Adam\Synapse-clip\target\release\deps\synapse_mcp.ort-4180190c75408094.ort.593a07bc442551a9-cgu.04.rcgu.o.rcgu.o:(ort::setup_api::hdfcf632de49dd38f)
+          
+          rust-lld: error: undefined symbol: 
+          
+          The ort-sys crate could not link to ONNX Runtime because:
+          	- `libonnxruntime` is not configured via `pkg-config`
+          	- ort-sys was instructed not to download prebuilt binaries (`cargo build --offline`), or the `download-binaries` feature is not enabled
+          	- Neither `ORT_LIB_PATH` or `ORT_IOS_XCFWK_PATH` (for iOS) were set to link to custom binaries
+          
+          To rectify this:
+          	- Compile ONNX Runtime from source and manually configure linking (see https://ort.pyke.io/setup/linking for more information)
+          	- Enable the `download-binaries` feature if the target is supported
+          	- Enable ort's `alternative-backend` feature if you intend to use a different backend (or ort-sys' `disable-linking` feature if you use this crate directly)
+          
+          >>> referenced by C:\Users\Adam\Synapse-clip\target\release\deps\synapse_mcp.ort_sys-3efc55b7418c8c83.ort_sys.f1dd0e8206ef2ec7-cgu.14.rcgu.o.rcgu.o:(ort_sys::link_error::X::hc54e6e5377957199)
+          
+
+error: could not compile `synapse-mcp` (bin "synapse-mcp") due to 1 previous error

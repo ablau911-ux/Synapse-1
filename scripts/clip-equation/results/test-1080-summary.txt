@@ -1,0 +1,11 @@
+#1 whole L-3              RAM 13 MB | t=2.1/0.3s u=38.1/0.9s s=142.2/1.3s f=14.9/0.8s v=6667.5/2.4s
+#2 stream L-3 W24         RAM 29 MB | t=0.7/0.3s u=10.6/1.0s s=35.6/1.1s f=4.5/1.0s v=6667.5/2.7s
+#3 stream L1 W24          RAM 29 MB | t=0.7/0.3s u=9.5/1.0s s=31.5/1.1s f=4.0/1.0s v=5949.4/4.7s
+#4 stream L-3 W25         RAM 45 MB | t=0.6/0.3s u=8.8/1.0s s=23.8/1.1s f=4.1/1.0s v=6667.3/2.7s
+#5 stream L1 W25          RAM 45 MB | t=0.5/0.3s u=7.8/1.0s s=20.0/1.1s f=3.5/1.0s v=5949.4/4.7s
+#6 stream L-3 W26         RAM 77 MB | t=0.6/0.4s u=7.8/1.0s s=16.3/1.1s f=3.6/1.0s v=6667.3/2.7s
+#7 stream L1 W26          RAM 77 MB | t=0.5/0.3s u=6.9/1.0s s=13.2/1.1s f=3.1/1.0s v=5949.4/4.7s
+#8 prefix+ldm L1          RAM 20 MB | t=0.5/1.7s u=6.5/3.7s s=8.7/3.3s f=4.1/4.3s v=5868.4/8.1s
+#9 prefix L3 (cliff)      RAM 19 MB | t=1.8/0.4s u=31.9/1.3s s=118.0/1.7s f=12.4/1.3s v=5573.2/15.7s
+#10 prefix+ldm L3          RAM 20 MB | t=0.5/1.8s u=6.1/4.0s s=8.1/3.6s f=4.1/4.8s v=5520.1/23.0s
+#11 H.264 Quick Sync q70   RAM 172 MB | t=0.4/2.0s u=3.2/5.7s s=27.1/6.5s f=2.0/5.9s v=222.5/8.8s

@@ -1,0 +1,152 @@
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+error[E0583]: file not found for module `clip_recovery`
+   --> crates\synapse-mcp\src\server.rs:259:1
+    |
+259 | mod clip_recovery;
+    | ^^^^^^^^^^^^^^^^^^
+    |
+    = help: to create the module `clip_recovery`, create file "crates\synapse-mcp\src\server\clip_recovery.rs" or "crates\synapse-mcp\src\server\clip_recovery\mod.rs"
+    = note: if there is a `mod clip_recovery` elsewhere in the crate already, import it with `use crate::...` instead
+
+error[E0432]: unresolved imports `super::clip_folder::SegmentCheckpoint`, `super::clip_folder::WAITING_DIR`, `super::clip_folder::is_waiting_frame`
+  --> crates\synapse-mcp\src\server\clip_viewer.rs:45:66
+   |
+45 |     CLIP_JSON_FILE, ClipJson, ClipState, FRAMES_FILE, FrameLine, SegmentCheckpoint, VIEWS_DIR,
+   |                                                                  ^^^^^^^^^^^^^^^^^ no `SegmentCheckpoint` in `server::clip_folder`
+46 |     WAITING_DIR, is_waiting_frame, read_frame_lines,
+   |     ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^ no `is_waiting_frame` in `server::clip_folder`
+   |     |
+   |     no `WAITING_DIR` in `server::clip_folder`
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:222:24
+    |
+222 |         if viewed.clip.segments.is_empty() {
+    |                        ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+222 |         if viewed.clip.moving.segments.is_empty() {
+    |                        +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:239:14
+    |
+239 |             .segments
+    |              ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+239 |             .moving.segments
+    |              +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:282:14
+    |
+282 |             .segments
+    |              ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+282 |             .moving.segments
+    |              +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:319:23
+    |
+319 |             self.clip.segments.len(),
+    |                       ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+319 |             self.clip.moving.segments.len(),
+    |                       +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:321:18
+    |
+321 |                 .segments
+    |                  ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+321 |                 .moving.segments
+    |                  +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:334:18
+    |
+334 |                 .segments
+    |                  ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+334 |                 .moving.segments
+    |                  +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:368:19
+    |
+368 |         self.clip.segments.iter().fold((0, 0), |(w, h), segment| {
+    |                   ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+368 |         self.clip.moving.segments.iter().fold((0, 0), |(w, h), segment| {
+    |                   +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:379:14
+    |
+379 |             .segments
+    |              ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+379 |             .moving.segments
+    |              +++++++
+
+error[E0609]: no field `segments` on type `ClipJson`
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:877:35
+    |
+877 |         for segment in &clip.clip.segments {
+    |                                   ^^^^^^^^ unknown field
+    |
+help: one of the expressions' fields has a field of the same name
+    |
+877 |         for segment in &clip.clip.moving.segments {
+    |                                   +++++++
+
+error[E0624]: method `next_frame` is private
+   --> crates\synapse-mcp\src\server\clip_viewer.rs:879:45
+    |
+879 |             while let Some(frame) = decoder.next_frame().map_err(decode_error)? {
+    |                                             ^^^^^^^^^^ private method
+    |
+   ::: crates\synapse-mcp\src\server\clip_decoder.rs:101:5
+    |
+101 |     fn next_frame(&mut self) -> Result<Option<DecodedFrame>, String> {
+    |     ---------------------------------------------------------------- private method defined here
+
+error[E0609]: no field `segments` on type `ClipJson`
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1144:14
+     |
+1144 |             .segments
+     |              ^^^^^^^^ unknown field
+     |
+help: one of the expressions' fields has a field of the same name
+     |
+1144 |             .moving.segments
+     |              +++++++
+
+error[E0599]: no method named `frame_at` found for mutable reference `&mut ClipDecoder` in the current scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:2024:40
+     |
+2024 |                 |(_, decoder)| decoder.frame_at(local_ms, frame_ms),
+     |                                        ^^^^^^^^ method not found in `&mut ClipDecoder`
+
+Some errors have detailed explanations: E0432, E0583, E0599, E0609, E0624.
+For more information about an error, try `rustc --explain E0432`.
+error: could not compile `synapse-mcp` (bin "synapse-mcp") due to 14 previous errors

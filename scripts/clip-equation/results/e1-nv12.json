@@ -1,0 +1,86 @@
+[
+ {
+  "folder": "typing-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9652406172710561,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "folder": "typing-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9652406172710561,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "folder": "typing-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 689"
+ },
+ {
+  "folder": "typing-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 683"
+ },
+ {
+  "folder": "scroll-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9974763082579434,
+  "note": "10 frames, 10 region reads, source chars per region 29154"
+ },
+ {
+  "folder": "scroll-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9975819422053851,
+  "note": "10 frames, 10 region reads, source chars per region 19308"
+ },
+ {
+  "folder": "scroll-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9959551268952692,
+  "note": "10 frames, 10 region reads, source chars per region 6870"
+ },
+ {
+  "folder": "scroll-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9954732273962801,
+  "note": "10 frames, 10 region reads, source chars per region 4964"
+ },
+ {
+  "folder": "ui-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 0 2688"
+ },
+ {
+  "folder": "ui-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9968521946502023,
+  "note": "10 frames, 10 region reads, source chars per region 0 2741"
+ },
+ {
+  "folder": "ui-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9972420262664166,
+  "note": "10 frames, 20 region reads, source chars per region 160 1690"
+ },
+ {
+  "folder": "ui-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9898027522381181,
+  "note": "10 frames, 20 region reads, source chars per region 160 1323"
+ }
+]

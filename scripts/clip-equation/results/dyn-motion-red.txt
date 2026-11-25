@@ -1,0 +1,2 @@
+FAIL layers mode: error: exp-dyn requires mode=exact or mode=moving
+

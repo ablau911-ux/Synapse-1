@@ -160,8 +160,9 @@ screenshot it has to squint at:
 - **`find`** — locate any element or on-screen entity by name, role, or free text.
 - **`read_text`** — OCR any region or element. Reads pixels directly, so it works even
   where the accessibility API can't reach (canvases and custom UIs).
-- **`screenshot`** — per-window Windows Graphics Capture (and GIF capture), so an agent
-  can photograph *its own* window even when it's behind yours.
+- **`screenshot`** — per-window Windows Graphics Capture (plus GIF capture and H.264 clip recording
+  of one window or monitor, read back by the `clip_*` viewer as a text timeline plus labelled
+  PNG frames), so an agent can photograph *its own* window even when it's behind yours.
 - **`subscribe`** — stream live events (focus changes, new windows, audio) instead of
   polling.
 - **Browser DOM mode** — Synapse-launched Chromium browsers expose real page nodes
@@ -679,7 +680,7 @@ glance:
 | `observe` | `current` |
 | `find` | `elements` |
 | `read_text` | `text` |
-| `screenshot` | `capture` · `gif` |
+| `screenshot` | `capture` · `gif` · `record` · `clip_overview` · `clip_frames` · `clip_frame` · `clip_diff` |
 | `target` | `get` · `list` · `set` · `clear` · `claim` · `status` · `adopt` · `release` |
 | `act` | `invoke` · `foreground` |
 | `shell` | `run` · `start` · `status` · `cancel` |

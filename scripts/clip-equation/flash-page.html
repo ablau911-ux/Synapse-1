@@ -1,0 +1,108 @@
+<!doctype html>
+<!--
+  Clip recorder proof page (docs/clip-recorder-plan.md, section Proof, cases 1 to 3 and 16).
+  - Draws a refresh counter on every screen refresh (requestAnimationFrame).
+  - Shows a 50 ms flash in a small box once per second (a small box, not the
+    whole window, so the page is not hard on the eyes). The flash phase steps by
+    PHASE_STEP_MS through one recording interval (1000 / RECORD_FPS = 50 ms),
+    so a run covers every phase.
+  - ?anim=1 adds a continuously animating region (case 2: a local flash while
+    another region animates).
+  - The log at the bottom lists every flash: number, start time since page
+    start, phase, and the counter values at its first and last refresh.
+  Open the file directly in a browser; it needs no server.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clip proof page</title>
+<style>
+  body { margin: 0; font: 16px/1.5 Consolas, monospace; background: #f4f4f8; color: #222; }
+  #counter { font-size: 96px; font-weight: bold; padding: 16px 24px; }
+  #clock { font-size: 28px; padding: 0 24px; }
+  #flash { position: fixed; left: 60%; top: 40px; width: 160px; height: 120px; background: #ff2050; display: none; }
+  #anim { position: fixed; left: 24px; top: 260px; width: 60px; height: 60px; background: #3a7bd5; display: none; }
+  #log { padding: 16px 24px; font-size: 14px; white-space: pre; position: fixed; top: 340px; }
+</style>
+</head>
+<body>
+<div id="counter">0</div>
+<div id="clock">t=0.000 s</div>
+<div id="anim"></div>
+<div id="flash"></div>
+<div id="log"></div>
+<script>
+  const FLASH_MS = 50;          // d_min: the shortest flash the clip must contain
+  const FLASH_PERIOD_MS = 1000; // one flash per second
+  const PHASE_STEP_MS = 5;      // phase sweep step across one 50 ms interval
+  const RECORD_INTERVAL_MS = 50;
+  const LOG_LINES = 12;
+
+  const anim = new URLSearchParams(location.search).get('anim') === '1';
+  const counterEl = document.getElementById('counter');
+  const clockEl = document.getElementById('clock');
+  const flashEl = document.getElementById('flash');
+  const animEl = document.getElementById('anim');
+  const logEl = document.getElementById('log');
+  if (anim) animEl.style.display = 'block';
+
+  let refresh = 0;
+  let t0 = null;
+  let current = null; // flash being shown: {n, start, phase, first, last, firstT}
+  let lastFlash = -1; // number of the last flash started, so each starts once
+  const log = [];
+
+  // Corpus mode (?start=<Unix ms>, experiments plan F7): the page time starts
+  // at `start` instead of the first refresh, the first flash is at 0.5 s so a
+  // 20 s capture holds 20 flashes, and the counter, clock and log show only
+  // values that depend on the 50 ms instant count, never on refresh timing.
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  const corpus = START > 0;
+  if (corpus) t0 = START - performance.timeOrigin;
+  const FIRST_FLASH_MS = corpus ? 500 : 1000;
+
+  function flashWindow(n) {
+    const phase = (n * PHASE_STEP_MS) % RECORD_INTERVAL_MS;
+    return { start: FIRST_FLASH_MS + n * FLASH_PERIOD_MS + phase, phase };
+  }
+
+  function frame(now) {
+    if (t0 === null) t0 = now;
+    const t = now - t0;
+    if (t < 0) { requestAnimationFrame(frame); return; }
+    refresh += 1;
+    const k = Math.floor(t / RECORD_INTERVAL_MS);
+    counterEl.textContent = corpus ? k : refresh;
+    clockEl.textContent = corpus ? 't=' + (k * RECORD_INTERVAL_MS / 1000).toFixed(2) + ' s'
+      : 't=' + (t / 1000).toFixed(3) + ' s';
+    if (anim) animEl.style.transform = 'translateX(' + (((corpus ? k * RECORD_INTERVAL_MS : t) / 4) % 600) + 'px)';
+
+    const n = Math.max(0, Math.floor((t - FIRST_FLASH_MS) / FLASH_PERIOD_MS));
+    const w = flashWindow(n);
+    // The flash starts at the first refresh at or after its start time and
+    // stays on until FLASH_MS after that first shown refresh, so it is on the
+    // screen for at least FLASH_MS (whole refreshes can otherwise make it
+    // shorter than one recording interval).
+    const starting = !current && t >= w.start && t < w.start + FLASH_MS && lastFlash !== n;
+    const on = starting || (current && t - current.firstT < FLASH_MS);
+    if (on) {
+      if (!current) { current = { n, start: w.start, phase: w.phase, first: refresh, firstT: t }; lastFlash = n; }
+      current.last = refresh;
+      flashEl.style.display = 'block';
+    } else {
+      flashEl.style.display = 'none';
+      if (current) {
+        log.unshift('flash ' + current.n + '  start ' + (current.start / 1000).toFixed(3) +
+          ' s  phase ' + current.phase + ' ms' + (corpus ? '' : '  refresh ' + current.first + '..' +
+          current.last + '  on ' + (t - current.firstT).toFixed(1) + ' ms'));
+        log.length = Math.min(log.length, LOG_LINES);
+        logEl.textContent = log.join('\n');
+        current = null;
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,134 @@
+# Experiments step 2 and 3, way Z (zstd alone): compress, decompress, verify.
+# Spec: docs/clip-recorder-experiments-plan.md, "Acceptance (BDD)", the Z rows of
+# step 2 and step 3; equations 1 to 6; ways of docs/clip-recorder-ways.md.
+# Checked by scripts/clip-equation/spec/step2z.mjs against
+# scripts/clip-equation/results/z-runs.csv (one row per `clip-probe exp-z` run).
+# Every check computes its known result from its inputs before it reads the outcome.
+# Symbols: px = w · h; N_new = new frames of the corpus folder; L = zstd level;
+# K_z = keyframe interval; B_c, B_d = frames held while compressing, decoding.
+
+Feature: Way Z, every zstd way compresses the corpus losslessly with known bytes, CPU and RAM
+
+  Background:
+    Given the corpus folder C:\Users\Adam\clip-corpus\<scenario>-<w>x<h>
+    And N_new = the count of lines with "new": true in its frames.jsonl
+    And D_wait = the sum of the sizes on disk of its frame-NNNN.zst files
+    And each row of z-runs.csv is one exp-z run of one way, level and option set on that folder
+
+  # Step 2, compress
+
+  Scenario: frames compressed
+    When a way compresses the folder
+    Then N_comp = N_new of the folder, exactly
+
+  Scenario: bytes
+    When a way writes its clip files to the scratch folder
+    Then bytes = the sum of the output sizes the way produced
+    And bytes = the sum of the clip's file sizes on disk, to the byte
+
+  Scenario: bytes of every retained file (M4)
+    When a way writes its clip
+    Then bytes = Σ frame files + frames.jsonl + clip.json, to the byte
+    And frames.jsonl has one line per instant of the clip (the lines of the corpus whose picture is a compressed frame)
+    And frames.jsonl and clip.json are written by the shared writer (exp_measure::ClipFiles), the same for ways Z and D
+
+  Scenario: baseline equals the corpus
+    Given way ZW1, whole frame, L = -3, independent frames, interleaved B,G,R, nbWorkers 0
+    And the corpus writer's call: ZSTD_compressStream2, output drained 16 KB at a time (drain=16384, as Node zlib.zstdCompressSync)
+    When it compresses the folder
+    Then the frame files' bytes = D_wait of the folder, to the byte (same coder, level, frames and call)
+
+  Scenario: one-shot call
+    Given way ZW1, L = -3, one ZSTD_compress2 call per frame (drain=0), as the product writes them
+    Then frame bytes − D_wait is reported: a known difference caused by the block splits of the call, not a pass or a fail (plan, Acceptance step 2)
+
+  Scenario: input format (M1)
+    Given every way receives each new frame as B,G,R,A (the capture format), expanded from the corpus before the timer
+    Then the conversion the way needs (B,G,R,A to its layout) is timed: convert cycles > 0, and 0 only for the B,G,R,A layout (ZW2)
+
+  Scenario: CPU of all the way's work (M2)
+    Then way cycles = convert + compress (with context creation) + write (frames, frames.jsonl, clip.json) + dictionary training cycles
+    And corpus decoding and verification are not in it
+
+  Scenario: dictionary training CPU (M2, M3)
+    Given a way with a trained dictionary (dict > 0), trained after M_0 on the first 20 new frames
+    Then train cycles > 0 and they are inside the way's CPU; the training's memory is inside the RAM peak
+
+  Scenario: RAM from the OS peak (M3)
+    Given M_0 = private bytes after the input is prepared (corpus reader open, capture frame filled once)
+    Then RAM = PeakPagefileUsage after the work − M_0, and the work set that peak (peak after > peak at M_0)
+
+  Scenario: ldm set explicitly (M8)
+    Then ZSTD_c_enableLongDistanceMatching read back from the context = 1 when ldm=1 and 2 (disabled) when ldm=0, never 0 (zstd's automatic choice)
+
+  Scenario: ZW9 rectangle list, ZW9b one box (M8)
+    Given ZW9 = changed tiles merged into rectangles (merge gap in tiles), a list of (row, byte, rows, bytes), their rows in one zstd frame
+    And ZW9b = one global bounding box of the change, a separate way
+    Then Σ bytes compressed = Σ rows · bytes of the listed rectangles, read back from the clip's headers
+    And ZW9b lists at most one rectangle per frame
+
+  Scenario: saved RAM prediction
+    Then known_m_comp saved by the runner = the RAM check's equation 4, with the nbWorkers and W_eff corrections (one shared calculation)
+
+  Scenario: run list (M9)
+    Given results/z-runlist.json
+    Then budget = T_floor + 4 h and T_total <= budget
+    And held-out cells = round(0.2 · cells that run at more than one size), drawn with mulberry32, seed 20261122
+
+  Scenario: resume keys (M9)
+    Then every saved row is found again by the key the runner plans with (defaults resolved the same way at planning, lookup and append)
+    And planning the list twice gives the same keys, none twice; the CSV has no key twice
+
+  Scenario: RAM, nbWorkers > 0
+    Given zstd's estimates cover one thread only
+    Then M_comp = M_0 + ZSTD_sizeof_CCtx + B_c · px · 3 is within ±10 % of the measured peak private bytes
+
+  Scenario: RAM, one stream
+    Given W_eff = min(2^W, px · 3) when K_z = 1 (zstd knows the frame size at the first call), else 2^W
+    Then M_comp = M_0 + M_cctx − 2^W + W_eff + B_c · px · 3 is within ±10 % of the measured peak private bytes
+
+  Scenario: CPU from the cycle counter
+    Given rate = cycles per second of `clip-probe exp-rate` (QueryThreadCycleTime over QueryPerformanceCounter, 3 spins of 300 ms, the largest kept)
+    Then C = process cycles (QueryProcessCycleTime, user plus kernel, every thread) / rate · 10^9
+    And for one thread C <= 1.02 · the wall time of the same calls
+
+  Scenario: determinism
+    Given one configuration run 3 times (repeat 1, 2 and 3)
+    Then bytes of run 1 = run 2 = run 3
+
+  Scenario: RAM while compressing (equation 4)
+    Given M_0 = private bytes of the run's process before the first frame
+    And M_cctx = zstd's own estimate (ZSTD_estimateCCtxSize_usingCCtxParams, or ZSTD_estimateCStreamSize_usingCCtxParams for one stream)
+    And B_c = 1 for independent frames, 2 for ways that keep the previous frame
+    Then M_comp = M_0 + M_cctx + B_c · px · 3 is within ±10 % of the measured peak private bytes
+
+  Scenario: CPU (equation 3)
+    Given κ_c fitted on the fit set of the full run (step 4)
+    Then held-out rows are within ±10 % of C_comp = N_new · (c_0 + px · κ_c)
+    # Pending until the full run and the fit; the pilot only reports C_comp per frame.
+
+  Scenario: run time (equation 6)
+    Given T = Σ_runs N_new · px · 3 / v(L, m) · repeats from the pilot
+    Then the full run's wall time is within ±20 % of T
+    # Pending until the full run; z-pilot.md gives T.
+
+  # Step 3, decompress and verify
+
+  Scenario: round trip
+    When the clip is decoded frame by frame and compared with the corpus
+    Then Σ |decoded − corpus| over every pixel of every frame = 0
+
+  Scenario: seek cost
+    When the worst frame of the clip is shown alone
+    Then N_dec(worst) = 1 for independent frames (ZW0 to ZW6, ZW16, ZW17)
+    And N_dec(worst) <= K_z for the delta, tile, rectangle, prefix, stream and switch ways
+
+  Scenario: decoder RAM (equation 4)
+    Given M_dctx = zstd's own estimate (ZSTD_estimateDCtxSize, or ZSTD_estimateDStreamSize for one stream)
+    And B_d = 1 for independent frames, 2 for ways that keep the previous frame
+    And b_max = the largest clip file, the compressed frame the viewer holds while it decodes (a term added to equation 4)
+    Then M_dec = M_0 + M_dctx + B_d · px · 3 + b_max is within ±10 % of the measured peak private bytes of the decode phase
+
+  Scenario: time until ready (equation 5)
+    When the last frame has arrived
+    Then t_ready = t_close, closing the last file and clip.json, is at most one instant, 50 ms

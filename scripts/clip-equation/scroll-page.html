@@ -1,0 +1,63 @@
+<!doctype html>
+<!--
+  Clip recorder package 0b, scenario "scroll" (docs/clip-recorder-plan.md, M10).
+  A long page of text that scrolls by itself (SCROLL_PX_PER_S, on every screen
+  refresh), so the probe needs no input. Open the file directly; no server.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>clip0b scroll</title>
+<style>
+  body { margin: 0; padding: 24px 40px; font: 16px/1.55 "Segoe UI", sans-serif; background: #fbfbfd; color: #23232b; }
+  h2 { font-size: 22px; margin: 28px 0 8px; color: #3a4a7a; }
+  p { margin: 0 0 12px; max-width: 900px; }
+  code { background: #eef0f6; padding: 1px 5px; border-radius: 4px; font-family: Consolas, monospace; }
+</style>
+</head>
+<body>
+<div id="text"></div>
+<script>
+  const SCROLL_PX_PER_S = 300;
+  const SECTIONS = 60;
+  const words = ('the recorder keeps one frame for every instant and writes it to the waiting folder ' +
+    'where the worker reads it back converts it and hands it to the encoder while the live part ' +
+    'stays within its share of the processor every changed tile is stored and every unchanged tile ' +
+    'is skipped so a page that scrolls changes almost every tile but a caret changes only one').split(' ');
+  let seed = 7;
+  const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const sentence = () => {
+    const n = 8 + Math.floor(random() * 14);
+    const s = Array.from({ length: n }, () => words[Math.floor(random() * words.length)]).join(' ');
+    return s[0].toUpperCase() + s.slice(1) + (random() < 0.2 ? ' with <code>WAITING_KEYFRAME_FRAMES</code>.' : '.');
+  };
+  let html = '';
+  for (let i = 0; i < SECTIONS; i++) {
+    html += '<h2>Section ' + (i + 1) + '</h2>';
+    for (let p = 0; p < 3; p++) html += '<p>' + Array.from({ length: 5 }, sentence).join(' ') + '</p>';
+  }
+  document.getElementById('text').innerHTML = html;
+
+  // Driven by the recording's instant count, never by wall time: step k is
+  // the number of whole 50 ms instants since the start (?start=<Unix ms>, or
+  // the first refresh without it); the scroll position is a pure function
+  // of k, so two captures on the same instant grid are identical.
+  const INSTANT_MS = 50;
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  let startPerf = START > 0 ? START - performance.timeOrigin : null;
+  let shown = -1;
+  function frame(now) {
+    if (startPerf === null) startPerf = now;
+    const k = Math.max(0, Math.floor((now - startPerf) / INSTANT_MS));
+    if (k !== shown) {
+      const root = document.scrollingElement;
+      const range = Math.max(1, root.scrollHeight - root.clientHeight);
+      root.scrollTop = Math.floor(k * SCROLL_PX_PER_S * INSTANT_MS / 1000) % range;
+      shown = k;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

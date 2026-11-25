@@ -1,0 +1,1 @@
+random seek | sequential pixels = reverse seek pixels | 0 mismatches | error: seek anchor at 39000000 hns is not a stored keyframe | FAIL

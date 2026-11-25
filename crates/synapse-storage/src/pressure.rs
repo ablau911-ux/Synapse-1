@@ -112,14 +112,34 @@ impl Default for PressureConfig {
     fn default() -> Self {
         Self {
             interval: POLL_INTERVAL,
-            thresholds: PressureThresholds {
-                level1: LEVEL_1_FREE_BYTES,
-                level2: LEVEL_2_FREE_BYTES,
-                level3: LEVEL_3_FREE_BYTES,
-                level4: LEVEL_4_FREE_BYTES,
-            },
+            thresholds: DEFAULT_THRESHOLDS,
         }
     }
+}
+
+/// The free-space thresholds every volume check uses (Level 1 = below 2 GB).
+const DEFAULT_THRESHOLDS: PressureThresholds = PressureThresholds {
+    level1: LEVEL_1_FREE_BYTES,
+    level2: LEVEL_2_FREE_BYTES,
+    level3: LEVEL_3_FREE_BYTES,
+    level4: LEVEL_4_FREE_BYTES,
+};
+
+/// The pressure level of a volume with `free_bytes` free, by the same
+/// thresholds as the storage probe. Public so other writers (the clip
+/// recorder) apply this one rule to their own volume.
+#[must_use]
+pub const fn level_for_free_bytes(free_bytes: u64) -> DiskPressureLevel {
+    DEFAULT_THRESHOLDS.level_for(free_bytes)
+}
+
+/// Free bytes on the volume that holds `path`.
+///
+/// # Errors
+///
+/// `ReadFailed` when the volume cannot be queried.
+pub fn volume_free_bytes(path: &Path) -> StorageResult<u64> {
+    Fs2DiskProbe.available_space(path)
 }
 
 #[derive(Clone, Copy, Debug)]

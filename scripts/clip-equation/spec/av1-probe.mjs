@@ -1,0 +1,1094 @@
+// Checks of the AV1 window-recording probe (docs/research/window-recording/probe-plan.md,
+// "Probe interface", "Proof" and "Rules"). Runs `clip-probe exp-av1` in replay mode on four
+// corpus scenes, judges each output folder against the contract, then prints the reported
+// (not judged) measures from probe.json as one table.
+//   node scripts/clip-equation/spec/run-spec.mjs av1-probe out=<dir> [probe=<exe>] [root=<corpus>]
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { runFeature } from './feature.mjs';
+
+const BASE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const options = Object.fromEntries(process.argv.slice(3).map(arg => {
+  const split = arg.indexOf('=');
+  return [arg.slice(0, split), arg.slice(split + 1)];
+}));
+const ROOT = options.root || JSON.parse(fs.readFileSync(path.join(BASE, 'corpus/corpus.json'), 'utf8')).root;
+const OUT = path.resolve(options.out || path.join(BASE, '../../.runs/av1-probe'));
+const PROBE = path.resolve(options.probe || path.join(BASE, 'probe/target/release/clip-probe.exe'));
+// `scenes=a,b,c` runs other corpus scenes (for example the small and odd-sized ones) through the same checks.
+const SCENES = options.scenes ? options.scenes.split(',') : ['typing-1920x1080', 'scroll-1920x1080', 'ui-1920x1080', 'mix-1920x1080', 'resize-640x360-to-506x333', 'lost-then-same-640x360'];
+// A clip the product recorded on a real page (1904x1012, 40 s, parts of 200 pictures); the fetch checks read it.
+const FETCH_CLIP = path.join(ROOT, 'recorded-real-page');
+const FETCH_GOLDEN = path.join(FETCH_CLIP, 'fetch-reference.json');
+const SETTLE_SCENE = 'mix-1920x1080'; // the scene whose corpus must hold at least one settle point
+const INSTANT_MS = 50;                // 20 instants per second (contract: t_ms = k*50)
+const SETTLE_INSTANTS = 10;           // probe default settle=<instants>: on screen this many instants, the changed one included
+const READ_BACK_MS = 500;
+const MB = 1048576; // the plan's targets were measured in units of 1048576 bytes
+const KINDS = ['enc', 'same', 'lost'];
+const VALID_KIND_VALUE = {
+  enc: v => Array.isArray(v) && v.length === 2 && v.every(n => Number.isInteger(n) && n >= 0),
+  same: v => v === true,
+  lost: v => typeof v === 'string',
+};
+const BIG_OUTPUT = 64 * 1024 * 1024;
+
+const readJsonl = file => fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+const pad = (n, width) => String(n).padStart(width, '0');
+/** The one kind (enc, same or lost) an index line carries, or null when it has none or several. */
+const kindOf = line => { const present = KINDS.filter(key => key in line); return present.length === 1 ? present[0] : null; };
+
+/** One corpus scene: its known source pictures, the probe run on it, and the probe's output. */
+class Scene {
+  constructor(name) {
+    this.name = name;
+    this.source = path.join(ROOT, name);
+    this.out = path.join(OUT, name);
+    this.corpus = readJsonl(path.join(this.source, 'frames.jsonl'));
+    this.error = null;
+    this.lines = [];
+    this.probe = null;
+    this.hashes = new Map(); // corpus frame number -> SHA-256 of its pixels
+  }
+
+  /** Runs the probe on this scene and loads frames.jsonl and probe.json; keeps the first failure. */
+  record() {
+    try {
+      if (fs.existsSync(this.out) && fs.readdirSync(this.out).length) throw new Error(`output folder not empty: ${this.out}`);
+      const run = spawnSync(PROBE, ['exp-av1', `out=${this.out}`, `folder=${this.source}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+      if (run.error || run.status !== 0) throw new Error(run.error?.message || run.stderr.trim() || `exit ${run.status}`);
+      this.lines = readJsonl(path.join(this.out, 'frames.jsonl'));
+      this.probe = JSON.parse(fs.readFileSync(path.join(this.out, 'probe.json'), 'utf8'));
+    } catch (error) { this.error = error.message; }
+  }
+
+  get instants() { return this.corpus.length; }
+
+  /** SHA-256 of the B,G,R bytes shown at instant k, computed once per corpus frame number. A new
+   *  frame number can hold the same pixels, so pictures are compared by content, not by number. */
+  pictureHash(k) {
+    const frame = this.corpus[k].frame;
+    if (!this.hashes.has(frame)) this.hashes.set(frame, crypto.createHash('sha256').update(this.picture(k)).digest('hex'));
+    return this.hashes.get(frame);
+  }
+
+  /** True when instant k shows a different picture than instant k-1; instant 0 and the instant after a lost one count as a change. */
+  changed(k) { return k === 0 || this.lostInCorpus(k - 1) || this.pictureHash(k) !== this.pictureHash(k - 1); }
+
+  /** True when the corpus says this instant's capture failed: the recorder is given no picture for it. */
+  lostInCorpus(k) { return this.corpus[k].lost === true; }
+
+  /** How many instants directly after k show the same picture as k. */
+  unchangedAfter(k) {
+    let n = 0;
+    while (k + 1 + n < this.instants && !this.lostInCorpus(k + 1 + n) && this.pictureHash(k + 1 + n) === this.pictureHash(k)) n += 1;
+    return n;
+  }
+
+  /** The B,G,R bytes the corpus captured for instant k. */
+  picture(k) {
+    return zlib.zstdDecompressSync(fs.readFileSync(path.join(this.source, `frame-${pad(this.corpus[k].frame, 4)}.zst`)));
+  }
+
+  partPath(part) { return path.join(this.out, 'video', `part-${pad(part, 4)}.ivf`); }
+
+  partFiles() {
+    const dir = path.join(this.out, 'video');
+    return fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => /^part-\d+\.ivf$/.test(f)).sort() : [];
+  }
+
+  /** Instant numbers of the files stills/still-NNNNNNNN.webp. */
+  stillInstants() {
+    const dir = path.join(this.out, 'stills');
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir).map(f => f.match(/^still-(\d{8})\.webp$/)).filter(Boolean).map(m => Number(m[1])).sort((a, b) => a - b);
+  }
+
+  stillPath(k) { return path.join(this.out, 'stills', `still-${pad(k, 8)}.webp`); }
+
+  encLines() { return this.lines.filter(line => kindOf(line) === 'enc'); }
+}
+
+/** Runs `check(scene)` -> { problem?, note } on every scene; a scene whose run failed is a miss. */
+function judge(check) {
+  const problems = [], notes = [];
+  for (const scene of scenes) {
+    if (scene.error) { problems.push(`${scene.name}: ${scene.error}`); continue; }
+    const { problem, note } = check(scene);
+    if (problem) problems.push(`${scene.name}: ${problem}`);
+    else notes.push(`${scene.name}: ${note}`);
+  }
+  return { pass: problems.length === 0, value: '-', measured: problems.length ? problems.join('; ') : notes.join('; ') };
+}
+
+const firstOf = (list, n = 3) => `${list.slice(0, n).join(', ')}${list.length > n ? ` (+${list.length - n} more)` : ''}`;
+
+function everyInstant(scene) {
+  if (scene.lines.length !== scene.instants) return { problem: `frames.jsonl has ${scene.lines.length} lines, scene has ${scene.instants} instants` };
+  const bad = [];
+  scene.lines.forEach((line, k) => {
+    const kind = kindOf(line);
+    if (line.instant !== k || line.t_ms !== k * INSTANT_MS) bad.push(`line ${k}: instant=${line.instant} t_ms=${line.t_ms}`);
+    else if (!kind) bad.push(`instant ${k}: not exactly one of enc, same, lost`);
+    else if (!VALID_KIND_VALUE[kind](line[kind])) bad.push(`instant ${k}: bad ${kind} value ${JSON.stringify(line[kind])}`);
+  });
+  if (bad.length) return { problem: firstOf(bad) };
+  const p = scene.probe;
+  if (p.instants !== scene.instants) return { problem: `probe.json instants=${p.instants}, scene has ${scene.instants}` };
+  if (p.encoded + p.same + p.lost !== p.instants) return { problem: `probe.json encoded+same+lost=${p.encoded}+${p.same}+${p.lost}, instants=${p.instants}` };
+  return { note: `${scene.instants} instants = ${p.encoded} enc + ${p.same} same + ${p.lost} lost` };
+}
+
+function nothingLostSilently(scene) {
+  const lost = scene.lines.filter(line => kindOf(line) === 'lost');
+  const unnamed = lost.filter(line => typeof line.lost !== 'string' || !line.lost.trim()).map(line => line.instant);
+  if (unnamed.length) return { problem: `lost without cause at instants ${firstOf(unnamed)}` };
+  const causes = [...new Set(lost.map(line => line.lost))];
+  return { note: `lost=${lost.length}${causes.length ? ` (${firstOf(causes)})` : ''}` };
+}
+
+/**
+ * Every instant that had a frame logs that frame's cursor in its own index line. exp-av1 hands the
+ * product the cursor [k mod 300, k mod 200] (frame pixels) with the picture of instant k, as the
+ * recorder hands the cursor sampled with the frame; an instant the corpus marks lost has no frame
+ * (a failed capture) and no cursor.
+ */
+function cursorLogged(scene) {
+  const expected = k => [k % 300, k % 200];
+  const bad = [];
+  for (const line of scene.lines) {
+    const framed = line.lost !== 'capture_failed';
+    if (framed && JSON.stringify(line.cursor) !== JSON.stringify(expected(line.instant))) bad.push(`instant ${line.instant}: cursor ${JSON.stringify(line.cursor)}, expected ${JSON.stringify(expected(line.instant))}`);
+    else if (!framed && line.cursor !== undefined) bad.push(`instant ${line.instant}: a failed capture logs cursor ${JSON.stringify(line.cursor)}`);
+  }
+  if (bad.length) return { problem: `${bad.length} lines: ${firstOf(bad)}` };
+  return { note: `${scene.lines.length} lines, each framed instant logs its cursor` };
+}
+
+/** Decodes every picture of one part: { codec, pictures } or { error }. */
+function decodePart(file) {
+  const run = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0',
+    '-show_entries', 'stream=nb_read_frames,codec_name', '-of', 'csv=p=0', file], { encoding: 'utf8' });
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `ffprobe exit ${run.status}` };
+  const fields = run.stdout.trim().split(/\r?\n/)[0]?.split(',') ?? [];
+  return { codec: fields.find(f => !/^\d+$/.test(f)), pictures: Number(fields.find(f => /^\d+$/.test(f))) };
+}
+
+function videoDecodes(scene) {
+  const parts = new Map();
+  for (const file of scene.partFiles()) {
+    const result = decodePart(path.join(scene.out, 'video', file));
+    if (result.error) return { problem: `${file}: ${result.error}` };
+    if (result.codec !== 'av1') return { problem: `${file}: codec ${result.codec}` };
+    parts.set(file, result.pictures);
+  }
+  const total = [...parts.values()].reduce((sum, n) => sum + n, 0);
+  const enc = scene.encLines();
+  if (total !== enc.length) return { problem: `ffprobe decodes ${total} pictures in ${parts.size} parts, index has ${enc.length} enc lines` };
+  if (enc[0]?.enc[0] !== 0 || enc[0]?.enc[1] !== 0) return { problem: `first enc is ${JSON.stringify(enc[0]?.enc)}, not [0,0]` };
+  const bad = [], seen = new Set();
+  let previousPart = null;
+  for (const line of enc) {
+    const [part, index] = line.enc;
+    const file = path.basename(scene.partPath(part));
+    if (!parts.has(file) || index >= parts.get(file)) bad.push(`instant ${line.instant}: [${part},${index}] does not exist`);
+    if (part !== previousPart && index !== 0) bad.push(`instant ${line.instant}: part ${part} starts at index ${index}`);
+    if (seen.has(`${part},${index}`)) bad.push(`instant ${line.instant}: [${part},${index}] used twice`);
+    seen.add(`${part},${index}`);
+    previousPart = part;
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  return { note: `${total} av1 pictures in ${parts.size} parts = ${enc.length} enc lines` };
+}
+
+function decodeStill(file) {
+  const run = spawnSync('ffmpeg', ['-v', 'error', '-i', file, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'], { maxBuffer: BIG_OUTPUT });
+  if (run.error || run.status !== 0) throw new Error(run.error?.message || String(run.stderr).trim() || `ffmpeg exit ${run.status}`);
+  return run.stdout;
+}
+
+function stillExact(scene) {
+  const files = scene.stillInstants();
+  const flagged = scene.lines.filter(line => line.still === true).map(line => line.instant);
+  const missing = flagged.filter(k => !files.includes(k)), extra = files.filter(k => !flagged.includes(k));
+  if (missing.length || extra.length) return { problem: `still:true without file at ${firstOf(missing) || '-'}; file without still:true at ${firstOf(extra) || '-'}` };
+  const bad = [];
+  for (const k of files) {
+    if (k >= scene.instants) { bad.push(`still ${k}: beyond the scene`); continue; }
+    const { width, height } = scene.corpus[k];
+    let decoded;
+    try { decoded = decodeStill(scene.stillPath(k)); } catch (error) { bad.push(`still ${k}: ${error.message}`); continue; }
+    const expected = scene.picture(k);
+    if (decoded.length !== width * height * 3 || expected.length !== width * height * 3) bad.push(`still ${k}: ${decoded.length} bytes, picture ${width}x${height} has ${expected.length}`);
+    else if (!decoded.equals(expected)) bad.push(`still ${k}: pixels differ`);
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  stillsCompared += files.length;
+  return { note: `${files.length} stills exact` };
+}
+
+/** "a still is exact", plus: at least one still compared over all scenes. */
+function stillsExact() {
+  stillsCompared = 0;
+  const result = judge(stillExact);
+  if (result.pass && stillsCompared === 0) return { ...result, pass: false, measured: `0 stills compared over all scenes; ${result.measured}` };
+  return result;
+}
+
+function stillOnSettle(scene) {
+  const bad = [];
+  if (scene.name === SETTLE_SCENE) {
+    const settles = scene.corpus.filter((row, k) => scene.changed(k) && scene.unchangedAfter(k) >= SETTLE_INSTANTS - 1).length;
+    if (settles === 0) bad.push(`corpus has 0 settle points (needs at least 1)`);
+  }
+  // A settle point is marked once: `still:true` (a file of its own) when its picture was never stored
+  // before, else `still_of: j` naming the earlier still with the same pixels. Nothing else is marked.
+  const wrong = [], stored = new Map(); // pixel hash -> instant of the still file that holds it
+  scene.corpus.forEach((row, k) => {
+    const line = scene.lines[k] ?? {};
+    const expected = !scene.lostInCorpus(k) && scene.changed(k) && scene.unchangedAfter(k) >= SETTLE_INSTANTS - 1;
+    const marked = line.still === true || line.still_of != null;
+    if (line.still === true && line.still_of != null) wrong.push(`${k} has both still and still_of`);
+    else if (marked !== expected) wrong.push(`${k}${expected ? ' missing' : ' extra'}`);
+    else if (expected) {
+      const hash = scene.pictureHash(k), earlier = stored.get(hash);
+      if (earlier === undefined) { if (line.still !== true) wrong.push(`${k} names still_of ${line.still_of}, but no earlier still holds its picture`); else stored.set(hash, k); }
+      else if (line.still_of !== earlier) wrong.push(`${k} should be still_of ${earlier} (same pixels), is ${line.still === true ? 'a second still file' : `still_of ${line.still_of}`}`);
+    }
+  });
+  if (wrong.length) bad.push(`settle marks wrong at instants ${firstOf(wrong)}`);
+  if (bad.length) return { problem: bad.join('; ') };
+  const stills = scene.lines.filter(line => line.still === true).map(line => line.instant);
+  const reused = scene.lines.filter(line => line.still_of != null).length;
+  return { note: `stills at ${stills.length ? firstOf(stills, 5) : 'none (corpus has none)'}${reused ? `, ${reused} settle points reuse a stored still` : ''}` };
+}
+
+function unchangedCostsNothing(scene) {
+  const wrong = [];
+  scene.lines.forEach((line, k) => {
+    const kind = kindOf(line);
+    if (scene.lostInCorpus(k)) { if (kind !== 'lost') wrong.push(`${k} is ${kind}, the corpus has no picture for it`); return; }
+    if (k === 0) { if (kind !== 'enc') wrong.push(`0 is ${kind}`); return; }
+    const unchanged = !scene.changed(k);
+    if ((kind === 'same') !== unchanged) wrong.push(`${k} is ${kind}, corpus ${unchanged ? 'unchanged' : 'changed'}`);
+  });
+  if (wrong.length) return { problem: firstOf(wrong) };
+  return { note: `${scene.lines.filter(line => kindOf(line) === 'same').length} same lines, all unchanged in the corpus` };
+}
+
+function readBack(scene) {
+  const enc = scene.encLines();
+  if (!enc.length) return { problem: 'no enc lines' };
+  // first, middle, last, and the worst place: the largest index-in-part (last picture before a key picture)
+  const deepest = enc.reduce((best, line, i) => (line.enc[1] > enc[best].enc[1] ? i : best), 0);
+  const picks = [...new Set([0, Math.floor(enc.length / 2), enc.length - 1, deepest])].map(i => enc[i]);
+  const bad = [];
+  let slowest = { ms: -1 };
+  for (const line of picks) {
+    const [part, index] = line.enc;
+    const started = process.hrtime.bigint();
+    const run = spawnSync('ffmpeg', ['-v', 'error', '-i', scene.partPath(part), '-vf', `select=eq(n\\,${index})`,
+      '-frames:v', '1', '-f', 'null', '-'], { encoding: 'utf8' });
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    if (run.error || run.status !== 0) { bad.push(`instant ${line.instant}: ${run.error?.message || run.stderr.trim() || `ffmpeg exit ${run.status}`}`); continue; }
+    if (ms >= READ_BACK_MS) bad.push(`instant ${line.instant}: ${ms.toFixed(0)} ms`);
+    if (ms > slowest.ms) slowest = { ms, instant: line.instant };
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  return { note: `slowest ${slowest.ms.toFixed(0)} ms (instant ${slowest.instant})` };
+}
+
+/**
+ * A window that changes size keeps being recorded: no instant is lost, the first instant at a new
+ * size starts a new part, and the pictures come back at the size they were recorded at.
+ */
+function resizeKeepsRecording(scene) {
+  const size = k => `${scene.corpus[k].width}x${scene.corpus[k].height}`;
+  const resizes = scene.corpus.map((row, k) => k).filter(k => k > 0 && size(k) !== size(k - 1));
+  if (!resizes.length) return { note: 'no size change in this scene' };
+  const lost = scene.lines.filter(line => kindOf(line) === 'lost');
+  if (lost.length) return { problem: `${lost.length} instants lost (${firstOf([...new Set(lost.map(line => line.lost))])}), first at ${lost[0].instant}` };
+  const bad = [];
+  for (const k of resizes) {
+    const line = scene.lines[k] ?? {};
+    if (kindOf(line) !== 'enc' || line.enc[1] !== 0) bad.push(`instant ${k} (first at ${size(k)}) is ${JSON.stringify(line.enc ?? kindOf(line))}, not the first picture of a new part`);
+  }
+  // the last encoded instant of every size segment comes back at that segment's size
+  for (const end of [...resizes.map(k => k - 1), scene.instants - 1]) {
+    const line = scene.lines.slice(0, end + 1).reverse().find(l => kindOf(l) === 'enc');
+    const got = fetchPicture(scene.out, line.instant);
+    if (got.error) bad.push(`fetch of instant ${line.instant}: ${got.error}`);
+    else if (`${got.width}x${got.height}` !== size(line.instant)) bad.push(`instant ${line.instant} comes back ${got.width}x${got.height}, recorded ${size(line.instant)}`);
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  return { note: `${resizes.length} size changes at instants ${resizes.join(', ')}: 0 lost, each starts a new part, pictures come back at their own size` };
+}
+
+/** After a lost instant the next picture is recorded again, never written as 'same' (a 'same' line would resolve back to the loss). */
+function recordedAgainAfterLoss(scene) {
+  const after = scene.lines.filter((line, k) => k > 0 && kindOf(scene.lines[k - 1]) === 'lost' && kindOf(line) !== 'lost');
+  if (!after.length) return { note: 'no lost instant in this scene' };
+  const bad = [];
+  for (const line of after) {
+    if (kindOf(line) !== 'enc') { bad.push(`instant ${line.instant} follows a lost instant and is ${kindOf(line)}`); continue; }
+    const got = fetchPicture(scene.out, line.instant);
+    if (got.error) bad.push(`fetch of instant ${line.instant}: ${got.error}`);
+    else if (got.kind === 'lost') bad.push(`instant ${line.instant} comes back as lost`);
+  }
+  // an unchanged instant later in the same run must come back as a picture too
+  const later = scene.lines.find((line, k) => kindOf(line) === 'same' && scene.lines.slice(0, k).some(l => kindOf(l) === 'lost'));
+  if (later) {
+    const got = fetchPicture(scene.out, later.instant);
+    if (got.error || got.kind === 'lost') bad.push(`instant ${later.instant} (same, after a loss) comes back as ${got.error ?? 'lost'}`);
+  }
+  if (bad.length) return { problem: firstOf(bad) };
+  return { note: `${after.length} instants after a loss are recorded again and come back as pictures` };
+}
+
+/**
+ * A copy of a killed recording, changed by `damage(dir)`, then recovered by the product: { dir, result, before, lines }
+ * or { error } (with dir and before when the recovery itself failed). `held(dir)`, when given, names a file another
+ * process holds while the recovery runs.
+ */
+function recovered(fixture, name, damage, held) {
+  const source = path.join(ROOT, fixture);
+  if (!fs.existsSync(path.join(source, 'clip.json'))) return { error: `no killed recording at ${source}` };
+  const dir = path.join(OUT, name);
+  if (fs.existsSync(dir)) return { error: `output folder exists: ${dir}` };
+  fs.cpSync(source, dir, { recursive: true });
+  const before = readJsonl(path.join(dir, 'frames.jsonl'));
+  damage(dir);
+  const args = ['exp-av1-recover', `folder=${dir}`];
+  const run = held ? runProbeHolding(held(dir), args) : spawnSync(PROBE, args, { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
+  let result;
+  try { result = JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
+  if (!result.ok) return { error: `recovery failed: ${result.error}`, dir, before };
+  return { dir, result, before, lines: readJsonl(path.join(dir, 'frames.jsonl')) };
+}
+// Another process holds HOLD_FILE (opened for reading, sharing only delete, as an indexer or antivirus
+// may; HOLD_SHARE in `env` names other sharing) while the probe runs with the arguments of HOLD_ARGS
+// (one per line); prints the probe's output.
+const HOLD_AND_RUN = "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', $env:HOLD_SHARE); try { & $env:HOLD_PROBE ($env:HOLD_ARGS -split '\\n') } finally { $f.Close() }";
+/** Runs the probe with `args` (and `env` added) while another process holds `file`. */
+const runProbeHolding = (file, args, env = {}) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', HOLD_AND_RUN],
+  { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, HOLD_SHARE: 'Delete', ...env, HOLD_FILE: file, HOLD_PROBE: PROBE, HOLD_ARGS: args.join('\n') } });
+/** The probe's last output line as JSON, or { error }. */
+const probeJson = run => {
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
+  try { return JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
+};
+/** SHA-256 of every file under `dir`, by relative path. */
+const fileHashes = dir => Object.fromEntries(fs.readdirSync(dir, { recursive: true }).map(String).filter(file => fs.statSync(path.join(dir, file)).isFile()).map(file => [file, crypto.createHash('sha256').update(fs.readFileSync(path.join(dir, file))).digest('hex')]));
+const lastPart = dir => path.join(dir, 'video', fs.readdirSync(path.join(dir, 'video')).filter(f => /^part-\d+\.ivf$/.test(f)).sort().at(-1));
+const verdict = (problems, note) => ({ pass: problems.length === 0, value: '-', measured: problems.length ? problems.join('; ') : note });
+
+/** The recorder died while writing the first bytes of a new part: the earlier parts must stay readable. */
+function tornLastPart() {
+  const TORN_BYTES = 10; // less than the 32-byte IVF header
+  let torn;
+  const got = recovered('killed-real-page', 'crash-torn-part', dir => {
+    torn = Number(path.basename(lastPart(dir)).match(/\d+/)[0]);
+    fs.truncateSync(lastPart(dir), TORN_BYTES);
+  });
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  const earlier = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] < torn);
+  const stillEnc = earlier.filter(line => kindOf(got.lines[line.instant] ?? {}) === 'enc').length;
+  if (stillEnc !== earlier.length) problems.push(`${earlier.length - stillEnc} of ${earlier.length} pictures of the earlier parts are no longer in the index`);
+  const fromTorn = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] === torn);
+  const unnamed = fromTorn.filter(line => { const now = got.lines[line.instant] ?? {}; return kindOf(now) !== 'lost' || !String(now.lost).trim(); }).length;
+  if (unnamed) problems.push(`${unnamed} of ${fromTorn.length} pictures of the torn part are not named lost`);
+  const sample = earlier.at(-1);
+  const fetched = fetchPicture(got.dir, sample.instant);
+  if (fetched.error || fetched.kind !== 'video') problems.push(`instant ${sample.instant} of an earlier part comes back as ${fetched.error ?? fetched.kind}`);
+  return verdict(problems, `part ${torn} torn to ${TORN_BYTES} bytes: recovery succeeded, ${earlier.length} earlier pictures kept, ${fromTorn.length} named lost, instant ${sample.instant} comes back as video`);
+}
+
+/** The still reached disk but the video picture of its instant did not: the still must survive and be the answer. */
+function stillSurvivesRecovery() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  const got = recovered('killed-text-page', 'crash-still-without-video', dir => fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES));
+  if (got.error) return verdict([got.error]);
+  const still = got.before.find(line => line.still === true);
+  if (!still) return verdict(['the killed recording has no still']);
+  const problems = [];
+  if (!got.result.stills_on_disk.includes(still.instant)) problems.push(`still of instant ${still.instant} was deleted`);
+  const next = got.before[still.instant + 1];
+  for (const instant of [still.instant, ...(next && kindOf(next) === 'same' ? [next.instant] : [])]) {
+    const fetched = fetchPicture(got.dir, instant);
+    if (fetched.error || fetched.kind !== 'exact still') problems.push(`instant ${instant} comes back as ${fetched.error ?? fetched.kind}, not the exact still`);
+  }
+  return verdict(problems, `video pictures gone, still of instant ${still.instant} kept and returned as exact still`);
+}
+
+/**
+ * The still file of an instant is gone and its line is lost: no lost line may name that still.
+ * `alreadyLost` false: the line becomes lost in this recovery (its part is cut to the header).
+ * `alreadyLost` true: the index already holds the line as lost with its still mark (an earlier recovery wrote it).
+ */
+function lostLineNamesNoMissingStill(name, alreadyLost) {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  let gone;
+  const got = recovered('killed-text-page', name, dir => {
+    const index = path.join(dir, 'frames.jsonl');
+    const lines = readJsonl(index);
+    const still = lines.find(line => line.still === true);
+    if (!still) return;
+    gone = still.instant;
+    if (alreadyLost) {
+      lines[gone] = { instant: still.instant, t_ms: still.t_ms, lost: 'service_restart', still: true };
+      fs.writeFileSync(index, lines.map(line => `${JSON.stringify(line)}\n`).join(''));
+    } else fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    fs.rmSync(path.join(dir, 'stills', `still-${pad(gone, 8)}.webp`));
+  });
+  if (got.error) return verdict([got.error]);
+  if (gone === undefined) return verdict(['the killed recording has no still']);
+  const problems = [];
+  if (kindOf(got.lines[gone] ?? {}) !== 'lost') problems.push(`instant ${gone} is not named lost`);
+  const naming = got.lines.filter(line => kindOf(line) === 'lost' && ((line.still === true && line.instant === gone) || line.still_of === gone));
+  if (naming.length) problems.push(`${naming.length} lost lines name the missing still of instant ${gone} (first: instant ${naming[0].instant})`);
+  const next = got.before[gone + 1];
+  if (next && kindOf(next) === 'same' && kindOf(got.lines[next.instant] ?? {}) !== 'lost') problems.push(`instant ${next.instant} repeats the lost instant ${gone} and is not named lost`);
+  return verdict(problems, `still of instant ${gone} gone and its line lost: no line names the still`);
+}
+
+/** A planned length off the 50 ms grid: every planned instant has an index line after recovery. */
+function recoveryNamesEveryInstant() {
+  const OFF_GRID_MS = 25;
+  let planned;
+  const got = recovered('killed-text-page', 'crash-off-grid', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.end_ms = readJsonl(path.join(dir, 'frames.jsonl')).length * INSTANT_MS + OFF_GRID_MS;
+    planned = Math.ceil(clip.end_ms / INSTANT_MS);
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  if (got.lines.length !== planned) problems.push(`${got.lines.length} index lines after recovery, ${planned} instants were planned (end_ms ${OFF_GRID_MS} ms off the grid)`);
+  else if (kindOf(got.lines.at(-1)) !== 'lost') problems.push(`the last planned instant is ${kindOf(got.lines.at(-1))}, not named lost`);
+  return verdict(problems, `${planned} planned instants, ${got.lines.length} index lines, the last one named lost`);
+}
+
+/**
+ * A failed clip whose index was never made to agree with the disk (the reconcile at failure itself
+ * failed): recovery on start names every line whose picture is not on disk lost (encoder_failed),
+ * adds no instant, lists the lost lines in clip.json and leaves the clip failed. A second recovery
+ * of the now agreeing clip changes neither frames.jsonl nor clip.json.
+ */
+function failedClipReconciled() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  let torn;
+  const got = recovered('killed-text-page', 'failed-unreconciled', dir => {
+    torn = Number(path.basename(lastPart(dir)).match(/\d+/)[0]);
+    fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'failed';
+    clip.failure = 'bench: the encoder failed and the reconcile at failure failed too';
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const missing = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] === torn);
+  if (!missing.length) return verdict([`part ${torn} has no enc line`]);
+  const problems = [];
+  const unnamed = missing.filter(line => (got.lines[line.instant] ?? {}).lost !== 'encoder_failed');
+  if (unnamed.length) problems.push(`${unnamed.length} of ${missing.length} lines whose picture is not on disk are not named lost encoder_failed (first: instant ${unnamed[0].instant} is ${kindOf(got.lines[unnamed[0].instant] ?? {})})`);
+  if (got.lines.length !== got.before.length) problems.push(`${got.lines.length} index lines after recovery, ${got.before.length} before`);
+  const clipFile = path.join(got.dir, 'clip.json'), indexFile = path.join(got.dir, 'frames.jsonl');
+  const clip = JSON.parse(fs.readFileSync(clipFile, 'utf8'));
+  if (clip.state !== 'failed') problems.push(`the clip is ${clip.state}, not failed`);
+  const listed = new Set((clip.lost ?? []).map(lost => lost.instant));
+  const unlisted = got.lines.filter(line => kindOf(line) === 'lost' && !listed.has(line.instant));
+  if (unlisted.length) problems.push(`${unlisted.length} lost lines are not in the lost list of clip.json (first: instant ${unlisted[0].instant})`);
+  const [clipBefore, indexBefore] = [fs.readFileSync(clipFile, 'utf8'), fs.readFileSync(indexFile, 'utf8')];
+  const clipWrittenBefore = fs.statSync(clipFile).mtimeMs;
+  const videoDir = path.join(got.dir, 'video');
+  const partTimes = () => Object.fromEntries(fs.readdirSync(videoDir).filter(f => /^part-\d+\.ivf$/.test(f)).map(f => [f, fs.statSync(path.join(videoDir, f)).mtimeMs]));
+  const partsWrittenBefore = partTimes();
+  const again = spawnSync(PROBE, ['exp-av1-recover', `folder=${got.dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  let second = null;
+  try { second = JSON.parse(again.stdout.trim().split(/\r?\n/).pop()); } catch { /* reported below as a failed second recovery */ }
+  if (again.error || again.status !== 0 || !second?.ok) problems.push(`second recovery: ${again.error?.message || again.stderr.trim() || second?.error || `exit ${again.status}`}`);
+  else {
+    if (fs.readFileSync(indexFile, 'utf8') !== indexBefore) problems.push('a second recovery changed frames.jsonl');
+    if (fs.readFileSync(clipFile, 'utf8') !== clipBefore) problems.push('a second recovery changed clip.json');
+    else if (fs.statSync(clipFile).mtimeMs !== clipWrittenBefore) problems.push('a second recovery wrote clip.json again (same bytes, new modified time)');
+    const partsWrittenAfter = partTimes();
+    const rewritten = Object.keys(partsWrittenBefore).filter(part => partsWrittenAfter[part] !== partsWrittenBefore[part]);
+    if (rewritten.length) problems.push(`a second recovery wrote ${rewritten.length} of ${Object.keys(partsWrittenBefore).length} parts again (new modified time; first: ${rewritten[0]})`);
+  }
+  return verdict(problems, `failed clip, part ${torn} cut to its header: ${missing.length} lines named lost encoder_failed and listed, still failed; a second recovery changed nothing and wrote no file (clip.json, frames.jsonl, ${Object.keys(partsWrittenBefore).length} parts)`);
+}
+
+/**
+ * A clip failed by a recorder thread that ended without finishing (RecorderClaim::drop writes
+ * state failed and lost_cause recorder_ended, with no reconcile): recovery on start names every line
+ * whose picture is not on disk lost with that cause, in frames.jsonl and in clip.json, never
+ * encoder_failed.
+ */
+function failedByRecorderEndNamed() {
+  const IVF_HEADER_BYTES = 32; // the part keeps its header and loses every picture
+  const CAUSE = 'recorder_ended';
+  let torn;
+  const got = recovered('killed-text-page', 'failed-recorder-ended', dir => {
+    torn = Number(path.basename(lastPart(dir)).match(/\d+/)[0]);
+    fs.truncateSync(lastPart(dir), IVF_HEADER_BYTES);
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'failed';
+    clip.failure = 'the recorder thread ended without finishing';
+    clip.lost_cause = CAUSE;
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const missing = got.before.filter(line => kindOf(line) === 'enc' && line.enc[0] === torn);
+  if (!missing.length) return verdict([`part ${torn} has no enc line`]);
+  const problems = [];
+  const misnamed = missing.filter(line => (got.lines[line.instant] ?? {}).lost !== CAUSE);
+  if (misnamed.length) problems.push(`${misnamed.length} of ${missing.length} lines whose picture is not on disk are not named lost ${CAUSE} (first: instant ${misnamed[0].instant} is ${JSON.stringify(got.lines[misnamed[0].instant] ?? {})})`);
+  const clip = JSON.parse(fs.readFileSync(path.join(got.dir, 'clip.json'), 'utf8'));
+  if (clip.state !== 'failed') problems.push(`the clip is ${clip.state}, not failed`);
+  const listedOther = (clip.lost ?? []).filter(lost => lost.cause !== CAUSE);
+  if (listedOther.length) problems.push(`${listedOther.length} lost instants in clip.json have another cause (first: instant ${listedOther[0].instant} ${listedOther[0].cause})`);
+  return verdict(problems, `clip failed by a recorder that ended without finishing, part ${torn} cut to its header: ${missing.length} lines named lost ${CAUSE} in frames.jsonl and clip.json`);
+}
+
+/**
+ * A failed clip that cannot be reconciled (clip.json says fps 0, and its index has a gap at instant 0,
+ * so lost lines would have to be made): recovery refuses it with an error and does not crash.
+ */
+function failedClipZeroFpsRefused() {
+  const got = recovered('killed-text-page', 'failed-zero-fps', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'failed';
+    clip.failure = 'bench: failed with fps 0';
+    clip.fps = 0;
+    fs.writeFileSync(file, JSON.stringify(clip));
+    const index = path.join(dir, 'frames.jsonl');
+    fs.writeFileSync(index, readJsonl(index).slice(1, 2).map(line => `${JSON.stringify(line)}\n`).join(''));
+  });
+  if (!got.error) return verdict(['recovery accepted a failed clip with fps 0']);
+  const refused = /^recovery failed: .*zero fps/.test(got.error);
+  return verdict(refused ? [] : [`recovery did not refuse cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], 'failed clip with fps 0 and a gap at instant 0: recovery refuses it (zero fps) and does not crash');
+}
+
+/**
+ * clip.json is refused where it is read when it says fps 0, whatever the clip's state: every reader
+ * (recovery, status, viewer) divides by fps. A ready clip is the case recovery itself never divided for.
+ */
+function zeroFpsRefusedAtRead() {
+  const got = recovered('killed-text-page', 'ready-zero-fps', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.state = 'ready';
+    clip.fps = 0;
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (!got.error) return verdict(['a ready clip with fps 0 was read without an error']);
+  const refused = /^recovery failed: .*zero fps/.test(got.error);
+  return verdict(refused ? [] : [`the clip was not refused cleanly: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`], 'ready clip with fps 0: refused when clip.json is read (zero fps)');
+}
+
+/**
+ * A killed recording whose clip.json plans more than the longest recording (10 minutes, made before
+ * the limit existed or a damaged clip.json): recovery recovers what is on disk and caps the plan at
+ * the longest recording. The clip is ready with 12000 index lines; its recorded lines are the ones a
+ * recovery of the same recording with its own plan keeps; every line after them is named lost.
+ */
+function overlongClipCapped() {
+  const LONGEST_MS = 600_000; // the recorder's longest clip
+  const LONGEST_INSTANTS = LONGEST_MS / INSTANT_MS;
+  const got = recovered('killed-text-page', 'crash-overlong', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    clip.end_ms = LONGEST_MS + INSTANT_MS;
+    fs.writeFileSync(file, JSON.stringify(clip));
+  });
+  if (got.error) return verdict([got.error]);
+  const reference = recovered('killed-text-page', 'crash-overlong-reference', () => {});
+  if (reference.error) return verdict([`reference recovery: ${reference.error}`]);
+  const problems = [];
+  if (got.result.state !== 'ready') problems.push(`the clip is ${got.result.state}, not ready`);
+  if (got.lines.length !== LONGEST_INSTANTS) problems.push(`${got.lines.length} index lines after recovery, ${LONGEST_INSTANTS} expected`);
+  const recorded = got.before.length;
+  const changed = got.before.filter(line => JSON.stringify(got.lines[line.instant]) !== JSON.stringify(reference.lines[line.instant]));
+  if (changed.length) problems.push(`${changed.length} of ${recorded} recorded lines differ from the reference recovery (first: instant ${changed[0].instant})`);
+  const unnamed = got.lines.slice(recorded).filter(line => kindOf(line) !== 'lost');
+  if (unnamed.length) problems.push(`${unnamed.length} lines after the recorded ones are not named lost (first: instant ${unnamed[0].instant})`);
+  return verdict(problems, `clip planned ${LONGEST_MS + INSTANT_MS} ms long: recovered ready, ${got.lines.length} index lines (capped at the longest recording), ${recorded} recorded lines kept`);
+}
+
+/**
+ * A clip folder of an older format (its clip.json lacks `method`, as the 16 old clips on disk do):
+ * recovery skips it quietly (no error, so no CLIP_RECOVERY_FAILED warning) and changes nothing in it.
+ */
+function otherFormatSkipped() {
+  const list = dir => fs.readdirSync(dir, { recursive: true }).map(String).sort();
+  let filesBefore, clipBefore;
+  const got = recovered('killed-text-page', 'other-format', dir => {
+    const file = path.join(dir, 'clip.json'), clip = JSON.parse(fs.readFileSync(file, 'utf8'));
+    delete clip.method;
+    fs.writeFileSync(file, JSON.stringify(clip));
+    clipBefore = fs.readFileSync(file, 'utf8');
+    filesBefore = list(dir);
+  });
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  if (fs.readFileSync(path.join(got.dir, 'clip.json'), 'utf8') !== clipBefore) problems.push('recovery changed clip.json');
+  if (JSON.stringify(got.lines) !== JSON.stringify(got.before)) problems.push('recovery changed frames.jsonl');
+  const filesAfter = list(got.dir);
+  const added = filesAfter.filter(file => !filesBefore.includes(file)), removed = filesBefore.filter(file => !filesAfter.includes(file));
+  if (added.length || removed.length) problems.push(`recovery added ${added.join(', ') || 'nothing'} and removed ${removed.join(', ') || 'nothing'}`);
+  return verdict(problems, 'clip.json without method (an older format): recovery skips it without an error and changes no file');
+}
+
+/**
+ * A still file cut to 0 bytes while its index line reached the disk (a power loss): recovery treats
+ * it as a missing still. No line names it, its file is gone, and its instant comes back as the
+ * video picture that is on disk.
+ */
+function emptyStillMissing() {
+  let cut;
+  const got = recovered('killed-text-page', 'crash-empty-still', dir => {
+    const still = readJsonl(path.join(dir, 'frames.jsonl')).find(line => line.still === true && kindOf(line) === 'enc');
+    if (!still) return;
+    cut = still.instant;
+    fs.truncateSync(path.join(dir, 'stills', `still-${pad(cut, 8)}.webp`), 0);
+  });
+  if (got.error) return verdict([got.error]);
+  if (cut === undefined) return verdict(['the killed recording has no still on an encoded instant']);
+  const problems = [];
+  const naming = got.lines.filter(line => (line.still === true && line.instant === cut) || line.still_of === cut);
+  if (naming.length) problems.push(`${naming.length} lines still name the empty still of instant ${cut} (first: instant ${naming[0].instant})`);
+  if (got.result.stills_on_disk.includes(cut)) problems.push(`the empty still of instant ${cut} is still on disk`);
+  const fetched = fetchPicture(got.dir, cut);
+  if (fetched.error || fetched.kind !== 'video') problems.push(`instant ${cut} comes back as ${fetched.error ?? fetched.kind}, not video`);
+  return verdict(problems, `still of instant ${cut} cut to 0 bytes: no line names it, its file is removed, the instant comes back as video`);
+}
+
+/**
+ * A still another process holds while recovery runs (it cannot be opened for reading, but may be deleted):
+ * a still that could not be read is not a missing still. Recovery ends with an error and changes nothing:
+ * every file of the folder is still there with the same bytes, the still among them.
+ */
+function heldStillKept() {
+  let held, filesBefore;
+  const got = recovered('killed-text-page', 'crash-held-still', dir => {
+    const still = readJsonl(path.join(dir, 'frames.jsonl')).find(line => line.still === true);
+    if (!still) return;
+    held = path.join(dir, 'stills', `still-${pad(still.instant, 8)}.webp`);
+    filesBefore = fileHashes(dir);
+  }, () => held);
+  if (held === undefined) return verdict(['the killed recording has no still']);
+  if (!got.dir) return verdict([got.error]);
+  const problems = [];
+  if (!got.error) problems.push('recovery succeeded while it could not read a still');
+  else if (!/^recovery failed: .*could not read .*still-\d{8}\.webp/.test(got.error)) problems.push(`recovery failed for another reason: ${got.error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  const filesAfter = fileHashes(got.dir);
+  const changed = Object.keys(filesBefore).filter(file => filesAfter[file] !== filesBefore[file]);
+  if (changed.length) problems.push(`recovery removed or changed ${changed.join(', ')}`);
+  return verdict(problems, `still ${path.basename(held)} held by another process: recovery ends with an error and every file of the folder is unchanged`);
+}
+
+/**
+ * The clip registry (active-clips.json under the default clips folder, here under a LOCALAPPDATA of the
+ * bench's own) is held by another process while a clip is marked finished: a registry change never
+ * writes from a failed read. The change ends with an error and the registry keeps its bytes.
+ */
+function registryKeptOnFailedRead() {
+  const appData = path.join(OUT, 'registry-held');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const file = path.join(clips, 'active-clips.json');
+  const entries = ['clip-a', 'clip-b'].map((id, n) => ({ clip_id: id, folder: path.join(clips, id), finished: n === 1 }));
+  fs.writeFileSync(file, JSON.stringify(entries, null, 2));
+  const before = fs.readFileSync(file, 'utf8');
+  const got = probeJson(runProbeHolding(file, ['exp-av1-registry', 'action=mark_finished', 'clip=clip-a'], { LOCALAPPDATA: appData }));
+  const problems = [];
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('mark_finished succeeded while it could not read the registry');
+  const after = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  if (after !== before) problems.push(`the registry was written from a failed read: it now holds ${after === null ? 'no file' : after.replace(/\s+/g, ' ').slice(0, 120)}`);
+  return verdict(problems, `registry held by another process: mark_finished ended with an error (${String(got.error).replace(/\s+/g, ' ').slice(0, 120)}) and the registry kept its ${entries.length} entries byte for byte`);
+}
+
+/**
+ * A failed atomic write removes its temp file. The registry file is read-only (here under a LOCALAPPDATA
+ * of the bench's own), so the rename of the written temp file over it fails: the change ends with an
+ * error, the registry is byte-equal and no `active-clips.json.tmp` is left.
+ */
+function failedAtomicWriteRemovesTemp() {
+  const appData = path.join(OUT, 'registry-write-failed');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const file = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(file, JSON.stringify([{ clip_id: 'clip-a', folder: path.join(clips, 'clip-a'), finished: false }], null, 2));
+  const before = fs.readFileSync(file, 'utf8');
+  fs.chmodSync(file, 0o444);
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=mark_finished', 'clip=clip-a'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  fs.chmodSync(file, 0o666);
+  const problems = [];
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('mark_finished succeeded while the registry is read-only');
+  if (fs.readFileSync(file, 'utf8') !== before) problems.push('the read-only registry changed');
+  const temp = `${file}.tmp`;
+  if (fs.existsSync(temp)) problems.push(`the failed write left its temp file ${path.basename(temp)}`);
+  return verdict(problems, `read-only registry: mark_finished ended with an error (${String(got.error).replace(/\s+/g, ' ').slice(0, 120)}), the registry is byte-equal and no temp file is left`);
+}
+
+/**
+ * A failed atomic write removes its temp file, or says it could not. Another process holds
+ * `active-clips.json.tmp` (opened for reading, sharing read and write but not delete): the product
+ * writes the temp file, but neither the rename over the registry nor the removal of the temp file can
+ * happen. The change ends with an error that names the temp file it could not remove, and the registry
+ * is byte-equal.
+ */
+function failedTempRemovalReported() {
+  const appData = path.join(OUT, 'registry-temp-held');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const file = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(file, JSON.stringify([{ clip_id: 'clip-a', folder: path.join(clips, 'clip-a'), finished: false }], null, 2));
+  const before = fs.readFileSync(file, 'utf8');
+  const temp = `${file}.tmp`;
+  fs.writeFileSync(temp, '');
+  const got = probeJson(runProbeHolding(temp, ['exp-av1-registry', 'action=mark_finished', 'clip=clip-a'], { LOCALAPPDATA: appData, HOLD_SHARE: 'ReadWrite' }));
+  const problems = [];
+  const error = String(got.error);
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('mark_finished succeeded while its temp file could not be renamed');
+  else if (!error.includes(`could not remove ${temp}`)) problems.push(`the error does not say the temp file could not be removed: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  if (fs.readFileSync(file, 'utf8') !== before) problems.push('the registry changed');
+  return verdict(problems, `temp file held without delete sharing: mark_finished ended with an error naming the temp file it could not remove (${error.replace(/\s+/g, ' ').slice(0, 200)}); the registry is byte-equal`);
+}
+
+/**
+ * A clip the earlier code recorded in the default clips folder without registering it, left `recording`
+ * by a crash, with no registry at all (here under a LOCALAPPDATA of the bench's own): recovery at start
+ * reaches it. The clip is ready afterwards and the registry lists it, finished.
+ */
+function unregisteredDefaultClipRecovered() {
+  const appData = path.join(OUT, 'registry-unregistered');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const source = path.join(ROOT, 'killed-text-page');
+  const clipId = JSON.parse(fs.readFileSync(path.join(source, 'clip.json'), 'utf8')).clip_id;
+  const clips = path.join(appData, 'synapse', 'clips');
+  const folder = path.join(clips, clipId);
+  fs.cpSync(source, folder, { recursive: true });
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  if (!got.ok) problems.push(`recovery at start: ${got.error}`);
+  const state = JSON.parse(fs.readFileSync(path.join(folder, 'clip.json'), 'utf8')).state;
+  if (state !== 'ready') problems.push(`the unregistered clip is ${state} after recovery at start, not ready`);
+  const registry = path.join(clips, 'active-clips.json');
+  const entries = fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, 'utf8')) : [];
+  const entry = entries.find(e => e.clip_id === clipId);
+  if (!entry) problems.push(`the registry does not list the clip (${entries.length} entries)`);
+  else if (!entry.finished || path.resolve(entry.folder) !== folder) problems.push(`the registry lists the clip as ${JSON.stringify(entry)}`);
+  return verdict(problems, `unregistered clip ${clipId} in the default folder, left recording: recovery at start registered it, made it ready and marked it finished`);
+}
+
+/**
+ * A clip recorded with an explicit folder under the default clips folder: its folder name is not its
+ * clip id. Recovery at start registers each such clip under the clip_id its clip.json names, also when
+ * its folder name is the id of another registered clip, and never under its folder name.
+ */
+function defaultClipRegisteredByItsId() {
+  const appData = path.join(OUT, 'registry-by-id');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const source = path.join(ROOT, 'killed-text-page');
+  const clipId = JSON.parse(fs.readFileSync(path.join(source, 'clip.json'), 'utf8')).clip_id;
+  const clips = path.join(appData, 'synapse', 'clips');
+  const named = path.join(clips, 'clip-other'), explicit = path.join(clips, 'explicit-b');
+  fs.cpSync(source, named, { recursive: true });
+  fs.cpSync(source, explicit, { recursive: true });
+  const explicitJson = path.join(explicit, 'clip.json');
+  const explicitClip = JSON.parse(fs.readFileSync(explicitJson, 'utf8'));
+  explicitClip.clip_id = `${clipId}-b`;
+  fs.writeFileSync(explicitJson, JSON.stringify(explicitClip));
+  const registry = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(registry, JSON.stringify([{ clip_id: 'clip-other', folder: path.join(appData, 'elsewhere', 'clip-other'), finished: true }], null, 2));
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  if (!got.ok) problems.push(`recovery at start: ${got.error}`);
+  const entries = JSON.parse(fs.readFileSync(registry, 'utf8'));
+  for (const [id, folder] of [[clipId, named], [`${clipId}-b`, explicit]]) {
+    const state = JSON.parse(fs.readFileSync(path.join(folder, 'clip.json'), 'utf8')).state;
+    if (state !== 'ready') problems.push(`${path.basename(folder)} is ${state} after recovery at start, not ready`);
+    const entry = entries.find(e => e.clip_id === id && path.resolve(e.folder) === folder);
+    if (!entry) problems.push(`the registry does not list ${id} with folder ${path.basename(folder)}`);
+    else if (!entry.finished) problems.push(`the registry lists ${id} unfinished`);
+  }
+  const byName = entries.filter(e => e.clip_id === 'explicit-b');
+  if (byName.length) problems.push(`the registry lists a clip under its folder name explicit-b: ${JSON.stringify(byName[0])}`);
+  return verdict(problems, `clips in clip-other (id ${clipId}, folder name registered for another clip) and explicit-b (id ${clipId}-b): both registered under their clip.json id, recovered ready and finished`);
+}
+
+/**
+ * Recovery at start reports what happened: a registered clip it could not recover (its clip.json is
+ * not JSON) makes the run end with an error naming that clip, and the clip stays unfinished.
+ */
+function recoveryFailureReported() {
+  const appData = path.join(OUT, 'registry-recovery-failed');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  const folder = path.join(appData, 'elsewhere', 'clip-broken');
+  fs.mkdirSync(clips, { recursive: true });
+  fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(folder, 'clip.json'), 'not json');
+  const registry = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(registry, JSON.stringify([{ clip_id: 'clip-broken', folder, finished: false }], null, 2));
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('recovery at start reported ok while it could not recover clip-broken');
+  else if (!String(got.error).includes(path.join(folder, 'clip.json'))) problems.push(`the error does not name the clip.json of clip-broken: ${String(got.error).replace(/\s+/g, ' ').slice(0, 200)}`);
+  const entry = JSON.parse(fs.readFileSync(registry, 'utf8')).find(e => e.clip_id === 'clip-broken');
+  if (!entry || entry.finished) problems.push(`the registry lists clip-broken as ${JSON.stringify(entry)}, not unfinished`);
+  return verdict(problems, `registered clip with a clip.json that is not JSON: recovery at start ended with an error (${String(got.error).replace(/\s+/g, ' ').slice(0, 120)}) and the clip stays unfinished`);
+}
+
+/**
+ * Recovery at start reports every failure: registering the default folder meets a clip whose clip.json
+ * is not JSON and then cannot write the registry (read-only). The run ends with an error naming both
+ * the unreadable clip.json and the registry.
+ */
+function registerFailuresAllReported() {
+  const appData = path.join(OUT, 'registry-register-failures');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const source = path.join(ROOT, 'killed-text-page');
+  const clips = path.join(appData, 'synapse', 'clips');
+  const broken = path.join(clips, 'clip-broken');
+  fs.cpSync(source, path.join(clips, 'clip-readable'), { recursive: true });
+  fs.mkdirSync(broken, { recursive: true });
+  fs.writeFileSync(path.join(broken, 'clip.json'), 'not json');
+  const registry = path.join(clips, 'active-clips.json');
+  fs.writeFileSync(registry, '[]');
+  fs.chmodSync(registry, 0o444);
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  fs.chmodSync(registry, 0o666);
+  const problems = [];
+  const error = String(got.error);
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('recovery at start reported ok while it could not write the registry');
+  else {
+    if (!error.includes(broken)) problems.push(`the error does not name clip-broken: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+    if (!error.includes(registry)) problems.push(`the error does not name the registry: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  }
+  return verdict(problems, `unreadable clip-broken and a read-only registry: recovery at start ended with an error naming both (${error.replace(/\s+/g, ' ').slice(0, 160)})`);
+}
+
+/**
+ * Registering the default folder reports an entry it cannot read, never skips it silently: the default
+ * clips folder holds clip-loop, a junction that points to itself, so its clip.json cannot be resolved
+ * (an error other than "not found"). Recovery at start ends with an error naming clip-loop.
+ */
+function unreadableEntryReported() {
+  const appData = path.join(OUT, 'registry-unreadable-entry');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  const clips = path.join(appData, 'synapse', 'clips');
+  fs.mkdirSync(clips, { recursive: true });
+  const loop = path.join(clips, 'clip-loop');
+  fs.symlinkSync(loop, loop, 'junction');
+  const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=recover'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+  const problems = [];
+  const error = String(got.error);
+  if (got.ok === undefined) problems.push(`probe: ${got.error}`);
+  else if (got.ok) problems.push('recovery at start reported ok while it could not read clip-loop');
+  else if (!error.includes(path.join(loop, 'clip.json'))) problems.push(`the error does not name the clip.json of clip-loop: ${error.replace(/\s+/g, ' ').slice(0, 200)}`);
+  return verdict(problems, `clip-loop (a junction to itself) in the default folder: recovery at start ended with an error naming its clip.json (${error.replace(/\s+/g, ' ').slice(0, 200)})`);
+}
+
+/**
+ * A `record` that failed before its first picture drops its registry entry, and nothing else of the
+ * registry: the registry file and its lock file belong to the registry, a store every start shares, so
+ * they stay (deleting a lock file lets two writers hold different lock files at once). With a second
+ * clip listed, the registry keeps exactly that clip; with none, it holds [].
+ */
+function failedStartKeepsRegistry() {
+  const problems = [];
+  const cases = [['registry-failed-start-only', ['clip-a'], []], ['registry-failed-start-other', ['clip-a', 'clip-b'], ['clip-b']]];
+  for (const [name, listed, left] of cases) {
+    const appData = path.join(OUT, name);
+    if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+    const clips = path.join(appData, 'synapse', 'clips');
+    fs.mkdirSync(clips, { recursive: true });
+    const registry = path.join(clips, 'active-clips.json');
+    const lock = `${registry}.lock`;
+    fs.writeFileSync(registry, JSON.stringify(listed.map(id => ({ clip_id: id, folder: path.join(clips, id), finished: false })), null, 2));
+    fs.writeFileSync(lock, '');
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=remove', 'clip=clip-a'], { encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (!got.ok) { problems.push(`${name}: remove: ${got.error}`); continue; }
+    const ids = fs.existsSync(registry) ? JSON.parse(fs.readFileSync(registry, 'utf8')).map(e => e.clip_id) : null;
+    if (ids === null) problems.push(`${name}: the registry file was deleted`);
+    else if (JSON.stringify(ids) !== JSON.stringify(left)) problems.push(`${name}: the registry lists ${JSON.stringify(ids)}, not ${JSON.stringify(left)}`);
+    if (!fs.existsSync(lock)) problems.push(`${name}: the registry's lock file was deleted`);
+  }
+  return verdict(problems, 'failed start: its entry dropped; the registry file and its lock file stay; with a second clip listed the registry keeps exactly that clip, with none it holds []');
+}
+
+/**
+ * A clip folder never is, or holds, the default clips folder or the registry: a failed start removes its
+ * clip folder with everything in it. Under a LOCALAPPDATA of the bench's own with no synapse folder (so
+ * the clips folder does not exist yet and `record` would create it as the clip folder), the product's
+ * check refuses the clips folder however it is written, the folder above it and the registry path, and
+ * accepts a folder inside the clips folder and one elsewhere.
+ */
+function clipFolderNeverHoldsRegistry() {
+  const appData = path.join(OUT, 'clip-folder-check');
+  if (fs.existsSync(appData)) return verdict([`output folder exists: ${appData}`]);
+  fs.mkdirSync(appData, { recursive: true });
+  const clips = path.join(appData, 'synapse', 'clips');
+  const cases = [
+    ['the clips folder', clips, false],
+    ['the clips folder in other case, with .. and a trailing separator', `${path.join(appData, 'SYNAPSE', 'x')}\\..\\CLIPS\\`, false],
+    ['the clips folder relative to the working folder', path.join('synapse', 'clips'), false],
+    ['the synapse folder above it', path.join(appData, 'synapse'), false],
+    ['the registry path', path.join(clips, 'active-clips.json'), false],
+    ['a folder in the clips folder', path.join(clips, 'clip-new'), true],
+    ['a folder elsewhere', path.join(appData, 'elsewhere', 'clip'), true],
+  ];
+  const problems = [];
+  for (const [name, folder, accepted] of cases) {
+    const got = probeJson(spawnSync(PROBE, ['exp-av1-registry', 'action=check_folder', `folder=${folder}`], { cwd: appData, encoding: 'utf8', maxBuffer: BIG_OUTPUT, env: { ...process.env, LOCALAPPDATA: appData } }));
+    if (got.ok === undefined) problems.push(`${name}: probe: ${String(got.error).replace(/\s+/g, ' ').slice(0, 160)}`);
+    else if (got.ok !== accepted) problems.push(`${name} (${folder}) was ${got.ok ? 'accepted' : `refused: ${got.error}`}`);
+    else if (!accepted && !/holds the default clips folder/.test(String(got.error))) problems.push(`${name}: refused for another reason: ${got.error}`);
+  }
+  if (fs.existsSync(path.join(appData, 'synapse'))) problems.push('the check created the synapse folder');
+  return verdict(problems, `${cases.filter(c => !c[2]).length} ways of naming the clips folder, a folder above it or the registry are refused; a folder in the clips folder and one elsewhere are accepted`);
+}
+
+/**
+ * Recovery answers whether a clip needs no more recovery: the registry marks such a clip finished
+ * and recovery at the next start does not visit it. A recovered killed recording needs none, and
+ * neither does the ready clip on a second recovery.
+ */
+function recoveredClipFinished() {
+  const got = recovered('killed-text-page', 'finished-recovered', () => {});
+  if (got.error) return verdict([got.error]);
+  const problems = [];
+  if (got.result.finished !== true) problems.push(`recovery of a killed recording answered finished = ${got.result.finished}, not true`);
+  const again = spawnSync(PROBE, ['exp-av1-recover', `folder=${got.dir}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  let second = null;
+  try { second = JSON.parse(again.stdout.trim().split(/\r?\n/).pop()); } catch { /* reported below */ }
+  if (again.error || again.status !== 0 || !second?.ok) problems.push(`second recovery: ${again.error?.message || again.stderr.trim() || second?.error || `exit ${again.status}`}`);
+  else if (second.finished !== true) problems.push(`second recovery of the ready clip answered finished = ${second.finished}, not true`);
+  return verdict(problems, 'killed recording: recovery answered finished; the ready clip on a second recovery answered finished');
+}
+
+/** One picture fetched through the product's decoder (`clip-probe exp-av1-fetch`): its JSON line, or { error }. */
+function fetchPicture(folder, instant) {
+  const run = spawnSync(PROBE, ['exp-av1-fetch', `folder=${folder}`, `instant=${instant}`], { encoding: 'utf8', maxBuffer: BIG_OUTPUT });
+  if (run.error || run.status !== 0) return { error: run.error?.message || run.stderr.trim() || `exit ${run.status}` };
+  try { return JSON.parse(run.stdout.trim().split(/\r?\n/).pop()); } catch (error) { return { error: `no JSON line: ${error.message}` }; }
+}
+
+/** The recorded clip of the fetch checks: its index, or the reason it cannot be used. */
+function fetchClip() {
+  const index = path.join(FETCH_CLIP, 'frames.jsonl');
+  if (!fs.existsSync(index)) return { error: `no recorded clip at ${FETCH_CLIP}` };
+  return { enc: readJsonl(index).filter(line => kindOf(line) === 'enc') };
+}
+
+/** The worst place to fetch: the picture with the largest index-in-part (everything before it in the part is decoded). */
+function latePictureInTime() {
+  const clip = fetchClip();
+  if (clip.error) return { pass: false, value: '-', measured: clip.error };
+  const line = clip.enc.reduce((best, candidate) => (candidate.enc[1] > best.enc[1] ? candidate : best));
+  const got = fetchPicture(FETCH_CLIP, line.instant);
+  if (got.error) return { pass: false, value: '-', measured: got.error };
+  const measured = `instant ${line.instant} [${line.enc}]: ${got.total_ms} ms in all (read ${got.read_part_ms}, decode ${got.decode_ms}, convert ${got.convert_ms}), ${got.pictures_decoded} pictures decoded, kind ${got.kind}`;
+  const pass = got.kind === 'video' && got.pictures_decoded === line.enc[1] + 1 && got.total_ms < READ_BACK_MS;
+  return { pass, value: `${got.total_ms} ms`, measured };
+}
+
+/**
+ * A change of decoder must not change a picture: the fetched pixels equal the reference hashes
+ * (first, deepest and last encoded instant). `golden=write` stores the hashes of the current
+ * build as the reference and leaves the check pending for that run.
+ */
+function fetchedPictureIsRecorded() {
+  const clip = fetchClip();
+  if (clip.error) return { pass: false, value: '-', measured: clip.error };
+  const deepest = clip.enc.reduce((best, candidate) => (candidate.enc[1] > best.enc[1] ? candidate : best));
+  const instants = [...new Set([clip.enc[0].instant, deepest.instant, clip.enc.at(-1).instant])];
+  const hashes = {};
+  for (const instant of instants) {
+    const got = fetchPicture(FETCH_CLIP, instant);
+    if (got.error) return { pass: false, value: '-', measured: `instant ${instant}: ${got.error}` };
+    hashes[instant] = got.rgba_sha256;
+  }
+  if (options.golden === 'write') {
+    fs.writeFileSync(FETCH_GOLDEN, `${JSON.stringify(hashes, null, 2)}\n`);
+    return { pass: 'PENDING', value: '-', measured: `reference written for instants ${instants.join(', ')}` };
+  }
+  if (!fs.existsSync(FETCH_GOLDEN)) return { pass: false, value: '-', measured: `no reference at ${FETCH_GOLDEN} (run once with golden=write)` };
+  const golden = JSON.parse(fs.readFileSync(FETCH_GOLDEN, 'utf8'));
+  const differ = instants.filter(instant => golden[instant] !== hashes[instant]);
+  return { pass: differ.length === 0, value: '-', measured: differ.length ? `pixels differ from the reference at instants ${differ.join(', ')}` : `${instants.length} pictures equal the reference (instants ${instants.join(', ')})` };
+}
+
+/** Reported, not judged: one row per scene from probe.json. */
+function printMeasures() {
+  console.log('scene | video MB/min | stills MB/min | cpu s per recorded s | peak RAM MB | first_encoded_ms | lost');
+  for (const scene of scenes) {
+    const p = scene.probe;
+    if (!p) { console.log(`${scene.name} | - | - | - | - | - | -`); continue; }
+    const seconds = p.instants / (1000 / INSTANT_MS);
+    const perMinute = bytes => (bytes / MB / (seconds / 60)).toFixed(2);
+    // sizes are read from the files on disk, not from the probe's own count
+    const onDisk = dir => (fs.existsSync(path.join(scene.out, dir)) ? fs.readdirSync(path.join(scene.out, dir)).reduce((sum, f) => sum + fs.statSync(path.join(scene.out, dir, f)).size, 0) : 0);
+    console.log(`${scene.name} | ${perMinute(onDisk('video'))} | ${perMinute(onDisk('stills'))} | ${(p.cpu_ns / 1e9 / seconds).toFixed(3)} | ${(p.ram_peak / MB).toFixed(1)} | ${p.first_encoded_ms} | ${p.lost}`);
+  }
+}
+
+const scenes = SCENES.map(name => new Scene(name));
+let stillsCompared = 0;
+fs.mkdirSync(OUT, { recursive: true });
+for (const scene of scenes) scene.record();
+const table = {
+  'every instant is accounted for': () => judge(everyInstant),
+  'nothing is lost silently': () => judge(nothingLostSilently),
+  'the video decodes': () => judge(videoDecodes),
+  'a still is exact': stillsExact,
+  'a still appears when the window settles': () => judge(stillOnSettle),
+  'unchanged instants cost nothing': () => judge(unchangedCostsNothing),
+  'read-back': () => judge(readBack),
+  'a resized window keeps recording': () => judge(resizeKeepsRecording),
+  'a picture after a lost instant is recorded again': () => judge(recordedAgainAfterLoss),
+  'each instant logs the cursor of its frame': () => judge(cursorLogged),
+  'a torn last part does not stop recovery': tornLastPart,
+  'recovery keeps a complete still': stillSurvivesRecovery,
+  'a lost line names no missing still': () => lostLineNamesNoMissingStill('crash-still-and-video-gone', false),
+  'a line already lost names no missing still': () => lostLineNamesNoMissingStill('crash-lost-line-stale-still', true),
+  'recovery names every planned instant': recoveryNamesEveryInstant,
+  'recovery makes a failed clip agree with its pictures': failedClipReconciled,
+  'recovery names the losses of a clip whose recorder ended': failedByRecorderEndNamed,
+  'recovery refuses a failed clip with zero fps': failedClipZeroFpsRefused,
+  'recovery caps a clip longer than the longest recording': overlongClipCapped,
+  'a clip with zero fps is refused when it is read': zeroFpsRefusedAtRead,
+  'recovery skips a clip of another format quietly': otherFormatSkipped,
+  'recovery says a recovered clip needs no more recovery': recoveredClipFinished,
+  'recovery treats an empty still as missing': emptyStillMissing,
+  'recovery never deletes a still it could not read': heldStillKept,
+  'a registry change never writes from a failed read': registryKeptOnFailedRead,
+  'a failed atomic write removes its temp file': failedAtomicWriteRemovesTemp,
+  'a failed atomic write says when it could not remove its temp file': failedTempRemovalReported,
+  'recovery at start reaches an unregistered clip in the default folder': unregisteredDefaultClipRecovered,
+  'recovery at start registers a default-folder clip under the id its clip.json names': defaultClipRegisteredByItsId,
+  'recovery at start reports a clip it could not recover': recoveryFailureReported,
+  'recovery at start reports every failure of registering the default folder': registerFailuresAllReported,
+  'recovery at start reports an entry of the default folder it cannot read': unreadableEntryReported,
+  'a failed start leaves no registry entry and never deletes the registry or its lock file': failedStartKeepsRegistry,
+  'a clip folder never is or holds the clips folder or the registry': clipFolderNeverHoldsRegistry,
+  'a late picture comes back in time': latePictureInTime,
+  'the fetched picture is the recorded one': fetchedPictureIsRecorded,
+};
+fs.writeFileSync(path.join(OUT, 'checks.json'), `${JSON.stringify(scenes.map(s => ({ name: s.name, error: s.error, probe: s.probe })), null, 2)}\n`);
+process.exitCode = runFeature('av1-probe', path.join(BASE, 'spec/av1-probe.feature'), table);
+printMeasures();

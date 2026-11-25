@@ -1,0 +1,102 @@
+<title>R בשלושה טקסטים</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+  /* Layout: one reading column; the same screen text three times, stacked, so the eye compares line by line. */
+  :root {
+    --bg: #eef2f5; --surface: #ffffff; --ink: #18222d; --muted: #566270; --line: #d6dee6;
+    --accent: #23686c; --err-bg: #ffd6d2; --err-ink: #a11d16; --ok: #2c7a4b;
+    --f-body: "Heebo", "Segoe UI", Arial, sans-serif;
+    --f-mono: "IBM Plex Mono", Consolas, "Courier New", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #10161c; --surface: #18212a; --ink: #e4eaf0; --muted: #9aa7b4; --line: #2a3541;
+      --accent: #74bcc0; --err-bg: #5c1d19; --err-ink: #ffb3ab; --ok: #73c492; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161c; --surface: #18212a; --ink: #e4eaf0; --muted: #9aa7b4; --line: #2a3541;
+    --accent: #74bcc0; --err-bg: #5c1d19; --err-ink: #ffb3ab; --ok: #73c492; color-scheme: dark;
+  }
+  body { background: var(--bg); color: var(--ink); font: 16px/1.6 var(--f-body); }
+  .wrap { max-width: 960px; margin: 0 auto; padding-block: 32px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid; gap: 24px; }
+  header { display: grid; gap: 8px; }
+  h1 { margin: 0; font-weight: 800; font-size: 2rem; line-height: 1.2; text-wrap: balance; }
+  .lead { margin: 0; max-width: 62ch; color: var(--muted); }
+  .eq { font-family: var(--f-mono); direction: ltr; unicode-bidi: isolate; color: var(--ink); font-weight: 600; }
+  .controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; color: var(--muted); font-size: 0.95rem; }
+  .controls label { display: inline-flex; gap: 8px; align-items: center; cursor: pointer; color: var(--ink); }
+  .controls input { width: 18px; height: 18px; accent-color: var(--accent); }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; display: grid; min-width: 0; }
+  .head { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline; padding: 16px 20px 12px; border-bottom: 1px solid var(--line); }
+  .r { font-family: var(--f-mono); font-weight: 600; font-size: 1.5rem; direction: ltr; unicode-bidi: isolate; }
+  .who { font-weight: 700; }
+  .count { margin-inline-start: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .count.zero { color: var(--ok); }
+  .count.some { color: var(--err-ink); }
+  .say { margin: 0; padding: 10px 20px 0; color: var(--muted); max-width: 70ch; }
+  .text { margin: 0; padding: 14px 20px 18px; overflow-x: auto; direction: ltr; text-align: left;
+    font: 13px/1.6 var(--f-mono); white-space: pre; color: var(--ink); }
+  mark { background: var(--err-bg); color: var(--err-ink); border-radius: 2px; font-weight: 600; outline: 1px solid var(--err-ink); }
+  .plain mark { background: none; color: inherit; font-weight: inherit; outline: none; }
+  .note { margin: 0; color: var(--muted); font-size: 0.9rem; max-width: 75ch; }
+  .note b { color: var(--ink); }
+  @media (max-width: 520px) { h1 { font-size: 1.6rem; } .count { margin-inline-start: 0; } }
+</style>
+
+<div class="wrap" dir="rtl">
+  <header>
+    <h1>איך נראית הירידה באיכות של H.264</h1>
+    <p class="lead">R הוא החלק מהטקסט שנקרא נכון אחרי ההקלטה: <span class="eq">R = 1 − errors ÷ chars</span>.
+      כאן אותו מסך, {{N}} תווים, בשלוש רמות. אותיות שהשתבשו מסומנות באדום, וריחוף מעל אות מראה מה היה במקור.</p>
+  </header>
+
+  <div class="controls">
+    <label for="marks"><input type="checkbox" id="marks" checked> סמן שגיאות</label>
+    <span>בלי סימון רואים את הטקסט כפי שהוא נקרא מההקלטה.</span>
+  </div>
+
+  <section class="panel" aria-labelledby="h1r">
+    <div class="head">
+      <span class="r" id="h1r">R = 1</span>
+      <span class="who">zstd, ללא אובדן</span>
+      <span class="count zero">0 שגיאות</span>
+    </div>
+    <p class="say">כל פיקסל זהה למקור, ולכן כל אות זהה. זה מה שהדרך Z שומרת.</p>
+    <pre class="text">{{T_r1}}</pre>
+  </section>
+
+  <section class="panel" aria-labelledby="h2r">
+    <div class="head">
+      <span class="r" id="h2r">R = {{R_r9996}}</span>
+      <span class="who">H.264, התוצאה הטובה ביותר שנמדדה</span>
+      <span class="count some">שגיאה אחת</span>
+    </div>
+    <p class="say">ui ‏1920×1080, Quick Sync. אות אחת שגויה ב-{{N}} תווים. בהדמיה היא נפלה על הסכום: 1,243.94 נקרא 1,248.94.</p>
+    <pre class="text">{{T_r9996}}</pre>
+  </section>
+
+  <section class="panel" aria-labelledby="h3r">
+    <div class="head">
+      <span class="r" id="h3r">R = {{R_r989}}</span>
+      <span class="who">H.264, הטוב ביותר בחלון קטן</span>
+      <span class="count some">{{E_r989}} שגיאות</span>
+    </div>
+    <p class="say">ui ‏506×333, המקודד בתוכנה של Microsoft באיכות 90. בערך אות שגויה אחת כל {{PER_LINE}} תווים, כמעט בכל שורה.</p>
+    <pre class="text">{{T_r989}}</pre>
+  </section>
+
+  <p class="note"><b>הדמיה.</b> מספר השגיאות נגזר מה-R שנמדד. המיקום וסוג השגיאה (אותיות דומות כמו 3↔8, l↔1, O↔0, נקודה↔פסיק) הם דוגמה, לא העתק של המדידה.
+    אלה התוצאות הטובות ביותר של H.264. בהגדרות חלשות יותר R ירד עד 0.934 (typing, איכות 30), כ-7 אותיות שגויות בכל 100.</p>
+</div>
+
+<script>
+  const box = document.getElementById('marks');
+  const sync = () => document.querySelectorAll('.text').forEach((el) => el.classList.toggle('plain', !box.checked));
+  box.addEventListener('change', sync);
+  sync();
+</script>

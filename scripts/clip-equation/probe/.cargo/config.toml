@@ -1,0 +1,15 @@
+# The probe links the dynamic C runtime (/MD), like the product: no +crt-static. libaom-sys
+# (exp-av1) forces the static runtime on libaom (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded); the
+# repository's CMake toolchain file (cmake/msvc-dynamic-runtime.cmake) moves it to /MD, so the
+# probe and the product build libaom the same way. Cargo joins this file with the repository's
+# own .cargo/config.toml.
+
+# libaom must be compiled with optimization. With no generator named, the cmake crate picks a
+# Visual Studio generator and, for MSVC, overwrites CMAKE_C_FLAGS_RELEASE with the cc flags
+# minus every /O flag ("let cmake deal with optimization" in cmake 0.1.58 src/lib.rs), so
+# libaom's Release build ran without /O2. With a named generator it leaves CMake's own
+# Release flags (/O2 /Ob2 /DNDEBUG) in place; Ninja is a single-configuration generator.
+[env]
+CMAKE_GENERATOR = "Ninja"
+# Relative to this probe folder (the parent of .cargo/).
+CMAKE_TOOLCHAIN_FILE = { value = "../../../cmake/msvc-dynamic-runtime.cmake", relative = true }

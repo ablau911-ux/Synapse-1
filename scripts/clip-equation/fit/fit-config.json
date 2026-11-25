@@ -1,0 +1,36 @@
+{
+  "note": "Tunables of fit/fit.mjs, fit/results.mjs and spec/step4.mjs, spec/step5.mjs. Spec: docs/clip-recorder-experiments-plan.md, 'How absolute and predictable is reached', 'Method', 'Equations'.",
+  "corpus_root": "C:\\Users\\Adam\\clip-corpus",
+  "runlist": "results/z-runlist.json",
+  "d_runlist": "results/d-runlist.json",
+  "fit_out": "results/fit.json",
+  "results_md": "../../docs/clip-recorder-experiments-results.md",
+  "results_csv": "results/results.csv",
+  "z_key_columns": ["folder", "way", "level", "layout", "mode", "tile", "gap", "wlog", "ldm", "dict", "workers", "kz", "theta", "drain", "frames_cap"],
+  "d_key_columns": ["folder", "encoder", "q", "tau_f", "hint", "rate", "beta"],
+  "text_scenarios": ["typing", "scroll", "ui"],
+  "tolerance": { "bytes": 0.10, "cpu": 0.10, "ram": 0.10, "ram_dec": 0.10, "ssim": 0.005 },
+  "dict_train_frames": 20,
+  "checks": {
+    "note": "Manager decision on #295 H6. Validity checks block a run from the fit and from J: a status not in ok_statuses (setting_refused, frame_map, ocr_error, error, not_activated), a validity_pass column at 0 (measurement rules M1 to M4 and M8), a missing repeat. Every other pass_* column is a known-result equation: a miss is reported per row and in the results, never blocking.",
+    "ok_statuses": ["ok"],
+    "validity_pass": {
+      "Z": ["pass_frames", "pass_bytes", "pass_bytesAll", "pass_inputFormat", "pass_cpuTotal", "pass_dictCpu", "pass_cpuCycles", "pass_ramOs", "pass_ldm", "pass_rectList"],
+      "D": ["pass_frames"]
+    },
+    "validity_rules": {
+      "note": "Rules of one D run owned by spec/step2d.mjs D_ROW_RULES (M1 input, M2 CPU of both phases, M3 RAM base and OS peak of both phases, M4 retained bytes, M5 beta > 0, M6 frames mapped by time); a broken rule blocks like a validity pass_* row.",
+      "D": ["two_processes", "ram_base", "ram_os_both", "retained_bytes", "beta_positive", "frames_mapped"]
+    }
+  },
+  "runlist_hash_columns": ["runlist_hash", "plan_hash", "list_hash"],
+  "hold_out": { "share": 0.2, "seed": 20261122, "generator": "mulberry32" },
+  "px0": 230400,
+  "d_base": { "tau_f": "20", "hint": "1", "rate": "quality" },
+  "worker_bytes_per_px": 4.5,
+  "c_conv_ns_per_px": 1.65,
+  "t_ready_limit_ms": 50,
+  "run_time_tolerance": 0.20,
+  "self_test_tolerance": 1e-6,
+  "j_tolerance": 1e-9
+}

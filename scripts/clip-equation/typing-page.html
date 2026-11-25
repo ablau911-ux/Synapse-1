@@ -1,0 +1,68 @@
+<!doctype html>
+<!--
+  Clip recorder package 0b, scenario "typing" (docs/clip-recorder-plan.md, M10;
+  experiments plan F7). Types text into its own text box by itself, CHARS_PER_S
+  characters per second (as M4's typing phase), with a caret that blinks, so
+  the probe needs no input. Open the file directly.
+
+  Driven by the recording's instant count, never by wall time: step k is the
+  number of whole 50 ms instants since the start (?start=<Unix ms>, or the
+  first refresh without it). The picture is a pure function of k, so two
+  captures on the same instant grid show the same picture at every instant.
+  The text box is a plain element, not a focused textarea, so no browser
+  timer (caret blink) changes the picture.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>clip0b typing</title>
+<style>
+  body { margin: 0; padding: 16px; background: #f6f7fb; font: 16px/1.5 "Segoe UI", sans-serif; color: #23232b; overflow: hidden; }
+  #box { box-sizing: border-box; width: 100%; height: calc(100vh - 32px); padding: 14px; border: 1px solid #d5d8e3;
+         border-radius: 10px; background: #fff; font: 15px/1.55 Consolas, monospace; color: #1f2430;
+         white-space: pre-wrap; overflow: hidden; }
+  #caret { border-left: 2px solid #1f2430; margin-left: -1px; }
+  #caret.off { border-left-color: transparent; }
+</style>
+</head>
+<body>
+<div id="box"><span id="text"></span><span id="caret"></span></div>
+<script>
+  const INSTANT_MS = 50;       // one step per recording instant (f = 20)
+  const CHARS_PER_S = 8;
+  const BLINK_STEPS = 10;      // caret on for 10 steps, off for 10 (500 ms)
+  const TEXT = 'fn main() {\n    let frames = capture(window);\n    for frame in frames {\n' +
+    '        if frame.is_new() { waiting.write(frame.compress()); }\n    }\n}\n' +
+    'The live part stores each new frame; the worker encodes it later.\n';
+  const HEAD = '// clip recorder notes\n';
+  const START = Number(new URLSearchParams(location.search).get('start'));
+  let startPerf = START > 0 ? START - performance.timeOrigin : null;
+  const box = document.getElementById('box');
+  const textEl = document.getElementById('text');
+  const caretEl = document.getElementById('caret');
+
+  function draw(k) {
+    const chars = Math.floor(k * CHARS_PER_S * INSTANT_MS / 1000);
+    let typed = '';
+    for (let i = 0; i < chars; i++) typed += TEXT[i % TEXT.length];
+    textEl.textContent = HEAD + typed;
+    caretEl.className = Math.floor(k / BLINK_STEPS) % 2 === 0 ? '' : 'off';
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // Only a step that changes the text or the caret touches the page, so a
+  // step without a change makes no new frame.
+  const key = (k) => Math.floor(k * CHARS_PER_S * INSTANT_MS / 1000) + ':' + Math.floor(k / BLINK_STEPS) % 2;
+  let shown = -1;
+  function frame(now) {
+    if (startPerf === null) startPerf = now;
+    const k = Math.max(0, Math.floor((now - startPerf) / INSTANT_MS));
+    if (k !== shown) { if (key(k) !== key(shown)) draw(k); shown = k; }
+    requestAnimationFrame(frame);
+  }
+  draw(0);
+  shown = 0;
+  requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+   Compiling ort-sys v2.0.0-rc.12
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-overlay v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-overlay)
+    Checking ort v2.0.0-rc.12
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-models v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-models)
+    Checking synapse-audio v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-audio)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 54s

@@ -1,0 +1,20 @@
+R1 PART 1 COMMIT BLOCKER
+Command: rtk git add scripts/clip-equation/probe/src/main.rs scripts/clip-equation/results/r1-start-*.txt scripts/clip-equation/results/r1-m1-build.*.txt
+fatal: Unable to create 'C:/Users/Adam/Synapse/.git/worktrees/Synapse-clip/index.lock': Permission denied
+Command: rtk git -c user.name=codex -c user.email=codex@gitea.localhost commit -m "Measure R1 hardware encoder start variants for #290"
+fatal: Unable to create 'C:/Users/Adam/Synapse/.git/worktrees/Synapse-clip/index.lock': Permission denied
+Command: rtk git push gitea feature/clip-capture
+Git sh failed CreateFileMapping with Win32 error 5. Credential helper failed.
+remote: Failed to authenticate user
+fatal: Authentication failed for 'http://gitea.localhost:8780/adam/synapse.git/'
+No commit created. No push succeeded. No escalation attempted: approval policy is never.
+Parts 2-4 not started. Product source unchanged.
+Proof status:
+FAIL (not run): dyn-moving 3/3 and behind=0, warm_ms, segment creation times.
+FAIL (not run): dyn-motion 3/3, noise/video SSIM >=0.95, slow passes.
+FAIL (not run): dyn-exact 3/3, fmt, clippy -D warnings on final release build.
+FAIL (blocked): r1-start evidence committed; RAM table measured peak update.
+PASS: no gate, threshold, timeout, or assertion changed.
+Slow crash: not investigated; 20-run loop not run; no fix claimed.
+RAM peak: not measured; dyn-live video not run; no UX verification claimed.
+Deviation: M1 used 30 fps; product RECORD_FPS=20. Measurements are provisional; no product proof claimed.

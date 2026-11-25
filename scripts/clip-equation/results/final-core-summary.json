@@ -1,0 +1,47 @@
+[
+  {
+    "label": "final-dyn-exact-1",
+    "exit": 0,
+    "elapsed_ms": 107077
+  },
+  {
+    "label": "final-dyn-exact-2",
+    "exit": 0,
+    "elapsed_ms": 98547
+  },
+  {
+    "label": "final-dyn-exact-3",
+    "exit": 0,
+    "elapsed_ms": 100626
+  },
+  {
+    "label": "final-dyn-moving-1",
+    "exit": 1,
+    "elapsed_ms": 218088
+  },
+  {
+    "label": "final-dyn-moving-2",
+    "exit": 1,
+    "elapsed_ms": 218385
+  },
+  {
+    "label": "final-dyn-moving-3",
+    "exit": 1,
+    "elapsed_ms": 218049
+  },
+  {
+    "label": "final-dyn-motion-1",
+    "exit": 1,
+    "elapsed_ms": 230318
+  },
+  {
+    "label": "final-dyn-motion-2",
+    "exit": 1,
+    "elapsed_ms": 229886
+  },
+  {
+    "label": "final-dyn-motion-3",
+    "exit": 1,
+    "elapsed_ms": 228345
+  }
+]

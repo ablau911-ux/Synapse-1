@@ -1,0 +1,173 @@
+step2z: 4598 rows from results/z-runs.csv
+FAIL  frames compressed: N_comp = N_new of the folder  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known 1, measured NaN
+        ... 79 more
+FAIL  bytes: bytes = Σ output sizes = Σ clip file sizes on disk  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known Σ out , measured on disk 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known Σ out , measured on disk 
+        ... 79 more
+FAIL  bytes of every retained file: bytes = Σ frame files + frames.jsonl (one line per instant) + clip.json  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known frames  + frames.jsonl  (400 lines) + clip.json , measured on disk ,  lines
+        ... 79 more
+FAIL  baseline equals the corpus: ZW1, L = -3, the corpus writer's call (16 KB output drain): frame bytes = D_wait  (0 rows pass, 0 miss)
+        no rows to check
+INFO  one-shot call: ZW1, L = -3, one ZSTD_compress2 per frame: frame bytes − D_wait, reported  (0 rows pass, 0 miss)
+        no rows to check
+FAIL  input format: every way receives B,G,R,A; the conversion it needs is timed (convert cycles > 0 unless the layout is B,G,R,A)  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known input bgra, convert cycles > 0, measured input , convert cycles 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known input bgra, convert cycles > 0, measured input , convert cycles 
+        ... 79 more
+FAIL  CPU of all the way's work: way cycles = convert + compress (with context creation) + write + dictionary training  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known Σ cycles NaN, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known Σ cycles NaN, measured NaN
+        ... 79 more
+FAIL  dictionary training CPU: dict > 0: train cycles > 0 and inside the way's CPU  (435 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known train cycles > 0, inside the way's CPU, measured train , way 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known train cycles > 0, inside the way's CPU, measured train , way 
+        ... 79 more
+FAIL  RAM from the OS peak: RAM = PeakPagefileUsage after the work − M_0 (M_0 after the input is prepared); the work sets the peak  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known peak  − M_0 , peak > peak at M_0 , measured ram , peak used 
+        ... 79 more
+FAIL  ldm set explicitly: ZSTD_c_enableLongDistanceMatching read back = 1 when ldm=1, 2 when ldm=0  (4493 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known 2, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known 2, measured NaN
+        ... 79 more
+PASS  ZW9 rectangle list, ZW9b one box: Σ bytes compressed = Σ rows · bytes of the listed rectangles; ZW9b at most 1 rectangle per frame  (576 rows pass, 0 miss)
+FAIL  saved RAM prediction: known_m_comp of the runner = the check's equation 4 (with the workers and W_eff corrections)  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known NaN, measured NaN
+        ... 79 more
+PASS  run list: budget = T_floor + 4 h; T_total <= budget; held-out = round(0.2 · multi-size cells); mulberry32 seed 20261122  (1 rows pass, 0 miss)
+PASS  resume keys: planned key = saved key for every row; planning twice gives the same unique keys  (3 rows pass, 0 miss)
+PASS  determinism: bytes(run 1) = bytes(run 2) = bytes(run 3)  (1533 rows pass, 0 miss)
+PASS  RAM while compressing: M_comp = M_0 + M_cctx + B_c · px · 3 within ±10 % of peak private bytes (one thread, frames)  (1862 rows pass, 0 miss)
+PASS  RAM, nbWorkers > 0: M_comp = M_0 + ZSTD_sizeof_CCtx + B_c · px · 3 within ±10 %  (342 rows pass, 0 miss)
+PASS  RAM, one stream: M_comp = M_0 + M_cctx − 2^W + W_eff + B_c · px · 3 within ±10 %; W_eff = min(2^W, px · 3) when K_z = 1, else 2^W  (1872 rows pass, 0 miss)
+FAIL  CPU from the cycle counter: C = cycles / rate · 10^9 (rate from clip-probe exp-rate); one thread: C <= 1.02 · wall  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known NaN ns <= 1.02 · wall , measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known NaN ns <= 1.02 · wall , measured NaN
+        ... 79 more
+PENDING  CPU: C_comp = N_new · (c_0 + px · κ_c), held-out rows within ±10 %  (0 rows pass, 0 miss)
+        needs κ_c fitted on the full run (step 4); the pilot reports C_comp per frame only
+PENDING  run time: full-run wall time within ±20 % of T (equation 6)  (0 rows pass, 0 miss)
+        needs the full run; z-pilot.md gives T
+FAIL  round trip: Σ |decoded − corpus| = 0  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known 0, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known 0, measured NaN
+        ... 79 more
+FAIL  seek cost: N_dec(worst) = 1 independent; <= K_z otherwise  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known 1, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known 1, measured NaN
+        ... 79 more
+PENDING-FIT  decoder RAM: M_dec = M_0 + M_dctx + B_d · px · 3 + b_max + m_d0 (m_d0 fitted) within ±10 % of decode peak private bytes  (0 rows pass, 0 miss)
+        known after the fit (step 4)
+        typing-506x333 ZW0 L=-3 raw/bgr rep 1: known 3857708 + m_d0, measured 4415488
+        typing-506x333 ZW0 L=-3 raw/bgr rep 2: known 3857708 + m_d0, measured 4419584
+        typing-506x333 ZW0 L=-3 raw/bgr rep 3: known 3865900 + m_d0, measured 4427776
+        flash-506x333 ZW0 L=-3 raw/bgr rep 1: known 3865900 + m_d0, measured 4435968
+        4598 rows, checked on the held-out rows in step 4
+PENDING-FIT  RAM with a trained dictionary: M_comp(ZW16) = M_0 + M_cctx + B_c · px · 3 + μ · S_samples (μ fitted), S_samples = N_train · px · 3  (0 rows pass, 0 miss)
+        known after the fit (step 4)
+        typing-506x333 ZW16 L=-100 whole/bgr rep 1: known 4447900 + μ · S_samples (S_samples 10109880), measured 27246592
+        typing-506x333 ZW16 L=-100 whole/bgr rep 2: known 4456092 + μ · S_samples (S_samples 10109880), measured 27250688
+        typing-506x333 ZW16 L=-100 whole/bgr rep 3: known 4447900 + μ · S_samples (S_samples 10109880), measured 27209728
+        flash-506x333 ZW16 L=-100 whole/bgr rep 1: known 4439060 + μ · S_samples (S_samples 10109880), measured 27258880
+        522 rows, checked on the held-out rows in step 4
+FAIL  decoder context: M_dctx (zstd estimate; one stream with K_z = 1: ZSTD_estimateDCtxSize, single pass) = ZSTD_sizeof_DCtx after the last frame  (4460 rows pass, 120 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known NaN, measured NaN
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known NaN, measured NaN
+        ... 112 more
+FAIL  time until ready: t_ready = t_close <= 50 ms  (4511 rows pass, 87 miss)
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 1: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 2: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-100 whole/bgr rep 3: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 1: known <= 50 ms, measured NaN ms
+        miss: still-506x333 ZW16 L=-50 whole/bgr rep 2: known <= 50 ms, measured NaN ms
+        ... 79 more
+PASS  no memory sampler in the measured work: memory samplers running during the way's measured work = 0 (RAM is the OS peak; CPU measured as in way D)  (4512 rows pass, 0 miss)
+PASS  run list identity: z-runlist.json hash = hash of its plan = hash of the plan rebuilt now (budget, factors, hold-out seed); every full-run row names it  (2 rows pass, 0 miss)
+step2z: 9 pass, 15 fail, 4 pending, 1 info

@@ -1,0 +1,12 @@
+step2d: corpus C:\Users\Adam\clip-corpus; runs results/d-runs.csv: no CSV at results/d-runs.csv
+action | equation | known | equation value | measured | result
+D: encoders | count(activated) | 4 | - | no runs | FAIL
+D: frames encoded | N_enc = N_new | exact, every run | - | no runs | FAIL
+D: keyframes | N_key = ceil(N_enc / tau_f) | exact for tau_f in {20, 40, 100, 200} | - | no runs | FAIL
+D: B-frames | count(B) | 0 | - | no runs | FAIL
+D: meter self-check | SSIM-Y(x, x); PSNR-Y(x, x); R(x, x) | 1; inf; 1 | 1; inf; 1 | probe gave no JSON (exit 1): error: unknown command 'exp-d'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders or exp-corpus | FAIL
+D: known distortion | MSE = d^2, PSNR = 20 * log10(255 / d), d = 4 | 36.0896 dB within 0.01 dB | 36.0896 | probe gave no JSON (exit 1): error: unknown command 'exp-d'; use info, readback, observe, delivery, newframes, disk, threading, lateness, encoder, compress, exp-encoders or exp-corpus | FAIL
+D: bytes against the prior | prior B_min = 10.3 MB * px_out / (1252 * 890) (Quick Sync, q 70, docs/clip-recorder-equation.md section 6) | reported, no pass or fail before the fit | - | no runs | FAIL
+D: CPU against the prior | prior a_w = N_new * px_out * (c_conv + c_enc(E)), c_conv 1.65 ns, c_enc 7.0 ns (software) or 2.0 ns (hardware) per pixel | reported, no pass or fail before the fit | - | no runs | FAIL
+D: RAM against the prior | prior M_worker = px_out * (3 + 1.5), one frame held (d = 1), M0_w and M_enc not yet known | reported, no pass or fail before the fit | - | no runs | FAIL
+step2d: 9 failed

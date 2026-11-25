@@ -1,0 +1,61 @@
+name,scene,rep,status,mib_per_min,cpu_s,ram_mb,exact,seek_frames,ssim,psnr,r
+stream L1 W28,typing,1,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L1 W27,typing,1,ok,0.5127496719360352,0.393202353,141.0859375,yes,20,1,inf,1
+stream L3 W27,typing,1,ok,0.5119056701660156,0.406023739,141.71875,yes,20,1,inf,1
+stream L1 W27,typing,2,ok,0.5127496719360352,0.356748017,140.99609375,yes,20,1,inf,1
+stream+ldm L1 W27,typing,1,ok,0.5302362442016602,1.539918255,149.15234375,yes,20,1,inf,1
+stream L1 W28,typing,2,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,typing,2,ok,0.5119056701660156,0.413525929,141.7265625,yes,20,1,inf,1
+stream L1 W27,typing,3,ok,0.5127496719360352,0.352873321,141.0234375,yes,20,1,inf,1
+stream+ldm L1 W27,typing,2,ok,0.5302362442016602,1.552212324,149.1484375,yes,20,1,inf,1
+stream L1 W28,typing,3,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,typing,3,ok,0.5119056701660156,0.412844622,141.74609375,yes,20,1,inf,1
+stream+ldm L1 W27,typing,3,ok,0.5302362442016602,1.644560547,149.07421875,yes,20,1,inf,1
+stream L1 W28,ui,1,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L1 W27,ui,1,ok,6.630721092224121,1.192865704,140.98828125,yes,20,1,inf,1
+stream L3 W27,ui,1,ok,6.29582405090332,1.154259532,141.6796875,yes,20,1,inf,1
+stream+ldm L1 W27,ui,1,ok,5.890053749084473,3.582629757,149.14453125,yes,20,1,inf,1
+stream L1 W27,ui,2,ok,6.630721092224121,1.06681574,141.03515625,yes,20,1,inf,1
+stream L1 W28,ui,2,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,ui,2,ok,6.29582405090332,1.30778142,141.71484375,yes,20,1,inf,1
+stream+ldm L1 W27,ui,2,ok,5.890053749084473,3.880853592,149.09375,yes,20,1,inf,1
+stream L1 W27,ui,3,ok,6.630721092224121,1.078064675,141.03125,yes,20,1,inf,1
+stream L1 W28,ui,3,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,ui,3,ok,6.29582405090332,1.184736893,141.69921875,yes,20,1,inf,1
+stream+ldm L1 W27,ui,3,ok,5.890053749084473,3.507833373,149.10546875,yes,20,1,inf,1
+stream L1 W27,scroll,1,ok,9.437215805053711,1.093782795,140.98046875,yes,20,1,inf,1
+stream L1 W28,scroll,1,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,scroll,1,ok,9.218132972717285,1.208252442,141.66796875,yes,20,1,inf,1
+stream+ldm L1 W27,scroll,1,ok,8.390996932983398,2.868713914,149.078125,yes,20,1,inf,1
+stream L1 W27,scroll,2,ok,9.437215805053711,1.094199706,141.04296875,yes,20,1,inf,1
+stream L1 W28,scroll,2,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,scroll,2,ok,9.218132972717285,1.182519012,141.70703125,yes,20,1,inf,1
+stream+ldm L1 W27,scroll,2,ok,8.390996932983398,2.741500977,149.0859375,yes,20,1,inf,1
+stream L1 W27,scroll,3,ok,9.437215805053711,1.085005517,140.98828125,yes,20,1,inf,1
+stream L1 W28,scroll,3,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,scroll,3,ok,9.218132972717285,1.174185672,141.71484375,yes,20,1,inf,1
+stream+ldm L1 W27,scroll,3,ok,8.390996932983398,2.834011295,149.125,yes,20,1,inf,1
+stream L1 W28,flash,1,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L1 W27,flash,1,ok,2.7897777557373047,1.050498649,141,yes,20,1,inf,1
+stream L3 W27,flash,1,ok,2.7499895095825195,1.163243906,141.70703125,yes,20,1,inf,1
+stream+ldm L1 W27,flash,1,ok,3.088296890258789,3.92624004,149.10546875,yes,20,1,inf,1
+stream L1 W27,flash,2,ok,2.7897777557373047,1.030680093,141.03515625,yes,20,1,inf,1
+stream L1 W28,flash,2,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,flash,2,ok,2.7499895095825195,1.168581218,141.71875,yes,20,1,inf,1
+stream L1 W27,flash,3,ok,2.7897777557373047,1.059369953,141.0234375,yes,20,1,inf,1
+stream+ldm L1 W27,flash,2,ok,3.088296890258789,3.910322031,149.1015625,yes,20,1,inf,1
+stream L1 W28,flash,3,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L3 W27,flash,3,ok,2.7499895095825195,1.218265421,141.7265625,yes,20,1,inf,1
+stream+ldm L1 W27,flash,3,ok,3.088296890258789,4.109378913,149.125,yes,20,1,inf,1
+stream L1 W28,video,1,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L1 W27,video,1,ok,5949.435879707336,4.759670133,141.00390625,yes,20,1,inf,1
+stream+ldm L1 W27,video,1,ok,5868.167824745178,7.031628539,149.12890625,yes,20,1,inf,1
+stream L3 W27,video,1,ok,5569.357546806335,15.851182078,141.69921875,yes,20,1,inf,1
+stream L1 W27,video,2,ok,5949.435879707336,4.484344816,140.98828125,yes,20,1,inf,1
+stream L1 W28,video,2,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream+ldm L1 W27,video,2,ok,5868.167824745178,6.837218147,149.12890625,yes,20,1,inf,1
+stream L3 W27,video,2,ok,5569.357546806335,15.562683175,141.71875,yes,20,1,inf,1
+stream L1 W28,video,3,error exit 1: error: ZSTD_decompressStream: Frame requires too much memory for decoding,NaN,NaN,NaN,,,1,inf,1
+stream L1 W27,video,3,ok,5949.435879707336,4.464198716,140.98828125,yes,20,1,inf,1
+stream+ldm L1 W27,video,3,ok,5868.167824745178,6.84481156,149.09375,yes,20,1,inf,1
+stream L3 W27,video,3,ok,5569.357546806335,15.238778402,141.71875,yes,20,1,inf,1

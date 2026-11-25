@@ -1,0 +1,290 @@
+[
+ {
+  "noise": 0,
+  "folder": "typing-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "noise": 0,
+  "folder": "typing-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "noise": 0,
+  "folder": "typing-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 689"
+ },
+ {
+  "noise": 0,
+  "folder": "typing-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 683"
+ },
+ {
+  "noise": 0,
+  "folder": "scroll-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 29154"
+ },
+ {
+  "noise": 0,
+  "folder": "scroll-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 19308"
+ },
+ {
+  "noise": 0,
+  "folder": "scroll-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 6870"
+ },
+ {
+  "noise": 0,
+  "folder": "scroll-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 4964"
+ },
+ {
+  "noise": 0,
+  "folder": "ui-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 0 2688"
+ },
+ {
+  "noise": 0,
+  "folder": "ui-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 10 region reads, source chars per region 0 2741"
+ },
+ {
+  "noise": 0,
+  "folder": "ui-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 20 region reads, source chars per region 160 1690"
+ },
+ {
+  "noise": 0,
+  "folder": "ui-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 1,
+  "note": "10 frames, 20 region reads, source chars per region 160 1323"
+ },
+ {
+  "noise": 1,
+  "folder": "typing-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9892906359347367,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "noise": 1,
+  "folder": "typing-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9877249847554236,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "noise": 1,
+  "folder": "typing-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9738195320162534,
+  "note": "10 frames, 10 region reads, source chars per region 689"
+ },
+ {
+  "noise": 1,
+  "folder": "typing-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9941176470588236,
+  "note": "10 frames, 10 region reads, source chars per region 683"
+ },
+ {
+  "noise": 1,
+  "folder": "scroll-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9997706247945999,
+  "note": "10 frames, 10 region reads, source chars per region 29154"
+ },
+ {
+  "noise": 1,
+  "folder": "scroll-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9996499681465671,
+  "note": "10 frames, 10 region reads, source chars per region 19308"
+ },
+ {
+  "noise": 1,
+  "folder": "scroll-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9962253833729449,
+  "note": "10 frames, 10 region reads, source chars per region 6870"
+ },
+ {
+  "noise": 1,
+  "folder": "scroll-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.996151986158879,
+  "note": "10 frames, 10 region reads, source chars per region 4964"
+ },
+ {
+  "noise": 1,
+  "folder": "ui-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.99766223625621,
+  "note": "10 frames, 10 region reads, source chars per region 0 2688"
+ },
+ {
+  "noise": 1,
+  "folder": "ui-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9966309072131573,
+  "note": "10 frames, 10 region reads, source chars per region 0 2741"
+ },
+ {
+  "noise": 1,
+  "folder": "ui-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9840351190951873,
+  "note": "10 frames, 20 region reads, source chars per region 160 1690"
+ },
+ {
+  "noise": 1,
+  "folder": "ui-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9753435535494462,
+  "note": "10 frames, 20 region reads, source chars per region 160 1323"
+ },
+ {
+  "noise": 2,
+  "folder": "typing-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9734656138519521,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "noise": 2,
+  "folder": "typing-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9769096835537843,
+  "note": "10 frames, 10 region reads, source chars per region 681"
+ },
+ {
+  "noise": 2,
+  "folder": "typing-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9872495446265939,
+  "note": "10 frames, 10 region reads, source chars per region 689"
+ },
+ {
+  "noise": 2,
+  "folder": "typing-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9941176470588236,
+  "note": "10 frames, 10 region reads, source chars per region 683"
+ },
+ {
+  "noise": 2,
+  "folder": "scroll-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9995473261384591,
+  "note": "10 frames, 10 region reads, source chars per region 29154"
+ },
+ {
+  "noise": 2,
+  "folder": "scroll-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9994046727223498,
+  "note": "10 frames, 10 region reads, source chars per region 19308"
+ },
+ {
+  "noise": 2,
+  "folder": "scroll-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9956737271208638,
+  "note": "10 frames, 10 region reads, source chars per region 6870"
+ },
+ {
+  "noise": 2,
+  "folder": "scroll-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9963007657052886,
+  "note": "10 frames, 10 region reads, source chars per region 4964"
+ },
+ {
+  "noise": 2,
+  "folder": "ui-1920x1080",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9968750120098309,
+  "note": "10 frames, 10 region reads, source chars per region 0 2688"
+ },
+ {
+  "noise": 2,
+  "folder": "ui-1280x720",
+  "sigma": 1,
+  "status": "ok",
+  "r": 0.9956452876036701,
+  "note": "10 frames, 10 region reads, source chars per region 0 2741"
+ },
+ {
+  "noise": 2,
+  "folder": "ui-640x360",
+  "sigma": 2,
+  "status": "ok",
+  "r": 0.9884294358341574,
+  "note": "10 frames, 20 region reads, source chars per region 160 1690"
+ },
+ {
+  "noise": 2,
+  "folder": "ui-506x333",
+  "sigma": 3,
+  "status": "ok",
+  "r": 0.9915622498966135,
+  "note": "10 frames, 20 region reads, source chars per region 160 1323"
+ }
+]

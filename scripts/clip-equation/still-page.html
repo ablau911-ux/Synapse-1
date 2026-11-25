@@ -1,0 +1,22 @@
+<!doctype html>
+<!--
+  Clip recorder package 0b, scenario "still" (docs/clip-recorder-plan.md, M10).
+  A page that never changes after it has loaded. Open the file directly.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>clip0b still</title>
+<style>
+  body { margin: 0; padding: 24px 40px; font: 16px/1.55 "Segoe UI", sans-serif; background: #fbfbfd; color: #23232b; }
+  h1 { font-size: 26px; color: #3a4a7a; }
+  .card { background: #fff; border-radius: 14px; box-shadow: 0 4px 18px rgba(40, 50, 90, .08); padding: 18px 22px; margin: 16px 0; max-width: 820px; }
+</style>
+</head>
+<body>
+<h1>Still window</h1>
+<div class="card">Nothing on this page moves. Windows composes it once; the recorder should see one new frame and then none.</div>
+<div class="card">A still window costs the live part nothing after its first frame: no new composition time, no read-back, no write.</div>
+<div class="card">The keyframe rule still applies to the first frame, so its file holds every tile.</div>
+</body>
+</html>

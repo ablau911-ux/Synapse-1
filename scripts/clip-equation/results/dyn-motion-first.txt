@@ -1,0 +1,33 @@
+PASS noise exact outside: 0
+PASS noise interval: [44,134,1]
+PASS noise rectangle: [400,304,320,240]
+PASS frozen exact rows: []
+PASS stop restored exact: {"height":1080,"instant":135,"new":false,"t_ms":6750,"width":1920,"x":[0,949166,232550,1382406]}
+PASS first four exact: [{"height":1080,"instant":40,"new":true,"t_ms":2000,"width":1920,"x":[0,13248,232598,1382406]},{"height":1080,"instant":41,"new":true,"t_ms":2050,"width":1920,"x":[0,245846,234972,1382406]},{"height":1080,"instant":42,"new":true,"t_ms":2100,"width":1920,"x":[0,480818,235682,1382406]},{"height":1080,"instant":43,"new":true,"t_ms":2150,"width":1920,"x":[0,716500,232666,1382406]}]
+FAIL noise moving quality: 0.6920073488316978
+PASS small exact outside: 0
+PASS small stays exact: 0
+PASS bar exact outside: 0
+PASS bar stays exact: 0
+PASS flat exact outside: 0
+PASS flat stays exact: 0
+PASS two exact outside: 0
+PASS largest group: [[400,304,320,240]]
+PASS odd exact outside: 0
+PASS outward alignment: [[400,288,336,256]]
+PASS corner exact outside: 0
+PASS clamped corner: [{"coded_height":254,"coded_width":330,"complete":true,"file":"moving/seg-0000.mp4","first_instant":44,"frames":91,"index":0,"key_frames":[[0,0],[6,3000000],[20,10000000],[40,20000000],[60,30000000],[80,40000000]],"last_instant":134,"rect":[672,448,329,253]}]
+PASS slow exact outside: 0
+PASS slow stays exact: 0
+PASS video exact outside: 0
+FAIL video moving quality: 0.9421424366063798
+PASS video admits whole picture: [{"coded_height":1080,"coded_width":1920,"complete":true,"file":"moving/seg-0000.mp4","first_instant":5,"frames":395,"index":0,"key_frames":[[0,0],[6,3000000],[20,10000000],[40,20000000],[60,30000000],[80,40000000],[100,50000000],[120,60000000],[140,70000000],[160,80000000],[180,90000000],[200,100000000],[220,110000000],[240,120000000],[260,130000000],[280,140000000],[300,150000000],[320,160000000],[340,170000000],[360,180000000],[380,190000000]],"last_instant":399,"rect":[0,0,1920,1080]}]
+PASS typing exact outside: 0
+PASS typing stays exact: 0
+PASS ui exact outside: 0
+PASS ui stays exact: 0
+PASS scroll exact outside: 0
+PASS scroll stays exact: 0
+PASS flash exact outside: 0
+PASS flash stays exact: 0
+dyn-motion: 2 failed

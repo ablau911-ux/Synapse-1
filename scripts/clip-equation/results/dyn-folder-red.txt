@@ -1,0 +1,2 @@
+FAIL readable dynamic folder: "ENOENT: no such file or directory, open 'C:\\Users\\Adam\\Synapse-clip\\.runs\\dyn-moving-cont3-fixed\\full\\clip.json'"
+dyn-folder: 1 failed

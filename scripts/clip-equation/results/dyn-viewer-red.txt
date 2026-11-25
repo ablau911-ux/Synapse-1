@@ -1,0 +1,2 @@
+FAIL viewer readable: "ENOENT: no such file or directory, open 'C:\\Users\\Adam\\Synapse-clip\\.runs\\dyn-motion-first\\noise\\clip.json'"
+dyn-viewer: 1 failed

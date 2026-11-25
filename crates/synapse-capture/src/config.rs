@@ -12,6 +12,15 @@ pub enum CaptureTarget {
     },
 }
 
+/// What the clip records (the clip recorder's target and the clip
+/// observer's source; plan section O). Defined on every platform because the
+/// clip tools are; only Windows can record it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipSource {
+    Window { hwnd: i64 },
+    Monitor { monitor_index: u32 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureConfig {
     pub target: CaptureTarget,

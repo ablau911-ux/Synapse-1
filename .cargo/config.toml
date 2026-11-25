@@ -34,6 +34,27 @@
 #   target — verified empirically (cargo build -v shows lld-link, never link.exe).
 #   If rust-lld is ever missing, linking ERRORS LOUDLY — there is no silent
 #   fallback to link.exe. Re-baseline target-cpu notes below still apply.
+#
+# C runtime (2026-11-24, clip recorder plan 5.0): the workspace links the dynamic C
+# runtime (/MD). Do NOT add +crt-static: the prebuilt ONNX Runtime (ort-sys) is /MD only,
+# and rust-lld then fails with "/failifmismatch: mismatch detected for 'RuntimeLibrary'"
+# against rocksdb built /MT. libaom (forced /MT by libaom-sys) is moved to /MD by the
+# CMake toolchain file named in [env] below.
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
-rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "linker-flavor=lld-link"]
+rustflags = [
+    "-C", "target-cpu=x86-64-v2",
+    "-C", "linker-flavor=lld-link",
+]
+
+# libaom must be compiled with optimization (measured: 3 times the processor time without).
+# With no generator named, the cmake crate picks a Visual Studio generator and, for MSVC,
+# overwrites CMAKE_C_FLAGS_RELEASE with the cc flags minus every /O flag, so libaom's
+# Release build ran without /O2. With Ninja (a single-configuration generator) CMake's own
+# Release flags (/O2 /Ob2 /DNDEBUG) stay in place.
+[env]
+CMAKE_GENERATOR = "Ninja"
+# libaom-sys forces the static C runtime (/MT); the workspace and the prebuilt ONNX Runtime
+# use the dynamic one (/MD), and rust-lld refuses to mix them. The toolchain file makes
+# libaom /MD: see cmake/msvc-dynamic-runtime.cmake.
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/msvc-dynamic-runtime.cmake", relative = true }

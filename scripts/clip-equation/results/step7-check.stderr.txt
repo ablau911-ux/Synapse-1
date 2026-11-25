@@ -1,0 +1,77 @@
+   Compiling synapse-storage v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-storage)
+    Checking synapse-reflex v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-reflex)
+    Checking synapse-mcp v0.1.0 (C:\Users\Adam\Synapse-clip\crates\synapse-mcp)
+error[E0425]: cannot find value `N_HI` in this scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1050:156
+     |
+1050 | ...lock differs from its last settled picture when {N_HI} pixels differ by more than {DELTA_HI} or {N_LO} by more than {DELTA_LO};...
+     |                                                     ^^^^ not found in this scope
+
+error[E0425]: cannot find value `DELTA_HI` in this scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1050:190
+     |
+  77 | const DELTA_LO: u8 = 32;
+     | ------------------------ similarly named constant `DELTA_LO` defined here
+...
+1050 |                 "change test: {BLOCK}x{BLOCK} blocks at recorded resolution, largest R/G/B difference; a block differs from its last settled picture when {N_HI} pixels differ by more than {DELTA_HI} o...
+     |                                                                                                                                                                                              ^^^^^^^^
+     |
+help: a constant with a similar name exists
+     |
+1050 -                 "change test: {BLOCK}x{BLOCK} blocks at recorded resolution, largest R/G/B difference; a block differs from its last settled picture when {N_HI} pixels differ by more than {DELTA_HI} or {N_LO} by more than {DELTA_LO}; settled after {SETTLE_MS} ms without change; short-lived = back within {SHORT_LIVED_MS} ms"
+1050 +                 "change test: {BLOCK}x{BLOCK} blocks at recorded resolution, largest R/G/B difference; a block differs from its last settled picture when {N_HI} pixels differ by more than {DELTA_LO} or {N_LO} by more than {DELTA_LO}; settled after {SETTLE_MS} ms without change; short-lived = back within {SHORT_LIVED_MS} ms"
+     |
+
+error[E0425]: cannot find value `N_LO` in this scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1050:204
+     |
+1050 | ...{N_HI} pixels differ by more than {DELTA_HI} or {N_LO} by more than {DELTA_LO}; settled after {SETTLE_MS} ms without change; sh...
+     |                                                     ^^^^ not found in this scope
+
+error[E0599]: no method named `decode` found for mutable reference `&mut ClipView` in the current scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1647:30
+     |
+1647 |             let frame = self.decode(number)?;
+     |                              ^^^^^^ method not found in `&mut ClipView`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `decode`, perhaps you need to implement one of them:
+             candidate #1: `base64::Engine`
+             candidate #2: `tokio_util::codec::Decoder`
+
+error[E0599]: no method named `decode` found for mutable reference `&mut ClipView` in the current scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1662:26
+     |
+1662 |         let frame = self.decode(number)?;
+     |                          ^^^^^^ method not found in `&mut ClipView`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `decode`, perhaps you need to implement one of them:
+             candidate #1: `base64::Engine`
+             candidate #2: `tokio_util::codec::Decoder`
+
+error[E0599]: no method named `decode` found for mutable reference `&mut ClipView` in the current scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1740:27
+     |
+1740 |         let before = self.decode(from)?;
+     |                           ^^^^^^ method not found in `&mut ClipView`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `decode`, perhaps you need to implement one of them:
+             candidate #1: `base64::Engine`
+             candidate #2: `tokio_util::codec::Decoder`
+
+error[E0599]: no method named `decode` found for mutable reference `&mut ClipView` in the current scope
+    --> crates\synapse-mcp\src\server\clip_viewer.rs:1741:26
+     |
+1741 |         let after = self.decode(to)?;
+     |                          ^^^^^^ method not found in `&mut ClipView`
+     |
+     = help: items from traits can only be used if the trait is implemented and in scope
+     = note: the following traits define an item `decode`, perhaps you need to implement one of them:
+             candidate #1: `base64::Engine`
+             candidate #2: `tokio_util::codec::Decoder`
+
+Some errors have detailed explanations: E0425, E0599.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `synapse-mcp` (bin "synapse-mcp") due to 7 previous errors

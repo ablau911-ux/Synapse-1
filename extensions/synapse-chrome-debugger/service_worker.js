@@ -5155,6 +5155,11 @@ async function handlePageScreenshot(params) {
 // high-DPI displays.
 const PAGE_SCREENSHOT_BACKGROUND_CHUNK_CSS = 4096;
 
+// Timeouts for the CDP screencast that forces an occluded render window to
+// paint (see startRenderWindowScreencast / handlePageScreenshotBackground).
+const PAGE_SCREENSHOT_SCREENCAST_SETUP_TIMEOUT_MS = 3000;
+const PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS = 2000;
+
 // Background capture for when Chrome is not the OS foreground (for example a
 // fullscreen game). Page.captureScreenshot renders the tab itself, so the
 // window is never focused and the user's active tab never changes.
@@ -5178,13 +5183,22 @@ async function handlePageScreenshotBackground(params) {
   const visibilityBefore = await pageVisibilityState(selected.tabId);
   try {
     // Chrome does not paint hidden pages (inactive tab, or a window covered by
-    // a fullscreen app), so a capture would hang. Render it in a temporary
-    // unfocused window on an uncovered display instead.
+    // another app), so a direct capture would hang. Move the tab into its own
+    // unfocused window where it becomes the active tab; the occlusion that
+    // remains is handled by the screencast started below.
     if (visibilityBefore !== "visible") {
-      renderWindow = await moveTabToRenderWindow(selected.tabId, commandDeadlineMs);
+      renderWindow = await moveTabToRenderWindow(selected.tabId);
     }
     // Attach before measuring: the debugger infobar can shrink the viewport.
     attachment = await attachDebuggerForCommand(selected.tabId);
+    // The render window is unfocused and sits beneath the user's foreground
+    // window, so Chrome's native occlusion tracker keeps the page hidden and it
+    // never paints. A CDP screencast holds a capturer count on the tab, forcing
+    // the compositor to produce frames while occluded so the capture reads real
+    // pixels. Stopped in the finally block; never changes the OS foreground.
+    if (renderWindow) {
+      await startRenderWindowScreencast(attachment.debuggee);
+    }
     setup = await runPageScreenshotSetup(selected.tabId, { ...request, token });
     if (!setup.ok) {
       throw bridgeError(
@@ -5271,6 +5285,13 @@ async function handlePageScreenshotBackground(params) {
         });
       } catch (error) {
         console.warn(`Synapse background pageScreenshot cleanup failed for tab ${selected.tabId}: ${errorMessage(error)}`);
+      }
+    }
+    if (attachment && renderWindow) {
+      try {
+        await sendDebuggerCommand(attachment.debuggee, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
+      } catch (_) {
+        // The capture already read back; releasing the screencast is hygiene.
       }
     }
     if (attachment?.shouldDetach) {
@@ -5422,12 +5443,39 @@ function renderWindowPlacements(origin, width, height, workArea) {
   return placements;
 }
 
-// Moves the tab into a new unfocused window placed on an uncovered spot, trying
-// each placement until Chrome reports the page visible (that is, the spot is
-// not covered). Beside-origin spots come first; a placement Chrome rejects for
-// bounds off screen is recorded and skipped, and the render window is created
-// with the first placement Chrome accepts. Never focuses anything.
-async function moveTabToRenderWindow(tabId, deadlineMs) {
+// Holds a capturer count on the attached tab via a tiny CDP screencast so an
+// occluded render window still paints. Chrome's native window occlusion tracker
+// marks an unfocused window that sits under another app as hidden, which stops
+// the compositor; a live capturer forces frames regardless of occlusion.
+// Page.startScreencast needs the Page domain enabled first and its frames are
+// ignored. Best-effort: if it fails the capture simply needs an unoccluded
+// window, so a failure must not abort the screenshot. Released by
+// Page.stopScreencast in the handler's finally block.
+async function startRenderWindowScreencast(debuggee) {
+  try {
+    await sendDebuggerCommand(debuggee, "Page.enable", {}, PAGE_SCREENSHOT_SCREENCAST_SETUP_TIMEOUT_MS);
+    await sendDebuggerCommand(
+      debuggee,
+      "Page.startScreencast",
+      { format: "png", maxWidth: 64, maxHeight: 64, everyNthFrame: 1 },
+      PAGE_SCREENSHOT_SCREENCAST_SETUP_TIMEOUT_MS
+    );
+  } catch (error) {
+    console.warn(`Synapse pageScreenshot render-window screencast start failed: ${errorMessage(error)}`);
+  }
+}
+
+// Moves the tab into a new unfocused window so it becomes that window's active
+// tab -- a background tab has no live render view, so this move is required
+// before any capture can read pixels. The window is created once at the first
+// placement Chrome accepts (>= 50% on screen); beside-origin spots are tried
+// first and a placement Chrome rejects for off-screen bounds is recorded and
+// skipped. It is never repositioned afterwards: chrome.windows.update with
+// bounds raises Chrome's whole window group and steals the OS foreground from
+// the user's app, which must never happen. Remaining occlusion by the user's
+// foreground window is expected and defeated by the caller's screencast, not by
+// finding an uncovered spot. Never focuses anything.
+async function moveTabToRenderWindow(tabId) {
   const tab = await chrome.tabs.get(tabId);
   const origin = await chrome.windows.get(tab.windowId);
   const originActive = await activeTabForWindow(tab.windowId);
@@ -5447,30 +5495,18 @@ async function moveTabToRenderWindow(tabId, deadlineMs) {
   };
   assertPhysicalMutationAdmission(`chrome.windows.create:renderWindow:tab=${tabId}`);
   for (const candidate of placements) {
-    let placed;
+    let created;
     try {
-      if (record.windowId === null) {
-        const created = await chrome.windows.create({
-          tabId,
-          focused: false,
-          state: "normal",
-          type: "normal",
-          left: candidate.left,
-          top: candidate.top,
-          width: candidate.width,
-          height: candidate.height
-        });
-        record.windowId = created.id;
-      } else {
-        await chrome.windows.update(record.windowId, {
-          left: candidate.left,
-          top: candidate.top,
-          width: candidate.width,
-          height: candidate.height,
-          focused: false
-        });
-      }
-      placed = await chrome.windows.get(record.windowId);
+      created = await chrome.windows.create({
+        tabId,
+        focused: false,
+        state: "normal",
+        type: "normal",
+        left: candidate.left,
+        top: candidate.top,
+        width: candidate.width,
+        height: candidate.height
+      });
     } catch (error) {
       // Chrome throws for bounds less than 50% on a screen. Record the rejected
       // placement and try the next one instead of failing the screenshot.
@@ -5485,28 +5521,22 @@ async function moveTabToRenderWindow(tabId, deadlineMs) {
       });
       continue;
     }
-    const waitUntil = Math.min(Date.now() + 1500, deadlineMs - 3000);
-    let visibility = await pageVisibilityState(tabId);
-    while (visibility !== "visible" && Date.now() < waitUntil) {
-      await sleep(100);
-      visibility = await pageVisibilityState(tabId);
-    }
+    record.windowId = created.id;
+    const placed = await chrome.windows.get(record.windowId);
     record.placements.push({
       side: candidate.side,
       left: placed.left,
       top: placed.top,
       width: placed.width,
       height: placed.height,
-      visibility
+      visibility: "render_window_created"
     });
-    if (visibility === "visible") {
-      return record;
-    }
+    return record;
   }
   const restore = await restoreTabFromRenderWindow(record);
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `pageScreenshot found no uncovered display spot to render hidden tab ${tabId}; ` +
+    `pageScreenshot found no on-screen spot to place a render window for hidden tab ${tabId}; ` +
       `tried ${JSON.stringify(record.placements)}; tab returned=${restore.ok}. ` +
       `Use browser_dom (content/aria_snapshot) for page state instead.`
   );

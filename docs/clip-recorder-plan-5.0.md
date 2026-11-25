@@ -14,7 +14,7 @@ Built on branch `feature/clip-capture`, head 0b5a8a36. Every figure below was me
 | viewer works | yes: every answer says `exact still`, `video` or `lost`; a late video picture comes back in 414 ms in the app; Claude read the text back correctly |
 | bench 10 of 10 | all 10 checks of `run-spec.mjs av1-probe` pass (§8) |
 | old design removed | yes: the exact, moving and layers design and its files are deleted (W8) |
-| known limits | processor time 0.45–0.97 of one core on the real page, inside the owner's target of at most 1 core per recording (#314); a killed recording is padded with lost instants (`service_restart`) up to the requested length; `clip_diff` compares two exact stills only |
+| known limits | processor time 0.45–0.97 of one core on the real page and 1.05 once (kill round, 2026-11-24), against the owner's target of at most 1 core per recording (#314); a killed recording is padded with lost instants (`service_restart`) up to the requested length; `clip_diff` compares two exact stills only |
 | not done | UI Automation text and event track (later); hardware HEVC upgrade (later); change analysis on video (O2) |
 | merged | into `main` 2026-11-25 (`4bf20bae`, follow-ups `9451157e`, `697dcc0a`) and installed into the running service |
 
@@ -166,7 +166,7 @@ Measured with ffmpeg standing in for the recorder, libaom AV1 at quality setting
 | Size | mixed, 60 s | ≤ 0.64 MB per minute (0.53 + 20 %) | — |
 | Size | text-only page, 20 s | none set | 0.55 MB per minute in total |
 | Lost instants | every scene | 0, or each named with its cause | real page 0 of 802; text-only page 0 of 402; window minimized 3 s: 0; server killed mid-recording: the rest named lost (`service_restart`) |
-| Processor time | every scene | at most 1 core per recording (owner, 2026-11-24: "every pc can spend 1 core", #314); also not above ffmpeg's on the same scene, measured in the same session. Measured so far: mixed 0.43–0.48 of one core, scrolling 0.42–0.67, real page 0.46–0.78 (the higher figures were taken while other work ran on the PC). **All measured runs are within the 1-core target.** | real page 0.45–0.97 of one core over the day's runs; text-only page 0.21 |
+| Processor time | every scene | at most 1 core per recording (owner, 2026-11-24: "every pc can spend 1 core", #314); also not above ffmpeg's on the same scene, measured in the same session. Measured so far: mixed 0.43–0.48 of one core, scrolling 0.42–0.67, real page 0.46–0.78 (the higher figures were taken while other work ran on the PC). **Within the 1-core target in every run but one: the kill round of the 2026-11-24 live check measured 1.05 (#314).** | real page 0.45–0.97 of one core over the day's runs; text-only page 0.21 |
 | Peak memory of the recorder | every scene | not above ffmpeg's whole program: about 410 MB | peak memory of the whole server 281–296 MB |
 | Start | first encoded picture after the `record` call | ≤ 2 instants (100 ms); measured stand-in about 70 ms. **Target not required (owner, 2026-11-24: working correctly, not perfect).** | `record` call answered in 230 ms |
 | Stop | `record_stop` to clip ready | none set | 0.6 s |

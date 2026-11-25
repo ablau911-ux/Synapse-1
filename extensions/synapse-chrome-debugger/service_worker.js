@@ -6717,6 +6717,51 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
   return created;
 }
 
+// #327: records the latest main-frame (frameId 0) navigation error Chrome
+// reports for a tab while a navigate/reload/back/forward runs, so a navigation
+// that ends on a Chrome error page fails loudly instead of returning a normal
+// result. dispose() removes the listener and must run on every exit path.
+function watchMainFrameNavigationError(tabId) {
+  let lastError = null;
+  const listener = (details) => {
+    if (details.tabId === tabId && details.frameId === 0) {
+      lastError = { url: details.url, error: details.error };
+    }
+  };
+  let attached = false;
+  if (chrome.webNavigation?.onErrorOccurred?.addListener) {
+    chrome.webNavigation.onErrorOccurred.addListener(listener);
+    attached = true;
+  }
+  return {
+    latest: () => lastError,
+    dispose: () => {
+      if (attached) {
+        chrome.webNavigation.onErrorOccurred.removeListener(listener);
+        attached = false;
+      }
+    }
+  };
+}
+
+// #327: turns a captured main-frame navigation error into the bridge error the
+// daemon maps to a tool error, or null when the navigation did not fail. A
+// Chrome error page is a failed main-frame navigation (Playwright's page.goto
+// contract). ERR_ABORTED is a download or a superseding navigation, not a
+// failure, so is_download handling stays as it is.
+function mainFrameNavigationFailure(watcher, contextUrl) {
+  const captured = watcher.latest();
+  if (!captured || captured.error === "net::ERR_ABORTED") {
+    return null;
+  }
+  const where = contextUrl ? JSON.stringify(contextUrl) : "the requested page";
+  return bridgeError(
+    ERROR_AXTREE_FAILED,
+    `navigation to ${where} failed: Chrome reported ${captured.error} and the tab now shows Chrome's ` +
+      `error page; error_url=${JSON.stringify(captured.url)}`
+  );
+}
+
 async function handleNavigateTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
@@ -6731,6 +6776,10 @@ async function handleNavigateTab(params) {
   // the download-event sequence before the navigate so we can detect a download
   // that this navigate started and report it as a structured outcome instead.
   let downloadSeqBefore = null;
+  // #327: watch the main frame for a navigation that ends on a Chrome error
+  // page (a name that does not resolve, a refused connection, a bad cert). The
+  // listener is removed on every exit path below.
+  const mainFrameError = watchMainFrameNavigationError(selected.tabId);
   try {
     if (action === "navigate") {
       markAgentNavigation(selected.tabId, {
@@ -6781,6 +6830,7 @@ async function handleNavigateTab(params) {
       };
     }
   } catch (error) {
+    mainFrameError.dispose();
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.${tabsNavigationMethod(action)}(${selected.tabId}) failed: ${errorMessage(error)}; ` +
@@ -6792,18 +6842,27 @@ async function handleNavigateTab(params) {
   // started by this navigate. A matching download is a valid outcome, reported
   // structurally instead of a navigation timeout.
   if (action === "navigate") {
-    const outcome = await waitForNavigateOrDownload(
-      selected.tabId,
-      selected.target,
-      waitTimeoutMs,
-      readbackExpectation,
-      downloadSeqBefore,
-      requestedUrl,
-      before.url
-    );
+    let outcome;
+    try {
+      outcome = await waitForNavigateOrDownload(
+        selected.tabId,
+        selected.target,
+        waitTimeoutMs,
+        readbackExpectation,
+        downloadSeqBefore,
+        requestedUrl,
+        before.url
+      );
+    } catch (error) {
+      mainFrameError.dispose();
+      throw error;
+    }
     if (outcome.kind === "download") {
       const dl = outcome.download;
       const after = outcome.state || before;
+      // A download aborts the main-frame navigation with ERR_ABORTED; that is a
+      // valid outcome, not a failed page.
+      mainFrameError.dispose();
       return {
         extension_id: chrome.runtime.id,
         target_id: after.target_id || selected.target.id,
@@ -6833,6 +6892,11 @@ async function handleNavigateTab(params) {
       };
     }
     const after = outcome.state;
+    const pageFailure = mainFrameNavigationFailure(mainFrameError, requestedUrl);
+    mainFrameError.dispose();
+    if (pageFailure) {
+      throw pageFailure;
+    }
     return {
       extension_id: chrome.runtime.id,
       target_id: after.target_id || selected.target.id,
@@ -6854,7 +6918,18 @@ async function handleNavigateTab(params) {
       target_selection_reason: selected.selectionReason
     };
   }
-  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, readbackExpectation);
+  let after;
+  try {
+    after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, readbackExpectation);
+  } catch (error) {
+    mainFrameError.dispose();
+    throw error;
+  }
+  const pageFailure = mainFrameNavigationFailure(mainFrameError, before.url);
+  mainFrameError.dispose();
+  if (pageFailure) {
+    throw pageFailure;
+  }
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,

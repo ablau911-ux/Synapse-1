@@ -365,6 +365,12 @@ impl SynapseService {
             kind = "observe",
             "tool.invocation kind=observe"
         );
+        if params.0.max_elements == Some(0) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "observe max_elements must be at least 1; got 0",
+            ));
+        }
         let include = observe_include(&params.0);
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;

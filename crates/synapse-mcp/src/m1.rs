@@ -172,7 +172,9 @@ pub struct ObserveParams {
     pub include: Vec<ObserveSlot>,
     #[serde(default)]
     pub depth: Option<u32>,
+    /// Element page size (default 60). Values above 500 are clamped to 500.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub max_elements: Option<usize>,
     #[serde(default)]
     pub element_offset: Option<usize>,

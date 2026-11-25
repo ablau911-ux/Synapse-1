@@ -189,6 +189,9 @@ pub const AGENT_TEMPLATE_NOT_FOUND: &str = "AGENT_TEMPLATE_NOT_FOUND";
 pub const AGENT_TASK_NOT_FOUND: &str = "AGENT_TASK_NOT_FOUND";
 pub const AGENT_TASK_INVALID_TRANSITION: &str = "AGENT_TASK_INVALID_TRANSITION";
 
+// === Shell jobs (act_run_shell background jobs, #193) ===
+pub const SHELL_JOB_NOT_FOUND: &str = "SHELL_JOB_NOT_FOUND";
+
 // === Models (06 section 8.7) ===
 pub const MODEL_DOWNLOAD_FAILED: &str = "MODEL_DOWNLOAD_FAILED";
 pub const MODEL_HASH_MISMATCH: &str = "MODEL_HASH_MISMATCH";

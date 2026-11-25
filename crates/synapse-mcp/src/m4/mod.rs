@@ -12373,17 +12373,22 @@ fn shell_status_replace_in_flight(path: &Path) -> io::Result<bool> {
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
     let bytes = read_shell_status_bytes(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            // An unknown job is a caller error: the message names the job, and
-            // the store path and OS error stay in the structured data (#193).
+            // An unknown job is a caller error with a typed not-found code; the
+            // answer names only the job. The store path and OS error are
+            // internal: they go to the log, not to the caller (#193).
+            tracing::debug!(
+                job_id,
+                status_path = %path.display(),
+                detail = %error,
+                "act_run_shell job status not found"
+            );
             return shell_tool_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                error_codes::SHELL_JOB_NOT_FOUND,
                 format!("act_run_shell job {job_id} was not found"),
                 json!({
-                    "code": error_codes::TOOL_PARAMS_INVALID,
+                    "code": error_codes::SHELL_JOB_NOT_FOUND,
                     "job_id": job_id,
-                    "path": path,
                     "reason": "job_not_found",
-                    "detail": error.to_string(),
                 }),
             );
         }
@@ -12404,17 +12409,23 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
         // directory of another job for a case variant. When the directory's
         // real name differs from the requested id, the requested job does not
         // exist (#265). A record that disagrees with its own directory stays
-        // the storage error below.
+        // the storage error below. Like any not-found answer it carries no
+        // store path (#193).
+        tracing::debug!(
+            job_id,
+            on_disk_job_id = %on_disk_job_id,
+            status_path = %path.display(),
+            "act_run_shell job id matched another job's directory by case only"
+        );
         return Err(shell_tool_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            error_codes::SHELL_JOB_NOT_FOUND,
             format!(
                 "act_run_shell job {job_id} was not found; job ids are case-sensitive and job {on_disk_job_id} exists"
             ),
             json!({
-                "code": error_codes::TOOL_PARAMS_INVALID,
+                "code": error_codes::SHELL_JOB_NOT_FOUND,
                 "job_id": job_id,
                 "on_disk_job_id": on_disk_job_id,
-                "path": path,
                 "reason": "job_not_found",
             }),
         ));

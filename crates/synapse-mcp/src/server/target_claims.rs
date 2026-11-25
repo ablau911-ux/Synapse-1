@@ -1423,7 +1423,7 @@ fn conflict_error(
             "claim": read,
             "read_only_observe_allowed": true,
             "mutation_allowed": false,
-            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt only for an older idle same-agent owner read from the Source of Truth",
+            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt; adoption takes over only from a live owner (read from the Source of Truth) with the same known agent_kind and client_name as the caller, that started before the caller, has no tool call in flight and does not hold the foreground input lease",
         })),
     )
 }

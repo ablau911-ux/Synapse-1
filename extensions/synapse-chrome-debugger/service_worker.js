@@ -137,6 +137,12 @@ const DIALOG_DEBUGGER_SESSIONS = new Map();
 const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
+// Tab ids whose render-window screencast could not be stopped on a BORROWED
+// debugger session (shouldDetach=false, which must never be detached). The owed
+// Page.stopScreencast is retried by an owned path -- at the start of the next
+// pageScreenshot for the tab and from the reconnect alarm tick -- and the id is
+// cleared on a successful stop, tab removal, or debugger detach.
+const RENDER_SCREENCAST_OWED_STOPS = new Set();
 let DURABLE_MUTATION_OWNERS_ENABLED = true;
 let DURABLE_MUTATION_DISABLE_SEQUENCE = 0;
 let COMMAND_EXECUTION_TAIL = Promise.resolve();
@@ -2477,6 +2483,10 @@ function handleReconnectWakeAlarm(alarm) {
   if (alarm?.name !== RECONNECT_WAKE_ALARM_NAME || permanentlyDisabled) {
     return;
   }
+  // Reuse this existing periodic tick (no new alarm/timer) to retry any render
+  // screencast a borrowed session still owes a stop. Fire-and-forget; each
+  // retry clears its own id on success.
+  retryAllOwedRenderScreencastStops();
   loadMaintenanceReconnectPause("reconnectWakeAlarm")
     .then(() => {
       if (permanentlyDisabled) {
@@ -2612,6 +2622,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordTabRemovedForPageEvents(tabId);
+  RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
@@ -2628,6 +2639,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 if (chrome.debugger?.onDetach?.addListener) {
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (Number.isInteger(source?.tabId)) {
+      RENDER_SCREENCAST_OWED_STOPS.delete(source.tabId);
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
       markBindingDebuggerDetached(source.tabId);
       markDialogDebuggerDetached(source.tabId);
@@ -5165,6 +5177,9 @@ const PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS = 2000;
 // window is never focused and the user's active tab never changes.
 async function handlePageScreenshotBackground(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
+  // Before touching this tab, clear any render screencast a previous
+  // borrowed-session capture could not stop on it (owned retry, never a detach).
+  await retryOwedRenderScreencastStop(selected.tabId);
   const request = normalizePageScreenshotRequest(params, selected.tabId);
   const commandStartedAtMs = Date.now();
   const commandDeadlineMs =
@@ -5481,29 +5496,60 @@ async function startRenderWindowScreencast(debuggee) {
   }
 }
 
+// Retries a Page.stopScreencast that a borrowed debugger session still owes
+// (see stopRenderWindowScreencast). The owner's session stays attached, so the
+// command can still reach the tab; the id is dropped on success and kept for a
+// later attempt on failure. Never detaches -- the borrowed session is not ours
+// to end. The onRemoved/onDetach handlers clear ids whose tab or session is
+// gone.
+async function retryOwedRenderScreencastStop(tabId) {
+  if (!RENDER_SCREENCAST_OWED_STOPS.has(tabId)) {
+    return;
+  }
+  try {
+    await sendDebuggerCommand({ tabId }, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
+    RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
+  } catch (error) {
+    console.warn(`Synapse render screencast owed-stop retry failed for tab ${tabId}: ${errorMessage(error)}`);
+  }
+}
+
+function retryAllOwedRenderScreencastStops() {
+  for (const tabId of Array.from(RENDER_SCREENCAST_OWED_STOPS)) {
+    retryOwedRenderScreencastStop(tabId);
+  }
+}
+
 // Confirms the render screencast is stopped before the screenshot command
 // returns. A leaked screencast keeps a capturer count that forces the user's
 // own tab to keep painting, so swallowing a failed stop is not safe.
 // Page.stopScreencast is retried once. If it still fails, the debugger is
-// detached only when this command attached the session itself; detaching a
-// borrowed persistent session (shouldDetach=false) would break the bindings,
-// init scripts and interception its owner registered, so that session is left
-// attached and the unstoppable screencast is reported as an error naming the
-// tab. The outcome is returned so the caller can report it, never hide it.
+// detached only when this command attached the session itself; a borrowed
+// persistent session (shouldDetach=false) must never be detached -- that would
+// break the bindings, init scripts and interception its owner registered -- so
+// its tab is recorded as owing a stop (retried by retryOwedRenderScreencastStop
+// on the next capture and from the reconnect tick) and reported as an error
+// naming the tab. The outcome is returned so the caller can report it.
 async function stopRenderWindowScreencast(attachment) {
+  const tabId = attachment.debuggee?.tabId;
   let stopError = null;
   for (let attemptNo = 0; attemptNo < 2; attemptNo += 1) {
     try {
       await sendDebuggerCommand(attachment.debuggee, "Page.stopScreencast", {}, PAGE_SCREENSHOT_SCREENCAST_STOP_TIMEOUT_MS);
+      if (Number.isInteger(tabId)) {
+        RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
+      }
       return { ok: true, method: attemptNo === 0 ? "stop" : "stop_retry" };
     } catch (error) {
       stopError = errorMessage(error);
     }
   }
-  const tabId = attachment.debuggee?.tabId;
   if (attachment.shouldDetach) {
     try {
       await chrome.debugger.detach(attachment.debuggee);
+      if (Number.isInteger(tabId)) {
+        RENDER_SCREENCAST_OWED_STOPS.delete(tabId);
+      }
       return { ok: true, method: "detach_fallback", stop_error: stopError };
     } catch (detachError) {
       return {
@@ -5512,10 +5558,13 @@ async function stopRenderWindowScreencast(attachment) {
       };
     }
   }
+  if (Number.isInteger(tabId)) {
+    RENDER_SCREENCAST_OWED_STOPS.add(tabId);
+  }
   return {
     ok: false,
     borrowed_session: true,
-    error: `Page.stopScreencast failed twice on tab ${tabId} (${stopError}); the debugger session is shared, so it was left attached and the screencast may still be running on the tab`
+    error: `Page.stopScreencast failed twice on tab ${tabId} (${stopError}); the debugger session is shared, so it was left attached and the screencast may still be running on the tab; the stop will be retried on the next capture of this tab and from the reconnect tick`
   };
 }
 

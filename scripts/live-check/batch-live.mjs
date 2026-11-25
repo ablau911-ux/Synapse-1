@@ -3,14 +3,16 @@
 //   node scripts/live-check/batch-live.mjs run=<name> [only=163,199]
 //
 // Starts target/release/synapse-mcp.exe twice, both with their own database, shell-job root and
-// working folder under .runs/live-check/<run>/: one stdio instance (most checks) and one HTTP
-// instance on a free loopback port outside 7700-7799 (transport and session checks), with a bearer
-// token generated for this run. It never connects to, signals or shares files with the owner's
-// running server. Each check sends its issue's failing input and prints
-//   #N PASS|FAIL|SKIP <observed, at most 300 characters>
+// working folder under .runs/live-check/<run>/: one stdio instance (checks with no session state)
+// and one HTTP instance on a free loopback port outside 7700-7799, with a bearer token generated
+// for this run. Target, browser and lease checks run in their own HTTP sessions there (those tools
+// need an MCP session id); transport and permission checks too (default read-only grants). It
+// never connects to, signals or shares files with the owner's running server. Each check sends
+// its issue's failing input and prints
+//   #N PASS|FAIL|SKIP <observed, at most 700 characters>
 // Checks whose issue touches a window open their own window (a WinForms test window, or a Chrome
-// window with its own --user-data-dir), save <N>-before.png / <N>-after.png through the test
-// server's screenshot tool, and close what they opened in the same check. results.txt in the run
+// window with its own --user-data-dir), save <N>-before.png / <N>-after.png through the stdio
+// test server's screenshot tool, print those paths, and close what they opened in the same check. results.txt in the run
 // folder gets every line. Exit code 0 when the run finished: a FAIL is a result, not an error.
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -23,7 +25,7 @@ import { McpServer, sleep } from './mcp-stdio.mjs';
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const EXE = path.join(REPO, 'target', 'release', 'synapse-mcp.exe');
 const OWNER_PORTS = [7700, 7799]; // the owner's port range; never used here
-const MAX_OBSERVED = 300;
+const MAX_OBSERVED = 700; // room for the decisive text plus the screenshot paths
 
 // ---------------------------------------------------------------- arguments and run folder
 
@@ -201,10 +203,10 @@ class HttpServer {
     if (!(await waitForPort(this.port, 60000))) throw new Error(`HTTP test server did not listen on ${this.port}`);
   }
 
-  /** A new initialized session. */
-  async session() {
+  /** A new initialized session. `clientName` is its clientInfo.name (the registry infers agent_kind from it). */
+  async session(clientName = 'live-check') {
     const s = new HttpSession(this, null);
-    const r = await s.post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'live-check', version: '0' } } });
+    const r = await s.post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: clientName, version: '0' } } });
     s.sid = r.headers.get('mcp-session-id');
     if (r.status !== 200 || !s.sid) throw new Error(`initialize: HTTP ${r.status} ${clip(r.text, 200)}`);
     await s.post({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
@@ -266,7 +268,7 @@ async function openChrome(n, title) {
 // ---------------------------------------------------------------- check context
 
 class Ctx {
-  constructor(srv) { this.srv = srv; this.http = null; this.windows = []; this.pids = []; this.toolsCache = null; }
+  constructor(srv) { this.srv = srv; this.http = null; this.windows = []; this.pids = []; this.sessions = []; this.toolsCache = null; }
 
   async call(name, args, timeoutMs) { return outcome(await this.srv.tool(name, args, timeoutMs)); }
 
@@ -300,6 +302,16 @@ class Ctx {
     return this.http;
   }
 
+  /**
+   * A session on the HTTP test server, closed (DELETE) when the check ends. Target, browser and
+   * lease tools need one: on the stdio server they answer "require an MCP session id".
+   */
+  async session(clientName) {
+    const s = await (await this.httpServer()).session(clientName);
+    this.sessions.push(s);
+    return s;
+  }
+
   async form(n) { const w = await openForm(`Synapse live check #${n} ${TAG}`); this.windows.push(w); return w; }
 
   async chrome(n) { const w = await openChrome(n, `LiveCheck-${n}-${TAG}`); if (w) this.windows.push(w); return w; }
@@ -310,11 +322,13 @@ class Ctx {
   async shot(n, hwnd, label) {
     const file = path.join(RUN_DIR, `${n}-${label}.png`);
     const o = await this.call('screenshot', { operation: 'capture', path: file, window_hwnd: hwnd, overwrite: true }, 60000);
-    return o.ok ? `${label}.png` : `${label}.png failed (${o.code})`;
+    const rel = path.relative(REPO, file);
+    return o.ok ? rel : `${rel} failed (${o.code})`;
   }
 
-  /** Closes every window and process this check opened. */
-  cleanup() {
+  /** Closes every HTTP session, window and process this check opened. */
+  async cleanup() {
+    for (const s of this.sessions.splice(0)) await s.del().catch(() => {});
     for (const w of this.windows.splice(0)) killTree(w.pid);
     for (const pid of this.pids.splice(0)) killTree(pid);
   }
@@ -395,27 +409,33 @@ const CHECKS = {
     return result(d.ok && m.ok && !i.ok && re.test(i.message) && !t.ok && re.test(t.message), `mode change: ${said(i)} | cap change: ${said(t)}`);
   },
 
-  // tool_usage counts act results with ok:false as errors (window: set_window_bounds the target cannot apply)
+  // tool_usage counts an act whose action.ok is false as an error (2d1a0ffa: top-level ok, isError,
+  // or act's action.ok). HTTP session: target = the test window, then set_window_bounds 1x1, which
+  // Windows clamps to its minimum size: delivered, readback size_satisfied false, so act answers
+  // without an error and action.ok false (status verify_needed).
   162: async (ctx, n) => {
     const w = await ctx.form(n);
-    const before = await ctx.call('telemetry', { operation: 'status', status: {} });
+    const s = await ctx.session();
     const shots = [await ctx.shot(n, w.hwnd, 'before')];
-    await ctx.call('target', { operation: 'set', target: { kind: 'window', window_hwnd: w.hwnd } });
+    const set = await s.call('target', { operation: 'set', target: { kind: 'window', window_hwnd: w.hwnd } });
+    if (!set.ok) return result(false, `target set: ${said(set)}; ${shots.join(' ')}`);
+    const before = await s.call('telemetry', { operation: 'status', status: {} });
     let falses = 0; const seen = [];
     try {
       for (let i = 0; i < 2; i += 1) {
-        const o = await ctx.call('act', { action: { verb: 'set_window_bounds', width: 1, height: 1 } });
-        const okField = dig(o.json, 'action')?.ok ?? dig(o.json, 'ok');
-        if (o.ok && okField === false) falses += 1;
-        seen.push(o.ok ? `action.ok=${okField}` : o.code);
+        const o = await s.call('act', { action: { verb: 'set_window_bounds', width: 1, height: 1 } });
+        const a = o.json?.action;
+        if (o.ok && a?.ok === false) falses += 1;
+        seen.push(o.ok ? `action.ok=${a?.ok} status ${a?.status} ${a?.delivery_state} actual ${a?.result?.actual?.width}x${a?.result?.actual?.height}` : said(o));
       }
-    } finally { await ctx.call('target', { operation: 'clear' }); }
+    } finally { await s.call('target', { operation: 'clear' }); }
     shots.push(await ctx.shot(n, w.hwnd, 'after'));
-    const after = await ctx.call('telemetry', { operation: 'status', status: {} });
+    const after = await s.call('telemetry', { operation: 'status', status: {} });
+    if (!before.ok || !after.ok) return result(false, `telemetry status: ${said(before.ok ? after : before)}; acts: ${seen.join(' | ')}; ${shots.join(' ')}`);
     const dErr = usage(after.json, 'act', 'error_total') - usage(before.json, 'act', 'error_total');
     const dOk = usage(after.json, 'act', 'ok_total') - usage(before.json, 'act', 'ok_total');
-    if (falses === 0) return result(false, `could not produce an act result with ok:false (${seen.join(', ')}); act ok_total +${dOk} error_total +${dErr}; ${shots.join(' ')}`);
-    return result(dErr >= falses, `${falses} act calls returned ok:false (${seen.join(', ')}); act error_total +${dErr}, ok_total +${dOk}; ${shots.join(' ')}`);
+    if (falses === 0) return result(false, `no act result with action.ok false (${seen.join(' | ')}); act ok_total +${dOk} error_total +${dErr}; ${shots.join(' ')}`);
+    return result(dErr === falses && dOk === 0, `${falses} act calls answered with action.ok false (${seen.join(' | ')}); act tool_usage error_total +${dErr}, ok_total +${dOk}; ${shots.join(' ')}`);
   },
 
   // observe include=interactable reaches the controls find reaches (Chrome page, depth > 6)
@@ -553,31 +573,36 @@ const CHECKS = {
     return result(p.ok && !d.ok && /expected_version is required because the key exists at version/.test(d.message), `put ${p.ok ? 'ok' : said(p)}; delete without expected_version: ${said(d)}`);
   },
 
-  // target set kind=cdp on a non-browser window: early ACTION_TARGET_INVALID, no bridge guide
+  // target set kind=cdp on a non-browser window: early ACTION_TARGET_INVALID, no bridge guide (HTTP session)
   199: async (ctx, n) => {
     const w = await ctx.form(n);
+    const s = await ctx.session();
     const shots = [await ctx.shot(n, w.hwnd, 'before')];
     const t0 = Date.now();
-    const o = await ctx.call('target', { operation: 'set', target: { kind: 'cdp', window_hwnd: w.hwnd, cdp_target_id: 'bogus' } });
+    const o = await s.call('target', { operation: 'set', target: { kind: 'cdp', window_hwnd: w.hwnd, cdp_target_id: 'bogus' } });
     const ms = Date.now() - t0;
-    await ctx.call('target', { operation: 'clear' });
+    await s.call('target', { operation: 'clear' });
     shots.push(await ctx.shot(n, w.hwnd, 'after'));
     return result(!o.ok && o.code === 'ACTION_TARGET_INVALID' && /requires a Chromium browser window/.test(o.message) && o.bytes < 2000, `${said(o)} (${o.bytes} bytes, ${ms} ms); ${shots.join(' ')}`);
   },
 
-  // CDP tab verbs on a native-window target say the target is a window
+  // CDP tab verbs on a native-window target say the target is a window (HTTP session)
   200: async (ctx, n) => {
     const w = await ctx.form(n);
+    const s = await ctx.session();
     const shots = [await ctx.shot(n, w.hwnd, 'before')];
-    const set = await ctx.call('target', { operation: 'set', target: { kind: 'window', window_hwnd: w.hwnd } });
+    const set = await s.call('target', { operation: 'set', target: { kind: 'window', window_hwnd: w.hwnd } });
     let nav; let ev;
     try {
-      nav = await ctx.call('act', { action: { verb: 'navigate', url: 'about:blank' } });
-      ev = await ctx.call('act', { action: { verb: 'dispatch_event', event_type: 'click', selector: 'body' } });
-    } finally { await ctx.call('target', { operation: 'clear' }); }
+      nav = await s.call('act', { action: { verb: 'navigate', url: 'about:blank' } });
+      ev = await s.call('act', { action: { verb: 'dispatch_event', event_type: 'click', selector: 'body' } });
+    } finally { await s.call('target', { operation: 'clear' }); }
     shots.push(await ctx.shot(n, w.hwnd, 'after'));
-    const good = (o) => !o.ok && /needs a browser tab target, but this session's target is the native window/.test(o.raw);
-    return result(set.ok && good(nav) && good(ev), `${set.ok ? '' : `set: ${said(set)}; `}navigate: ${said(nav)} | dispatch_event: ${ev.ok ? clip(ev.text, 60) : ev.code}; ${shots.join(' ')}`);
+    const re = /needs a browser tab target, but this session's target is the native window/;
+    // a13e112e: act still answers the refusal inside its result (action.ok false, refused_before_delivery).
+    const good = (o) => re.test(o.raw) && /ACTION_TARGET_INVALID/.test(o.raw);
+    const show = (o) => (o.ok ? `action.ok=${o.json?.action?.ok} ${o.json?.action?.delivery_state} ${dig(o.json?.action, 'code')}: ${clip(dig(o.json?.action, 'message') ?? o.text, 140)}` : said(o));
+    return result(set.ok && good(nav) && good(ev), `${set.ok ? '' : `set: ${said(set)}; `}navigate: ${show(nav)} | dispatch_event: ${show(ev)}; ${shots.join(' ')}`);
   },
 
   // tools/call with missing or malformed params is -32602
@@ -675,14 +700,18 @@ const CHECKS = {
     return result(!a.ok && /PROFILE_NOT_FOUND/.test(a.raw) && !b.ok, `unknown: ${said(a)} | traversal: ${b.ok ? 'accepted' : b.code}`);
   },
 
-  // storage summary names its figures as estimates
+  // storage summary names its figures as estimates (21fdff37: the facade contract row of storage
+  // summary reads "RocksDB CF size estimates (live data + memtables) + estimated row counts", no
+  // longer "... + exact row counts"; the summary itself reports metrics_mode ..._estimated_row_counts)
   223: async (ctx) => {
     const o = await ctx.call('storage', { operation: 'summary', summary: {} });
-    const desc = (await ctx.tool('storage'))?.description ?? '';
-    const all = `${o.raw} ${desc}`;
-    const pass = o.ok && /estimated row counts/i.test(all) && /size estimates/i.test(all);
-    const m = all.match(/[^."]*estimate[^."]*/i);
-    return result(pass, `${o.ok ? 'summary ok' : said(o)}; ${clip(m ? m[0] : 'no estimate label found', 200)}`);
+    const p = await ctx.call('profile', { operation: 'status', detail: true });
+    const contract = digAll(p.json, (x) => x.tool_name === 'storage' && Array.isArray(x.operations))[0];
+    const row = contract?.operations?.find((op) => op.operation === 'summary');
+    const sot = String(row?.source_of_truth ?? '');
+    const mode = String(dig(o.json, 'metrics_mode') ?? '');
+    const pass = o.ok && p.ok && /size estimates/.test(sot) && /estimated row counts/.test(sot) && !/exact row counts/.test(sot) && /estimated_row_counts/.test(mode);
+    return result(pass, `summary ${o.ok ? `metrics_mode ${mode}` : said(o)}; contract storage.summary source_of_truth: ${p.ok ? (row ? JSON.stringify(sot) : 'row not found') : said(p)}`);
   },
 
   // out-of-range readback limits are refused, not clamped
@@ -795,38 +824,41 @@ const CHECKS = {
     return result(o.ok && ms < 8000 && port == null && !line.includes('--remote-debugging-port'), `${o.ok ? `pid ${proc(o)} in ${ms} ms, cdp_debug_port ${port}, command_line ${clip(line, 120)}` : `${said(o)} after ${ms} ms`}`);
   },
 
-  // browser tab tools check an explicit window_hwnd first (dead, non-browser, browser without tab)
+  // browser tab tools check an explicit window_hwnd first (dead, non-browser, browser without tab; HTTP session)
   250: async (ctx, n) => {
     const w = await ctx.form(n);
     const c = await ctx.chrome(n);
+    const s = await ctx.session();
     const shots = [await ctx.shot(n, w.hwnd, 'before')];
     if (c) shots.push(await ctx.shot(n, c.hwnd, 'chrome-before'));
-    const dead = await ctx.call('browser_storage', { operation: 'get', window_hwnd: 4294967295 });
-    const form = await ctx.call('browser_dom', { operation: 'content', content: { window_hwnd: w.hwnd } });
-    const tabless = c ? await ctx.call('browser_dom', { operation: 'content', content: { window_hwnd: c.hwnd } }) : null;
+    const dead = await s.call('browser_storage', { operation: 'get', window_hwnd: 4294967295 });
+    const form = await s.call('browser_dom', { operation: 'content', content: { window_hwnd: w.hwnd } });
+    const tabless = c ? await s.call('browser_dom', { operation: 'content', content: { window_hwnd: c.hwnd } }) : null;
     shots.push(await ctx.shot(n, w.hwnd, 'after'));
     if (c) shots.push(await ctx.shot(n, c.hwnd, 'chrome-after'));
     const pass = dead.code === 'TARGET_WINDOW_NOT_FOUND' && form.code === 'ACTION_TARGET_INVALID' && /requires a Chromium browser window/.test(form.message)
       && (!tabless || (tabless.code === 'TARGET_NOT_SET' && /does not select a tab/.test(tabless.message)));
-    return result(pass, `dead: ${dead.code} | form: ${form.code} ${clip(form.message, 60)} | chrome no tab: ${tabless ? `${tabless.code} ${clip(tabless.message, 50)}` : 'no Chrome'}; ${shots.join(' ')}`);
+    return result(pass, `dead: ${dead.code} ${clip(dead.message, 80)} | form: ${form.code} ${clip(form.message, 100)} | chrome no tab: ${tabless ? `${tabless.code} ${clip(tabless.message, 100)}` : 'no Chrome'}; ${shots.join(' ')}`);
   },
 
-  // chrome-tab id plus a non-browser hwnd: one typed refusal before any bridge call
+  // chrome-tab id plus a non-browser hwnd: one typed refusal before any bridge call (HTTP session)
   251: async (ctx, n) => {
     const w = await ctx.form(n);
+    const s = await ctx.session();
     const shots = [await ctx.shot(n, w.hwnd, 'before')];
-    const dom = await ctx.call('browser_dom', { operation: 'content', content: { cdp_target_id: 'chrome-tab:abc', window_hwnd: w.hwnd } });
-    const tabs = await ctx.call('browser_tabs', { operation: 'select', cdp_target_id: 'chrome-tab:abc', window_hwnd: w.hwnd });
+    const dom = await s.call('browser_dom', { operation: 'content', content: { cdp_target_id: 'chrome-tab:abc', window_hwnd: w.hwnd } });
+    const tabs = await s.call('browser_tabs', { operation: 'select', cdp_target_id: 'chrome-tab:abc', window_hwnd: w.hwnd });
     shots.push(await ctx.shot(n, w.hwnd, 'after'));
     const good = (o) => o.code === 'ACTION_TARGET_INVALID' && /requires a Chromium browser window/.test(o.message) && o.bytes < 2000;
-    return result(good(dom) && good(tabs), `browser_dom: ${dom.code} (${dom.bytes} bytes) ${clip(dom.message, 70)} | browser_tabs: ${tabs.code} (${tabs.bytes} bytes); ${shots.join(' ')}`);
+    return result(good(dom) && good(tabs), `browser_dom: ${dom.code} (${dom.bytes} bytes) ${clip(dom.message, 110)} | browser_tabs: ${tabs.code} (${tabs.bytes} bytes) ${clip(tabs.message, 110)}; ${shots.join(' ')}`);
   },
 
-  // browser_tabs refuses a field the operation does not take before its format
+  // browser_tabs refuses a field the operation does not take before its format (HTTP session)
   252: async (ctx) => {
-    const a = await ctx.call('browser_tabs', { operation: 'list', url: 'x' });
-    const b = await ctx.call('browser_tabs', { operation: 'select', url: 'x', cdp_target_id: 'chrome-tab:1' });
-    return result(a.code === 'TOOL_PARAMS_INVALID' && /does not accept url/.test(a.message) && /does not accept url/.test(b.message), `list: ${said(a)} | select: ${clip(b.message, 80)}`);
+    const s = await ctx.session();
+    const a = await s.call('browser_tabs', { operation: 'list', url: 'x' });
+    const b = await s.call('browser_tabs', { operation: 'select', url: 'x', cdp_target_id: 'chrome-tab:1' });
+    return result(a.code === 'TOOL_PARAMS_INVALID' && /does not accept url/.test(a.message) && b.code === 'TOOL_PARAMS_INVALID' && /does not accept url/.test(b.message), `list: ${said(a)} | select: ${said(b)}`);
   },
 
   // workspace get on an expired key is WORKSPACE_KEY_ABSENT
@@ -871,20 +903,30 @@ const CHECKS = {
     return result(r.status === 200 && !!m && (m.result !== undefined || (m.error?.code === -32603 && reason === 'response_stream_ended_without_reply')), `DELETE HTTP ${d.status}; in-flight call: HTTP ${r.status}, ${m ? (m.error ? `error ${m.error.code} reason ${reason}` : 'result') : `no message (${clip(r.text, 60) || 'empty stream'})`}`);
   },
 
-  // a terminated adopt owner is the adopt tool's own refusal (3 HTTP sessions, one test window)
+  // a terminated adopt owner is the adopt tool's own refusal (3 HTTP sessions, one test window).
+  // Adoption (target_claims.rs ensure_same_agent_adoption_allowed) needs both sessions live, the
+  // same known agent_kind (inferred from clientInfo.name: "claude" -> claude), the same
+  // client_name, and the adopter started later than the owner. Two adopters then race for one
+  // owner: the winner terminates it; per 6b21a52b the loser gets TARGET_CLAIM_ADOPT_REFUSED
+  // "owner_session_id was already terminated" with requester_session_id = its own session, not
+  // HTTP_SESSION_INVALID naming the owner as if it were the caller.
   259: async (ctx, n) => {
-    const http = await ctx.httpServer();
+    const CLIENT = 'claude-code'; // agent_kind claude for every session of this check
     const w = await ctx.form(n);
     const shots = [await ctx.shot(n, w.hwnd, 'before')];
-    const [a, b1, b2] = await Promise.all([http.session(), http.session(), http.session()]);
-    try {
-      const claim = await a.call('target', { operation: 'claim', target: { kind: 'window', window_hwnd: w.hwnd }, ttl_ms: 60000 });
-      await Promise.all([b1, b2].map((b) => b.call('target', { operation: 'set', target: { kind: 'window', window_hwnd: w.hwnd } })));
-      const res = await Promise.all([b1, b2].map((b) => b.call('target', { operation: 'adopt', owner_session_id: a.sid })));
-      shots.push(await ctx.shot(n, w.hwnd, 'after'));
-      const won = res.filter((o) => o.ok).length; const lost = res.find((o) => !o.ok);
-      return result(claim.ok && won === 1 && lost?.code === 'TARGET_CLAIM_ADOPT_REFUSED', `claim ${claim.ok ? 'ok' : said(claim)}; adopts won ${won}; loser: ${lost ? said(lost) : 'none'}; ${shots.join(' ')}`);
-    } finally { for (const s of [a, b1, b2]) await s.del().catch(() => {}); }
+    const target = { kind: 'window', window_hwnd: w.hwnd };
+    const a = await ctx.session(CLIENT);
+    await sleep(50); // adopters must start strictly later than the owner (ms clock)
+    const [b1, b2] = await Promise.all([ctx.session(CLIENT), ctx.session(CLIENT)]);
+    const claim = await a.call('target', { operation: 'claim', target, ttl_ms: 60000 });
+    if (!claim.ok) return result(false, `claim: ${said(claim)}; ${shots.join(' ')}`);
+    const res = await Promise.all([b1, b2].map((b) => b.call('target', { operation: 'adopt', owner_session_id: a.sid, target, ttl_ms: 60000 })));
+    shots.push(await ctx.shot(n, w.hwnd, 'after'));
+    const won = res.filter((o) => o.ok).length;
+    const li = res.findIndex((o) => !o.ok); const lost = res[li]; const loserSid = [b1, b2][li]?.sid;
+    const reqSid = lost ? dig(lost.json, 'requester_session_id') : undefined;
+    const pass = won === 1 && lost?.code === 'TARGET_CLAIM_ADOPT_REFUSED' && /owner_session_id was already terminated/.test(lost.message) && reqSid === loserSid;
+    return result(pass, `claim ok; adopts won ${won}; loser: ${lost ? `${said(lost)} [requester_session_id ${reqSid === loserSid ? 'is the loser' : JSON.stringify(reqSid)}, owner ${dig(lost.json, 'owner_session_id') === a.sid ? 'is A' : 'other'}]` : 'none'}; ${shots.join(' ')}`);
   },
 
   // unknown-field errors on the session facade list its accepted fields
@@ -966,9 +1008,10 @@ const CHECKS = {
     return result(!o.ok && /browser_fill_form/.test(o.message) && !/browser_set_value/.test(o.message), said(o));
   },
 
-  // live-window refusals name the calling tool
+  // live-window refusals name the calling tool (HTTP session)
   273: async (ctx) => {
-    const o = await ctx.call('browser_tabs', { operation: 'list', window_hwnd: 1 });
+    const s = await ctx.session();
+    const o = await s.call('browser_tabs', { operation: 'list', window_hwnd: 1 });
     return result(o.code === 'TARGET_WINDOW_NOT_FOUND' && /^browser_tabs window_hwnd 0x1 is not a live window/.test(o.message), said(o));
   },
 
@@ -1033,20 +1076,59 @@ const CHECKS = {
   },
 
   // cleanup without behaviour change: lease owner still printed as a plain id or "none"
+  // (e85a5697 lease::owner_label). Two HTTP sessions: A holds the lease; B reads status, is refused
+  // acquire (held by session <A>) and release (current holder <A>); after A releases, B's release
+  // names holder none. No answer may carry Rust's "Some(".
   289: async (ctx) => {
-    const o = await ctx.call('act', { operation: 'lease_status' });
-    const owner = dig(o.json, 'owner_session_id');
-    return result(o.ok && !/Some\(/.test(o.raw), `lease_status ${o.ok ? 'ok' : said(o)}; owner_session_id ${JSON.stringify(owner)}; "Some(" in answer: ${/Some\(/.test(o.raw)}`);
+    const a = await ctx.session(); const b = await ctx.session();
+    const lease = (s, op, extra = {}) => s.call('act', { operation: op, ...extra });
+    const acq = await lease(a, 'lease_acquire', { ttl_ms: 10000 });
+    if (!acq.ok) return result(false, `A lease_acquire: ${said(acq)}`);
+    let st; let busy; let rel;
+    try {
+      st = await lease(b, 'lease_status');
+      busy = await lease(b, 'lease_acquire', { ttl_ms: 10000 });
+      rel = await lease(b, 'lease_release');
+    } finally { await lease(a, 'lease_release'); }
+    const relNone = await lease(b, 'lease_release');
+    const all = [acq, st, busy, rel, relNone];
+    const some = all.some((o) => /Some\(/.test(o.raw));
+    // A non-holder's release is an idempotent ok (outcome not_held) carrying owner_session_id
+    // (id or null); a refusal that names a holder must name the right one (id or "none").
+    const names = (o, sid) => (o.ok ? dig(o.json, 'owner_session_id') === sid : new RegExp(`(held by session|current holder) "?${sid ?? 'none'}\\b`).test(o.message));
+    const owner = dig(st.json, 'owner_session_id');
+    const pass = !some && st.ok && owner === a.sid && !busy.ok && busy.message.includes(`held by session ${a.sid}`) && names(rel, a.sid) && names(relNone, null);
+    const anon = (t) => String(t).replaceAll(a.sid, '<A>').replaceAll(b.sid, '<B>');
+    const show = (o) => (o.ok ? `ok ${dig(o.json, 'outcome')} owner ${anon(JSON.stringify(dig(o.json, 'owner_session_id')))}` : `${o.code}: ${clip(anon(o.message), 110)}`);
+    return result(pass, `B status: owner ${owner === a.sid ? '<A>' : JSON.stringify(owner)} | B acquire: ${show(busy)} | B release while A holds: ${show(rel)} | B release after A released: ${show(relNone)}; "Some(" in any answer: ${some}`);
   },
 
-  // maintenance denials name the tool's read-only operations
+  // maintenance denials name the tool's read-only operations (8228ff5e). HTTP session with the
+  // default read-only grants and profile normal_agent: require_maintenance_profile refuses before
+  // any permission check, with remediation "...; normal_agent may use <read-only ops> first".
+  // (The stdio server is unscoped break_glass, so it never denies.) Payloads are valid ones.
   311: async (ctx) => {
-    const g = await ctx.call('storage', { operation: 'gc_once', gc_once: { cf_name: 'CF_EVENTS', soft_cap_rows: 1000000, hard_cap_rows: 1000000 } });
-    const m = await ctx.call('model', { operation: 'register', register: { name: `${TAG}-m`, base_url: 'http://127.0.0.1:9', model_id: 'x' } });
-    const h = await ctx.call('hygiene', { operation: 'scan_storage', scan_storage: {} });
-    const rem = (o) => String(dig(o.json, 'remediation') ?? o.raw);
-    const pass = /normal_agent may use inspect or summary first/.test(rem(g)) && /normal_agent may use list or status first/.test(rem(m)) && /normal_agent may use scan_text without persist, flags or report first/.test(rem(h));
-    return result(pass, `gc_once: ${g.code} | register: ${m.code} | scan_storage: ${h.code}; ${clip(rem(g).match(/normal_agent[^"]*/)?.[0] ?? rem(g), 120)}`);
+    const s = await ctx.session();
+    const prof = async () => String(dig((await s.call('profile', { operation: 'status' })).json, 'profile') ?? '?');
+    let profile = await prof();
+    if (profile !== 'normal_agent') {
+      const set = await s.call('profile', { operation: 'set', profile: 'normal_agent', reason: 'live check #311' });
+      if (!set.ok) return result(false, `profile ${profile}; set normal_agent: ${said(set)}`);
+      profile = await prof();
+    }
+    const cases = [
+      ['storage gc_once', await s.call('storage', { operation: 'gc_once', gc_once: { cf_name: 'CF_EVENTS', soft_cap_rows: 1000000, hard_cap_rows: 1000000 } }), /normal_agent may use inspect or summary first/],
+      ['model register', await s.call('model', { operation: 'register', register: { name: `${TAG}-m`, base_url: 'http://127.0.0.1:9', model_id: 'x' } }), /normal_agent may use list or status first/],
+      ['hygiene scan_storage', await s.call('hygiene', { operation: 'scan_storage', scan_storage: {} }), /normal_agent may use scan_text without persist, flags or report first/],
+    ];
+    const rem = (o) => String(dig(o.json, 'remediation') ?? '');
+    let pass = profile === 'normal_agent'; const seen = [];
+    for (const [name, o, want] of cases) {
+      const ok = !o.ok && o.code === 'TOOL_PROFILE_POLICY_DENIED' && want.test(rem(o));
+      pass &&= ok;
+      seen.push(`${name}: ${o.ok ? 'accepted' : `${o.code} remediation ...${clip(rem(o).match(/; normal_agent[^"]*/)?.[0] ?? (rem(o) || o.message), 90)}`}${ok ? '' : '!'}`);
+    }
+    return result(pass, `profile ${profile} | ${seen.join(' | ')}`);
   },
 
   // delivery fact of an error raised after delivered input: needs a read-back that fails after input
@@ -1075,7 +1157,8 @@ async function main() {
     env: { SYNAPSE_SHELL_JOB_ROOT: path.join(RUN_DIR, `shell-jobs-stdio-${STAMP}`), SYNAPSE_MCP_ALLOWED_PERMISSIONS: 'READ_EVENTS,READ_REFLEX,READ_PROFILE,READ_STORAGE,WRITE_STORAGE' },
   });
   const ctx = new Ctx(srv);
-  const onSignal = () => { ctx.cleanup(); ctx.http?.stop(); srv.kill(); process.exit(130); };
+  // Killing the HTTP server ends its sessions; windows and processes are closed here.
+  const onSignal = () => { ctx.sessions.length = 0; ctx.cleanup(); ctx.http?.stop(); srv.kill(); process.exit(130); };
   process.on('SIGINT', onSignal);
   let counts = { PASS: 0, FAIL: 0, SKIP: 0 };
   try {
@@ -1083,14 +1166,14 @@ async function main() {
     for (const n of ISSUES) {
       if (ONLY && !ONLY.has(n)) continue;
       let r;
-      try { r = await CHECKS[n](ctx, n); } catch (e) { r = { status: 'FAIL', observed: `check error: ${e.message}` }; } finally { ctx.cleanup(); }
+      try { r = await CHECKS[n](ctx, n); } catch (e) { r = { status: 'FAIL', observed: `check error: ${e.message}` }; } finally { await ctx.cleanup(); }
       const line = `#${n} ${r.status} ${clip(r.observed)}`;
       counts[r.status] += 1;
       console.log(line);
       fs.appendFileSync(RESULTS, `${line}\n`);
     }
   } finally {
-    ctx.cleanup();
+    await ctx.cleanup();
     ctx.http?.stop();
     await srv.close();
   }

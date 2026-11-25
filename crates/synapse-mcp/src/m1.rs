@@ -3880,6 +3880,9 @@ pub fn observe_input(
 ) -> Result<ObservationInput, ErrorData> {
     let depth = observe_gather_depth(params);
     if let Some(element_id) = &params.subtree_root {
+        if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
+            ensure_element_in_target_window("observe", "subtree_root", element_id, hwnd)?;
+        }
         return element_input_from_id(element_id, depth, state.perception_mode);
     }
     // Precedence: explicit per-call window_hwnd > session active target >

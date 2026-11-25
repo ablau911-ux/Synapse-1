@@ -47,7 +47,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::agent_state::{AgentLifecycleState, AgentStateRead, StateTransition};
-use crate::m3::permissions::{Permission, required};
 use super::notify_tools::{
     NotifyHumanParams, NotifyKind, ToastCleanupReport, ToastRemovalOutcome, remove_internal_toast,
     remove_orphaned_escalation_toasts, run_internal_toast, toast_tag_for,
@@ -59,6 +58,7 @@ use crate::m3::approvals::{
     ApprovalAllow, ApprovalAuditRecord, ApprovalItemRecord, ApprovalKind, ApprovalStatus,
     ApprovalTimeoutDecision, ApprovalToastState,
 };
+use crate::m3::permissions::{Permission, required};
 
 type CfKvRow = (Vec<u8>, Vec<u8>);
 type CfKvRows = Vec<CfKvRow>;

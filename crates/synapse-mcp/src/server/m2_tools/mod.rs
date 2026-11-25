@@ -20,7 +20,7 @@ use crate::m2::postcondition::{
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, ActStrokePlan, CLICK_REASON_NO_OBSERVED_DELTA,
     CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, ForegroundClickPolicy, HwndKeyboardTargetState,
-    OperatorPanicActionBoundary, PressBackend, ResolvedKeymapPress, TypeBackend,
+    OperatorPanicActionBoundary, PostKeyDelivery, PressBackend, ResolvedKeymapPress, TypeBackend,
     act_click_postmessage_with_params, act_focus_window_with_boundary,
     act_keymap_response_from_press, act_pad_with_handle_and_boundary, act_press_cdp_target,
     act_press_normalized_labels, act_press_postmessage_target, act_press_with_handle_and_boundary,
@@ -4384,7 +4384,14 @@ impl SynapseService {
             None
         };
         let verify_timeout_ms = params.verify_timeout_ms;
-        let mut response = act_press_postmessage_target(root_hwnd, params, boundary).await?;
+        let (mut response, delivery) =
+            act_press_postmessage_target(root_hwnd, params, boundary).await?;
+        if let PostKeyDelivery::TargetWindowClosed { detail } = delivery {
+            // The key-down closed the target window; the press was delivered and
+            // there is no live window to verify against (mirrors act_click).
+            response.postcondition = postcondition_target_window_closed("act_press", detail);
+            return Ok(response);
+        }
         // The keys were posted: every failure of the read-back below says so.
         let postcondition = async {
             tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;

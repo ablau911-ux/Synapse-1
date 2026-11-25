@@ -131,11 +131,20 @@ pub(crate) async fn act_press_cdp_target(
     })
 }
 
+/// How the caller of a PostMessage key press finishes building the answer.
+pub(crate) enum PostKeyDelivery {
+    /// The target window is live; verify the delta by reading it back.
+    VerifyReadback,
+    /// The key-down closed the target window; the press was delivered and there
+    /// is no live window to read back.
+    TargetWindowClosed { detail: String },
+}
+
 pub(crate) async fn act_press_postmessage_target(
     root_hwnd: i64,
     params: ActPressParams,
     boundary: super::OperatorPanicActionBoundary,
-) -> Result<ActPressResponse, ErrorData> {
+) -> Result<(ActPressResponse, PostKeyDelivery), ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
     let key_count = u32::try_from(keys.len()).map_err(|_err| {
@@ -145,16 +154,25 @@ pub(crate) async fn act_press_postmessage_target(
         )
     })?;
     validate_hold_ms(params.hold_ms)?;
-    postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await?;
-    Ok(ActPressResponse {
-        ok: true,
-        keys_pressed: key_count,
-        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
-        backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
-        backend_tier_used: "postmessage".to_owned(),
-        required_foreground: false,
-        postcondition: press_postcondition_not_requested(),
-    })
+    let delivery =
+        match postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await? {
+            postmessage::PostKeySequenceOutcome::Readback => PostKeyDelivery::VerifyReadback,
+            postmessage::PostKeySequenceOutcome::TargetWindowClosed { detail } => {
+                PostKeyDelivery::TargetWindowClosed { detail }
+            }
+        };
+    Ok((
+        ActPressResponse {
+            ok: true,
+            keys_pressed: key_count,
+            elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
+            backend_tier_used: "postmessage".to_owned(),
+            required_foreground: false,
+            postcondition: press_postcondition_not_requested(),
+        },
+        delivery,
+    ))
 }
 
 pub(crate) fn hwnd_keyboard_target_state(

@@ -25,6 +25,16 @@ pub(crate) struct HwndKeyboardTargetState {
     pub key_up_not_posted_window_closed: Option<String>,
 }
 
+/// Outcome of a PostMessage key sequence delivered to a root window.
+#[derive(Clone, Debug)]
+pub(crate) enum PostKeySequenceOutcome {
+    /// The target window is still live; the post-delivery readback succeeded.
+    Readback,
+    /// The key-down closed the target root window. The press was delivered and
+    /// there is no live window to read back; `detail` names the closed window.
+    TargetWindowClosed { detail: String },
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 struct WindowCandidate {
@@ -52,7 +62,7 @@ pub(crate) async fn post_key_sequence(
     keys: &[Key],
     hold_ms: u32,
     boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
+) -> Result<PostKeySequenceOutcome, ErrorData> {
     post_key_sequence_impl(root_hwnd, keys, hold_ms, boundary).await
 }
 
@@ -62,7 +72,7 @@ async fn post_key_sequence_impl(
     keys: &[Key],
     hold_ms: u32,
     boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
+) -> Result<PostKeySequenceOutcome, ErrorData> {
     let key_specs = keys
         .iter()
         .map(key_spec)
@@ -171,12 +181,26 @@ async fn post_key_sequence_impl(
     if let Some(error) = release_error {
         return Err(error);
     }
-    // Input was already posted before this readback.
-    let mut state = best_keyboard_target(root_hwnd)
+    // Input was already posted before this readback. When the key-down closed
+    // the target root window there is no live window to read back; the press was
+    // delivered, so report the closed window instead of failing the readback.
+    if let Some(detail) = key_up_window_closed
+        && !root_is_window(root_hwnd)
+    {
+        return Ok(PostKeySequenceOutcome::TargetWindowClosed { detail });
+    }
+    // Liveness gate: a dead root without a skipped key-up is still an error.
+    best_keyboard_target(root_hwnd)
         .and_then(target_state)
         .map_err(|error| crate::m2::error_after_earlier_steps(action_error_to_mcp(&error), 1))?;
-    state.key_up_not_posted_window_closed = key_up_window_closed;
-    Ok(state)
+    Ok(PostKeySequenceOutcome::Readback)
+}
+
+/// True when `root_hwnd` still names a live top-level window.
+#[cfg(windows)]
+fn root_is_window(root_hwnd: i64) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    hwnd_from_i64(root_hwnd).is_ok_and(|hwnd| unsafe { IsWindow(Some(hwnd)) }.as_bool())
 }
 
 #[cfg(not(windows))]
@@ -185,7 +209,7 @@ async fn post_key_sequence_impl(
     _keys: &[Key],
     _hold_ms: u32,
     _boundary: crate::m2::OperatorPanicActionBoundary,
-) -> Result<HwndKeyboardTargetState, ErrorData> {
+) -> Result<PostKeySequenceOutcome, ErrorData> {
     Err(action_error_to_mcp(&ActionError::BackendUnavailable {
         detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
     }))

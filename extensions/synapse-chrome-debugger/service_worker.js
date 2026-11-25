@@ -5514,9 +5514,20 @@ async function retryOwedRenderScreencastStop(tabId) {
   }
 }
 
+// Alarm-driven entry: the reconnect tick carries no command admission context,
+// so sendDebuggerCommand would reject (assertPhysicalMutationAdmission needs
+// one). Route each owed stop through the serialized background-mutation
+// admission -- which sets that context, persists ordering, and runs one at a
+// time -- mirroring the dialogAutoHandle event path. Errors are contained so a
+// tick never produces an unhandled rejection.
 function retryAllOwedRenderScreencastStops() {
   for (const tabId of Array.from(RENDER_SCREENCAST_OWED_STOPS)) {
-    retryOwedRenderScreencastStop(tabId);
+    enqueuePersistedBackgroundMutation(
+      "renderScreencastStop",
+      () => retryOwedRenderScreencastStop(tabId)
+    ).catch((error) => {
+      console.warn(`Synapse render screencast owed-stop tick failed for tab ${tabId}: ${errorMessage(error)}`);
+    });
   }
 }
 

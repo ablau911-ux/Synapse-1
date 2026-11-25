@@ -572,6 +572,12 @@ impl SynapseService {
         target: Option<SessionTarget>,
         mcp_session_id: Option<&str>,
     ) -> Result<Json<FindResponse>, ErrorData> {
+        if params.0.limit == Some(0) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "find limit must be at least 1; got 0",
+            ));
+        }
         let explicit_hwnd = params.0.window_hwnd;
         let target_hwnd = perception_window_hwnd("find", &target, explicit_hwnd)?;
         let cdp_target_id_hint = if explicit_hwnd.is_some() {

@@ -222,7 +222,9 @@ pub struct FindParams {
     pub automation_id: Option<String>,
     #[serde(default)]
     pub scope: Option<FindScope>,
+    /// Maximum results (default 5). Values above 20 are clamped to 20.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub limit: Option<usize>,
     #[serde(default)]
     pub in_window: Option<ElementId>,

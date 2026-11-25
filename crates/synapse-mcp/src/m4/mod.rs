@@ -1587,15 +1587,22 @@ pub struct ActLaunchResponse {
     pub hwnd: Option<i64>,
     /// PID that actually OWNS `hwnd`. Equals `pid` for a normal launch where the
     /// spawned process showed its own window. Differs from `pid` when act_launch
-    /// matched a PRE-EXISTING same-app window via the existing-window fallback, or
-    /// the target re-exec'd into another process — so `(hwnd, window_owner_pid)`
+    /// matched a PRE-EXISTING same-app window via the existing-window fallback,
+    /// the target re-exec'd into another process, or the window belongs to a
+    /// descendant of the launched process (a `.bat` or `npm` launcher whose
+    /// grandchild shows the app window, #322) — so `(hwnd, window_owner_pid)`
     /// always refer to the same process even when `pid` does not (#1358).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_owner_pid: Option<u32>,
+    /// Process name of `window_owner_pid` (for example `Finance Manager.exe`),
+    /// when a window was matched (#322).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_owner_process_name: Option<String>,
     /// True when `hwnd` is a window act_launch did NOT freshly spawn: its owner
-    /// (`window_owner_pid`) differs from the launched `pid`. The spawned `pid` may
-    /// be a separate, still-running (orphaned) process — bind by `hwnd` /
-    /// `window_owner_pid`, not `pid`, to drive the matched window (#1358).
+    /// (`window_owner_pid`) is neither the launched `pid` nor one of its
+    /// descendants. The spawned `pid` may be a separate, still-running
+    /// (orphaned) process — bind by `hwnd` / `window_owner_pid`, not `pid`, to
+    /// drive the matched window (#1358).
     pub reused_existing_window: bool,
     pub matched_title: Option<String>,
     pub launched_at: String,
@@ -7274,7 +7281,8 @@ pub(crate) async fn launch_for_session_with_boundary(
     // matched a window it did not freshly spawn (existing-window fallback / a
     // re-exec'd pid). `pid` stays the spawned process for back-compat.
     let window_owner_pid = window.matched_pid;
-    let reused_existing_window = window.matched_pid.is_some_and(|owner| owner != pid);
+    let reused_existing_window =
+        !window.owned_by_launch_tree && window.matched_pid.is_some_and(|owner| owner != pid);
     if reused_existing_window {
         tracing::warn!(
             code = "M4_ACT_LAUNCH_REUSED_EXISTING_WINDOW",
@@ -7290,6 +7298,7 @@ pub(crate) async fn launch_for_session_with_boundary(
             pid,
             command_line: Some(spawned.command_line),
             window_owner_pid,
+            window_owner_process_name: window.matched_process_name,
             reused_existing_window,
             hwnd: window.hwnd,
             matched_title: window.matched_title,
@@ -10347,7 +10356,11 @@ struct WindowWaitResult {
     /// PID owning the matched window (#1358) — may differ from the launched pid
     /// when the existing-window fallback matches a pre-existing instance.
     matched_pid: Option<u32>,
+    matched_process_name: Option<String>,
     matched_title: Option<String>,
+    /// True when `matched_pid` is the launched pid or one of its descendants
+    /// (#322), so the window was freshly spawned by this launch.
+    owned_by_launch_tree: bool,
     reason: Option<String>,
 }
 
@@ -10356,19 +10369,45 @@ impl WindowWaitResult {
         Self {
             hwnd: None,
             matched_pid: None,
+            matched_process_name: None,
             matched_title: None,
+            owned_by_launch_tree: false,
             reason: None,
         }
     }
 
-    fn matched(context: ForegroundContext) -> Self {
+    fn matched(context: ForegroundContext, launch_tree: &HashSet<u32>) -> Self {
         Self {
             hwnd: Some(context.hwnd),
             matched_pid: Some(context.pid),
+            owned_by_launch_tree: launch_tree.contains(&context.pid),
+            matched_process_name: Some(context.process_name),
             matched_title: Some(context.window_title),
             reason: None,
         }
     }
+}
+
+/// The launched pid plus, when needed, its live descendants (#322). A launcher
+/// such as a `.bat` running `npm run tauri dev` shows the app window from a
+/// grandchild, so a title match owned by another process is checked against
+/// the launch's process tree. The tree is read only when such a candidate
+/// window exists, so a normal launch pays no process-table snapshot.
+fn launch_tree_for_title_candidates(
+    contexts: &[ForegroundContext],
+    pid: u32,
+    title_regex: &regex::Regex,
+    excluded_hwnds: &HashSet<i64>,
+) -> HashSet<u32> {
+    let other_process_candidate = contexts.iter().any(|context| {
+        context.pid != pid
+            && !excluded_hwnds.contains(&context.hwnd)
+            && title_regex.is_match(&context.window_title)
+    });
+    if !other_process_candidate {
+        return HashSet::from([pid]);
+    }
+    owned_process_tree_ids(pid).into_iter().collect()
 }
 
 fn excluded_launch_wait_hwnds(
@@ -10402,9 +10441,12 @@ async fn wait_for_launch_window(
             Ok(contexts) => {
                 last_windows = window_context_summaries(&contexts);
                 last_title_mismatch = title_matching_other_pid_windows(&contexts, title_regex, pid);
+                let launch_tree =
+                    launch_tree_for_title_candidates(&contexts, pid, title_regex, excluded_hwnds);
                 if let Some(context) = select_launch_window(
                     &contexts,
                     pid,
+                    &launch_tree,
                     title_regex,
                     excluded_hwnds,
                     launch_target_name,
@@ -10414,10 +10456,11 @@ async fn wait_for_launch_window(
                         code = "M4_ACT_LAUNCH_WINDOW_MATCHED",
                         hwnd = context.hwnd,
                         pid = context.pid,
+                        process_name = %context.process_name,
                         title = %context.window_title,
                         "act_launch matched the requested launched window without activating it"
                     );
-                    return Ok(WindowWaitResult::matched(context.clone()));
+                    return Ok(WindowWaitResult::matched(context.clone(), &launch_tree));
                 }
                 last_error = None;
             }
@@ -10485,9 +10528,12 @@ async fn wait_for_launch_desktop_window(
             Ok(contexts) => {
                 last_windows = window_context_summaries(&contexts);
                 last_title_mismatch = title_matching_other_pid_windows(&contexts, title_regex, pid);
+                let launch_tree =
+                    launch_tree_for_title_candidates(&contexts, pid, title_regex, excluded_hwnds);
                 if let Some(context) = select_launch_desktop_window(
                     &contexts,
                     pid,
+                    &launch_tree,
                     title_regex,
                     excluded_hwnds,
                     launch_target_name,
@@ -10501,7 +10547,7 @@ async fn wait_for_launch_desktop_window(
                         desktop = %desktop_name,
                         "act_launch matched the requested launched hidden-desktop window without activating the human foreground"
                     );
-                    return Ok(WindowWaitResult::matched(context.clone()));
+                    return Ok(WindowWaitResult::matched(context.clone(), &launch_tree));
                 }
                 last_error = None;
             }
@@ -10555,7 +10601,8 @@ fn window_context_summaries(contexts: &[ForegroundContext]) -> Vec<serde_json::V
 /// non-empty list means a same-titled window exists under a different process: a
 /// stale/leftover instance from an earlier launch, or the launched process
 /// re-exec'd into a pid act_launch is not tracking. act_launch only accepts a
-/// title match owned by the launched pid, so these are rejected — and now say so.
+/// title match owned by the launched pid or one of its descendants (#322), so
+/// these are rejected — and now say so.
 fn title_matching_other_pid_windows(
     contexts: &[ForegroundContext],
     title_regex: &regex::Regex,
@@ -10700,7 +10747,7 @@ fn launch_window_error(
     // pids in observed_windows by hand.
     let rejection_explanation = (!title_matching_other_pid.is_empty()).then(|| {
         format!(
-            "{} visible window(s) match the title regex but are owned by a different pid than the launched process (pid {pid}). act_launch only accepts a title match owned by the launched pid, so these were rejected as stale/foreign instances. Close the stale window(s) and retry, wait for the launched pid's own window, or — if the target intentionally re-execs into another process — match on that pid instead.",
+            "{} visible window(s) match the title regex but are owned by a different pid than the launched process (pid {pid}) and its descendants. act_launch only accepts a title match owned by the launched pid or one of its descendants, so these were rejected as stale/foreign instances. Close the stale window(s) and retry, wait for the launched pid's own window, or — if the target intentionally re-execs into another process — match on that pid instead.",
             title_matching_other_pid.len()
         )
     });
@@ -10724,6 +10771,7 @@ fn launch_window_error(
 fn select_launch_window<'a>(
     contexts: &'a [ForegroundContext],
     pid: u32,
+    launch_tree: &HashSet<u32>,
     title_regex: &regex::Regex,
     excluded_hwnds: &HashSet<i64>,
     launch_target_name: &str,
@@ -10735,6 +10783,13 @@ fn select_launch_window<'a>(
             context.pid == pid
                 && !excluded_hwnds.contains(&context.hwnd)
                 && title_regex.is_match(&context.window_title)
+        })
+        .or_else(|| {
+            contexts.iter().find(|context| {
+                launch_tree.contains(&context.pid)
+                    && !excluded_hwnds.contains(&context.hwnd)
+                    && title_regex.is_match(&context.window_title)
+            })
         })
         .or_else(|| {
             contexts.iter().find(|context| {
@@ -10763,6 +10818,7 @@ fn select_launch_window<'a>(
 fn select_launch_desktop_window<'a>(
     contexts: &'a [ForegroundContext],
     pid: u32,
+    launch_tree: &HashSet<u32>,
     title_regex: &regex::Regex,
     excluded_hwnds: &HashSet<i64>,
     launch_target_name: &str,
@@ -10771,6 +10827,7 @@ fn select_launch_desktop_window<'a>(
     select_launch_window(
         contexts,
         pid,
+        launch_tree,
         title_regex,
         excluded_hwnds,
         launch_target_name,
@@ -18287,17 +18344,23 @@ fn shell_job_descendant_process_ids(
     root_start_time: u64,
 ) -> Vec<u32> {
     let mut descendants = Vec::new();
-    let mut stack = vec![root_pid];
+    // Track each parent's start time, not just the root's: a genuine child
+    // process starts no earlier than its immediate parent, so comparing a
+    // candidate against its parent's start time rejects a process that merely
+    // inherited a reused PID after the real parent exited (the parent() link
+    // points at the reused number, but the stale child predates it). Seeding
+    // the stack with the root keeps the root's own gate unchanged.
+    let mut stack = vec![(root_pid, root_start_time)];
     let mut visited = HashSet::from([root_pid]);
-    while let Some(parent) = stack.pop() {
+    while let Some((parent, parent_start_time)) = stack.pop() {
         for (pid, process) in system.processes() {
             if process.parent().map(|value| value.as_u32()) == Some(parent) {
                 let child = pid.as_u32();
-                if process.start_time() < root_start_time || !visited.insert(child) {
+                if process.start_time() < parent_start_time || !visited.insert(child) {
                     continue;
                 }
                 descendants.push(child);
-                stack.push(child);
+                stack.push((child, process.start_time()));
             }
         }
     }

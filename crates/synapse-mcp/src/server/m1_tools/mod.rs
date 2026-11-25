@@ -651,6 +651,14 @@ impl SynapseService {
         if let Some(element_id) = params.0.element_id.as_ref() {
             crate::m1::validate_element_id_hwnd_shape("read_text", "element_id hwnd", element_id)?;
         }
+        // #158: region and element_id each name the OCR area; with both, one
+        // would be silently ignored (a stale element_id read as success).
+        if params.0.region.is_some() && params.0.element_id.is_some() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "read_text accepts region or element_id, not both: each names the OCR area",
+            ));
+        }
         // #703: a web element id (cdcd sentinel) is not a UIA element, so the
         // element-bounds path cannot resolve it. OCR it from a CDP
         // element-clipped screenshot instead of failing with a stale-UIA error.

@@ -7435,6 +7435,13 @@ fn chromium_cdp_launch(params: &ActLaunchParams) -> Option<ChromiumCdpLaunch> {
         "--disable-extensions".to_owned(),
         "--no-first-run".to_owned(),
         "--no-default-browser-check".to_owned(),
+        // Keep this window's pages live when it is covered (#334): Chrome
+        // otherwise marks an occluded window's pages hidden and silently drops
+        // trusted input dispatched to them. Any caller-supplied
+        // `--disable-features=` is folded into ours during arg assembly (Chrome
+        // honours only the last one).
+        "--disable-backgrounding-occluded-windows".to_owned(),
+        "--disable-features=CalculateNativeWinOcclusion".to_owned(),
     ];
     Some(ChromiumCdpLaunch {
         user_data_dir,
@@ -7456,9 +7463,59 @@ fn params_with_chromium_launch_args(
     if let Some(arg) = force_renderer_accessibility {
         args.push(arg);
     }
-    args.extend(params.args.iter().cloned());
+    append_caller_args_merging_disable_features(&mut args, &params.args);
     spawn_params.args = args;
     spawn_params
+}
+
+/// Appends the caller's `caller_args` to `args`, folding any caller
+/// `--disable-features` into the `--disable-features=` already present in `args`
+/// (our injected occlusion flag) rather than letting the caller's own list
+/// silently override it (#334). Chrome honours only the LAST `--disable-features`
+/// switch and the caller's args follow our injected one, so the caller's
+/// effective value — the value of its last `--disable-features` switch, empty
+/// when that one is bare or `=` — is merged into ours (never duplicating a
+/// feature name) and every caller `--disable-features` switch is dropped, so
+/// exactly one such switch survives. A bare `--disable-features` is a switch with
+/// an empty value: Chrome does not read the following token as its value, so that
+/// token (like any non-switch arg) passes through unchanged. If `args` has no
+/// injected `--disable-features=` (a non-CDP launch injected nothing), the
+/// caller's args are appended verbatim.
+fn append_caller_args_merging_disable_features(args: &mut Vec<String>, caller_args: &[String]) {
+    const SWITCH: &str = "--disable-features";
+    const FLAG: &str = "--disable-features=";
+    /// Value of a `--disable-features` switch; a bare switch (no `=`) is empty.
+    fn switch_value(arg: &str) -> &str {
+        arg.strip_prefix(FLAG).unwrap_or("")
+    }
+    let is_switch = |arg: &str| arg == SWITCH || arg.starts_with(FLAG);
+
+    let Some(injected_idx) = args.iter().position(|arg| arg.starts_with(FLAG)) else {
+        args.extend(caller_args.iter().cloned());
+        return;
+    };
+    if let Some(caller_value) = caller_args
+        .iter()
+        .rfind(|arg| is_switch(arg.as_str()))
+        .map(|arg| switch_value(arg.as_str()))
+    {
+        let injected_value = switch_value(args[injected_idx].as_str()).to_owned();
+        let mut features: Vec<&str> = injected_value
+            .split(',')
+            .filter(|f| !f.is_empty())
+            .collect();
+        for feature in caller_value.split(',').filter(|f| !f.is_empty()) {
+            if !features.contains(&feature) {
+                features.push(feature);
+            }
+        }
+        args[injected_idx] = format!("{FLAG}{}", features.join(","));
+    }
+    for arg in caller_args {
+        if !is_switch(arg.as_str()) {
+            args.push(arg.clone());
+        }
+    }
 }
 
 /// Dedicated, non-default automation profile dir. Honors

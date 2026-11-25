@@ -2801,7 +2801,13 @@ impl SynapseService {
             verb: verb.as_str().to_owned(),
             ok,
             status: status.to_owned(),
-            delivery_state: target_act_delivery_state_from_result(ok, status, &result).to_owned(),
+            delivery_state: target_act_delivery_state_from_result(
+                delegated_tool,
+                ok,
+                status,
+                &result,
+            )
+            .to_owned(),
             delegated_tool: delegated_tool.to_owned(),
             routing: target_act_routing_description(),
             result,
@@ -10039,7 +10045,20 @@ fn target_act_error_result(delegated_tool: &'static str, error: ErrorData) -> Va
     })
 }
 
-fn target_act_delivery_state_from_result(ok: bool, status: &str, result: &Value) -> &'static str {
+fn target_act_delivery_state_from_result(
+    delegated_tool: &str,
+    ok: bool,
+    status: &str,
+    result: &Value,
+) -> &'static str {
+    // The raw-CDP trusted-mouse click lane dispatches real input but runs no
+    // post-dispatch effect readback, so a delivered click is only ever
+    // "delivered, effect not checked" — the answer must not claim it was verified
+    // (#334). The hidden-page case never reaches here as ok: cdp_click_node
+    // refuses it before delivery, so it arrives as a refused/error status.
+    if delegated_tool == "synapse_a11y.cdp_click_node" && ok && status == TARGET_ACT_STATUS_OK {
+        return "delivered_unverified";
+    }
     if ok
         && status == TARGET_ACT_STATUS_OK
         && target_act_result_has_visual_pixel_verification(result)

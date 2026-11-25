@@ -644,6 +644,9 @@ async fn cdp_click_node_owned(
         target_id_hint,
         backend_node_id,
         |page, center| async move {
+            // Refuse before the preparatory mouse-move below so no event at all
+            // reaches a hidden page (#334).
+            ensure_cdp_page_visible(&page).await?;
             page.execute(mouse_event_with_modifiers(
                 DispatchMouseEventType::MouseMoved,
                 center,
@@ -728,6 +731,8 @@ pub async fn cdp_type_node(
             target_id_hint.as_deref(),
             backend_node_id,
             |page, center| async move {
+                // Refuse before any dispatch when the page is hidden (#334).
+                ensure_cdp_page_visible(&page).await?;
                 // Click to place the caret, then focus and insert text.
                 dispatch_mouse_click_on_page(
                     &input_endpoint,
@@ -1232,6 +1237,8 @@ pub async fn cdp_set_node_text(
             target_id_hint.as_deref(),
             backend_node_id,
             |page, center| async move {
+                // Refuse before any dispatch when the page is hidden (#334).
+                ensure_cdp_page_visible(&page).await?;
                 dispatch_mouse_click_on_page(
                     &input_endpoint,
                     &page,
@@ -1388,6 +1395,8 @@ pub async fn cdp_mouse_stroke_target(
     let duration_ms = points.last().map_or(0.0, |point| point.elapsed_ms.max(0.0));
     let button = button.map_or(MouseButton::None, CdpMouseButton::to_cdp);
     let dispatched_target_id = with_target_page(endpoint, target_id, |page| async move {
+        // Refuse before the raw dispatch is spawned when the page is hidden (#334).
+        ensure_cdp_page_visible(&page).await?;
         let dispatched_target_id = page.target_id().inner().clone();
         Ok(dispatched_target_id)
     })
@@ -6197,6 +6206,8 @@ async fn dispatch_touch_tap_on_page(
     point: CdpActionPoint,
 ) -> A11yResult<CdpTouchTapResult> {
     validate_cdp_action_point(point, "touch tap")?;
+    // Refuse before any dispatch when the page is hidden (#334).
+    ensure_cdp_page_visible(page).await?;
     let touch_state = read_touch_input_state(page).await.unwrap_or_default();
     let owner = persist_cdp_mutation_owner(
         endpoint,
@@ -6256,6 +6267,8 @@ async fn dispatch_key_sequence_on_page(
     keys: &[CdpKeyStroke],
     hold_ms: u32,
 ) -> A11yResult<()> {
+    // Refuse before any dispatch when the page is hidden (#334).
+    ensure_cdp_page_visible(page).await?;
     for key in keys {
         let key_down_type = if key.text.is_some() {
             DispatchKeyEventType::KeyDown
@@ -6361,6 +6374,40 @@ fn dispatch_err(err: &chromiumoxide::error::CdpError) -> A11yError {
     A11yError::CdpAxtreeFailed {
         detail: format!("CDP input dispatch failed: {err}"),
     }
+}
+
+/// Refuses a raw-CDP trusted-input dispatch when the target page is hidden —
+/// its window is covered/occluded or its tab is inactive. Chrome drops
+/// `Input.dispatch*Event` sent to a hidden page while still acknowledging the
+/// command, so dispatching would report delivered input that never reached the
+/// page (#334). Read `document.visibilityState` through the already-open CDP
+/// session; only a page positively observed `hidden` is refused — a visible
+/// page or a transient read failure is allowed through, so this never blocks a
+/// page that can receive input.
+///
+/// Every raw-CDP input path calls this once, right after it resolves its page
+/// and before its first `Input.dispatch*Event`: the mouse-click closures
+/// (`cdp_click_node_owned`, `cdp_type_node`, `cdp_set_node_text`), the touch and
+/// key dispatch primitives (`dispatch_touch_tap_on_page`,
+/// `dispatch_key_sequence_on_page`), and the mouse-stroke target
+/// (`cdp_mouse_stroke_target`). The error is raised before any event is sent, so
+/// it is never marked delivered.
+async fn ensure_cdp_page_visible(page: &chromiumoxide::Page) -> A11yResult<()> {
+    let visibility = page
+        .evaluate_expression(r#"String(document.visibilityState || "")"#)
+        .await
+        .ok()
+        .and_then(|value| value.into_value::<String>().ok());
+    if visibility.as_deref() == Some("hidden") {
+        return Err(A11yError::foreground_activation_refused(
+            "page is hidden (its window is covered/occluded or its tab is inactive); \
+             Chrome drops trusted input sent to a hidden page, so the dispatch was \
+             refused before any event was sent. Bring the tab to the front of its \
+             window; an automation Chrome launched through process launch stays live \
+             when its window is covered.",
+        ));
+    }
+    Ok(())
 }
 
 fn cdp_key_event(

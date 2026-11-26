@@ -47,8 +47,6 @@ const STROKE_DETAIL_TARGET_UNRESOLVED: &str = "STROKE_TARGET_UNRESOLVED";
 const CDP_STROKE_MIN_DISPATCH_INTERVAL_MS: f64 = 8.0;
 #[cfg(windows)]
 const CDP_STROKE_MAX_DISPATCH_POINTS: usize = 256;
-#[cfg(windows)]
-const CDP_STROKE_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -285,20 +283,13 @@ pub(crate) async fn act_stroke_cdp_target(
         let points = cdp_dispatch_points_from_stroke_plan(&stroke_plan);
         let button = cdp_mouse_button(params.button)?;
         boundary.ensure("immediately_before_cdp_mouse_stroke_target")?;
-        let dispatch = tokio::time::timeout(
-            CDP_STROKE_ROUTE_TIMEOUT,
-            synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button),
-        )
+        // Await the owned dispatch through its terminal verdict, including
+        // button release/owner resolution. A route-level timeout would drop
+        // this receiver while the task continues sending input. The raw
+        // transport already bounds connection, send and acknowledgement waits;
+        // their delays can accumulate beyond the validated stroke duration.
+        let dispatch = synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button)
         .await
-        .map_err(|_| {
-            mcp_error(
-                error_codes::A11Y_CDP_AXTREE_FAILED,
-                format!(
-                    "act_stroke CDP Input.dispatchMouseEvent route timed out after {} ms for target {cdp_target_id:?}",
-                    CDP_STROKE_ROUTE_TIMEOUT.as_millis()
-                ),
-            )
-        })?
         .map_err(|error| {
             crate::m2::error_after_a11y_input(
                 mcp_error(

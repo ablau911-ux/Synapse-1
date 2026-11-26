@@ -185,6 +185,7 @@ async fn install_clock(
             "nowMs": now_ms,
             "loopLimit": DEFAULT_LOOP_LIMIT,
         }),
+        false,
     )
     .await?;
     Ok(CdpClockResult {
@@ -204,7 +205,7 @@ async fn clock_status(endpoint: &str, target_id: &str) -> A11yResult<CdpClockRes
         .ok()
         .and_then(|slots| slots.get(target_id).cloned())
         .filter(|slot| slot.endpoint == endpoint);
-    let readback = run_clock_js(endpoint, target_id, "status", json!({})).await?;
+    let readback = run_clock_js(endpoint, target_id, "status", json!({}), false).await?;
     Ok(CdpClockResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: target_id.to_owned(),
@@ -229,7 +230,7 @@ async fn run_clock_command(
         .ok()
         .and_then(|slots| slots.get(target_id).cloned())
         .filter(|slot| slot.endpoint == endpoint);
-    let readback = run_clock_js(endpoint, target_id, operation.wire(), args).await?;
+    let readback = run_clock_js(endpoint, target_id, operation.wire(), args, false).await?;
     Ok(CdpClockResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: target_id.to_owned(),
@@ -248,6 +249,7 @@ async fn run_clock_js(
     target_id: &str,
     method: &str,
     args: Value,
+    operation_lock_held: bool,
 ) -> A11yResult<CdpClockReadback> {
     let method_json =
         serde_json::to_string(method).map_err(|error| A11yError::CdpAxtreeFailed {
@@ -267,9 +269,23 @@ async fn run_clock_js(
         version = CLOCK_VERSION,
         shim = clock_init_script(),
     );
-    let evaluated =
+    // A caller holding the durable browser-mutation operation lock (the clock
+    // drain, which runs inside durable_browser_mutation_owners_disable_and_drain)
+    // must evaluate through the lock-free owned entry so it does not re-enter
+    // that lock; every other caller is lock-free and uses the guarded entry.
+    let evaluated = if operation_lock_held {
+        crate::cdp_action::cdp_evaluate_expression_owned(
+            endpoint,
+            target_id,
+            &expression,
+            false,
+            true,
+        )
+        .await?
+    } else {
         crate::cdp_action::cdp_evaluate_expression(endpoint, target_id, &expression, false, true)
-            .await?;
+            .await?
+    };
     serde_json::from_value::<CdpClockReadback>(evaluated.value).map_err(|error| {
         A11yError::CdpAxtreeFailed {
             detail: format!("browser clock readback decode: {error}"),
@@ -304,9 +320,15 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
     let mut failures = Vec::new();
     let mut failed_slots = Vec::new();
     for (target_id, slot) in slots {
+        // This drain already holds the durable browser-mutation operation lock
+        // (it runs inside durable_browser_mutation_owners_disable_and_drain), so
+        // evaluate the current-document uninstall through the lock-free path.
         let current_cleanup =
-            run_clock_js(&slot.endpoint, &target_id, "uninstall", json!({})).await;
-        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
+            run_clock_js(&slot.endpoint, &target_id, "uninstall", json!({}), true).await;
+        // This drain already holds the durable browser-mutation operation lock
+        // (it runs inside `durable_browser_mutation_owners_disable_and_drain`),
+        // so call the lock-free body to avoid re-entering that lock.
+        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target_owned(
             &slot.endpoint,
             &target_id,
             &slot.init_script_identifier,

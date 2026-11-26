@@ -3411,6 +3411,7 @@ pub fn durable_init_script_active_count_readback() -> Result<usize, String> {
     Ok(total)
 }
 
+#[must_use]
 pub fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback {
     let slots = match init_script_slot_registry().slots.lock() {
         Ok(mut slots) => std::mem::take(&mut *slots),

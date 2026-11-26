@@ -12179,6 +12179,7 @@ function clearNetworkConditionsShimInPage() {
 }
 
 async function readGeolocationStateInPage() {
+  const shimActive = Boolean(globalThis["__synapseGeolocationEmulationOverride"]);
   const permissionState = await (async () => {
     try {
       if (!globalThis.navigator || !navigator.permissions || typeof navigator.permissions.query !== "function") {
@@ -12191,6 +12192,19 @@ async function readGeolocationStateInPage() {
       return `error:${String(name)}`;
     }
   })();
+  // #339/C: getCurrentPosition is only safe to call when the shim is intercepting it
+  // (it answers from the emulated value, never a real prompt) or the real permission
+  // is already "granted" (granted never prompts). With a real "prompt"/"denied"/
+  // unsupported permission and no shim, calling it would make Chrome ask the user --
+  // so report the permission state with no position instead of asking.
+  if (!shimActive && permissionState !== "granted") {
+    return {
+      permission_state: permissionState,
+      position: null,
+      error: null,
+      emulated_by_shim: false
+    };
+  }
   const result = await new Promise(resolve => {
     if (!globalThis.navigator || !navigator.geolocation) {
       resolve({
@@ -12244,7 +12258,8 @@ async function readGeolocationStateInPage() {
   return {
     permission_state: permissionState,
     position: result.position,
-    error: result.error
+    error: result.error,
+    emulated_by_shim: shimActive
   };
 }
 

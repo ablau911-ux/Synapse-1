@@ -1992,6 +1992,18 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
     let init_scripts_active_after = init_scripts.active_after;
     failures.extend(init_scripts.failures);
 
+    // Tear down every live emulation override session the same way: dropping each
+    // slot closes its CDP session and Chrome clears the overrides. A non-zero
+    // active_after is a leak, so it joins `failures` and bars `fully_drained`.
+    let emulation = crate::cdp_emulation::durable_emulation_overrides_disable_and_drain_all();
+    if emulation.active_after != 0 {
+        failures.push(format!(
+            "{} emulation override session(s) remain live after drain",
+            emulation.active_after
+        ));
+    }
+    failures.extend(emulation.failures);
+
     let persisted = crate::cdp_action::persisted_cdp_mutation_owners_disable_and_drain().await;
     let persisted_cdp_mutation_owners_found = persisted.total_found;
     let persisted_cdp_input_owners_found = persisted.input_found;

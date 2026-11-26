@@ -1,8 +1,11 @@
 //! Target-scoped raw-CDP browser emulation helpers (#1173/#1174/#1175/#1176/#1177/#1178).
 
 use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -980,27 +983,377 @@ fn validate_network_connection_type(value: &str) -> A11yResult<()> {
     }
 }
 
-async fn run_device_metrics_command(
+/// One emulation override domain held on a target's long-lived raw-CDP session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EmulationDomain {
+    Viewport,
+    Device,
+    Geolocation,
+    LocaleTimezone,
+    Media,
+    Network,
+}
+
+/// One long-lived raw-CDP session that keeps a target's emulation overrides
+/// alive. Chrome ends every `Emulation.*` / `Network.emulateNetworkConditions`
+/// override the instant the CDP client that set it disconnects, so — exactly
+/// like [`crate::cdp_action`]'s init-script slot — we keep one session open per
+/// target for as long as any emulation domain holds an override on it. The
+/// slot's domain set is the one source of truth for which domains are overridden.
+struct EmulationSlot {
+    /// Distinguishes this slot from a later one opened at the same key, so the
+    /// reaper only ever evicts its own entry, never a replacement.
+    slot_id: u64,
+    page: chromiumoxide::Page,
+    /// Kept open so a geolocation permission write (a Browser-level command) and
+    /// every override outlive the call; dropping it closes the CDP session.
+    browser: chromiumoxide::Browser,
+    handler_task: tokio::task::JoinHandle<()>,
+    /// A page-scoped event stream kept only as a liveness sentinel: Chrome ends
+    /// it when the target is destroyed, so this task finishes and reaps the slot
+    /// without waiting for the next set/reset on that target.
+    listener_task: tokio::task::JoinHandle<()>,
+    /// Which emulation domains currently hold an override on this session.
+    domains: Mutex<HashSet<EmulationDomain>>,
+}
+
+impl Drop for EmulationSlot {
+    fn drop(&mut self) {
+        self.handler_task.abort();
+        self.listener_task.abort();
+    }
+}
+
+#[derive(Default)]
+struct EmulationSlotRegistry {
+    slots: Mutex<HashMap<String, Arc<EmulationSlot>>>,
+}
+
+fn emulation_slot_registry() -> &'static EmulationSlotRegistry {
+    static REGISTRY: OnceLock<EmulationSlotRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(EmulationSlotRegistry::default)
+}
+
+fn emulation_slot_key(endpoint: &str, target_id: &str) -> String {
+    format!("{endpoint}\n{target_id}")
+}
+
+fn next_emulation_slot_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A slot is dead once either its browser connection (`handler_task`) or its
+/// target (`listener_task`, the page-scoped sentinel) has gone.
+fn emulation_slot_live(slot: &EmulationSlot) -> bool {
+    !slot.handler_task.is_finished() && !slot.listener_task.is_finished()
+}
+
+/// Removes a slot whose target was destroyed, identified by `slot_id` so a
+/// replacement slot opened at the same key after this one is never evicted. Run
+/// by the sentinel task the moment the target's event stream ends, so a closed
+/// tab releases its CDP session without waiting for the next call or the drain.
+fn reap_dead_emulation_slot(endpoint: &str, target_id: &str, slot_id: u64) {
+    let key = emulation_slot_key(endpoint, target_id);
+    let Ok(mut slots) = emulation_slot_registry().slots.lock() else {
+        return;
+    };
+    if slots.get(&key).is_some_and(|slot| slot.slot_id == slot_id) {
+        slots.remove(&key);
+    }
+}
+
+/// Returns the live slot for a target, dropping and forgetting one whose session
+/// has already ended (target gone or connection lost) so a later reset honestly
+/// takes the harmless fresh-connection path instead of reusing a dead session.
+fn lookup_live_emulation_slot(endpoint: &str, target_id: &str) -> Option<Arc<EmulationSlot>> {
+    let key = emulation_slot_key(endpoint, target_id);
+    let mut slots = emulation_slot_registry().slots.lock().ok()?;
+    match slots.get(&key) {
+        Some(slot) if emulation_slot_live(slot) => Some(Arc::clone(slot)),
+        Some(_) => {
+            slots.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Returns the target's existing emulation session or opens a new long-lived
+/// one, mirroring the init-script slot: connect, spawn the handler task, attach
+/// a target-destroyed sentinel and store the slot (including the lost-race case
+/// where a concurrent caller inserted first — the surplus session is dropped and
+/// its handler aborted).
+async fn get_or_create_emulation_slot(
     endpoint: &str,
     target_id: &str,
-    command: DeviceMetricsCommand,
-) -> A11yResult<()> {
+) -> A11yResult<Arc<EmulationSlot>> {
     use chromiumoxide::Browser;
-    use chromiumoxide::cdp::browser_protocol::emulation::{
-        ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EnableParams as PageEnableParams, EventFrameNavigated,
     };
     use futures_util::StreamExt as _;
+
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    if let Some(slot) = lookup_live_emulation_slot(endpoint, target_id) {
+        return Ok(slot);
+    }
 
     let (browser, mut handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
+                detail: format!("emulation session connect {endpoint}: {err}"),
             })?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
+    let page = match crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await {
+        Ok(page) => page,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    // Subscribe to one page-scoped event purely as a liveness sentinel, exactly
+    // as the init-script slot does. We never read the events; what matters is
+    // that Chrome ends this stream when the target is destroyed (navigation just
+    // fires frameNavigated, which is ignored, so an override survives a reload).
+    // When the stream ends, the task below reaps the slot, so a closed tab does
+    // not leak its CDP session. On any setup failure, abort the handler.
+    let sentinel = async {
+        page.execute(PageEnableParams::default())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.enable for emulation session sentinel: {err}"),
+            })?;
+        page.event_listener::<EventFrameNavigated>()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("subscribe Page.frameNavigated for emulation sentinel: {err}"),
+            })
+    }
+    .await;
+    let mut target_gone = match sentinel {
+        Ok(stream) => stream,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    let slot_id = next_emulation_slot_id();
+    let listener_task = {
+        let listener_page = page.clone();
+        let listener_endpoint = endpoint.to_owned();
+        let listener_target = target_id.to_owned();
+        tokio::spawn(async move {
+            let _page = listener_page;
+            while target_gone.next().await.is_some() {}
+            reap_dead_emulation_slot(&listener_endpoint, &listener_target, slot_id);
+        })
+    };
+
+    let slot = Arc::new(EmulationSlot {
+        slot_id,
+        page,
+        browser,
+        handler_task,
+        listener_task,
+        domains: Mutex::new(HashSet::new()),
+    });
+
+    let key = emulation_slot_key(endpoint, target_id);
+    let mut slots = emulation_slot_registry().slots.lock().map_err(|_| {
+        A11yError::internal("emulation slot registry lock poisoned while inserting slot")
+    })?;
+    match slots.get(&key) {
+        Some(existing) if emulation_slot_live(existing) => Ok(Arc::clone(existing)),
+        _ => {
+            slots.insert(key, Arc::clone(&slot));
+            Ok(slot)
+        }
+    }
+}
+
+/// Drops a target's emulation session once its last override has been reset,
+/// re-checking emptiness under the registry lock so a domain set between the
+/// reset and this call keeps its session open.
+fn close_empty_emulation_slot(endpoint: &str, target_id: &str) {
+    let key = emulation_slot_key(endpoint, target_id);
+    let Ok(mut slots) = emulation_slot_registry().slots.lock() else {
+        return;
+    };
+    let still_empty = slots
+        .get(&key)
+        .is_some_and(|slot| slot.domains.lock().is_ok_and(|domains| domains.is_empty()));
+    if still_empty {
+        slots.remove(&key);
+    }
+}
+
+/// Where one emulation command runs. A set, and a reset of a target that still
+/// holds overrides, run on the target's long-lived override session; a reset of
+/// a target with no live session runs on a throwaway connection (the clear is
+/// harmless there and answers exactly as before this fix).
+enum EmulationContext {
+    Slot(Arc<EmulationSlot>),
+    Fresh {
+        browser: chromiumoxide::Browser,
+        page: chromiumoxide::Page,
+        handler_task: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl EmulationContext {
+    /// Acquires the session a command runs on: a set always takes (and opens, if
+    /// needed) the long-lived slot; a reset reuses a live slot or, when none
+    /// exists, a throwaway connection.
+    async fn acquire(endpoint: &str, target_id: &str, is_set: bool) -> A11yResult<Self> {
+        use chromiumoxide::Browser;
+        use futures_util::StreamExt as _;
+
+        if is_set {
+            return Ok(Self::Slot(
+                get_or_create_emulation_slot(endpoint, target_id).await?,
+            ));
+        }
+        if let Some(slot) = lookup_live_emulation_slot(endpoint, target_id) {
+            return Ok(Self::Slot(slot));
+        }
+
+        let (browser, mut handler) =
+            Browser::connect(endpoint)
+                .await
+                .map_err(|err| A11yError::CdpAttachFailed {
+                    detail: format!("connect {endpoint}: {err}"),
+                })?;
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let page =
+            match crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await {
+                Ok(page) => page,
+                Err(err) => {
+                    handler_task.abort();
+                    return Err(err);
+                }
+            };
+        Ok(Self::Fresh {
+            browser,
+            page,
+            handler_task,
+        })
+    }
+
+    fn page(&self) -> &chromiumoxide::Page {
+        match self {
+            Self::Slot(slot) => &slot.page,
+            Self::Fresh { page, .. } => page,
+        }
+    }
+
+    fn browser(&self) -> &chromiumoxide::Browser {
+        match self {
+            Self::Slot(slot) => &slot.browser,
+            Self::Fresh { browser, .. } => browser,
+        }
+    }
+
+    /// Finishes a command: a throwaway session's handler task is aborted; a
+    /// slot's domain set is updated on success (a set records its domain, a
+    /// reset forgets it) and an emptied slot is closed so its session is freed.
+    fn finish(
+        self,
+        endpoint: &str,
+        target_id: &str,
+        domain: EmulationDomain,
+        is_set: bool,
+        succeeded: bool,
+    ) -> A11yResult<()> {
+        match self {
+            Self::Slot(slot) => {
+                {
+                    let mut domains = slot.domains.lock().map_err(|_| {
+                        A11yError::internal(
+                            "emulation slot domain set poisoned while updating a domain",
+                        )
+                    })?;
+                    if succeeded {
+                        if is_set {
+                            domains.insert(domain);
+                        } else {
+                            domains.remove(&domain);
+                        }
+                    }
+                }
+                close_empty_emulation_slot(endpoint, target_id);
+            }
+            Self::Fresh { handler_task, .. } => handler_task.abort(),
+        }
+        Ok(())
+    }
+}
+
+/// Count of emulation override sessions torn down at daemon drain.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CdpEmulationOverrideDrainReadback {
+    pub found: usize,
+    pub cleared: usize,
+    pub failures: Vec<String>,
+    pub active_after: usize,
+}
+
+/// Tears down every live emulation override session at daemon drain. Dropping a
+/// slot aborts its handler task and closes the CDP session, and Chrome clears
+/// every emulation override that session installed — that is the physical
+/// teardown, so no per-domain clear is reopened here. Mirrors the init-script
+/// drain and is called from the browser-mutation drain while it holds the
+/// operation lock, so it takes only the registry lock and never re-acquires it.
+#[must_use]
+pub fn durable_emulation_overrides_disable_and_drain_all() -> CdpEmulationOverrideDrainReadback {
+    let slots = match emulation_slot_registry().slots.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => {
+            return CdpEmulationOverrideDrainReadback {
+                failures: vec!["durable emulation override registry lock is poisoned".to_owned()],
+                active_after: usize::MAX,
+                ..Default::default()
+            };
+        }
+    };
+    let found = slots.len();
+    drop(slots);
+    let active_after = emulation_slot_registry()
+        .slots
+        .lock()
+        .map_or(usize::MAX, |slots| slots.len());
+    CdpEmulationOverrideDrainReadback {
+        found,
+        cleared: found,
+        failures: Vec::new(),
+        active_after,
+    }
+}
+
+async fn run_device_metrics_command(
+    endpoint: &str,
+    target_id: &str,
+    command: DeviceMetricsCommand,
+) -> A11yResult<()> {
+    use chromiumoxide::cdp::browser_protocol::emulation::{
+        ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
+    };
+
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    let is_set = matches!(command, DeviceMetricsCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
+
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             DeviceMetricsCommand::Set(override_metrics) => {
                 let params = SetDeviceMetricsOverrideParams::builder()
@@ -1044,11 +1397,17 @@ async fn run_device_metrics_command(
                     })?;
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Viewport,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1057,24 +1416,18 @@ async fn run_device_descriptor_command(
     target_id: &str,
     command: DeviceDescriptorCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{
         ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
         SetEmitTouchEventsForMouseConfiguration, SetEmitTouchEventsForMouseParams,
         SetTouchEmulationEnabledParams, SetUserAgentOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    let is_set = matches!(command, DeviceDescriptorCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             DeviceDescriptorCommand::Set(descriptor) => {
                 let user_agent = SetUserAgentOverrideParams::builder()
@@ -1177,11 +1530,17 @@ async fn run_device_descriptor_command(
                 }
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Device,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1190,22 +1549,16 @@ async fn run_geolocation_command(
     target_id: &str,
     command: GeolocationCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{
         ClearGeolocationOverrideParams, SetGeolocationOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    let is_set = matches!(command, GeolocationCommand::Set { .. });
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             GeolocationCommand::Set {
                 geolocation,
@@ -1213,15 +1566,14 @@ async fn run_geolocation_command(
                 origin,
             } => {
                 let permission = geolocation_permission_params(&origin, permission_setting)?;
-                browser
-                    .execute(permission)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                ctx.browser().execute(permission).await.map_err(|err| {
+                    A11yError::CdpAxtreeFailed {
                         detail: format!(
                             "Browser.setPermission geolocation={}: {err}",
                             permission_setting.as_str()
                         ),
-                    })?;
+                    }
+                })?;
 
                 let mut params = SetGeolocationOverrideParams::builder()
                     .latitude(geolocation.latitude)
@@ -1253,19 +1605,24 @@ async fn run_geolocation_command(
                     })?;
                 let permission =
                     geolocation_permission_params(&origin, GeolocationPermissionSetting::Prompt)?;
-                browser
-                    .execute(permission)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                ctx.browser().execute(permission).await.map_err(|err| {
+                    A11yError::CdpAxtreeFailed {
                         detail: format!("Browser.setPermission geolocation=prompt: {err}"),
-                    })?;
+                    }
+                })?;
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Geolocation,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1297,22 +1654,16 @@ async fn run_locale_timezone_command(
     target_id: &str,
     command: LocaleTimezoneCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{
         SetLocaleOverrideParams, SetTimezoneOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    let is_set = matches!(command, LocaleTimezoneCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             LocaleTimezoneCommand::Set(requested) => {
                 if let Some(locale) = requested.locale {
@@ -1349,11 +1700,17 @@ async fn run_locale_timezone_command(
                     })?;
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::LocaleTimezone,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1362,20 +1719,14 @@ async fn run_media_command(
     target_id: &str,
     command: MediaCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    let is_set = matches!(command, MediaCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         let params = match command {
             MediaCommand::Set(requested) => {
                 let mut features = Vec::new();
@@ -1400,11 +1751,17 @@ async fn run_media_command(
             .map_err(|err| A11yError::CdpAxtreeFailed {
                 detail: format!("Emulation.setEmulatedMedia: {err}"),
             })?;
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Media,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1414,22 +1771,16 @@ async fn run_network_conditions_command(
     target_id: &str,
     command: NetworkConditionsCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::network::{
         ConnectionType, EmulateNetworkConditionsParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    let is_set = matches!(command, NetworkConditionsCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         let params = match command {
             NetworkConditionsCommand::Set(requested) => {
                 let mut builder = EmulateNetworkConditionsParams::builder()
@@ -1464,11 +1815,17 @@ async fn run_network_conditions_command(
             .map_err(|err| A11yError::CdpAxtreeFailed {
                 detail: format!("Network.emulateNetworkConditions: {err}"),
             })?;
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Network,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 

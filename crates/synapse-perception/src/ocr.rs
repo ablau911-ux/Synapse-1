@@ -55,6 +55,64 @@ pub fn read_text(region: Rect) -> PerceptionResult<Vec<TextRegion>> {
     platform::read_text(region)
 }
 
+/// Reads OCR text using the requested language, without falling back to a
+/// different language. An absent or blank hint keeps the platform default.
+///
+/// # Errors
+///
+/// Returns `OCR_BACKEND_UNAVAILABLE` for invalid or unavailable languages,
+/// and the same capture/recognition errors as [`read_text`].
+pub fn read_text_with_language(
+    region: Rect,
+    lang_hint: Option<&str>,
+) -> PerceptionResult<Vec<TextRegion>> {
+    validate_ocr_language(lang_hint)?;
+    #[cfg(windows)]
+    {
+        if is_empty_region(region) {
+            return Err(PerceptionError::OcrNoText { region });
+        }
+        platform::read_text_with_language(region, lang_hint)
+    }
+    #[cfg(not(windows))]
+    {
+        read_text(region)
+    }
+}
+
+/// Validates language selection before a caller can reuse cached OCR output.
+///
+/// # Errors
+///
+/// Returns `OCR_BACKEND_UNAVAILABLE` if the language is invalid, not installed,
+/// or explicit language selection is not supported by the platform backend.
+pub fn validate_ocr_language(lang_hint: Option<&str>) -> PerceptionResult<()> {
+    let Some(lang) = lang_hint.map(str::trim).filter(|lang| !lang.is_empty()) else {
+        return Ok(());
+    };
+    if !lang.is_ascii()
+        || lang
+            .chars()
+            .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-')
+    {
+        return Err(PerceptionError::OcrBackendUnavailable {
+            detail: "lang_hint must be a valid OCR language tag".to_owned(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        platform::ocr_engine_for_language(Some(lang)).map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        Err(PerceptionError::OcrBackendUnavailable {
+            detail: format!(
+                "explicit OCR language {lang:?} is unavailable on this platform backend"
+            ),
+        })
+    }
+}
+
 /// Reads OCR text with an injected provider.
 ///
 /// # Errors
@@ -114,6 +172,27 @@ pub fn read_text_from_bgra_bitmap(
         return Err(PerceptionError::OcrNoText { region });
     }
     platform::read_text_from_bgra_bitmap(region, width, height, bytes)
+}
+
+#[cfg(windows)]
+/// Runs bitmap OCR with explicit language selection.
+///
+/// # Errors
+///
+/// Returns the same bitmap/recognition errors as [`read_text_from_bgra_bitmap`]
+/// and `OCR_BACKEND_UNAVAILABLE` for an invalid or unavailable language.
+pub fn read_text_from_bgra_bitmap_with_language(
+    region: Rect,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+    lang_hint: Option<&str>,
+) -> PerceptionResult<Vec<TextRegion>> {
+    validate_ocr_language(lang_hint)?;
+    if is_empty_region(region) {
+        return Err(PerceptionError::OcrNoText { region });
+    }
+    platform::read_text_from_bgra_bitmap_with_language(region, width, height, bytes, lang_hint)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -317,12 +396,13 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use std::sync::OnceLock;
+    use std::{borrow::Cow, sync::OnceLock};
 
     use image::{ImageBuffer, Rgba, imageops::FilterType};
     use synapse_capture::screen_region_to_bgra_bitmap;
     use synapse_core::Rect;
     use windows::{
+        Globalization::Language,
         Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
         Media::Ocr::{OcrEngine, OcrResult},
         Storage::Streams::DataWriter,
@@ -340,9 +420,22 @@ mod platform {
     const OCR_CONTENT_PADDING_PX: u32 = 6;
 
     pub fn read_text(region: Rect) -> PerceptionResult<Vec<TextRegion>> {
+        read_text_with_language(region, None)
+    }
+
+    pub fn read_text_with_language(
+        region: Rect,
+        lang_hint: Option<&str>,
+    ) -> PerceptionResult<Vec<TextRegion>> {
         let captured = screen_region_to_bgra_bitmap(region)
             .map_err(|err| backend_unavailable(err.to_string()))?;
-        read_text_from_bgra_bitmap(region, captured.width, captured.height, &captured.bytes)
+        read_text_from_bgra_bitmap_with_language(
+            region,
+            captured.width,
+            captured.height,
+            &captured.bytes,
+            lang_hint,
+        )
     }
 
     pub fn read_text_from_software_bitmap(
@@ -364,20 +457,52 @@ mod platform {
         height: u32,
         bytes: &[u8],
     ) -> PerceptionResult<Vec<TextRegion>> {
-        let engine = ocr_engine()?;
+        read_text_from_bgra_bitmap_with_language(region, width, height, bytes, None)
+    }
+
+    pub fn read_text_from_bgra_bitmap_with_language(
+        region: Rect,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+        lang_hint: Option<&str>,
+    ) -> PerceptionResult<Vec<TextRegion>> {
+        let engine = ocr_engine_for_language(lang_hint)?;
         let max_dimension = ocr_max_image_dimension()?;
-        let primary = recognize_bgra_region(engine, region, width, height, bytes, max_dimension);
+        let primary = recognize_bgra_region(&engine, region, width, height, bytes, max_dimension);
         let fallback = if should_try_sparse_ocr(width, height, max_dimension)
             || matches!(
                 &primary,
                 Err(PerceptionError::OcrNoText { .. }
                     | PerceptionError::OcrBackendUnavailable { .. })
             ) {
-            sparse_bgra_alternative(engine, region, width, height, bytes, max_dimension)
+            sparse_bgra_alternative(&engine, region, width, height, bytes, max_dimension)
         } else {
             None
         };
         select_ocr_candidate(primary, fallback)
+    }
+
+    pub(super) fn ocr_engine_for_language(
+        lang_hint: Option<&str>,
+    ) -> PerceptionResult<Cow<'static, OcrEngine>> {
+        let Some(lang) = lang_hint.map(str::trim).filter(|lang| !lang.is_empty()) else {
+            return ocr_engine().map(Cow::Borrowed);
+        };
+        let language = Language::CreateLanguage(&windows::core::HSTRING::from(lang))
+            .map_err(|err| backend_unavailable(format!("invalid OCR language {lang:?}: {err}")))?;
+        let supported = OcrEngine::IsLanguageSupported(&language)
+            .map_err(|err| backend_unavailable(err.to_string()))?;
+        if !supported {
+            return Err(backend_unavailable(format!(
+                "OCR language {lang:?} is not installed or supported on this host"
+            )));
+        }
+        OcrEngine::TryCreateFromLanguage(&language)
+            .map(Cow::Owned)
+            .map_err(|err| {
+                backend_unavailable(format!("OCR language {lang:?} is unavailable: {err}"))
+            })
     }
 
     fn ocr_engine() -> PerceptionResult<&'static OcrEngine> {

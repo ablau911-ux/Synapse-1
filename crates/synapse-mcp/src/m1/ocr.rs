@@ -1,7 +1,7 @@
 use rmcp::ErrorData;
 use synapse_core::{OcrBackend, OcrConfidenceSource, OcrResult, OcrWord, Rect, error_codes};
 use synapse_perception::{
-    TextRegion, TextRegionConfidenceSource, read_text as platform_read_text,
+    TextRegion, TextRegionConfidenceSource, read_text_with_language as platform_read_text,
     read_text_with_provider,
 };
 
@@ -80,7 +80,10 @@ pub fn read_text_request_uncached(
         return ocr_result_or_empty(read_text_with_provider(&provider, request.region), request);
     }
     match request.effective_backend {
-        OcrBackend::Winrt => ocr_result_or_empty(platform_read_text(request.region), request),
+        OcrBackend::Winrt => ocr_result_or_empty(
+            platform_read_text(request.region, request.lang_hint.as_deref()),
+            request,
+        ),
         OcrBackend::Crnn => Err(crnn_unavailable_error()),
         OcrBackend::Auto => Err(mcp_error(
             error_codes::OCR_BACKEND_UNAVAILABLE,
@@ -100,11 +103,12 @@ pub fn read_text_request_from_bgra(
     let request = read_text_request_for_captured_bitmap(request.clone(), captured)?;
     match request.effective_backend {
         OcrBackend::Winrt => ocr_result_or_empty(
-            synapse_perception::read_text_from_bgra_bitmap(
+            synapse_perception::read_text_from_bgra_bitmap_with_language(
                 request.region,
                 captured.width,
                 captured.height,
                 &captured.bytes,
+                request.lang_hint.as_deref(),
             ),
             &request,
         ),
@@ -194,7 +198,9 @@ pub fn ocr_result_from_web_bitmap(
         require_text: false,
     };
     ocr_result_or_empty(
-        synapse_perception::read_text_from_bgra_bitmap(region, width, height, bgra),
+        synapse_perception::read_text_from_bgra_bitmap_with_language(
+            region, width, height, bgra, lang_hint,
+        ),
         &request,
     )
 }

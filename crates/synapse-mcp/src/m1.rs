@@ -310,6 +310,8 @@ pub struct ReadTextParams {
     #[serde(default)]
     #[schemars(schema_with = "read_text_backend_schema")]
     pub backend: OcrBackend,
+    /// Optional OCR language tag (for example, en-US). Invalid or unavailable
+    /// languages return OCR_BACKEND_UNAVAILABLE instead of using another language.
     #[serde(default)]
     pub lang_hint: Option<String>,
     /// When true, a clean OCR pass that finds no glyphs returns the typed

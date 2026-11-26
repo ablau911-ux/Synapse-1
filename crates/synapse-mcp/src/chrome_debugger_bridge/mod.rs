@@ -8793,6 +8793,7 @@ pub struct ChromeDebuggerDomActionRequest<'a> {
 pub async fn dom_action(
     request: ChromeDebuggerDomActionRequest<'_>,
 ) -> Result<Value, ChromeDebuggerBridgeError> {
+    ensure_dom_action_bridge_target(request.target_id)?;
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "domAction")?;
     bridge()
         .send_command(
@@ -8824,6 +8825,19 @@ pub async fn dom_action(
             }),
         )
         .await
+}
+
+fn ensure_dom_action_bridge_target(target_id: &str) -> Result<(), ChromeDebuggerBridgeError> {
+    if target_id.starts_with("chrome-tab:") {
+        return Ok(());
+    }
+    Err(ChromeDebuggerBridgeError {
+        code: error_codes::CHROME_DOM_ACTION_UNSUPPORTED,
+        input_delivered: false,
+        detail: format!(
+            "DOM actions through the normal Chrome bridge require a chrome-tab:<tabId> target; target {target_id:?} is not supported by this transport. This DOM action is unavailable on raw-CDP targets"
+        ),
+    })
 }
 
 pub struct ChromeDebuggerCdpInputRequest<'a> {

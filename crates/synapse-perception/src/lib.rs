@@ -21,7 +21,7 @@ pub use observe::{
 };
 pub use ocr::{
     OcrProvider, SystemOcrProvider, TextRegion, TextRegionConfidenceSource, is_empty_region,
-    read_text, read_text_with_provider,
+    read_text, read_text_with_language, read_text_with_provider, validate_ocr_language,
 };
 pub use template_match::{
     HudTemplate, TemplateCounterConfig, TemplateCounterReading, TemplateSlotReading,
@@ -29,4 +29,7 @@ pub use template_match::{
 };
 
 #[cfg(windows)]
-pub use ocr::{read_text_from_bgra_bitmap, read_text_from_software_bitmap};
+pub use ocr::{
+    read_text_from_bgra_bitmap, read_text_from_bgra_bitmap_with_language,
+    read_text_from_software_bitmap,
+};

@@ -176,11 +176,22 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_click",
-            click_claim_target(&params),
-            &request_context,
-        ) {
+        let claim_check = match &params.target {
+            crate::m2::ActClickTarget::Element(element) => {
+                self.ensure_element_action_target(
+                    "act_click",
+                    element.element_id.as_str(),
+                    &request_context,
+                )
+                .await
+            }
+            crate::m2::ActClickTarget::Point(_) => self.ensure_target_claim_allows_action(
+                "act_click",
+                click_claim_target(&params),
+                &request_context,
+            ),
+        };
+        if let Err(error) = claim_check {
             return audit_target_claim_denial(self, "act_click", error, &request_context);
         }
         if let Err(error) = maybe_auto_wait_for_actionability(
@@ -348,6 +359,13 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
+        if let Some(element_id) = params.into_element.as_ref()
+            && let Err(error) = self
+                .ensure_element_action_target("act_type", element_id.as_str(), &request_context)
+                .await
+        {
+            return audit_target_claim_denial(self, "act_type", error, &request_context);
+        }
         if let Err(error) = self.ensure_target_claim_allows_action(
             "act_type",
             params.into_element.as_ref().and_then(element_claim_target),
@@ -678,11 +696,14 @@ impl SynapseService {
             }),
             &request_context,
         )?;
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_set_value",
-            element_claim_target(&params.element_id),
-            &request_context,
-        ) {
+        if let Err(error) = self
+            .ensure_element_action_target(
+                "act_set_value",
+                params.element_id.as_str(),
+                &request_context,
+            )
+            .await
+        {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
         }
         let foreground_guard =
@@ -805,11 +826,14 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_set_field_text",
-            element_claim_target(&element_id),
-            &request_context,
-        ) {
+        if let Err(error) = self
+            .ensure_element_action_target(
+                "act_set_field_text",
+                element_id.as_str(),
+                &request_context,
+            )
+            .await
+        {
             return audit_target_claim_denial(self, "act_set_field_text", error, &request_context);
         }
         let result = self
@@ -840,11 +864,14 @@ impl SynapseService {
                             )
                         })?
                         .clone();
-                    if let Err(error) = self.ensure_target_claim_allows_action(
-                        "act_set_field_text",
-                        element_claim_target(&retry_element_id),
-                        &request_context,
-                    ) {
+                    if let Err(error) = self
+                        .ensure_element_action_target(
+                            "act_set_field_text",
+                            retry_element_id.as_str(),
+                            &request_context,
+                        )
+                        .await
+                    {
                         Err(error)
                     } else {
                         self.act_set_field_text_execute_resolved(
@@ -866,6 +893,144 @@ impl SynapseService {
         };
         self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
         result.map(Json)
+    }
+
+    pub(super) async fn ensure_element_action_target(
+        &self,
+        tool: &'static str,
+        element_id: &str,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let bound = self.request_session_target(request_context)?.ok_or_else(|| {
+            mcp_error(error_codes::TARGET_NOT_SET,
+                format!("{tool} element actions require a bound session target; bind the destination window or tab first"))
+        })?;
+        if let Some(element_tab) = super::m1_tools::parse_chrome_bridge_element_target(element_id)?
+        {
+            if !matches!(&bound, SessionTarget::Cdp { cdp_target_id, .. } if cdp_target_id.eq_ignore_ascii_case(&element_tab))
+            {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!("{tool} bridge element does not belong to the bound tab"),
+                ));
+            }
+            return self.ensure_element_action_scope(tool, &bound, request_context);
+        }
+        let parsed = match ElementId::parse(element_id) {
+            Ok(parsed) => parsed,
+            Err(_)
+                if super::background_router::target_act_click_element_id_can_be_dom_id(
+                    element_id,
+                ) && matches!(&bound, SessionTarget::Cdp { .. }) =>
+            {
+                // Router DOM-id shorthand becomes a selector evaluated only in
+                // the bound tab, rather than an observed cross-target node id.
+                return self.ensure_element_action_scope(tool, &bound, request_context);
+            }
+            Err(error) => {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    error.to_string(),
+                ));
+            }
+        };
+        self.ensure_observed_element_action_target(tool, &parsed, &bound, request_context)
+            .await
+    }
+
+    fn ensure_element_action_scope(
+        &self,
+        tool: &'static str,
+        target: &SessionTarget,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let hwnd = match target {
+            SessionTarget::Window { hwnd } => *hwnd,
+            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+        };
+        self.ensure_target_claim_allows_action(
+            tool,
+            Some(SessionTarget::Window { hwnd }),
+            request_context,
+        )?;
+        self.ensure_target_claim_allows_action(tool, Some(target.clone()), request_context)
+    }
+
+    async fn ensure_observed_element_action_target(
+        &self,
+        tool: &'static str,
+        element_id: &ElementId,
+        target: &SessionTarget,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        // UIA element ids can name a child HWND. Claims belong to the root
+        // window, so checking the encoded HWND alone misses the owner's claim.
+        let root_hwnd = crate::m1::element_root_window(
+            tool,
+            "element_id",
+            element_id,
+            error_codes::ACTION_TARGET_INVALID,
+        )?;
+        let bound_hwnd = match target {
+            SessionTarget::Window { hwnd } => *hwnd,
+            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+        };
+        if root_hwnd != bound_hwnd {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!("{tool} element root window does not match the session target"),
+            ));
+        }
+        self.ensure_element_action_scope(tool, target, request_context)?;
+        if matches!(target, SessionTarget::Cdp { .. })
+            && synapse_a11y::cdp_backend_from_element_id(element_id).is_none()
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} native UIA elements cannot prove membership in the bound CDP tab; re-resolve the element through that tab's DOM"
+                ),
+            ));
+        }
+        #[cfg(windows)]
+        if synapse_a11y::cdp_backend_from_element_id(element_id).is_some() {
+            if matches!(target, SessionTarget::Window { .. }) {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "{tool} CDP elements require a bound tab to verify frame ownership and its parent-tab claim; bind the observed tab first"
+                    ),
+                ));
+            }
+            let element_target_id = synapse_a11y::cdp_target_from_element_id(element_id)
+                .ok_or_else(|| mcp_error(error_codes::ACTION_TARGET_INVALID,
+                    format!("{tool} CDP element must include its target id; re-resolve it against the session target")))?;
+            if let SessionTarget::Cdp { cdp_target_id, .. } = target
+                && !cdp_target_id.eq_ignore_ascii_case(&element_target_id)
+            {
+                let endpoint = synapse_a11y::endpoint_for_window(root_hwnd).ok_or_else(|| {
+                        mcp_error(error_codes::A11Y_CDP_UNREACHABLE,
+                            format!("{tool} requires a raw-CDP endpoint to verify descendant-frame ownership"))
+                    })?;
+                super::background_router::target_act_validate_observed_cdp_element_target(
+                    &endpoint,
+                    root_hwnd,
+                    cdp_target_id,
+                    &element_target_id,
+                    tool,
+                )
+                .await?;
+            }
+            self.ensure_target_claim_allows_action(
+                tool,
+                Some(SessionTarget::Cdp {
+                    window_hwnd: root_hwnd,
+                    cdp_target_id: element_target_id,
+                }),
+                request_context,
+            )?;
+        }
+        Ok(())
     }
 
     async fn act_set_field_text_execute_resolved(
@@ -1178,6 +1343,45 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
+        if let Some(element_id) = params.auto_wait_element_id.as_ref() {
+            if let Err(error) = self
+                .ensure_element_action_target("act_press", element_id.as_str(), &request_context)
+                .await
+            {
+                return audit_target_claim_denial(self, "act_press", error, &request_context);
+            }
+            let bound = self.request_session_target(&request_context)?;
+            let destination_matches = match bound.as_ref() {
+                Some(SessionTarget::Window { hwnd }) => {
+                    params.window_hwnd.is_none_or(|explicit| explicit == *hwnd)
+                        && params.cdp_target_id.is_none()
+                }
+                Some(SessionTarget::Cdp {
+                    window_hwnd,
+                    cdp_target_id,
+                }) => {
+                    params
+                        .window_hwnd
+                        .is_none_or(|explicit| explicit == *window_hwnd)
+                        && params
+                            .cdp_target_id
+                            .as_ref()
+                            .is_none_or(|explicit| explicit.eq_ignore_ascii_case(cdp_target_id))
+                }
+                None => false,
+            };
+            if !destination_matches {
+                return audit_target_claim_denial(
+                    self,
+                    "act_press",
+                    mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        "act_press element-addressed input cannot override the bound destination",
+                    ),
+                    &request_context,
+                );
+            }
+        }
         if let Err(error) = self.ensure_target_claim_allows_action(
             "act_press",
             params
@@ -1491,6 +1695,22 @@ impl SynapseService {
             &act_stroke_audit_details(&stroke_details, &preflight),
             &request_context,
         )?;
+        for target in [&params.target, &params.from, &params.to]
+            .into_iter()
+            .flatten()
+        {
+            if let crate::m2::ActStrokeTarget::Element(element) = target
+                && let Err(error) = self
+                    .ensure_element_action_target(
+                        "act_stroke",
+                        element.element_id.as_str(),
+                        &request_context,
+                    )
+                    .await
+            {
+                return audit_target_claim_denial(self, "act_stroke", error, &request_context);
+            }
+        }
         if let Err(error) =
             self.ensure_target_claim_allows_action("act_stroke", None, &request_context)
         {
@@ -1685,6 +1905,17 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
+        if let Some(target) = params.target.as_ref()
+            && let Err(error) = self
+                .ensure_element_action_target(
+                    "act_scroll",
+                    target.element_id.as_str(),
+                    &request_context,
+                )
+                .await
+        {
+            return audit_target_claim_denial(self, "act_scroll", error, &request_context);
+        }
         if let Err(error) = self.ensure_target_claim_allows_action(
             "act_scroll",
             scroll_claim_target(&params),

@@ -1213,6 +1213,14 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let har = validate_browser_network_har_params(&params.0)?;
+        if matches!(har.operation, BrowserNetworkHarOperation::Record) {
+            self.require_m3_permissions(
+                HAR_TOOL,
+                &crate::m3::permissions::required([
+                    crate::m3::permissions::Permission::WriteStorage,
+                ]),
+            )?;
+        }
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": params.0.window_hwnd,

@@ -249,7 +249,7 @@ impl SessionRegistry {
                 last_reason_code: None,
                 spawned_agent: None,
             });
-        entry.last_seen_unix_ms = now_unix_ms;
+        entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
         if let Some(action) = action {
             entry.last_action = Some(action);
             entry.last_reason_code = None;

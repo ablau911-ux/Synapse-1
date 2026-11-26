@@ -408,6 +408,10 @@ impl SynapseService {
             })?;
 
         let locator = validate_locator(&params)?;
+        if let Some(element_id) = params.element_id.as_deref() {
+            self.ensure_element_action_target(TOOL, element_id, &request_context)
+                .await?;
+        }
         let (window_hwnd, cdp_target_id) = self.resolve_bridge_target(
             TOOL,
             &session_id,
@@ -971,7 +975,7 @@ impl SynapseService {
 
     fn resolve_bridge_target(
         &self,
-        tool: &str,
+        tool: &'static str,
         session_id: &str,
         cdp_target_id_param: Option<&str>,
         window_hwnd_param: Option<i64>,
@@ -1031,6 +1035,26 @@ impl SynapseService {
                 ));
             }
         }
+        if !matches!(active_target.as_ref(), Some(SessionTarget::Cdp { window_hwnd: owned_hwnd, .. }) if *owned_hwnd == window_hwnd)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!("{tool} window must match the bound tab's window"),
+            ));
+        }
+        self.ensure_target_claim_allows_session(
+            tool,
+            session_id,
+            &SessionTarget::Window { hwnd: window_hwnd },
+        )?;
+        self.ensure_target_claim_allows_session(
+            tool,
+            session_id,
+            &SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id: cdp_target_id.clone(),
+            },
+        )?;
         Ok((window_hwnd, cdp_target_id))
     }
 }

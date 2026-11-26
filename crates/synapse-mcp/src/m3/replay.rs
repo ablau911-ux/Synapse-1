@@ -77,7 +77,7 @@ pub const fn replay_record() -> M3ToolStub {
 
 #[must_use]
 pub fn required_permissions(_params: &ReplayRecordParams) -> RequiredPermissions {
-    required([Permission::WriteReplay])
+    required([Permission::WriteReplay, Permission::WriteStorage])
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

@@ -246,6 +246,10 @@ struct LedgerRewrite {
 pub(crate) struct ToolCallGuard {
     run_id: String,
     seq: Option<u64>,
+    session_activity: Option<(
+        crate::server::session_registry::SharedSessionRegistry,
+        String,
+    )>,
 }
 
 #[derive(Debug)]
@@ -562,6 +566,7 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
     Ok(ToolCallGuard {
         run_id: state.run.run_id.clone(),
         seq: Some(seq),
+        session_activity: None,
     })
 }
 
@@ -609,6 +614,33 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
 }
 
 impl ToolCallGuard {
+    pub(crate) fn with_session_activity(
+        mut self,
+        registry: crate::server::session_registry::SharedSessionRegistry,
+        session_id: Option<&str>,
+    ) -> Self {
+        self.session_activity = session_id.map(|id| (registry, id.to_owned()));
+        self
+    }
+
+    fn refresh_session_activity(&self) -> anyhow::Result<()> {
+        if let Some((registry, session_id)) = &self.session_activity {
+            registry
+                .lock()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "session registry lock poisoned while recording terminal tool activity"
+                    )
+                })?
+                .record_seen(
+                    session_id,
+                    None,
+                    crate::server::session_registry::unix_time_ms_now(),
+                );
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_ok_with_effective_target(
         mut self,
         effective_target: Option<Value>,
@@ -642,6 +674,9 @@ impl ToolCallGuard {
         let seq = self
             .seq
             .ok_or_else(|| anyhow::anyhow!("daemon lifecycle tool guard is already terminal"))?;
+        // Publish completion activity before releasing the in-flight ledger entry,
+        // including error, cancellation and panic outcomes.
+        self.refresh_session_activity()?;
         let result = finish_tool_call(&self.run_id, seq, status, error, panic, effective_target);
         if result.is_ok() {
             self.seq = None;
@@ -657,6 +692,7 @@ impl Drop for ToolCallGuard {
         };
         let run_id = self.run_id.clone();
         let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.refresh_session_activity()?;
             finish_tool_call(
                 &run_id,
                 seq,

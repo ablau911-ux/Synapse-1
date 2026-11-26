@@ -43,6 +43,10 @@ impl SynapseService {
         params: Parameters<CaptureGifParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<CaptureGifResponse>, ErrorData> {
+        self.require_m3_permissions(
+            "capture_gif",
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         let params = params.0;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",

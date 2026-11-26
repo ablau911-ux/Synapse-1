@@ -355,7 +355,7 @@ pub fn required_permissions_decide(params: &ProfileAuthoringDecideParams) -> Req
 
 #[must_use]
 pub fn required_permissions_export(_params: &ProfileAuthoringExportParams) -> RequiredPermissions {
-    required([Permission::ReadStorage])
+    required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
 #[must_use]
@@ -1792,7 +1792,17 @@ fn replay_records(path: Option<&str>, max_replay_rows: u32) -> Result<ReplayReco
         });
     }
     let normalized = normalize_replay_path(&replay_root(), Some(path))?;
-    let text = fs::read_to_string(&normalized).map_err(|error| {
+    let (mut file, _directory_guards) =
+        super::permissions::open_confined_artifact(&replay_root(), &normalized, false).map_err(
+            |error| {
+                mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!("profile_authoring_generate could not safely open replay: {error}"),
+                )
+            },
+        )?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(

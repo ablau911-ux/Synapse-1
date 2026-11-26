@@ -24,6 +24,9 @@ use super::{
 pub(crate) const DEFAULT_TARGET_CLAIM_TTL_MS: u64 = 120_000;
 const MIN_TARGET_CLAIM_TTL_MS: u64 = 1_000;
 const MAX_TARGET_CLAIM_TTL_MS: u64 = 600_000;
+// A five-second quiet interval protects short gaps between ordinary tool calls
+// while still allowing prompt recovery after client churn or compaction.
+const TARGET_CLAIM_ADOPT_MIN_IDLE_MS: u64 = 5_000;
 
 pub(crate) type SharedTargetClaims = Arc<Mutex<TargetClaimRegistry>>;
 
@@ -327,7 +330,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Explicitly recover a target claim from an older live same-agent MCP session after client churn/compaction. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, and the old owner has no in-flight tool call. On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
+        description = "Explicitly recover a target claim from an older live idle same-agent MCP session after client churn/compaction. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, and the old owner has been idle for at least 5000 ms and has no in-flight tool call. On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
     )]
     pub async fn target_claim_adopt(
         &self,
@@ -997,7 +1000,7 @@ impl SynapseService {
         ),
         ErrorData,
     > {
-        let (requester, owner) = {
+        let (requester, mut owner) = {
             let guard = self.session_registry_ref().lock().map_err(|_error| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
@@ -1087,6 +1090,42 @@ impl SynapseService {
                 "owner session has in-flight tool calls",
             ));
         }
+        // Completion refreshes activity before clearing the ledger entry. Read
+        // it again after observing an empty ledger, not from the earlier snapshot.
+        owner = self
+            .session_registry_ref()
+            .lock()
+            .map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned while refreshing adoption owner activity",
+                )
+            })?
+            .reads(now_unix_ms)
+            .into_iter()
+            .find(|read| read.session_id == owner_session_id)
+            .filter(|read| read.lifecycle == "live")
+            .ok_or_else(|| {
+                adopt_refused_error(
+                    requester_session_id,
+                    owner_session_id,
+                    "owner session is no longer live",
+                    Some(&requester),
+                    Some(&owner),
+                )
+            })?;
+        let owner_idle_ms = now_unix_ms.saturating_sub(owner.last_seen_unix_ms);
+        if owner_idle_ms < TARGET_CLAIM_ADOPT_MIN_IDLE_MS {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                &format!(
+                    "owner has been idle for {owner_idle_ms} ms; an older idle same-agent owner must be idle for at least {TARGET_CLAIM_ADOPT_MIN_IDLE_MS} ms to avoid takeover between tool calls"
+                ),
+                Some(&requester),
+                Some(&owner),
+            ));
+        }
         let lease_status = synapse_action::lease::status();
         if lease_status.owner_session_id.as_deref() == Some(owner_session_id) {
             return Err(owner_active_error(
@@ -1135,11 +1174,14 @@ impl TargetClaimRegistry {
     pub(crate) fn claim(
         &mut self,
         session_id: &str,
-        target: SessionTarget,
+        mut target: SessionTarget,
         ttl_ms: u64,
         now_unix_ms: u64,
         live_sessions: &BTreeSet<String>,
     ) -> Result<(TargetClaimEntry, &'static str), TargetClaimConflict> {
+        if let SessionTarget::Cdp { cdp_target_id, .. } = &mut target {
+            cdp_target_id.make_ascii_lowercase();
+        }
         let target_key = target_key(&target);
         if let Some(existing) = self.claims.get(&target_key)
             && existing.owner_session_id != session_id
@@ -1266,7 +1308,10 @@ pub(crate) fn target_key(target: &SessionTarget) -> String {
         SessionTarget::Cdp {
             window_hwnd,
             cdp_target_id,
-        } => format!("cdp:0x{window_hwnd:x}:{cdp_target_id}"),
+        } => format!(
+            "cdp:0x{window_hwnd:x}:{}",
+            cdp_target_id.to_ascii_lowercase()
+        ),
     }
 }
 
@@ -1428,7 +1473,7 @@ fn conflict_error(
             "claim": read,
             "read_only_observe_allowed": true,
             "mutation_allowed": false,
-            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt; adoption takes over only from a live owner (read from the Source of Truth) with the same known agent_kind and client_name as the caller, that started before the caller, has no tool call in flight and does not hold the foreground input lease",
+            "resolution": format!("release the claim, wait for claim expiry, use a different target, or call target_claim_adopt; adoption takes over only from an older idle same-agent live owner (read from the Source of Truth) with the same known agent_kind and client_name as the caller, that started before the caller, has been idle for at least {TARGET_CLAIM_ADOPT_MIN_IDLE_MS} ms, has no tool call in flight and does not hold the foreground input lease"),
         })),
     )
 }

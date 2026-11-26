@@ -7,7 +7,7 @@ use rmcp::ErrorData;
 use synapse_core::{EventFilter, error_codes};
 use synapse_perception::ObservationAssembler;
 use tokio::{
-    fs::{self, File},
+    fs::File,
     io::{AsyncWrite, AsyncWriteExt, BufWriter},
     time::{Instant, sleep},
 };
@@ -32,15 +32,16 @@ pub async fn record_replay(
     let target = ReplayTarget::parse(&params.target)?;
     let _format = ReplayFormat::parse(&params.format)?;
     let path = replay_path(params.path.as_deref())?;
-    create_parent_dir(&path).await?;
-
-    let file = File::create(&path).await.map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("replay_record could not create {}: {error}", path.display()),
-        )
-    })?;
-    let mut writer = BufWriter::new(file);
+    let (file, _directory_guards) =
+        crate::m3::permissions::open_confined_artifact(&replay_root(), &path, true).map_err(
+            |error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("replay_record could not create {}: {error}", path.display()),
+                )
+            },
+        )?;
+    let mut writer = BufWriter::new(File::from_std(file));
 
     let stats = if params.duration_ms > 0 {
         record_window(&mut writer, &m1_state, &sse_state, target, params).await?
@@ -54,9 +55,7 @@ pub async fn record_replay(
             format!("replay_record could not flush {}: {error}", path.display()),
         )
     })?;
-    drop(writer);
-
-    let bytes = fs::metadata(&path).await.map_err(|error| {
+    let bytes = writer.get_ref().metadata().await.map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(
@@ -182,22 +181,6 @@ impl RecordWindowStats {
             .observations_skipped
             .saturating_add(write.observations_skipped);
     }
-}
-
-async fn create_parent_dir(path: &Path) -> Result<(), ErrorData> {
-    let parent = path.parent().filter(|value| !value.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        fs::create_dir_all(parent).await.map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "replay_record could not create parent directory {}: {error}",
-                    parent.display()
-                ),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn replay_path(path: Option<&str>) -> Result<PathBuf, ErrorData> {

@@ -728,6 +728,10 @@ impl SynapseService {
             kind = "capture_screenshot",
             "tool.invocation kind=capture_screenshot"
         );
+        self.require_m3_permissions(
+            "capture_screenshot",
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
         if params.0.window_hwnd.is_none()
@@ -931,6 +935,14 @@ impl SynapseService {
             | ScreenshotOperation::RecordStop
             | ScreenshotOperation::RecordExtend => {
                 let operation = params.operation;
+                if !matches!(operation, ScreenshotOperation::RecordStatus) {
+                    self.require_m3_permissions(
+                        "screenshot",
+                        &crate::m3::permissions::required([
+                            crate::m3::permissions::Permission::WriteStorage,
+                        ]),
+                    )?;
+                }
                 let (clip_id, add_ms) = validate_screenshot_record_control_facade_params(params)?;
                 let status = match operation {
                     ScreenshotOperation::RecordStop => {
@@ -955,6 +967,12 @@ impl SynapseService {
             | ScreenshotOperation::ClipFrames
             | ScreenshotOperation::ClipFrame
             | ScreenshotOperation::ClipDiff => {
+                self.require_m3_permissions(
+                    "screenshot",
+                    &crate::m3::permissions::required([
+                        crate::m3::permissions::Permission::WriteStorage,
+                    ]),
+                )?;
                 let view = validate_screenshot_clip_view_facade_params(params)?;
                 #[cfg(windows)]
                 {
@@ -984,6 +1002,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserScreenshotResponse>, ErrorData> {
         const TOOL: &str = "browser_screenshot";
+        self.require_m3_permissions(
+            TOOL,
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -1066,6 +1088,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserPdfResponse>, ErrorData> {
         const TOOL: &str = "browser_pdf";
+        self.require_m3_permissions(
+            TOOL,
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -1132,6 +1158,17 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let validation = validate_browser_downloads_params(params.0)?;
+        if matches!(
+            validation.params.operation,
+            BrowserDownloadsOperation::Save | BrowserDownloadsOperation::Move
+        ) {
+            self.require_m3_permissions(
+                TOOL,
+                &crate::m3::permissions::required([
+                    crate::m3::permissions::Permission::WriteStorage,
+                ]),
+            )?;
+        }
         let window_resolution = self.resolve_browser_tabs_window_context(
             TOOL,
             &session_id,
@@ -1180,6 +1217,10 @@ impl SynapseService {
         params: Parameters<HiddenDesktopPipFrameParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<HiddenDesktopPipFrameResponse>, ErrorData> {
+        self.require_m3_permissions(
+            "hidden_desktop_pip_frame",
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "hidden_desktop_pip_frame",
@@ -3140,6 +3181,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserEvaluateResponse>, ErrorData> {
         const TOOL: &str = "browser_evaluate";
+        if let Some(element_id) = params.0.element_id.as_deref() {
+            self.ensure_element_action_target(TOOL, element_id, &request_context)
+                .await?;
+        }
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -4428,6 +4473,8 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserScrollIntoViewResponse>, ErrorData> {
         const TOOL: &str = "browser_scroll_into_view";
+        self.ensure_element_action_target(TOOL, &params.0.element_id, &request_context)
+            .await?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -15438,7 +15485,9 @@ fn parse_browser_evaluate_element(element_id: &str) -> Result<(i64, String), Err
     Ok((backend, target))
 }
 
-fn parse_chrome_bridge_element_target(element_id: &str) -> Result<Option<String>, ErrorData> {
+pub(super) fn parse_chrome_bridge_element_target(
+    element_id: &str,
+) -> Result<Option<String>, ErrorData> {
     let trimmed = element_id.trim();
     let Some(after_prefix) = trimmed.strip_prefix("chrome-tab:") else {
         return Ok(None);

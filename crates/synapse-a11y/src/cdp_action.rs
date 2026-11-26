@@ -3333,10 +3333,21 @@ pub async fn cdp_remove_init_script_target(
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
+    // Hold the same process-global browser-mutation lock that `add` and the
+    // drain take, so a remove never overlaps an add on the target (which would
+    // let this remove close a session the add is still registering a script on,
+    // losing it) or the drain (which would let the drain mark the ledger clean
+    // while this remove still holds the session and its scripts open). Callers
+    // that already hold the lock — the add rollback and the clock drain — call
+    // `cdp_remove_init_script_target_owned` directly to avoid re-entering it.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     cdp_remove_init_script_target_owned(endpoint, target_id, identifier).await
 }
 
-async fn cdp_remove_init_script_target_owned(
+/// The lock-free body of [`cdp_remove_init_script_target`], for callers that
+/// already hold the durable browser-mutation operation lock (the add rollback
+/// and the clock drain).
+pub(crate) async fn cdp_remove_init_script_target_owned(
     endpoint: &str,
     target_id: &str,
     identifier: &str,

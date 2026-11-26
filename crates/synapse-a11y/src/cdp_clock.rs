@@ -306,7 +306,10 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
     for (target_id, slot) in slots {
         let current_cleanup =
             run_clock_js(&slot.endpoint, &target_id, "uninstall", json!({})).await;
-        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
+        // This drain already holds the durable browser-mutation operation lock
+        // (it runs inside `durable_browser_mutation_owners_disable_and_drain`),
+        // so call the lock-free body to avoid re-entering that lock.
+        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target_owned(
             &slot.endpoint,
             &target_id,
             &slot.init_script_identifier,

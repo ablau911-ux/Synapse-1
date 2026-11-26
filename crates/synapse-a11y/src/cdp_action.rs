@@ -36,7 +36,7 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
-    DispatchTouchEventParams, DispatchTouchEventType, InsertTextParams, MouseButton, TouchPoint,
+    DispatchTouchEventType, InsertTextParams, MouseButton, TouchPoint,
 };
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
@@ -6469,15 +6469,39 @@ fn after_input_if<T>(result: A11yResult<T>, delivered: bool) -> A11yResult<T> {
     }
 }
 
+/// `Input.dispatchTouchEvent` command whose `touchPoints` array is always put
+/// on the wire, even when empty. The generated `DispatchTouchEventParams` skips
+/// an empty list, but Chrome rejects a `touchEnd` that arrives without the
+/// `touchPoints` key (`-32602 Invalid parameters`, #342). This is the one
+/// owner of a touch event that is sent — both the live tap and the persisted
+/// touch release build their event here.
+#[derive(Clone, Debug, Serialize)]
+struct DispatchTouchEventCommand {
+    #[serde(rename = "type")]
+    kind: DispatchTouchEventType,
+    #[serde(rename = "touchPoints")]
+    touch_points: Vec<TouchPoint>,
+}
+
+impl chromiumoxide::types::Method for DispatchTouchEventCommand {
+    fn identifier(&self) -> chromiumoxide::types::MethodId {
+        "Input.dispatchTouchEvent".into()
+    }
+}
+
+impl chromiumoxide::types::Command for DispatchTouchEventCommand {
+    type Response = chromiumoxide::cdp::browser_protocol::input::DispatchTouchEventReturns;
+}
+
 fn touch_event(
     kind: DispatchTouchEventType,
     point: Option<CdpActionPoint>,
-) -> A11yResult<DispatchTouchEventParams> {
+) -> A11yResult<DispatchTouchEventCommand> {
     let touch_points = match point {
         Some(point) => vec![touch_point(point)?],
         None => Vec::new(),
     };
-    Ok(DispatchTouchEventParams::new(kind, touch_points))
+    Ok(DispatchTouchEventCommand { kind, touch_points })
 }
 
 fn touch_point(point: CdpActionPoint) -> A11yResult<TouchPoint> {

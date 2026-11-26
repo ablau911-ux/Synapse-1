@@ -113,7 +113,6 @@ pub fn validate_ocr_language(lang_hint: Option<&str>) -> PerceptionResult<()> {
     }
 }
 
-
 /// Reads OCR text with an injected provider.
 ///
 /// # Errors

@@ -31,7 +31,7 @@ use crate::{A11yError, A11yResult, ElementSearchScope};
 use super::common::{
     TreeView, cached_hwnd, cached_patterns, cached_rect, cached_role,
     cached_runtime_id_hex_or_fallback, cached_value, create_cache_request, map_uia_error,
-    non_empty, pattern_property, with_automation, with_automation_operation,
+    non_empty, pattern_property, with_automation_read, with_automation_read_operation,
 };
 
 static SNAPSHOT_CACHE: Mutex<Option<SnapshotCache>> = Mutex::new(None);
@@ -83,7 +83,7 @@ pub fn snapshot(root: &UIElement, depth: u32) -> A11yResult<AccessibleSubtree> {
 
 pub fn snapshot_window_from_hwnd(hwnd: i64, depth: u32) -> A11yResult<AccessibleSubtree> {
     let hwnd = native_hwnd_value(hwnd)?;
-    with_automation_operation(
+    with_automation_read_operation(
         format!("snapshot_window_from_hwnd hwnd=0x{hwnd:x} depth={depth}"),
         SNAPSHOT_WORKER_REPLY_TIMEOUT,
         move |automation| {
@@ -97,7 +97,7 @@ pub fn snapshot_window_from_hwnd(hwnd: i64, depth: u32) -> A11yResult<Accessible
 
 pub fn snapshot_element(id: &ElementId, depth: u32) -> A11yResult<AccessibleSubtree> {
     let id = id.clone();
-    with_automation_operation(
+    with_automation_read_operation(
         format!("snapshot_element element_id={id} depth={depth}"),
         SNAPSHOT_WORKER_REPLY_TIMEOUT,
         move |automation| {
@@ -136,7 +136,7 @@ pub(super) fn snapshot_from_root(
 }
 
 pub fn focused_element_node() -> A11yResult<AccessibleNode> {
-    with_automation(|automation| {
+    with_automation_read(|automation| {
         let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Control)?;
         let element = automation
             .get_focused_element_build_cache(&cache)
@@ -198,7 +198,7 @@ pub fn focused_element_node_in_window(hwnd: i64) -> A11yResult<Option<Accessible
 
     let focus_raw = focus.0 as isize;
     let target_raw = hwnd_to_wire(target.0 as isize);
-    with_automation_operation(
+    with_automation_read_operation(
         format!(
             "focused_element_node_in_window target=0x{:x} focus=0x{focus_raw:x}",
             target.0 as isize
@@ -217,7 +217,7 @@ pub fn focused_element_node_in_window(hwnd: i64) -> A11yResult<Option<Accessible
 }
 
 pub fn element_node_from_point(point: Point) -> A11yResult<AccessibleNode> {
-    with_automation(move |automation| {
+    with_automation_read(move |automation| {
         let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Control)?;
         let element = automation
             .element_from_point_build_cache(UiaPoint::new(point.x, point.y), &cache)
@@ -252,7 +252,7 @@ pub fn find_by_name_and_pattern_in_window(
     scope: ElementSearchScope,
 ) -> A11yResult<Option<AccessibleNode>> {
     let hwnd = native_hwnd_value(hwnd)?;
-    with_automation_operation(
+    with_automation_read_operation(
         format!(
             "find_by_name_and_pattern_in_window hwnd=0x{hwnd:x} scope={scope:?} pattern={pattern:?}"
         ),
@@ -275,7 +275,7 @@ pub fn chromium_renderer_accessibility_nodes_from_window(
         return Ok(Vec::new());
     }
     let hwnd = native_hwnd_value(hwnd)?;
-    with_automation_operation(
+    with_automation_read_operation(
         format!(
             "chromium_renderer_accessibility_nodes_from_window hwnd=0x{hwnd:x} depth={depth} max_nodes={max_nodes}"
         ),

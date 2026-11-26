@@ -840,6 +840,8 @@ fn key_after(key: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod parameter_code_tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]

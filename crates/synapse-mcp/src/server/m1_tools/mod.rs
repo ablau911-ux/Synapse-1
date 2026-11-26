@@ -19085,6 +19085,17 @@ fn screenshot_format_from_path(path: &Path) -> Result<CaptureScreenshotFormat, E
 /// the middle of the path is the caller's mistake, not a storage fault).
 /// Missing parent directories are created.
 fn ensure_output_path_available(tool: &str, path: &Path, overwrite: bool) -> Result<(), ErrorData> {
+    // Colons outside the drive prefix select NTFS alternate data streams.
+    // Reject them before creating directories or a sibling temporary file.
+    #[cfg(windows)]
+    if path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().contains(':'))
+    }) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{tool} output path must not contain an NTFS stream colon: {}", path.display()),
+        ));
+    }
     if path.try_exists().map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,
@@ -21193,4 +21204,31 @@ fn record_hud_error(
             detail: detail.into(),
         },
     );
+}
+
+#[cfg(all(test, windows))]
+mod output_path_checks {
+    use super::*;
+
+    #[test]
+    fn stream_paths_are_rejected_before_creating_parents_or_files() {
+        let parent = std::env::temp_dir().join(format!(
+            "synapse-stream-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        for tail in ["host.txt:ads.png", "dir:stream/image.png"] {
+            let error =
+                ensure_output_path_available("capture_screenshot", &parent.join(tail), false)
+                    .expect_err("NTFS streams must be refused");
+            assert!(error.message.contains("NTFS stream colon"));
+            assert!(
+                !parent.exists(),
+                "validation must not create parent directories"
+            );
+        }
+    }
 }

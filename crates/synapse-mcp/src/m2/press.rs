@@ -108,19 +108,36 @@ pub(crate) async fn act_press_cdp_target(
     validate_hold_ms(params.hold_ms)?;
     let strokes = cdp_key_strokes(&keys)?;
     boundary.ensure("immediately_before_cdp_press_key_sequence")?;
-    synapse_a11y::cdp_press_key_sequence(endpoint, cdp_target_id, strokes, params.hold_ms)
-        .await
-        .map_err(|error| {
-            crate::m2::error_after_a11y_input(
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "act_press CDP Input.dispatchKeyEvent failed for target {cdp_target_id:?}: {error}"
+    let outcome =
+        synapse_a11y::cdp_press_key_sequence(endpoint, cdp_target_id, strokes, params.hold_ms)
+            .await
+            .map_err(|error| {
+                crate::m2::error_after_a11y_input(
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "act_press CDP Input.dispatchKeyEvent failed for target {cdp_target_id:?}: {error}"
+                        ),
                     ),
-                ),
-                &error,
-            )
-        })?;
+                    &error,
+                )
+            })?;
+    // #329: a key-down that closed its own target is a delivered press. The
+    // key-up was unnecessary because its target no longer exists, so the target
+    // disappearing IS the observed delta (mirrors the PostMessage tier).
+    let (postcondition, key_up_not_posted_window_closed) = match outcome {
+        synapse_a11y::CdpKeySequenceOutcome::Delivered => {
+            (press_postcondition_not_requested(), None)
+        }
+        synapse_a11y::CdpKeySequenceOutcome::TargetClosed { detail } => (
+            crate::m2::postcondition::postcondition_target_window_closed(
+                "act_press",
+                "key-down",
+                "no post-delivery readback: the raw-CDP target is gone",
+            ),
+            Some(detail),
+        ),
+    };
     Ok(ActPressResponse {
         ok: true,
         keys_pressed: key_count,
@@ -128,8 +145,8 @@ pub(crate) async fn act_press_cdp_target(
         backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
         backend_tier_used: "cdp".to_owned(),
         required_foreground: false,
-        postcondition: press_postcondition_not_requested(),
-        key_up_not_posted_window_closed: None,
+        postcondition,
+        key_up_not_posted_window_closed,
     })
 }
 

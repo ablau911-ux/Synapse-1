@@ -1,8 +1,11 @@
 //! Target-scoped raw-CDP browser emulation helpers (#1173/#1174/#1175/#1176/#1177/#1178).
 
 use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -265,11 +268,6 @@ enum MediaCommand {
     Reset,
 }
 
-enum NetworkConditionsCommand {
-    Set(CdpNetworkConditionsOverride),
-    Reset,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GeolocationPermissionSetting {
     Granted,
@@ -328,6 +326,11 @@ pub async fn cdp_set_viewport_size_with_mobile(
     mobile: bool,
 ) -> A11yResult<CdpViewportResult> {
     validate_viewport_override(width, height, device_scale_factor)?;
+    // Item 3: one critical section — hold the operation lock across the set, its
+    // readback and any rollback so a concurrent set on the same target cannot
+    // replace this override between the set and the readback. The runner and the
+    // readback (`cdp_evaluate_expression_owned`) are lock-free holders of it.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     let requested = CdpViewportOverride {
         width,
         height,
@@ -341,6 +344,14 @@ pub async fn cdp_set_viewport_size_with_mobile(
     )
     .await?;
     let readback = viewport_readback(endpoint, target_id).await?;
+    if let Some(detail) = viewport_override_mismatch(&requested, &readback.metrics) {
+        let _ = run_device_metrics_command(endpoint, target_id, DeviceMetricsCommand::Reset).await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set viewport did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpViewportResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -359,6 +370,8 @@ pub async fn cdp_reset_viewport_size(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpViewportResult> {
+    // Item 3: hold the operation lock across the reset and its readback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     run_device_metrics_command(endpoint, target_id, DeviceMetricsCommand::Reset).await?;
     let readback = viewport_readback(endpoint, target_id).await?;
     Ok(CdpViewportResult {
@@ -381,6 +394,8 @@ pub async fn cdp_apply_device_descriptor(
     descriptor: CdpDeviceDescriptor,
 ) -> A11yResult<CdpDeviceResult> {
     validate_device_descriptor(&descriptor)?;
+    // Item 3: one critical section across the set, its readback and any rollback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     let key = device_registry_key(endpoint, target_id);
     let original_readback = device_readback(endpoint, target_id).await?;
     if let Ok(mut originals) = original_user_agents().lock() {
@@ -395,6 +410,25 @@ pub async fn cdp_apply_device_descriptor(
     )
     .await?;
     let readback = device_readback(endpoint, target_id).await?;
+    if let Some(detail) = device_descriptor_mismatch(&descriptor, &readback.metrics) {
+        let original_user_agent = original_user_agents()
+            .lock()
+            .ok()
+            .and_then(|mut originals| originals.remove(&device_registry_key(endpoint, target_id)));
+        let _ = run_device_descriptor_command(
+            endpoint,
+            target_id,
+            DeviceDescriptorCommand::Reset {
+                original_user_agent,
+            },
+        )
+        .await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set device did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpDeviceResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -415,6 +449,8 @@ pub async fn cdp_reset_device_descriptor(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpDeviceResult> {
+    // Item 3: hold the operation lock across the reset and its readback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     let key = device_registry_key(endpoint, target_id);
     let original_user_agent = original_user_agents()
         .lock()
@@ -451,6 +487,8 @@ pub async fn cdp_set_geolocation_override(
     grant_permission: bool,
 ) -> A11yResult<CdpGeolocationResult> {
     validate_geolocation_override(&geolocation)?;
+    // Item 3: one critical section across the origin/readback and the set.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     let origin = geolocation_origin(endpoint, target_id).await?;
     let permission_setting = if grant_permission {
         GeolocationPermissionSetting::Granted
@@ -488,6 +526,8 @@ pub async fn cdp_reset_geolocation_override(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpGeolocationResult> {
+    // Item 3: hold the operation lock across the reset and its readback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     let origin = geolocation_origin(endpoint, target_id).await?;
     run_geolocation_command(
         endpoint,
@@ -520,6 +560,8 @@ pub async fn cdp_set_locale_timezone_override(
     requested: CdpLocaleTimezoneOverride,
 ) -> A11yResult<CdpLocaleTimezoneResult> {
     validate_locale_timezone_override(&requested)?;
+    // Item 3: one critical section across the set, its readback and any rollback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     run_locale_timezone_command(
         endpoint,
         target_id,
@@ -527,6 +569,15 @@ pub async fn cdp_set_locale_timezone_override(
     )
     .await?;
     let readback = locale_timezone_readback(endpoint, target_id).await?;
+    if let Some(detail) = locale_timezone_override_mismatch(&requested, &readback.metrics) {
+        let _ =
+            run_locale_timezone_command(endpoint, target_id, LocaleTimezoneCommand::Reset).await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set locale/timezone did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpLocaleTimezoneResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -545,6 +596,8 @@ pub async fn cdp_reset_locale_timezone_override(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpLocaleTimezoneResult> {
+    // Item 3: hold the operation lock across the reset and its readback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     run_locale_timezone_command(endpoint, target_id, LocaleTimezoneCommand::Reset).await?;
     let readback = locale_timezone_readback(endpoint, target_id).await?;
     Ok(CdpLocaleTimezoneResult {
@@ -567,8 +620,18 @@ pub async fn cdp_set_media_override(
     requested: CdpMediaOverride,
 ) -> A11yResult<CdpMediaResult> {
     validate_media_override(&requested)?;
+    // Item 3: one critical section across the set, its readback and any rollback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     run_media_command(endpoint, target_id, MediaCommand::Set(requested.clone())).await?;
     let readback = media_readback(endpoint, target_id).await?;
+    if let Some(detail) = media_override_mismatch(&requested, &readback.metrics) {
+        let _ = run_media_command(endpoint, target_id, MediaCommand::Reset).await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set media did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpMediaResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -586,6 +649,8 @@ pub async fn cdp_reset_media_override(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpMediaResult> {
+    // Item 3: hold the operation lock across the reset and its readback.
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
     run_media_command(endpoint, target_id, MediaCommand::Reset).await?;
     let readback = media_readback(endpoint, target_id).await?;
     Ok(CdpMediaResult {
@@ -600,40 +665,40 @@ pub async fn cdp_reset_media_override(
     })
 }
 
-/// Applies offline/throttling network conditions to one CDP page target, then
-/// reads back page-visible navigator network state from the same target.
-pub async fn cdp_set_network_conditions(
-    endpoint: &str,
-    target_id: &str,
-    requested: CdpNetworkConditionsOverride,
+/// Raw-CDP network-conditions emulation cannot be held, so a set always refuses.
+///
+/// Chrome clears a target's whole network-conditions override — offline flag and
+/// throttle alike — the instant any other DevTools client of the target
+/// disconnects, and every Synapse raw-CDP tool call opens and closes its own
+/// connection, so a set could never outlive even its own readback. There is also
+/// no page-visible proof of a throttle and no CDP getter for the current
+/// conditions, so durability could never be proven. The request is validated for
+/// a precise error on malformed input, then refused — nothing is sent to Chrome
+/// and no domain is recorded. Hold network conditions with a Chrome bridge tab.
+pub fn cdp_set_network_conditions(
+    _endpoint: &str,
+    _target_id: &str,
+    requested: &CdpNetworkConditionsOverride,
 ) -> A11yResult<CdpNetworkConditionsResult> {
-    validate_network_conditions_override(&requested)?;
-    run_network_conditions_command(
-        endpoint,
-        target_id,
-        NetworkConditionsCommand::Set(requested.clone()),
-    )
-    .await?;
-    let readback = network_conditions_readback(endpoint, target_id).await?;
-    Ok(CdpNetworkConditionsResult {
-        endpoint: endpoint.to_owned(),
-        cdp_target_id: readback.target_id,
-        operation: "set".to_owned(),
-        requested: Some(requested),
-        page_url: readback.url,
-        page_title: readback.title,
-        ready_state: readback.ready_state,
-        readback: readback.metrics,
+    validate_network_conditions_override(requested)?;
+    Err(A11yError::CdpAxtreeFailed {
+        detail: "raw-CDP network emulation cannot be held across tool calls: Chrome \
+                 clears a target's network conditions when another DevTools session of \
+                 the target closes; use a normal Chrome bridge tab"
+            .to_owned(),
     })
 }
 
 /// Clears network-condition emulation for one CDP page target by restoring
-/// Chromium's online/full-speed defaults.
+/// Chromium's online/full-speed defaults. Conditions cannot be *held* on raw CDP
+/// (see [`cdp_set_network_conditions`]), but a reset is an instantaneous clear and
+/// still answers ok.
 pub async fn cdp_reset_network_conditions(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpNetworkConditionsResult> {
-    run_network_conditions_command(endpoint, target_id, NetworkConditionsCommand::Reset).await?;
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    reset_network_conditions_on_target(endpoint, target_id).await?;
     let readback = network_conditions_readback(endpoint, target_id).await?;
     Ok(CdpNetworkConditionsResult {
         endpoint: endpoint.to_owned(),
@@ -980,27 +1045,619 @@ fn validate_network_connection_type(value: &str) -> A11yResult<()> {
     }
 }
 
-async fn run_device_metrics_command(
+/// One emulation override domain held on a target's long-lived raw-CDP session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EmulationDomain {
+    Viewport,
+    Device,
+    Geolocation,
+    LocaleTimezone,
+    Media,
+}
+
+/// One long-lived raw-CDP session that keeps a target's emulation overrides
+/// alive. Chrome ends every `Emulation.*` / `Network.emulateNetworkConditions`
+/// override the instant the CDP client that set it disconnects, so — exactly
+/// like [`crate::cdp_action`]'s init-script slot — we keep one session open per
+/// target for as long as any emulation domain holds an override on it. The
+/// slot's domain set is the one source of truth for which domains are overridden.
+struct EmulationSlot {
+    /// Distinguishes this slot from a later one opened at the same key, so the
+    /// reaper only ever evicts its own entry, never a replacement.
+    slot_id: u64,
+    page: chromiumoxide::Page,
+    /// Kept open so a geolocation permission write (a Browser-level command) and
+    /// every override outlive the call; dropping it closes the CDP session.
+    browser: chromiumoxide::Browser,
+    handler_task: tokio::task::JoinHandle<()>,
+    /// A page-scoped event stream kept only as a liveness sentinel: Chrome ends
+    /// it when the target is destroyed, so this task finishes and reaps the slot
+    /// without waiting for the next set/reset on that target.
+    listener_task: tokio::task::JoinHandle<()>,
+    /// Which emulation domains currently hold an override on this session.
+    ///
+    /// Ownership note for the shared device-metrics override: `Viewport` and
+    /// `Device` both drive Chrome's single `Emulation.setDeviceMetricsOverride`,
+    /// and the last of the two to set wins while both are held. `remembered_metrics`
+    /// keeps each one's last successfully-applied device-metrics parameters so the
+    /// shared override can be reconstructed. When one of the two is reset while the
+    /// other is still recorded, the override is re-applied from the survivor's own
+    /// remembered metrics (not left as the reset domain's numbers, and not wiped),
+    /// so it becomes the survivor's metrics again — and the reset's readback is
+    /// taken against that. When neither remains, the override is cleared. Every
+    /// other domain owns an independent override.
+    domains: Mutex<HashSet<EmulationDomain>>,
+    /// Last device-metrics parameters each of `Viewport` and `Device` successfully
+    /// applied, so a reset of one can restore the survivor's own metrics to the
+    /// shared override. Kept next to `domains` and in step with it.
+    remembered_metrics: Mutex<RememberedDeviceMetrics>,
+}
+
+/// The last device-metrics parameters `Viewport` and `Device` each applied on a
+/// slot. See the shared-override ownership note on [`EmulationSlot::domains`].
+#[derive(Default)]
+struct RememberedDeviceMetrics {
+    viewport: Option<CdpViewportOverride>,
+    device: Option<CdpDeviceDescriptor>,
+}
+
+impl Drop for EmulationSlot {
+    fn drop(&mut self) {
+        self.handler_task.abort();
+        self.listener_task.abort();
+    }
+}
+
+#[derive(Default)]
+struct EmulationSlotRegistry {
+    slots: Mutex<HashMap<String, Arc<EmulationSlot>>>,
+}
+
+fn emulation_slot_registry() -> &'static EmulationSlotRegistry {
+    static REGISTRY: OnceLock<EmulationSlotRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(EmulationSlotRegistry::default)
+}
+
+fn emulation_slot_key(endpoint: &str, target_id: &str) -> String {
+    format!("{endpoint}\n{target_id}")
+}
+
+fn next_emulation_slot_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A slot is dead once either its browser connection (`handler_task`) or its
+/// target (`listener_task`, the page-scoped sentinel) has gone.
+fn emulation_slot_live(slot: &EmulationSlot) -> bool {
+    !slot.handler_task.is_finished() && !slot.listener_task.is_finished()
+}
+
+/// Removes a slot whose target was destroyed, identified by `slot_id` so a
+/// replacement slot opened at the same key after this one is never evicted. Run
+/// by the sentinel task the moment the target's event stream ends, so a closed
+/// tab releases its CDP session without waiting for the next call or the drain.
+fn reap_dead_emulation_slot(endpoint: &str, target_id: &str, slot_id: u64) {
+    let key = emulation_slot_key(endpoint, target_id);
+    let Ok(mut slots) = emulation_slot_registry().slots.lock() else {
+        return;
+    };
+    if slots.get(&key).is_some_and(|slot| slot.slot_id == slot_id) {
+        slots.remove(&key);
+    }
+}
+
+/// Returns the live slot for a target, dropping and forgetting one whose session
+/// has already ended (target gone or connection lost) so a later reset honestly
+/// takes the harmless fresh-connection path instead of reusing a dead session.
+fn lookup_live_emulation_slot(endpoint: &str, target_id: &str) -> Option<Arc<EmulationSlot>> {
+    let key = emulation_slot_key(endpoint, target_id);
+    let mut slots = emulation_slot_registry().slots.lock().ok()?;
+    match slots.get(&key) {
+        Some(slot) if emulation_slot_live(slot) => Some(Arc::clone(slot)),
+        Some(_) => {
+            slots.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Returns the target's existing emulation session or opens a new long-lived
+/// one, mirroring the init-script slot: connect, spawn the handler task, attach
+/// a target-destroyed sentinel and store the slot (including the lost-race case
+/// where a concurrent caller inserted first — the surplus session is dropped and
+/// its handler aborted).
+async fn get_or_create_emulation_slot(
     endpoint: &str,
     target_id: &str,
-    command: DeviceMetricsCommand,
-) -> A11yResult<()> {
+) -> A11yResult<Arc<EmulationSlot>> {
     use chromiumoxide::Browser;
-    use chromiumoxide::cdp::browser_protocol::emulation::{
-        ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
+    use chromiumoxide::cdp::browser_protocol::page::{
+        EnableParams as PageEnableParams, EventFrameNavigated,
     };
     use futures_util::StreamExt as _;
+
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    if let Some(slot) = lookup_live_emulation_slot(endpoint, target_id) {
+        return Ok(slot);
+    }
 
     let (browser, mut handler) =
         Browser::connect(endpoint)
             .await
             .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
+                detail: format!("emulation session connect {endpoint}: {err}"),
             })?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
+    let page = match crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await {
+        Ok(page) => page,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    // Subscribe to one page-scoped event purely as a liveness sentinel, exactly
+    // as the init-script slot does. We never read the events; what matters is
+    // that Chrome ends this stream when the target is destroyed (navigation just
+    // fires frameNavigated, which is ignored, so an override survives a reload).
+    // When the stream ends, the task below reaps the slot, so a closed tab does
+    // not leak its CDP session. On any setup failure, abort the handler.
+    let sentinel = async {
+        page.execute(PageEnableParams::default())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.enable for emulation session sentinel: {err}"),
+            })?;
+        page.event_listener::<EventFrameNavigated>()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("subscribe Page.frameNavigated for emulation sentinel: {err}"),
+            })
+    }
+    .await;
+    let mut target_gone = match sentinel {
+        Ok(stream) => stream,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    let slot_id = next_emulation_slot_id();
+    let listener_task = {
+        let listener_page = page.clone();
+        let listener_endpoint = endpoint.to_owned();
+        let listener_target = target_id.to_owned();
+        tokio::spawn(async move {
+            let _page = listener_page;
+            while target_gone.next().await.is_some() {}
+            reap_dead_emulation_slot(&listener_endpoint, &listener_target, slot_id);
+        })
+    };
+
+    let slot = Arc::new(EmulationSlot {
+        slot_id,
+        page,
+        browser,
+        handler_task,
+        listener_task,
+        domains: Mutex::new(HashSet::new()),
+        remembered_metrics: Mutex::new(RememberedDeviceMetrics::default()),
+    });
+
+    let key = emulation_slot_key(endpoint, target_id);
+    let mut slots = emulation_slot_registry().slots.lock().map_err(|_| {
+        A11yError::internal("emulation slot registry lock poisoned while inserting slot")
+    })?;
+    match slots.get(&key) {
+        Some(existing) if emulation_slot_live(existing) => Ok(Arc::clone(existing)),
+        _ => {
+            slots.insert(key, Arc::clone(&slot));
+            Ok(slot)
+        }
+    }
+}
+
+/// Drops a target's emulation session once its last override has been reset,
+/// re-checking emptiness under the registry lock so a domain set between the
+/// reset and this call keeps its session open.
+fn close_empty_emulation_slot(endpoint: &str, target_id: &str) {
+    let key = emulation_slot_key(endpoint, target_id);
+    let Ok(mut slots) = emulation_slot_registry().slots.lock() else {
+        return;
+    };
+    let still_empty = slots
+        .get(&key)
+        .is_some_and(|slot| slot.domains.lock().is_ok_and(|domains| domains.is_empty()));
+    if still_empty {
+        slots.remove(&key);
+    }
+}
+
+/// Where one emulation command runs. A set, and a reset of a target that still
+/// holds overrides, run on the target's long-lived override session; a reset of
+/// a target with no live session runs on a throwaway connection (the clear is
+/// harmless there and answers exactly as before this fix).
+enum EmulationContext {
+    Slot(Arc<EmulationSlot>),
+    Fresh {
+        /// Boxed: a `Browser` is far larger than the slot variant's `Arc`.
+        browser: Box<chromiumoxide::Browser>,
+        page: chromiumoxide::Page,
+        handler_task: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl EmulationContext {
+    /// Acquires the session a command runs on: a set always takes (and opens, if
+    /// needed) the long-lived slot; a reset reuses a live slot or, when none
+    /// exists, a throwaway connection.
+    async fn acquire(endpoint: &str, target_id: &str, is_set: bool) -> A11yResult<Self> {
+        use chromiumoxide::Browser;
+        use futures_util::StreamExt as _;
+
+        if is_set {
+            // Item 1: recheck the operator panic gate under the operation lock the
+            // caller holds — as the init-script install and network override do —
+            // and refuse before opening a slot, so a set queued behind a drain
+            // never reopens a durable session after the drain. Refusing here leaves
+            // nothing open.
+            if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+                return Err(A11yError::CdpAttachFailed {
+                    detail: "durable browser mutation owners are disabled by operator \
+                             panic; refusing emulation override set"
+                        .to_owned(),
+                });
+            }
+            return Ok(Self::Slot(
+                get_or_create_emulation_slot(endpoint, target_id).await?,
+            ));
+        }
+        if let Some(slot) = lookup_live_emulation_slot(endpoint, target_id) {
+            return Ok(Self::Slot(slot));
+        }
+
+        let (browser, mut handler) =
+            Browser::connect(endpoint)
+                .await
+                .map_err(|err| A11yError::CdpAttachFailed {
+                    detail: format!("connect {endpoint}: {err}"),
+                })?;
+        let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let page =
+            match crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await {
+                Ok(page) => page,
+                Err(err) => {
+                    handler_task.abort();
+                    return Err(err);
+                }
+            };
+        Ok(Self::Fresh {
+            browser: Box::new(browser),
+            page,
+            handler_task,
+        })
+    }
+
+    fn page(&self) -> &chromiumoxide::Page {
+        match self {
+            Self::Slot(slot) => &slot.page,
+            Self::Fresh { page, .. } => page,
+        }
+    }
+
+    fn browser(&self) -> &chromiumoxide::Browser {
+        match self {
+            Self::Slot(slot) => &slot.browser,
+            Self::Fresh { browser, .. } => browser.as_ref(),
+        }
+    }
+
+    /// Records the viewport metrics this set applied on the slot, so a later
+    /// device reset can restore them to the shared override. No-op for a
+    /// throwaway connection.
+    fn remember_viewport_metrics(&self, params: &CdpViewportOverride) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.viewport = Some(params.clone());
+        }
+    }
+
+    /// Records the device descriptor this set applied on the slot, so a later
+    /// viewport reset can restore its metrics to the shared override.
+    fn remember_device_metrics(&self, params: &CdpDeviceDescriptor) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.device = Some(params.clone());
+        }
+    }
+
+    /// The viewport metrics still remembered on this command's slot, if the
+    /// viewport domain is holding the shared override (always `None` for a
+    /// throwaway connection).
+    fn remembered_viewport_metrics(&self) -> Option<CdpViewportOverride> {
+        match self {
+            Self::Slot(slot) => slot
+                .remembered_metrics
+                .lock()
+                .ok()
+                .and_then(|remembered| remembered.viewport.clone()),
+            Self::Fresh { .. } => None,
+        }
+    }
+
+    /// The device metrics still remembered on this command's slot, if the device
+    /// domain is holding the shared override.
+    fn remembered_device_metrics(&self) -> Option<CdpDeviceDescriptor> {
+        match self {
+            Self::Slot(slot) => slot
+                .remembered_metrics
+                .lock()
+                .ok()
+                .and_then(|remembered| remembered.device.clone()),
+            Self::Fresh { .. } => None,
+        }
+    }
+
+    /// Drops the viewport's remembered metrics when the viewport domain is reset.
+    fn forget_viewport_metrics(&self) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.viewport = None;
+        }
+    }
+
+    /// Drops the device's remembered metrics when the device domain is reset.
+    fn forget_device_metrics(&self) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.device = None;
+        }
+    }
+
+    /// Finishes a command: a throwaway session's handler task is aborted; a
+    /// slot's domain set is updated on success (a set records its domain, a
+    /// reset forgets it) and an emptied slot is closed so its session is freed.
+    fn finish(
+        self,
+        endpoint: &str,
+        target_id: &str,
+        domain: EmulationDomain,
+        is_set: bool,
+        succeeded: bool,
+    ) -> A11yResult<()> {
+        match self {
+            Self::Slot(slot) => {
+                {
+                    let mut domains = slot.domains.lock().map_err(|_| {
+                        A11yError::internal(
+                            "emulation slot domain set poisoned while updating a domain",
+                        )
+                    })?;
+                    if is_set {
+                        // Item 5: record the domain on any set attempt, success or
+                        // failure. A compound set (device, locale/timezone) can apply
+                        // some commands before a later one fails; recording it means a
+                        // reset or the drain always clears whatever was applied, so
+                        // there is never an applied-but-unrecorded override.
+                        domains.insert(domain);
+                    } else if succeeded {
+                        domains.remove(&domain);
+                    }
+                }
+                close_empty_emulation_slot(endpoint, target_id);
+            }
+            Self::Fresh { handler_task, .. } => handler_task.abort(),
+        }
+        Ok(())
+    }
+}
+
+/// Count of emulation override sessions torn down at daemon drain.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CdpEmulationOverrideDrainReadback {
+    pub found: usize,
+    pub cleared: usize,
+    pub failures: Vec<String>,
+    pub active_after: usize,
+}
+
+/// Tears down every live emulation override session at daemon drain. Dropping a
+/// slot aborts its handler task and closes the CDP session, and Chrome clears
+/// every emulation override that session installed — that is the physical
+/// teardown, so no per-domain clear is reopened here. Mirrors the init-script
+/// drain and is called from the browser-mutation drain while it holds the
+/// operation lock, so it takes only the registry lock and never re-acquires it.
+#[must_use]
+pub fn durable_emulation_overrides_disable_and_drain_all() -> CdpEmulationOverrideDrainReadback {
+    let slots = match emulation_slot_registry().slots.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => {
+            return CdpEmulationOverrideDrainReadback {
+                failures: vec!["durable emulation override registry lock is poisoned".to_owned()],
+                active_after: usize::MAX,
+                ..Default::default()
+            };
+        }
+    };
+    let found = slots.len();
+    drop(slots);
+    let active_after = emulation_slot_registry()
+        .slots
+        .lock()
+        .map_or(usize::MAX, |slots| slots.len());
+    CdpEmulationOverrideDrainReadback {
+        found,
+        cleared: found,
+        failures: Vec::new(),
+        active_after,
+    }
+}
+
+// Rule 2: a set whose page readback contradicts the request did not take
+// effect, so it is an error rather than a false success. Each helper compares
+// only values a page reports back unambiguously for its domain and returns a
+// human-readable mismatch, or `None` when the readback agrees or carries
+// nothing comparable. On `Some`, the caller clears the override and forgets the
+// domain. Geolocation (an async, permission-gated position) and network
+// conditions (only weakly observable through `navigator`) carry nothing exact,
+// so they have no helper and are never compared.
+
+/// Viewport — the live-reproduced failure. Compared against `screen.width` /
+/// `screen.height`, which the device-metrics override fixes for every page.
+/// `innerWidth`/`innerHeight` are the layout viewport and legitimately differ
+/// from the requested device size (a mobile emulation of a page without a
+/// viewport meta tag lays out at ~980px wide), so comparing them would reject a
+/// correct set. The device scale factor is not compared because
+/// `devicePixelRatio` can legitimately round.
+fn viewport_override_mismatch(
+    requested: &CdpViewportOverride,
+    readback: &CdpViewportReadback,
+) -> Option<String> {
+    let want_width = i64::from(requested.width);
+    let want_height = i64::from(requested.height);
+    if readback.screen_width == want_width && readback.screen_height == want_height {
+        return None;
+    }
+    Some(format!(
+        "requested screen size {want_width}x{want_height} but the page read {}x{}",
+        readback.screen_width, readback.screen_height
+    ))
+}
+
+/// Device descriptor — the user agent round-trips exactly through
+/// `navigator.userAgent`, and the emulated viewport is compared as above.
+fn device_descriptor_mismatch(
+    requested: &CdpDeviceDescriptor,
+    readback: &CdpDeviceReadback,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    if readback.user_agent != requested.user_agent {
+        problems.push(format!(
+            "requested user_agent {:?} but the page read {:?}",
+            requested.user_agent, readback.user_agent
+        ));
+    }
+    let want_width = i64::from(requested.width);
+    let want_height = i64::from(requested.height);
+    if readback.viewport.screen_width != want_width
+        || readback.viewport.screen_height != want_height
+    {
+        problems.push(format!(
+            "requested screen size {want_width}x{want_height} but the page read {}x{}",
+            readback.viewport.screen_width, readback.viewport.screen_height
+        ));
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
+}
+
+/// Media — each requested feature maps to a `matchMedia` boolean the readback
+/// carries directly, so every set feature is comparable.
+fn media_override_mismatch(
+    requested: &CdpMediaOverride,
+    readback: &CdpMediaReadback,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    if let Some(scheme) = requested.color_scheme.as_deref() {
+        let honored = match scheme {
+            "light" => readback.color_scheme_light,
+            "dark" => readback.color_scheme_dark,
+            "no-preference" => readback.color_scheme_no_preference,
+            _ => true,
+        };
+        if !honored {
+            problems.push(format!(
+                "color_scheme={scheme} not reflected (light={}, dark={}, no-preference={})",
+                readback.color_scheme_light,
+                readback.color_scheme_dark,
+                readback.color_scheme_no_preference
+            ));
+        }
+    }
+    if let Some(motion) = requested.reduced_motion.as_deref() {
+        let honored = match motion {
+            "reduce" => readback.reduced_motion_reduce,
+            "no-preference" => readback.reduced_motion_no_preference,
+            _ => true,
+        };
+        if !honored {
+            problems.push(format!(
+                "reduced_motion={motion} not reflected (reduce={}, no-preference={})",
+                readback.reduced_motion_reduce, readback.reduced_motion_no_preference
+            ));
+        }
+    }
+    if let Some(media) = requested.media.as_deref() {
+        let honored = match media {
+            "screen" => readback.media_screen,
+            "print" => readback.media_print,
+            _ => true,
+        };
+        if !honored {
+            problems.push(format!(
+                "media={media} not reflected (screen={}, print={})",
+                readback.media_screen, readback.media_print
+            ));
+        }
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
+}
+
+/// Locale/timezone — only the timezone is compared: an IANA id round-trips
+/// exactly through `Intl.DateTimeFormat().resolvedOptions().timeZone`, whereas a
+/// requested BCP-47 locale can be legitimately normalised (case, subtag order)
+/// by the engine, so comparing it would reject correct sets.
+fn locale_timezone_override_mismatch(
+    requested: &CdpLocaleTimezoneOverride,
+    readback: &CdpLocaleTimezoneReadback,
+) -> Option<String> {
+    let timezone_id = requested.timezone_id.as_deref()?;
+    if timezone_id.is_empty() || readback.time_zone == timezone_id {
+        return None;
+    }
+    Some(format!(
+        "requested timezone_id {timezone_id:?} but the page read time_zone {:?}",
+        readback.time_zone
+    ))
+}
+
+async fn run_device_metrics_command(
+    endpoint: &str,
+    target_id: &str,
+    command: DeviceMetricsCommand,
+) -> A11yResult<()> {
+    use chromiumoxide::cdp::browser_protocol::emulation::{
+        ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
+    };
+
+    // The caller (a `cdp_set_*` / `cdp_reset_*` entry point) holds the durable
+    // browser-mutation operation lock across the set, its readback and any
+    // rollback, so this runner never takes it itself.
+    let is_set = matches!(command, DeviceMetricsCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
+
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             DeviceMetricsCommand::Set(override_metrics) => {
                 let params = SetDeviceMetricsOverrideParams::builder()
@@ -1019,36 +1676,73 @@ async fn run_device_metrics_command(
                     .map_err(|err| A11yError::CdpAxtreeFailed {
                         detail: format!("Emulation.setDeviceMetricsOverride: {err}"),
                     })?;
+                ctx.remember_viewport_metrics(&override_metrics);
             }
             DeviceMetricsCommand::Reset => {
-                page.execute(ClearDeviceMetricsOverrideParams::default())
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
-                    })?;
-                let params = SetDeviceMetricsOverrideParams::builder()
-                    .width(0)
-                    .height(0)
-                    .device_scale_factor(0.0)
-                    .mobile(false)
-                    .screen_width(0)
-                    .screen_height(0)
-                    .build()
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("Emulation.setDeviceMetricsOverride reset params: {err}"),
-                    })?;
-                page.execute(params)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("Emulation.setDeviceMetricsOverride reset: {err}"),
-                    })?;
+                // Item 1: Viewport and Device share this one device-metrics
+                // override. If Device still holds it, restore Device's own metrics
+                // so resetting Viewport leaves Device's numbers in force; otherwise
+                // clear the shared override. Either way, Viewport stops remembering.
+                if let Some(device) = ctx.remembered_device_metrics() {
+                    let params = SetDeviceMetricsOverrideParams::builder()
+                        .width(i64::from(device.width))
+                        .height(i64::from(device.height))
+                        .device_scale_factor(device.device_scale_factor)
+                        .mobile(device.is_mobile)
+                        .screen_width(i64::from(device.width))
+                        .screen_height(i64::from(device.height))
+                        .build()
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "Emulation.setDeviceMetricsOverride device restore params: {err}"
+                            ),
+                        })?;
+                    page.execute(params)
+                        .await
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "Emulation.setDeviceMetricsOverride device restore: {err}"
+                            ),
+                        })?;
+                } else {
+                    page.execute(ClearDeviceMetricsOverrideParams::default())
+                        .await
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                        })?;
+                    let params = SetDeviceMetricsOverrideParams::builder()
+                        .width(0)
+                        .height(0)
+                        .device_scale_factor(0.0)
+                        .mobile(false)
+                        .screen_width(0)
+                        .screen_height(0)
+                        .build()
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "Emulation.setDeviceMetricsOverride reset params: {err}"
+                            ),
+                        })?;
+                    page.execute(params)
+                        .await
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!("Emulation.setDeviceMetricsOverride reset: {err}"),
+                        })?;
+                }
+                ctx.forget_viewport_metrics();
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Viewport,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1057,24 +1751,19 @@ async fn run_device_descriptor_command(
     target_id: &str,
     command: DeviceDescriptorCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{
         ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
         SetEmitTouchEventsForMouseConfiguration, SetEmitTouchEventsForMouseParams,
         SetTouchEmulationEnabledParams, SetUserAgentOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // The caller holds the durable browser-mutation operation lock; see
+    // `run_device_metrics_command`.
+    let is_set = matches!(command, DeviceDescriptorCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             DeviceDescriptorCommand::Set(descriptor) => {
                 let user_agent = SetUserAgentOverrideParams::builder()
@@ -1136,15 +1825,47 @@ async fn run_device_descriptor_command(
                     .map_err(|err| A11yError::CdpAxtreeFailed {
                         detail: format!("Emulation.setEmitTouchEventsForMouse: {err}"),
                     })?;
+                ctx.remember_device_metrics(&descriptor);
             }
             DeviceDescriptorCommand::Reset {
                 original_user_agent,
             } => {
-                page.execute(ClearDeviceMetricsOverrideParams::default())
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
-                    })?;
+                // Item 1: Viewport shares this one device-metrics override. If
+                // Viewport still holds it, restore Viewport's own metrics so this
+                // device reset leaves Viewport's numbers in force; otherwise clear
+                // the shared override. The touch and user-agent overrides below are
+                // the device domain's own and are always cleared/restored.
+                match ctx.remembered_viewport_metrics() {
+                    Some(viewport) => {
+                        let params = SetDeviceMetricsOverrideParams::builder()
+                            .width(i64::from(viewport.width))
+                            .height(i64::from(viewport.height))
+                            .device_scale_factor(viewport.device_scale_factor)
+                            .mobile(viewport.mobile)
+                            .screen_width(i64::from(viewport.width))
+                            .screen_height(i64::from(viewport.height))
+                            .build()
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride viewport restore params: {err}"
+                                ),
+                            })?;
+                        page.execute(params).await.map_err(|err| {
+                            A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride viewport restore: {err}"
+                                ),
+                            }
+                        })?;
+                    }
+                    None => {
+                        page.execute(ClearDeviceMetricsOverrideParams::default())
+                            .await
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                            })?;
+                    }
+                }
                 page.execute(SetTouchEmulationEnabledParams::new(false))
                     .await
                     .map_err(|err| A11yError::CdpAxtreeFailed {
@@ -1175,13 +1896,20 @@ async fn run_device_descriptor_command(
                             detail: format!("Emulation.setUserAgentOverride restore: {err}"),
                         })?;
                 }
+                ctx.forget_device_metrics();
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Device,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1190,22 +1918,17 @@ async fn run_geolocation_command(
     target_id: &str,
     command: GeolocationCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{
         ClearGeolocationOverrideParams, SetGeolocationOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // The caller holds the durable browser-mutation operation lock; see
+    // `run_device_metrics_command`.
+    let is_set = matches!(command, GeolocationCommand::Set { .. });
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             GeolocationCommand::Set {
                 geolocation,
@@ -1213,15 +1936,14 @@ async fn run_geolocation_command(
                 origin,
             } => {
                 let permission = geolocation_permission_params(&origin, permission_setting)?;
-                browser
-                    .execute(permission)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                ctx.browser().execute(permission).await.map_err(|err| {
+                    A11yError::CdpAxtreeFailed {
                         detail: format!(
                             "Browser.setPermission geolocation={}: {err}",
                             permission_setting.as_str()
                         ),
-                    })?;
+                    }
+                })?;
 
                 let mut params = SetGeolocationOverrideParams::builder()
                     .latitude(geolocation.latitude)
@@ -1253,19 +1975,24 @@ async fn run_geolocation_command(
                     })?;
                 let permission =
                     geolocation_permission_params(&origin, GeolocationPermissionSetting::Prompt)?;
-                browser
-                    .execute(permission)
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                ctx.browser().execute(permission).await.map_err(|err| {
+                    A11yError::CdpAxtreeFailed {
                         detail: format!("Browser.setPermission geolocation=prompt: {err}"),
-                    })?;
+                    }
+                })?;
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Geolocation,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1297,22 +2024,17 @@ async fn run_locale_timezone_command(
     target_id: &str,
     command: LocaleTimezoneCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{
         SetLocaleOverrideParams, SetTimezoneOverrideParams,
     };
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // The caller holds the durable browser-mutation operation lock; see
+    // `run_device_metrics_command`.
+    let is_set = matches!(command, LocaleTimezoneCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         match command {
             LocaleTimezoneCommand::Set(requested) => {
                 if let Some(locale) = requested.locale {
@@ -1349,11 +2071,17 @@ async fn run_locale_timezone_command(
                     })?;
             }
         }
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::LocaleTimezone,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
@@ -1362,20 +2090,15 @@ async fn run_media_command(
     target_id: &str,
     command: MediaCommand,
 ) -> A11yResult<()> {
-    use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
-    use futures_util::StreamExt as _;
 
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // The caller holds the durable browser-mutation operation lock; see
+    // `run_device_metrics_command`.
+    let is_set = matches!(command, MediaCommand::Set(_));
+    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
 
     let result = async {
-        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let page = ctx.page();
         let params = match command {
             MediaCommand::Set(requested) => {
                 let mut features = Vec::new();
@@ -1400,24 +2123,28 @@ async fn run_media_command(
             .map_err(|err| A11yError::CdpAxtreeFailed {
                 detail: format!("Emulation.setEmulatedMedia: {err}"),
             })?;
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
-    handler_task.abort();
+    ctx.finish(
+        endpoint,
+        target_id,
+        EmulationDomain::Media,
+        is_set,
+        result.is_ok(),
+    )?;
     result
 }
 
+/// Restores Chromium's online / full-speed network defaults on one CDP page
+/// target through a throwaway connection. Network conditions cannot be held on
+/// raw CDP (see [`cdp_set_network_conditions`]), so there is no slot to reuse and
+/// no domain to record — this is a one-shot clear.
 #[allow(deprecated)]
-async fn run_network_conditions_command(
-    endpoint: &str,
-    target_id: &str,
-    command: NetworkConditionsCommand,
-) -> A11yResult<()> {
+async fn reset_network_conditions_on_target(endpoint: &str, target_id: &str) -> A11yResult<()> {
     use chromiumoxide::Browser;
-    use chromiumoxide::cdp::browser_protocol::network::{
-        ConnectionType, EmulateNetworkConditionsParams,
-    };
+    use chromiumoxide::cdp::browser_protocol::network::EmulateNetworkConditionsParams;
     use futures_util::StreamExt as _;
 
     let (browser, mut handler) =
@@ -1430,41 +2157,21 @@ async fn run_network_conditions_command(
 
     let result = async {
         let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
-        let params = match command {
-            NetworkConditionsCommand::Set(requested) => {
-                let mut builder = EmulateNetworkConditionsParams::builder()
-                    .offline(requested.offline)
-                    .latency(requested.latency_ms)
-                    .download_throughput(requested.download_throughput_bytes_per_sec)
-                    .upload_throughput(requested.upload_throughput_bytes_per_sec);
-                if let Some(connection_type) = requested.connection_type.as_deref() {
-                    let parsed = connection_type.parse::<ConnectionType>().map_err(|err| {
-                        A11yError::CdpAxtreeFailed {
-                            detail: format!("connection_type {connection_type:?}: {err}"),
-                        }
-                    })?;
-                    builder = builder.connection_type(parsed);
-                }
-                builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Network.emulateNetworkConditions params: {err}"),
-                })?
-            }
-            NetworkConditionsCommand::Reset => EmulateNetworkConditionsParams::builder()
-                .offline(false)
-                .latency(0.0)
-                .download_throughput(-1.0)
-                .upload_throughput(-1.0)
-                .build()
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Network.emulateNetworkConditions reset params: {err}"),
-                })?,
-        };
+        let params = EmulateNetworkConditionsParams::builder()
+            .offline(false)
+            .latency(0.0)
+            .download_throughput(-1.0)
+            .upload_throughput(-1.0)
+            .build()
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Network.emulateNetworkConditions reset params: {err}"),
+            })?;
         page.execute(params)
             .await
             .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Network.emulateNetworkConditions: {err}"),
+                detail: format!("Network.emulateNetworkConditions reset: {err}"),
             })?;
-        Ok(())
+        Ok::<(), A11yError>(())
     }
     .await;
 
@@ -1521,7 +2228,7 @@ struct NetworkConditionsReadback {
 }
 
 async fn viewport_readback(endpoint: &str, target_id: &str) -> A11yResult<ViewportReadback> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         VIEWPORT_READBACK_JS,
@@ -1545,7 +2252,7 @@ async fn viewport_readback(endpoint: &str, target_id: &str) -> A11yResult<Viewpo
 }
 
 async fn device_readback(endpoint: &str, target_id: &str) -> A11yResult<DeviceReadback> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         DEVICE_READBACK_JS,
@@ -1569,7 +2276,7 @@ async fn device_readback(endpoint: &str, target_id: &str) -> A11yResult<DeviceRe
 }
 
 async fn geolocation_origin(endpoint: &str, target_id: &str) -> A11yResult<String> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         GEOLOCATION_ORIGIN_JS,
@@ -1594,7 +2301,7 @@ async fn geolocation_origin(endpoint: &str, target_id: &str) -> A11yResult<Strin
 }
 
 async fn geolocation_readback(endpoint: &str, target_id: &str) -> A11yResult<GeolocationReadback> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         GEOLOCATION_READBACK_JS,
@@ -1621,7 +2328,7 @@ async fn locale_timezone_readback(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<LocaleTimezoneReadback> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         LOCALE_TIMEZONE_READBACK_JS,
@@ -1645,7 +2352,7 @@ async fn locale_timezone_readback(
 }
 
 async fn media_readback(endpoint: &str, target_id: &str) -> A11yResult<MediaReadback> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         MEDIA_READBACK_JS,
@@ -1671,7 +2378,7 @@ async fn network_conditions_readback(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<NetworkConditionsReadback> {
-    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+    let evaluated = crate::cdp_action::cdp_evaluate_expression_owned(
         endpoint,
         target_id,
         NETWORK_CONDITIONS_READBACK_JS,

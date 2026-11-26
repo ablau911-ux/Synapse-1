@@ -15,6 +15,10 @@ const DEFAULT_DETECTION_CONFIDENCE_THRESHOLD: f32 = 0.5;
 const DEFAULT_DETECTION_MAX_DETECTIONS: u32 = 32;
 const STALE_TRACK_MS: i64 = 3_000;
 const MIN_TRACK_MATCH_DISTANCE_PX: f32 = 96.0;
+/// A detection whose bbox covers at least this fraction of the captured window
+/// frame is a whole-window misread of the window chrome itself (not a real
+/// physical object), so it is suppressed (#160).
+const MAX_ENTITY_FRAME_COVERAGE: f32 = 0.90;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectionRuntimeConfig {
@@ -228,6 +232,8 @@ pub fn populate_detection_from_state(
         }
     };
     let detections = filter_classes(batch.items, &state.detection_config.classes_of_interest);
+    let detections =
+        suppress_whole_frame_misdetections(detections, captured.width, captured.height);
     let entities =
         state
             .detection_runtime
@@ -254,6 +260,40 @@ fn threshold_percent(value: f32) -> u16 {
     } else {
         scaled as u16
     }
+}
+
+/// Drop detections whose bbox covers (almost) the entire captured window: a
+/// real physical object cannot fill the whole frame, so these are the detector
+/// misreading the window chrome itself as an object (e.g. a whole VS Code window
+/// labelled `tvmonitor`/`cell phone`). Legitimate sub-window objects are kept
+/// unchanged (#160).
+fn suppress_whole_frame_misdetections(
+    detections: Vec<Detection>,
+    frame_width: u32,
+    frame_height: u32,
+) -> Vec<Detection> {
+    let frame_area = f64::from(frame_width) * f64::from(frame_height);
+    if frame_area <= 0.0 {
+        return detections;
+    }
+    detections
+        .into_iter()
+        .filter(|detection| {
+            let coverage = (f64::from(detection.bbox.w) * f64::from(detection.bbox.h)) / frame_area;
+            if coverage >= f64::from(MAX_ENTITY_FRAME_COVERAGE) {
+                tracing::debug!(
+                    code = "M1_DETECTION_WHOLE_FRAME_SUPPRESSED",
+                    class_label = %detection.class_label,
+                    confidence = detection.confidence,
+                    coverage,
+                    "suppressed a whole-window physical-object misdetection (#160)"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
 }
 
 fn filter_classes(detections: Vec<Detection>, classes_of_interest: &[String]) -> Vec<Detection> {

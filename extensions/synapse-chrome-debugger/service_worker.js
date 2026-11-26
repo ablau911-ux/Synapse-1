@@ -13113,6 +13113,63 @@ function emulationSessionHasActiveDomains(tabId) {
   return Boolean(session?.domains?.size);
 }
 
+// #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
+// stale cleanup) so each enumerates the same ledger field, baseline map and page
+// shim for every emulation domain in one place.
+const EMULATION_DOMAIN_WIRING = {
+  viewport: { ledgerField: "viewportOverrides", baselineMap: VIEWPORT_BASELINE_BY_TAB, clearShim: clearViewportDprShim },
+  device: { ledgerField: "deviceOverrides", baselineMap: DEVICE_BASELINE_BY_TAB, clearShim: clearDeviceEmulationShim },
+  geolocation: { ledgerField: "geolocationOverrides", baselineMap: GEOLOCATION_OVERRIDE_BY_TAB, clearShim: clearGeolocationEmulationShim },
+  locale: { ledgerField: "localeOverrides", baselineMap: LOCALE_BASELINE_BY_TAB, clearShim: clearLocaleEmulationShim },
+  media: { ledgerField: "mediaOverrides", baselineMap: MEDIA_BASELINE_BY_TAB, clearShim: clearMediaEmulationShim },
+  network: { ledgerField: "networkOverrides", baselineMap: NETWORK_BASELINE_BY_TAB, clearShim: clearNetworkConditionsShim }
+};
+
+// #336: the domains the durable ledger records as holding an override on this tab.
+function emulationDomainsHeldInLedger(tabId) {
+  const held = [];
+  for (const [domain, wiring] of Object.entries(EMULATION_DOMAIN_WIRING)) {
+    if (DURABLE_OWNER_LEDGER[wiring.ledgerField].some((entry) => entry.tabId === tabId)) {
+      held.push(domain);
+    }
+  }
+  return held;
+}
+
+// #336: a Chrome-attached session survived only when the attachment persisted AND no
+// in-memory session is the reason it persisted -- i.e. the registry was wiped by a
+// worker restart but Chrome still holds the debugger. Borrowing a live init-script /
+// binding / dialog / file-chooser session is not a restart; the emulation overrides
+// the ledger still lists were dropped when their own attachment detached.
+function emulationAttachmentSurvivedRestart(tabId, attachment) {
+  return Boolean(attachment.persistent) &&
+    !INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId) &&
+    !bindingSessionIsAttached(tabId) &&
+    !dialogSessionIsAttached(tabId) &&
+    !fileChooserSessionIsAttached(tabId);
+}
+
+// #336: a fresh (or borrowed-but-not-survived) attachment means any emulation
+// override the ledger still records for this tab is gone; its page shim is stale.
+// Tear those shims down best-effort and clear their ledger/baseline so a later reset,
+// restart adopt, or operator-panic cleanup does not act on a ghost. The domain being
+// set now is left alone -- its own set is about to apply.
+async function forgetStaleEmulationOverridesOnFreshAttach(tabId, settingDomain) {
+  for (const held of emulationDomainsHeldInLedger(tabId)) {
+    if (held === settingDomain) {
+      continue;
+    }
+    const wiring = EMULATION_DOMAIN_WIRING[held];
+    try {
+      await wiring.clearShim(tabId);
+    } catch (error) {
+      console.warn(`Synapse stale ${held} emulation shim teardown failed for tab ${tabId}: ${errorMessage(error)}`);
+    }
+    wiring.baselineMap.delete(tabId);
+    removeLedgerOverride(wiring.ledgerField, tabId);
+  }
+}
+
 // #336: hold the debugger attached for an emulation override. Borrows an
 // already-persistent session (shouldDetach:false) through attachDebuggerForCommand
 // -- which also re-detects, after a worker restart, an attachment Chrome still
@@ -13123,6 +13180,7 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
   const attachment = await attachDebuggerForCommand(tabId, protocolVersion);
   let session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
   if (!session) {
+    const survivedRestart = emulationAttachmentSurvivedRestart(tabId, attachment);
     session = {
       protocolVersion,
       domains: new Set(),
@@ -13131,6 +13189,15 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
     };
     EMULATION_DEBUGGER_SESSIONS.set(tabId, session);
     await recordLedgerDebuggerTab(tabId);
+    if (survivedRestart) {
+      // #336: the attachment and its overrides survived a worker restart; adopt every
+      // domain the ledger says is held so releasing one does not detach the others.
+      for (const held of emulationDomainsHeldInLedger(tabId)) {
+        session.domains.add(held);
+      }
+    } else {
+      await forgetStaleEmulationOverridesOnFreshAttach(tabId, domain);
+    }
   }
   session.domains.add(domain);
   return { debuggee: attachment.debuggee, session, attachment };

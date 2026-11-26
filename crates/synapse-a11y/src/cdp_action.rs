@@ -3421,7 +3421,7 @@ pub async fn cdp_remove_init_script_target(
 /// The lock-free body of [`cdp_remove_init_script_target`], for callers that
 /// already hold the durable browser-mutation operation lock (the add rollback
 /// and the clock drain).
-pub(crate) async fn cdp_remove_init_script_target_owned(
+pub(super) async fn cdp_remove_init_script_target_owned(
     endpoint: &str,
     target_id: &str,
     identifier: &str,

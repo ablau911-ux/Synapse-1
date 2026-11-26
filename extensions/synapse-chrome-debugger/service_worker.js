@@ -8623,26 +8623,36 @@ async function handleViewportEmulation(params) {
   }
   let resetFallback = null;
   if (!requested) {
-    const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId);
-    // #336: the override is gone when the tab is back at its pre-override
-    // width/devicePixelRatio/screen. inner_height is not compared: a held
-    // debugger session shows Chrome's "started debugging this browser" bar,
-    // which shortens the height, so the natural height legitimately differs
-    // between "a session is attached" and "none is". With no stored baseline
-    // there is nothing to clear -- the tab is already natural and the reset
-    // answers ok.
-    if (baseline && !viewportOverrideCleared(after.viewport, baseline)) {
-      // Those bar-independent fields did not return to baseline, so a CDP
-      // override is lingering; reload the document (which drops it) and confirm.
-      resetFallback = await reloadViewportTabAfterReset(
-        selected.tabId,
-        selected.target,
-        waitTimeoutMs
-      );
-      after = await waitForViewportOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
+    if (ledgerHasEmulationOverride("deviceOverrides", selected.tabId)) {
+      // #336: the reset skipped the shared device-metrics override because device
+      // emulation owns it (item 5). There is nothing for the viewport metrics to
+      // settle to -- the current viewport is the device's -- so release only the
+      // viewport domain's own state and answer ok, with no baseline comparison and
+      // no reload (which would have dropped the device's override).
+      VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("viewportOverrides", selected.tabId);
+    } else {
+      const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId);
+      // #336: the override is gone when the tab is back at its pre-override
+      // width/devicePixelRatio/screen. inner_height is not compared: a held
+      // debugger session shows Chrome's "started debugging this browser" bar,
+      // which shortens the height, so the natural height legitimately differs
+      // between "a session is attached" and "none is". With no stored baseline
+      // there is nothing to clear -- the tab is already natural and the reset
+      // answers ok.
+      if (baseline && !viewportOverrideCleared(after.viewport, baseline)) {
+        // Those bar-independent fields did not return to baseline, so a CDP
+        // override is lingering; reload the document (which drops it) and confirm.
+        resetFallback = await reloadViewportTabAfterReset(
+          selected.tabId,
+          selected.target,
+          waitTimeoutMs
+        );
+        after = await waitForViewportOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
+      }
+      VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("viewportOverrides", selected.tabId);
     }
-    VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
-    removeLedgerOverride("viewportOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -8719,21 +8729,32 @@ async function handleDeviceEmulation(params) {
   }
   let resetFallback = null;
   if (!descriptor) {
-    const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
-    // #336: same bar-independent rule as the viewport reset -- the override is
-    // gone when the user agent, touch, and the viewport's width/dpr/screen are
-    // back to baseline. inner_height is not compared because the debugging bar
-    // shortens it while a session is held.
-    if (baseline?.viewport && !deviceOverrideCleared(after.device, baseline)) {
-      resetFallback = await reloadViewportTabAfterReset(
-        selected.tabId,
-        selected.target,
-        waitTimeoutMs
-      );
-      after = await waitForDeviceOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
+    if (ledgerHasEmulationOverride("viewportOverrides", selected.tabId)) {
+      // #336: the device reset left the shared device-metrics override to viewport
+      // emulation, which owns it (item 5). The user agent and touch were restored and
+      // are already confirmed by the primary readback above, and the metrics have
+      // nothing to settle to, so release only the device domain's own state and
+      // answer ok -- no baseline comparison, no reload (which would drop viewport's
+      // override).
+      DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("deviceOverrides", selected.tabId);
+    } else {
+      const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
+      // #336: same bar-independent rule as the viewport reset -- the override is
+      // gone when the user agent, touch, and the viewport's width/dpr/screen are
+      // back to baseline. inner_height is not compared because the debugging bar
+      // shortens it while a session is held.
+      if (baseline?.viewport && !deviceOverrideCleared(after.device, baseline)) {
+        resetFallback = await reloadViewportTabAfterReset(
+          selected.tabId,
+          selected.target,
+          waitTimeoutMs
+        );
+        after = await waitForDeviceOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
+      }
+      DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("deviceOverrides", selected.tabId);
     }
-    DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
-    removeLedgerOverride("deviceOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,

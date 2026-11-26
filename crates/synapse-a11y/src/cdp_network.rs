@@ -1986,7 +1986,7 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
     let clocks_active_after = clocks.active_after;
     failures.extend(clocks.failures);
 
-    let init_scripts = crate::cdp_action::durable_init_scripts_disable_and_drain_all().await;
+    let init_scripts = crate::cdp_action::durable_init_scripts_disable_and_drain_all();
     let init_scripts_found = init_scripts.found;
     let init_scripts_removed = init_scripts.removed;
     let init_scripts_active_after = init_scripts.active_after;

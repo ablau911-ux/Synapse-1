@@ -5954,8 +5954,13 @@ async fn send_raw_cdp_input_payload(
                 CDP_INPUT_COMMAND_TIMEOUT.as_millis()
             ),
         }),
-    }?;
-    await_raw_cdp_command_ack(socket, command_id, stage, sample_index).await
+    }
+    // Once a frame is handed to the socket, a send/acknowledgement failure
+    // cannot prove that Chrome received no input, including on the first event.
+    .map_err(A11yError::after_input)?;
+    await_raw_cdp_command_ack(socket, command_id, stage, sample_index)
+        .await
+        .map_err(A11yError::after_input)
 }
 
 async fn await_raw_cdp_command_ack(

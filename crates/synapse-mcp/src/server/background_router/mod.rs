@@ -2710,6 +2710,15 @@ impl SynapseService {
             }
             "key" | "key_chord" => target_act_key_press(self, &params, &request_context).await?,
             "press" => {
+                if !target_act_has_key_chord(&params)
+                    && !target_act_has_dom_locator(&params)
+                    && !params
+                        .element_id
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                {
+                    target_act_key_chord_keys(&params, "press")?;
+                }
                 if target_act_has_key_chord(&params) {
                     target_act_key_press(self, &params, &request_context).await?
                 } else {

@@ -10253,7 +10253,10 @@ fn target_act_result_has_visual_pixel_verification(value: &Value) -> bool {
             let source_is_visual = object
                 .get("source_of_truth")
                 .and_then(Value::as_str)
-                .is_some_and(|source| source.contains("ui_or_pixels"));
+                .is_some_and(|source| {
+                    matches!(source, "target_window_pixels" | "target_point_pixels")
+                })
+                && object.get("observed_delta").and_then(Value::as_bool) == Some(true);
             let postcondition_is_visual = object
                 .get("postcondition")
                 .is_some_and(target_act_result_has_visual_pixel_verification);
@@ -10316,5 +10319,47 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
             | error_codes::TRANSIENT_ELEMENT_EXPIRED,
         ) => TARGET_ACT_STATUS_REFUSED,
         _ => TARGET_ACT_STATUS_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod pixel_verification_tests {
+    use super::*;
+
+    #[test]
+    fn ui_delta_alone_is_not_pixel_verified() {
+        let result = json!({
+            "postcondition": {
+                "source_of_truth": "target_window_ui_or_pixels",
+                "observed_delta": true,
+            }
+        });
+        assert_eq!(
+            target_act_delivery_state_from_result("act_press", true, TARGET_ACT_STATUS_OK, &result),
+            "delivered_and_verified"
+        );
+    }
+
+    #[test]
+    fn pixel_verification_requires_an_observed_pixel_delta() {
+        for source in ["target_window_pixels", "target_point_pixels"] {
+            let mut result = json!({
+                "postcondition": {
+                    "source_of_truth": source,
+                    "observed_delta": false,
+                }
+            });
+            assert!(!target_act_result_has_visual_pixel_verification(&result));
+            result["postcondition"]["observed_delta"] = json!(true);
+            assert_eq!(
+                target_act_delivery_state_from_result(
+                    "act_press",
+                    true,
+                    TARGET_ACT_STATUS_OK,
+                    &result,
+                ),
+                "delivered_and_pixel_verified"
+            );
+        }
     }
 }

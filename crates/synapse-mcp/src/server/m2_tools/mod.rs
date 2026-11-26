@@ -3973,7 +3973,8 @@ impl SynapseService {
         let focused = input.focused.clone();
         let elements_sha256 = elements_fingerprint_hash(&input.elements)?;
         let foreground_title_sha256 = non_empty_sha256(&input.foreground.window_title);
-        let pixel = capture_pixel_signature(input.foreground.window_bounds);
+        let pixel =
+            capture_pixel_signature(input.foreground.window_bounds, Some(input.foreground.hwnd));
         Ok(ClickDeltaSignature {
             window_source: if target_window_hwnd.is_some() {
                 "target_window"
@@ -4004,7 +4005,8 @@ impl SynapseService {
                 .then(|| synapse_action::backend::software::cursor_position().ok())
                 .flatten(),
             pixel,
-            point_pixel: point_region.map(|point| capture_pixel_signature(point_delta_rect(point))),
+            point_pixel: point_region
+                .map(|point| capture_pixel_signature(point_delta_rect(point), None)),
         })
     }
 
@@ -4902,7 +4904,16 @@ fn verify_captured_action_delta(
         let after_point = after.point_pixel;
         let before_hash = verify_hash_json(&before_point)?;
         let after_hash = verify_hash_json(&after_point)?;
-        if before_point == after_point {
+        let pixels_changed = before_point
+            .as_ref()
+            .and_then(|pixel| pixel.bitmap_sha256.as_ref())
+            .zip(
+                after_point
+                    .as_ref()
+                    .and_then(|pixel| pixel.bitmap_sha256.as_ref()),
+            )
+            .is_some_and(|(before, after)| before != after);
+        if !pixels_changed {
             return Err(source_no_observed_delta_error(
                 tool,
                 source_of_truth,
@@ -4918,7 +4929,7 @@ fn verify_captured_action_delta(
         }
         return Ok(postcondition_observed_delta(
             tool,
-            source_of_truth,
+            "target_point_pixels",
             before_hash,
             after_hash,
             "observed a target point pixel signature change after delivery",
@@ -4953,7 +4964,17 @@ fn verify_captured_action_delta(
             }),
         ));
     }
-    if before == after {
+    // A capture error or recovery is not evidence that the window changed.
+    // Ignore pixels for comparison unless both captures produced a bitmap,
+    // while preserving the actual captures and errors in the readback.
+    let unchanged = if before.pixel.bitmap_sha256.is_none() || after.pixel.bitmap_sha256.is_none() {
+        let mut comparable_before = before.clone();
+        comparable_before.pixel = after.pixel.clone();
+        comparable_before == after
+    } else {
+        before == after
+    };
+    if unchanged {
         return Err(source_no_observed_delta_error(
             tool,
             source_of_truth,
@@ -4966,9 +4987,19 @@ fn verify_captured_action_delta(
             }),
         ));
     }
+    let pixels_changed = before
+        .pixel
+        .bitmap_sha256
+        .as_ref()
+        .zip(after.pixel.bitmap_sha256.as_ref())
+        .is_some_and(|(before, after)| before != after);
     Ok(postcondition_observed_delta(
         tool,
-        source_of_truth,
+        if pixels_changed {
+            "target_window_pixels"
+        } else {
+            source_of_truth
+        },
         before_hash,
         after_hash,
         "observed a Source-of-Truth signature change after delivery",
@@ -5765,7 +5796,7 @@ fn elements_fingerprint_hash(elements: &[AccessibleNode]) -> Result<String, Erro
     hash_json(&fingerprints)
 }
 
-fn capture_pixel_signature(region: Rect) -> ClickPixelSignature {
+fn capture_pixel_signature(region: Rect, window_hwnd: Option<i64>) -> ClickPixelSignature {
     if region.w <= 0 || region.h <= 0 {
         return ClickPixelSignature {
             status: "unavailable".to_owned(),
@@ -5774,7 +5805,14 @@ fn capture_pixel_signature(region: Rect) -> ClickPixelSignature {
             detail: Some("foreground window bounds are empty".to_owned()),
         };
     }
-    match synapse_capture::screen_region_to_bgra_bitmap(region) {
+    // Window verification must not hash an overlapping window or the OS cursor.
+    // Use the same passive WGC full-frame capture as window screenshots.
+    let captured = match window_hwnd {
+        Some(hwnd) => synapse_capture::window_full_frame_to_bgra_bitmap(hwnd, 500)
+            .map(|captured| captured.bitmap),
+        None => synapse_capture::screen_region_to_bgra_bitmap(region),
+    };
+    match captured {
         Ok(bitmap) => {
             let mut hasher = Sha256::new();
             hasher.update(bitmap.width.to_le_bytes());

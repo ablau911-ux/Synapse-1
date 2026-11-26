@@ -106,7 +106,7 @@ mod windows_shutdown {
         core::{BOOL, w},
     };
 
-    use super::*;
+    use super::{Duration, daemon_lifecycle, json};
 
     // Windows can terminate the process when a close/session-end callback
     // returns, or after its own deadline. Leave time for a best-effort marker.

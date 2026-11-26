@@ -3005,7 +3005,7 @@ impl SynapseService {
             operator_panic_epoch_at_entry,
         )?;
 
-        let transaction = std::panic::AssertUnwindSafe(async {
+        let transaction = std::panic::AssertUnwindSafe(Box::pin(async {
         if authority_guard.operator_panic_observed() {
             let mut cleanup = authority_guard.cleanup_now("operator_panic_before_acquire");
             if !cleanup.cleanup_ok {
@@ -3388,7 +3388,7 @@ impl SynapseService {
             },
             action,
         }))
-        })
+        }))
         .catch_unwind()
         .await;
         match transaction {

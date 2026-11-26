@@ -23,7 +23,7 @@
 //! **Attempts**: each claim/dispatch appends an attempt linked to the agent's
 //! session, so parallel attempts (different templates) are recorded and the UI
 //! can compare-and-pick. **Crash safety**: `task_reconcile` (run explicitly and
-//! lazily on `task_list`/`task_dispatch_once`) checks every `in_progress` task's
+//! lazily on `task_next`/`task_dispatch_once`) checks every `in_progress` task's
 //! live attempt against the session registry; a completed spawned agent is
 //! settled from its terminal artifact and moved to `review`, while an attempt
 //! whose session is gone without terminal evidence is flagged `orphaned` and
@@ -353,7 +353,7 @@ pub struct TaskListResponse {
     /// Tasks in dispatch order (priority, fairness, FIFO) for the queue; other
     /// states ordered by enqueue sequence.
     pub tasks: Vec<AgentTask>,
-    /// Tasks reconcile flagged as orphaned during this read.
+    /// Retained for response compatibility; listing never reconciles tasks.
     pub reconciled_orphans: Vec<String>,
 }
 
@@ -1361,10 +1361,6 @@ impl SynapseService {
     fn task_list_impl(&self, params: TaskListParams) -> Result<TaskListResponse, ErrorData> {
         validate_list_max(params.max)?;
         let db = self.agent_task_db()?;
-        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
-        // Lazy reconcile on read so orphaned in_progress tasks surface even
-        // without an explicit reconcile or a daemon restart hook.
-        let (_, flagged) = self.reconcile_tasks(&db)?;
         let mut tasks = Self::read_all_tasks(&db)?;
         if let Some(state) = params.state {
             tasks.retain(|task| task.state == state);
@@ -1375,7 +1371,7 @@ impl SynapseService {
             ok: true,
             count: ordered.len(),
             tasks: ordered,
-            reconciled_orphans: flagged,
+            reconciled_orphans: Vec::new(),
         })
     }
 
@@ -1926,7 +1922,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "List agent tasks (optionally filtered by state), todo tasks in dispatch order (priority, per-template fairness, FIFO). Lazily reconciles orphaned in_progress tasks first; returns which were flagged."
+        description = "List agent tasks without changing stored rows (optionally filtered by state), todo tasks in dispatch order (priority, per-template fairness, FIFO). Use task reconcile to settle orphaned attempts."
     )]
     pub async fn task_list(
         &self,
@@ -1958,7 +1954,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Reconcile the queue against live sessions: completed spawned attempts are settled from completion-status.json into review, while in_progress attempts whose session is gone without terminal evidence are flagged orphaned and moved to review (never silently re-queued). Crash-safe recovery; also runs lazily on task_list/task_next/task_dispatch_once."
+        description = "Reconcile the queue against live sessions: completed spawned attempts are settled from completion-status.json into review, while in_progress attempts whose session is gone without terminal evidence are flagged orphaned and moved to review (never silently re-queued). Crash-safe recovery; also runs lazily on task_next/task_dispatch_once."
     )]
     pub async fn task_reconcile(
         &self,

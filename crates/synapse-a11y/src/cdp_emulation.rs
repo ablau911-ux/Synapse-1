@@ -1683,54 +1683,51 @@ async fn run_device_metrics_command(
                 // override. If Device still holds it, restore Device's own metrics
                 // so resetting Viewport leaves Device's numbers in force; otherwise
                 // clear the shared override. Either way, Viewport stops remembering.
-                match ctx.remembered_device_metrics() {
-                    Some(device) => {
-                        let params = SetDeviceMetricsOverrideParams::builder()
-                            .width(i64::from(device.width))
-                            .height(i64::from(device.height))
-                            .device_scale_factor(device.device_scale_factor)
-                            .mobile(device.is_mobile)
-                            .screen_width(i64::from(device.width))
-                            .screen_height(i64::from(device.height))
-                            .build()
-                            .map_err(|err| A11yError::CdpAxtreeFailed {
-                                detail: format!(
-                                    "Emulation.setDeviceMetricsOverride device restore params: {err}"
-                                ),
-                            })?;
-                        page.execute(params).await.map_err(|err| {
-                            A11yError::CdpAxtreeFailed {
-                                detail: format!(
-                                    "Emulation.setDeviceMetricsOverride device restore: {err}"
-                                ),
-                            }
+                if let Some(device) = ctx.remembered_device_metrics() {
+                    let params = SetDeviceMetricsOverrideParams::builder()
+                        .width(i64::from(device.width))
+                        .height(i64::from(device.height))
+                        .device_scale_factor(device.device_scale_factor)
+                        .mobile(device.is_mobile)
+                        .screen_width(i64::from(device.width))
+                        .screen_height(i64::from(device.height))
+                        .build()
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "Emulation.setDeviceMetricsOverride device restore params: {err}"
+                            ),
                         })?;
-                    }
-                    None => {
-                        page.execute(ClearDeviceMetricsOverrideParams::default())
-                            .await
-                            .map_err(|err| A11yError::CdpAxtreeFailed {
-                                detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
-                            })?;
-                        let params = SetDeviceMetricsOverrideParams::builder()
-                            .width(0)
-                            .height(0)
-                            .device_scale_factor(0.0)
-                            .mobile(false)
-                            .screen_width(0)
-                            .screen_height(0)
-                            .build()
-                            .map_err(|err| A11yError::CdpAxtreeFailed {
-                                detail: format!(
-                                    "Emulation.setDeviceMetricsOverride reset params: {err}"
-                                ),
-                            })?;
-                        page.execute(params).await.map_err(|err| {
-                            A11yError::CdpAxtreeFailed {
-                                detail: format!("Emulation.setDeviceMetricsOverride reset: {err}"),
-                            }
+                    page.execute(params)
+                        .await
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "Emulation.setDeviceMetricsOverride device restore: {err}"
+                            ),
                         })?;
-                    }
+                } else {
+                    page.execute(ClearDeviceMetricsOverrideParams::default())
+                        .await
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                        })?;
+                    let params = SetDeviceMetricsOverrideParams::builder()
+                        .width(0)
+                        .height(0)
+                        .device_scale_factor(0.0)
+                        .mobile(false)
+                        .screen_width(0)
+                        .screen_height(0)
+                        .build()
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!(
+                                "Emulation.setDeviceMetricsOverride reset params: {err}"
+                            ),
+                        })?;
+                    page.execute(params)
+                        .await
+                        .map_err(|err| A11yError::CdpAxtreeFailed {
+                            detail: format!("Emulation.setDeviceMetricsOverride reset: {err}"),
+                        })?;
                 }
                 ctx.forget_viewport_metrics();
             }

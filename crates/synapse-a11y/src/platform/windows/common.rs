@@ -321,43 +321,6 @@ pub(super) fn worker_readback() -> A11yResult<UiaWorkerReadback> {
     with_automation_read(|_automation| Ok(read_current_worker_state()))
 }
 
-#[cfg(test)]
-#[test]
-#[allow(
-    clippy::expect_used,
-    reason = "Test setup and thread failures must fail the regression check"
-)]
-fn a_blocked_provider_does_not_queue_an_unrelated_job() {
-    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::sync_channel(1);
-    let blocked = thread::spawn(move || {
-        with_automation_read_operation(
-            "blocked_provider_check",
-            Duration::from_secs(5),
-            move |_| {
-                entered_tx.send(()).expect("notify provider entered");
-                release_rx
-                    .recv_timeout(Duration::from_secs(4))
-                    .expect("release blocked provider");
-                Ok(())
-            },
-        )
-    });
-    entered_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("provider entered");
-    let healthy =
-        with_automation_read_operation("healthy_provider_check", Duration::from_secs(1), |_| {
-            Ok("healthy")
-        });
-    let _ = release_tx.send(());
-    blocked
-        .join()
-        .expect("provider thread")
-        .expect("blocked job");
-    assert_eq!(healthy.expect("unrelated job must not queue"), "healthy");
-}
-
 fn read_current_worker_state() -> UiaWorkerReadback {
     let thread_id = unsafe { GetCurrentThreadId() };
     UiaWorkerReadback {

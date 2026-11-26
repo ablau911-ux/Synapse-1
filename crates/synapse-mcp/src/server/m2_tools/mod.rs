@@ -4968,8 +4968,10 @@ fn verify_captured_action_delta(
     // Ignore pixels for comparison unless both captures produced a bitmap,
     // while preserving the actual captures and errors in the readback.
     let unchanged = if before.pixel.bitmap_sha256.is_none() || after.pixel.bitmap_sha256.is_none() {
-        let mut comparable_before = before.clone();
-        comparable_before.pixel = after.pixel.clone();
+        let comparable_before = ClickDeltaSignature {
+            pixel: after.pixel.clone(),
+            ..before.clone()
+        };
         comparable_before == after
     } else {
         before == after

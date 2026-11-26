@@ -13203,6 +13203,21 @@ function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
     return;
   }
   enqueuePersistedBackgroundMutation("emulationShimTeardown", async () => {
+    // #336: by the time this runs (serialized behind any queued set), a newer set
+    // may have re-attached the debugger and re-applied an override on this tab. Only
+    // an unattached tab has lost its override, so re-check reality via getTargets
+    // right before removing anything; if a debugger is attached again, do nothing --
+    // a genuinely stale domain is reclaimed by a later reconcile once the tab is
+    // unattached. (This runs atomically w.r.t. sets, so the check cannot go stale
+    // mid-teardown.)
+    try {
+      if ((await debuggerAttachmentReadback(tabId)).attached) {
+        return;
+      }
+    } catch (error) {
+      console.warn(`Synapse emulation shim teardown readback failed for tab ${tabId}: ${errorMessage(error)}`);
+      return;
+    }
     let changed = false;
     for (const domain of domains) {
       const wiring = EMULATION_DOMAIN_WIRING[domain];

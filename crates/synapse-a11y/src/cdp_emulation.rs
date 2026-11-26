@@ -687,13 +687,18 @@ pub async fn cdp_set_network_conditions(
     )
     .await?;
     let readback = network_conditions_readback(endpoint, target_id).await?;
-    // Durability probe. Only `offline:true` is observable at all — `navigator.onLine`.
-    // A throttle-only request (`offline:false`) leaves nothing in the readback that
-    // can prove survival (`downlink`/`rtt` are weakly-related estimates, not the set
-    // values), so it is not probed and answers as before. The readback above already
-    // opened and closed a connection — the disconnect that makes Chrome drop the
-    // override — so this reads the post-disconnect truth through the slot's session
-    // and never answers ok for an override that is already gone.
+    // Durability check. The readback above already opened and closed a connection
+    // — the disconnect that makes Chrome drop the target's whole network-conditions
+    // override (offline flag and throttle alike) — so answer ok only when the
+    // override is proven still in force after it.
+    //
+    // `offline:true` is provable: `navigator.onLine` is page-visible, so probe it
+    // through the slot's own session. A throttle-only request (`offline:false`) is
+    // not: nothing page-visible reflects the throttle, and the CDP Network domain
+    // has no getter for the current emulated conditions (only enable / disable /
+    // emulateNetworkConditions), so survival cannot be proven at all — fail with
+    // the same clear error worded for throttling. Either way the recorded domain
+    // is forgotten so nothing is left behind.
     if requested.offline {
         let survived = match lookup_live_emulation_slot(endpoint, target_id) {
             Some(slot) => network_offline_override_survived(&slot).await?,
@@ -714,6 +719,16 @@ pub async fn cdp_set_network_conditions(
                     .to_owned(),
             });
         }
+    } else {
+        let _ =
+            run_network_conditions_command(endpoint, target_id, NetworkConditionsCommand::Reset)
+                .await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "raw-CDP network throttling cannot be held across tool calls: Chrome \
+                     clears a target's network conditions when another DevTools session of \
+                     the target closes; use a normal Chrome bridge tab"
+                .to_owned(),
+        });
     }
     Ok(CdpNetworkConditionsResult {
         endpoint: endpoint.to_owned(),

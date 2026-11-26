@@ -1947,7 +1947,7 @@ async fn run_network_conditions_command(
     command: NetworkConditionsCommand,
 ) -> A11yResult<()> {
     use chromiumoxide::cdp::browser_protocol::network::{
-        ConnectionType, EmulateNetworkConditionsParams,
+        ConnectionType, EmulateNetworkConditionsParams, EnableParams as NetworkEnableParams,
     };
 
     let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
@@ -1985,6 +1985,17 @@ async fn run_network_conditions_command(
                     detail: format!("Network.emulateNetworkConditions reset params: {err}"),
                 })?,
         };
+        // Unlike the `Emulation.*` overrides, a network condition only persists
+        // while the session that set it keeps the Network domain enabled; without
+        // this, Chrome applies the condition but reverts it on the next session
+        // attach (e.g. the very next readback or evaluate), so it never holds. The
+        // slot session stays open, so enabling here keeps the condition live until
+        // reset, target loss or the daemon drain.
+        page.execute(NetworkEnableParams::default())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Network.enable for network conditions: {err}"),
+            })?;
         page.execute(params)
             .await
             .map_err(|err| A11yError::CdpAxtreeFailed {

@@ -2646,7 +2646,14 @@ async fn reload_cdp_target_with_new_document_readback(
     .await
 }
 
-async fn cdp_target_present_inventory(endpoint: &str, target_id: &str) -> A11yResult<bool> {
+/// Reports whether `target_id` is still present in the browser's live target
+/// inventory at `endpoint` (`Target.getTargets`). A sure absence proves a
+/// target closed itself (#329).
+///
+/// # Errors
+///
+/// `A11Y_CDP_*` if the target inventory cannot be read.
+pub async fn cdp_target_present_inventory(endpoint: &str, target_id: &str) -> A11yResult<bool> {
     let targets = crate::cdp::cdp_list_targets(endpoint).await?;
     Ok(targets.iter().any(|target| target.target_id == target_id))
 }

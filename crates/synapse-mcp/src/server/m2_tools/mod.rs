@@ -4349,14 +4349,23 @@ impl SynapseService {
         let verify_timeout_ms = params.verify_timeout_ms;
         let mut response =
             act_press_cdp_target(&endpoint, &cdp_target_id, params, boundary).await?;
+        // #329: when the press already reports its own target closed (the
+        // key-down closed it, so the key-up was unnecessary) there is nothing to
+        // read back; keep the target-closed answer whatever verify mode was
+        // asked. Mirrors the PostKeyDelivery::TargetWindowClosed branch on the
+        // PostMessage tier.
+        if response.key_up_not_posted_window_closed.is_some() {
+            return Ok(response);
+        }
         if let Some(before) = before {
             tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
             // The key events were dispatched before this read-back.
-            response.postcondition = self
+            match self
                 .capture_cdp_keyboard_delta_signature(&endpoint, &cdp_target_id)
                 .await
-                .and_then(|after| {
-                    verify_keyboard_delta_signature(
+            {
+                Ok(after) => {
+                    response.postcondition = verify_keyboard_delta_signature(
                         "act_press",
                         "cdp_active_element_value_or_selection",
                         verify_timeout_ms,
@@ -4364,8 +4373,31 @@ impl SynapseService {
                         after,
                         "observed CDP target active-element value/selection change after Input.dispatchKeyEvent delivery",
                     )
-                })
-                .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
+                    .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
+                }
+                Err(error) => {
+                    // #329: a delivered press whose target has since closed makes
+                    // this after-readback fail because the target is gone — the
+                    // same delivered-and-target-closed answer, not a failure. A
+                    // readback that fails while the target still exists stays
+                    // today's failure.
+                    if matches!(
+                        synapse_a11y::cdp_target_present_inventory(&endpoint, &cdp_target_id).await,
+                        Ok(false)
+                    ) {
+                        response.postcondition = postcondition_target_window_closed(
+                            "act_press",
+                            "key-down",
+                            "no post-delivery readback: the raw-CDP target is gone",
+                        );
+                        response.key_up_not_posted_window_closed = Some(format!(
+                            "raw-CDP target {cdp_target_id:?} closed after a delivered key press; active-element readback skipped"
+                        ));
+                    } else {
+                        return Err(crate::m2::error_after_earlier_steps(error, 1));
+                    }
+                }
+            }
         }
         Ok(response)
     }

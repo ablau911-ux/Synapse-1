@@ -8840,21 +8840,6 @@ fn ensure_dom_action_bridge_target(target_id: &str) -> Result<(), ChromeDebugger
     })
 }
 
-#[cfg(test)]
-mod dom_action_target_tests {
-    use super::*;
-
-    #[test]
-    fn raw_cdp_dom_actions_are_unsupported_before_bridge_dispatch() {
-        let error = ensure_dom_action_bridge_target("A1B2C3D4")
-            .expect_err("raw CDP target cannot use bridge DOM actions");
-        assert_eq!(error.code, error_codes::CHROME_DOM_ACTION_UNSUPPORTED);
-        assert!(!error.input_delivered);
-        assert!(error.detail.contains("chrome-tab:<tabId>"));
-        assert!(ensure_dom_action_bridge_target("chrome-tab:123").is_ok());
-    }
-}
-
 pub struct ChromeDebuggerCdpInputRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,

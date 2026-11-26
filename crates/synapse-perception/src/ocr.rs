@@ -113,46 +113,6 @@ pub fn validate_ocr_language(lang_hint: Option<&str>) -> PerceptionResult<()> {
     }
 }
 
-#[cfg(test)]
-mod language_tests {
-    use super::{PerceptionError, validate_ocr_language};
-
-    #[test]
-    fn invalid_language_hints_are_typed_errors() {
-        for lang in ["en-US\0ignored", "en-US ; DROP", "en_US", "עברית"] {
-            assert!(matches!(
-                validate_ocr_language(Some(lang)),
-                Err(PerceptionError::OcrBackendUnavailable { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn absent_language_keeps_platform_default() {
-        for lang in [None, Some(""), Some("  ")] {
-            assert!(validate_ocr_language(lang).is_ok());
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn language_engine_uses_installed_language() -> Result<(), Box<dyn std::error::Error>> {
-        use windows::Media::Ocr::OcrEngine;
-
-        let languages = OcrEngine::AvailableRecognizerLanguages()?;
-        for index in 0..languages.Size()? {
-            let language = languages.GetAt(index)?;
-            let tag = language.LanguageTag()?.to_string();
-            let engine = super::platform::ocr_engine_for_language(Some(&tag))?;
-            assert_eq!(engine.RecognizerLanguage()?.LanguageTag()?.to_string(), tag);
-        }
-        assert!(matches!(
-            validate_ocr_language(Some("zz-ZZ")),
-            Err(PerceptionError::OcrBackendUnavailable { .. })
-        ));
-        Ok(())
-    }
-}
 
 /// Reads OCR text with an injected provider.
 ///

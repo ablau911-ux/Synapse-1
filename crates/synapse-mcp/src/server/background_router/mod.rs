@@ -10178,16 +10178,19 @@ fn target_act_delivery_state_from_result(
     if delegated_tool == "synapse_a11y.cdp_click_node" && ok && status == TARGET_ACT_STATUS_OK {
         return "delivered_unverified";
     }
-    // Stroke delivery alone does not verify the app-specific DOM/canvas effect.
-    if delegated_tool == "act_stroke"
-        && ok
-        && status == TARGET_ACT_STATUS_OK
-        && result
+    // The stroke signature can change from cursor movement alone. It carries
+    // no independent pixel evidence, so never promote it to pixel-verified.
+    if delegated_tool == "act_stroke" && ok && status == TARGET_ACT_STATUS_OK {
+        return if result
             .pointer("/postcondition/observed_delta")
             .and_then(Value::as_bool)
-            != Some(true)
-    {
-        return "delivered_unverified";
+            == Some(true)
+            && !target_act_result_reports_target_closed(result)
+        {
+            "delivered_and_verified"
+        } else {
+            "delivered_unverified"
+        };
     }
     // #341: an action whose target closed on the press ran no post-dispatch
     // readback — the target is gone — so its answer carries

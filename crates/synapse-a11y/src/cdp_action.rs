@@ -268,7 +268,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
 
-const CDP_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// Shared deadline for CDP input connection, preparation and command waits.
+pub const CDP_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where a CDP action landed, in viewport CSS coordinates (diagnostics).
 #[derive(Copy, Clone, Debug, PartialEq, Serialize)]
@@ -1624,7 +1625,11 @@ pub async fn cdp_mouse_stroke_target(
     let button = button.map_or(MouseButton::None, CdpMouseButton::to_cdp);
     let dispatched_target_id = with_target_page(endpoint, target_id, |page| async move {
         // Refuse before the raw dispatch is spawned when the page is hidden (#334).
-        ensure_cdp_page_visible(&page).await?;
+        tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, ensure_cdp_page_visible(&page))
+            .await
+            .map_err(|_| A11yError::CdpAttachFailed {
+                detail: "CDP stroke visibility preflight timed out after 15 s".to_owned(),
+            })??;
         let dispatched_target_id = page.target_id().inner().clone();
         Ok(dispatched_target_id)
     })
@@ -1634,15 +1639,26 @@ pub async fn cdp_mouse_stroke_target(
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut terminal_guard = RawCdpInputTaskTerminalGuard::new();
-        let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-        let result = if crate::cdp_network::durable_browser_mutation_owners_enabled() {
-            dispatch_cdp_mouse_stroke_raw(&owned_endpoint, &owned_target_id, &points, button).await
-        } else {
-            Err(A11yError::CdpAttachFailed {
-                detail: "durable browser mutation owners are disabled by operator panic; refusing raw CDP mouse stroke"
-                    .to_owned(),
-            })
-        };
+        // Bound queueing before any input or persisted owner is created, but
+        // still publish the terminal error through this task's result channel.
+        let result = async {
+            let _operation_guard = tokio::time::timeout(
+                CDP_INPUT_COMMAND_TIMEOUT,
+                crate::cdp_network::durable_browser_mutation_operation_guard(),
+            )
+            .await
+            .map_err(|_| A11yError::CdpAttachFailed {
+                detail: "CDP stroke browser-mutation operation lock timed out after 15 s".to_owned(),
+            })?;
+            if crate::cdp_network::durable_browser_mutation_owners_enabled() {
+                dispatch_cdp_mouse_stroke_raw(&owned_endpoint, &owned_target_id, &points, button).await
+            } else {
+                Err(A11yError::CdpAttachFailed {
+                    detail: "durable browser mutation owners are disabled by operator panic; refusing raw CDP mouse stroke"
+                        .to_owned(),
+                })
+            }
+        }.await;
         // Every normal return from the dispatcher either observed the release
         // acknowledgement or incremented the unresolved-owner counter itself.
         terminal_guard.mark_terminal_accounted();
@@ -5834,12 +5850,12 @@ async fn settle_failed_release_after_press(
     closed_by: &str,
     context: &str,
 ) -> A11yResult<String> {
-    let target_absent = delivered
-        && primary_error.is_none()
-        && matches!(
-            cdp_target_present_inventory(endpoint, target_id).await,
-            Ok(false)
-        );
+    let inventory = if delivered && primary_error.is_none() {
+        Some(cdp_target_present_inventory(endpoint, target_id).await)
+    } else {
+        None
+    };
+    let target_absent = matches!(&inventory, Some(Ok(false)));
     if target_absent {
         resolve_persisted_cdp_mutation_owner(owner).map(|()| {
             format!(
@@ -5847,6 +5863,12 @@ async fn settle_failed_release_after_press(
             )
         })
     } else {
+        let release_detail = match inventory {
+            Some(Err(error)) => {
+                format!("{release_detail}; target absence inventory inconclusive: {error}")
+            }
+            _ => release_detail,
+        };
         Err(record_unresolved_input_release_detail(
             primary_error,
             release_detail,
@@ -5954,8 +5976,13 @@ async fn send_raw_cdp_input_payload(
                 CDP_INPUT_COMMAND_TIMEOUT.as_millis()
             ),
         }),
-    }?;
-    await_raw_cdp_command_ack(socket, command_id, stage, sample_index).await
+    }
+    // Once a frame is handed to the socket, a send/acknowledgement failure
+    // cannot prove that Chrome received no input, including on the first event.
+    .map_err(A11yError::after_input)?;
+    await_raw_cdp_command_ack(socket, command_id, stage, sample_index)
+        .await
+        .map_err(A11yError::after_input)
 }
 
 async fn await_raw_cdp_command_ack(
@@ -7047,17 +7074,25 @@ where
             detail: "CDP target id must not be empty".to_owned(),
         });
     }
-    let (browser, mut handler) =
-        Browser::connect(endpoint)
-            .await
-            .map_err(|err| A11yError::CdpAttachFailed {
-                detail: format!("connect {endpoint}: {err}"),
-            })?;
+    let crate::cdp::CdpAttachment {
+        browser,
+        mut handler,
+        ..
+    } = crate::cdp::attach_chromiumoxide(endpoint).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let result = async {
-        let page = get_target_page_with_discovery(&browser, target_id).await?;
-        prime_target_page_for_input(&page, target_id).await?;
+        // Only preparation is deadline-bound here. Never cancel an action
+        // which may already be emitting input; it owns its release/settlement.
+        let page = tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, async {
+            let page = get_target_page_with_discovery(&browser, target_id).await?;
+            prime_target_page_for_input(&page, target_id).await?;
+            Ok::<_, A11yError>(page)
+        })
+        .await
+        .map_err(|_| A11yError::CdpAttachFailed {
+            detail: format!("CDP target {target_id:?} lookup/DOM preparation timed out after 15 s"),
+        })??;
         action(page).await
     }
     .await;

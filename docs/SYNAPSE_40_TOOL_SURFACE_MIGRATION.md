@@ -51,7 +51,7 @@ Removed status means removed from the normal public surface. It does not always 
 | `read_text` | `text` |
 | `screenshot` | `capture`, `gif`, `record`, `clip_overview`, `clip_frames`, `clip_frame`, `clip_diff` |
 | `target` | `get`, `list`, `set`, `clear`, `claim`, `status`, `adopt`, `release` |
-| `act` | `invoke`, `foreground` |
+| `act` | `invoke`, `foreground`, `lease_acquire`, `lease_status`, `lease_release` |
 | `shell` | `run`, `start`, `status`, `cancel` |
 | `process` | `list`, `launch`, `history` |
 | `browser_tabs` | `list`, `select`, `new`, `close` |
@@ -107,6 +107,58 @@ args: { "operation": "set", "target": { "kind": "window", "window_hwnd": 123456 
 tool: act
 args: { "operation": "invoke", "action": { "verb": "click", "element_id": "known-element" } }
 ```
+
+### Mouse strokes and drags (#341)
+
+Use public `act` with `action.verb=stroke` and nested `action.stroke` parameters. The facade delegates to the existing `act_stroke` implementation, including its validation, target-claim checks, audit, operator-panic checks, and lane guards. A bound session target is required; an absent target never selects the human foreground implicitly. `act_stroke` itself remains hidden under every scoped HTTP profile, and the public surface remains 40 tools.
+
+On a bound raw-CDP target, an explicit `stroke.path` with `backend=auto` or `software` dispatches background `Input.dispatchMouseEvent` samples under `normal_agent`, without a foreground input lease or break_glass. Path coordinates are viewport CSS pixels. Omit `stroke.button` for movement; set it to `left`, `right`, or `middle` for a drag. The raw-CDP path does not support modifiers or `verify_delta=true` and does not fall back to the real cursor if the target or endpoint is unavailable. Read the target DOM/canvas separately to verify the effect. The response reports `delegated_tool=act_stroke`, `backend_tier_used=cdp`, `required_foreground=false`, and `delivery_state=delivered_unverified` when no effect readback ran, including the #341 closed-target outcome.
+
+For a drag from element A to element B, first observe both elements in the bound target and use their current viewport centers in an explicit path. CDP element IDs in `stroke.from`/`stroke.to` are not supported for a drag; the existing element-target form supports pointer aim only, with no button or starting point. The following public `act` arguments assume A's center is `(120, 160)` and B's center is `(420, 160)`:
+
+```json
+{
+  "operation": "invoke",
+  "action": {
+    "verb": "stroke",
+    "stroke": {
+      "path": {
+        "kind": "line",
+        "from": { "x": 120, "y": 160 },
+        "to": { "x": 420, "y": 160 }
+      },
+      "button": "left",
+      "duration_or_speed": { "kind": "duration_ms", "duration_ms": 500 },
+      "backend": "auto"
+    }
+  }
+}
+```
+
+A pure mouse-move path uses the same route without a button:
+
+```json
+{
+  "operation": "invoke",
+  "action": {
+    "verb": "stroke",
+    "stroke": {
+      "path": {
+        "kind": "polyline",
+        "points": [
+          { "x": 120, "y": 160 },
+          { "x": 260, "y": 220 },
+          { "x": 420, "y": 160 }
+        ]
+      },
+      "duration_or_speed": { "kind": "duration_ms", "duration_ms": 500 },
+      "backend": "auto"
+    }
+  }
+}
+```
+
+Native real-cursor strokes use screen coordinates. Real-cursor and hardware delivery require `break_glass`/`full_capability` plus the foreground input lease. Prefer `act operation=foreground` with the same `action` and a non-empty `reason` to acquire the lease, escalate, run the stroke, and restore the profile/lease through the existing audited transaction. Recording and CDP element aim retain their existing handling.
 
 Already-open Chrome tab workflow:
 

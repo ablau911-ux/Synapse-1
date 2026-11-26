@@ -89,7 +89,7 @@ pub use stroke::{
     act_stroke_validation_failure_details, validate_act_stroke_params,
 };
 pub(crate) use stroke::{
-    ActStrokePlan, act_stroke_cdp_target, act_stroke_with_handle_and_boundary,
+    ActStrokePlan, ActStrokeTarget, act_stroke_cdp_target, act_stroke_with_handle_and_boundary,
 };
 pub use type_text::action_from_type_params;
 pub use type_text::{ActTypeParams, ActTypeResponse, TypeBackend};
@@ -1213,6 +1213,9 @@ fn validate_foreground_input_lease_ttl_ms(
 
 pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
     match error {
+        ActionError::AfterInput { error, .. } => {
+            error_after_earlier_steps(action_error_to_mcp(error), 1)
+        }
         ActionError::ForegroundLeaseBusy {
             detail,
             holder_session_id,

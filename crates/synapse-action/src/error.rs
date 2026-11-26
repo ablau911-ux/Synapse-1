@@ -62,6 +62,14 @@ pub enum ActionError {
     SafetyReleaseAllFired { detail: String },
     #[error("safety operator hotkey fired: {detail}")]
     SafetyOperatorHotkeyFired { detail: String },
+    /// Preserves the original error while recording that input was already
+    /// delivered. Mirrors `A11yError`'s delivery marker across the emitter seam.
+    #[error("{error}")]
+    AfterInput {
+        code: &'static str,
+        retry_after_ms: Option<u64>,
+        error: Box<Self>,
+    },
 }
 
 impl ActionError {
@@ -95,6 +103,7 @@ impl ActionError {
             Self::StuckKeyAutoReleased { .. } => error_codes::STUCK_KEY_AUTO_RELEASED,
             Self::SafetyReleaseAllFired { .. } => error_codes::SAFETY_RELEASE_ALL_FIRED,
             Self::SafetyOperatorHotkeyFired { .. } => error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            Self::AfterInput { code, .. } => code,
         }
     }
 
@@ -122,6 +131,7 @@ impl ActionError {
             | Self::StuckKeyAutoReleased { detail }
             | Self::SafetyReleaseAllFired { detail }
             | Self::SafetyOperatorHotkeyFired { detail } => detail,
+            Self::AfterInput { error, .. } => error.detail(),
         }
     }
 
@@ -175,6 +185,20 @@ impl ActionError {
             Self::StuckKeyAutoReleased { .. } => Self::StuckKeyAutoReleased { detail },
             Self::SafetyReleaseAllFired { .. } => Self::SafetyReleaseAllFired { detail },
             Self::SafetyOperatorHotkeyFired { .. } => Self::SafetyOperatorHotkeyFired { detail },
+            Self::AfterInput { error, .. } => error.with_detail(detail).after_input(),
+        }
+    }
+
+    /// Records delivery without changing the error code, detail, or retry hint.
+    #[must_use]
+    pub fn after_input(self) -> Self {
+        if matches!(self, Self::AfterInput { .. }) {
+            return self;
+        }
+        Self::AfterInput {
+            code: self.code(),
+            retry_after_ms: self.retry_after_ms(),
+            error: Box::new(self),
         }
     }
 
@@ -201,6 +225,7 @@ impl ActionError {
     pub const fn refused_before_delivery(&self, earlier_steps_done: usize) -> Option<bool> {
         match self {
             _ if earlier_steps_done > 0 => Some(false),
+            Self::AfterInput { .. } => Some(false),
             Self::ForegroundLost {
                 before_any_delivery,
                 ..
@@ -214,6 +239,7 @@ impl ActionError {
         match self {
             Self::RateLimited { retry_after_ms, .. }
             | Self::ForegroundLeaseBusy { retry_after_ms, .. } => Some(*retry_after_ms),
+            Self::AfterInput { retry_after_ms, .. } => *retry_after_ms,
             Self::QueueFull { .. }
             | Self::BackendUnavailable { .. }
             | Self::ForegroundActivationRefused { .. }

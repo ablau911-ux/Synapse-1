@@ -4285,7 +4285,12 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
             "observe operation=current",
             "target operation=set",
         ],
-        "act_stroke" | "act_pad" => vec![
+        "act_stroke" => vec![
+            "target operation=set",
+            "act operation=invoke action.verb=stroke action.stroke=<ActStrokeParams> (explicit raw-CDP path: normal profile, no foreground lease)",
+            "act operation=foreground action.verb=stroke action.stroke=<ActStrokeParams> reason=<why real cursor input is required> (native/hardware)",
+        ],
+        "act_pad" => vec![
             "target operation=set",
             "act operation=lease_acquire",
             "profile operation=set profile=break_glass",

@@ -47,8 +47,6 @@ const STROKE_DETAIL_TARGET_UNRESOLVED: &str = "STROKE_TARGET_UNRESOLVED";
 const CDP_STROKE_MIN_DISPATCH_INTERVAL_MS: f64 = 8.0;
 #[cfg(windows)]
 const CDP_STROKE_MAX_DISPATCH_POINTS: usize = 256;
-#[cfg(windows)]
-const CDP_STROKE_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -285,20 +283,13 @@ pub(crate) async fn act_stroke_cdp_target(
         let points = cdp_dispatch_points_from_stroke_plan(&stroke_plan);
         let button = cdp_mouse_button(params.button)?;
         boundary.ensure("immediately_before_cdp_mouse_stroke_target")?;
-        let dispatch = tokio::time::timeout(
-            CDP_STROKE_ROUTE_TIMEOUT,
-            synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button),
-        )
+        // Await the owned dispatch through its terminal verdict, including
+        // button release/owner resolution. A route-level timeout would drop
+        // this receiver while the task continues sending input. The raw
+        // transport already bounds connection, send and acknowledgement waits;
+        // their delays can accumulate beyond the validated stroke duration.
+        let dispatch = synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button)
         .await
-        .map_err(|_| {
-            mcp_error(
-                error_codes::A11Y_CDP_AXTREE_FAILED,
-                format!(
-                    "act_stroke CDP Input.dispatchMouseEvent route timed out after {} ms for target {cdp_target_id:?}",
-                    CDP_STROKE_ROUTE_TIMEOUT.as_millis()
-                ),
-            )
-        })?
         .map_err(|error| {
             crate::m2::error_after_a11y_input(
                 mcp_error(
@@ -892,7 +883,7 @@ async fn execute_with_modifiers(
             let _release_result =
                 release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup")
                     .await;
-            return Err(error);
+            return Err(crate::m2::error_after_earlier_steps(error, pressed.len()));
         }
         if let Err(error) = handle
             .execute(Action::KeyDown {
@@ -915,7 +906,7 @@ async fn execute_with_modifiers(
     if let Err(error) = boundary.ensure("immediately_before_foreground_stroke_dispatch") {
         let _release_result =
             release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup").await;
-        return Err(error);
+        return Err(crate::m2::error_after_earlier_steps(error, pressed.len()));
     }
     let stroke_result = handle.execute(stroke_action).await;
     let boundary_error = boundary
@@ -946,7 +937,10 @@ async fn execute_with_modifiers(
                 "operator panic superseded a stroke and best-effort modifier cleanup failed"
             );
         }
-        return Err(error);
+        return Err(crate::m2::error_after_earlier_steps(
+            error,
+            pressed.len() + 1,
+        ));
     }
     if let Err(error) = release_result {
         // The modifier key-downs and the stroke ran before this release.
@@ -997,8 +991,12 @@ async fn execute_cdp_aim(
             cdp_aim.backend_node_id,
         )
         .await
-        .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-        boundary.ensure("after_cdp_aim_node")?;
+        .map_err(|err| {
+            crate::m2::error_after_a11y_input(mcp_error(err.code(), err.to_string()), &err)
+        })?;
+        boundary
+            .ensure("after_cdp_aim_node")
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_AIM_MOVED",
             element_id = %cdp_aim.element_id,
@@ -1387,6 +1385,9 @@ fn stroke_error_to_mcp(error: &StrokeError) -> ErrorData {
 }
 
 fn action_error_to_mcp(error: &ActionError) -> ErrorData {
+    if let ActionError::AfterInput { error, .. } = error {
+        return crate::m2::error_after_earlier_steps(action_error_to_mcp(error), 1);
+    }
     let mut data = json!({
         "code": error.code(),
         "detail": error.detail(),
@@ -1405,8 +1406,8 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
         data["requesting_session_id"] = json!(requesting_session_id);
         data["retry_after_ms"] = json!(retry_after_ms);
     }
-    if matches!(error, ActionError::ForegroundLost { .. }) {
-        data["refused_before_delivery"] = json!(error.refused_before_any_delivery());
+    if let Some(refused) = error.refused_before_delivery(0) {
+        data["refused_before_delivery"] = json!(refused);
     }
     ErrorData::new(ErrorCode(-32099), error.to_string(), Some(data))
 }

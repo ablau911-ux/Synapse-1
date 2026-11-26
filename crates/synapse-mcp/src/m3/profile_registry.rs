@@ -811,7 +811,11 @@ pub fn required_permissions_disable(_params: &ProfileRegistryDisableParams) -> R
 
 #[must_use]
 pub fn required_permissions_export(_params: &ProfileRegistryExportParams) -> RequiredPermissions {
-    required([Permission::ReadProfile, Permission::ReadStorage])
+    required([
+        Permission::ReadProfile,
+        Permission::ReadStorage,
+        Permission::WriteStorage,
+    ])
 }
 
 #[must_use]

@@ -200,6 +200,10 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let upload = validate_browser_file_upload_params(&params.0)?;
+        if let Some(element_id) = upload.element_id.as_deref() {
+            self.ensure_element_action_target(TOOL, element_id, &request_context)
+                .await?;
+        }
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": params.0.window_hwnd,

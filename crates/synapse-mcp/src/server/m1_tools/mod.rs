@@ -3181,6 +3181,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserEvaluateResponse>, ErrorData> {
         const TOOL: &str = "browser_evaluate";
+        if let Some(element_id) = params.0.element_id.as_deref() {
+            self.ensure_element_action_target(TOOL, element_id, &request_context)
+                .await?;
+        }
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -4469,6 +4473,8 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserScrollIntoViewResponse>, ErrorData> {
         const TOOL: &str = "browser_scroll_into_view";
+        self.ensure_element_action_target(TOOL, &params.0.element_id, &request_context)
+            .await?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -15479,7 +15485,9 @@ fn parse_browser_evaluate_element(element_id: &str) -> Result<(i64, String), Err
     Ok((backend, target))
 }
 
-fn parse_chrome_bridge_element_target(element_id: &str) -> Result<Option<String>, ErrorData> {
+pub(super) fn parse_chrome_bridge_element_target(
+    element_id: &str,
+) -> Result<Option<String>, ErrorData> {
     let trimmed = element_id.trim();
     let Some(after_prefix) = trimmed.strip_prefix("chrome-tab:") else {
         return Ok(None);

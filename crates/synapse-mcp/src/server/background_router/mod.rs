@@ -2279,6 +2279,12 @@ impl SynapseService {
     ) -> Result<Json<TargetActResponse>, ErrorData> {
         let params = params.0;
         let verb = params.verb.as_str().to_owned();
+        if !matches!(verb.as_str(), "read" | "screenshot")
+            && let Some(element_id) = params.element_id.as_deref()
+        {
+            self.ensure_element_action_target("target_act", element_id, &request_context)
+                .await?;
+        }
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "target_act",
@@ -4799,6 +4805,10 @@ async fn target_act_save_impl(
     params: &TargetActParams,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<TargetActSaveResponse, ErrorData> {
+    service.require_m3_permissions(
+        "target_act save",
+        &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+    )?;
     let started = Instant::now();
     target_act_validate_save_params(params)?;
     let session_id = target_act_session_id(request_context, "save")?;
@@ -7818,7 +7828,7 @@ fn target_act_parse_observed_element_id(
     }
 }
 
-fn target_act_click_element_id_can_be_dom_id(value: &str) -> bool {
+pub(super) fn target_act_click_element_id_can_be_dom_id(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || value.starts_with("0x") || value.starts_with("-0x") {
         return false;

@@ -355,7 +355,7 @@ pub fn required_permissions_decide(params: &ProfileAuthoringDecideParams) -> Req
 
 #[must_use]
 pub fn required_permissions_export(_params: &ProfileAuthoringExportParams) -> RequiredPermissions {
-    required([Permission::ReadStorage])
+    required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
 #[must_use]

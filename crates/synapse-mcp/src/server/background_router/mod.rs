@@ -6939,7 +6939,7 @@ async fn target_act_raw_cdp_click_dispatch(
     };
     let modifiers = target_act_click_modifiers_cdp_mask(&params.modifiers);
     ensure_target_act_operator_panic_boundary("click_before_mouse_dispatch")?;
-    let point = synapse_a11y::cdp_click_node(
+    let outcome = synapse_a11y::cdp_click_node(
         endpoint,
         "",
         Some(&element.target_id),
@@ -6961,11 +6961,16 @@ async fn target_act_raw_cdp_click_dispatch(
             &error,
         )
     })?;
+    // #341: when the mouse-down closed its own target the release could not be
+    // acknowledged; the press was delivered and the target is confirmed gone,
+    // so the tool answers ok and states the fact (mirrors the key lane's
+    // key_up_not_posted_window_closed).
     Ok(json!({
         "ok": true,
         "action": action,
         "target_id": element.target_id,
-        "point": point,
+        "point": outcome.point,
+        "release_not_sent_target_closed": outcome.target_closed,
         "resolved_by": element.resolved_by,
         "backend_node_id": element.backend_node_id,
         "element_id": element.element_id,

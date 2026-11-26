@@ -305,6 +305,11 @@ pub struct CdpTouchTapResult {
     pub ontouchstart_available: bool,
     pub touch_emulation_detected: bool,
     pub non_touch_fallback: String,
+    /// Set when the touch-start closed the target so the touchEnd could not be
+    /// acknowledged; the tap was delivered and the target is confirmed gone
+    /// (#341). Absent for an ordinary delivered tap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_not_sent_target_closed: Option<String>,
 }
 
 /// One CDP wheel event in viewport CSS pixels.
@@ -778,8 +783,19 @@ impl CdpMouseButton {
     }
 }
 
+/// Outcome of a raw-CDP node click: the viewport point clicked and, when the
+/// mouse-down closed the target so the release could not be acknowledged, a
+/// short detail naming the closed target (#341). `target_closed` is `None` for
+/// an ordinary delivered click.
+#[derive(Clone, Debug)]
+pub struct CdpClickOutcome {
+    pub point: CdpActionPoint,
+    pub target_closed: Option<String>,
+}
+
 /// Clicks a web node `click_count` times with `button`, after scrolling it into
-/// view. Returns the viewport point clicked.
+/// view. Returns the viewport point clicked and, when the mouse-down closed its
+/// own target (#341), a closed-target detail.
 ///
 /// # Errors
 ///
@@ -793,7 +809,7 @@ pub async fn cdp_click_node(
     button: CdpMouseButton,
     click_count: i64,
     modifiers: i64,
-) -> A11yResult<CdpActionPoint> {
+) -> A11yResult<CdpClickOutcome> {
     let endpoint = endpoint.to_owned();
     let page_title_hint = page_title_hint.to_owned();
     let target_id_hint = target_id_hint.map(ToOwned::to_owned);
@@ -820,7 +836,7 @@ async fn cdp_click_node_owned(
     button: CdpMouseButton,
     click_count: i64,
     modifiers: i64,
-) -> A11yResult<CdpActionPoint> {
+) -> A11yResult<CdpClickOutcome> {
     let input_endpoint = endpoint.to_owned();
     with_node_center(
         endpoint,
@@ -841,7 +857,7 @@ async fn cdp_click_node_owned(
             .await
             .map_err(|err| dispatch_err(&err))?;
             // The mouse move above was delivered input.
-            dispatch_mouse_click_on_page(
+            let target_closed = dispatch_mouse_click_on_page(
                 &input_endpoint,
                 &page,
                 center,
@@ -851,7 +867,10 @@ async fn cdp_click_node_owned(
             )
             .await
             .map_err(A11yError::after_input)?;
-            Ok(center)
+            Ok(CdpClickOutcome {
+                point: center,
+                target_closed,
+            })
         },
     )
     .await
@@ -5776,6 +5795,47 @@ fn record_unresolved_input_release(
     record_unresolved_input_release_detail(primary, release.to_string(), context)
 }
 
+/// Settles a raw-CDP input whose release acknowledgement failed after the
+/// press was delivered (#341, generalising the #329 key rule). When the press
+/// was delivered, no earlier dispatch error occurred, and Chrome confirms the
+/// target is gone, the press closed its own target: the persisted `owner` is
+/// resolved (no unresolved-owner count) and a short closed-target detail is
+/// returned. Otherwise the fail-closed owner is kept and the original
+/// unresolved-release error is returned — a live target, an inconclusive
+/// inventory, or an undelivered press is never reported as released. One owner
+/// for this decision across the key, click and touch lanes.
+#[allow(clippy::too_many_arguments)]
+async fn settle_failed_release_after_press(
+    endpoint: &str,
+    target_id: &str,
+    owner: &PersistedCdpMutationOwner,
+    delivered: bool,
+    primary_error: Option<A11yError>,
+    release_detail: String,
+    closed_by: &str,
+    context: &str,
+) -> A11yResult<String> {
+    let target_absent = delivered
+        && primary_error.is_none()
+        && matches!(
+            cdp_target_present_inventory(endpoint, target_id).await,
+            Ok(false)
+        );
+    if target_absent {
+        resolve_persisted_cdp_mutation_owner(owner).map(|()| {
+            format!(
+                "raw-CDP target {target_id:?} closed by its own {closed_by}; release not sent: {release_detail}"
+            )
+        })
+    } else {
+        Err(record_unresolved_input_release_detail(
+            primary_error,
+            release_detail,
+            context,
+        ))
+    }
+}
+
 fn record_unresolved_input_release_detail(
     primary: Option<A11yError>,
     release_detail: String,
@@ -6342,7 +6402,7 @@ async fn dispatch_mouse_click_on_page(
     button: MouseButton,
     click_count: i64,
     modifiers: i64,
-) -> A11yResult<()> {
+) -> A11yResult<Option<String>> {
     let owner = persist_cdp_mutation_owner(
         endpoint,
         page.target_id().inner(),
@@ -6376,15 +6436,25 @@ async fn dispatch_mouse_click_on_page(
         .map_err(|error| dispatch_err(&error));
     let delivered = press.is_ok() || release.is_ok();
     let result = match (press, release) {
-        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner),
+        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner).map(|()| None),
         (Err(press_error), Ok(_)) => {
             resolve_persisted_cdp_mutation_owner(&owner).and(Err(press_error))
         }
-        (press, Err(release_error)) => Err(record_unresolved_input_release(
+        // #341: a mouse-down that closed its own target leaves the mouseReleased
+        // acknowledgement unprovable; the shared helper confirms the target is
+        // gone and reports a delivered press instead of a held button.
+        (press, Err(release_error)) => settle_failed_release_after_press(
+            endpoint,
+            page.target_id().inner(),
+            &owner,
+            delivered,
             press.err(),
-            release_error,
+            release_error.to_string(),
+            "mouse-down",
             "mouse click release acknowledgement was not proven",
-        )),
+        )
+        .await
+        .map(Some),
     };
     after_input_if(result, delivered)
 }
@@ -6479,18 +6549,28 @@ async fn dispatch_touch_tap_on_page(
         .await
         .map_err(|error| dispatch_err(&error));
     let delivered = start.is_ok() || end.is_ok();
-    let settled = match (start, end) {
-        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner),
+    // #341: a touch-start that closed its own target leaves the touchEnd
+    // acknowledgement unprovable; the shared helper confirms the target is gone
+    // and reports a delivered tap instead of a held touch.
+    let settled: A11yResult<Option<String>> = match (start, end) {
+        (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner).map(|()| None),
         (Err(start_error), Ok(_)) => {
             resolve_persisted_cdp_mutation_owner(&owner).and(Err(start_error))
         }
-        (start, Err(end_error)) => Err(record_unresolved_input_release(
+        (start, Err(end_error)) => settle_failed_release_after_press(
+            endpoint,
+            page.target_id().inner(),
+            &owner,
+            delivered,
             start.err(),
-            end_error,
+            end_error.to_string(),
+            "touch-start",
             "touchEnd acknowledgement was not proven",
-        )),
+        )
+        .await
+        .map(Some),
     };
-    after_input_if(settled, delivered)?;
+    let release_not_sent_target_closed = after_input_if(settled, delivered)?;
     Ok(CdpTouchTapResult {
         target_id: page.target_id().inner().clone(),
         point,
@@ -6501,6 +6581,7 @@ async fn dispatch_touch_tap_on_page(
             || touch_state.ontouchstart_available,
         non_touch_fallback:
             "none; use mouse click explicitly when touch semantics are not required".to_owned(),
+        release_not_sent_target_closed,
     })
 }
 
@@ -6581,32 +6662,20 @@ async fn dispatch_key_sequence_on_page(
     }
     let release_detail = release_failures.join(" | ");
     // #329: a key-up that failed because its own key-down closed the target is
-    // a delivered press, not a held key. Ask Chrome whether the target is gone;
-    // only a sure absence (a delivered key-down with no key-down dispatch
-    // error) converts the failure into a closed-target outcome and resolves the
-    // persisted owner. A live target, an inconclusive inventory, or a key-down
-    // that never arrived keeps today's fail-closed owner exactly as before, so
-    // a really held key is never reported as released.
-    let target_id = page.target_id().inner();
-    let target_absent = delivered
-        && primary_error.is_none()
-        && matches!(
-            cdp_target_present_inventory(endpoint, target_id).await,
-            Ok(false)
-        );
-    let settled = if target_absent {
-        resolve_persisted_cdp_mutation_owner(&owner).map(|()| CdpKeySequenceOutcome::TargetClosed {
-            detail: format!(
-                "raw-CDP target {target_id:?} closed by its own key-down; key-up not sent: {release_detail}"
-            ),
-        })
-    } else {
-        Err(record_unresolved_input_release_detail(
-            primary_error,
-            release_detail,
-            "one or more keyUp acknowledgements were not proven",
-        ))
-    };
+    // a delivered press, not a held key. The shared helper (#341) asks Chrome
+    // whether the target is gone and resolves the owner on a sure absence.
+    let settled = settle_failed_release_after_press(
+        endpoint,
+        page.target_id().inner(),
+        &owner,
+        delivered,
+        primary_error,
+        release_detail,
+        "key-down",
+        "one or more keyUp acknowledgements were not proven",
+    )
+    .await
+    .map(|detail| CdpKeySequenceOutcome::TargetClosed { detail });
     after_input_if(settled, delivered)
 }
 

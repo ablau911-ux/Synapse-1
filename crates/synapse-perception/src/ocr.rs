@@ -396,7 +396,10 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use std::{borrow::Cow, sync::OnceLock};
+    use std::{
+        borrow::Cow,
+        sync::{Mutex, OnceLock},
+    };
 
     use image::{ImageBuffer, Rgba, imageops::FilterType};
     use synapse_capture::screen_region_to_bgra_bitmap;
@@ -443,11 +446,7 @@ mod platform {
         bitmap: &windows::Graphics::Imaging::SoftwareBitmap,
     ) -> PerceptionResult<Vec<TextRegion>> {
         let engine = ocr_engine()?;
-        let result = engine
-            .RecognizeAsync(bitmap)
-            .map_err(|err| backend_unavailable(err.to_string()))?
-            .join()
-            .map_err(|err| backend_unavailable(err.to_string()))?;
+        let result = recognize_bitmap(engine, bitmap)?;
         text_regions_from_result(region, &result, 1.0)
     }
 
@@ -515,6 +514,23 @@ mod platform {
             .map_err(|detail| backend_unavailable(detail.clone()))
     }
 
+    fn recognize_bitmap(
+        engine: &OcrEngine,
+        bitmap: &SoftwareBitmap,
+    ) -> PerceptionResult<OcrResult> {
+        static RECOGNITION_LOCK: Mutex<()> = Mutex::new(());
+        // WinRT rejects overlapping operations on the shared engine. Keep the
+        // guard until recognition completes, including for sparse OCR retries.
+        let _recognition_guard = RECOGNITION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        engine
+            .RecognizeAsync(bitmap)
+            .map_err(|err| backend_unavailable(err.to_string()))?
+            .join()
+            .map_err(|err| backend_unavailable(err.to_string()))
+    }
+
     fn text_regions_from_result(
         region: Rect,
         result: &OcrResult,
@@ -576,11 +592,7 @@ mod platform {
         max_dimension: u32,
     ) -> PerceptionResult<Vec<TextRegion>> {
         let (bitmap, scale) = ocr_bitmap_from_bgra(width, height, bytes, max_dimension)?;
-        let result = engine
-            .RecognizeAsync(&bitmap)
-            .map_err(|err| backend_unavailable(err.to_string()))?
-            .join()
-            .map_err(|err| backend_unavailable(err.to_string()))?;
+        let result = recognize_bitmap(engine, &bitmap)?;
         text_regions_from_result(region, &result, f64::from(scale))
     }
 

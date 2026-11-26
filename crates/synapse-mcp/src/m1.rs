@@ -65,7 +65,37 @@ pub struct M1State {
     pub fs_recent_tracker: FsRecentTracker,
 }
 
+/// Immutable gather settings copied while the service lock is held. Provider
+/// calls use this snapshot after releasing the daemon-wide mutable state.
+#[derive(Clone)]
+pub struct M1InputSnapshot {
+    pub(crate) perception_mode: PerceptionMode,
+    synthetic: Option<ObservationInput>,
+    force_no_perception: bool,
+    force_observe_internal: bool,
+    active_capture_config: ObservationCaptureConfig,
+    capture_runtime: CaptureRuntimeReadback,
+}
+
+impl M1InputSnapshot {
+    fn capture_runtime_readback(&self) -> CaptureRuntimeReadback {
+        self.capture_runtime.clone()
+    }
+}
+
 impl M1State {
+    #[must_use]
+    pub fn input_snapshot(&self) -> M1InputSnapshot {
+        M1InputSnapshot {
+            perception_mode: self.perception_mode,
+            synthetic: self.synthetic.clone(),
+            force_no_perception: self.force_no_perception,
+            force_observe_internal: self.force_observe_internal,
+            active_capture_config: self.active_capture_config.clone(),
+            capture_runtime: self.capture_runtime_readback(),
+        }
+    }
+
     #[must_use]
     pub fn from_env() -> Self {
         let synthetic = match std::env::var("SYNAPSE_MCP_SYNTHETIC_FIXTURE") {
@@ -3817,6 +3847,13 @@ pub fn observe_gather_depth(params: &ObserveParams) -> u32 {
 }
 
 pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, ErrorData> {
+    current_input_from_snapshot(&state.input_snapshot(), depth)
+}
+
+pub(crate) fn current_input_from_snapshot(
+    state: &M1InputSnapshot,
+    depth: u32,
+) -> Result<ObservationInput, ErrorData> {
     if state.force_observe_internal {
         return Err(mcp_error(
             error_codes::OBSERVE_INTERNAL,
@@ -3853,7 +3890,7 @@ pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, Er
 /// that the window/foreground perception path refuses to downgrade (#1508). The
 /// caller populates the requested global slots (fs recent, clipboard, audio)
 /// onto the returned input.
-pub fn global_only_input(state: &M1State) -> ObservationInput {
+pub(crate) fn global_only_input(state: &M1InputSnapshot) -> ObservationInput {
     // An honest "no window was observed" foreground: hwnd 0, empty process and
     // title. A global-only observe deliberately reads no window, so the
     // foreground carries no borrowed/foreground identity.
@@ -3890,6 +3927,14 @@ pub fn observe_input(
     params: &ObserveParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
+    observe_input_from_snapshot(&state.input_snapshot(), params, target_hwnd)
+}
+
+pub(crate) fn observe_input_from_snapshot(
+    state: &M1InputSnapshot,
+    params: &ObserveParams,
+    target_hwnd: Option<i64>,
+) -> Result<ObservationInput, ErrorData> {
     let depth = observe_gather_depth(params);
     if let Some(element_id) = &params.subtree_root {
         if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
@@ -3905,7 +3950,7 @@ pub fn observe_input(
         input.capture_runtime = Some(state.capture_runtime_readback());
         return Ok(input);
     }
-    current_input(state, depth)
+    current_input_from_snapshot(state, depth)
 }
 
 /// Attaches CDP (when reachable) and folds the page's DOM/accessibility tree
@@ -4831,16 +4876,25 @@ pub fn build_find_input(
     params: &FindParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
+    let mut input = build_find_input_from_snapshot(&state.input_snapshot(), params, target_hwnd)?;
+    populate_detection_from_state(state, &mut input);
+    Ok(input)
+}
+
+pub(crate) fn build_find_input_from_snapshot(
+    state: &M1InputSnapshot,
+    params: &FindParams,
+    target_hwnd: Option<i64>,
+) -> Result<ObservationInput, ErrorData> {
     // Precedence matches observe: explicit window_hwnd > session target > foreground.
-    let mut input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
+    let input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
         let mut input = window_input_from_hwnd(hwnd, FIND_SNAPSHOT_DEPTH, state.perception_mode)?;
         input.capture_config = Some(state.active_capture_config.clone());
         input.capture_runtime = Some(state.capture_runtime_readback());
         input
     } else {
-        current_input(state, FIND_SNAPSHOT_DEPTH)?
+        current_input_from_snapshot(state, FIND_SNAPSHOT_DEPTH)?
     };
-    populate_detection_from_state(state, &mut input);
     Ok(input)
 }
 

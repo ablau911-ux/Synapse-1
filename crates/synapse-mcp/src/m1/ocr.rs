@@ -5,7 +5,7 @@ use synapse_perception::{
     read_text_with_provider,
 };
 
-use crate::m1::{M1State, ReadTextParams, current_input, mcp_error};
+use crate::m1::{M1InputSnapshot, ReadTextParams, current_input_from_snapshot, mcp_error};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadTextCaptureSource {
@@ -51,7 +51,7 @@ impl ResolvedReadTextRequest {
 }
 
 pub fn resolve_read_text_request(
-    state: &M1State,
+    state: &M1InputSnapshot,
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
 ) -> Result<ResolvedReadTextRequest, ErrorData> {
@@ -206,7 +206,7 @@ pub fn ocr_result_from_web_bitmap(
 }
 
 fn text_region(
-    state: &M1State,
+    state: &M1InputSnapshot,
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
 ) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
@@ -247,7 +247,7 @@ fn text_region(
             }
             return Ok((region, ReadTextCaptureSource::Screen));
         }
-        let input = current_input(state, 2)?;
+        let input = current_input_from_snapshot(state, 2)?;
         let region = input
             .elements
             .iter()
@@ -263,7 +263,7 @@ fn text_region(
     }
 
     let Some(hwnd) = target_hwnd else {
-        let input = current_input(state, 2)?;
+        let input = current_input_from_snapshot(state, 2)?;
         let region = input.focused.map(|focused| focused.bbox).ok_or_else(|| {
             mcp_error(
                 error_codes::OCR_NO_TEXT,

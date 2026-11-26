@@ -10253,7 +10253,10 @@ fn target_act_result_has_visual_pixel_verification(value: &Value) -> bool {
             let source_is_visual = object
                 .get("source_of_truth")
                 .and_then(Value::as_str)
-                .is_some_and(|source| source.contains("ui_or_pixels"));
+                .is_some_and(|source| {
+                    matches!(source, "target_window_pixels" | "target_point_pixels")
+                })
+                && object.get("observed_delta").and_then(Value::as_bool) == Some(true);
             let postcondition_is_visual = object
                 .get("postcondition")
                 .is_some_and(target_act_result_has_visual_pixel_verification);

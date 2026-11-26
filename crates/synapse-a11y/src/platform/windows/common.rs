@@ -147,28 +147,70 @@ fn uia_worker_thread(
 pub(super) fn with_automation<T: Send + 'static>(
     action: impl FnOnce(&UIAutomation) -> A11yResult<T> + Send + 'static,
 ) -> A11yResult<T> {
-    with_automation_operation("uia_worker_job", DEFAULT_UIA_WORKER_JOB_TIMEOUT, action)
+    with_automation_worker_operation(
+        "uia_worker_job",
+        DEFAULT_UIA_WORKER_JOB_TIMEOUT,
+        false,
+        action,
+    )
 }
 
-pub(super) fn with_automation_operation<T: Send + 'static>(
+pub(super) fn with_automation_read<T: Send + 'static>(
+    action: impl FnOnce(&UIAutomation) -> A11yResult<T> + Send + 'static,
+) -> A11yResult<T> {
+    with_automation_read_operation("uia_worker_read", DEFAULT_UIA_WORKER_JOB_TIMEOUT, action)
+}
+
+pub(super) fn with_automation_read_operation<T: Send + 'static>(
     operation: impl Into<String>,
     timeout: Duration,
     action: impl FnOnce(&UIAutomation) -> A11yResult<T> + Send + 'static,
 ) -> A11yResult<T> {
+    with_automation_worker_operation(operation, timeout, true, action)
+}
+
+fn with_automation_worker_operation<T: Send + 'static>(
+    operation: impl Into<String>,
+    timeout: Duration,
+    isolate_busy: bool,
+    action: impl FnOnce(&UIAutomation) -> A11yResult<T> + Send + 'static,
+) -> A11yResult<T> {
     let operation = operation.into();
-    let worker = worker()?;
+    let shared_worker = worker()?;
+    let isolated_worker;
+    let started = Instant::now();
+    // Perception must not queue behind a possibly hung provider. Concurrent
+    // reads get a short-lived MTA worker; mutations retain their serialization.
+    let (worker, _job_guard) = match shared_worker.job_lock.try_lock() {
+        Ok(guard) => (&shared_worker, guard),
+        Err(TryLockError::WouldBlock) if isolate_busy => {
+            isolated_worker = Arc::new(start_worker()?);
+            let guard = isolated_worker
+                .job_lock
+                .lock()
+                .map_err(|error| A11yError::internal(error.to_string()))?;
+            (&isolated_worker, guard)
+        }
+        Err(TryLockError::WouldBlock) => (
+            &shared_worker,
+            acquire_job_slot(&shared_worker, &operation, timeout, started)?,
+        ),
+        Err(TryLockError::Poisoned(error)) => {
+            return Err(A11yError::internal(format!(
+                "UIA worker job lock poisoned for operation={operation}: {error}"
+            )));
+        }
+    };
     if worker.timed_out.load(Ordering::SeqCst) {
-        retire_worker(&worker, "pre_send_timeout");
+        retire_worker(worker, "pre_send_timeout");
         return Err(A11yError::uia_worker_timeout(format!(
             "operation={operation} phase=worker_unavailable previous_timeout=true timeout_ms={} remediation=retry; previous UIA worker job exceeded its bounded deadline and this worker was retired so the next request can use a fresh worker",
             timeout.as_millis()
         )));
     }
 
-    let started = Instant::now();
-    let _job_guard = acquire_job_slot(&worker, &operation, timeout, started)?;
     if worker.timed_out.load(Ordering::SeqCst) {
-        retire_worker(&worker, "post_lock_timeout");
+        retire_worker(worker, "post_lock_timeout");
         return Err(A11yError::uia_worker_timeout(format!(
             "operation={operation} phase=worker_unavailable previous_timeout=true timeout_ms={} elapsed_ms={} remediation=retry; previous UIA worker job exceeded its bounded deadline and this worker was retired so the next request can use a fresh worker",
             timeout.as_millis(),
@@ -190,14 +232,14 @@ pub(super) fn with_automation_operation<T: Send + 'static>(
             let _ = reply_tx.send(action(automation));
         }))
         .map_err(|err| {
-            retire_worker(&worker, "send_failed");
+            retire_worker(worker, "send_failed");
             A11yError::internal(format!("send UIA worker job failed: {err}"))
         })?;
     match reply_rx.recv_timeout(remaining) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             worker.timed_out.store(true, Ordering::SeqCst);
-            retire_worker(&worker, "reply_timeout");
+            retire_worker(worker, "reply_timeout");
             Err(A11yError::uia_worker_timeout(format!(
                 "operation={operation} phase=worker_reply_recv timeout_ms={} elapsed_ms={} remediation=retry; UIA provider call did not return before the bounded worker deadline, daemon stayed alive, and the worker was retired so unrelated later requests can use a fresh worker",
                 timeout.as_millis(),
@@ -205,7 +247,7 @@ pub(super) fn with_automation_operation<T: Send + 'static>(
             )))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            retire_worker(&worker, "reply_disconnected");
+            retire_worker(worker, "reply_disconnected");
             Err(A11yError::internal(format!(
                 "receive UIA worker job failed for operation={operation}: channel disconnected"
             )))
@@ -276,7 +318,7 @@ fn retire_worker(worker: &Arc<ProcessUiaWorker>, reason: &'static str) {
 }
 
 pub(super) fn worker_readback() -> A11yResult<UiaWorkerReadback> {
-    with_automation(|_automation| Ok(read_current_worker_state()))
+    with_automation_read(|_automation| Ok(read_current_worker_state()))
 }
 
 fn read_current_worker_state() -> UiaWorkerReadback {

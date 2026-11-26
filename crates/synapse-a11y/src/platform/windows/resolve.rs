@@ -114,7 +114,7 @@ pub(super) fn re_resolve_on_worker(
 
 pub fn element_bounding_rect(id: &ElementId) -> A11yResult<Rect> {
     let id = id.clone();
-    with_automation(move |automation| {
+    super::common::with_automation_read(move |automation| {
         let element = re_resolve_on_worker(automation, &id)?;
         element_rect(&element)
     })

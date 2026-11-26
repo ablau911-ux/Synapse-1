@@ -34,10 +34,10 @@ use super::{
     SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
     SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
     TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
-    mcp_error, observe_include, observe_input, populate_audio_summary, populate_clipboard_summary,
+    mcp_error, observe_include, populate_audio_summary, populate_clipboard_summary,
     populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
-    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
-    set_target_input_schema, tool, tool_router,
+    set_capture_target_in_state, set_perception_mode_in_state, set_target_input_schema, tool,
+    tool_router,
 };
 use crate::hex::hex_encode;
 use crate::m1::ClipViewParams;
@@ -417,38 +417,49 @@ impl SynapseService {
         } else {
             target_cdp_id(&target)
         };
-        let mut fs_timeline_events = Vec::new();
-        // Scope the (non-Send) state guard so it is released before any await.
-        let mut input = {
-            let state = self.m1_state()?;
-            let mut input = if needs_window {
-                match observe_input(&state, &params.0, target_hwnd) {
-                    Ok(input) => input,
-                    Err(error) if params.0.subtree_root.is_none() => {
-                        let Some(hwnd) = target_hwnd else {
-                            return Err(error);
-                        };
-                        let Some(session_id) = mcp_session_id else {
-                            return Err(error);
-                        };
-                        self.hidden_desktop_observe_input(
-                            session_id,
-                            hwnd,
-                            crate::m1::observe_gather_depth(&params.0),
-                            state.perception_mode,
-                            error,
-                        )?
-                    }
-                    Err(error) => return Err(error),
-                }
+        // Copy settings under the service lock, then release it before any
+        // provider call. A hung UIA target must not block other sessions' OCR.
+        let snapshot = self.m1_state()?.input_snapshot();
+        let perception_mode = snapshot.perception_mode;
+        let gather_params = params.0.clone();
+        let gathered = tokio::task::spawn_blocking(move || {
+            if needs_window {
+                crate::m1::observe_input_from_snapshot(&snapshot, &gather_params, target_hwnd)
             } else {
-                crate::m1::global_only_input(&state)
-            };
-            if include.fs && input.fs_recent.is_empty() {
-                fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
+                Ok(crate::m1::global_only_input(&snapshot))
             }
-            input
+        })
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("observe gather worker failed: {error}"),
+            )
+        })?;
+        let mut input = match gathered {
+            Ok(input) => input,
+            Err(error) if params.0.subtree_root.is_none() => {
+                let Some(hwnd) = target_hwnd else {
+                    return Err(error);
+                };
+                let Some(session_id) = mcp_session_id else {
+                    return Err(error);
+                };
+                self.hidden_desktop_observe_input(
+                    session_id,
+                    hwnd,
+                    crate::m1::observe_gather_depth(&params.0),
+                    perception_mode,
+                    error,
+                )?
+            }
+            Err(error) => return Err(error),
         };
+        let mut fs_timeline_events = Vec::new();
+        if include.fs && input.fs_recent.is_empty() {
+            let state = self.m1_state()?;
+            fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
+        }
         if let Some(since) = params.0.since_event_seq {
             input.recent_events.retain(|event| event.seq > since);
         }
@@ -597,28 +608,35 @@ impl SynapseService {
         } else {
             target_cdp_id(&target)
         };
-        let mut input = {
-            let mut state = self.m1_state()?;
-            match super::build_find_input(&mut state, &params.0, target_hwnd) {
-                Ok(input) => input,
-                Err(error) => {
-                    let Some(hwnd) = target_hwnd else {
-                        return Err(error);
-                    };
-                    let Some(session_id) = mcp_session_id else {
-                        return Err(error);
-                    };
-                    let mut input = self.hidden_desktop_find_input(
-                        session_id,
-                        hwnd,
-                        state.perception_mode,
-                        error,
-                    )?;
-                    populate_detection_from_state(&mut state, &mut input);
-                    input
-                }
+        let snapshot = self.m1_state()?.input_snapshot();
+        let perception_mode = snapshot.perception_mode;
+        let gather_params = params.0.clone();
+        let gathered = tokio::task::spawn_blocking(move || {
+            crate::m1::build_find_input_from_snapshot(&snapshot, &gather_params, target_hwnd)
+        })
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("find gather worker failed: {error}"),
+            )
+        })?;
+        let mut input = match gathered {
+            Ok(input) => input,
+            Err(error) => {
+                let Some(hwnd) = target_hwnd else {
+                    return Err(error);
+                };
+                let Some(session_id) = mcp_session_id else {
+                    return Err(error);
+                };
+                self.hidden_desktop_find_input(session_id, hwnd, perception_mode, error)?
             }
         };
+        {
+            let mut state = self.m1_state()?;
+            populate_detection_from_state(&mut state, &mut input);
+        }
         super::enrich_input_with_cdp_for_target(
             &mut input,
             super::find_snapshot_depth(),
@@ -677,7 +695,17 @@ impl SynapseService {
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
         let target_hwnd = perception_window_hwnd("read_text", &target, params.0.window_hwnd)?;
-        self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
+        })
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("read_text worker failed: {error}"),
+            )
+        })?
     }
 
     fn read_text_with_target_hwnd(
@@ -686,11 +714,9 @@ impl SynapseService {
         target_hwnd: Option<i64>,
         mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
-        let normal_result = ({
-            let state = self.m1_state()?;
-            resolve_read_text_request(&state, &params.0, target_hwnd)
-        })
-        .and_then(|request| self.read_text_request_with_cache(request));
+        let snapshot = self.m1_state()?.input_snapshot();
+        let normal_result = crate::m1::resolve_read_text_request(&snapshot, &params.0, target_hwnd)
+            .and_then(|request| self.read_text_request_with_cache(request));
         match normal_result {
             Ok(mut result) => {
                 // #1557 fail-closed gate, applied to the final (post-cache)
@@ -19497,11 +19523,67 @@ fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
     Ok((total, hex))
 }
 
+#[cfg(windows)]
+fn publish_screenshot_no_replace(temp_path: &Path, output_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        core::PCWSTR,
+    };
+    let source: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = output_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Unlike std::fs::rename, omitting MOVEFILE_REPLACE_EXISTING preserves an
+    // existing destination. Rename also works on filesystems without hard links.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+}
+
+#[cfg(not(windows))]
+fn publish_screenshot_no_replace(temp_path: &Path, output_path: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(temp_path, output_path)
+}
+
 fn install_screenshot_file(
     temp_path: &Path,
     output_path: &Path,
     overwrite: bool,
 ) -> Result<(), ErrorData> {
+    if !overwrite {
+        // Publish the complete sibling temp file without replacing a winner
+        // from another capture. An existence check followed by rename races.
+        let result = publish_screenshot_no_replace(temp_path, output_path);
+        let _ = std::fs::remove_file(temp_path);
+        return result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "capture_screenshot output file already exists and overwrite=false: {}",
+                        output_path.display()
+                    ),
+                )
+            } else {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "capture_screenshot failed to publish {} to {}: {error}",
+                        temp_path.display(),
+                        output_path.display()
+                    ),
+                )
+            }
+        });
+    }
     if overwrite && output_path.exists() {
         std::fs::remove_file(output_path).map_err(|error| {
             let _ = std::fs::remove_file(temp_path);

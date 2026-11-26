@@ -275,11 +275,17 @@ pub struct CdpAttachment {
 /// supplied endpoint.
 #[cfg(windows)]
 pub async fn attach_chromiumoxide(endpoint: &str) -> A11yResult<CdpAttachment> {
-    let (browser, handler) = chromiumoxide::Browser::connect(endpoint)
-        .await
-        .map_err(|err| A11yError::CdpUnreachable {
-            detail: err.to_string(),
-        })?;
+    let (browser, handler) = timeout(
+        crate::cdp_action::CDP_INPUT_COMMAND_TIMEOUT,
+        chromiumoxide::Browser::connect(endpoint),
+    )
+    .await
+    .map_err(|_| A11yError::CdpUnreachable {
+        detail: "CDP HTTP discovery/WebSocket connect timed out after 15 s".to_owned(),
+    })?
+    .map_err(|err| A11yError::CdpUnreachable {
+        detail: err.to_string(),
+    })?;
     Ok(CdpAttachment {
         browser,
         handler,
@@ -340,8 +346,19 @@ pub async fn cdp_list_targets(endpoint: &str) -> A11yResult<Vec<CdpTargetSummary
         ..
     } = attach_chromiumoxide(endpoint).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
-    let result = cdp_list_targets_with_browser(&browser).await;
+    // Bound the query separately from connection establishment. Always stop
+    // the handler, including on timeout; settlement treats this as inconclusive.
+    let result = timeout(
+        crate::cdp_action::CDP_INPUT_COMMAND_TIMEOUT,
+        cdp_list_targets_with_browser(&browser),
+    )
+    .await
+    .map_err(|_| A11yError::CdpAttachFailed {
+        detail: "CDP target inventory timed out after 15 s".to_owned(),
+    })
+    .and_then(std::convert::identity);
     handler_task.abort();
+    let _shutdown = handler_task.await;
     result
 }
 

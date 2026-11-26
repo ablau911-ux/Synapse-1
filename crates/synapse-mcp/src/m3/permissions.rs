@@ -280,8 +280,12 @@ pub(crate) fn normalize_path_under_root(
     };
     let root = lexical_normalize(root);
     let candidate = lexical_normalize(&candidate);
-    let (resolved_root, root_existing) = resolve_path_without_links(&root).map_err(|_| denied())?;
-    let (resolved_candidate, candidate_existing) =
+    // Retain both sets of ancestor pins until containment has been compared.
+    // Actual file I/O acquires its own pins in open_confined_artifact and
+    // returns them to the caller for the lifetime of the read/write operation.
+    let (resolved_root, root_existing, _root_guards) =
+        resolve_path_without_links(&root).map_err(|_| denied())?;
+    let (resolved_candidate, candidate_existing, _candidate_guards) =
         resolve_path_without_links(&candidate).map_err(|_| denied())?;
     if !resolved_path_is_under_root(
         &resolved_candidate,
@@ -508,7 +512,9 @@ fn artifact_handle_path(_file: &std::fs::File, path: &Path) -> std::io::Result<P
     std::fs::canonicalize(path)
 }
 
-fn resolve_path_without_links(path: &Path) -> std::io::Result<(PathBuf, usize)> {
+fn resolve_path_without_links(
+    path: &Path,
+) -> std::io::Result<(PathBuf, usize, Vec<std::fs::File>)> {
     // Pin from the volume down before looking up the next child. Do not let
     // canonicalization follow an ancestor swapped after its metadata check.
     let mut existing = path;
@@ -547,7 +553,7 @@ fn resolve_path_without_links(path: &Path) -> std::io::Result<(PathBuf, usize)> 
         canonical.ok_or_else(|| std::io::Error::other("artifact path has no existing ancestor"))?;
     let suffix = path.strip_prefix(existing).map_err(std::io::Error::other)?;
     let existing_components = canonical.components().count();
-    Ok((canonical.join(suffix), existing_components))
+    Ok((canonical.join(suffix), existing_components, guards))
 }
 
 #[must_use]

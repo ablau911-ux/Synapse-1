@@ -9527,11 +9527,13 @@ function rejectNetworkConditionsResetField(value, fieldName) {
 // #336: device emulation (user agent, device metrics, touch) is held on the
 // shared per-tab emulation session so the overrides survive until reset.
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
+  let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
     await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
       userAgent: descriptor.user_agent
     });
+    applied = true;
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
       width: descriptor.width,
       height: descriptor.height,
@@ -9556,10 +9558,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger deviceEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
+    throw await failEmulationSetDispatch(tabId, "device", "deviceEmulation", applied, error);
   }
 }
 
@@ -9617,6 +9616,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
 // not tied to the session.)
 async function dispatchGeolocationEmulationSet(tabId, origin, requested, permissionSetting) {
   let permissionMethod = `Browser.setPermission(${permissionSetting})`;
+  let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "geolocation");
     try {
@@ -9646,15 +9646,13 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
       params.speed = requested.speed;
     }
     await sendDebuggerCommand(debuggee, "Emulation.setGeolocationOverride", params);
+    applied = true;
     return {
       method: `Emulation.setGeolocationOverride+${permissionMethod}`,
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger geolocationEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
+    throw await failEmulationSetDispatch(tabId, "geolocation", "geolocationEmulation", applied, error);
   }
 }
 
@@ -9709,10 +9707,8 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger localeEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
+    // #339/A: a command of this set applied only if it was pushed to `methods`.
+    throw await failEmulationSetDispatch(tabId, "locale", "localeEmulation", methods.length > 0, error);
   }
 }
 
@@ -9740,6 +9736,7 @@ async function dispatchLocaleEmulationReset(tabId) {
 // #336: the emulated-media override is held on the shared emulation session so it
 // survives until reset.
 async function dispatchMediaEmulationSet(tabId, requested) {
+  let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "media");
     const features = [];
@@ -9753,15 +9750,13 @@ async function dispatchMediaEmulationSet(tabId, requested) {
       media: requested.media || "",
       features
     });
+    applied = true;
     return {
       method: "Emulation.setEmulatedMedia(media,features)",
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger mediaEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
+    throw await failEmulationSetDispatch(tabId, "media", "mediaEmulation", applied, error);
   }
 }
 
@@ -9790,9 +9785,11 @@ async function dispatchMediaEmulationReset(tabId) {
 // so it survives until reset. Network.enable stays enabled while the session is
 // held, as the override requires.
 async function dispatchNetworkConditionsSet(tabId, requested) {
+  let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
     await sendDebuggerCommand(debuggee, "Network.enable", {});
+    applied = true;
     const params = {
       offline: Boolean(requested.offline),
       latency: Number(requested.latency_ms),
@@ -9808,10 +9805,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger networkConditions set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
+    throw await failEmulationSetDispatch(tabId, "network", "networkConditions", applied, error);
   }
 }
 
@@ -9844,6 +9838,7 @@ async function dispatchNetworkConditionsReset(tabId) {
 // runs next is therefore taken while the override is still live. The handler
 // releases the "viewport" domain if the set could not be verified.
 async function dispatchViewportEmulationSet(tabId, requested) {
+  let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
@@ -9854,15 +9849,13 @@ async function dispatchViewportEmulationSet(tabId, requested) {
       screenWidth: requested.width,
       screenHeight: requested.height
     });
+    applied = true;
     return {
       method: `Emulation.setDeviceMetricsOverride(width,height,deviceScaleFactor,mobile=${String(Boolean(requested.mobile))})`,
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger viewportEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
+    throw await failEmulationSetDispatch(tabId, "viewport", "viewportEmulation", applied, error);
   }
 }
 
@@ -13281,7 +13274,31 @@ async function releaseEmulationDebuggerSessionDomain(tabId, domain) {
 // one live -- and the shim teardown removes the page-side shim; then forget the
 // baseline and ledger entry. If the undo itself fails, the ledger entry is kept so
 // operator-panic cleanup can retry, and the original error is surfaced with a note.
+// #339/A: build the set-failed error, and when no command of the set applied
+// anything, release the domain (so nothing stays registered or holds the debugger)
+// and mark the error so the handler's cleanup does not try to undo a no-op. "Undo
+// failed, kept registered" is reserved for a command that did succeed.
+async function failEmulationSetDispatch(tabId, domain, label, applied, cause) {
+  const wrapped = bridgeError(
+    ERROR_ATTACH_FAILED,
+    `chrome.debugger ${label} set failed for tab ${tabId}: ${errorMessage(cause)}`
+  );
+  if (!applied) {
+    await releaseEmulationDebuggerSessionDomain(tabId, domain);
+    wrapped.emulationNothingApplied = true;
+  }
+  return wrapped;
+}
+
 async function cleanupFailedEmulationSet(tabId, domain, wiring, cause) {
+  if (cause && cause.emulationNothingApplied) {
+    // #339/A: the set applied nothing (its first command was refused) and the
+    // dispatch already released the domain, so there is nothing to undo. Forget the
+    // baseline and ledger entry and let the original error stand.
+    wiring.baselineMap.delete(tabId);
+    removeLedgerOverride(wiring.ledgerField, tabId);
+    return;
+  }
   try {
     await wiring.reset();
     await wiring.clearShim(tabId);

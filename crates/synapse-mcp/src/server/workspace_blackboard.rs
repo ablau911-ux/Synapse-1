@@ -2051,7 +2051,13 @@ fn readback_artifact_path(path_value: &str) -> Result<WorkspaceArtifactReadback,
                 root.display()
             ))
         })?;
-    let metadata = path.metadata().map_err(|error| {
+    let (mut file, _directory_guards) =
+        crate::m3::permissions::open_confined_artifact(&root, &path, false).map_err(|error| {
+            params_error(format!(
+                "workspace artifact could not be safely opened: {error}"
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         params_error(format!(
             "workspace artifact path {} is not readable: {error}",
             path.display()
@@ -2063,7 +2069,7 @@ fn readback_artifact_path(path_value: &str) -> Result<WorkspaceArtifactReadback,
             path.display()
         )));
     }
-    let sha256 = sha256_file(&path)?;
+    let sha256 = sha256_file(&path, &mut file)?;
     Ok(WorkspaceArtifactReadback {
         path: path.display().to_string(),
         exists: true,
@@ -2073,13 +2079,7 @@ fn readback_artifact_path(path_value: &str) -> Result<WorkspaceArtifactReadback,
     })
 }
 
-fn sha256_file(path: &Path) -> Result<String, ErrorData> {
-    let mut file = File::open(path).map_err(|error| {
-        params_error(format!(
-            "workspace artifact path {} could not be opened for hashing: {error}",
-            path.display()
-        ))
-    })?;
+fn sha256_file(path: &Path, file: &mut File) -> Result<String, ErrorData> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {

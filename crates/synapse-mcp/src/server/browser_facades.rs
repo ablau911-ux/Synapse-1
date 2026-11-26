@@ -352,7 +352,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Stable browser debugger facade. evaluate, console_messages and network run under any profile against a tab this session owns/has bound, or an explicitly named unowned chrome-tab cdp_target_id (auto-adopted: refused if another session owns/claims it or it is the active tab of the human's foreground window without an exact claim). All other operations fail closed until this session is set to browser_debugger. Pick operation and pass exactly one matching spec object; server-side typed validation remains authoritative.",
+        description = "Stable browser debugger facade. evaluate, console_messages and network are available under any profile; console_messages, network, network_har, network_overrides and route require a raw-CDP automation tab with a debugging endpoint. evaluate also supports page-scope evaluation through the normal Chrome bridge. Target a tab this session owns/has bound, or an explicitly named unowned chrome-tab cdp_target_id (auto-adopted: refused if another session owns/claims it or it is the active tab of the human's foreground window without an exact claim). All other operations require profile=browser_debugger, break_glass, or full_capability. Pick operation and pass exactly one matching spec object; server-side typed validation remains authoritative.",
         input_schema = browser_debugger_input_schema()
     )]
     pub async fn browser_debugger(

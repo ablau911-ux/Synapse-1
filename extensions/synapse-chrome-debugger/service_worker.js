@@ -13169,7 +13169,21 @@ async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
     }
   }
   assertPhysicalMutationAdmission(`chrome.debugger.attach:tab=${tabId}`);
-  await chrome.debugger.attach(debuggee, protocolVersion);
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+  } catch (error) {
+    if (!errorMessage(error).includes("Another debugger is already attached")) {
+      throw error;
+    }
+    // A failed earlier command can leave our attachment without a registry
+    // entry. sendCommand succeeds only for this extension's own session: never
+    // detach or borrow an attachment belonging to DevTools or another client.
+    try {
+      await sendDebuggerCommand(debuggee, "Runtime.getIsolateId", {});
+    } catch (_) {
+      throw error;
+    }
+  }
   return { debuggee, shouldDetach: true, persistent: false, protocolVersion };
 }
 

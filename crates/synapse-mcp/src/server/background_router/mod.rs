@@ -2710,6 +2710,15 @@ impl SynapseService {
             }
             "key" | "key_chord" => target_act_key_press(self, &params, &request_context).await?,
             "press" => {
+                if !target_act_has_key_chord(&params)
+                    && !target_act_has_dom_locator(&params)
+                    && !params
+                        .element_id
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                {
+                    target_act_key_chord_keys(&params, "press")?;
+                }
                 if target_act_has_key_chord(&params) {
                     target_act_key_press(self, &params, &request_context).await?
                 } else {
@@ -2996,7 +3005,7 @@ impl SynapseService {
             operator_panic_epoch_at_entry,
         )?;
 
-        let transaction = std::panic::AssertUnwindSafe(async {
+        let transaction = std::panic::AssertUnwindSafe(Box::pin(async {
         if authority_guard.operator_panic_observed() {
             let mut cleanup = authority_guard.cleanup_now("operator_panic_before_acquire");
             if !cleanup.cleanup_ok {
@@ -3379,7 +3388,7 @@ impl SynapseService {
             },
             action,
         }))
-        })
+        }))
         .catch_unwind()
         .await;
         match transaction {

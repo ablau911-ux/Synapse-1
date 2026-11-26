@@ -56,6 +56,7 @@ mod approval_protocol;
 mod chrome_debugger_bridge;
 mod connect;
 mod daemon_lifecycle;
+mod daemon_shutdown;
 mod desktop_worker;
 mod doctor;
 mod emitter_shutdown;
@@ -312,7 +313,9 @@ fn main() -> ExitCode {
             return top_level_error_exit(anyhow::anyhow!("initialize tokio runtime: {error:#}"));
         }
     };
+    let shutdown_guard = daemon_shutdown::ProcessExitGuard::new(&runtime);
     let result = runtime.block_on(run());
+    drop(shutdown_guard);
     runtime.shutdown_timeout(Duration::from_secs(5));
     match result {
         Ok(code) => code,
@@ -414,6 +417,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         return result;
     }
 
+    daemon_shutdown::install().context("install daemon shutdown handlers")?;
     let dpi_awareness = synapse_capture::init_process_dpi_awareness()
         .context("initialize per-monitor DPI awareness")?;
     tracing::info!(?cli, code = "MCP_CLI_PARSED", "synapse-mcp cli parsed");
@@ -1655,17 +1659,7 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
-    // Ctrl+Break can be delivered to one CREATE_NEW_PROCESS_GROUP without
-    // broadcasting Ctrl+C into the operator's terminal. Treat both Windows
-    // console shutdown controls as the same graceful lifecycle boundary.
-    let mut ctrl_c = tokio::signal::windows::ctrl_c()
-        .with_context(|| format!("register ctrl-c handler {phase}"))?;
-    let mut ctrl_break = tokio::signal::windows::ctrl_break()
-        .with_context(|| format!("register ctrl-break handler {phase}"))?;
-    tokio::select! {
-        signal = ctrl_c.recv() => signal
-            .ok_or_else(|| anyhow::anyhow!("ctrl-c handler closed while waiting {phase}")),
-        signal = ctrl_break.recv() => signal
-            .ok_or_else(|| anyhow::anyhow!("ctrl-break handler closed while waiting {phase}")),
-    }
+    daemon_shutdown::requested().await;
+    tracing::info!(phase, "Windows daemon shutdown requested");
+    Ok(())
 }

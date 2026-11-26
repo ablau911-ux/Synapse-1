@@ -23,6 +23,8 @@ pub enum A11yError {
     CdpUnreachable { detail: String },
     #[error("Chromium DevTools Protocol attach failed: {detail}")]
     CdpAttachFailed { detail: String },
+    #[error("Chromium input is busy: {detail}")]
+    CdpInputBusy { detail: String },
     #[error("Chromium accessibility tree retrieval failed: {detail}")]
     CdpAxtreeFailed { detail: String },
     #[error("browser wait timed out: {detail}")]
@@ -65,7 +67,9 @@ impl A11yError {
                 error_codes::ACTION_TARGET_INVALID
             }
             Self::CdpUnreachable { .. } => error_codes::A11Y_CDP_UNREACHABLE,
-            Self::CdpAttachFailed { .. } => error_codes::A11Y_CDP_ATTACH_FAILED,
+            Self::CdpAttachFailed { .. } | Self::CdpInputBusy { .. } => {
+                error_codes::A11Y_CDP_ATTACH_FAILED
+            }
             Self::CdpAxtreeFailed { .. } => error_codes::A11Y_CDP_AXTREE_FAILED,
             Self::BrowserWaitTimeout { .. } => error_codes::BROWSER_WAIT_TIMEOUT,
             Self::CdpEvaluateTimeout { .. } => error_codes::BROWSER_EVALUATE_TIMEOUT,

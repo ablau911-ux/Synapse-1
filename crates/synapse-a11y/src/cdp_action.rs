@@ -1647,7 +1647,7 @@ pub async fn cdp_mouse_stroke_target(
                 crate::cdp_network::durable_browser_mutation_operation_guard(),
             )
             .await
-            .map_err(|_| A11yError::CdpAttachFailed {
+            .map_err(|_| A11yError::CdpInputBusy {
                 detail: "CDP stroke browser-mutation operation lock timed out after 15 s".to_owned(),
             })?;
             if crate::cdp_network::durable_browser_mutation_owners_enabled() {
@@ -6470,8 +6470,8 @@ async fn dispatch_mouse_click_on_page(
         ))
         .await
         .map_err(|error| dispatch_err(&error));
-    let release = page
-        .execute(mouse_event_with_modifiers(
+    let release = async {
+        page.execute(mouse_event_with_modifiers(
             DispatchMouseEventType::MouseReleased,
             point,
             button,
@@ -6479,7 +6479,39 @@ async fn dispatch_mouse_click_on_page(
             modifiers,
         ))
         .await
-        .map_err(|error| dispatch_err(&error));
+        .map_err(|error| dispatch_err(&error))
+    };
+    // Chrome may never acknowledge a release addressed to a target that its
+    // own mouse-down closed. Keep sending the release, but settle independently
+    // as soon as the browser inventory proves that target is gone.
+    let target_closed = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    cdp_target_present_inventory(endpoint, page.target_id().inner()),
+                )
+                .await,
+                Ok(Ok(false))
+            ) {
+                break;
+            }
+        }
+    };
+    tokio::pin!(release);
+    let release = tokio::select! {
+        result = &mut release => result,
+        () = target_closed, if press.is_ok() => {
+            return after_input_if(
+                resolve_persisted_cdp_mutation_owner(&owner).map(|()| Some(format!(
+                    "raw-CDP target {:?} closed by its own mouse-down; release acknowledgement was still pending",
+                    page.target_id().inner(),
+                ))),
+                true,
+            );
+        }
+    };
     let delivered = press.is_ok() || release.is_ok();
     let result = match (press, release) {
         (Ok(_), Ok(_)) => resolve_persisted_cdp_mutation_owner(&owner).map(|()| None),

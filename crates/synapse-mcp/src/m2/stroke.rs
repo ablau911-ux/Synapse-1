@@ -291,7 +291,7 @@ pub(crate) async fn act_stroke_cdp_target(
         let dispatch = synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button)
         .await
         .map_err(|error| {
-            crate::m2::error_after_a11y_input(
+            let mapped = crate::m2::error_after_a11y_input(
                 mcp_error(
                     error.code(),
                     format!(

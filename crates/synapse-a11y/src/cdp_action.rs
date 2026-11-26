@@ -1647,7 +1647,7 @@ pub async fn cdp_mouse_stroke_target(
                 crate::cdp_network::durable_browser_mutation_operation_guard(),
             )
             .await
-            .map_err(|_| A11yError::CdpAttachFailed {
+            .map_err(|_| A11yError::CdpInputBusy {
                 detail: "CDP stroke browser-mutation operation lock timed out after 15 s".to_owned(),
             })?;
             if crate::cdp_network::durable_browser_mutation_owners_enabled() {

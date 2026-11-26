@@ -613,4 +613,3 @@ fn hwnd_from_wire_value(hwnd: i64) -> A11yResult<HWND> {
     })?;
     Ok(HWND(native as *mut c_void))
 }
-

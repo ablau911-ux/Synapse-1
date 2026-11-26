@@ -148,6 +148,12 @@ const EMULATION_DEBUGGER_SESSIONS = new Map();
 // unrelated debugger attach never blocks it. Keyed `${tabId}:${domain}`.
 let EMULATION_SET_SEQUENCE = 0;
 const EMULATION_DOMAIN_SET_SEQ = new Map();
+// #336: viewport and device emulation share the one Emulation.setDeviceMetricsOverride;
+// the last set wins while both are held. This records each domain's last applied
+// metrics params and which domain set them last, so when one is reset while the other
+// is still held the surviving domain's metrics are restored rather than left stale.
+// tabId -> { viewport: params|null, device: params|null, lastOwner: "viewport"|"device"|null }.
+const EMULATION_DEVICE_METRICS_BY_TAB = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
 // Tab ids whose render-window screencast could not be stopped on a BORROWED
@@ -2108,6 +2114,7 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
   forgetEmulationDomainSetSeq(tabId);
+  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
@@ -2657,6 +2664,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
   forgetEmulationDomainSetSeq(tabId);
+  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
@@ -9596,14 +9604,18 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
       userAgent: descriptor.user_agent
     });
     applied = true;
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+    const metricsParams = {
       width: descriptor.width,
       height: descriptor.height,
       deviceScaleFactor: descriptor.device_scale_factor,
       mobile: descriptor.is_mobile,
       screenWidth: descriptor.width,
       screenHeight: descriptor.height
-    });
+    };
+    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", metricsParams);
+    // #336: remember device's metrics so a later viewport reset can hand the shared
+    // override back to device while it still holds.
+    rememberDeviceMetrics(tabId, "device", metricsParams);
     // #338: Emulation.setTouchEmulationEnabled rejects maxTouchPoints outside
     // 1..16 even when enabling=false, so send the count only when touch is on
     // (the descriptor defaults it to a valid 5); leave the field out when off.
@@ -9629,10 +9641,22 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
     const methods = [];
     if (ledgerHasEmulationOverride("viewportOverrides", tabId)) {
-      // #336: viewport emulation holds the shared Emulation.setDeviceMetricsOverride
-      // (per the durable ledger), so it owns the device metrics; leave them and only
-      // restore the device-only user agent and touch below.
-      methods.push("skip-device-metrics(viewport emulation owns device metrics)");
+      // #336: viewport survives this device reset and the shared metrics belong to
+      // it. If device's metrics were the live ones, hand the override back by
+      // re-applying viewport's own last metrics; if viewport set last, its metrics
+      // are already live. (The device-only user agent and touch are restored below.)
+      const record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
+      if (record && record.lastOwner === "device" && record.viewport) {
+        await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", record.viewport);
+        record.lastOwner = "viewport";
+        record.device = null;
+        methods.push("Emulation.setDeviceMetricsOverride(restore viewport metrics)");
+      } else {
+        if (record) {
+          record.device = null;
+        }
+        methods.push("skip-device-metrics(viewport emulation owns device metrics)");
+      }
     } else {
       await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
       await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
@@ -9643,6 +9667,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
         screenWidth: 0,
         screenHeight: 0
       });
+      EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
       methods.push("Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)");
     }
     await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled", {
@@ -9912,15 +9937,19 @@ async function dispatchViewportEmulationSet(tabId, requested) {
   let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+    const metricsParams = {
       width: requested.width,
       height: requested.height,
       deviceScaleFactor: requested.device_scale_factor,
       mobile: requested.mobile,
       screenWidth: requested.width,
       screenHeight: requested.height
-    });
+    };
+    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", metricsParams);
     applied = true;
+    // #336: remember viewport's metrics so a later device reset can hand the shared
+    // override back to viewport while it still holds.
+    rememberDeviceMetrics(tabId, "viewport", metricsParams);
     return {
       method: `Emulation.setDeviceMetricsOverride(width,height,deviceScaleFactor,mobile=${String(Boolean(requested.mobile))})`,
       protocol_version: attachment.protocolVersion
@@ -9938,12 +9967,23 @@ async function dispatchViewportEmulationReset(tabId) {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
     let method;
     if (ledgerHasEmulationOverride("deviceOverrides", tabId)) {
-      // #336: viewport and device emulation share Emulation.setDeviceMetricsOverride.
-      // Device emulation holds the device-metrics override here (per the durable
-      // ledger), so it owns the metrics; a viewport reset must send nothing that
-      // would clear them and leave the device override without its dimensions. Only
-      // the viewport domain is given back below.
-      method = "skip-device-metrics(device emulation owns device metrics)";
+      // #336: viewport and device share Emulation.setDeviceMetricsOverride and the
+      // last set wins while both are held. Device survives this viewport reset, so
+      // the metrics belong to it: if viewport's metrics were the live ones, hand the
+      // override back by re-applying device's own last metrics; if device set last,
+      // its metrics are already live and there is nothing to do.
+      const record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
+      if (record && record.lastOwner === "viewport" && record.device) {
+        await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", record.device);
+        record.lastOwner = "device";
+        record.viewport = null;
+        method = "Emulation.setDeviceMetricsOverride(restore device metrics)";
+      } else {
+        if (record) {
+          record.viewport = null;
+        }
+        method = "skip-device-metrics(device emulation owns device metrics)";
+      }
     } else {
       await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
       await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
@@ -9954,6 +9994,7 @@ async function dispatchViewportEmulationReset(tabId) {
         screenWidth: 0,
         screenHeight: 0
       });
+      EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
       method = "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0,deviceScaleFactor=0,mobile=false)";
     }
     return {
@@ -13235,6 +13276,18 @@ function forgetEmulationDomainSetSeq(tabId) {
   }
 }
 
+// #336: record the device-metrics params a successful viewport/device set applied,
+// and that this domain set them last.
+function rememberDeviceMetrics(tabId, owner, params) {
+  let record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
+  if (!record) {
+    record = { viewport: null, device: null, lastOwner: null };
+    EMULATION_DEVICE_METRICS_BY_TAB.set(tabId, record);
+  }
+  record[owner] = params;
+  record.lastOwner = owner;
+}
+
 // #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
 // stale cleanup) so each enumerates the same ledger field, baseline map and page
 // shim for every emulation domain in one place.
@@ -13500,6 +13553,7 @@ async function cleanupFailedEmulationSet(tabId, domain, wiring, cause) {
 // drops them); a closed tab is pruned by the closed-tab ledger prune.
 function forgetEmulationOverridesForTab(tabId) {
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
   GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);

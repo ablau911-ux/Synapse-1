@@ -344,6 +344,14 @@ pub async fn cdp_set_viewport_size_with_mobile(
     )
     .await?;
     let readback = viewport_readback(endpoint, target_id).await?;
+    if let Some(detail) = viewport_override_mismatch(&requested, &readback.metrics) {
+        let _ = run_device_metrics_command(endpoint, target_id, DeviceMetricsCommand::Reset).await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set viewport did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpViewportResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -398,6 +406,25 @@ pub async fn cdp_apply_device_descriptor(
     )
     .await?;
     let readback = device_readback(endpoint, target_id).await?;
+    if let Some(detail) = device_descriptor_mismatch(&descriptor, &readback.metrics) {
+        let original_user_agent = original_user_agents()
+            .lock()
+            .ok()
+            .and_then(|mut originals| originals.remove(&device_registry_key(endpoint, target_id)));
+        let _ = run_device_descriptor_command(
+            endpoint,
+            target_id,
+            DeviceDescriptorCommand::Reset {
+                original_user_agent,
+            },
+        )
+        .await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set device did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpDeviceResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -530,6 +557,15 @@ pub async fn cdp_set_locale_timezone_override(
     )
     .await?;
     let readback = locale_timezone_readback(endpoint, target_id).await?;
+    if let Some(detail) = locale_timezone_override_mismatch(&requested, &readback.metrics) {
+        let _ =
+            run_locale_timezone_command(endpoint, target_id, LocaleTimezoneCommand::Reset).await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set locale/timezone did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpLocaleTimezoneResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -572,6 +608,14 @@ pub async fn cdp_set_media_override(
     validate_media_override(&requested)?;
     run_media_command(endpoint, target_id, MediaCommand::Set(requested.clone())).await?;
     let readback = media_readback(endpoint, target_id).await?;
+    if let Some(detail) = media_override_mismatch(&requested, &readback.metrics) {
+        let _ = run_media_command(endpoint, target_id, MediaCommand::Reset).await;
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "emulate set media did not take effect: {detail}; the override was cleared"
+            ),
+        });
+    }
     Ok(CdpMediaResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -1337,6 +1381,136 @@ pub fn durable_emulation_overrides_disable_and_drain_all() -> CdpEmulationOverri
         failures: Vec::new(),
         active_after,
     }
+}
+
+// Rule 2: a set whose page readback contradicts the request did not take
+// effect, so it is an error rather than a false success. Each helper compares
+// only values a page reports back unambiguously for its domain and returns a
+// human-readable mismatch, or `None` when the readback agrees or carries
+// nothing comparable. On `Some`, the caller clears the override and forgets the
+// domain. Geolocation (an async, permission-gated position) and network
+// conditions (only weakly observable through `navigator`) carry nothing exact,
+// so they have no helper and are never compared.
+
+/// Viewport — the live-reproduced failure. The emulated layout viewport is
+/// reported by `innerWidth`/`innerHeight`; the device scale factor is not
+/// compared because `devicePixelRatio` can legitimately round.
+fn viewport_override_mismatch(
+    requested: &CdpViewportOverride,
+    readback: &CdpViewportReadback,
+) -> Option<String> {
+    let want_width = i64::from(requested.width);
+    let want_height = i64::from(requested.height);
+    if readback.inner_width == want_width && readback.inner_height == want_height {
+        return None;
+    }
+    Some(format!(
+        "requested inner size {want_width}x{want_height} but the page read {}x{}",
+        readback.inner_width, readback.inner_height
+    ))
+}
+
+/// Device descriptor — the user agent round-trips exactly through
+/// `navigator.userAgent`, and the emulated viewport is compared as above.
+fn device_descriptor_mismatch(
+    requested: &CdpDeviceDescriptor,
+    readback: &CdpDeviceReadback,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    if readback.user_agent != requested.user_agent {
+        problems.push(format!(
+            "requested user_agent {:?} but the page read {:?}",
+            requested.user_agent, readback.user_agent
+        ));
+    }
+    let want_width = i64::from(requested.width);
+    let want_height = i64::from(requested.height);
+    if readback.viewport.inner_width != want_width || readback.viewport.inner_height != want_height
+    {
+        problems.push(format!(
+            "requested inner size {want_width}x{want_height} but the page read {}x{}",
+            readback.viewport.inner_width, readback.viewport.inner_height
+        ));
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
+}
+
+/// Media — each requested feature maps to a `matchMedia` boolean the readback
+/// carries directly, so every set feature is comparable.
+fn media_override_mismatch(
+    requested: &CdpMediaOverride,
+    readback: &CdpMediaReadback,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    if let Some(scheme) = requested.color_scheme.as_deref() {
+        let honored = match scheme {
+            "light" => readback.color_scheme_light,
+            "dark" => readback.color_scheme_dark,
+            "no-preference" => readback.color_scheme_no_preference,
+            _ => true,
+        };
+        if !honored {
+            problems.push(format!(
+                "color_scheme={scheme} not reflected (light={}, dark={}, no-preference={})",
+                readback.color_scheme_light,
+                readback.color_scheme_dark,
+                readback.color_scheme_no_preference
+            ));
+        }
+    }
+    if let Some(motion) = requested.reduced_motion.as_deref() {
+        let honored = match motion {
+            "reduce" => readback.reduced_motion_reduce,
+            "no-preference" => readback.reduced_motion_no_preference,
+            _ => true,
+        };
+        if !honored {
+            problems.push(format!(
+                "reduced_motion={motion} not reflected (reduce={}, no-preference={})",
+                readback.reduced_motion_reduce, readback.reduced_motion_no_preference
+            ));
+        }
+    }
+    if let Some(media) = requested.media.as_deref() {
+        let honored = match media {
+            "screen" => readback.media_screen,
+            "print" => readback.media_print,
+            _ => true,
+        };
+        if !honored {
+            problems.push(format!(
+                "media={media} not reflected (screen={}, print={})",
+                readback.media_screen, readback.media_print
+            ));
+        }
+    }
+    if problems.is_empty() {
+        None
+    } else {
+        Some(problems.join("; "))
+    }
+}
+
+/// Locale/timezone — only the timezone is compared: an IANA id round-trips
+/// exactly through `Intl.DateTimeFormat().resolvedOptions().timeZone`, whereas a
+/// requested BCP-47 locale can be legitimately normalised (case, subtag order)
+/// by the engine, so comparing it would reject correct sets.
+fn locale_timezone_override_mismatch(
+    requested: &CdpLocaleTimezoneOverride,
+    readback: &CdpLocaleTimezoneReadback,
+) -> Option<String> {
+    let timezone_id = requested.timezone_id.as_deref()?;
+    if timezone_id.is_empty() || readback.time_zone == timezone_id {
+        return None;
+    }
+    Some(format!(
+        "requested timezone_id {timezone_id:?} but the page read time_zone {:?}",
+        readback.time_zone
+    ))
 }
 
 async fn run_device_metrics_command(

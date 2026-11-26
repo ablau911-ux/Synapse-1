@@ -1007,14 +1007,14 @@ fn one_line(text: &str) -> String {
 fn validate_params(params: &AgentQueryParams) -> Result<(), ErrorData> {
     if params.session_id.trim().is_empty() {
         return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_QUERY_SESSION_ID_EMPTY",
             "AGENT_QUERY_SESSION_ID_EMPTY: session_id must be a non-empty MCP session id or \
              agent-spawn-* id",
         ));
     }
     if params.max_events == 0 || params.max_events > MAX_MAX_EVENTS {
         return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_QUERY_MAX_EVENTS_INVALID",
             format!(
                 "AGENT_QUERY_MAX_EVENTS_INVALID: max_events must be 1..={MAX_MAX_EVENTS}, got {}",
                 params.max_events
@@ -1023,7 +1023,7 @@ fn validate_params(params: &AgentQueryParams) -> Result<(), ErrorData> {
     }
     if params.lookback_ms == 0 || params.lookback_ms > MAX_LOOKBACK_MS {
         return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_QUERY_LOOKBACK_INVALID",
             format!(
                 "AGENT_QUERY_LOOKBACK_INVALID: lookback_ms must be 1..={MAX_LOOKBACK_MS}, got {}",
                 params.lookback_ms
@@ -1033,7 +1033,7 @@ fn validate_params(params: &AgentQueryParams) -> Result<(), ErrorData> {
     if params.deep && (params.deep_timeout_ms == 0 || params.deep_timeout_ms > MAX_DEEP_TIMEOUT_MS)
     {
         return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_QUERY_DEEP_TIMEOUT_INVALID",
             format!(
                 "AGENT_QUERY_DEEP_TIMEOUT_INVALID: deep_timeout_ms must be 1..={MAX_DEEP_TIMEOUT_MS}, got {}",
                 params.deep_timeout_ms

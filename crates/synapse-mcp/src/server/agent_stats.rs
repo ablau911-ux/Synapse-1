@@ -357,22 +357,29 @@ fn resolve_options(params: &AgentStatsParams) -> Result<Option<usize>, ErrorData
     if let (Some(since), Some(until)) = (params.since_ns, params.until_ns)
         && since >= until
     {
-        return Err(invalid_params(format!(
-            "AGENT_STATS_RANGE_INVALID: since_ns {since} must be < until_ns {until}"
-        )));
+        return Err(mcp_error(
+            "AGENT_STATS_RANGE_INVALID",
+            format!("AGENT_STATS_RANGE_INVALID: since_ns {since} must be < until_ns {until}"),
+        ));
     }
     let limit = params.per_agent_limit.unwrap_or(DEFAULT_PER_AGENT_LIMIT);
     if !(1..=MAX_PER_AGENT_LIMIT).contains(&limit) {
-        return Err(invalid_params(format!(
-            "AGENT_STATS_LIMIT_INVALID: per_agent_limit must be 1..={MAX_PER_AGENT_LIMIT}, got {limit}"
-        )));
+        return Err(mcp_error(
+            "AGENT_STATS_LIMIT_INVALID",
+            format!(
+                "AGENT_STATS_LIMIT_INVALID: per_agent_limit must be 1..={MAX_PER_AGENT_LIMIT}, got {limit}"
+            ),
+        ));
     }
     match params.group_by.as_deref() {
         None | Some("fleet") => Ok(None),
         Some("agent") => Ok(Some(limit as usize)),
-        Some(other) => Err(invalid_params(format!(
-            "AGENT_STATS_GROUP_BY_INVALID: group_by must be `fleet` or `agent`, got {other:?}"
-        ))),
+        Some(other) => Err(mcp_error(
+            "AGENT_STATS_GROUP_BY_INVALID",
+            format!(
+                "AGENT_STATS_GROUP_BY_INVALID: group_by must be `fleet` or `agent`, got {other:?}"
+            ),
+        )),
     }
 }
 
@@ -823,14 +830,42 @@ const fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-fn invalid_params(detail: String) -> ErrorData {
-    mcp_error(error_codes::TOOL_PARAMS_INVALID, detail)
-}
-
 /// Smallest key strictly greater than `key` (append a zero byte). Pages past
 /// the last row of a scan window without re-reading it.
 fn key_after(key: &[u8]) -> Vec<u8> {
     let mut next = key.to_vec();
     next.push(0);
     next
+}
+
+#[cfg(test)]
+mod parameter_code_tests {
+    use super::*;
+
+    #[test]
+    fn validation_codes_survive_the_agent_facade() -> Result<(), String> {
+        for (params, expected) in [
+            (
+                json!({"since_ns": 5, "until_ns": 1}),
+                "AGENT_STATS_RANGE_INVALID",
+            ),
+            (json!({"group_by": "bogus"}), "AGENT_STATS_GROUP_BY_INVALID"),
+            (json!({"per_agent_limit": 0}), "AGENT_STATS_LIMIT_INVALID"),
+        ] {
+            let params = serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let error = resolve_options(&params)
+                .err()
+                .ok_or("expected invalid parameters")?;
+            let wrapped = crate::server::delegate_errors::delegate_error(
+                "agent",
+                "stats",
+                "CF_AGENT_EVENTS",
+                "fleet",
+                error,
+                "fix parameters",
+            );
+            assert_eq!(crate::m1::error_code(&wrapped), Some(expected));
+        }
+        Ok(())
+    }
 }

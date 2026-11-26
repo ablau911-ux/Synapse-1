@@ -1518,7 +1518,7 @@ pub(super) fn write_agent_spawn_task_started_from_session(
     let log_dir = root.join(spawn_id);
     if !log_dir.is_dir() {
         return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_NOT_FOUND",
             format!(
                 "agent_spawn_task_started refused unknown spawn_id {spawn_id:?}: no spawn directory at {}",
                 log_dir.display()

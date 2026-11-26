@@ -65,9 +65,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 struct InitScriptSlot {
     endpoint: String,
     target_id: String,
+    /// Distinguishes this slot from a later one opened at the same key, so the
+    /// reaper only ever evicts its own entry, never a replacement.
+    slot_id: u64,
     page: chromiumoxide::Page,
     _browser: Browser,
     handler_task: tokio::task::JoinHandle<()>,
+    /// A page-scoped event stream kept only as a liveness sentinel: Chrome ends
+    /// it when the target is destroyed, so this task finishes and reaps the slot
+    /// without waiting for the next add/remove on that target.
+    listener_task: tokio::task::JoinHandle<()>,
     /// Identifiers Chrome returned for scripts still registered on this session.
     identifiers: Mutex<HashSet<String>>,
 }
@@ -75,6 +82,7 @@ struct InitScriptSlot {
 impl Drop for InitScriptSlot {
     fn drop(&mut self) {
         self.handler_task.abort();
+        self.listener_task.abort();
     }
 }
 
@@ -92,6 +100,31 @@ fn init_script_slot_key(endpoint: &str, target_id: &str) -> String {
     format!("{endpoint}\n{target_id}")
 }
 
+fn next_init_script_slot_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A slot is dead once either its browser connection (`handler_task`) or its
+/// target (`listener_task`, the page-scoped sentinel) has gone.
+fn init_script_slot_live(slot: &InitScriptSlot) -> bool {
+    !slot.handler_task.is_finished() && !slot.listener_task.is_finished()
+}
+
+/// Removes a slot whose target was destroyed, identified by `slot_id` so a
+/// replacement slot opened at the same key after this one is never evicted. Run
+/// by the sentinel task the moment the target's event stream ends, so a closed
+/// tab releases its CDP session without waiting for the next call or the drain.
+fn reap_dead_init_script_slot(endpoint: &str, target_id: &str, slot_id: u64) {
+    let key = init_script_slot_key(endpoint, target_id);
+    let Ok(mut slots) = init_script_slot_registry().slots.lock() else {
+        return;
+    };
+    if slots.get(&key).is_some_and(|slot| slot.slot_id == slot_id) {
+        slots.remove(&key);
+    }
+}
+
 /// Returns the live slot for a target, dropping and forgetting one whose session
 /// has already ended (target gone or connection lost) so a later remove honestly
 /// reports the script as no longer registered.
@@ -99,7 +132,7 @@ fn lookup_live_init_script_slot(endpoint: &str, target_id: &str) -> Option<Arc<I
     let key = init_script_slot_key(endpoint, target_id);
     let mut slots = init_script_slot_registry().slots.lock().ok()?;
     match slots.get(&key) {
-        Some(slot) if !slot.handler_task.is_finished() => Some(Arc::clone(slot)),
+        Some(slot) if init_script_slot_live(slot) => Some(Arc::clone(slot)),
         Some(_) => {
             slots.remove(&key);
             None
@@ -142,12 +175,53 @@ async fn get_or_create_init_script_slot(
         }
     };
 
+    // Subscribe to one page-scoped event purely as a liveness sentinel. We never
+    // read the events; what matters is that Chrome ends this stream when the
+    // target is destroyed (navigation keeps it open — frameNavigated just fires
+    // and is ignored). Page.enable makes the subscription valid. When the stream
+    // ends, the task below reaps the slot, so a closed tab does not leak its CDP
+    // session. On any setup failure, abort the handler so the connection closes.
+    let sentinel = async {
+        page.execute(PageEnableParams::default())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.enable for init-script session sentinel: {err}"),
+            })?;
+        page.event_listener::<EventFrameNavigated>()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("subscribe Page.frameNavigated for init-script sentinel: {err}"),
+            })
+    }
+    .await;
+    let mut target_gone = match sentinel {
+        Ok(stream) => stream,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    let slot_id = next_init_script_slot_id();
+    let listener_task = {
+        let listener_page = page.clone();
+        let listener_endpoint = endpoint.to_owned();
+        let listener_target = target_id.to_owned();
+        tokio::spawn(async move {
+            let _page = listener_page;
+            while target_gone.next().await.is_some() {}
+            reap_dead_init_script_slot(&listener_endpoint, &listener_target, slot_id);
+        })
+    };
+
     let slot = Arc::new(InitScriptSlot {
         endpoint: endpoint.to_owned(),
         target_id: target_id.to_owned(),
+        slot_id,
         page,
         _browser: browser,
         handler_task,
+        listener_task,
         identifiers: Mutex::new(HashSet::new()),
     });
 
@@ -156,7 +230,7 @@ async fn get_or_create_init_script_slot(
         A11yError::internal("init-script slot registry lock poisoned while inserting slot")
     })?;
     match slots.get(&key) {
-        Some(existing) if !existing.handler_task.is_finished() => Ok(Arc::clone(existing)),
+        Some(existing) if init_script_slot_live(existing) => Ok(Arc::clone(existing)),
         _ => {
             slots.insert(key, Arc::clone(&slot));
             Ok(slot)

@@ -2819,10 +2819,17 @@ fn acquire_tool_foreground_input_lease_with_ttl(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ClickDeltaSignature {
+    /// The observed window can be a background target, not the OS foreground.
+    window_source: &'static str,
+    #[serde(rename = "observed_window_hwnd")]
     foreground_hwnd: i64,
+    #[serde(rename = "observed_window_pid")]
     foreground_pid: u32,
+    #[serde(rename = "observed_window_process")]
     foreground_process: String,
+    #[serde(rename = "observed_window_title")]
     foreground_title: String,
+    #[serde(rename = "observed_window_title_sha256")]
     foreground_title_sha256: Option<String>,
     focused_element_id: Option<String>,
     focused_role: Option<String>,
@@ -3968,6 +3975,11 @@ impl SynapseService {
         let foreground_title_sha256 = non_empty_sha256(&input.foreground.window_title);
         let pixel = capture_pixel_signature(input.foreground.window_bounds);
         Ok(ClickDeltaSignature {
+            window_source: if target_window_hwnd.is_some() {
+                "target_window"
+            } else {
+                "os_foreground_window"
+            },
             foreground_hwnd: input.foreground.hwnd,
             foreground_pid: input.foreground.pid,
             foreground_process: input.foreground.process_name,

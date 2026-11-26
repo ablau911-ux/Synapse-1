@@ -268,11 +268,6 @@ enum MediaCommand {
     Reset,
 }
 
-enum NetworkConditionsCommand {
-    Set(CdpNetworkConditionsOverride),
-    Reset,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GeolocationPermissionSetting {
     Granted,
@@ -670,87 +665,40 @@ pub async fn cdp_reset_media_override(
     })
 }
 
-/// Applies offline/throttling network conditions to one CDP page target, then
-/// reads back page-visible navigator network state from the same target.
-pub async fn cdp_set_network_conditions(
-    endpoint: &str,
-    target_id: &str,
-    requested: CdpNetworkConditionsOverride,
+/// Raw-CDP network-conditions emulation cannot be held, so a set always refuses.
+///
+/// Chrome clears a target's whole network-conditions override — offline flag and
+/// throttle alike — the instant any other DevTools client of the target
+/// disconnects, and every Synapse raw-CDP tool call opens and closes its own
+/// connection, so a set could never outlive even its own readback. There is also
+/// no page-visible proof of a throttle and no CDP getter for the current
+/// conditions, so durability could never be proven. The request is validated for
+/// a precise error on malformed input, then refused — nothing is sent to Chrome
+/// and no domain is recorded. Hold network conditions with a Chrome bridge tab.
+pub fn cdp_set_network_conditions(
+    _endpoint: &str,
+    _target_id: &str,
+    requested: &CdpNetworkConditionsOverride,
 ) -> A11yResult<CdpNetworkConditionsResult> {
-    validate_network_conditions_override(&requested)?;
-    // Item 3: one critical section across the set and its readback.
-    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-    run_network_conditions_command(
-        endpoint,
-        target_id,
-        NetworkConditionsCommand::Set(requested.clone()),
-    )
-    .await?;
-    let readback = network_conditions_readback(endpoint, target_id).await?;
-    // Durability check. The readback above already opened and closed a connection
-    // — the disconnect that makes Chrome drop the target's whole network-conditions
-    // override (offline flag and throttle alike) — so answer ok only when the
-    // override is proven still in force after it.
-    //
-    // `offline:true` is provable: `navigator.onLine` is page-visible, so probe it
-    // through the slot's own session. A throttle-only request (`offline:false`) is
-    // not: nothing page-visible reflects the throttle, and the CDP Network domain
-    // has no getter for the current emulated conditions (only enable / disable /
-    // emulateNetworkConditions), so survival cannot be proven at all — fail with
-    // the same clear error worded for throttling. Either way the recorded domain
-    // is forgotten so nothing is left behind.
-    if requested.offline {
-        let survived = match lookup_live_emulation_slot(endpoint, target_id) {
-            Some(slot) => network_offline_override_survived(&slot).await?,
-            None => false,
-        };
-        if !survived {
-            let _ = run_network_conditions_command(
-                endpoint,
-                target_id,
-                NetworkConditionsCommand::Reset,
-            )
-            .await;
-            return Err(A11yError::CdpAxtreeFailed {
-                detail: "Chrome cleared the network-conditions override when another \
-                         DevTools session of the target closed; raw-CDP network \
-                         emulation cannot be held across tool calls; use a normal \
-                         Chrome bridge tab"
-                    .to_owned(),
-            });
-        }
-    } else {
-        let _ =
-            run_network_conditions_command(endpoint, target_id, NetworkConditionsCommand::Reset)
-                .await;
-        return Err(A11yError::CdpAxtreeFailed {
-            detail: "raw-CDP network throttling cannot be held across tool calls: Chrome \
-                     clears a target's network conditions when another DevTools session of \
-                     the target closes; use a normal Chrome bridge tab"
-                .to_owned(),
-        });
-    }
-    Ok(CdpNetworkConditionsResult {
-        endpoint: endpoint.to_owned(),
-        cdp_target_id: readback.target_id,
-        operation: "set".to_owned(),
-        requested: Some(requested),
-        page_url: readback.url,
-        page_title: readback.title,
-        ready_state: readback.ready_state,
-        readback: readback.metrics,
+    validate_network_conditions_override(requested)?;
+    Err(A11yError::CdpAxtreeFailed {
+        detail: "raw-CDP network emulation cannot be held across tool calls: Chrome \
+                 clears a target's network conditions when another DevTools session of \
+                 the target closes; use a normal Chrome bridge tab"
+            .to_owned(),
     })
 }
 
 /// Clears network-condition emulation for one CDP page target by restoring
-/// Chromium's online/full-speed defaults.
+/// Chromium's online/full-speed defaults. Conditions cannot be *held* on raw CDP
+/// (see [`cdp_set_network_conditions`]), but a reset is an instantaneous clear and
+/// still answers ok.
 pub async fn cdp_reset_network_conditions(
     endpoint: &str,
     target_id: &str,
 ) -> A11yResult<CdpNetworkConditionsResult> {
-    // Item 3: hold the operation lock across the reset and its readback.
     let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-    run_network_conditions_command(endpoint, target_id, NetworkConditionsCommand::Reset).await?;
+    reset_network_conditions_on_target(endpoint, target_id).await?;
     let readback = network_conditions_readback(endpoint, target_id).await?;
     Ok(CdpNetworkConditionsResult {
         endpoint: endpoint.to_owned(),
@@ -1105,7 +1053,6 @@ enum EmulationDomain {
     Geolocation,
     LocaleTimezone,
     Media,
-    Network,
 }
 
 /// One long-lived raw-CDP session that keeps a target's emulation overrides
@@ -2193,109 +2140,45 @@ async fn run_media_command(
     result
 }
 
-/// Proves whether an `offline:true` network override actually survived on a
-/// target, by reading `navigator.onLine` back through the slot's own,
-/// still-open session (no new connection, and lock-free so a holder of the
-/// operation lock can call it).
-///
-/// Raw-CDP network emulation cannot be held across tool calls: Chrome clears a
-/// target's network-conditions override the instant any *other* DevTools client
-/// of that target disconnects, and every Synapse raw-CDP call opens and closes
-/// its own connection (`with_target_page`, each evaluate readback, …). The set's
-/// own readback connection closing is exactly that disconnect, so by the time
-/// this runs the override is already gone unless Chrome has changed. Returns
-/// `true` only if the page still reports itself offline.
-async fn network_offline_override_survived(slot: &EmulationSlot) -> A11yResult<bool> {
-    let online = slot
-        .page
-        .evaluate_expression("navigator.onLine")
-        .await
-        .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("Runtime.evaluate navigator.onLine durability probe: {err}"),
-        })?
-        .into_value::<bool>()
-        .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("navigator.onLine durability probe decode: {err}"),
-        })?;
-    Ok(!online)
-}
-
+/// Restores Chromium's online / full-speed network defaults on one CDP page
+/// target through a throwaway connection. Network conditions cannot be held on
+/// raw CDP (see [`cdp_set_network_conditions`]), so there is no slot to reuse and
+/// no domain to record — this is a one-shot clear.
 #[allow(deprecated)]
-async fn run_network_conditions_command(
-    endpoint: &str,
-    target_id: &str,
-    command: NetworkConditionsCommand,
-) -> A11yResult<()> {
-    use chromiumoxide::cdp::browser_protocol::network::{
-        ConnectionType, EmulateNetworkConditionsParams, EnableParams as NetworkEnableParams,
-    };
+async fn reset_network_conditions_on_target(endpoint: &str, target_id: &str) -> A11yResult<()> {
+    use chromiumoxide::Browser;
+    use chromiumoxide::cdp::browser_protocol::network::EmulateNetworkConditionsParams;
+    use futures_util::StreamExt as _;
 
-    // The caller holds the durable browser-mutation operation lock; see
-    // `run_device_metrics_command`.
-    let is_set = matches!(command, NetworkConditionsCommand::Set(_));
-    let ctx = EmulationContext::acquire(endpoint, target_id, is_set).await?;
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let result = async {
-        let page = ctx.page();
-        let params = match command {
-            NetworkConditionsCommand::Set(requested) => {
-                let mut builder = EmulateNetworkConditionsParams::builder()
-                    .offline(requested.offline)
-                    .latency(requested.latency_ms)
-                    .download_throughput(requested.download_throughput_bytes_per_sec)
-                    .upload_throughput(requested.upload_throughput_bytes_per_sec);
-                if let Some(connection_type) = requested.connection_type.as_deref() {
-                    let parsed = connection_type.parse::<ConnectionType>().map_err(|err| {
-                        A11yError::CdpAxtreeFailed {
-                            detail: format!("connection_type {connection_type:?}: {err}"),
-                        }
-                    })?;
-                    builder = builder.connection_type(parsed);
-                }
-                builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Network.emulateNetworkConditions params: {err}"),
-                })?
-            }
-            NetworkConditionsCommand::Reset => EmulateNetworkConditionsParams::builder()
-                .offline(false)
-                .latency(0.0)
-                .download_throughput(-1.0)
-                .upload_throughput(-1.0)
-                .build()
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Network.emulateNetworkConditions reset params: {err}"),
-                })?,
-        };
-        // A network condition only applies while the session that set it has the
-        // Network domain enabled, so enable it on the slot before an offline /
-        // throttle set. This does NOT make the override durable — Chrome clears it
-        // when any other DevTools client of the target disconnects (see
-        // `network_offline_override_survived`) — but the override must apply at
-        // all so the durability probe can tell "survived" from "gone". A reset
-        // only clears, so it needs no enable.
-        if is_set {
-            page.execute(NetworkEnableParams::default())
-                .await
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Network.enable for network conditions: {err}"),
-                })?;
-        }
+        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let params = EmulateNetworkConditionsParams::builder()
+            .offline(false)
+            .latency(0.0)
+            .download_throughput(-1.0)
+            .upload_throughput(-1.0)
+            .build()
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Network.emulateNetworkConditions reset params: {err}"),
+            })?;
         page.execute(params)
             .await
             .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Network.emulateNetworkConditions: {err}"),
+                detail: format!("Network.emulateNetworkConditions reset: {err}"),
             })?;
         Ok::<(), A11yError>(())
     }
     .await;
 
-    ctx.finish(
-        endpoint,
-        target_id,
-        EmulationDomain::Network,
-        is_set,
-        result.is_ok(),
-    )?;
+    handler_task.abort();
     result
 }
 

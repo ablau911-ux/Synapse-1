@@ -421,7 +421,7 @@ impl SynapseService {
                     let result = synapse_a11y::cdp_set_network_conditions(
                         &endpoint,
                         cdp_target_id,
-                        synapse_a11y::CdpNetworkConditionsOverride {
+                        &synapse_a11y::CdpNetworkConditionsOverride {
                             offline: network.offline.unwrap_or(false),
                             latency_ms: network.latency_ms.unwrap_or(0.0),
                             download_throughput_bytes_per_sec: network
@@ -433,7 +433,6 @@ impl SynapseService {
                             connection_type: network.connection_type.clone(),
                         },
                     )
-                    .await
                     .map_err(|error| emulate_error(BrowserEmulateDomain::Network, error))?;
                     super::operator_panic_boundary::ensure_mcp_mutation(
                         "browser_emulate_after_raw_network_command",

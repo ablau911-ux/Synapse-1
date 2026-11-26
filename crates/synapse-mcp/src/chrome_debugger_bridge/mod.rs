@@ -3162,6 +3162,12 @@ pub struct ChromeDebuggerGeolocationReadback {
     pub position: Option<ChromeDebuggerGeolocationCoordinatesReadback>,
     #[serde(default)]
     pub error: Option<ChromeDebuggerGeolocationErrorReadback>,
+    /// True when only the in-page shim answered geolocation (the real
+    /// `Browser.setPermission` grant did not take), so a "granted"
+    /// `permission_state`/`permission_setting` is shim-only, not a real browser
+    /// grant (#344). The extension reports this flag.
+    #[serde(default)]
+    pub emulated_by_shim: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -10035,6 +10041,9 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "permission_state": result
                 .get("geolocation")
                 .and_then(|value| value.get("permission_state")),
+            "emulated_by_shim": result
+                .get("geolocation")
+                .and_then(|value| value.get("emulated_by_shim")),
             "position_returned": result
                 .get("geolocation")
                 .and_then(|value| value.get("position"))

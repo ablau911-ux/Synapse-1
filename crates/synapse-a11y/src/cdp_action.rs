@@ -5766,16 +5766,26 @@ async fn dispatch_cdp_mouse_stroke_raw(
     .await;
     if let Err(release_error) = release_result {
         // #341: the button-press was delivered (we are past the press-error
-        // return); a release that then fails because the button-down closed its
-        // own target is a delivered stroke. The shared helper confirms the
-        // target is gone and resolves the owner, or keeps the fail-closed owner.
+        // return), so a failure of any later event of the stroke is settled by
+        // the same "is the target gone?" question — whether a drag move broke
+        // the loop (`dispatch_failure`) or this release failed. The absence
+        // check turns only on press delivery, so the drag-move error must not
+        // gate it; it is folded into the detail so it is never lost. Target
+        // absent: delivered, owner resolved. Target present or inconclusive:
+        // today's fail-closed owner, with both errors reported.
+        let release_detail = dispatch_failure.as_ref().map_or_else(
+            || release_error.to_string(),
+            |move_error| {
+                format!("drag move not acknowledged: {move_error}; release: {release_error}")
+            },
+        );
         let settled = settle_failed_release_after_press(
             endpoint,
             target_id,
             &owner,
             true,
-            dispatch_failure,
-            release_error.to_string(),
+            None,
+            release_detail,
             "mouse-down",
             "mouse release acknowledgement was not proven",
         )

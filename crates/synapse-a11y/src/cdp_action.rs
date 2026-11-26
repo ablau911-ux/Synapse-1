@@ -5804,6 +5804,7 @@ fn record_unresolved_input_release(
 /// unresolved-release error is returned — a live target, an inconclusive
 /// inventory, or an undelivered press is never reported as released. One owner
 /// for this decision across the key, click and touch lanes.
+#[allow(clippy::too_many_arguments)]
 async fn settle_failed_release_after_press(
     endpoint: &str,
     target_id: &str,

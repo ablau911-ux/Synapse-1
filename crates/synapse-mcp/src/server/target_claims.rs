@@ -1000,7 +1000,7 @@ impl SynapseService {
         ),
         ErrorData,
     > {
-        let (requester, owner) = {
+        let (requester, mut owner) = {
             let guard = self.session_registry_ref().lock().map_err(|_error| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
@@ -1072,18 +1072,6 @@ impl SynapseService {
                 Some(&owner),
             ));
         }
-        let owner_idle_ms = now_unix_ms.saturating_sub(owner.last_seen_unix_ms);
-        if owner_idle_ms < TARGET_CLAIM_ADOPT_MIN_IDLE_MS {
-            return Err(adopt_refused_error(
-                requester_session_id,
-                owner_session_id,
-                &format!(
-                    "owner has been idle for {owner_idle_ms} ms; an older idle same-agent owner must be idle for at least {TARGET_CLAIM_ADOPT_MIN_IDLE_MS} ms to avoid takeover between tool calls"
-                ),
-                Some(&requester),
-                Some(&owner),
-            ));
-        }
         let owner_in_flight =
             match crate::daemon_lifecycle::in_flight_tool_calls_for_session(owner_session_id) {
                 Ok(calls) => calls,
@@ -1100,6 +1088,42 @@ impl SynapseService {
                 owner_session_id,
                 owner_in_flight,
                 "owner session has in-flight tool calls",
+            ));
+        }
+        // Completion refreshes activity before clearing the ledger entry. Read
+        // it again after observing an empty ledger, not from the earlier snapshot.
+        owner = self
+            .session_registry_ref()
+            .lock()
+            .map_err(|_| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned while refreshing adoption owner activity",
+                )
+            })?
+            .reads(now_unix_ms)
+            .into_iter()
+            .find(|read| read.session_id == owner_session_id)
+            .filter(|read| read.lifecycle == "live")
+            .ok_or_else(|| {
+                adopt_refused_error(
+                    requester_session_id,
+                    owner_session_id,
+                    "owner session is no longer live",
+                    Some(&requester),
+                    Some(&owner),
+                )
+            })?;
+        let owner_idle_ms = now_unix_ms.saturating_sub(owner.last_seen_unix_ms);
+        if owner_idle_ms < TARGET_CLAIM_ADOPT_MIN_IDLE_MS {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                &format!(
+                    "owner has been idle for {owner_idle_ms} ms; an older idle same-agent owner must be idle for at least {TARGET_CLAIM_ADOPT_MIN_IDLE_MS} ms to avoid takeover between tool calls"
+                ),
+                Some(&requester),
+                Some(&owner),
             ));
         }
         let lease_status = synapse_action::lease::status();
@@ -1150,11 +1174,14 @@ impl TargetClaimRegistry {
     pub(crate) fn claim(
         &mut self,
         session_id: &str,
-        target: SessionTarget,
+        mut target: SessionTarget,
         ttl_ms: u64,
         now_unix_ms: u64,
         live_sessions: &BTreeSet<String>,
     ) -> Result<(TargetClaimEntry, &'static str), TargetClaimConflict> {
+        if let SessionTarget::Cdp { cdp_target_id, .. } = &mut target {
+            cdp_target_id.make_ascii_lowercase();
+        }
         let target_key = target_key(&target);
         if let Some(existing) = self.claims.get(&target_key)
             && existing.owner_session_id != session_id
@@ -1281,7 +1308,10 @@ pub(crate) fn target_key(target: &SessionTarget) -> String {
         SessionTarget::Cdp {
             window_hwnd,
             cdp_target_id,
-        } => format!("cdp:0x{window_hwnd:x}:{cdp_target_id}"),
+        } => format!(
+            "cdp:0x{window_hwnd:x}:{}",
+            cdp_target_id.to_ascii_lowercase()
+        ),
     }
 }
 

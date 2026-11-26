@@ -218,6 +218,7 @@ pub struct TargetActParams {
     /// `click`: click count for target element clicks. Defaults to 1; valid range is 1..=3.
     /// `dblclick` defaults to 2 and rejects any other count.
     #[serde(default, alias = "clickCount")]
+    #[schemars(range(min = 1, max = 3))]
     pub clicks: Option<u8>,
     /// `click` / `dblclick`: mouse button for browser/native click delivery.
     #[serde(default)]
@@ -291,6 +292,7 @@ pub struct TargetActParams {
     pub working_dir: Option<String>,
     /// `run_shell`: inline wait budget (ms). Defaults to 30000.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
 }
 

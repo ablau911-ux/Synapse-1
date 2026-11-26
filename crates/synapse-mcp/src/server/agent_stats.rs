@@ -357,22 +357,29 @@ fn resolve_options(params: &AgentStatsParams) -> Result<Option<usize>, ErrorData
     if let (Some(since), Some(until)) = (params.since_ns, params.until_ns)
         && since >= until
     {
-        return Err(invalid_params(format!(
-            "AGENT_STATS_RANGE_INVALID: since_ns {since} must be < until_ns {until}"
-        )));
+        return Err(mcp_error(
+            "AGENT_STATS_RANGE_INVALID",
+            format!("AGENT_STATS_RANGE_INVALID: since_ns {since} must be < until_ns {until}"),
+        ));
     }
     let limit = params.per_agent_limit.unwrap_or(DEFAULT_PER_AGENT_LIMIT);
     if !(1..=MAX_PER_AGENT_LIMIT).contains(&limit) {
-        return Err(invalid_params(format!(
-            "AGENT_STATS_LIMIT_INVALID: per_agent_limit must be 1..={MAX_PER_AGENT_LIMIT}, got {limit}"
-        )));
+        return Err(mcp_error(
+            "AGENT_STATS_LIMIT_INVALID",
+            format!(
+                "AGENT_STATS_LIMIT_INVALID: per_agent_limit must be 1..={MAX_PER_AGENT_LIMIT}, got {limit}"
+            ),
+        ));
     }
     match params.group_by.as_deref() {
         None | Some("fleet") => Ok(None),
         Some("agent") => Ok(Some(limit as usize)),
-        Some(other) => Err(invalid_params(format!(
-            "AGENT_STATS_GROUP_BY_INVALID: group_by must be `fleet` or `agent`, got {other:?}"
-        ))),
+        Some(other) => Err(mcp_error(
+            "AGENT_STATS_GROUP_BY_INVALID",
+            format!(
+                "AGENT_STATS_GROUP_BY_INVALID: group_by must be `fleet` or `agent`, got {other:?}"
+            ),
+        )),
     }
 }
 
@@ -821,10 +828,6 @@ const fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
         (Some(v), None) | (None, Some(v)) => Some(v),
         (None, None) => None,
     }
-}
-
-fn invalid_params(detail: String) -> ErrorData {
-    mcp_error(error_codes::TOOL_PARAMS_INVALID, detail)
 }
 
 /// Smallest key strictly greater than `key` (append a zero byte). Pages past

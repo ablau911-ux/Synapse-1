@@ -218,6 +218,7 @@ pub struct TargetActParams {
     /// `click`: click count for target element clicks. Defaults to 1; valid range is 1..=3.
     /// `dblclick` defaults to 2 and rejects any other count.
     #[serde(default, alias = "clickCount")]
+    #[schemars(range(min = 1, max = 3))]
     pub clicks: Option<u8>,
     /// `click` / `dblclick`: mouse button for browser/native click delivery.
     #[serde(default)]
@@ -291,6 +292,7 @@ pub struct TargetActParams {
     pub working_dir: Option<String>,
     /// `run_shell`: inline wait budget (ms). Defaults to 30000.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub timeout_ms: Option<u64>,
 }
 
@@ -9916,13 +9918,12 @@ fn target_act_parse_key_chord(raw: &str, verb: &str) -> Result<Vec<String>, Erro
     let keys = raw
         .split('+')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if keys.is_empty() {
+    if keys.iter().any(String::is_empty) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("target_act verb={verb} key chord must contain at least one key"),
+            format!("target_act verb={verb} key names must be non-empty"),
         ));
     }
     Ok(keys)

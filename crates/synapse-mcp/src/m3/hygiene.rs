@@ -2634,6 +2634,15 @@ fn scan_text(text: &str, min_score: u32) -> Vec<HygieneTextMatch> {
         add_pattern_matches(text, &normalized, *pattern, &mut matches);
     }
     add_role_marker_matches(text, &normalized, &mut matches);
+    // Tags can either split visible words or encode an entire ASCII payload.
+    // Scan both views, preserving original byte spans in each normalization.
+    if text.chars().any(|ch| ascii_tag(ch).is_some()) {
+        let decoded = NormalizedText::with_decoded_tags(text);
+        for pattern in SUSPICIOUS_PATTERNS {
+            add_pattern_matches(text, &decoded, *pattern, &mut matches);
+        }
+        add_role_marker_matches(text, &decoded, &mut matches);
+    }
     add_zero_width_low_signal_matches(text, &mut matches);
     matches.retain(|item| item.score >= min_score);
     matches.sort_by(|left, right| {
@@ -2707,7 +2716,7 @@ fn add_role_marker_matches(
 
 fn add_zero_width_low_signal_matches(original: &str, matches: &mut Vec<HygieneTextMatch>) {
     for (index, ch) in original.char_indices() {
-        if is_zero_width(ch) {
+        if is_obfuscating_char(ch) {
             add_match(
                 matches,
                 original,
@@ -2923,15 +2932,24 @@ struct NormalizedText {
 
 impl NormalizedText {
     fn new(original: &str) -> Self {
+        Self::normalize(original, false)
+    }
+
+    fn with_decoded_tags(original: &str) -> Self {
+        Self::normalize(original, true)
+    }
+
+    fn normalize(original: &str, decode_tags: bool) -> Self {
         let mut text = String::with_capacity(original.len());
         let mut start_map = Vec::with_capacity(original.len());
         let mut end_map = Vec::with_capacity(original.len());
         for (index, ch) in original.char_indices() {
-            if is_zero_width(ch) {
+            let decoded = decode_tags.then(|| ascii_tag(ch)).flatten();
+            if decoded.is_none() && is_obfuscating_char(ch) {
                 continue;
             }
             let end = index + ch.len_utf8();
-            let mapped = normalize_char(ch);
+            let mapped = normalize_char(decoded.unwrap_or(ch));
             text.push(mapped);
             start_map.push(index);
             end_map.push(end);
@@ -2975,16 +2993,39 @@ fn confusable_ascii(ch: char) -> Option<char> {
     }
 }
 
-fn is_zero_width(ch: char) -> bool {
+fn ascii_tag(ch: char) -> Option<char> {
+    match ch {
+        '\u{E0020}'..='\u{E007E}' => char::from_u32(ch as u32 - 0xE0000),
+        _ => None,
+    }
+}
+
+fn is_obfuscating_char(ch: char) -> bool {
+    // Default-ignorable formatting characters, Unicode tags/variation selectors,
+    // and combining-mark blocks that can split otherwise recognizable words.
     matches!(
         ch,
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+        '\u{00AD}'
+            | '\u{0300}'..='\u{036F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FE20}'..='\u{FE2F}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
 fn is_obfuscated_span(span: &str) -> bool {
     span.chars()
-        .any(|ch| is_zero_width(ch) || (!ch.is_ascii() && confusable_ascii(ch).is_some()))
+        .any(|ch| is_obfuscating_char(ch) || (!ch.is_ascii() && confusable_ascii(ch).is_some()))
 }
 
 #[derive(Clone, Debug)]

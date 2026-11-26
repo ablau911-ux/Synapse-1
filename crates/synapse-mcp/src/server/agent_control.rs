@@ -1213,7 +1213,7 @@ impl SynapseService {
         let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_INTERRUPT)?;
         if target.dead {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_ALREADY_DEAD",
                 format!(
                     "AGENT_ALREADY_DEAD: agent {} (session {}) is closed; interrupt targets a live agent — use agent_kill to reclaim a dead agent's resources",
                     lookup, target.session_id
@@ -1606,14 +1606,14 @@ impl SynapseService {
         let instruction = params.instruction.trim();
         if instruction.is_empty() {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_STEER_EMPTY",
                 "AGENT_STEER_EMPTY: instruction must be a non-empty string of guidance to inject",
             ));
         }
         let instruction_chars = instruction.chars().count();
         if instruction_chars > MAX_STEER_INSTRUCTION_CHARS {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_STEER_TOO_LONG",
                 format!(
                     "AGENT_STEER_TOO_LONG: instruction is {instruction_chars} chars; the cooperative steering channel caps a single instruction at {MAX_STEER_INSTRUCTION_CHARS}"
                 ),
@@ -1622,7 +1622,7 @@ impl SynapseService {
         let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_STEER)?;
         if target.dead {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_ALREADY_DEAD",
                 format!(
                     "AGENT_ALREADY_DEAD: agent {} (session {}) is closed; steering targets a live agent",
                     lookup, target.session_id
@@ -2093,7 +2093,7 @@ impl SynapseService {
         let target = self.resolve_spawned_agent(&lookup, tool)?;
         if target.dead {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_ALREADY_DEAD",
                 format!(
                     "AGENT_ALREADY_DEAD: agent {} (session {}) is closed; {operation} targets a live agent",
                     lookup, target.session_id
@@ -2103,7 +2103,7 @@ impl SynapseService {
         let process = process_readback_for_target(&target);
         if process.live_process_ids.is_empty() {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_NO_LIVE_PROCESS",
                 format!(
                     "AGENT_NO_LIVE_PROCESS: agent {} (session {}) has no live process tree to {operation}",
                     lookup, target.session_id
@@ -2260,13 +2260,13 @@ impl SynapseService {
         let prompt = params.prompt.trim();
         if prompt.is_empty() {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_PROMPT_REQUIRED",
                 "AGENT_RESPAWN_PROMPT_REQUIRED: the original prompt is not persisted; supply the continued task prompt for the new instance",
             ));
         }
         if params.grace_ms > MAX_KILL_GRACE_MS {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_GRACE_INVALID",
                 format!(
                     "AGENT_RESPAWN_GRACE_INVALID: grace_ms must be 0..={MAX_KILL_GRACE_MS}, got {}",
                     params.grace_ms
@@ -2281,7 +2281,7 @@ impl SynapseService {
         let manifest = self.read_respawn_manifest(&target)?;
         let Some(cli_token) = spawn_cli_serde_token(&manifest.agent_kind) else {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_KIND_UNSUPPORTED",
                 format!(
                     "AGENT_RESPAWN_KIND_UNSUPPORTED: prior spawn manifest reports agent kind {:?}, which is not a respawnable CLI",
                     manifest.agent_kind
@@ -2643,7 +2643,7 @@ impl SynapseService {
             PathBuf::from(&target.log_dir).join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
         let bytes = fs::read(&manifest_path).map_err(|error| {
             mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_NO_MANIFEST",
                 format!(
                     "AGENT_RESPAWN_NO_MANIFEST: cannot read prior spawn manifest {}: {error}",
                     manifest_path.display()
@@ -2652,7 +2652,7 @@ impl SynapseService {
         })?;
         let manifest: Value = serde_json::from_slice(&bytes).map_err(|error| {
             mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_MANIFEST_INVALID",
                 format!(
                     "AGENT_RESPAWN_MANIFEST_INVALID: prior spawn manifest {} is not valid JSON: {error}",
                     manifest_path.display()
@@ -2677,7 +2677,7 @@ impl SynapseService {
             .or_else(|| string_field("effective_working_dir"))
             .ok_or_else(|| {
                 mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
+                    "AGENT_RESPAWN_WORKING_DIR_MISSING",
                     format!(
                         "AGENT_RESPAWN_WORKING_DIR_MISSING: prior spawn manifest {} has no working_dir/effective_working_dir; refusing to respawn into the daemon default cwd",
                         manifest_path.display()
@@ -2687,7 +2687,7 @@ impl SynapseService {
         let working_dir_path = PathBuf::from(&working_dir);
         let canonical_working_dir = fs::canonicalize(&working_dir_path).map_err(|error| {
             mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_WORKING_DIR_INVALID",
                 format!(
                     "AGENT_RESPAWN_WORKING_DIR_INVALID: prior spawn working_dir {working_dir_path:?} from {} could not be resolved: {error}",
                     manifest_path.display()
@@ -2696,7 +2696,7 @@ impl SynapseService {
         })?;
         if !canonical_working_dir.is_dir() {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_WORKING_DIR_INVALID",
                 format!(
                     "AGENT_RESPAWN_WORKING_DIR_INVALID: prior spawn working_dir {canonical_working_dir:?} from {} is not a directory",
                     manifest_path.display()
@@ -3186,7 +3186,7 @@ impl SynapseService {
         let lookup = validate_lookup_id(&params.session_id, TOOL_AGENT_KILL)?;
         if params.grace_ms > MAX_KILL_GRACE_MS {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_KILL_GRACE_INVALID",
                 format!(
                     "AGENT_KILL_GRACE_INVALID: grace_ms must be 0..={MAX_KILL_GRACE_MS}, got {}",
                     params.grace_ms
@@ -3667,14 +3667,14 @@ impl SynapseService {
         }
         if non_spawned_session_hit {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_NOT_SPAWNED",
                 format!(
                     "AGENT_NOT_SPAWNED: session {lookup} exists but is not a Synapse-spawned agent; {tool} owns no process tree for it"
                 ),
             ));
         }
         Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
+            "AGENT_NOT_FOUND",
             format!(
                 "AGENT_NOT_FOUND: no live spawned agent resolves to '{lookup}' (try its MCP session id or agent-spawn-* id from act_spawn_agent / agent_query)"
             ),
@@ -3777,7 +3777,7 @@ fn resolved_agent_from_durable_state_read(
         None if terminal_dead => spawn_id.clone(),
         None => {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_NOT_READY",
                 format!(
                     "AGENT_NOT_READY: {tool} resolved spawn {spawn_id} from durable agent state but no MCP session id is linked yet"
                 ),
@@ -3789,7 +3789,7 @@ fn resolved_agent_from_durable_state_read(
         None if terminal_dead => 0,
         None => {
             return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_PROCESS_UNAVAILABLE",
                 format!(
                     "AGENT_PROCESS_UNAVAILABLE: {tool} resolved spawn {spawn_id} from durable agent state but no launcher process id is recorded"
                 ),

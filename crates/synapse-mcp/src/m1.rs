@@ -5100,7 +5100,7 @@ pub(crate) fn validate_live_target_window(subject: &str, hwnd: i64) -> Result<()
         return Err(mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
             format!(
-                "{subject} {hwnd:#x} is a child control, not a top-level window; pass the HWND of its top-level window (target operation=list) and address the control by element_id"
+                "{subject} {hwnd:#x} is not a top-level application window (child controls, desktop and shell windows are not valid targets); choose a window with target operation=list and address its controls by element_id"
             ),
         ));
     }

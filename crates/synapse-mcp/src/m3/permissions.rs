@@ -202,29 +202,122 @@ pub fn normalize_replay_path(
     root: &Path,
     path: Option<&str>,
 ) -> std::result::Result<PathBuf, ErrorData> {
-    let Some(raw_path) = path.map(str::trim) else {
-        return Ok(default_replay_path(root));
-    };
-    if raw_path.is_empty() {
+    let raw_path = path.map(str::trim);
+    if raw_path.is_some_and(str::is_empty) {
         return Err(crate::m1::mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "replay path must not be empty when provided",
         ));
     }
 
-    let requested = PathBuf::from(raw_path);
+    let requested = raw_path.map_or_else(|| default_replay_path(root), PathBuf::from);
+    normalize_path_under_root(root, &requested).map_err(|_| replay_path_error(&requested, root))
+}
+
+/// Validate before any open. Reject links rather than following reparse points
+/// that could resolve to a remote share or escape the artifact root.
+pub(crate) fn normalize_path_under_root(
+    root: &Path,
+    requested: &Path,
+) -> std::result::Result<PathBuf, ErrorData> {
+    let denied = || {
+        crate::m1::mcp_error(
+            error_codes::SAFETY_PERMISSION_DENIED,
+            format!(
+                "path must stay under {} without network/device paths or links",
+                root.display()
+            ),
+        )
+    };
+    let local_path = |path: &Path| {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        let (_, rest) = split_windows_drive_prefix(&raw);
+        !raw.starts_with("//")
+            && !rest.contains(':')
+            && !raw.chars().any(char::is_control)
+            && !rest.split('/').any(|part| {
+                let name = part
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end()
+                    .to_ascii_uppercase();
+                let device_number = name
+                    .strip_prefix("COM")
+                    .or_else(|| name.strip_prefix("LPT"));
+                !matches!(part, "" | "." | "..")
+                    && (part.ends_with(['.', ' '])
+                        || matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                        || device_number.is_some_and(|number| {
+                            matches!(
+                                number,
+                                "1" | "2"
+                                    | "3"
+                                    | "4"
+                                    | "5"
+                                    | "6"
+                                    | "7"
+                                    | "8"
+                                    | "9"
+                                    | "¹"
+                                    | "²"
+                                    | "³"
+                            )
+                        }))
+            })
+    };
+    if !root.is_absolute() || !local_path(root) || !local_path(requested) {
+        return Err(denied());
+    }
     let candidate = if requested.is_absolute() {
-        requested
+        requested.to_path_buf()
     } else {
         root.join(requested)
     };
     let root = lexical_normalize(root);
     let candidate = lexical_normalize(&candidate);
-    if is_under_root(&candidate, &root) {
-        Ok(candidate)
-    } else {
-        Err(replay_path_error(&candidate, &root))
+    if !is_under_root(&candidate, &root) {
+        return Err(denied());
     }
+    let resolved_root = resolve_path_without_links(&root).map_err(|_| denied())?;
+    let resolved_candidate = resolve_path_without_links(&candidate).map_err(|_| denied())?;
+    if !resolved_candidate.starts_with(&resolved_root) {
+        return Err(denied());
+    }
+    Ok(candidate)
+}
+
+fn resolve_path_without_links(path: &Path) -> std::io::Result<PathBuf> {
+    // Walk from the volume down so no metadata lookup follows an unchecked
+    // parent junction. Missing components are allowed for recording new files.
+    let mut existing = path;
+    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::other(
+                        "artifact path contains a symbolic link",
+                    ));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        return Err(std::io::Error::other(
+                            "artifact path contains a reparse point",
+                        ));
+                    }
+                }
+                existing = ancestor;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    let canonical = std::fs::canonicalize(existing)?;
+    let suffix = path.strip_prefix(existing).map_err(std::io::Error::other)?;
+    Ok(canonical.join(suffix))
 }
 
 #[must_use]

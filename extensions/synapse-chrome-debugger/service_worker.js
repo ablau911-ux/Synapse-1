@@ -9566,18 +9566,28 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
 async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
-    await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
-      width: 0,
-      height: 0,
-      deviceScaleFactor: 0,
-      mobile: false,
-      screenWidth: 0,
-      screenHeight: 0
-    });
+    const methods = [];
+    if (ledgerHasEmulationOverride("viewportOverrides", tabId)) {
+      // #336: viewport emulation holds the shared Emulation.setDeviceMetricsOverride
+      // (per the durable ledger), so it owns the device metrics; leave them and only
+      // restore the device-only user agent and touch below.
+      methods.push("skip-device-metrics(viewport emulation owns device metrics)");
+    } else {
+      await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
+      await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+        width: 0,
+        height: 0,
+        deviceScaleFactor: 0,
+        mobile: false,
+        screenWidth: 0,
+        screenHeight: 0
+      });
+      methods.push("Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)");
+    }
     await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled", {
       enabled: false
     });
+    methods.push("Emulation.setTouchEmulationEnabled(false)");
     await sendDebuggerCommand(debuggee, "Emulation.setEmitTouchEventsForMouse", {
       enabled: false,
       configuration: "desktop"
@@ -9586,11 +9596,10 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
         userAgent: restoredUserAgent
       });
+      methods.push("Emulation.setUserAgentOverride(original)");
     }
     return {
-      method: restoredUserAgent
-        ? "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)+Emulation.setTouchEmulationEnabled(false)+Emulation.setUserAgentOverride(original)"
-        : "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)+Emulation.setTouchEmulationEnabled(false)",
+      method: methods.join("+"),
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
@@ -9863,17 +9872,28 @@ async function dispatchViewportEmulationSet(tabId, requested) {
 async function dispatchViewportEmulationReset(tabId) {
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
-    await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
-      width: 0,
-      height: 0,
-      deviceScaleFactor: 0,
-      mobile: false,
-      screenWidth: 0,
-      screenHeight: 0
-    });
+    let method;
+    if (ledgerHasEmulationOverride("deviceOverrides", tabId)) {
+      // #336: viewport and device emulation share Emulation.setDeviceMetricsOverride.
+      // Device emulation holds the device-metrics override here (per the durable
+      // ledger), so it owns the metrics; a viewport reset must send nothing that
+      // would clear them and leave the device override without its dimensions. Only
+      // the viewport domain is given back below.
+      method = "skip-device-metrics(device emulation owns device metrics)";
+    } else {
+      await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
+      await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+        width: 0,
+        height: 0,
+        deviceScaleFactor: 0,
+        mobile: false,
+        screenWidth: 0,
+        screenHeight: 0
+      });
+      method = "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0,deviceScaleFactor=0,mobile=false)";
+    }
     return {
-      method: "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0,deviceScaleFactor=0,mobile=false)",
+      method,
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
@@ -13134,6 +13154,13 @@ function emulationDomainsHeldInLedger(tabId) {
     }
   }
   return held;
+}
+
+// #336: does the durable ledger record this tab as holding an override in `field`?
+// Read from the ledger (not an in-memory map) so the viewport/device shared
+// device-metrics ownership check below is still correct after a worker restart.
+function ledgerHasEmulationOverride(field, tabId) {
+  return DURABLE_OWNER_LEDGER[field].some((entry) => entry.tabId === tabId);
 }
 
 // #336: a Chrome-attached session survived only when the attachment persisted AND no

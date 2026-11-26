@@ -531,6 +531,9 @@ impl SynapseService {
             session_target,
             session_target_read_error,
         })
+        .map(|guard| {
+            guard.with_session_activity(Arc::clone(self.session_registry_ref()), mcp_session_id)
+        })
         .map_err(lifecycle_mcp_error)
     }
 }

@@ -1,4 +1,4 @@
-use std::fs;
+use std::io::Read as _;
 
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
@@ -33,7 +33,21 @@ pub(super) fn inspect_replay_artifact(
                 "choose a replay artifact path under the Synapse replay root",
             )
         })?;
-    let bytes = fs::read(&path).map_err(|error| {
+    let (mut file, _directory_guards) =
+        crate::m3::permissions::open_confined_artifact(&replay_root(), &path, false).map_err(
+            |error| {
+                io_error(
+                    REPLAY_TOOL,
+                    "artifact_inspect",
+                    &path.display().to_string(),
+                    REPLAY_SOT,
+                    error,
+                    "verify the replay artifact is a local file under the replay root",
+                )
+            },
+        )?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
         io_error(
             REPLAY_TOOL,
             "artifact_inspect",

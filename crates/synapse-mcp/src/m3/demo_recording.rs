@@ -8,7 +8,6 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{
@@ -689,15 +688,9 @@ fn export_demo_replay(
     end_ts_ns: u64,
 ) -> Result<ExportSummary> {
     let path = PathBuf::from(&active.replay_path);
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create demo replay parent {}", parent.display()))?;
-    }
-    let file = File::create(&path)
-        .with_context(|| format!("create demo replay bundle {}", path.display()))?;
+    let (file, _directory_guards) =
+        super::permissions::open_confined_artifact(&replay_root(), &path, true)
+            .with_context(|| format!("create demo replay bundle {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     let rows = db
         .scan_cf_from(
@@ -738,7 +731,9 @@ fn export_demo_replay(
         records_written = records_written.saturating_add(1);
     }
     writer.flush().context("flush demo replay JSONL")?;
-    let bytes = fs::metadata(&path)
+    let bytes = writer
+        .get_ref()
+        .metadata()
         .with_context(|| format!("read demo replay metadata {}", path.display()))?
         .len();
     Ok(ExportSummary {

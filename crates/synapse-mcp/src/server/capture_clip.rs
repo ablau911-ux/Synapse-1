@@ -260,6 +260,10 @@ impl SynapseService {
         params: CaptureClipParams,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<CaptureClipResponse, ErrorData> {
+        self.require_m3_permissions(
+            "capture_clip",
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         let target = self
             .capture_clip_target(&params, request_context)
             .map_err(|error| with_clip_context(error, "session_target"))?;

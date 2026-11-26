@@ -7187,7 +7187,7 @@ async fn target_act_touch_tap_dispatch(
 }
 
 #[cfg(windows)]
-async fn target_act_validate_observed_cdp_element_target(
+pub(super) async fn target_act_validate_observed_cdp_element_target(
     endpoint: &str,
     window_hwnd: i64,
     session_cdp_target_id: &str,

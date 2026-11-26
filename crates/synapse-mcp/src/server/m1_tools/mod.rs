@@ -935,6 +935,14 @@ impl SynapseService {
             | ScreenshotOperation::RecordStop
             | ScreenshotOperation::RecordExtend => {
                 let operation = params.operation;
+                if !matches!(operation, ScreenshotOperation::RecordStatus) {
+                    self.require_m3_permissions(
+                        "screenshot",
+                        &crate::m3::permissions::required([
+                            crate::m3::permissions::Permission::WriteStorage,
+                        ]),
+                    )?;
+                }
                 let (clip_id, add_ms) = validate_screenshot_record_control_facade_params(params)?;
                 let status = match operation {
                     ScreenshotOperation::RecordStop => {
@@ -959,6 +967,12 @@ impl SynapseService {
             | ScreenshotOperation::ClipFrames
             | ScreenshotOperation::ClipFrame
             | ScreenshotOperation::ClipDiff => {
+                self.require_m3_permissions(
+                    "screenshot",
+                    &crate::m3::permissions::required([
+                        crate::m3::permissions::Permission::WriteStorage,
+                    ]),
+                )?;
                 let view = validate_screenshot_clip_view_facade_params(params)?;
                 #[cfg(windows)]
                 {
@@ -988,6 +1002,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserScreenshotResponse>, ErrorData> {
         const TOOL: &str = "browser_screenshot";
+        self.require_m3_permissions(
+            TOOL,
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -1070,6 +1088,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<BrowserPdfResponse>, ErrorData> {
         const TOOL: &str = "browser_pdf";
+        self.require_m3_permissions(
+            TOOL,
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = TOOL,
@@ -1136,6 +1158,17 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let validation = validate_browser_downloads_params(params.0)?;
+        if matches!(
+            validation.params.operation,
+            BrowserDownloadsOperation::Save | BrowserDownloadsOperation::Move
+        ) {
+            self.require_m3_permissions(
+                TOOL,
+                &crate::m3::permissions::required([
+                    crate::m3::permissions::Permission::WriteStorage,
+                ]),
+            )?;
+        }
         let window_resolution = self.resolve_browser_tabs_window_context(
             TOOL,
             &session_id,
@@ -1184,6 +1217,10 @@ impl SynapseService {
         params: Parameters<HiddenDesktopPipFrameParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<HiddenDesktopPipFrameResponse>, ErrorData> {
+        self.require_m3_permissions(
+            "hidden_desktop_pip_frame",
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "hidden_desktop_pip_frame",

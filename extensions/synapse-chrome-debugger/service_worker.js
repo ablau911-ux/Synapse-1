@@ -135,6 +135,25 @@ const INIT_SCRIPT_DEBUGGER_SESSIONS = new Map();
 const BINDING_DEBUGGER_SESSIONS = new Map();
 const DIALOG_DEBUGGER_SESSIONS = new Map();
 const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
+// #336: a CDP emulation override (device metrics, user agent, touch, locale,
+// timezone, geolocation, emulated media, network conditions) is dropped by
+// Chrome the instant the debugger that set it detaches. To make an override set
+// with `emulate` hold until it is reset, the attachment stays attached and is
+// registered here as a persistent session, keyed by tab, recording which
+// emulation domains currently need the attachment. One owner for that rule.
+const EMULATION_DEBUGGER_SESSIONS = new Map();
+// #336: a monotonic per-tab-per-domain "set generation", bumped whenever a set or
+// reset touches a domain. A queued shim teardown captures the value it saw and acts
+// only while it is unchanged, so a newer set it raced is never torn down and an
+// unrelated debugger attach never blocks it. Keyed `${tabId}:${domain}`.
+let EMULATION_SET_SEQUENCE = 0;
+const EMULATION_DOMAIN_SET_SEQ = new Map();
+// #336: viewport and device emulation share the one Emulation.setDeviceMetricsOverride;
+// the last set wins while both are held. This records each domain's last applied
+// metrics params and which domain set them last, so when one is reset while the other
+// is still held the surviving domain's metrics are restored rather than left stale.
+// tabId -> { viewport: params|null, device: params|null, lastOwner: "viewport"|"device"|null }.
+const EMULATION_DEVICE_METRICS_BY_TAB = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
 // Tab ids whose render-window screencast could not be stopped on a BORROWED
@@ -1694,6 +1713,19 @@ async function reconcileDurableOwners(trigger, options = {}) {
       continue;
     }
     const liveTarget = live.get(tabId) || null;
+    // #336/B: decide emulation shim teardown from reality, not from continuity. An
+    // extension reload (chrome.runtime.reload) detaches every debugger even though the
+    // browser instance -- and so continuity -- is unchanged, and a browser restart
+    // breaks continuity; in both cases the tab's target reports attached=false via
+    // chrome.debugger.getTargets (the `live` readback), its CDP override is gone, and
+    // its MAIN-world shims must be torn down and the ledger entry cleared. A target
+    // still attached kept its override and is adopted by the next emulation op (item
+    // 4). This runs for every present tab on every reconcile, independent of the
+    // continuity decision.
+    const staleEmulationDomains = liveTarget?.attached ? [] : emulationDomainsHeldInLedger(tabId);
+    if (staleEmulationDomains.length) {
+      enqueueEmulationShimTeardown(tabId, staleEmulationDomains, true);
+    }
     if (!continuity) {
       // Continuity is unproven (no fingerprinted row matched a live target), so
       // every fingerprinted row here refers to a target that no longer exists.
@@ -2080,6 +2112,9 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+  EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  forgetEmulationDomainSetSeq(tabId);
+  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
@@ -2627,6 +2662,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+  EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  forgetEmulationDomainSetSeq(tabId);
+  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
@@ -2644,6 +2682,11 @@ if (chrome.debugger?.onDetach?.addListener) {
       markBindingDebuggerDetached(source.tabId);
       markDialogDebuggerDetached(source.tabId);
       markFileChooserDebuggerDetached(source.tabId);
+      // #339/B: the overrides are gone with the attachment; tear their page shims
+      // down out of band and drop the ledger entries on success (kept on failure).
+      const staleEmulationDomains = emulationDomainsHeldInLedger(source.tabId);
+      forgetEmulationOverridesForTab(source.tabId);
+      enqueueEmulationShimTeardown(source.tabId, staleEmulationDomains, true);
       console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
       if (DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
         .some((entry) => entry.tabId === source.tabId)) {
@@ -8559,6 +8602,7 @@ async function handleViewportEmulation(params) {
   const beforeViewport = await tabViewportMetricsState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = {
       width: normalizeViewportDimension(params.width, "width"),
@@ -8567,10 +8611,30 @@ async function handleViewportEmulation(params) {
       mobile: normalizeViewportMobile(params.isMobile)
     };
     if (!VIEWPORT_BASELINE_BY_TAB.has(selected.tabId)) {
-      VIEWPORT_BASELINE_BY_TAB.set(selected.tabId, beforeViewport);
+      // #336: mirror -- if device emulation currently holds the shared device-metrics
+      // override, beforeViewport is device's EMULATED size, so take the override-free
+      // metrics from device's own baseline instead.
+      const deviceBaseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
+      const viewportBaseline = ledgerHasEmulationOverride("deviceOverrides", selected.tabId) && deviceBaseline?.viewport
+        ? deviceBaseline.viewport
+        : beforeViewport;
+      VIEWPORT_BASELINE_BY_TAB.set(selected.tabId, viewportBaseline);
     }
-    dispatch = await dispatchViewportEmulationSet(selected.tabId, requested);
-    await applyViewportDprShim(selected.tabId, requested.device_scale_factor);
+    try {
+      dispatch = await dispatchViewportEmulationSet(selected.tabId, requested);
+      await applyViewportDprShim(selected.tabId, requested.device_scale_factor);
+      after = await waitForViewportReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: undo the override on the held session and tear down the shim before
+      // forgetting it, so it is never left applied but untracked.
+      await cleanupFailedEmulationSet(selected.tabId, "viewport", {
+        reset: () => dispatchViewportEmulationReset(selected.tabId),
+        clearShim: clearViewportDprShim,
+        baselineMap: VIEWPORT_BASELINE_BY_TAB,
+        ledgerField: "viewportOverrides"
+      }, error);
+      throw error;
+    }
   } else {
     rejectViewportResetField(params.width, "width");
     rejectViewportResetField(params.height, "height");
@@ -8578,35 +8642,40 @@ async function handleViewportEmulation(params) {
     rejectViewportResetField(params.isMobile, "isMobile");
     dispatch = await dispatchViewportEmulationReset(selected.tabId);
     await clearViewportDprShim(selected.tabId);
+    after = await waitForViewportResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeViewport);
   }
-  let after = requested
-    ? await waitForViewportReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForViewportResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeViewport);
   let resetFallback = null;
-  let resetBaselineRestore = null;
   if (!requested) {
-    const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId);
-    const baselineRequest = viewportRequestFromBaseline(baseline);
-    if (baselineRequest && !viewportMatchesRequest(after.viewport, baselineRequest)) {
-      resetFallback = await reloadViewportTabAfterReset(
-        selected.tabId,
-        selected.target,
-        waitTimeoutMs
-      );
-      try {
-        after = await waitForViewportReadback(
+    if (ledgerHasEmulationOverride("deviceOverrides", selected.tabId)) {
+      // #336: the reset skipped the shared device-metrics override because device
+      // emulation owns it (item 5). There is nothing for the viewport metrics to
+      // settle to -- the current viewport is the device's -- so release only the
+      // viewport domain's own state and answer ok, with no baseline comparison and
+      // no reload (which would have dropped the device's override).
+      VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("viewportOverrides", selected.tabId);
+    } else {
+      const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId);
+      // #336: the override is gone when the tab is back at its pre-override
+      // width/devicePixelRatio/screen. inner_height is not compared: a held
+      // debugger session shows Chrome's "started debugging this browser" bar,
+      // which shortens the height, so the natural height legitimately differs
+      // between "a session is attached" and "none is". With no stored baseline
+      // there is nothing to clear -- the tab is already natural and the reset
+      // answers ok.
+      if (baseline && !viewportOverrideCleared(after.viewport, baseline)) {
+        // Those bar-independent fields did not return to baseline, so a CDP
+        // override is lingering; reload the document (which drops it) and confirm.
+        resetFallback = await reloadViewportTabAfterReset(
           selected.tabId,
           selected.target,
-          Math.min(waitTimeoutMs, 2000),
-          baselineRequest
+          waitTimeoutMs
         );
-      } catch (_error) {
-        resetBaselineRestore = await dispatchViewportBaselineRestore(selected.tabId, baselineRequest);
-        after = await waitForViewportReadback(selected.tabId, selected.target, waitTimeoutMs, baselineRequest);
+        after = await waitForViewportOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
       }
+      VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("viewportOverrides", selected.tabId);
     }
-    VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
-    removeLedgerOverride("viewportOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -8625,7 +8694,7 @@ async function handleViewportEmulation(params) {
     backend_tier_used: "chrome_tabs_extension_debugger",
     required_foreground: false,
     source_of_truth: "normal Chrome bridge page script window.innerWidth/window.innerHeight/devicePixelRatio",
-    method: viewportEmulationMethod(dispatch, resetFallback, resetBaselineRestore),
+    method: viewportEmulationMethod(dispatch, resetFallback),
     debugger_protocol_version: dispatch.protocol_version,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
@@ -8642,13 +8711,37 @@ async function handleDeviceEmulation(params) {
   let descriptor = null;
   let dispatch;
   let restoredUserAgent = null;
+  let after;
   if (operation === "set") {
     descriptor = normalizeDeviceDescriptor(params);
     if (!DEVICE_BASELINE_BY_TAB.has(selected.tabId)) {
-      DEVICE_BASELINE_BY_TAB.set(selected.tabId, beforeDevice);
+      // #336: a baseline is the override-free tab, never a sibling domain's emulated
+      // state. If viewport emulation currently holds the shared device-metrics
+      // override, beforeDevice.viewport is viewport's EMULATED size, so take the
+      // metric fields from viewport's own override-free baseline; the user agent and
+      // touch fields (which viewport does not emulate) stay from beforeDevice.
+      const deviceBaseline = ledgerHasEmulationOverride("viewportOverrides", selected.tabId) && VIEWPORT_BASELINE_BY_TAB.has(selected.tabId)
+        ? { ...beforeDevice, viewport: VIEWPORT_BASELINE_BY_TAB.get(selected.tabId) }
+        : beforeDevice;
+      DEVICE_BASELINE_BY_TAB.set(selected.tabId, deviceBaseline);
     }
-    dispatch = await dispatchDeviceEmulationSet(selected.tabId, descriptor);
-    await applyDeviceEmulationShim(selected.tabId, descriptor);
+    try {
+      dispatch = await dispatchDeviceEmulationSet(selected.tabId, descriptor);
+      await applyDeviceEmulationShim(selected.tabId, descriptor);
+      after = await waitForDeviceReadback(selected.tabId, selected.target, waitTimeoutMs, descriptor);
+    } catch (error) {
+      // #336: undo the override on the held session and tear down the shim before
+      // forgetting it, restoring the pre-set user agent, so it is never left applied
+      // but untracked.
+      const restoredUserAgent = DEVICE_BASELINE_BY_TAB.get(selected.tabId)?.user_agent || null;
+      await cleanupFailedEmulationSet(selected.tabId, "device", {
+        reset: () => dispatchDeviceEmulationReset(selected.tabId, restoredUserAgent),
+        clearShim: clearDeviceEmulationShim,
+        baselineMap: DEVICE_BASELINE_BY_TAB,
+        ledgerField: "deviceOverrides"
+      }, error);
+      throw error;
+    }
   } else {
     rejectDeviceResetField(params.userAgent, "userAgent");
     rejectDeviceResetField(params.width, "width");
@@ -8663,40 +8756,36 @@ async function handleDeviceEmulation(params) {
       : null;
     dispatch = await dispatchDeviceEmulationReset(selected.tabId, restoredUserAgent);
     await clearDeviceEmulationShim(selected.tabId);
+    after = await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   }
-  let after = descriptor
-    ? await waitForDeviceReadback(selected.tabId, selected.target, waitTimeoutMs, descriptor)
-    : await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   let resetFallback = null;
-  let resetBaselineRestore = null;
   if (!descriptor) {
-    const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
-    const baselineRequest = viewportRequestFromBaseline(baseline?.viewport);
-    if (baselineRequest && !viewportMatchesRequest(after.device.viewport, baselineRequest)) {
-      resetFallback = await reloadViewportTabAfterReset(
-        selected.tabId,
-        selected.target,
-        waitTimeoutMs
-      );
-      try {
-        after = await waitForDeviceResetBaselineReadback(
+    if (ledgerHasEmulationOverride("viewportOverrides", selected.tabId)) {
+      // #336: the device reset left the shared device-metrics override to viewport
+      // emulation, which owns it (item 5). The user agent and touch were restored and
+      // are already confirmed by the primary readback above, and the metrics have
+      // nothing to settle to, so release only the device domain's own state and
+      // answer ok -- no baseline comparison, no reload (which would drop viewport's
+      // override).
+      DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("deviceOverrides", selected.tabId);
+    } else {
+      const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
+      // #336: same bar-independent rule as the viewport reset -- the override is
+      // gone when the user agent, touch, and the viewport's width/dpr/screen are
+      // back to baseline. inner_height is not compared because the debugging bar
+      // shortens it while a session is held.
+      if (baseline?.viewport && !deviceOverrideCleared(after.device, baseline)) {
+        resetFallback = await reloadViewportTabAfterReset(
           selected.tabId,
           selected.target,
-          Math.min(waitTimeoutMs, 2000),
-          baseline
+          waitTimeoutMs
         );
-      } catch (_error) {
-        resetBaselineRestore = await dispatchViewportBaselineRestore(selected.tabId, baselineRequest);
-        after = await waitForDeviceResetBaselineReadback(
-          selected.tabId,
-          selected.target,
-          waitTimeoutMs,
-          baseline
-        );
+        after = await waitForDeviceOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
       }
+      DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("deviceOverrides", selected.tabId);
     }
-    DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
-    removeLedgerOverride("deviceOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -8716,7 +8805,7 @@ async function handleDeviceEmulation(params) {
     backend_tier_used: "chrome_tabs_extension_debugger",
     required_foreground: false,
     source_of_truth: "normal Chrome bridge page script navigator/userAgent/viewport/touch media queries",
-    method: viewportEmulationMethod(dispatch, resetFallback, resetBaselineRestore),
+    method: viewportEmulationMethod(dispatch, resetFallback),
     debugger_protocol_version: dispatch.protocol_version,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
@@ -8733,15 +8822,35 @@ async function handleGeolocationEmulation(params) {
   let requested = null;
   let permissionSetting = "prompt";
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeGeolocationOverride(params);
     permissionSetting = normalizeGeolocationPermissionSetting(params.grantPermission);
     GEOLOCATION_OVERRIDE_BY_TAB.set(selected.tabId, origin);
-    dispatch = await dispatchGeolocationEmulationSet(selected.tabId, origin, requested, permissionSetting);
-    await applyGeolocationEmulationShim(selected.tabId, {
-      requested,
-      permission_state: permissionSetting
-    });
+    try {
+      dispatch = await dispatchGeolocationEmulationSet(selected.tabId, origin, requested, permissionSetting);
+      await applyGeolocationEmulationShim(selected.tabId, {
+        requested,
+        permission_state: permissionSetting
+      });
+      after = await waitForGeolocationReadback(
+        selected.tabId,
+        selected.target,
+        waitTimeoutMs,
+        requested,
+        permissionSetting
+      );
+    } catch (error) {
+      // #336: undo the override on the held session and tear down the shim before
+      // forgetting it, so it is never left applied but untracked.
+      await cleanupFailedEmulationSet(selected.tabId, "geolocation", {
+        reset: () => dispatchGeolocationEmulationReset(selected.tabId, origin),
+        clearShim: clearGeolocationEmulationShim,
+        baselineMap: GEOLOCATION_OVERRIDE_BY_TAB,
+        ledgerField: "geolocationOverrides"
+      }, error);
+      throw error;
+    }
   } else {
     rejectGeolocationResetField(params.latitude, "latitude");
     rejectGeolocationResetField(params.longitude, "longitude");
@@ -8755,14 +8864,14 @@ async function handleGeolocationEmulation(params) {
     await clearGeolocationEmulationShim(selected.tabId);
     GEOLOCATION_OVERRIDE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("geolocationOverrides", selected.tabId);
+    after = await waitForGeolocationReadback(
+      selected.tabId,
+      selected.target,
+      waitTimeoutMs,
+      requested,
+      permissionSetting
+    );
   }
-  const after = await waitForGeolocationReadback(
-    selected.tabId,
-    selected.target,
-    waitTimeoutMs,
-    requested,
-    permissionSetting
-  );
   return {
     extension_id: chrome.runtime.id,
     target_id: after.page.target_id || selected.target.id,
@@ -8797,28 +8906,37 @@ async function handleLocaleEmulation(params) {
   const beforeLocale = await tabLocaleState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeLocaleOverride(params);
     if (!LOCALE_BASELINE_BY_TAB.has(selected.tabId)) {
       LOCALE_BASELINE_BY_TAB.set(selected.tabId, beforeLocale);
     }
-    dispatch = await dispatchLocaleEmulationSet(selected.tabId, requested);
-    await applyLocaleEmulationShim(selected.tabId, requested);
+    try {
+      dispatch = await dispatchLocaleEmulationSet(selected.tabId, requested);
+      await applyLocaleEmulationShim(selected.tabId, requested);
+      after = await waitForLocaleReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: undo the override on the held session and tear down the shim first.
+      await cleanupFailedEmulationSet(selected.tabId, "locale", {
+        reset: () => dispatchLocaleEmulationReset(selected.tabId),
+        clearShim: clearLocaleEmulationShim,
+        baselineMap: LOCALE_BASELINE_BY_TAB,
+        ledgerField: "localeOverrides"
+      }, error);
+      throw error;
+    }
   } else {
     rejectLocaleResetField(params.locale, "locale");
     rejectLocaleResetField(params.timezoneId, "timezoneId");
     dispatch = await dispatchLocaleEmulationReset(selected.tabId);
     await clearLocaleEmulationShim(selected.tabId);
-  }
-  let after = requested
-    ? await waitForLocaleReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForLocaleResetReadback(
+    after = await waitForLocaleResetReadback(
       selected.tabId,
       selected.target,
       waitTimeoutMs,
       LOCALE_BASELINE_BY_TAB.get(selected.tabId)
     );
-  if (!requested) {
     LOCALE_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("localeOverrides", selected.tabId);
   }
@@ -8855,29 +8973,38 @@ async function handleMediaEmulation(params) {
   const beforeMedia = await tabMediaState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeMediaOverride(params);
     if (!MEDIA_BASELINE_BY_TAB.has(selected.tabId)) {
       MEDIA_BASELINE_BY_TAB.set(selected.tabId, beforeMedia);
     }
-    dispatch = await dispatchMediaEmulationSet(selected.tabId, requested);
-    await applyMediaEmulationShim(selected.tabId, requested);
+    try {
+      dispatch = await dispatchMediaEmulationSet(selected.tabId, requested);
+      await applyMediaEmulationShim(selected.tabId, requested);
+      after = await waitForMediaReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: undo the override on the held session and tear down the shim first.
+      await cleanupFailedEmulationSet(selected.tabId, "media", {
+        reset: () => dispatchMediaEmulationReset(selected.tabId),
+        clearShim: clearMediaEmulationShim,
+        baselineMap: MEDIA_BASELINE_BY_TAB,
+        ledgerField: "mediaOverrides"
+      }, error);
+      throw error;
+    }
   } else {
     rejectMediaResetField(params.media, "media");
     rejectMediaResetField(params.colorScheme, "colorScheme");
     rejectMediaResetField(params.reducedMotion, "reducedMotion");
     dispatch = await dispatchMediaEmulationReset(selected.tabId);
     await clearMediaEmulationShim(selected.tabId);
-  }
-  const after = requested
-    ? await waitForMediaReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForMediaResetReadback(
+    after = await waitForMediaResetReadback(
       selected.tabId,
       selected.target,
       waitTimeoutMs,
       MEDIA_BASELINE_BY_TAB.get(selected.tabId)
     );
-  if (!requested) {
     MEDIA_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("mediaOverrides", selected.tabId);
   }
@@ -8914,13 +9041,26 @@ async function handleNetworkConditions(params) {
   const beforeNetwork = await tabNetworkState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeNetworkConditionsOverride(params);
     if (!NETWORK_BASELINE_BY_TAB.has(selected.tabId)) {
       NETWORK_BASELINE_BY_TAB.set(selected.tabId, beforeNetwork);
     }
-    dispatch = await dispatchNetworkConditionsSet(selected.tabId, requested);
-    await applyNetworkConditionsShim(selected.tabId, requested);
+    try {
+      dispatch = await dispatchNetworkConditionsSet(selected.tabId, requested);
+      await applyNetworkConditionsShim(selected.tabId, requested);
+      after = await waitForNetworkConditionsReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: undo the override on the held session and tear down the shim first.
+      await cleanupFailedEmulationSet(selected.tabId, "network", {
+        reset: () => dispatchNetworkConditionsReset(selected.tabId),
+        clearShim: clearNetworkConditionsShim,
+        baselineMap: NETWORK_BASELINE_BY_TAB,
+        ledgerField: "networkOverrides"
+      }, error);
+      throw error;
+    }
   } else {
     rejectNetworkConditionsResetField(params.offline, "offline");
     rejectNetworkConditionsResetField(params.latencyMs, "latencyMs");
@@ -8929,16 +9069,12 @@ async function handleNetworkConditions(params) {
     rejectNetworkConditionsResetField(params.connectionType, "connectionType");
     dispatch = await dispatchNetworkConditionsReset(selected.tabId);
     await clearNetworkConditionsShim(selected.tabId);
-  }
-  const after = requested
-    ? await waitForNetworkConditionsReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForNetworkConditionsResetReadback(
+    after = await waitForNetworkConditionsResetReadback(
       selected.tabId,
       selected.target,
       waitTimeoutMs,
       NETWORK_BASELINE_BY_TAB.get(selected.tabId)
     );
-  if (!requested) {
     NETWORK_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("networkOverrides", selected.tabId);
   }
@@ -9457,71 +9593,88 @@ function rejectNetworkConditionsResetField(value, fieldName) {
   }
 }
 
+// #336: device emulation (user agent, device metrics, touch) is held on the
+// shared per-tab emulation session so the overrides survive until reset.
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
+  const wasRegistered = emulationDomainWasHeld(tabId, "device");
+  let applied = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
     await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
       userAgent: descriptor.user_agent
     });
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+    applied = true;
+    bumpEmulationDomainSetSeq(tabId, "device");
+    const metricsParams = {
       width: descriptor.width,
       height: descriptor.height,
       deviceScaleFactor: descriptor.device_scale_factor,
       mobile: descriptor.is_mobile,
       screenWidth: descriptor.width,
       screenHeight: descriptor.height
-    });
-    await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled", {
-      enabled: descriptor.has_touch,
-      maxTouchPoints: descriptor.has_touch ? descriptor.max_touch_points : 0
-    });
+    };
+    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", metricsParams);
+    // #336: remember device's metrics so a later viewport reset can hand the shared
+    // override back to device while it still holds.
+    rememberDeviceMetrics(tabId, "device", metricsParams);
+    // #338: Emulation.setTouchEmulationEnabled rejects maxTouchPoints outside
+    // 1..16 even when enabling=false, so send the count only when touch is on
+    // (the descriptor defaults it to a valid 5); leave the field out when off.
+    await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled",
+      descriptor.has_touch
+        ? { enabled: true, maxTouchPoints: descriptor.max_touch_points }
+        : { enabled: false });
     await sendDebuggerCommand(debuggee, "Emulation.setEmitTouchEventsForMouse", {
       enabled: descriptor.has_touch,
       configuration: descriptor.is_mobile ? "mobile" : "desktop"
     });
     return {
       method: "Emulation.setUserAgentOverride+Emulation.setDeviceMetricsOverride+Emulation.setTouchEmulationEnabled+Emulation.setEmitTouchEventsForMouse",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger deviceEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for deviceEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    throw await failEmulationSetDispatch(tabId, "device", "deviceEmulation", applied, wasRegistered, error);
   }
 }
 
 async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
-    await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
-      width: 0,
-      height: 0,
-      deviceScaleFactor: 0,
-      mobile: false,
-      screenWidth: 0,
-      screenHeight: 0
-    });
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
+    const methods = [];
+    if (ledgerHasEmulationOverride("viewportOverrides", tabId)) {
+      // #336: viewport survives this device reset and the shared metrics belong to
+      // it. If device's metrics were the live ones, hand the override back by
+      // re-applying viewport's own last metrics; if viewport set last, its metrics
+      // are already live. (The device-only user agent and touch are restored below.)
+      const record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
+      if (record && record.lastOwner === "device" && record.viewport) {
+        await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", record.viewport);
+        record.lastOwner = "viewport";
+        record.device = null;
+        methods.push("Emulation.setDeviceMetricsOverride(restore viewport metrics)");
+      } else {
+        if (record) {
+          record.device = null;
+        }
+        methods.push("skip-device-metrics(viewport emulation owns device metrics)");
+      }
+    } else {
+      await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
+      await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+        width: 0,
+        height: 0,
+        deviceScaleFactor: 0,
+        mobile: false,
+        screenWidth: 0,
+        screenHeight: 0
+      });
+      EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
+      methods.push("Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)");
+    }
     await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled", {
       enabled: false
     });
+    methods.push("Emulation.setTouchEmulationEnabled(false)");
     await sendDebuggerCommand(debuggee, "Emulation.setEmitTouchEventsForMouse", {
       enabled: false,
       configuration: "desktop"
@@ -9530,12 +9683,11 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
         userAgent: restoredUserAgent
       });
+      methods.push("Emulation.setUserAgentOverride(original)");
     }
     return {
-      method: restoredUserAgent
-        ? "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)+Emulation.setTouchEmulationEnabled(false)+Emulation.setUserAgentOverride(original)"
-        : "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)+Emulation.setTouchEmulationEnabled(false)",
-      protocol_version: protocolVersion
+      method: methods.join("+"),
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9543,30 +9695,29 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       `chrome.debugger deviceEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for deviceEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "device");
   }
 }
 
+// #336: the geolocation override is held on the shared emulation session so it
+// survives until reset. (Browser.setPermission is browser-global and best-effort,
+// not tied to the session.)
 async function dispatchGeolocationEmulationSet(tabId, origin, requested, permissionSetting) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   let permissionMethod = `Browser.setPermission(${permissionSetting})`;
+  let applied = false;
+  const wasRegistered = emulationDomainWasHeld(tabId, "geolocation");
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "geolocation");
     try {
       await sendDebuggerCommand(debuggee, "Browser.setPermission", {
         permission: { name: "geolocation" },
         setting: permissionSetting,
         origin
       });
+      // #336/item3: the permission changed, so the set has applied state; a later
+      // failure of setGeolocationOverride must undo it (the reset path reverts the
+      // permission to prompt).
+      applied = true;
     } catch (error) {
       permissionMethod = `Browser.setPermission(${permissionSetting}) best_effort_failed=${errorMessage(error)}`;
     }
@@ -9588,34 +9739,21 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
       params.speed = requested.speed;
     }
     await sendDebuggerCommand(debuggee, "Emulation.setGeolocationOverride", params);
+    applied = true;
+    bumpEmulationDomainSetSeq(tabId, "geolocation");
     return {
       method: `Emulation.setGeolocationOverride+${permissionMethod}`,
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger geolocationEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    throw await failEmulationSetDispatch(tabId, "geolocation", "geolocationEmulation", applied, wasRegistered, error);
   }
 }
 
 async function dispatchGeolocationEmulationReset(tabId, origin) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   let permissionMethod = "Browser.setPermission(prompt)";
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "geolocation");
     await sendDebuggerCommand(debuggee, "Emulation.clearGeolocationOverride", {});
     try {
       await sendDebuggerCommand(debuggee, "Browser.setPermission", {
@@ -9628,7 +9766,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
     }
     return {
       method: `Emulation.clearGeolocationOverride+${permissionMethod}`,
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9636,24 +9774,17 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
       `chrome.debugger geolocationEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "geolocation");
   }
 }
 
+// #336: the locale/timezone overrides are held on the shared emulation session
+// so they survive until reset.
 async function dispatchLocaleEmulationSet(tabId, requested) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
+  const wasRegistered = emulationDomainWasHeld(tabId, "locale");
   const methods = [];
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "locale");
     if (requested.locale) {
       await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {
         locale: requested.locale
@@ -9666,40 +9797,29 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
       });
       methods.push("Emulation.setTimezoneOverride");
     }
+    if (methods.length) {
+      bumpEmulationDomainSetSeq(tabId, "locale");
+    }
     return {
       method: methods.join("+"),
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger localeEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for localeEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    // #339/A: a command of this set applied only if it was pushed to `methods`.
+    throw await failEmulationSetDispatch(tabId, "locale", "localeEmulation", methods.length > 0, wasRegistered, error);
   }
 }
 
 async function dispatchLocaleEmulationReset(tabId) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "locale");
     await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setTimezoneOverride", {
       timezoneId: ""
     });
     return {
       method: "Emulation.setLocaleOverride(default)+Emulation.setTimezoneOverride(default)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9707,23 +9827,17 @@ async function dispatchLocaleEmulationReset(tabId) {
       `chrome.debugger localeEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for localeEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "locale");
   }
 }
 
+// #336: the emulated-media override is held on the shared emulation session so it
+// survives until reset.
 async function dispatchMediaEmulationSet(tabId, requested) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
+  const wasRegistered = emulationDomainWasHeld(tabId, "media");
+  let applied = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "media");
     const features = [];
     if (requested.color_scheme) {
       features.push({ name: "prefers-color-scheme", value: requested.color_scheme });
@@ -9735,40 +9849,27 @@ async function dispatchMediaEmulationSet(tabId, requested) {
       media: requested.media || "",
       features
     });
+    applied = true;
+    bumpEmulationDomainSetSeq(tabId, "media");
     return {
       method: "Emulation.setEmulatedMedia(media,features)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger mediaEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for mediaEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    throw await failEmulationSetDispatch(tabId, "media", "mediaEmulation", applied, wasRegistered, error);
   }
 }
 
 async function dispatchMediaEmulationReset(tabId) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "media");
     await sendDebuggerCommand(debuggee, "Emulation.setEmulatedMedia", {
       media: "",
       features: []
     });
     return {
       method: "Emulation.setEmulatedMedia(default)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9776,24 +9877,21 @@ async function dispatchMediaEmulationReset(tabId) {
       `chrome.debugger mediaEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for mediaEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "media");
   }
 }
 
+// #336: the network-conditions override is held on the shared emulation session
+// so it survives until reset. Network.enable stays enabled while the session is
+// held, as the override requires.
 async function dispatchNetworkConditionsSet(tabId, requested) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
+  const wasRegistered = emulationDomainWasHeld(tabId, "network");
+  let applied = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
     await sendDebuggerCommand(debuggee, "Network.enable", {});
+    applied = true;
+    bumpEmulationDomainSetSeq(tabId, "network");
     const params = {
       offline: Boolean(requested.offline),
       latency: Number(requested.latency_ms),
@@ -9806,31 +9904,16 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
     await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", params);
     return {
       method: "Network.enable+Network.emulateNetworkConditions",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger networkConditions set failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for networkConditions set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    throw await failEmulationSetDispatch(tabId, "network", "networkConditions", applied, wasRegistered, error);
   }
 }
 
 async function dispatchNetworkConditionsReset(tabId) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", {
       offline: false,
@@ -9840,7 +9923,7 @@ async function dispatchNetworkConditionsReset(tabId) {
     });
     return {
       method: "Network.enable+Network.emulateNetworkConditions(default)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9848,36 +9931,95 @@ async function dispatchNetworkConditionsReset(tabId) {
       `chrome.debugger networkConditions reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for networkConditions reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "network");
   }
 }
 
+// #336: set the device-metrics override on a held emulation session and leave it
+// attached, so the override survives until it is reset. The readback the handler
+// runs next is therefore taken while the override is still live. The handler
+// releases the "viewport" domain if the set could not be verified.
 async function dispatchViewportEmulationSet(tabId, requested) {
-  return await dispatchViewportEmulation(tabId, "set", {
-    width: requested.width,
-    height: requested.height,
-    deviceScaleFactor: requested.device_scale_factor,
-    mobile: requested.mobile,
-    screenWidth: requested.width,
-    screenHeight: requested.height
-  });
+  const wasRegistered = emulationDomainWasHeld(tabId, "viewport");
+  let applied = false;
+  try {
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
+    const metricsParams = {
+      width: requested.width,
+      height: requested.height,
+      deviceScaleFactor: requested.device_scale_factor,
+      mobile: requested.mobile,
+      screenWidth: requested.width,
+      screenHeight: requested.height
+    };
+    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", metricsParams);
+    applied = true;
+    // #336: the override applied, so bump the generation -- a shim teardown queued
+    // before now stands down for this domain; a set that applied nothing never gets
+    // here, so its teardown still acts.
+    bumpEmulationDomainSetSeq(tabId, "viewport");
+    // #336: remember viewport's metrics so a later device reset can hand the shared
+    // override back to viewport while it still holds.
+    rememberDeviceMetrics(tabId, "viewport", metricsParams);
+    return {
+      method: `Emulation.setDeviceMetricsOverride(width,height,deviceScaleFactor,mobile=${String(Boolean(requested.mobile))})`,
+      protocol_version: attachment.protocolVersion
+    };
+  } catch (error) {
+    throw await failEmulationSetDispatch(tabId, "viewport", "viewportEmulation", applied, wasRegistered, error);
+  }
 }
 
+// #336: clear the override on the held session, then give the "viewport" domain
+// back (which detaches when no other emulation domain or persistent reason holds
+// the session).
 async function dispatchViewportEmulationReset(tabId) {
-  return await dispatchViewportEmulation(tabId, "reset", {
-    width: 0,
-    height: 0,
-    deviceScaleFactor: 0,
-    mobile: false,
-    screenWidth: 0,
-    screenHeight: 0
-  });
+  try {
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
+    let method;
+    if (ledgerHasEmulationOverride("deviceOverrides", tabId)) {
+      // #336: viewport and device share Emulation.setDeviceMetricsOverride and the
+      // last set wins while both are held. Device survives this viewport reset, so
+      // the metrics belong to it: if viewport's metrics were the live ones, hand the
+      // override back by re-applying device's own last metrics; if device set last,
+      // its metrics are already live and there is nothing to do.
+      const record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
+      if (record && record.lastOwner === "viewport" && record.device) {
+        await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", record.device);
+        record.lastOwner = "device";
+        record.viewport = null;
+        method = "Emulation.setDeviceMetricsOverride(restore device metrics)";
+      } else {
+        if (record) {
+          record.viewport = null;
+        }
+        method = "skip-device-metrics(device emulation owns device metrics)";
+      }
+    } else {
+      await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
+      await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
+        width: 0,
+        height: 0,
+        deviceScaleFactor: 0,
+        mobile: false,
+        screenWidth: 0,
+        screenHeight: 0
+      });
+      EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
+      method = "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0,deviceScaleFactor=0,mobile=false)";
+    }
+    return {
+      method,
+      protocol_version: attachment.protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger viewportEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    await releaseEmulationDebuggerSessionDomain(tabId, "viewport");
+  }
 }
 
 async function dispatchViewportBaselineRestore(tabId, requested) {
@@ -9910,42 +10052,6 @@ async function dispatchViewportBaselineRestore(tabId, requested) {
         await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for viewportEmulation baseline restore tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
-  }
-}
-
-async function dispatchViewportEmulation(tabId, operation, params) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
-  try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
-    if (operation === "set") {
-      await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", params);
-      return {
-        method: `Emulation.setDeviceMetricsOverride(width,height,deviceScaleFactor,mobile=${String(Boolean(params.mobile))})`,
-        protocol_version: protocolVersion
-      };
-    }
-    await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
-    await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", params);
-    return {
-      method: "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0,deviceScaleFactor=0,mobile=false)",
-      protocol_version: protocolVersion
-    };
-  } catch (error) {
-    throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `chrome.debugger viewportEmulation ${operation} failed for tab ${tabId}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for viewportEmulation tab ${tabId}: ${errorMessage(error)}`);
       }
     }
   }
@@ -10059,7 +10165,38 @@ async function waitForDeviceResetReadback(tabId, fallbackTarget, waitTimeoutMs, 
   throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset readback unavailable within ${timeoutMs} ms; ${detail}`);
 }
 
-async function waitForDeviceResetBaselineReadback(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+// #336: poll until the viewport override is gone by the bar-independent rule
+// (viewportOverrideCleared): width/devicePixelRatio/screen back to the
+// pre-override baseline, height left to whatever the bar does now.
+async function waitForViewportOverrideCleared(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const viewport = await tabViewportMetricsState(tabId);
+      last = { page, viewport };
+      lastError = null;
+      if (viewportOverrideCleared(viewport, baseline)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last viewport=${JSON.stringify(last.viewport)} baseline width/dpr/screen=${JSON.stringify({ inner_width: baseline?.inner_width, device_pixel_ratio: baseline?.device_pixel_ratio, screen_width: baseline?.screen_width, screen_height: baseline?.screen_height })}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no viewport readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `viewportEmulation reset did not return to the pre-override width/devicePixelRatio/screen within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+// #336: the device equivalent -- user agent and touch back to baseline, viewport
+// cleared by the same bar-independent rule.
+async function waitForDeviceOverrideCleared(tabId, fallbackTarget, waitTimeoutMs, baseline) {
   const started = Date.now();
   let last = null;
   let lastError = null;
@@ -10069,7 +10206,7 @@ async function waitForDeviceResetBaselineReadback(tabId, fallbackTarget, waitTim
       const device = await tabDeviceMetricsState(tabId);
       last = { page, device };
       lastError = null;
-      if (deviceMatchesBaseline(device, baseline)) {
+      if (deviceOverrideCleared(device, baseline)) {
         return last;
       }
     } catch (error) {
@@ -10082,7 +10219,7 @@ async function waitForDeviceResetBaselineReadback(tabId, fallbackTarget, waitTim
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
       : "no device readback";
-  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset baseline readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset did not return to the pre-override user agent/width/devicePixelRatio/screen within ${waitTimeoutMs} ms; ${detail}`);
 }
 
 async function waitForGeolocationReadback(tabId, fallbackTarget, waitTimeoutMs, requested, permissionSetting) {
@@ -10738,13 +10875,10 @@ async function reloadViewportTabAfterReset(tabId, fallbackTarget, waitTimeoutMs)
   };
 }
 
-function viewportEmulationMethod(dispatch, resetFallback, resetBaselineRestore) {
+function viewportEmulationMethod(dispatch, resetFallback) {
   const parts = [dispatch.method];
   if (resetFallback) {
     parts.push(`baselineReload:${resetFallback.method}`);
-  }
-  if (resetBaselineRestore) {
-    parts.push(`baselineMetricsRestore:${resetBaselineRestore.method}`);
   }
   return parts.join("+");
 }
@@ -10755,6 +10889,42 @@ function viewportMatchesRequest(viewport, requested) {
     viewport.inner_width === requested.width &&
     viewport.inner_height === requested.height &&
     Math.abs(Number(viewport.device_pixel_ratio) - requested.device_scale_factor) <= 0.01
+  );
+}
+
+// #336: a device-metrics override is cleared once the tab is back at the fields
+// the debugging bar does not move -- inner_width, devicePixelRatio and the screen
+// size. inner_height is deliberately excluded: while a debugger session is held
+// the tab shows Chrome's "started debugging this browser" bar, which shortens
+// inner_height, so the natural height differs between "a session is attached" and
+// "none is", and comparing it would make a correct reset fail. The override moves
+// width and dpr too, so these fields alone decide whether it is gone.
+function viewportOverrideCleared(viewport, baseline) {
+  if (!viewport || !baseline || !Number.isSafeInteger(baseline.inner_width)) {
+    return false;
+  }
+  return (
+    viewport.inner_width === baseline.inner_width &&
+    Math.abs(Number(viewport.device_pixel_ratio) - Number(baseline.device_pixel_ratio)) <= 0.01 &&
+    viewport.screen_width === baseline.screen_width &&
+    viewport.screen_height === baseline.screen_height
+  );
+}
+
+// #336: a device override is cleared when its viewport is cleared by the same
+// bar-independent rule and the user agent and touch fields are back to baseline.
+function deviceOverrideCleared(device, baseline) {
+  return (
+    Boolean(device) &&
+    Boolean(baseline) &&
+    viewportOverrideCleared(device.viewport, baseline.viewport) &&
+    device.user_agent === baseline.user_agent &&
+    Number(device.max_touch_points) === Number(baseline.max_touch_points) &&
+    Boolean(device.ontouchstart_available) === Boolean(baseline.ontouchstart_available) &&
+    Boolean(device.pointer_coarse) === Boolean(baseline.pointer_coarse) &&
+    Boolean(device.any_pointer_coarse) === Boolean(baseline.any_pointer_coarse) &&
+    Boolean(device.hover_none) === Boolean(baseline.hover_none) &&
+    Boolean(device.any_hover_none) === Boolean(baseline.any_hover_none)
   );
 }
 
@@ -10828,10 +10998,6 @@ function sameDeviceMetrics(left, right) {
     Boolean(left.hover_none) === Boolean(right.hover_none) &&
     Boolean(left.any_hover_none) === Boolean(right.any_hover_none)
   );
-}
-
-function deviceMatchesBaseline(device, baseline) {
-  return sameDeviceMetrics(device, baseline);
 }
 
 function summarizeDeviceReadback(device) {
@@ -12125,6 +12291,7 @@ function clearNetworkConditionsShimInPage() {
 }
 
 async function readGeolocationStateInPage() {
+  const shimActive = Boolean(globalThis["__synapseGeolocationEmulationOverride"]);
   const permissionState = await (async () => {
     try {
       if (!globalThis.navigator || !navigator.permissions || typeof navigator.permissions.query !== "function") {
@@ -12137,6 +12304,19 @@ async function readGeolocationStateInPage() {
       return `error:${String(name)}`;
     }
   })();
+  // #339/C: getCurrentPosition is only safe to call when the shim is intercepting it
+  // (it answers from the emulated value, never a real prompt) or the real permission
+  // is already "granted" (granted never prompts). With a real "prompt"/"denied"/
+  // unsupported permission and no shim, calling it would make Chrome ask the user --
+  // so report the permission state with no position instead of asking.
+  if (!shimActive && permissionState !== "granted") {
+    return {
+      permission_state: permissionState,
+      position: null,
+      error: null,
+      emulated_by_shim: false
+    };
+  }
   const result = await new Promise(resolve => {
     if (!globalThis.navigator || !navigator.geolocation) {
       resolve({
@@ -12190,7 +12370,8 @@ async function readGeolocationStateInPage() {
   return {
     permission_state: permissionState,
     position: result.position,
-    error: result.error
+    error: result.error,
+    emulated_by_shim: shimActive
   };
 }
 
@@ -13035,7 +13216,7 @@ async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier)
     return false;
   }
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
-  if (bindingSessionHasActiveNames(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId)) {
+  if (bindingSessionHasActiveNames(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId) || emulationSessionHasActiveDomains(tabId)) {
     return false;
   }
   try {
@@ -13069,7 +13250,329 @@ function persistentDebuggerSessionIsAttached(tabId) {
   return INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId) ||
     bindingSessionIsAttached(tabId) ||
     dialogSessionIsAttached(tabId) ||
-    fileChooserSessionIsAttached(tabId);
+    fileChooserSessionIsAttached(tabId) ||
+    emulationSessionIsAttached(tabId);
+}
+
+function emulationSessionIsAttached(tabId) {
+  const session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
+  return Boolean(session?.attached);
+}
+
+function emulationSessionHasActiveDomains(tabId) {
+  const session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
+  return Boolean(session?.domains?.size);
+}
+
+// #336: was this domain already held before the current set? Answered from the
+// durable ledger -- the same source item-4 adoption restores a surviving attachment
+// from -- so a repeat set right after a worker restart (before the in-memory session
+// has re-adopted the domain) is still recognised as a repeat and does not unregister
+// the earlier live override. A repeat set that applies nothing must leave it intact.
+function emulationDomainWasHeld(tabId, domain) {
+  return ledgerHasEmulationOverride(EMULATION_DOMAIN_WIRING[domain].ledgerField, tabId);
+}
+
+function bumpEmulationDomainSetSeq(tabId, domain) {
+  EMULATION_DOMAIN_SET_SEQ.set(`${tabId}:${domain}`, ++EMULATION_SET_SEQUENCE);
+}
+
+function emulationDomainSetSeq(tabId, domain) {
+  return EMULATION_DOMAIN_SET_SEQ.get(`${tabId}:${domain}`) || 0;
+}
+
+function forgetEmulationDomainSetSeq(tabId) {
+  for (const domain of Object.keys(EMULATION_DOMAIN_WIRING)) {
+    EMULATION_DOMAIN_SET_SEQ.delete(`${tabId}:${domain}`);
+  }
+}
+
+// #336: record the device-metrics params a successful viewport/device set applied,
+// and that this domain set them last.
+function rememberDeviceMetrics(tabId, owner, params) {
+  let record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
+  if (!record) {
+    record = { viewport: null, device: null, lastOwner: null };
+    EMULATION_DEVICE_METRICS_BY_TAB.set(tabId, record);
+  }
+  record[owner] = params;
+  record.lastOwner = owner;
+}
+
+// #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
+// stale cleanup) so each enumerates the same ledger field, baseline map and page
+// shim for every emulation domain in one place.
+const EMULATION_DOMAIN_WIRING = {
+  viewport: { ledgerField: "viewportOverrides", baselineMap: VIEWPORT_BASELINE_BY_TAB, clearShim: clearViewportDprShim },
+  device: { ledgerField: "deviceOverrides", baselineMap: DEVICE_BASELINE_BY_TAB, clearShim: clearDeviceEmulationShim },
+  geolocation: { ledgerField: "geolocationOverrides", baselineMap: GEOLOCATION_OVERRIDE_BY_TAB, clearShim: clearGeolocationEmulationShim },
+  locale: { ledgerField: "localeOverrides", baselineMap: LOCALE_BASELINE_BY_TAB, clearShim: clearLocaleEmulationShim },
+  media: { ledgerField: "mediaOverrides", baselineMap: MEDIA_BASELINE_BY_TAB, clearShim: clearMediaEmulationShim },
+  network: { ledgerField: "networkOverrides", baselineMap: NETWORK_BASELINE_BY_TAB, clearShim: clearNetworkConditionsShim }
+};
+
+// #336: the domains the durable ledger records as holding an override on this tab.
+function emulationDomainsHeldInLedger(tabId) {
+  const held = [];
+  for (const [domain, wiring] of Object.entries(EMULATION_DOMAIN_WIRING)) {
+    if (DURABLE_OWNER_LEDGER[wiring.ledgerField].some((entry) => entry.tabId === tabId)) {
+      held.push(domain);
+    }
+  }
+  return held;
+}
+
+// #336: does the durable ledger record this tab as holding an override in `field`?
+// Read from the ledger (not an in-memory map) so the viewport/device shared
+// device-metrics ownership check below is still correct after a worker restart.
+function ledgerHasEmulationOverride(field, tabId) {
+  return DURABLE_OWNER_LEDGER[field].some((entry) => entry.tabId === tabId);
+}
+
+// #339/B: when a tab's emulation debugger attachment is lost from outside (a human
+// Cancel on the debugging bar, an extension reload, or Chrome), the CDP overrides
+// die at once but the MAIN-world shims keep answering the page. Tear those shims
+// down out of band: the sync onDetach listener and the durable reconcile cannot run
+// page mutations inline, but the persisted background queue carries a command
+// admission context and shim teardown needs only chrome.scripting.executeScript, not
+// the debugger. `clearLedger` is true for the detach path (this owns the ledger
+// cleanup: drop on success, keep on failure so panic cleanup / the next op retry);
+// false for the startup reconcile, which prunes the ledger itself. `domains` is
+// captured by the caller because the reconcile prunes the ledger right after.
+function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
+  if (!domains || !domains.length) {
+    return;
+  }
+  // #336: capture each domain's set generation now. At run time tear a domain down
+  // only if its generation is unchanged -- i.e. no newer set or reset touched it
+  // since this was queued. Whether some unrelated debugger (a per-command attach for
+  // evaluate / screenshot / navigation, an init script, a binding) is attached is not
+  // the question, so this never skips because of an unrelated owner, nor tears down a
+  // domain a newer set re-applied.
+  const captured = domains.map((domain) => ({ domain, setSeq: emulationDomainSetSeq(tabId, domain) }));
+  enqueuePersistedBackgroundMutation("emulationShimTeardown", async () => {
+    let changed = false;
+    for (const { domain, setSeq } of captured) {
+      if (emulationDomainSetSeq(tabId, domain) !== setSeq) {
+        continue;
+      }
+      const wiring = EMULATION_DOMAIN_WIRING[domain];
+      if (!wiring) {
+        continue;
+      }
+      try {
+        await wiring.clearShim(tabId);
+      } catch (error) {
+        console.warn(`Synapse emulation shim teardown failed for ${domain} tab ${tabId}: ${errorMessage(error)}`);
+        continue;
+      }
+      if (clearLedger) {
+        wiring.baselineMap.delete(tabId);
+        removeLedgerOverride(wiring.ledgerField, tabId);
+        changed = true;
+      }
+      // #336: the override is gone, so give the domain's registration back too -- a
+      // refused repeat set after the detach may have re-registered it on the fresh
+      // attachment (the refused-repeat "keep" rule holds only while the attachment
+      // that held the override is the same one). Detaches once nothing else needs the
+      // tab's debugger.
+      await releaseEmulationDebuggerSessionDomain(tabId, domain);
+    }
+    if (changed) {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    }
+  }).catch((error) => {
+    console.warn(`Synapse emulation shim teardown could not run for tab ${tabId}: ${errorMessage(error)}`);
+  });
+}
+
+// #336: a Chrome-attached session survived only when the attachment persisted AND no
+// in-memory session is the reason it persisted -- i.e. the registry was wiped by a
+// worker restart but Chrome still holds the debugger. Borrowing a live init-script /
+// binding / dialog / file-chooser session is not a restart; the emulation overrides
+// the ledger still lists were dropped when their own attachment detached.
+function emulationAttachmentSurvivedRestart(tabId, attachment) {
+  return Boolean(attachment.persistent) &&
+    !INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId) &&
+    !bindingSessionIsAttached(tabId) &&
+    !dialogSessionIsAttached(tabId) &&
+    !fileChooserSessionIsAttached(tabId);
+}
+
+// #336: a fresh (or borrowed-but-not-survived) attachment means any emulation
+// override the ledger still records for this tab is gone; its page shim is stale.
+// Tear those shims down best-effort and clear their ledger/baseline so a later reset,
+// restart adopt, or operator-panic cleanup does not act on a ghost. The domain being
+// set now is left alone -- its own set is about to apply.
+async function forgetStaleEmulationOverridesOnFreshAttach(tabId, settingDomain) {
+  for (const held of emulationDomainsHeldInLedger(tabId)) {
+    if (held === settingDomain) {
+      continue;
+    }
+    const wiring = EMULATION_DOMAIN_WIRING[held];
+    try {
+      await wiring.clearShim(tabId);
+    } catch (error) {
+      console.warn(`Synapse stale ${held} emulation shim teardown failed for tab ${tabId}: ${errorMessage(error)}`);
+    }
+    wiring.baselineMap.delete(tabId);
+    removeLedgerOverride(wiring.ledgerField, tabId);
+  }
+}
+
+// #336: hold the debugger attached for an emulation override. Borrows an
+// already-persistent session (shouldDetach:false) through attachDebuggerForCommand
+// -- which also re-detects, after a worker restart, an attachment Chrome still
+// has -- or attaches fresh, and records the domain so the attachment is held the
+// way the init-script sessions are. Never detaches here; the override must stay
+// live until releaseEmulationDebuggerSessionDomain lets it go.
+async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "1.3") {
+  const attachment = await attachDebuggerForCommand(tabId, protocolVersion);
+  let session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    const survivedRestart = emulationAttachmentSurvivedRestart(tabId, attachment);
+    session = {
+      protocolVersion,
+      domains: new Set(),
+      attached: true,
+      attachedAtUnixMs: Date.now()
+    };
+    EMULATION_DEBUGGER_SESSIONS.set(tabId, session);
+    await recordLedgerDebuggerTab(tabId);
+    if (survivedRestart) {
+      // #336: the attachment and its overrides survived a worker restart; adopt every
+      // domain the ledger says is held so releasing one does not detach the others.
+      for (const held of emulationDomainsHeldInLedger(tabId)) {
+        session.domains.add(held);
+      }
+    } else {
+      await forgetStaleEmulationOverridesOnFreshAttach(tabId, domain);
+    }
+  }
+  session.domains.add(domain);
+  return { debuggee: attachment.debuggee, session, attachment };
+}
+
+// #336: the single source of truth for whether any owner still needs this tab's
+// debugger. It counts only ACTIVE work -- an init script's identifiers, a binding's
+// names, an open dialog/file-chooser interception, a held emulation domain -- not a
+// session's bare "attached" flag: a binding session can stay attached with no active
+// names, and that idle state must not keep the debugger alive. Every detach decision
+// uses this so the debugger is detached exactly once, when the last owner goes.
+function tabDebuggerStillNeeded(tabId) {
+  return hasActiveInitScriptDebuggerSession(tabId) ||
+    bindingSessionHasActiveNames(tabId) ||
+    dialogSessionIsActive(tabId) ||
+    fileChooserSessionIsActive(tabId) ||
+    emulationSessionHasActiveDomains(tabId);
+}
+
+// #336: a reset or a failed set gives the domain back. When the tab's last owner
+// is gone, detach once and clear every other registry's attached flag so none is
+// left stale (otherwise a later op reads a phantom owner and never detaches);
+// otherwise leave the attachment to its remaining owner (a borrowed session is
+// never ours to end).
+async function releaseEmulationDebuggerSessionDomain(tabId, domain) {
+  const session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    return false;
+  }
+  session.domains.delete(domain);
+  if (session.domains.size > 0) {
+    return false;
+  }
+  EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  if (tabDebuggerStillNeeded(tabId)) {
+    return false;
+  }
+  try {
+    await chrome.debugger.detach({ tabId });
+    INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+    markBindingDebuggerDetached(tabId, false);
+    markDialogDebuggerDetached(tabId, false);
+    markFileChooserDebuggerDetached(tabId, false);
+    return true;
+  } catch (error) {
+    console.warn(`Synapse chrome.debugger detach failed for emulation cleanup tab ${tabId}: ${errorMessage(error)}`);
+    return false;
+  }
+}
+
+// #336: a set that failed or could not be verified must not leave the override
+// applied but untracked. Undo it: the reset clears the domain's override on the
+// still-held session -- so another domain keeping the attachment does not leave this
+// one live -- and the shim teardown removes the page-side shim; then forget the
+// baseline and ledger entry. If the undo itself fails, the ledger entry is kept so
+// operator-panic cleanup can retry, and the original error is surfaced with a note.
+// #339/A, #336: build the set-failed error. When no command of THIS set applied
+// anything, mark the error so the handler cleanup does not undo a no-op, and record
+// whether the domain was already registered before this set. Only a FIRST set that
+// applied nothing releases the domain (registering nothing); a REPEAT set that
+// applied nothing leaves the earlier override's registration, ledger and shim
+// exactly as they were. "Undo failed, kept registered" stays for a command that did
+// succeed.
+async function failEmulationSetDispatch(tabId, domain, label, applied, wasRegistered, cause) {
+  const wrapped = bridgeError(
+    ERROR_ATTACH_FAILED,
+    `chrome.debugger ${label} set failed for tab ${tabId}: ${errorMessage(cause)}`
+  );
+  if (!applied) {
+    wrapped.emulationNothingApplied = true;
+    wrapped.emulationDomainWasRegistered = Boolean(wasRegistered);
+    if (!wasRegistered) {
+      await releaseEmulationDebuggerSessionDomain(tabId, domain);
+    }
+  }
+  return wrapped;
+}
+
+async function cleanupFailedEmulationSet(tabId, domain, wiring, cause) {
+  if (cause && cause.emulationNothingApplied) {
+    if (cause.emulationDomainWasRegistered) {
+      // #336: this set applied nothing, but the domain already held a live override
+      // from an earlier set; leave it exactly as it was (registered, same baseline,
+      // ledger and shim) and let the original error stand.
+      return;
+    }
+    // #339/A: a first set applied nothing and the dispatch released the domain, so
+    // there is nothing to undo. Forget the baseline and ledger entry.
+    wiring.baselineMap.delete(tabId);
+    removeLedgerOverride(wiring.ledgerField, tabId);
+    return;
+  }
+  try {
+    await wiring.reset();
+    await wiring.clearShim(tabId);
+  } catch (undoError) {
+    wiring.baselineMap.delete(tabId);
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `${errorMessage(cause)}; and undo of the failed ${domain} set also failed, so the override was left registered for operator-panic cleanup: ${errorMessage(undoError)}`
+    );
+  }
+  wiring.baselineMap.delete(tabId);
+  removeLedgerOverride(wiring.ledgerField, tabId);
+}
+
+// #336: Chrome detached the debugger (tab closed, user hit "cancel" on the
+// debugging bar, or the session was dropped), so every CDP emulation override on
+// the tab is gone. Drop the held session and the live baselines. The ledger
+// override entries are kept on purpose: the page-side shims each set installed
+// (devicePixelRatio / matchMedia / navigator / fetch / geolocation) are MAIN-world
+// injections the CDP detach does NOT remove, and this synchronous onDetach listener
+// has no command admission context in which to run their executeScript teardown.
+// Keeping the ledger entry means operator-panic cleanup -- and the next emulation
+// op's fresh-attach reconcile -- can still clear those shims (a navigation also
+// drops them); a closed tab is pruned by the closed-tab ledger prune.
+function forgetEmulationOverridesForTab(tabId) {
+  EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
+  VIEWPORT_BASELINE_BY_TAB.delete(tabId);
+  DEVICE_BASELINE_BY_TAB.delete(tabId);
+  GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
+  LOCALE_BASELINE_BY_TAB.delete(tabId);
+  MEDIA_BASELINE_BY_TAB.delete(tabId);
+  NETWORK_BASELINE_BY_TAB.delete(tabId);
 }
 
 function bindingSessionHasActiveNames(tabId) {
@@ -13141,7 +13644,7 @@ async function addBindingToSession(debuggee, session, name, executionContextName
 }
 
 async function detachBindingDebuggerSession(tabId, debuggee, session) {
-  if (hasActiveInitScriptDebuggerSession(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId)) {
+  if (hasActiveInitScriptDebuggerSession(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId) || emulationSessionHasActiveDomains(tabId)) {
     return false;
   }
   try {
@@ -14097,6 +14600,7 @@ async function handleOperatorPanicCleanup(params) {
       BINDING_DEBUGGER_SESSIONS.delete(tabId);
       DIALOG_DEBUGGER_SESSIONS.delete(tabId);
       FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+      EMULATION_DEBUGGER_SESSIONS.delete(tabId);
       debuggerTabsDetached += 1;
       detachedDebuggerTabs.push(tabId);
     } catch (error) {

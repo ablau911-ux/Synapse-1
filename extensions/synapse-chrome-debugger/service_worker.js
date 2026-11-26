@@ -142,6 +142,12 @@ const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
 // registered here as a persistent session, keyed by tab, recording which
 // emulation domains currently need the attachment. One owner for that rule.
 const EMULATION_DEBUGGER_SESSIONS = new Map();
+// #336: a monotonic per-tab-per-domain "set generation", bumped whenever a set or
+// reset touches a domain. A queued shim teardown captures the value it saw and acts
+// only while it is unchanged, so a newer set it raced is never torn down and an
+// unrelated debugger attach never blocks it. Keyed `${tabId}:${domain}`.
+let EMULATION_SET_SEQUENCE = 0;
+const EMULATION_DOMAIN_SET_SEQ = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
 // Tab ids whose render-window screencast could not be stopped on a BORROWED
@@ -2101,6 +2107,7 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  forgetEmulationDomainSetSeq(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
@@ -2649,6 +2656,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
+  forgetEmulationDomainSetSeq(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
@@ -13213,6 +13221,20 @@ function emulationDomainWasHeld(tabId, domain) {
   return ledgerHasEmulationOverride(EMULATION_DOMAIN_WIRING[domain].ledgerField, tabId);
 }
 
+function bumpEmulationDomainSetSeq(tabId, domain) {
+  EMULATION_DOMAIN_SET_SEQ.set(`${tabId}:${domain}`, ++EMULATION_SET_SEQUENCE);
+}
+
+function emulationDomainSetSeq(tabId, domain) {
+  return EMULATION_DOMAIN_SET_SEQ.get(`${tabId}:${domain}`) || 0;
+}
+
+function forgetEmulationDomainSetSeq(tabId) {
+  for (const domain of Object.keys(EMULATION_DOMAIN_WIRING)) {
+    EMULATION_DOMAIN_SET_SEQ.delete(`${tabId}:${domain}`);
+  }
+}
+
 // #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
 // stale cleanup) so each enumerates the same ledger field, baseline map and page
 // shim for every emulation domain in one place.
@@ -13257,24 +13279,19 @@ function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
   if (!domains || !domains.length) {
     return;
   }
+  // #336: capture each domain's set generation now. At run time tear a domain down
+  // only if its generation is unchanged -- i.e. no newer set or reset touched it
+  // since this was queued. Whether some unrelated debugger (a per-command attach for
+  // evaluate / screenshot / navigation, an init script, a binding) is attached is not
+  // the question, so this never skips because of an unrelated owner, nor tears down a
+  // domain a newer set re-applied.
+  const captured = domains.map((domain) => ({ domain, setSeq: emulationDomainSetSeq(tabId, domain) }));
   enqueuePersistedBackgroundMutation("emulationShimTeardown", async () => {
-    // #336: by the time this runs (serialized behind any queued set), a newer set
-    // may have re-attached the debugger and re-applied an override on this tab. Only
-    // an unattached tab has lost its override, so re-check reality via getTargets
-    // right before removing anything; if a debugger is attached again, do nothing --
-    // a genuinely stale domain is reclaimed by a later reconcile once the tab is
-    // unattached. (This runs atomically w.r.t. sets, so the check cannot go stale
-    // mid-teardown.)
-    try {
-      if ((await debuggerAttachmentReadback(tabId)).attached) {
-        return;
-      }
-    } catch (error) {
-      console.warn(`Synapse emulation shim teardown readback failed for tab ${tabId}: ${errorMessage(error)}`);
-      return;
-    }
     let changed = false;
-    for (const domain of domains) {
+    for (const { domain, setSeq } of captured) {
+      if (emulationDomainSetSeq(tabId, domain) !== setSeq) {
+        continue;
+      }
       const wiring = EMULATION_DOMAIN_WIRING[domain];
       if (!wiring) {
         continue;
@@ -13363,6 +13380,10 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
     }
   }
   session.domains.add(domain);
+  // #336: this set or reset is touching the domain; bump its generation so any shim
+  // teardown queued before now stands down for it (a per-command attach for another
+  // tool never reaches here, so it never bumps).
+  bumpEmulationDomainSetSeq(tabId, domain);
   return { debuggee: attachment.debuggee, session, attachment };
 }
 

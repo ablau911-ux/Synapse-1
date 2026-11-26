@@ -301,6 +301,36 @@ impl SynapseService {
         let mut results = Vec::new();
         match params.operation {
             BrowserEmulateOperation::Set => {
+                // A raw-CDP network-conditions set is always refused (Chrome
+                // clears a target's network conditions when another DevTools
+                // session of the target closes), so it is asked first: a mixed
+                // set must not apply other domains and then fail on this one.
+                if let Some(network) = params.network.as_ref() {
+                    let result = synapse_a11y::cdp_set_network_conditions(
+                        &endpoint,
+                        cdp_target_id,
+                        &synapse_a11y::CdpNetworkConditionsOverride {
+                            offline: network.offline.unwrap_or(false),
+                            latency_ms: network.latency_ms.unwrap_or(0.0),
+                            download_throughput_bytes_per_sec: network
+                                .download_throughput_bytes_per_sec
+                                .unwrap_or(-1.0),
+                            upload_throughput_bytes_per_sec: network
+                                .upload_throughput_bytes_per_sec
+                                .unwrap_or(-1.0),
+                            connection_type: network.connection_type.clone(),
+                        },
+                    )
+                    .map_err(|error| emulate_error(BrowserEmulateDomain::Network, error))?;
+                    super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_emulate_after_raw_network_command",
+                    )?;
+                    results.push(domain_result(
+                        BrowserEmulateDomain::Network,
+                        params.operation,
+                        result,
+                    )?);
+                }
                 if let Some(viewport) = params.viewport.as_ref() {
                     let result = synapse_a11y::cdp_set_viewport_size(
                         &endpoint,
@@ -413,32 +443,6 @@ impl SynapseService {
                     )?;
                     results.push(domain_result(
                         BrowserEmulateDomain::Media,
-                        params.operation,
-                        result,
-                    )?);
-                }
-                if let Some(network) = params.network.as_ref() {
-                    let result = synapse_a11y::cdp_set_network_conditions(
-                        &endpoint,
-                        cdp_target_id,
-                        &synapse_a11y::CdpNetworkConditionsOverride {
-                            offline: network.offline.unwrap_or(false),
-                            latency_ms: network.latency_ms.unwrap_or(0.0),
-                            download_throughput_bytes_per_sec: network
-                                .download_throughput_bytes_per_sec
-                                .unwrap_or(-1.0),
-                            upload_throughput_bytes_per_sec: network
-                                .upload_throughput_bytes_per_sec
-                                .unwrap_or(-1.0),
-                            connection_type: network.connection_type.clone(),
-                        },
-                    )
-                    .map_err(|error| emulate_error(BrowserEmulateDomain::Network, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_raw_network_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Network,
                         params.operation,
                         result,
                     )?);

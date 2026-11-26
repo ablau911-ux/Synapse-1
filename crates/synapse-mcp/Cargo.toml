@@ -76,7 +76,7 @@ libaom-sys = { version = "0.18.1", default-features = false, features = ["av1_en
 rav1d = "1.1.0"
 # dav1d's "again" result is DAV1D_ERR(EAGAIN); rav1d takes EAGAIN from libc.
 libc = "0.2"
-windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Variant", "Win32_System_Com_StructuredStorage", "Win32_Globalization"] }
+windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Variant", "Win32_System_Com_StructuredStorage", "Win32_Globalization", "Win32_System_Console"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb.workspace = true

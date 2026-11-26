@@ -792,6 +792,34 @@ pub(crate) fn record_startup_exit(cause: &'static str, detail: Value) -> anyhow:
     record_exit("daemon_exit", cause, detail)
 }
 
+pub(crate) fn exit_marker_pending() -> anyhow::Result<bool> {
+    let state = state_slot()
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    Ok(state
+        .as_ref()
+        .is_some_and(|state| state.run.ended_at_unix_ms.is_none()))
+}
+
+pub(crate) fn record_shutdown_drain(detail: Value) -> anyhow::Result<()> {
+    append_diagnostic_event("shutdown_drain", "process_exit_fallback", detail)
+}
+
+/// An end marker records termination, not a successful graceful drain. Preserve
+/// any verdict already written by the transport's checked finalization path.
+pub(crate) fn record_exit_fallback(source: &'static str, detail: Value) -> anyhow::Result<()> {
+    let mut state = state_slot()
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    let Some(state) = state.as_mut() else {
+        return Ok(());
+    };
+    if state.run.ended_at_unix_ms.is_some() {
+        return Ok(());
+    }
+    record_exit_for_state(state, "daemon_exit", source, detail)
+}
+
 pub(crate) fn record_top_level_error(detail: &str) -> anyhow::Result<()> {
     record_exit(
         "daemon_exit",

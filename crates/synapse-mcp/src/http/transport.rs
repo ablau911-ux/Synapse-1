@@ -9483,26 +9483,6 @@ async fn wait_for_server_stop_with_timeouts(
     Ok(())
 }
 
-#[cfg(windows)]
 async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
-    let mut ctrl_break = tokio::signal::windows::ctrl_break()
-        .with_context(|| format!("register ctrl-break handler {phase}"))?;
-    tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.with_context(|| format!("wait for ctrl-c {phase}"))?;
-        }
-        received = ctrl_break.recv() => {
-            if received.is_none() {
-                anyhow::bail!("ctrl-break stream ended while waiting for shutdown signal {phase}");
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
-    tokio::signal::ctrl_c()
-        .await
-        .with_context(|| format!("wait for ctrl-c {phase}"))
+    crate::wait_for_shutdown_signal(phase).await
 }

@@ -9604,6 +9604,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
       userAgent: descriptor.user_agent
     });
     applied = true;
+    bumpEmulationDomainSetSeq(tabId, "device");
     const metricsParams = {
       width: descriptor.width,
       height: descriptor.height,
@@ -9739,6 +9740,7 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
     }
     await sendDebuggerCommand(debuggee, "Emulation.setGeolocationOverride", params);
     applied = true;
+    bumpEmulationDomainSetSeq(tabId, "geolocation");
     return {
       method: `Emulation.setGeolocationOverride+${permissionMethod}`,
       protocol_version: attachment.protocolVersion
@@ -9795,6 +9797,9 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
       });
       methods.push("Emulation.setTimezoneOverride");
     }
+    if (methods.length) {
+      bumpEmulationDomainSetSeq(tabId, "locale");
+    }
     return {
       method: methods.join("+"),
       protocol_version: attachment.protocolVersion
@@ -9845,6 +9850,7 @@ async function dispatchMediaEmulationSet(tabId, requested) {
       features
     });
     applied = true;
+    bumpEmulationDomainSetSeq(tabId, "media");
     return {
       method: "Emulation.setEmulatedMedia(media,features)",
       protocol_version: attachment.protocolVersion
@@ -9885,6 +9891,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     applied = true;
+    bumpEmulationDomainSetSeq(tabId, "network");
     const params = {
       offline: Boolean(requested.offline),
       latency: Number(requested.latency_ms),
@@ -9947,6 +9954,10 @@ async function dispatchViewportEmulationSet(tabId, requested) {
     };
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", metricsParams);
     applied = true;
+    // #336: the override applied, so bump the generation -- a shim teardown queued
+    // before now stands down for this domain; a set that applied nothing never gets
+    // here, so its teardown still acts.
+    bumpEmulationDomainSetSeq(tabId, "viewport");
     // #336: remember viewport's metrics so a later device reset can hand the shared
     // override back to viewport while it still holds.
     rememberDeviceMetrics(tabId, "viewport", metricsParams);
@@ -13360,6 +13371,12 @@ function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
         removeLedgerOverride(wiring.ledgerField, tabId);
         changed = true;
       }
+      // #336: the override is gone, so give the domain's registration back too -- a
+      // refused repeat set after the detach may have re-registered it on the fresh
+      // attachment (the refused-repeat "keep" rule holds only while the attachment
+      // that held the override is the same one). Detaches once nothing else needs the
+      // tab's debugger.
+      await releaseEmulationDebuggerSessionDomain(tabId, domain);
     }
     if (changed) {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
@@ -13433,10 +13450,6 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
     }
   }
   session.domains.add(domain);
-  // #336: this set or reset is touching the domain; bump its generation so any shim
-  // teardown queued before now stands down for it (a per-command attach for another
-  // tool never reaches here, so it never bumps).
-  bumpEmulationDomainSetSeq(tabId, domain);
   return { debuggee: attachment.debuggee, session, attachment };
 }
 

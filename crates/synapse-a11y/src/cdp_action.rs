@@ -3003,6 +3003,41 @@ pub async fn cdp_evaluate_expression(
     await_promise: bool,
     return_by_value: bool,
 ) -> A11yResult<CdpEvaluateResult> {
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "durable browser mutation owners are disabled by operator panic; refusing Runtime.evaluate"
+                .to_owned(),
+        });
+    }
+    cdp_evaluate_expression_inner(
+        endpoint,
+        target_id,
+        expression,
+        await_promise,
+        return_by_value,
+        None,
+    )
+    .await
+}
+
+/// Lock-free, panic-gate-free [`cdp_evaluate_expression`] for callers that
+/// already hold the durable browser-mutation operation lock — the clock drain,
+/// which evaluates the current-document clock uninstall during teardown. It does
+/// not take that lock (so it cannot deadlock a holder) and does not consult the
+/// panic gate (so teardown cleanup still runs after the gate has closed).
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the `Runtime.evaluate` command or readback fails.
+pub async fn cdp_evaluate_expression_owned(
+    endpoint: &str,
+    target_id: &str,
+    expression: &str,
+    await_promise: bool,
+    return_by_value: bool,
+) -> A11yResult<CdpEvaluateResult> {
     cdp_evaluate_expression_inner(
         endpoint,
         target_id,
@@ -3027,6 +3062,13 @@ pub async fn cdp_evaluate_expression_with_timeout(
     return_by_value: bool,
     timeout_ms: u64,
 ) -> A11yResult<CdpEvaluateResult> {
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "durable browser mutation owners are disabled by operator panic; refusing Runtime.evaluate"
+                .to_owned(),
+        });
+    }
     cdp_evaluate_expression_inner(
         endpoint,
         target_id,
@@ -3038,6 +3080,12 @@ pub async fn cdp_evaluate_expression_with_timeout(
     .await
 }
 
+/// Lock-free, panic-gate-free body shared by [`cdp_evaluate_expression`],
+/// [`cdp_evaluate_expression_with_timeout`] and [`cdp_evaluate_expression_owned`].
+/// The two guarded entries take the durable browser-mutation operation lock and
+/// the panic gate before calling this; the owned entry does neither, so a caller
+/// already holding the lock (the clock drain) can evaluate cleanup without
+/// re-entering the lock or being refused by the gate during teardown.
 async fn cdp_evaluate_expression_inner(
     endpoint: &str,
     target_id: &str,
@@ -3047,13 +3095,6 @@ async fn cdp_evaluate_expression_inner(
     timeout_ms: Option<u64>,
 ) -> A11yResult<CdpEvaluateResult> {
     use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
-    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
-    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        return Err(A11yError::CdpAttachFailed {
-            detail: "durable browser mutation owners are disabled by operator panic; refusing Runtime.evaluate"
-                .to_owned(),
-        });
-    }
     let owner_endpoint = endpoint.to_owned();
     let expression = expression.to_owned();
     with_target_page(endpoint, target_id, |page| async move {
@@ -3441,8 +3482,13 @@ pub async fn cdp_remove_init_script_target(
 
 /// The lock-free body of [`cdp_remove_init_script_target`], for callers that
 /// already hold the durable browser-mutation operation lock (the add rollback
-/// and the clock drain).
-pub(super) async fn cdp_remove_init_script_target_owned(
+/// and the clock drain). A caller that does not hold that lock must use
+/// [`cdp_remove_init_script_target`] instead.
+///
+/// # Errors
+///
+/// The same as [`cdp_remove_init_script_target`].
+pub async fn cdp_remove_init_script_target_owned(
     endpoint: &str,
     target_id: &str,
     identifier: &str,

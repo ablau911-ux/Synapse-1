@@ -176,11 +176,19 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_click",
-            click_claim_target(&params),
-            &request_context,
-        ) {
+        let claim_check = match &params.target {
+            crate::m2::ActClickTarget::Element(element) => self.ensure_element_action_target(
+                "act_click",
+                &element.element_id,
+                &request_context,
+            ),
+            crate::m2::ActClickTarget::Point(_) => self.ensure_target_claim_allows_action(
+                "act_click",
+                click_claim_target(&params),
+                &request_context,
+            ),
+        };
+        if let Err(error) = claim_check {
             return audit_target_claim_denial(self, "act_click", error, &request_context);
         }
         if let Err(error) = maybe_auto_wait_for_actionability(
@@ -805,11 +813,9 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_set_field_text",
-            element_claim_target(&element_id),
-            &request_context,
-        ) {
+        if let Err(error) =
+            self.ensure_element_action_target("act_set_field_text", &element_id, &request_context)
+        {
             return audit_target_claim_denial(self, "act_set_field_text", error, &request_context);
         }
         let result = self
@@ -840,9 +846,9 @@ impl SynapseService {
                             )
                         })?
                         .clone();
-                    if let Err(error) = self.ensure_target_claim_allows_action(
+                    if let Err(error) = self.ensure_element_action_target(
                         "act_set_field_text",
-                        element_claim_target(&retry_element_id),
+                        &retry_element_id,
                         &request_context,
                     ) {
                         Err(error)
@@ -866,6 +872,64 @@ impl SynapseService {
         };
         self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
         result.map(Json)
+    }
+
+    fn ensure_element_action_target(
+        &self,
+        tool: &'static str,
+        element_id: &ElementId,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        // UIA element ids can name a child HWND. Claims belong to the root
+        // window, so checking the encoded HWND alone misses the owner's claim.
+        let root_hwnd = crate::m1::element_root_window(
+            tool,
+            "element_id",
+            element_id,
+            error_codes::ACTION_TARGET_INVALID,
+        )?;
+        let target = self.request_session_target(request_context)?;
+        if let Some(bound) = target.as_ref() {
+            let bound_hwnd = match bound {
+                SessionTarget::Window { hwnd } => *hwnd,
+                SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+            };
+            if root_hwnd != bound_hwnd {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!("{tool} element root window does not match the session target"),
+                ));
+            }
+        }
+        self.ensure_target_claim_allows_action(
+            tool,
+            Some(SessionTarget::Window { hwnd: root_hwnd }),
+            request_context,
+        )?;
+        #[cfg(windows)]
+        if synapse_a11y::cdp_backend_from_element_id(element_id).is_some() {
+            let element_target_id = synapse_a11y::cdp_target_from_element_id(element_id)
+                .ok_or_else(|| mcp_error(error_codes::ACTION_TARGET_INVALID,
+                    format!("{tool} CDP element must include its target id; re-resolve it against the session target")))?;
+            if let Some(bound) = target.as_ref()
+                && !matches!(bound, SessionTarget::Cdp { cdp_target_id, .. }
+                    if cdp_target_id.eq_ignore_ascii_case(&element_target_id))
+            {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!("{tool} CDP element does not match the session tab target"),
+                ));
+            }
+            self.ensure_target_claim_allows_action(
+                tool,
+                Some(SessionTarget::Cdp {
+                    window_hwnd: root_hwnd,
+                    cdp_target_id: element_target_id,
+                }),
+                request_context,
+            )?;
+        }
+        Ok(())
     }
 
     async fn act_set_field_text_execute_resolved(

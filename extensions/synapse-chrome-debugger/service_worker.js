@@ -1701,14 +1701,20 @@ async function reconcileDurableOwners(trigger, options = {}) {
       continue;
     }
     const liveTarget = live.get(tabId) || null;
+    // #336/B: decide emulation shim teardown from reality, not from continuity. An
+    // extension reload (chrome.runtime.reload) detaches every debugger even though the
+    // browser instance -- and so continuity -- is unchanged, and a browser restart
+    // breaks continuity; in both cases the tab's target reports attached=false via
+    // chrome.debugger.getTargets (the `live` readback), its CDP override is gone, and
+    // its MAIN-world shims must be torn down and the ledger entry cleared. A target
+    // still attached kept its override and is adopted by the next emulation op (item
+    // 4). This runs for every present tab on every reconcile, independent of the
+    // continuity decision.
+    const staleEmulationDomains = liveTarget?.attached ? [] : emulationDomainsHeldInLedger(tabId);
+    if (staleEmulationDomains.length) {
+      enqueueEmulationShimTeardown(tabId, staleEmulationDomains, true);
+    }
     if (!continuity) {
-      // #339/B: a prior instance's CDP emulation overrides cannot have survived the
-      // extension reload / browser restart that broke continuity (its debugger is
-      // gone), but their MAIN-world shims persist on this live tab; tear them down
-      // out of band before the rows below are pruned, so the page stops reporting
-      // emulated values. Where continuity holds instead, the attachment survived and
-      // item-4 adoption keeps the overrides -- so this runs only when they are gone.
-      enqueueEmulationShimTeardown(tabId, emulationDomainsHeldInLedger(tabId), false);
       // Continuity is unproven (no fingerprinted row matched a live target), so
       // every fingerprinted row here refers to a target that no longer exists.
       // CDP-session state (debugger sessions, init scripts, bindings, emulation,

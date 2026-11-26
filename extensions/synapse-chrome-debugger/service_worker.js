@@ -8662,13 +8662,25 @@ async function handleDeviceEmulation(params) {
   let descriptor = null;
   let dispatch;
   let restoredUserAgent = null;
+  let after;
   if (operation === "set") {
     descriptor = normalizeDeviceDescriptor(params);
     if (!DEVICE_BASELINE_BY_TAB.has(selected.tabId)) {
       DEVICE_BASELINE_BY_TAB.set(selected.tabId, beforeDevice);
     }
-    dispatch = await dispatchDeviceEmulationSet(selected.tabId, descriptor);
-    await applyDeviceEmulationShim(selected.tabId, descriptor);
+    try {
+      dispatch = await dispatchDeviceEmulationSet(selected.tabId, descriptor);
+      await applyDeviceEmulationShim(selected.tabId, descriptor);
+      after = await waitForDeviceReadback(selected.tabId, selected.target, waitTimeoutMs, descriptor);
+    } catch (error) {
+      // #336: a failed set leaves nothing behind -- give the "device" domain
+      // back (which detaches and so drops the override) and forget the baseline
+      // and ledger entry.
+      await releaseEmulationDebuggerSessionDomain(selected.tabId, "device");
+      DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("deviceOverrides", selected.tabId);
+      throw error;
+    }
   } else {
     rejectDeviceResetField(params.userAgent, "userAgent");
     rejectDeviceResetField(params.width, "width");
@@ -8683,10 +8695,8 @@ async function handleDeviceEmulation(params) {
       : null;
     dispatch = await dispatchDeviceEmulationReset(selected.tabId, restoredUserAgent);
     await clearDeviceEmulationShim(selected.tabId);
+    after = await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   }
-  let after = descriptor
-    ? await waitForDeviceReadback(selected.tabId, selected.target, waitTimeoutMs, descriptor)
-    : await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   let resetFallback = null;
   let resetBaselineRestore = null;
   if (!descriptor) {
@@ -8753,15 +8763,33 @@ async function handleGeolocationEmulation(params) {
   let requested = null;
   let permissionSetting = "prompt";
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeGeolocationOverride(params);
     permissionSetting = normalizeGeolocationPermissionSetting(params.grantPermission);
     GEOLOCATION_OVERRIDE_BY_TAB.set(selected.tabId, origin);
-    dispatch = await dispatchGeolocationEmulationSet(selected.tabId, origin, requested, permissionSetting);
-    await applyGeolocationEmulationShim(selected.tabId, {
-      requested,
-      permission_state: permissionSetting
-    });
+    try {
+      dispatch = await dispatchGeolocationEmulationSet(selected.tabId, origin, requested, permissionSetting);
+      await applyGeolocationEmulationShim(selected.tabId, {
+        requested,
+        permission_state: permissionSetting
+      });
+      after = await waitForGeolocationReadback(
+        selected.tabId,
+        selected.target,
+        waitTimeoutMs,
+        requested,
+        permissionSetting
+      );
+    } catch (error) {
+      // #336: a failed set leaves nothing behind -- give the "geolocation"
+      // domain back (which detaches and so drops the override) and forget the
+      // override map and ledger entry.
+      await releaseEmulationDebuggerSessionDomain(selected.tabId, "geolocation");
+      GEOLOCATION_OVERRIDE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("geolocationOverrides", selected.tabId);
+      throw error;
+    }
   } else {
     rejectGeolocationResetField(params.latitude, "latitude");
     rejectGeolocationResetField(params.longitude, "longitude");
@@ -8775,14 +8803,14 @@ async function handleGeolocationEmulation(params) {
     await clearGeolocationEmulationShim(selected.tabId);
     GEOLOCATION_OVERRIDE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("geolocationOverrides", selected.tabId);
+    after = await waitForGeolocationReadback(
+      selected.tabId,
+      selected.target,
+      waitTimeoutMs,
+      requested,
+      permissionSetting
+    );
   }
-  const after = await waitForGeolocationReadback(
-    selected.tabId,
-    selected.target,
-    waitTimeoutMs,
-    requested,
-    permissionSetting
-  );
   return {
     extension_id: chrome.runtime.id,
     target_id: after.page.target_id || selected.target.id,
@@ -8817,28 +8845,34 @@ async function handleLocaleEmulation(params) {
   const beforeLocale = await tabLocaleState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeLocaleOverride(params);
     if (!LOCALE_BASELINE_BY_TAB.has(selected.tabId)) {
       LOCALE_BASELINE_BY_TAB.set(selected.tabId, beforeLocale);
     }
-    dispatch = await dispatchLocaleEmulationSet(selected.tabId, requested);
-    await applyLocaleEmulationShim(selected.tabId, requested);
+    try {
+      dispatch = await dispatchLocaleEmulationSet(selected.tabId, requested);
+      await applyLocaleEmulationShim(selected.tabId, requested);
+      after = await waitForLocaleReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: a failed set leaves nothing behind.
+      await releaseEmulationDebuggerSessionDomain(selected.tabId, "locale");
+      LOCALE_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("localeOverrides", selected.tabId);
+      throw error;
+    }
   } else {
     rejectLocaleResetField(params.locale, "locale");
     rejectLocaleResetField(params.timezoneId, "timezoneId");
     dispatch = await dispatchLocaleEmulationReset(selected.tabId);
     await clearLocaleEmulationShim(selected.tabId);
-  }
-  let after = requested
-    ? await waitForLocaleReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForLocaleResetReadback(
+    after = await waitForLocaleResetReadback(
       selected.tabId,
       selected.target,
       waitTimeoutMs,
       LOCALE_BASELINE_BY_TAB.get(selected.tabId)
     );
-  if (!requested) {
     LOCALE_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("localeOverrides", selected.tabId);
   }
@@ -8875,29 +8909,35 @@ async function handleMediaEmulation(params) {
   const beforeMedia = await tabMediaState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeMediaOverride(params);
     if (!MEDIA_BASELINE_BY_TAB.has(selected.tabId)) {
       MEDIA_BASELINE_BY_TAB.set(selected.tabId, beforeMedia);
     }
-    dispatch = await dispatchMediaEmulationSet(selected.tabId, requested);
-    await applyMediaEmulationShim(selected.tabId, requested);
+    try {
+      dispatch = await dispatchMediaEmulationSet(selected.tabId, requested);
+      await applyMediaEmulationShim(selected.tabId, requested);
+      after = await waitForMediaReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: a failed set leaves nothing behind.
+      await releaseEmulationDebuggerSessionDomain(selected.tabId, "media");
+      MEDIA_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("mediaOverrides", selected.tabId);
+      throw error;
+    }
   } else {
     rejectMediaResetField(params.media, "media");
     rejectMediaResetField(params.colorScheme, "colorScheme");
     rejectMediaResetField(params.reducedMotion, "reducedMotion");
     dispatch = await dispatchMediaEmulationReset(selected.tabId);
     await clearMediaEmulationShim(selected.tabId);
-  }
-  const after = requested
-    ? await waitForMediaReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForMediaResetReadback(
+    after = await waitForMediaResetReadback(
       selected.tabId,
       selected.target,
       waitTimeoutMs,
       MEDIA_BASELINE_BY_TAB.get(selected.tabId)
     );
-  if (!requested) {
     MEDIA_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("mediaOverrides", selected.tabId);
   }
@@ -8934,13 +8974,23 @@ async function handleNetworkConditions(params) {
   const beforeNetwork = await tabNetworkState(selected.tabId);
   let requested = null;
   let dispatch;
+  let after;
   if (operation === "set") {
     requested = normalizeNetworkConditionsOverride(params);
     if (!NETWORK_BASELINE_BY_TAB.has(selected.tabId)) {
       NETWORK_BASELINE_BY_TAB.set(selected.tabId, beforeNetwork);
     }
-    dispatch = await dispatchNetworkConditionsSet(selected.tabId, requested);
-    await applyNetworkConditionsShim(selected.tabId, requested);
+    try {
+      dispatch = await dispatchNetworkConditionsSet(selected.tabId, requested);
+      await applyNetworkConditionsShim(selected.tabId, requested);
+      after = await waitForNetworkConditionsReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
+    } catch (error) {
+      // #336: a failed set leaves nothing behind.
+      await releaseEmulationDebuggerSessionDomain(selected.tabId, "network");
+      NETWORK_BASELINE_BY_TAB.delete(selected.tabId);
+      removeLedgerOverride("networkOverrides", selected.tabId);
+      throw error;
+    }
   } else {
     rejectNetworkConditionsResetField(params.offline, "offline");
     rejectNetworkConditionsResetField(params.latencyMs, "latencyMs");
@@ -8949,16 +8999,12 @@ async function handleNetworkConditions(params) {
     rejectNetworkConditionsResetField(params.connectionType, "connectionType");
     dispatch = await dispatchNetworkConditionsReset(selected.tabId);
     await clearNetworkConditionsShim(selected.tabId);
-  }
-  const after = requested
-    ? await waitForNetworkConditionsReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
-    : await waitForNetworkConditionsResetReadback(
+    after = await waitForNetworkConditionsResetReadback(
       selected.tabId,
       selected.target,
       waitTimeoutMs,
       NETWORK_BASELINE_BY_TAB.get(selected.tabId)
     );
-  if (!requested) {
     NETWORK_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("networkOverrides", selected.tabId);
   }
@@ -9477,13 +9523,11 @@ function rejectNetworkConditionsResetField(value, fieldName) {
   }
 }
 
+// #336: device emulation (user agent, device metrics, touch) is held on the
+// shared per-tab emulation session so the overrides survive until reset.
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
     await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
       userAgent: descriptor.user_agent
     });
@@ -9505,31 +9549,19 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
     });
     return {
       method: "Emulation.setUserAgentOverride+Emulation.setDeviceMetricsOverride+Emulation.setTouchEmulationEnabled+Emulation.setEmitTouchEventsForMouse",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger deviceEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
     );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for deviceEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
   }
 }
 
 async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
     await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
       width: 0,
@@ -9555,7 +9587,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       method: restoredUserAgent
         ? "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)+Emulation.setTouchEmulationEnabled(false)+Emulation.setUserAgentOverride(original)"
         : "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0)+Emulation.setTouchEmulationEnabled(false)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9563,24 +9595,17 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       `chrome.debugger deviceEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for deviceEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "device");
   }
 }
 
+// #336: the geolocation override is held on the shared emulation session so it
+// survives until reset. (Browser.setPermission is browser-global and best-effort,
+// not tied to the session.)
 async function dispatchGeolocationEmulationSet(tabId, origin, requested, permissionSetting) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   let permissionMethod = `Browser.setPermission(${permissionSetting})`;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "geolocation");
     try {
       await sendDebuggerCommand(debuggee, "Browser.setPermission", {
         permission: { name: "geolocation" },
@@ -9610,32 +9635,20 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
     await sendDebuggerCommand(debuggee, "Emulation.setGeolocationOverride", params);
     return {
       method: `Emulation.setGeolocationOverride+${permissionMethod}`,
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger geolocationEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
     );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
   }
 }
 
 async function dispatchGeolocationEmulationReset(tabId, origin) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   let permissionMethod = "Browser.setPermission(prompt)";
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "geolocation");
     await sendDebuggerCommand(debuggee, "Emulation.clearGeolocationOverride", {});
     try {
       await sendDebuggerCommand(debuggee, "Browser.setPermission", {
@@ -9648,7 +9661,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
     }
     return {
       method: `Emulation.clearGeolocationOverride+${permissionMethod}`,
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9656,24 +9669,16 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
       `chrome.debugger geolocationEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "geolocation");
   }
 }
 
+// #336: the locale/timezone overrides are held on the shared emulation session
+// so they survive until reset.
 async function dispatchLocaleEmulationSet(tabId, requested) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   const methods = [];
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "locale");
     if (requested.locale) {
       await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {
         locale: requested.locale
@@ -9688,38 +9693,26 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
     }
     return {
       method: methods.join("+"),
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger localeEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
     );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for localeEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
   }
 }
 
 async function dispatchLocaleEmulationReset(tabId) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "locale");
     await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setTimezoneOverride", {
       timezoneId: ""
     });
     return {
       method: "Emulation.setLocaleOverride(default)+Emulation.setTimezoneOverride(default)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9727,23 +9720,15 @@ async function dispatchLocaleEmulationReset(tabId) {
       `chrome.debugger localeEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for localeEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "locale");
   }
 }
 
+// #336: the emulated-media override is held on the shared emulation session so it
+// survives until reset.
 async function dispatchMediaEmulationSet(tabId, requested) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "media");
     const features = [];
     if (requested.color_scheme) {
       features.push({ name: "prefers-color-scheme", value: requested.color_scheme });
@@ -9757,38 +9742,26 @@ async function dispatchMediaEmulationSet(tabId, requested) {
     });
     return {
       method: "Emulation.setEmulatedMedia(media,features)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger mediaEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
     );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for mediaEmulation set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
   }
 }
 
 async function dispatchMediaEmulationReset(tabId) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "media");
     await sendDebuggerCommand(debuggee, "Emulation.setEmulatedMedia", {
       media: "",
       features: []
     });
     return {
       method: "Emulation.setEmulatedMedia(default)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9796,23 +9769,16 @@ async function dispatchMediaEmulationReset(tabId) {
       `chrome.debugger mediaEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for mediaEmulation reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "media");
   }
 }
 
+// #336: the network-conditions override is held on the shared emulation session
+// so it survives until reset. Network.enable stays enabled while the session is
+// held, as the override requires.
 async function dispatchNetworkConditionsSet(tabId, requested) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     const params = {
       offline: Boolean(requested.offline),
@@ -9826,31 +9792,19 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
     await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", params);
     return {
       method: "Network.enable+Network.emulateNetworkConditions",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
       `chrome.debugger networkConditions set failed for tab ${tabId}: ${errorMessage(error)}`
     );
-  } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for networkConditions set tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
   }
 }
 
 async function dispatchNetworkConditionsReset(tabId) {
-  const debuggee = { tabId };
-  const protocolVersion = "1.3";
-  let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
-    attached = true;
+    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", {
       offline: false,
@@ -9860,7 +9814,7 @@ async function dispatchNetworkConditionsReset(tabId) {
     });
     return {
       method: "Network.enable+Network.emulateNetworkConditions(default)",
-      protocol_version: protocolVersion
+      protocol_version: attachment.protocolVersion
     };
   } catch (error) {
     throw bridgeError(
@@ -9868,13 +9822,7 @@ async function dispatchNetworkConditionsReset(tabId) {
       `chrome.debugger networkConditions reset failed for tab ${tabId}: ${errorMessage(error)}`
     );
   } finally {
-    if (attached) {
-      try {
-        await chrome.debugger.detach(debuggee);
-      } catch (error) {
-        console.warn(`Synapse chrome.debugger detach failed for networkConditions reset tab ${tabId}: ${errorMessage(error)}`);
-      }
-    }
+    await releaseEmulationDebuggerSessionDomain(tabId, "network");
   }
 }
 

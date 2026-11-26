@@ -8585,12 +8585,14 @@ async function handleViewportEmulation(params) {
       await applyViewportDprShim(selected.tabId, requested.device_scale_factor);
       after = await waitForViewportReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
     } catch (error) {
-      // #336: a failed set leaves nothing behind -- give the "viewport" domain
-      // back (which detaches and so drops the override) and forget the baseline
-      // and ledger entry, so nothing later believes an override is live.
-      await releaseEmulationDebuggerSessionDomain(selected.tabId, "viewport");
-      VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
-      removeLedgerOverride("viewportOverrides", selected.tabId);
+      // #336: undo the override on the held session and tear down the shim before
+      // forgetting it, so it is never left applied but untracked.
+      await cleanupFailedEmulationSet(selected.tabId, "viewport", {
+        reset: () => dispatchViewportEmulationReset(selected.tabId),
+        clearShim: clearViewportDprShim,
+        baselineMap: VIEWPORT_BASELINE_BY_TAB,
+        ledgerField: "viewportOverrides"
+      }, error);
       throw error;
     }
   } else {
@@ -8670,12 +8672,16 @@ async function handleDeviceEmulation(params) {
       await applyDeviceEmulationShim(selected.tabId, descriptor);
       after = await waitForDeviceReadback(selected.tabId, selected.target, waitTimeoutMs, descriptor);
     } catch (error) {
-      // #336: a failed set leaves nothing behind -- give the "device" domain
-      // back (which detaches and so drops the override) and forget the baseline
-      // and ledger entry.
-      await releaseEmulationDebuggerSessionDomain(selected.tabId, "device");
-      DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
-      removeLedgerOverride("deviceOverrides", selected.tabId);
+      // #336: undo the override on the held session and tear down the shim before
+      // forgetting it, restoring the pre-set user agent, so it is never left applied
+      // but untracked.
+      const restoredUserAgent = DEVICE_BASELINE_BY_TAB.get(selected.tabId)?.user_agent || null;
+      await cleanupFailedEmulationSet(selected.tabId, "device", {
+        reset: () => dispatchDeviceEmulationReset(selected.tabId, restoredUserAgent),
+        clearShim: clearDeviceEmulationShim,
+        baselineMap: DEVICE_BASELINE_BY_TAB,
+        ledgerField: "deviceOverrides"
+      }, error);
       throw error;
     }
   } else {
@@ -8766,12 +8772,14 @@ async function handleGeolocationEmulation(params) {
         permissionSetting
       );
     } catch (error) {
-      // #336: a failed set leaves nothing behind -- give the "geolocation"
-      // domain back (which detaches and so drops the override) and forget the
-      // override map and ledger entry.
-      await releaseEmulationDebuggerSessionDomain(selected.tabId, "geolocation");
-      GEOLOCATION_OVERRIDE_BY_TAB.delete(selected.tabId);
-      removeLedgerOverride("geolocationOverrides", selected.tabId);
+      // #336: undo the override on the held session and tear down the shim before
+      // forgetting it, so it is never left applied but untracked.
+      await cleanupFailedEmulationSet(selected.tabId, "geolocation", {
+        reset: () => dispatchGeolocationEmulationReset(selected.tabId, origin),
+        clearShim: clearGeolocationEmulationShim,
+        baselineMap: GEOLOCATION_OVERRIDE_BY_TAB,
+        ledgerField: "geolocationOverrides"
+      }, error);
       throw error;
     }
   } else {
@@ -8840,10 +8848,13 @@ async function handleLocaleEmulation(params) {
       await applyLocaleEmulationShim(selected.tabId, requested);
       after = await waitForLocaleReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
     } catch (error) {
-      // #336: a failed set leaves nothing behind.
-      await releaseEmulationDebuggerSessionDomain(selected.tabId, "locale");
-      LOCALE_BASELINE_BY_TAB.delete(selected.tabId);
-      removeLedgerOverride("localeOverrides", selected.tabId);
+      // #336: undo the override on the held session and tear down the shim first.
+      await cleanupFailedEmulationSet(selected.tabId, "locale", {
+        reset: () => dispatchLocaleEmulationReset(selected.tabId),
+        clearShim: clearLocaleEmulationShim,
+        baselineMap: LOCALE_BASELINE_BY_TAB,
+        ledgerField: "localeOverrides"
+      }, error);
       throw error;
     }
   } else {
@@ -8904,10 +8915,13 @@ async function handleMediaEmulation(params) {
       await applyMediaEmulationShim(selected.tabId, requested);
       after = await waitForMediaReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
     } catch (error) {
-      // #336: a failed set leaves nothing behind.
-      await releaseEmulationDebuggerSessionDomain(selected.tabId, "media");
-      MEDIA_BASELINE_BY_TAB.delete(selected.tabId);
-      removeLedgerOverride("mediaOverrides", selected.tabId);
+      // #336: undo the override on the held session and tear down the shim first.
+      await cleanupFailedEmulationSet(selected.tabId, "media", {
+        reset: () => dispatchMediaEmulationReset(selected.tabId),
+        clearShim: clearMediaEmulationShim,
+        baselineMap: MEDIA_BASELINE_BY_TAB,
+        ledgerField: "mediaOverrides"
+      }, error);
       throw error;
     }
   } else {
@@ -8969,10 +8983,13 @@ async function handleNetworkConditions(params) {
       await applyNetworkConditionsShim(selected.tabId, requested);
       after = await waitForNetworkConditionsReadback(selected.tabId, selected.target, waitTimeoutMs, requested);
     } catch (error) {
-      // #336: a failed set leaves nothing behind.
-      await releaseEmulationDebuggerSessionDomain(selected.tabId, "network");
-      NETWORK_BASELINE_BY_TAB.delete(selected.tabId);
-      removeLedgerOverride("networkOverrides", selected.tabId);
+      // #336: undo the override on the held session and tear down the shim first.
+      await cleanupFailedEmulationSet(selected.tabId, "network", {
+        reset: () => dispatchNetworkConditionsReset(selected.tabId),
+        clearShim: clearNetworkConditionsShim,
+        baselineMap: NETWORK_BASELINE_BY_TAB,
+        ledgerField: "networkOverrides"
+      }, error);
       throw error;
     }
   } else {
@@ -13119,10 +13136,25 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
   return { debuggee: attachment.debuggee, session, attachment };
 }
 
-// #336: a reset or a failed set gives the domain back. When no emulation domain
-// is left for the tab and no other persistent reason holds the session, detach
-// -- otherwise leave the attachment to its remaining owner (a borrowed session
-// is never ours to end).
+// #336: the single source of truth for whether any owner still needs this tab's
+// debugger. It counts only ACTIVE work -- an init script's identifiers, a binding's
+// names, an open dialog/file-chooser interception, a held emulation domain -- not a
+// session's bare "attached" flag: a binding session can stay attached with no active
+// names, and that idle state must not keep the debugger alive. Every detach decision
+// uses this so the debugger is detached exactly once, when the last owner goes.
+function tabDebuggerStillNeeded(tabId) {
+  return hasActiveInitScriptDebuggerSession(tabId) ||
+    bindingSessionHasActiveNames(tabId) ||
+    dialogSessionIsActive(tabId) ||
+    fileChooserSessionIsActive(tabId) ||
+    emulationSessionHasActiveDomains(tabId);
+}
+
+// #336: a reset or a failed set gives the domain back. When the tab's last owner
+// is gone, detach once and clear every other registry's attached flag so none is
+// left stale (otherwise a later op reads a phantom owner and never detaches);
+// otherwise leave the attachment to its remaining owner (a borrowed session is
+// never ours to end).
 async function releaseEmulationDebuggerSessionDomain(tabId, domain) {
   const session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
   if (!session) {
@@ -13133,11 +13165,15 @@ async function releaseEmulationDebuggerSessionDomain(tabId, domain) {
     return false;
   }
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
-  if (persistentDebuggerSessionIsAttached(tabId)) {
+  if (tabDebuggerStillNeeded(tabId)) {
     return false;
   }
   try {
     await chrome.debugger.detach({ tabId });
+    INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+    markBindingDebuggerDetached(tabId, false);
+    markDialogDebuggerDetached(tabId, false);
+    markFileChooserDebuggerDetached(tabId, false);
     return true;
   } catch (error) {
     console.warn(`Synapse chrome.debugger detach failed for emulation cleanup tab ${tabId}: ${errorMessage(error)}`);
@@ -13145,10 +13181,37 @@ async function releaseEmulationDebuggerSessionDomain(tabId, domain) {
   }
 }
 
+// #336: a set that failed or could not be verified must not leave the override
+// applied but untracked. Undo it: the reset clears the domain's override on the
+// still-held session -- so another domain keeping the attachment does not leave this
+// one live -- and the shim teardown removes the page-side shim; then forget the
+// baseline and ledger entry. If the undo itself fails, the ledger entry is kept so
+// operator-panic cleanup can retry, and the original error is surfaced with a note.
+async function cleanupFailedEmulationSet(tabId, domain, wiring, cause) {
+  try {
+    await wiring.reset();
+    await wiring.clearShim(tabId);
+  } catch (undoError) {
+    wiring.baselineMap.delete(tabId);
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `${errorMessage(cause)}; and undo of the failed ${domain} set also failed, so the override was left registered for operator-panic cleanup: ${errorMessage(undoError)}`
+    );
+  }
+  wiring.baselineMap.delete(tabId);
+  removeLedgerOverride(wiring.ledgerField, tabId);
+}
+
 // #336: Chrome detached the debugger (tab closed, user hit "cancel" on the
 // debugging bar, or the session was dropped), so every CDP emulation override on
-// the tab is gone. Drop the held session and clear the baselines and the ledger
-// overrides so nothing later believes an override is still live.
+// the tab is gone. Drop the held session and the live baselines. The ledger
+// override entries are kept on purpose: the page-side shims each set installed
+// (devicePixelRatio / matchMedia / navigator / fetch / geolocation) are MAIN-world
+// injections the CDP detach does NOT remove, and this synchronous onDetach listener
+// has no command admission context in which to run their executeScript teardown.
+// Keeping the ledger entry means operator-panic cleanup -- and the next emulation
+// op's fresh-attach reconcile -- can still clear those shims (a navigation also
+// drops them); a closed tab is pruned by the closed-tab ledger prune.
 function forgetEmulationOverridesForTab(tabId) {
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
@@ -13157,12 +13220,6 @@ function forgetEmulationOverridesForTab(tabId) {
   LOCALE_BASELINE_BY_TAB.delete(tabId);
   MEDIA_BASELINE_BY_TAB.delete(tabId);
   NETWORK_BASELINE_BY_TAB.delete(tabId);
-  removeLedgerOverride("viewportOverrides", tabId);
-  removeLedgerOverride("deviceOverrides", tabId);
-  removeLedgerOverride("geolocationOverrides", tabId);
-  removeLedgerOverride("localeOverrides", tabId);
-  removeLedgerOverride("mediaOverrides", tabId);
-  removeLedgerOverride("networkOverrides", tabId);
 }
 
 function bindingSessionHasActiveNames(tabId) {

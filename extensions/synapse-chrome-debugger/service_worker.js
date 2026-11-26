@@ -8603,27 +8603,24 @@ async function handleViewportEmulation(params) {
     after = await waitForViewportResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeViewport);
   }
   let resetFallback = null;
-  let resetBaselineRestore = null;
   if (!requested) {
     const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId);
-    const baselineRequest = viewportRequestFromBaseline(baseline);
-    if (baselineRequest && !viewportMatchesRequest(after.viewport, baselineRequest)) {
+    // #336: the override is gone when the tab is back at its pre-override
+    // width/devicePixelRatio/screen. inner_height is not compared: a held
+    // debugger session shows Chrome's "started debugging this browser" bar,
+    // which shortens the height, so the natural height legitimately differs
+    // between "a session is attached" and "none is". With no stored baseline
+    // there is nothing to clear -- the tab is already natural and the reset
+    // answers ok.
+    if (baseline && !viewportOverrideCleared(after.viewport, baseline)) {
+      // Those bar-independent fields did not return to baseline, so a CDP
+      // override is lingering; reload the document (which drops it) and confirm.
       resetFallback = await reloadViewportTabAfterReset(
         selected.tabId,
         selected.target,
         waitTimeoutMs
       );
-      try {
-        after = await waitForViewportReadback(
-          selected.tabId,
-          selected.target,
-          Math.min(waitTimeoutMs, 2000),
-          baselineRequest
-        );
-      } catch (_error) {
-        resetBaselineRestore = await dispatchViewportBaselineRestore(selected.tabId, baselineRequest);
-        after = await waitForViewportReadback(selected.tabId, selected.target, waitTimeoutMs, baselineRequest);
-      }
+      after = await waitForViewportOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
     }
     VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("viewportOverrides", selected.tabId);
@@ -8645,7 +8642,7 @@ async function handleViewportEmulation(params) {
     backend_tier_used: "chrome_tabs_extension_debugger",
     required_foreground: false,
     source_of_truth: "normal Chrome bridge page script window.innerWidth/window.innerHeight/devicePixelRatio",
-    method: viewportEmulationMethod(dispatch, resetFallback, resetBaselineRestore),
+    method: viewportEmulationMethod(dispatch, resetFallback),
     debugger_protocol_version: dispatch.protocol_version,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
@@ -8698,32 +8695,19 @@ async function handleDeviceEmulation(params) {
     after = await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   }
   let resetFallback = null;
-  let resetBaselineRestore = null;
   if (!descriptor) {
     const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
-    const baselineRequest = viewportRequestFromBaseline(baseline?.viewport);
-    if (baselineRequest && !viewportMatchesRequest(after.device.viewport, baselineRequest)) {
+    // #336: same bar-independent rule as the viewport reset -- the override is
+    // gone when the user agent, touch, and the viewport's width/dpr/screen are
+    // back to baseline. inner_height is not compared because the debugging bar
+    // shortens it while a session is held.
+    if (baseline?.viewport && !deviceOverrideCleared(after.device, baseline)) {
       resetFallback = await reloadViewportTabAfterReset(
         selected.tabId,
         selected.target,
         waitTimeoutMs
       );
-      try {
-        after = await waitForDeviceResetBaselineReadback(
-          selected.tabId,
-          selected.target,
-          Math.min(waitTimeoutMs, 2000),
-          baseline
-        );
-      } catch (_error) {
-        resetBaselineRestore = await dispatchViewportBaselineRestore(selected.tabId, baselineRequest);
-        after = await waitForDeviceResetBaselineReadback(
-          selected.tabId,
-          selected.target,
-          waitTimeoutMs,
-          baseline
-        );
-      }
+      after = await waitForDeviceOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
     }
     DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
     removeLedgerOverride("deviceOverrides", selected.tabId);
@@ -8746,7 +8730,7 @@ async function handleDeviceEmulation(params) {
     backend_tier_used: "chrome_tabs_extension_debugger",
     required_foreground: false,
     source_of_truth: "normal Chrome bridge page script navigator/userAgent/viewport/touch media queries",
-    method: viewportEmulationMethod(dispatch, resetFallback, resetBaselineRestore),
+    method: viewportEmulationMethod(dispatch, resetFallback),
     debugger_protocol_version: dispatch.protocol_version,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
@@ -10025,7 +10009,38 @@ async function waitForDeviceResetReadback(tabId, fallbackTarget, waitTimeoutMs, 
   throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset readback unavailable within ${timeoutMs} ms; ${detail}`);
 }
 
-async function waitForDeviceResetBaselineReadback(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+// #336: poll until the viewport override is gone by the bar-independent rule
+// (viewportOverrideCleared): width/devicePixelRatio/screen back to the
+// pre-override baseline, height left to whatever the bar does now.
+async function waitForViewportOverrideCleared(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const viewport = await tabViewportMetricsState(tabId);
+      last = { page, viewport };
+      lastError = null;
+      if (viewportOverrideCleared(viewport, baseline)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last viewport=${JSON.stringify(last.viewport)} baseline width/dpr/screen=${JSON.stringify({ inner_width: baseline?.inner_width, device_pixel_ratio: baseline?.device_pixel_ratio, screen_width: baseline?.screen_width, screen_height: baseline?.screen_height })}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no viewport readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `viewportEmulation reset did not return to the pre-override width/devicePixelRatio/screen within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+// #336: the device equivalent -- user agent and touch back to baseline, viewport
+// cleared by the same bar-independent rule.
+async function waitForDeviceOverrideCleared(tabId, fallbackTarget, waitTimeoutMs, baseline) {
   const started = Date.now();
   let last = null;
   let lastError = null;
@@ -10035,7 +10050,7 @@ async function waitForDeviceResetBaselineReadback(tabId, fallbackTarget, waitTim
       const device = await tabDeviceMetricsState(tabId);
       last = { page, device };
       lastError = null;
-      if (deviceMatchesBaseline(device, baseline)) {
+      if (deviceOverrideCleared(device, baseline)) {
         return last;
       }
     } catch (error) {
@@ -10048,7 +10063,7 @@ async function waitForDeviceResetBaselineReadback(tabId, fallbackTarget, waitTim
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
       : "no device readback";
-  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset baseline readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset did not return to the pre-override user agent/width/devicePixelRatio/screen within ${waitTimeoutMs} ms; ${detail}`);
 }
 
 async function waitForGeolocationReadback(tabId, fallbackTarget, waitTimeoutMs, requested, permissionSetting) {
@@ -10704,13 +10719,10 @@ async function reloadViewportTabAfterReset(tabId, fallbackTarget, waitTimeoutMs)
   };
 }
 
-function viewportEmulationMethod(dispatch, resetFallback, resetBaselineRestore) {
+function viewportEmulationMethod(dispatch, resetFallback) {
   const parts = [dispatch.method];
   if (resetFallback) {
     parts.push(`baselineReload:${resetFallback.method}`);
-  }
-  if (resetBaselineRestore) {
-    parts.push(`baselineMetricsRestore:${resetBaselineRestore.method}`);
   }
   return parts.join("+");
 }
@@ -10721,6 +10733,42 @@ function viewportMatchesRequest(viewport, requested) {
     viewport.inner_width === requested.width &&
     viewport.inner_height === requested.height &&
     Math.abs(Number(viewport.device_pixel_ratio) - requested.device_scale_factor) <= 0.01
+  );
+}
+
+// #336: a device-metrics override is cleared once the tab is back at the fields
+// the debugging bar does not move -- inner_width, devicePixelRatio and the screen
+// size. inner_height is deliberately excluded: while a debugger session is held
+// the tab shows Chrome's "started debugging this browser" bar, which shortens
+// inner_height, so the natural height differs between "a session is attached" and
+// "none is", and comparing it would make a correct reset fail. The override moves
+// width and dpr too, so these fields alone decide whether it is gone.
+function viewportOverrideCleared(viewport, baseline) {
+  if (!viewport || !baseline || !Number.isSafeInteger(baseline.inner_width)) {
+    return false;
+  }
+  return (
+    viewport.inner_width === baseline.inner_width &&
+    Math.abs(Number(viewport.device_pixel_ratio) - Number(baseline.device_pixel_ratio)) <= 0.01 &&
+    viewport.screen_width === baseline.screen_width &&
+    viewport.screen_height === baseline.screen_height
+  );
+}
+
+// #336: a device override is cleared when its viewport is cleared by the same
+// bar-independent rule and the user agent and touch fields are back to baseline.
+function deviceOverrideCleared(device, baseline) {
+  return (
+    Boolean(device) &&
+    Boolean(baseline) &&
+    viewportOverrideCleared(device.viewport, baseline.viewport) &&
+    device.user_agent === baseline.user_agent &&
+    Number(device.max_touch_points) === Number(baseline.max_touch_points) &&
+    Boolean(device.ontouchstart_available) === Boolean(baseline.ontouchstart_available) &&
+    Boolean(device.pointer_coarse) === Boolean(baseline.pointer_coarse) &&
+    Boolean(device.any_pointer_coarse) === Boolean(baseline.any_pointer_coarse) &&
+    Boolean(device.hover_none) === Boolean(baseline.hover_none) &&
+    Boolean(device.any_hover_none) === Boolean(baseline.any_hover_none)
   );
 }
 
@@ -10794,10 +10842,6 @@ function sameDeviceMetrics(left, right) {
     Boolean(left.hover_none) === Boolean(right.hover_none) &&
     Boolean(left.any_hover_none) === Boolean(right.any_hover_none)
   );
-}
-
-function deviceMatchesBaseline(device, baseline) {
-  return sameDeviceMetrics(device, baseline);
 }
 
 function summarizeDeviceReadback(device) {

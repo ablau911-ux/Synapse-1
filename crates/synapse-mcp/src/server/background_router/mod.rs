@@ -9916,13 +9916,12 @@ fn target_act_parse_key_chord(raw: &str, verb: &str) -> Result<Vec<String>, Erro
     let keys = raw
         .split('+')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    if keys.is_empty() {
+    if keys.iter().any(String::is_empty) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("target_act verb={verb} key chord must contain at least one key"),
+            format!("target_act verb={verb} key names must be non-empty"),
         ));
     }
     Ok(keys)
@@ -10296,5 +10295,32 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
             | error_codes::TRANSIENT_ELEMENT_EXPIRED,
         ) => TARGET_ACT_STATUS_REFUSED,
         _ => TARGET_ACT_STATUS_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod key_chord_tests {
+    use super::*;
+
+    #[test]
+    fn empty_chord_segments_are_rejected_before_delivery() {
+        for raw in [
+            "Shift+",
+            "+Shift",
+            "Shift++Alt",
+            "Ctrl+",
+            "+++",
+            "Ctrl+ +A",
+            "",
+        ] {
+            let result = target_act_parse_key_chord(raw, "press");
+            assert!(matches!(result, Err(error)
+                if error_code(&error) == Some(error_codes::TOOL_PARAMS_INVALID)
+                    && error.message.contains("key names must be non-empty")));
+        }
+        assert_eq!(
+            target_act_parse_key_chord(" Ctrl + Shift + A ", "press").ok(),
+            Some(vec!["Ctrl".to_owned(), "Shift".to_owned(), "A".to_owned()])
+        );
     }
 }

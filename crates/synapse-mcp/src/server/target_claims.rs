@@ -215,7 +215,8 @@ impl SynapseService {
             .lock_session_authority_for_tool("target_claim", &session_id)
             .await?;
         validate_target_claim_ttl(params.0.ttl_ms)?;
-        let target = self.resolve_target_claim_target(&session_id, params.0.target)?;
+        let target =
+            self.resolve_target_claim_target("target_claim", &session_id, params.0.target)?;
         validate_claim_target(&target)?;
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
@@ -371,7 +372,7 @@ impl SynapseService {
             ));
         }
         validate_target_claim_ttl(ttl_ms)?;
-        let target = self.resolve_target_claim_target(&session_id, target)?;
+        let target = self.resolve_target_claim_target("target_claim_adopt", &session_id, target)?;
         validate_claim_target(&target)?;
         let now = unix_time_ms_now();
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
@@ -591,7 +592,8 @@ impl SynapseService {
         let _authority_gate = self
             .lock_session_authority_for_tool("target_release", &session_id)
             .await?;
-        let target = self.resolve_target_claim_target(&session_id, params.0.target)?;
+        let target =
+            self.resolve_target_claim_target("target_release", &session_id, params.0.target)?;
         validate_claim_target_shape(&target)?;
         let target_key = target_key(&target);
         let now = unix_time_ms_now();
@@ -942,6 +944,7 @@ impl SynapseService {
 
     fn resolve_target_claim_target(
         &self,
+        operation: &'static str,
         session_id: &str,
         target: Option<TargetClaimTargetParam>,
     ) -> Result<SessionTarget, ErrorData> {
@@ -950,7 +953,9 @@ impl SynapseService {
             None => self.session_target(Some(session_id))?.ok_or_else(|| {
                 mcp_error(
                     error_codes::TARGET_NOT_SET,
-                    "target_claim requires an explicit target or this session's active target",
+                    format!(
+                        "{operation} requires an explicit target or this session's active target"
+                    ),
                 )
             }),
         }

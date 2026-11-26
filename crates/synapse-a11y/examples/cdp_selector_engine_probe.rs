@@ -480,7 +480,7 @@ fn main() {
             .unwrap_or_default();
         println!(
             "readback=probe action stage=after click_at=({:.1},{:.1}) __synapse_clicks={clicks_after:?}",
-            point.x, point.y
+            point.point.x, point.point.y
         );
         assert_eq!(clicks_before, "0", "counter should start at 0");
         assert_eq!(clicks_after, "1", "resolved testid id must drive a real click → counter 0->1");

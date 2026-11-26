@@ -91,7 +91,7 @@ fn main() {
             .unwrap_or_else(|err| panic!("cdp_click_node FAILED (fix regressed): {err}"));
         println!(
             "readback=cdp_click_node_probe stage=click dispatched_at=({:.1},{:.1})",
-            point.x, point.y
+            point.point.x, point.point.y
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;

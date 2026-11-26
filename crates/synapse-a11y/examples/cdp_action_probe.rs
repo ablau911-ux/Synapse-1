@@ -85,7 +85,7 @@ mod windows_impl {
         let after = eval_string(&page, "document.body.getAttribute('data-clicked')||''").await?;
         println!(
             "readback=cdp_click before=data-clicked:{before:?} landed:({:.1},{:.1}) after=data-clicked:{after:?}",
-            landed.x, landed.y
+            landed.point.x, landed.point.y
         );
         assert_eq!(after, "yes", "CDP click did not fire the button onclick");
 

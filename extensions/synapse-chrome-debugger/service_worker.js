@@ -9523,10 +9523,13 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
       screenWidth: descriptor.width,
       screenHeight: descriptor.height
     });
-    await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled", {
-      enabled: descriptor.has_touch,
-      maxTouchPoints: descriptor.has_touch ? descriptor.max_touch_points : 0
-    });
+    // #338: Emulation.setTouchEmulationEnabled rejects maxTouchPoints outside
+    // 1..16 even when enabling=false, so send the count only when touch is on
+    // (the descriptor defaults it to a valid 5); leave the field out when off.
+    await sendDebuggerCommand(debuggee, "Emulation.setTouchEmulationEnabled",
+      descriptor.has_touch
+        ? { enabled: true, maxTouchPoints: descriptor.max_touch_points }
+        : { enabled: false });
     await sendDebuggerCommand(debuggee, "Emulation.setEmitTouchEventsForMouse", {
       enabled: descriptor.has_touch,
       configuration: descriptor.is_mobile ? "mobile" : "desktop"

@@ -36,7 +36,7 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
-    DispatchTouchEventParams, DispatchTouchEventType, InsertTextParams, MouseButton, TouchPoint,
+    DispatchTouchEventType, InsertTextParams, MouseButton, TouchPoint,
 };
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
@@ -293,6 +293,10 @@ pub struct CdpMouseStrokeResult {
     pub start: CdpActionPoint,
     pub end: CdpActionPoint,
     pub duration_ms: f64,
+    /// Set when the button-down closed the target so the mouse release could
+    /// not be acknowledged; the stroke was delivered and the target is
+    /// confirmed gone (#341). Absent for an ordinary delivered stroke.
+    pub release_not_sent_target_closed: Option<String>,
 }
 
 /// Dispatch summary for a CDP touch tap.
@@ -1644,7 +1648,8 @@ pub async fn cdp_mouse_stroke_target(
         terminal_guard.mark_terminal_accounted();
         let _send_result = result_sender.send(result);
     });
-    result_receiver.await.map_err(|error| A11yError::CdpAxtreeFailed {
+    let release_not_sent_target_closed =
+        result_receiver.await.map_err(|error| A11yError::CdpAxtreeFailed {
             detail: format!(
                 "owned raw CDP mouse stroke task closed before publishing its terminal verdict: {error}; unresolved_raw_cdp_input_owner_count={}",
                 unresolved_raw_cdp_input_owner_count()
@@ -1656,6 +1661,7 @@ pub async fn cdp_mouse_stroke_target(
         start,
         end,
         duration_ms,
+        release_not_sent_target_closed,
     })
 }
 
@@ -5601,7 +5607,7 @@ async fn dispatch_cdp_mouse_stroke_raw(
     target_id: &str,
     points: &[CdpMouseStrokePoint],
     button: MouseButton,
-) -> A11yResult<()> {
+) -> A11yResult<Option<String>> {
     let ws_url = cdp_page_websocket_url(endpoint, target_id)?;
     let connect = tokio_tungstenite::connect_async(ws_url.as_str());
     let (mut socket, _response) = tokio::time::timeout(CDP_INPUT_COMMAND_TIMEOUT, connect)
@@ -5650,7 +5656,7 @@ async fn dispatch_cdp_mouse_stroke_raw(
             .map_err(A11yError::after_input)?;
         }
         settle_and_close_raw_input_socket(&mut socket).await;
-        return Ok(());
+        return Ok(None);
     }
 
     send_raw_mouse_event(
@@ -5707,6 +5713,8 @@ async fn dispatch_cdp_mouse_stroke_raw(
             0,
         )
         .await;
+        // The press itself did not deliver, so the closed-target rule never
+        // applies here: a failed press stays a failure.
         return match release {
             Ok(()) => resolve_persisted_cdp_mutation_owner(&owner).and(Err(press_error)),
             Err(release_error) => Err(record_unresolved_input_release(
@@ -5757,33 +5765,44 @@ async fn dispatch_cdp_mouse_stroke_raw(
     )
     .await;
     if let Err(release_error) = release_result {
-        UNRESOLVED_RAW_CDP_INPUT_OWNERS.fetch_add(1, Ordering::SeqCst);
-        return Err(combine_raw_input_failures(
-            dispatch_failure,
-            release_error,
+        // #341: the button-press was delivered (we are past the press-error
+        // return), so a failure of any later event of the stroke is settled by
+        // the same "is the target gone?" question — whether a drag move broke
+        // the loop (`dispatch_failure`) or this release failed. The absence
+        // check turns only on press delivery, so the drag-move error must not
+        // gate it; it is folded into the detail so it is never lost. Target
+        // absent: delivered, owner resolved. Target present or inconclusive:
+        // today's fail-closed owner, with both errors reported.
+        let release_detail = dispatch_failure.as_ref().map_or_else(
+            || release_error.to_string(),
+            |move_error| {
+                format!("drag move not acknowledged: {move_error}; release: {release_error}")
+            },
+        );
+        let settled = settle_failed_release_after_press(
+            endpoint,
+            target_id,
+            &owner,
+            true,
+            None,
+            release_detail,
+            "mouse-down",
             "mouse release acknowledgement was not proven",
         )
-        .after_input());
+        .await;
+        return match settled {
+            Ok(detail) => {
+                settle_and_close_raw_input_socket(&mut socket).await;
+                Ok(Some(detail))
+            }
+            Err(error) => Err(error.after_input()),
+        };
     }
     resolve_persisted_cdp_mutation_owner(&owner).map_err(A11yError::after_input)?;
     settle_and_close_raw_input_socket(&mut socket).await;
     match dispatch_failure {
         Some(error) => Err(error.after_input()),
-        None => Ok(()),
-    }
-}
-
-fn combine_raw_input_failures(
-    primary: Option<A11yError>,
-    release: A11yError,
-    context: &str,
-) -> A11yError {
-    let primary = primary.map_or_else(|| "none".to_owned(), |error| error.to_string());
-    A11yError::CdpAxtreeFailed {
-        detail: format!(
-            "{context}; primary_error={primary}; release_error={release}; unresolved_raw_cdp_input_owner_count={}",
-            unresolved_raw_cdp_input_owner_count()
-        ),
+        None => Ok(None),
     }
 }
 
@@ -6469,15 +6488,39 @@ fn after_input_if<T>(result: A11yResult<T>, delivered: bool) -> A11yResult<T> {
     }
 }
 
+/// `Input.dispatchTouchEvent` command whose `touchPoints` array is always put
+/// on the wire, even when empty. The generated `DispatchTouchEventParams` skips
+/// an empty list, but Chrome rejects a `touchEnd` that arrives without the
+/// `touchPoints` key (`-32602 Invalid parameters`, #342). This is the one
+/// owner of a touch event that is sent — both the live tap and the persisted
+/// touch release build their event here.
+#[derive(Clone, Debug, Serialize)]
+struct DispatchTouchEventCommand {
+    #[serde(rename = "type")]
+    kind: DispatchTouchEventType,
+    #[serde(rename = "touchPoints")]
+    touch_points: Vec<TouchPoint>,
+}
+
+impl chromiumoxide::types::Method for DispatchTouchEventCommand {
+    fn identifier(&self) -> chromiumoxide::types::MethodId {
+        "Input.dispatchTouchEvent".into()
+    }
+}
+
+impl chromiumoxide::types::Command for DispatchTouchEventCommand {
+    type Response = chromiumoxide::cdp::browser_protocol::input::DispatchTouchEventReturns;
+}
+
 fn touch_event(
     kind: DispatchTouchEventType,
     point: Option<CdpActionPoint>,
-) -> A11yResult<DispatchTouchEventParams> {
+) -> A11yResult<DispatchTouchEventCommand> {
     let touch_points = match point {
         Some(point) => vec![touch_point(point)?],
         None => Vec::new(),
     };
-    Ok(DispatchTouchEventParams::new(kind, touch_points))
+    Ok(DispatchTouchEventCommand { kind, touch_points })
 }
 
 fn touch_point(point: CdpActionPoint) -> A11yResult<TouchPoint> {
@@ -6571,10 +6614,17 @@ async fn dispatch_touch_tap_on_page(
         .map(Some),
     };
     let release_not_sent_target_closed = after_input_if(settled, delivered)?;
+    // #341: when the touch-start closed the target the touchEnd was never
+    // acknowledged, so it is not among the events that were delivered.
+    let dispatched_events = if release_not_sent_target_closed.is_some() {
+        vec!["touchStart".to_owned()]
+    } else {
+        vec!["touchStart".to_owned(), "touchEnd".to_owned()]
+    };
     Ok(CdpTouchTapResult {
         target_id: page.target_id().inner().clone(),
         point,
-        dispatched_events: vec!["touchStart".to_owned(), "touchEnd".to_owned()],
+        dispatched_events,
         max_touch_points: touch_state.max_touch_points,
         ontouchstart_available: touch_state.ontouchstart_available,
         touch_emulation_detected: touch_state.max_touch_points > 0

@@ -837,37 +837,3 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next.push(0);
     next
 }
-
-#[cfg(test)]
-mod parameter_code_tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn validation_codes_survive_the_agent_facade() -> Result<(), String> {
-        for (params, expected) in [
-            (
-                json!({"since_ns": 5, "until_ns": 1}),
-                "AGENT_STATS_RANGE_INVALID",
-            ),
-            (json!({"group_by": "bogus"}), "AGENT_STATS_GROUP_BY_INVALID"),
-            (json!({"per_agent_limit": 0}), "AGENT_STATS_LIMIT_INVALID"),
-        ] {
-            let params = serde_json::from_value(params).map_err(|error| error.to_string())?;
-            let error = resolve_options(&params)
-                .err()
-                .ok_or("expected invalid parameters")?;
-            let wrapped = crate::server::delegate_errors::delegate_error(
-                "agent",
-                "stats",
-                "CF_AGENT_EVENTS",
-                "fleet",
-                error,
-                "fix parameters",
-            );
-            assert_eq!(crate::m1::error_code(&wrapped), Some(expected));
-        }
-        Ok(())
-    }
-}

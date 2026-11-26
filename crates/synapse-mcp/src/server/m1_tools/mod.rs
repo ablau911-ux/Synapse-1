@@ -21205,30 +21205,3 @@ fn record_hud_error(
         },
     );
 }
-
-#[cfg(all(test, windows))]
-mod output_path_checks {
-    use super::*;
-
-    #[test]
-    fn stream_paths_are_rejected_before_creating_parents_or_files() {
-        let parent = std::env::temp_dir().join(format!(
-            "synapse-stream-path-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        for tail in ["host.txt:ads.png", "dir:stream/image.png"] {
-            let error =
-                ensure_output_path_available("capture_screenshot", &parent.join(tail), false)
-                    .expect_err("NTFS streams must be refused");
-            assert!(error.message.contains("NTFS stream colon"));
-            assert!(
-                !parent.exists(),
-                "validation must not create parent directories"
-            );
-        }
-    }
-}

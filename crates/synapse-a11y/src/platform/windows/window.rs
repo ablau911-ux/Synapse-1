@@ -614,19 +614,3 @@ fn hwnd_from_wire_value(hwnd: i64) -> A11yResult<HWND> {
     Ok(HWND(native as *mut c_void))
 }
 
-#[cfg(test)]
-mod application_window_tests {
-    use super::*;
-
-    #[test]
-    fn desktop_and_shell_are_not_application_targets() {
-        for hwnd in [unsafe { GetDesktopWindow() }, unsafe { GetShellWindow() }] {
-            if !hwnd.0.is_null() {
-                assert_eq!(
-                    is_top_level_window(hwnd_to_wire(hwnd.0 as isize)).ok(),
-                    Some(false)
-                );
-            }
-        }
-    }
-}

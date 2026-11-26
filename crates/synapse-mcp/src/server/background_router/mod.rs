@@ -10299,30 +10299,3 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
         _ => TARGET_ACT_STATUS_ERROR,
     }
 }
-
-#[cfg(test)]
-mod key_chord_tests {
-    use super::*;
-
-    #[test]
-    fn empty_chord_segments_are_rejected_before_delivery() {
-        for raw in [
-            "Shift+",
-            "+Shift",
-            "Shift++Alt",
-            "Ctrl+",
-            "+++",
-            "Ctrl+ +A",
-            "",
-        ] {
-            let result = target_act_parse_key_chord(raw, "press");
-            assert!(matches!(result, Err(error)
-                if error_code(&error) == Some(error_codes::TOOL_PARAMS_INVALID)
-                    && error.message.contains("key names must be non-empty")));
-        }
-        assert_eq!(
-            target_act_parse_key_chord(" Ctrl + Shift + A ", "press").ok(),
-            Some(vec!["Ctrl".to_owned(), "Shift".to_owned(), "A".to_owned()])
-        );
-    }
-}

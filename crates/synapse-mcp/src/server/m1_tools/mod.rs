@@ -19745,6 +19745,10 @@ impl SynapseService {
             return read_text_request_uncached(&request);
         }
         let bitmap_sha256 = sha256_hex(&captured.bytes);
+        // Check availability even on a cache hit: an installed OCR language
+        // may have been removed since the row was written.
+        synapse_perception::validate_ocr_language(request.lang_hint.as_deref())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let cache_key = ocr_cache_key(
             &request,
             captured.width,
@@ -20108,7 +20112,7 @@ fn ocr_cache_key(
     capture_backend: &str,
 ) -> String {
     format!(
-        "ocr/cache/v2/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+        "ocr/cache/v3/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
         ocr_backend_name(request.requested_backend),
         ocr_backend_name(request.effective_backend),
         sha256_hex(request.lang().as_bytes()),

@@ -24,7 +24,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -56,20 +56,130 @@ use chromiumoxide::page::ScreenshotParams;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Clone, Debug)]
-struct DurableInitScriptEntry {
+/// One long-lived raw-CDP session that keeps a target's init-script
+/// registrations alive. Chrome drops every `Page.addScriptToEvaluateOnNewDocument`
+/// script the instant the CDP client that added it disconnects, so — exactly
+/// like [`crate::cdp_binding`] — we keep one session open per target for as long
+/// as any init script is registered on it. The slot's identifier set is the one
+/// source of truth for which init scripts are registered on the target.
+struct InitScriptSlot {
     endpoint: String,
     target_id: String,
-    identifier: String,
+    page: chromiumoxide::Page,
+    _browser: Browser,
+    handler_task: tokio::task::JoinHandle<()>,
+    /// Identifiers Chrome returned for scripts still registered on this session.
+    identifiers: Mutex<HashSet<String>>,
 }
 
-fn durable_init_script_registry() -> &'static Mutex<HashMap<String, DurableInitScriptEntry>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, DurableInitScriptEntry>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+impl Drop for InitScriptSlot {
+    fn drop(&mut self) {
+        self.handler_task.abort();
+    }
 }
 
-fn durable_init_script_key(endpoint: &str, target_id: &str, identifier: &str) -> String {
-    format!("{endpoint}\n{target_id}\n{identifier}")
+#[derive(Default)]
+struct InitScriptSlotRegistry {
+    slots: Mutex<HashMap<String, Arc<InitScriptSlot>>>,
+}
+
+fn init_script_slot_registry() -> &'static InitScriptSlotRegistry {
+    static REGISTRY: OnceLock<InitScriptSlotRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(InitScriptSlotRegistry::default)
+}
+
+fn init_script_slot_key(endpoint: &str, target_id: &str) -> String {
+    format!("{endpoint}\n{target_id}")
+}
+
+/// Returns the live slot for a target, dropping and forgetting one whose session
+/// has already ended (target gone or connection lost) so a later remove honestly
+/// reports the script as no longer registered.
+fn lookup_live_init_script_slot(endpoint: &str, target_id: &str) -> Option<Arc<InitScriptSlot>> {
+    let key = init_script_slot_key(endpoint, target_id);
+    let mut slots = init_script_slot_registry().slots.lock().ok()?;
+    match slots.get(&key) {
+        Some(slot) if !slot.handler_task.is_finished() => Some(Arc::clone(slot)),
+        Some(_) => {
+            slots.remove(&key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Returns the target's existing init-script session or opens a new long-lived
+/// one, mirroring how `cdp_binding` connects, spawns the handler task and stores
+/// the slot (including the lost-race case where a concurrent caller inserted
+/// first — the surplus session is dropped and its handler aborted).
+async fn get_or_create_init_script_slot(
+    endpoint: &str,
+    target_id: &str,
+) -> A11yResult<Arc<InitScriptSlot>> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    if let Some(slot) = lookup_live_init_script_slot(endpoint, target_id) {
+        return Ok(slot);
+    }
+
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("init-script session connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let page = match get_target_page_with_discovery(&browser, target_id).await {
+        Ok(page) => page,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    let slot = Arc::new(InitScriptSlot {
+        endpoint: endpoint.to_owned(),
+        target_id: target_id.to_owned(),
+        page,
+        _browser: browser,
+        handler_task,
+        identifiers: Mutex::new(HashSet::new()),
+    });
+
+    let key = init_script_slot_key(endpoint, target_id);
+    let mut slots = init_script_slot_registry().slots.lock().map_err(|_| {
+        A11yError::internal("init-script slot registry lock poisoned while inserting slot")
+    })?;
+    match slots.get(&key) {
+        Some(existing) if !existing.handler_task.is_finished() => Ok(Arc::clone(existing)),
+        _ => {
+            slots.insert(key, Arc::clone(&slot));
+            Ok(slot)
+        }
+    }
+}
+
+/// Drops a target's init-script session once its last script has been removed,
+/// re-checking emptiness under the registry lock so a script registered between
+/// the remove and this call keeps its session open.
+fn close_empty_init_script_slot(endpoint: &str, target_id: &str) {
+    let key = init_script_slot_key(endpoint, target_id);
+    let Ok(mut slots) = init_script_slot_registry().slots.lock() else {
+        return;
+    };
+    let still_empty = slots.get(&key).is_some_and(|slot| {
+        slot.identifiers
+            .lock()
+            .is_ok_and(|identifiers| identifiers.is_empty())
+    });
+    if still_empty {
+        slots.remove(&key);
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -2299,31 +2409,6 @@ fn mark_persisted_init_script_registration_removed(
     Ok(())
 }
 
-fn persisted_init_script_registration_removed_readback(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<bool> {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    if !snapshot.failures.is_empty() {
-        return Err(cdp_owner_ledger_error(format!(
-            "cannot read init-script registration state: {}",
-            snapshot.failures.join(" | ")
-        )));
-    }
-    Ok(snapshot.rows.iter().any(|row| {
-        row.owner.endpoint == endpoint
-            && row.owner.target_id == target_id
-            && matches!(
-                &row.owner.mutation,
-                PersistedCdpMutationKind::InitScriptEffect {
-                    registration_identifier: Some(row_identifier),
-                    registration_removed: true,
-                } if row_identifier == identifier
-            )
-    }))
-}
-
 fn transition_persisted_init_script_registration_removed(
     owner: &PersistedCdpMutationOwner,
 ) -> A11yResult<PersistedCdpMutationOwner> {
@@ -3147,100 +3232,88 @@ async fn cdp_add_init_script_target_owned(
             detail: "durable browser mutation owners are disabled by operator panic; refusing init-script install".to_owned(),
         });
     }
-    let source = source.to_owned();
-    let world_name = world_name.map(ToOwned::to_owned);
-    let owner_endpoint = endpoint.to_owned();
-    let result = with_target_page(endpoint, target_id, |page| async move {
-        let target_id = page.target_id().inner().clone();
-        let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source);
-        if let Some(world_name) = world_name {
-            builder = builder.world_name(world_name);
-        }
-        if let Some(include_command_line_api) = include_command_line_api {
-            builder = builder.include_command_line_api(include_command_line_api);
-        }
-        if let Some(run_immediately) = run_immediately {
-            builder = builder.run_immediately(run_immediately);
-        }
-        let params = builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {err}"),
+
+    // One long-lived CDP session per target keeps the registration alive: Chrome
+    // drops every `addScriptToEvaluateOnNewDocument` script the instant the
+    // client that added it disconnects, so the slot's session must outlive this
+    // call (the same shape `cdp_binding` uses for a persistent target session).
+    let slot = get_or_create_init_script_slot(endpoint, target_id).await?;
+    let page = slot.page.clone();
+    let owner_target_id = page.target_id().inner().clone();
+
+    let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source.to_owned());
+    if let Some(world_name) = world_name {
+        builder = builder.world_name(world_name.to_owned());
+    }
+    if let Some(include_command_line_api) = include_command_line_api {
+        builder = builder.include_command_line_api(include_command_line_api);
+    }
+    if let Some(run_immediately) = run_immediately {
+        builder = builder.run_immediately(run_immediately);
+    }
+    let params = builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
+        detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {err}"),
+    })?;
+    // Persist a conservative unknown-registration effect owner before the
+    // physical command. If the response is lost, K2 cannot safely infer an
+    // identifier and must close the exact target rather than reload a possibly
+    // still-registered script.
+    let pending_effect_owner = persist_cdp_mutation_owner(
+        endpoint,
+        &owner_target_id,
+        PersistedCdpMutationKind::InitScriptEffect {
+            registration_identifier: None,
+            registration_removed: false,
+        },
+    )?;
+    let added = page
+        .execute(params)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Page.addScriptToEvaluateOnNewDocument: {err}"),
+        })?
+        .result;
+    let identifier = added.identifier.inner().clone();
+    // Commit the identifier-bearing owner before retiring the conservative
+    // pending row. Normal registration removal intentionally leaves this effect
+    // owner active until a new-document reload readback terminates page-world
+    // code which may already have executed.
+    let _effect_owner = persist_cdp_mutation_owner(
+        endpoint,
+        &owner_target_id,
+        PersistedCdpMutationKind::InitScriptEffect {
+            registration_identifier: Some(identifier.clone()),
+            registration_removed: false,
+        },
+    )?;
+    resolve_persisted_cdp_mutation_owner(&pending_effect_owner)?;
+
+    // The slot's identifier set is the one source of truth for which init
+    // scripts are registered on this target; record what Chrome returned so a
+    // later remove can validate it and the drain knows what to tear down. The
+    // identifier is now unique per target for as long as the slot lives.
+    {
+        let mut identifiers = slot.identifiers.lock().map_err(|_| {
+            A11yError::internal(
+                "init-script slot identifier set poisoned while recording a registration",
+            )
         })?;
-        // Persist a conservative unknown-registration effect owner before the
-        // physical command. If the response is lost, K2 cannot safely infer an
-        // identifier and must close the exact target rather than reload a
-        // possibly still-registered script.
-        let pending_effect_owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::InitScriptEffect {
-                registration_identifier: None,
-                registration_removed: false,
-            },
-        )?;
-        let added = page
-            .execute(params)
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Page.addScriptToEvaluateOnNewDocument: {err}"),
-            })?
-            .result;
-        let identifier = added.identifier.inner().clone();
-        // Commit the identifier-bearing owner before retiring the conservative
-        // pending row. Normal registration removal intentionally leaves this
-        // effect owner active until a new-document reload readback terminates
-        // page-world code which may already have executed.
-        let _effect_owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::InitScriptEffect {
-                registration_identifier: Some(identifier.clone()),
-                registration_removed: false,
-            },
-        )?;
-        resolve_persisted_cdp_mutation_owner(&pending_effect_owner)?;
-        let state = read_page_state(&page).await?;
-        Ok(CdpInitScriptResult {
-            target_id,
-            identifier,
-            state,
-        })
-    })
-    .await?;
+        identifiers.insert(identifier.clone());
+    }
+
+    let state = read_page_state(&page).await?;
+    let result = CdpInitScriptResult {
+        target_id: owner_target_id,
+        identifier,
+        state,
+    };
+
     if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
         let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
         return Err(A11yError::CdpAttachFailed {
             detail:
                 "operator panic crossed init-script installation; the new identifier was removed"
                     .to_owned(),
-        });
-    }
-    let entry = DurableInitScriptEntry {
-        endpoint: endpoint.to_owned(),
-        target_id: target_id.to_owned(),
-        identifier: result.identifier.clone(),
-    };
-    let key = durable_init_script_key(endpoint, target_id, &result.identifier);
-    let registered = match durable_init_script_registry().lock() {
-        Ok(mut registry) => {
-            if crate::cdp_network::durable_browser_mutation_owners_enabled() {
-                registry.insert(key, entry);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
-        Err(_) => Err(()),
-    };
-    if registered != Ok(true) {
-        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
-        return Err(A11yError::CdpAttachFailed {
-            detail: if registered == Ok(false) {
-                "operator panic crossed init-script registration; the new identifier was removed"
-                    .to_owned()
-            } else {
-                "durable init-script registry lock is poisoned; the untracked physical identifier was removed"
-                    .to_owned()
-            },
         });
     }
     Ok(result)
@@ -3253,24 +3326,14 @@ async fn cdp_add_init_script_target_owned(
 /// # Errors
 ///
 /// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
-/// `A11Y_CDP_AXTREE_FAILED` if the Page command or post-command readback fails.
+/// `A11Y_CDP_AXTREE_FAILED` if the Page command or post-command readback fails,
+/// or if `identifier` is not registered on the target's live session.
 pub async fn cdp_remove_init_script_target(
     endpoint: &str,
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
-    let result = cdp_remove_init_script_target_owned(endpoint, target_id, identifier).await?;
-    let key = durable_init_script_key(endpoint, target_id, identifier);
-    let mut registry =
-        durable_init_script_registry()
-            .lock()
-            .map_err(|_| A11yError::CdpAttachFailed {
-                detail: "durable init-script registry lock is poisoned after physical removal"
-                    .to_owned(),
-            })?;
-    registry.remove(&key);
-    drop(registry);
-    Ok(result)
+    cdp_remove_init_script_target_owned(endpoint, target_id, identifier).await
 }
 
 async fn cdp_remove_init_script_target_owned(
@@ -3278,51 +3341,79 @@ async fn cdp_remove_init_script_target_owned(
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
-    cdp_remove_init_script_target_physical(endpoint, target_id, identifier).await
-}
-
-async fn cdp_remove_init_script_target_physical(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<CdpInitScriptResult> {
-    let owner_endpoint = endpoint.to_owned();
-    let owner_target_id = target_id.to_owned();
-    let identifier = identifier.to_owned();
-    with_target_page(endpoint, target_id, |page| async move {
-        let target_id = page.target_id().inner().clone();
-        page.execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
-            ScriptIdentifier::new(identifier.clone()),
-        ))
-        .await
-        .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.removeScriptToEvaluateOnNewDocument({identifier:?}): {err}"),
+    let Some(slot) = lookup_live_init_script_slot(endpoint, target_id) else {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "init script {identifier:?} is no longer registered: target {target_id:?} has no live init-script session"
+            ),
+        });
+    };
+    {
+        let identifiers = slot.identifiers.lock().map_err(|_| {
+            A11yError::internal(
+                "init-script slot identifier set poisoned while removing a registration",
+            )
         })?;
-        mark_persisted_init_script_registration_removed(
-            &owner_endpoint,
-            &owner_target_id,
-            &identifier,
-        )?;
-        let state = read_page_state(&page).await?;
-        Ok(CdpInitScriptResult {
-            target_id,
-            identifier,
-            state,
-        })
-    })
+        if !identifiers.contains(identifier) {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "init script {identifier:?} is not registered on target {target_id:?}"
+                ),
+            });
+        }
+    }
+    let page = slot.page.clone();
+    let owner_target_id = page.target_id().inner().clone();
+    page.execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
+        ScriptIdentifier::new(identifier.to_owned()),
+    ))
     .await
+    .map_err(|err| A11yError::CdpAxtreeFailed {
+        detail: format!("Page.removeScriptToEvaluateOnNewDocument({identifier:?}): {err}"),
+    })?;
+    mark_persisted_init_script_registration_removed(endpoint, &owner_target_id, identifier)?;
+    let state = read_page_state(&page).await?;
+    // Forget the identifier and, when the slot has no scripts left, close its
+    // session so no empty raw-CDP session leaks past the last removal.
+    let now_empty = {
+        let mut identifiers = slot.identifiers.lock().map_err(|_| {
+            A11yError::internal(
+                "init-script slot identifier set poisoned after removing a registration",
+            )
+        })?;
+        identifiers.remove(identifier);
+        identifiers.is_empty()
+    };
+    if now_empty {
+        close_empty_init_script_slot(endpoint, target_id);
+    }
+    Ok(CdpInitScriptResult {
+        target_id: owner_target_id,
+        identifier: identifier.to_owned(),
+        state,
+    })
 }
 
 pub fn durable_init_script_active_count_readback() -> Result<usize, String> {
-    durable_init_script_registry()
+    let slots = init_script_slot_registry()
+        .slots
         .lock()
-        .map(|entries| entries.len())
-        .map_err(|_| "durable init-script registry lock is poisoned".to_owned())
+        .map_err(|_| "durable init-script registry lock is poisoned".to_owned())?;
+    let mut total = 0usize;
+    for slot in slots.values() {
+        let count = slot
+            .identifiers
+            .lock()
+            .map(|identifiers| identifiers.len())
+            .map_err(|_| "init-script slot identifier set is poisoned".to_owned())?;
+        total = total.saturating_add(count);
+    }
+    Ok(total)
 }
 
 pub async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback {
-    let entries = match durable_init_script_registry().lock() {
-        Ok(mut entries) => std::mem::take(&mut *entries),
+    let slots = match init_script_slot_registry().slots.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
         Err(_) => {
             return CdpDurableInitScriptDrainReadback {
                 failures: vec!["durable init-script registry lock is poisoned".to_owned()],
@@ -3331,50 +3422,42 @@ pub async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScrip
             };
         }
     };
-    let found = entries.len();
-    let mut removed = 0usize;
+    // Record what each slot holds, then drop the slots. Dropping a slot aborts
+    // its handler task and closes the CDP session, and Chrome removes every
+    // script that session registered — that is the physical teardown, so we do
+    // not reopen a recovery session per script here.
+    let mut registrations: Vec<(String, String, String)> = Vec::new();
     let mut failures = Vec::new();
-    let mut failed_entries = Vec::new();
-    for (key, entry) in entries {
-        let removal = match persisted_init_script_registration_removed_readback(
-            &entry.endpoint,
-            &entry.target_id,
-            &entry.identifier,
-        ) {
-            Ok(true) => Ok(()),
-            Ok(false) => remove_init_script_registration_for_recovery(
-                &entry.endpoint,
-                &entry.target_id,
-                &entry.identifier,
-            )
-            .await
-            .and_then(|()| {
-                mark_persisted_init_script_registration_removed(
-                    &entry.endpoint,
-                    &entry.target_id,
-                    &entry.identifier,
-                )
-            }),
-            Err(error) => Err(error),
+    for slot in slots.values() {
+        let owner_target_id = slot.page.target_id().inner().clone();
+        let Some(identifiers) = slot
+            .identifiers
+            .lock()
+            .ok()
+            .map(|identifiers| identifiers.iter().cloned().collect::<Vec<String>>())
+        else {
+            failures.push(format!(
+                "init-script slot identifier set poisoned for target {:?} during drain",
+                slot.target_id
+            ));
+            continue;
         };
-        match removal {
-            Ok(()) => removed = removed.saturating_add(1),
-            Err(error) => {
-                failures.push(format!(
-                    "remove init script {:?} from target {:?}: {error}",
-                    entry.identifier, entry.target_id
-                ));
-                failed_entries.push((key, entry));
-            }
+        for identifier in identifiers {
+            registrations.push((slot.endpoint.clone(), owner_target_id.clone(), identifier));
         }
     }
-    if !failed_entries.is_empty() {
-        match durable_init_script_registry().lock() {
-            Ok(mut registry) => registry.extend(failed_entries),
-            Err(_) => failures.push(
-                "durable init-script registry lock poisoned while retaining failed removals"
-                    .to_owned(),
-            ),
+    let found = registrations.len();
+    drop(slots);
+    // Mark each registration removed so the persisted effect-owner drain does
+    // not reopen a session for a script the dropped session already took with
+    // it; the reload that clears page-world effects still runs there.
+    let mut removed = 0usize;
+    for (endpoint, target_id, identifier) in registrations {
+        match mark_persisted_init_script_registration_removed(&endpoint, &target_id, &identifier) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) => failures.push(format!(
+                "mark init script {identifier:?} on target {target_id:?} removed during drain: {error}"
+            )),
         }
     }
     let active_after = durable_init_script_active_count_readback().unwrap_or(usize::MAX);

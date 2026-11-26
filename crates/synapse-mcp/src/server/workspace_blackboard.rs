@@ -253,6 +253,8 @@ pub struct WorkspaceDeleteParams {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceArtifactRef {
     pub handle: String,
+    /// Local file under LOCALAPPDATA/synapse/artifacts. Relative paths are
+    /// resolved under that root. Network/device paths and links are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2036,7 +2038,19 @@ fn normalize_sha256(value: String) -> Result<String, ErrorData> {
 }
 
 fn readback_artifact_path(path_value: &str) -> Result<WorkspaceArtifactReadback, ErrorData> {
-    let path = Path::new(path_value);
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
+        .join("synapse")
+        .join("artifacts");
+    // Check containment before metadata, open, or hashing, so even rejected
+    // size/hash probes cannot disclose files or trigger an outbound SMB open.
+    let path = crate::m3::permissions::normalize_path_under_root(&root, Path::new(path_value))
+        .map_err(|_| {
+            params_error(format!(
+                "workspace artifact path must stay under {} without network/device paths or links",
+                root.display()
+            ))
+        })?;
     let metadata = path.metadata().map_err(|error| {
         params_error(format!(
             "workspace artifact path {} is not readable: {error}",
@@ -2049,7 +2063,7 @@ fn readback_artifact_path(path_value: &str) -> Result<WorkspaceArtifactReadback,
             path.display()
         )));
     }
-    let sha256 = sha256_file(path)?;
+    let sha256 = sha256_file(&path)?;
     Ok(WorkspaceArtifactReadback {
         path: path.display().to_string(),
         exists: true,

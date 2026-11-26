@@ -340,12 +340,21 @@ pub struct CdpActivateTabResult {
 pub async fn cdp_list_targets(endpoint: &str) -> A11yResult<Vec<CdpTargetSummary>> {
     use futures_util::StreamExt as _;
 
+    struct AbortHandlerOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortHandlerOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     let CdpAttachment {
         browser,
         mut handler,
         ..
     } = attach_chromiumoxide(endpoint).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // Inventory reads may be cancelled when a concurrent input command settles.
+    let _handler_guard = AbortHandlerOnDrop(handler_task.abort_handle());
     // Bound the query separately from connection establishment. Always stop
     // the handler, including on timeout; settlement treats this as inconclusive.
     let result = timeout(

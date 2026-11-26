@@ -10064,6 +10064,13 @@ fn target_act_delivery_state_from_result(
     if delegated_tool == "synapse_a11y.cdp_click_node" && ok && status == TARGET_ACT_STATUS_OK {
         return "delivered_unverified";
     }
+    // #341: an action whose target closed on the press ran no post-dispatch
+    // readback — the target is gone — so its answer carries
+    // release_not_sent_target_closed and is delivered-but-unverified, never
+    // verified (the raw-CDP tap lane; the click lane is already unverified).
+    if ok && status == TARGET_ACT_STATUS_OK && target_act_result_reports_target_closed(result) {
+        return "delivered_unverified";
+    }
     if ok
         && status == TARGET_ACT_STATUS_OK
         && target_act_result_has_visual_pixel_verification(result)
@@ -10071,6 +10078,14 @@ fn target_act_delivery_state_from_result(
         return "delivered_and_pixel_verified";
     }
     target_act_delivery_state(ok, status)
+}
+
+/// True when a target_act result reports that the action's target closed on the
+/// press (`release_not_sent_target_closed`), meaning no readback ran (#341).
+fn target_act_result_reports_target_closed(value: &Value) -> bool {
+    value
+        .get("release_not_sent_target_closed")
+        .is_some_and(|closed| !closed.is_null())
 }
 
 fn target_act_delivery_state(ok: bool, status: &str) -> &'static str {

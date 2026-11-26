@@ -150,6 +150,11 @@ pub struct ActStrokeResponse {
     pub required_foreground: bool,
     pub elapsed_ms: u32,
     pub postcondition: ActPostcondition,
+    /// Set when the button-down closed the stroke's own target so the mouse
+    /// release could not be acknowledged (#341); the stroke was delivered and
+    /// the target is confirmed gone. Absent for an ordinary delivered stroke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_not_sent_target_closed: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +333,7 @@ pub(crate) async fn act_stroke_cdp_target(
             &stroke_plan,
             dispatch.point_count,
             started,
+            dispatch.release_not_sent_target_closed,
         ))
     }
 
@@ -1138,6 +1144,7 @@ fn response(
         required_foreground: true,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested("act_stroke", "cursor_foreground_ui_or_pixels"),
+        release_not_sent_target_closed: None,
     }
 }
 
@@ -1160,6 +1167,7 @@ fn cdp_aim_response(params: &ActStrokeParams, started: Instant) -> ActStrokeResp
         required_foreground: false,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested("act_stroke", "cdp_pointer_or_foreground_ui"),
+        release_not_sent_target_closed: None,
     }
 }
 
@@ -1169,6 +1177,7 @@ fn cdp_target_response(
     stroke_plan: &StrokePlan,
     dispatched_point_count: usize,
     started: Instant,
+    release_not_sent_target_closed: Option<String>,
 ) -> ActStrokeResponse {
     ActStrokeResponse {
         ok: true,
@@ -1188,6 +1197,7 @@ fn cdp_target_response(
         required_foreground: false,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested("act_stroke", "cdp_target_mouse_events"),
+        release_not_sent_target_closed,
     }
 }
 

@@ -24,6 +24,9 @@ use super::{
 pub(crate) const DEFAULT_TARGET_CLAIM_TTL_MS: u64 = 120_000;
 const MIN_TARGET_CLAIM_TTL_MS: u64 = 1_000;
 const MAX_TARGET_CLAIM_TTL_MS: u64 = 600_000;
+// A five-second quiet interval protects short gaps between ordinary tool calls
+// while still allowing prompt recovery after client churn or compaction.
+const TARGET_CLAIM_ADOPT_MIN_IDLE_MS: u64 = 5_000;
 
 pub(crate) type SharedTargetClaims = Arc<Mutex<TargetClaimRegistry>>;
 
@@ -327,7 +330,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Explicitly recover a target claim from an older live same-agent MCP session after client churn/compaction. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, and the old owner has no in-flight tool call. On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
+        description = "Explicitly recover a target claim from an older live idle same-agent MCP session after client churn/compaction. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, and the old owner has been idle for at least 5000 ms and has no in-flight tool call. On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
     )]
     pub async fn target_claim_adopt(
         &self,
@@ -1069,6 +1072,18 @@ impl SynapseService {
                 Some(&owner),
             ));
         }
+        let owner_idle_ms = now_unix_ms.saturating_sub(owner.last_seen_unix_ms);
+        if owner_idle_ms < TARGET_CLAIM_ADOPT_MIN_IDLE_MS {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                &format!(
+                    "owner has been idle for {owner_idle_ms} ms; an older idle same-agent owner must be idle for at least {TARGET_CLAIM_ADOPT_MIN_IDLE_MS} ms to avoid takeover between tool calls"
+                ),
+                Some(&requester),
+                Some(&owner),
+            ));
+        }
         let owner_in_flight =
             match crate::daemon_lifecycle::in_flight_tool_calls_for_session(owner_session_id) {
                 Ok(calls) => calls,
@@ -1428,7 +1443,7 @@ fn conflict_error(
             "claim": read,
             "read_only_observe_allowed": true,
             "mutation_allowed": false,
-            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt; adoption takes over only from a live owner (read from the Source of Truth) with the same known agent_kind and client_name as the caller, that started before the caller, has no tool call in flight and does not hold the foreground input lease",
+            "resolution": format!("release the claim, wait for claim expiry, use a different target, or call target_claim_adopt; adoption takes over only from an older idle same-agent live owner (read from the Source of Truth) with the same known agent_kind and client_name as the caller, that started before the caller, has been idle for at least {TARGET_CLAIM_ADOPT_MIN_IDLE_MS} ms, has no tool call in flight and does not hold the foreground input lease"),
         })),
     )
 }

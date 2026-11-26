@@ -687,6 +687,34 @@ pub async fn cdp_set_network_conditions(
     )
     .await?;
     let readback = network_conditions_readback(endpoint, target_id).await?;
+    // Durability probe. Only `offline:true` is observable at all — `navigator.onLine`.
+    // A throttle-only request (`offline:false`) leaves nothing in the readback that
+    // can prove survival (`downlink`/`rtt` are weakly-related estimates, not the set
+    // values), so it is not probed and answers as before. The readback above already
+    // opened and closed a connection — the disconnect that makes Chrome drop the
+    // override — so this reads the post-disconnect truth through the slot's session
+    // and never answers ok for an override that is already gone.
+    if requested.offline {
+        let survived = match lookup_live_emulation_slot(endpoint, target_id) {
+            Some(slot) => network_offline_override_survived(&slot).await?,
+            None => false,
+        };
+        if !survived {
+            let _ = run_network_conditions_command(
+                endpoint,
+                target_id,
+                NetworkConditionsCommand::Reset,
+            )
+            .await;
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: "Chrome cleared the network-conditions override when another \
+                         DevTools session of the target closed; raw-CDP network \
+                         emulation cannot be held across tool calls; use a normal \
+                         Chrome bridge tab"
+                    .to_owned(),
+            });
+        }
+    }
     Ok(CdpNetworkConditionsResult {
         endpoint: endpoint.to_owned(),
         cdp_target_id: readback.target_id,
@@ -2027,6 +2055,33 @@ async fn run_media_command(
     result
 }
 
+/// Proves whether an `offline:true` network override actually survived on a
+/// target, by reading `navigator.onLine` back through the slot's own,
+/// still-open session (no new connection, and lock-free so a holder of the
+/// operation lock can call it).
+///
+/// Raw-CDP network emulation cannot be held across tool calls: Chrome clears a
+/// target's network-conditions override the instant any *other* DevTools client
+/// of that target disconnects, and every Synapse raw-CDP call opens and closes
+/// its own connection (`with_target_page`, each evaluate readback, …). The set's
+/// own readback connection closing is exactly that disconnect, so by the time
+/// this runs the override is already gone unless Chrome has changed. Returns
+/// `true` only if the page still reports itself offline.
+async fn network_offline_override_survived(slot: &EmulationSlot) -> A11yResult<bool> {
+    let online = slot
+        .page
+        .evaluate_expression("navigator.onLine")
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.evaluate navigator.onLine durability probe: {err}"),
+        })?
+        .into_value::<bool>()
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("navigator.onLine durability probe decode: {err}"),
+        })?;
+    Ok(!online)
+}
+
 #[allow(deprecated)]
 async fn run_network_conditions_command(
     endpoint: &str,
@@ -2073,17 +2128,20 @@ async fn run_network_conditions_command(
                     detail: format!("Network.emulateNetworkConditions reset params: {err}"),
                 })?,
         };
-        // Unlike the `Emulation.*` overrides, a network condition only persists
-        // while the session that set it keeps the Network domain enabled; without
-        // this, Chrome applies the condition but reverts it on the next session
-        // attach (e.g. the very next readback or evaluate), so it never holds. The
-        // slot session stays open, so enabling here keeps the condition live until
-        // reset, target loss or the daemon drain.
-        page.execute(NetworkEnableParams::default())
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Network.enable for network conditions: {err}"),
-            })?;
+        // A network condition only applies while the session that set it has the
+        // Network domain enabled, so enable it on the slot before an offline /
+        // throttle set. This does NOT make the override durable — Chrome clears it
+        // when any other DevTools client of the target disconnects (see
+        // `network_offline_override_survived`) — but the override must apply at
+        // all so the durability probe can tell "survived" from "gone". A reset
+        // only clears, so it needs no enable.
+        if is_set {
+            page.execute(NetworkEnableParams::default())
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("Network.enable for network conditions: {err}"),
+                })?;
+        }
         page.execute(params)
             .await
             .map_err(|err| A11yError::CdpAxtreeFailed {

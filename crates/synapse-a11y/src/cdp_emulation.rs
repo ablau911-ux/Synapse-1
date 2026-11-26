@@ -1131,12 +1131,27 @@ struct EmulationSlot {
     ///
     /// Ownership note for the shared device-metrics override: `Viewport` and
     /// `Device` both drive Chrome's single `Emulation.setDeviceMetricsOverride`,
-    /// so resetting one must not wipe the other. A reset of either leaves the
-    /// device-metrics override in place while the other is still recorded here
-    /// (the sibling keeps owning it); it clears the shared override only when the
-    /// sibling is absent, so a domain is never left recorded with nothing behind
-    /// it. Every other domain owns an independent override.
+    /// and the last of the two to set wins while both are held. `remembered_metrics`
+    /// keeps each one's last successfully-applied device-metrics parameters so the
+    /// shared override can be reconstructed. When one of the two is reset while the
+    /// other is still recorded, the override is re-applied from the survivor's own
+    /// remembered metrics (not left as the reset domain's numbers, and not wiped),
+    /// so it becomes the survivor's metrics again — and the reset's readback is
+    /// taken against that. When neither remains, the override is cleared. Every
+    /// other domain owns an independent override.
     domains: Mutex<HashSet<EmulationDomain>>,
+    /// Last device-metrics parameters each of `Viewport` and `Device` successfully
+    /// applied, so a reset of one can restore the survivor's own metrics to the
+    /// shared override. Kept next to `domains` and in step with it.
+    remembered_metrics: Mutex<RememberedDeviceMetrics>,
+}
+
+/// The last device-metrics parameters `Viewport` and `Device` each applied on a
+/// slot. See the shared-override ownership note on [`EmulationSlot::domains`].
+#[derive(Default)]
+struct RememberedDeviceMetrics {
+    viewport: Option<CdpViewportOverride>,
+    device: Option<CdpDeviceDescriptor>,
 }
 
 impl Drop for EmulationSlot {
@@ -1288,6 +1303,7 @@ async fn get_or_create_emulation_slot(
         handler_task,
         listener_task,
         domains: Mutex::new(HashSet::new()),
+        remembered_metrics: Mutex::new(RememberedDeviceMetrics::default()),
     });
 
     let key = emulation_slot_key(endpoint, target_id);
@@ -1398,16 +1414,69 @@ impl EmulationContext {
         }
     }
 
-    /// Whether `domain` is currently recorded on this command's slot (always
-    /// false for a throwaway reset connection). Lets a viewport or device reset
-    /// tell whether its sibling still owns the shared device-metrics override.
-    fn slot_has_domain(&self, domain: EmulationDomain) -> bool {
+    /// Records the viewport metrics this set applied on the slot, so a later
+    /// device reset can restore them to the shared override. No-op for a
+    /// throwaway connection.
+    fn remember_viewport_metrics(&self, params: &CdpViewportOverride) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.viewport = Some(params.clone());
+        }
+    }
+
+    /// Records the device descriptor this set applied on the slot, so a later
+    /// viewport reset can restore its metrics to the shared override.
+    fn remember_device_metrics(&self, params: &CdpDeviceDescriptor) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.device = Some(params.clone());
+        }
+    }
+
+    /// The viewport metrics still remembered on this command's slot, if the
+    /// viewport domain is holding the shared override (always `None` for a
+    /// throwaway connection).
+    fn remembered_viewport_metrics(&self) -> Option<CdpViewportOverride> {
         match self {
             Self::Slot(slot) => slot
-                .domains
+                .remembered_metrics
                 .lock()
-                .is_ok_and(|domains| domains.contains(&domain)),
-            Self::Fresh { .. } => false,
+                .ok()
+                .and_then(|remembered| remembered.viewport.clone()),
+            Self::Fresh { .. } => None,
+        }
+    }
+
+    /// The device metrics still remembered on this command's slot, if the device
+    /// domain is holding the shared override.
+    fn remembered_device_metrics(&self) -> Option<CdpDeviceDescriptor> {
+        match self {
+            Self::Slot(slot) => slot
+                .remembered_metrics
+                .lock()
+                .ok()
+                .and_then(|remembered| remembered.device.clone()),
+            Self::Fresh { .. } => None,
+        }
+    }
+
+    /// Drops the viewport's remembered metrics when the viewport domain is reset.
+    fn forget_viewport_metrics(&self) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.viewport = None;
+        }
+    }
+
+    /// Drops the device's remembered metrics when the device domain is reset.
+    fn forget_device_metrics(&self) {
+        if let Self::Slot(slot) = self
+            && let Ok(mut remembered) = slot.remembered_metrics.lock()
+        {
+            remembered.device = None;
         }
     }
 
@@ -1660,36 +1729,63 @@ async fn run_device_metrics_command(
                     .map_err(|err| A11yError::CdpAxtreeFailed {
                         detail: format!("Emulation.setDeviceMetricsOverride: {err}"),
                     })?;
+                ctx.remember_viewport_metrics(&override_metrics);
             }
             DeviceMetricsCommand::Reset => {
-                // Item 4: the Device domain shares this one device-metrics
-                // override. While Device still holds it, leave the override in
-                // place and only forget the Viewport domain below.
-                if !ctx.slot_has_domain(EmulationDomain::Device) {
-                    page.execute(ClearDeviceMetricsOverrideParams::default())
-                        .await
-                        .map_err(|err| A11yError::CdpAxtreeFailed {
-                            detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                // Item 1: Viewport and Device share this one device-metrics
+                // override. If Device still holds it, restore Device's own metrics
+                // so resetting Viewport leaves Device's numbers in force; otherwise
+                // clear the shared override. Either way, Viewport stops remembering.
+                match ctx.remembered_device_metrics() {
+                    Some(device) => {
+                        let params = SetDeviceMetricsOverrideParams::builder()
+                            .width(i64::from(device.width))
+                            .height(i64::from(device.height))
+                            .device_scale_factor(device.device_scale_factor)
+                            .mobile(device.is_mobile)
+                            .screen_width(i64::from(device.width))
+                            .screen_height(i64::from(device.height))
+                            .build()
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride device restore params: {err}"
+                                ),
+                            })?;
+                        page.execute(params).await.map_err(|err| {
+                            A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride device restore: {err}"
+                                ),
+                            }
                         })?;
-                    let params = SetDeviceMetricsOverrideParams::builder()
-                        .width(0)
-                        .height(0)
-                        .device_scale_factor(0.0)
-                        .mobile(false)
-                        .screen_width(0)
-                        .screen_height(0)
-                        .build()
-                        .map_err(|err| A11yError::CdpAxtreeFailed {
-                            detail: format!(
-                                "Emulation.setDeviceMetricsOverride reset params: {err}"
-                            ),
+                    }
+                    None => {
+                        page.execute(ClearDeviceMetricsOverrideParams::default())
+                            .await
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                            })?;
+                        let params = SetDeviceMetricsOverrideParams::builder()
+                            .width(0)
+                            .height(0)
+                            .device_scale_factor(0.0)
+                            .mobile(false)
+                            .screen_width(0)
+                            .screen_height(0)
+                            .build()
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride reset params: {err}"
+                                ),
+                            })?;
+                        page.execute(params).await.map_err(|err| {
+                            A11yError::CdpAxtreeFailed {
+                                detail: format!("Emulation.setDeviceMetricsOverride reset: {err}"),
+                            }
                         })?;
-                    page.execute(params)
-                        .await
-                        .map_err(|err| A11yError::CdpAxtreeFailed {
-                            detail: format!("Emulation.setDeviceMetricsOverride reset: {err}"),
-                        })?;
+                    }
                 }
+                ctx.forget_viewport_metrics();
             }
         }
         Ok::<(), A11yError>(())
@@ -1785,20 +1881,46 @@ async fn run_device_descriptor_command(
                     .map_err(|err| A11yError::CdpAxtreeFailed {
                         detail: format!("Emulation.setEmitTouchEventsForMouse: {err}"),
                     })?;
+                ctx.remember_device_metrics(&descriptor);
             }
             DeviceDescriptorCommand::Reset {
                 original_user_agent,
             } => {
-                // Item 4: Viewport shares this one device-metrics override. While
-                // Viewport still holds it, leave the metrics in place; the touch
-                // and user-agent overrides below are the device domain's own and
-                // are always cleared/restored.
-                if !ctx.slot_has_domain(EmulationDomain::Viewport) {
-                    page.execute(ClearDeviceMetricsOverrideParams::default())
-                        .await
-                        .map_err(|err| A11yError::CdpAxtreeFailed {
-                            detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                // Item 1: Viewport shares this one device-metrics override. If
+                // Viewport still holds it, restore Viewport's own metrics so this
+                // device reset leaves Viewport's numbers in force; otherwise clear
+                // the shared override. The touch and user-agent overrides below are
+                // the device domain's own and are always cleared/restored.
+                match ctx.remembered_viewport_metrics() {
+                    Some(viewport) => {
+                        let params = SetDeviceMetricsOverrideParams::builder()
+                            .width(i64::from(viewport.width))
+                            .height(i64::from(viewport.height))
+                            .device_scale_factor(viewport.device_scale_factor)
+                            .mobile(viewport.mobile)
+                            .screen_width(i64::from(viewport.width))
+                            .screen_height(i64::from(viewport.height))
+                            .build()
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride viewport restore params: {err}"
+                                ),
+                            })?;
+                        page.execute(params).await.map_err(|err| {
+                            A11yError::CdpAxtreeFailed {
+                                detail: format!(
+                                    "Emulation.setDeviceMetricsOverride viewport restore: {err}"
+                                ),
+                            }
                         })?;
+                    }
+                    None => {
+                        page.execute(ClearDeviceMetricsOverrideParams::default())
+                            .await
+                            .map_err(|err| A11yError::CdpAxtreeFailed {
+                                detail: format!("Emulation.clearDeviceMetricsOverride: {err}"),
+                            })?;
+                    }
                 }
                 page.execute(SetTouchEmulationEnabledParams::new(false))
                     .await
@@ -1830,6 +1952,7 @@ async fn run_device_descriptor_command(
                             detail: format!("Emulation.setUserAgentOverride restore: {err}"),
                         })?;
                 }
+                ctx.forget_device_metrics();
             }
         }
         Ok::<(), A11yError>(())

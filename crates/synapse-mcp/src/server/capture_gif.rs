@@ -76,146 +76,23 @@ impl SynapseService {
             ));
         }
 
-        let frames_requested = usize::try_from(duration_ms / interval_ms)
-            .unwrap_or(1)
-            .max(1);
-        let started = Instant::now();
-        let mut native_dims: Option<(u32, u32)> = None;
-        let mut target_dims: Option<(u32, u32)> = None;
-        let mut frames: Vec<RgbaImage> = Vec::with_capacity(frames_requested);
-        let mut capture_backend = "graphics_capture_window_bgra".to_owned();
-        let mut last_error: Option<String> = None;
-
-        while started.elapsed().as_millis() < u128::from(duration_ms) {
-            let frame_started = Instant::now();
-            match synapse_capture::window_full_frame_to_bgra_bitmap(window_hwnd, FRAME_TIMEOUT_MS) {
-                Ok(captured) => {
-                    capture_backend = captured.capture_backend.to_owned();
-                    let bitmap = captured.bitmap;
-                    if native_dims.is_none() {
-                        native_dims = Some((bitmap.width, bitmap.height));
-                        target_dims = Some(capture_gif_target_dims(
-                            bitmap.width,
-                            bitmap.height,
-                            max_long_edge,
-                        ));
-                    }
-                    let rgba = bgra_to_rgba(&bitmap.bytes, bitmap.width, bitmap.height)?;
-                    let (tw, th) = target_dims.unwrap_or((bitmap.width, bitmap.height));
-                    let frame = if (tw, th) == (bitmap.width, bitmap.height) {
-                        rgba
-                    } else {
-                        image::imageops::resize(
-                            &rgba,
-                            tw,
-                            th,
-                            image::imageops::FilterType::Triangle,
-                        )
-                    };
-                    frames.push(frame);
-                }
-                // An invalid target (for example a minimized window) stays
-                // invalid for the whole recording: fail now with its own code.
-                Err(error @ synapse_capture::CaptureError::TargetInvalid { .. }) => {
-                    return Err(mcp_error(
-                        error.code(),
-                        format!("capture_gif cannot record hwnd {window_hwnd:#x}: {error}"),
-                    ));
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                }
-            }
-            // Pace to interval_ms, accounting for capture time, but never sleep
-            // past duration_ms: an interval longer than the duration must not
-            // stretch the call beyond the requested recording length.
-            let spent = frame_started.elapsed();
-            let until_deadline =
-                Duration::from_millis(duration_ms).saturating_sub(started.elapsed());
-            if let Some(remaining) = Duration::from_millis(interval_ms).checked_sub(spent) {
-                tokio::time::sleep(remaining.min(until_deadline)).await;
-            }
-        }
-
-        if frames.is_empty() {
-            return Err(mcp_error(
-                synapse_core::error_codes::ACTION_NO_OBSERVED_DELTA,
-                format!(
-                    "capture_gif captured 0 frames of hwnd {window_hwnd:#x} in {duration_ms} ms; last capture error: {}",
-                    last_error.unwrap_or_else(|| "none".to_owned())
-                ),
-            ));
-        }
-
-        let (tw, th) = target_dims.unwrap_or((1, 1));
-        let (nw, nh) = native_dims.unwrap_or((tw, th));
-        let frames_captured = frames.len();
-
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    format!("capture_gif could not create output directory: {error}"),
-                )
-            })?;
-        }
-        let file = std::fs::File::create(&output_path).map_err(|error| {
+        tokio::task::spawn_blocking(move || {
+            capture_gif_blocking(
+                params,
+                window_hwnd,
+                output_path,
+                duration_ms,
+                interval_ms,
+                max_long_edge,
+            )
+        })
+        .await
+        .map_err(|error| {
             mcp_error(
                 synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                format!("capture_gif could not create {:?}: {error}", params.path),
+                format!("capture_gif blocking worker failed: {error}"),
             )
-        })?;
-        let delay = Delay::from_numer_denom_ms(u32::try_from(interval_ms).unwrap_or(500), 1);
-        {
-            let mut encoder = GifEncoder::new_with_speed(file, 10);
-            encoder.set_repeat(Repeat::Infinite).map_err(|error| {
-                mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    format!("capture_gif set_repeat failed: {error}"),
-                )
-            })?;
-            for rgba in frames {
-                let frame = Frame::from_parts(rgba, 0, 0, delay);
-                encoder.encode_frame(frame).map_err(|error| {
-                    mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!("capture_gif GIF frame encode failed: {error}"),
-                    )
-                })?;
-            }
-        }
-
-        let bytes_written = std::fs::metadata(&output_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(duration_ms);
-        tracing::info!(
-            code = "CAPTURE_GIF_RECORDED",
-            hwnd = window_hwnd,
-            frames_captured,
-            frames_requested,
-            width = tw,
-            height = th,
-            bytes_written,
-            elapsed_ms,
-            "readback=capture_gif outcome=encoded"
-        );
-
-        Ok(Json(CaptureGifResponse {
-            path: output_path.to_string_lossy().into_owned(),
-            frames_captured,
-            frames_requested,
-            width: tw,
-            height: th,
-            native_width: nw,
-            native_height: nh,
-            interval_ms,
-            duration_ms,
-            elapsed_ms,
-            bytes_written,
-            capture_backend,
-            window_hwnd,
-        }))
+        })?
     }
 
     fn capture_gif_resolve_window(
@@ -238,6 +115,152 @@ impl SynapseService {
         };
         validate_window_hwnd_shape("capture_gif", hwnd)
     }
+}
+
+// Capture, pixel conversion, resizing, encoding and file I/O all block.
+// Keep the whole recording on the blocking pool, including interval pacing.
+fn capture_gif_blocking(
+    params: CaptureGifParams,
+    window_hwnd: i64,
+    output_path: std::path::PathBuf,
+    duration_ms: u64,
+    interval_ms: u64,
+    max_long_edge: u32,
+) -> Result<Json<CaptureGifResponse>, ErrorData> {
+    let frames_requested = usize::try_from(duration_ms / interval_ms)
+        .unwrap_or(1)
+        .max(1);
+    let started = Instant::now();
+    let mut native_dims: Option<(u32, u32)> = None;
+    let mut target_dims: Option<(u32, u32)> = None;
+    let mut frames: Vec<RgbaImage> = Vec::with_capacity(frames_requested);
+    let mut capture_backend = "graphics_capture_window_bgra".to_owned();
+    let mut last_error: Option<String> = None;
+
+    while started.elapsed().as_millis() < u128::from(duration_ms) {
+        let frame_started = Instant::now();
+        match synapse_capture::window_full_frame_to_bgra_bitmap(window_hwnd, FRAME_TIMEOUT_MS) {
+            Ok(captured) => {
+                capture_backend = captured.capture_backend.to_owned();
+                let bitmap = captured.bitmap;
+                if native_dims.is_none() {
+                    native_dims = Some((bitmap.width, bitmap.height));
+                    target_dims = Some(capture_gif_target_dims(
+                        bitmap.width,
+                        bitmap.height,
+                        max_long_edge,
+                    ));
+                }
+                let rgba = bgra_to_rgba(&bitmap.bytes, bitmap.width, bitmap.height)?;
+                let (tw, th) = target_dims.unwrap_or((bitmap.width, bitmap.height));
+                let frame = if (tw, th) == (bitmap.width, bitmap.height) {
+                    rgba
+                } else {
+                    image::imageops::resize(&rgba, tw, th, image::imageops::FilterType::Triangle)
+                };
+                frames.push(frame);
+            }
+            // An invalid target (for example a minimized window) stays
+            // invalid for the whole recording: fail now with its own code.
+            Err(error @ synapse_capture::CaptureError::TargetInvalid { .. }) => {
+                return Err(mcp_error(
+                    error.code(),
+                    format!("capture_gif cannot record hwnd {window_hwnd:#x}: {error}"),
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+        // Pace to interval_ms, accounting for capture time, but never sleep
+        // past duration_ms: an interval longer than the duration must not
+        // stretch the call beyond the requested recording length.
+        let spent = frame_started.elapsed();
+        let until_deadline = Duration::from_millis(duration_ms).saturating_sub(started.elapsed());
+        if let Some(remaining) = Duration::from_millis(interval_ms).checked_sub(spent) {
+            std::thread::sleep(remaining.min(until_deadline));
+        }
+    }
+
+    if frames.is_empty() {
+        return Err(mcp_error(
+            synapse_core::error_codes::ACTION_NO_OBSERVED_DELTA,
+            format!(
+                "capture_gif captured 0 frames of hwnd {window_hwnd:#x} in {duration_ms} ms; last capture error: {}",
+                last_error.unwrap_or_else(|| "none".to_owned())
+            ),
+        ));
+    }
+
+    let (tw, th) = target_dims.unwrap_or((1, 1));
+    let (nw, nh) = native_dims.unwrap_or((tw, th));
+    let frames_captured = frames.len();
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            mcp_error(
+                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                format!("capture_gif could not create output directory: {error}"),
+            )
+        })?;
+    }
+    let file = std::fs::File::create(&output_path).map_err(|error| {
+        mcp_error(
+            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            format!("capture_gif could not create {:?}: {error}", params.path),
+        )
+    })?;
+    let delay = Delay::from_numer_denom_ms(u32::try_from(interval_ms).unwrap_or(500), 1);
+    {
+        let mut encoder = GifEncoder::new_with_speed(file, 10);
+        encoder.set_repeat(Repeat::Infinite).map_err(|error| {
+            mcp_error(
+                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                format!("capture_gif set_repeat failed: {error}"),
+            )
+        })?;
+        for rgba in frames {
+            let frame = Frame::from_parts(rgba, 0, 0, delay);
+            encoder.encode_frame(frame).map_err(|error| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!("capture_gif GIF frame encode failed: {error}"),
+                )
+            })?;
+        }
+    }
+
+    let bytes_written = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(duration_ms);
+    tracing::info!(
+        code = "CAPTURE_GIF_RECORDED",
+        hwnd = window_hwnd,
+        frames_captured,
+        frames_requested,
+        width = tw,
+        height = th,
+        bytes_written,
+        elapsed_ms,
+        "readback=capture_gif outcome=encoded"
+    );
+
+    Ok(Json(CaptureGifResponse {
+        path: output_path.to_string_lossy().into_owned(),
+        frames_captured,
+        frames_requested,
+        width: tw,
+        height: th,
+        native_width: nw,
+        native_height: nh,
+        interval_ms,
+        duration_ms,
+        elapsed_ms,
+        bytes_written,
+        capture_backend,
+        window_hwnd,
+    }))
 }
 
 fn capture_gif_timing(params: &CaptureGifParams) -> Result<(u64, u64), ErrorData> {

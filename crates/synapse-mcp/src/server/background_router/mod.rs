@@ -26,8 +26,8 @@ use crate::m1::{
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
-    ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, act_press_normalized_labels,
-    default_auto_wait_timeout_ms, default_verify_timeout_ms,
+    ActSetFieldTextLocator, ActSetFieldTextParams, ActStrokeParams, ActTypeParams,
+    act_press_normalized_labels, default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
 use crate::m4::{
     ActRunShellJobIdParams, ActRunShellStartParams, ActRunShellStatusParams,
@@ -59,7 +59,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, stroke, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
 const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "call act operation=foreground with the same action payload and a non-empty reason; the facade acquires the foreground input lease, temporarily sets break_glass, runs target_act, restores the prior profile, and releases the lease";
@@ -134,6 +134,12 @@ impl TargetActVerb {
 pub struct TargetActParams {
     /// The high-level operation to perform on the session target.
     pub verb: TargetActVerb,
+    /// `stroke`: the existing act_stroke parameters. An explicit path uses
+    /// viewport CSS pixels on a raw-CDP target, screen pixels on a native target.
+    /// Omit stroke.button for movement; set it for a drag. Real-cursor delivery
+    /// requires break_glass/full_capability and the foreground input lease.
+    #[serde(default)]
+    pub stroke: Option<Box<ActStrokeParams>>,
     /// `navigate`: destination URL.
     #[serde(default)]
     pub url: Option<String>,
@@ -1708,7 +1714,7 @@ fn cleanup_act_foreground_after_shutdown_cancellation(
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth.",
+        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. action.verb=stroke delegates nested action.stroke parameters to act_stroke: an explicit path on a bound raw-CDP target uses viewport CSS pixels in the background under normal_agent without a foreground lease; omit stroke.button to move or set it to drag. Native/real-cursor and hardware stroke lanes require break_glass/full_capability plus the foreground input lease; use operation=foreground with a non-empty reason for audited escalation and cleanup. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth.",
         input_schema = act_input_schema()
     )]
     pub async fn act(
@@ -2150,7 +2156,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state, size_satisfied, and position_satisfied (ok=false with status=verify_needed when requested bounds are not applied) so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=stroke delegates nested stroke parameters to act_stroke, with button unset for movement or set for drag; an explicit path on a bound raw-CDP target uses viewport CSS pixels in the background under normal_agent without a foreground lease, while real-cursor/native and hardware delivery uses screen pixels and requires break_glass/full_capability plus the foreground input lease (or act operation=foreground with a reason); verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state, size_satisfied, and position_satisfied (ok=false with status=verify_needed when requested bounds are not applied) so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -2590,6 +2596,25 @@ impl SynapseService {
                 }
             }
             "tap" => target_act_touch_tap(self, &params, &request_context).await?,
+            "stroke" => {
+                let stroke = params.stroke.clone().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "target_act verb=stroke requires nested `stroke` parameters",
+                    )
+                })?;
+                let session_id = target_act_session_id(&request_context, "stroke")?;
+                let response = if self.session_target(Some(&session_id))?.is_none() {
+                    Err(mcp_error(
+                        error_codes::TARGET_NOT_SET,
+                        "target_act verb=stroke requires a bound session target; refusing implicit human OS foreground fallback",
+                    ))
+                } else {
+                    ensure_target_act_operator_panic_boundary("stroke_before_delegation")?;
+                    self.act_stroke(Parameters(*stroke), request_context).await
+                };
+                target_act_delegate_response("act_stroke", response)?
+            }
             "hover" => target_act_hover(self, &params, &request_context).await?,
             "dispatch_event" | "dispatchevent" => {
                 target_act_browser_dom_action(self, "dispatch_event", &params, &request_context)
@@ -10062,6 +10087,17 @@ fn target_act_delivery_state_from_result(
     // (#334). The hidden-page case never reaches here as ok: cdp_click_node
     // refuses it before delivery, so it arrives as a refused/error status.
     if delegated_tool == "synapse_a11y.cdp_click_node" && ok && status == TARGET_ACT_STATUS_OK {
+        return "delivered_unverified";
+    }
+    // Stroke delivery alone does not verify the app-specific DOM/canvas effect.
+    if delegated_tool == "act_stroke"
+        && ok
+        && status == TARGET_ACT_STATUS_OK
+        && result
+            .pointer("/postcondition/observed_delta")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
         return "delivered_unverified";
     }
     // #341: an action whose target closed on the press ran no post-dispatch

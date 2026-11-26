@@ -1535,6 +1535,33 @@ impl SynapseService {
                 return Err(error);
             }
         }
+        // The target-scoped CDP path above needs no foreground authority.
+        // Recording and CDP element aim also keep their existing background
+        // semantics; gate only the lane that can emit real cursor input.
+        if should_acquire_act_stroke_input_lease(recording.is_some(), plan.requires_input_lease()) {
+            let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
+            let profile = self.tool_profile_snapshot(session_id.as_deref())?.profile;
+            if !profile.allows_foreground_tier() {
+                let error = ErrorData::new(
+                    rmcp::model::ErrorCode(-32099),
+                    "act_stroke real-cursor delivery requires profile=break_glass or full_capability",
+                    Some(json!({
+                        "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
+                        "tool": "act_stroke",
+                        "profile": profile.as_str(),
+                        "source_of_truth": "CF_SESSIONS tool-profile policy row",
+                        "remediation": "call act operation=foreground with action.verb=stroke, the same nested action.stroke parameters, and a non-empty reason; or acquire the foreground input lease and explicitly set break_glass/full_capability",
+                    })),
+                );
+                self.audit_action_denied_with_details_for_request(
+                    "act_stroke",
+                    &error,
+                    &act_stroke_failure_audit_details(&stroke_details, &preflight, &error),
+                    &request_context,
+                );
+                return Err(error);
+            }
+        }
         let before_delta_signature = if params.verify_delta {
             match self
                 .capture_action_delta_signature(160, None, true, None)

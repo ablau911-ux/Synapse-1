@@ -8595,7 +8595,14 @@ async function handleViewportEmulation(params) {
       mobile: normalizeViewportMobile(params.isMobile)
     };
     if (!VIEWPORT_BASELINE_BY_TAB.has(selected.tabId)) {
-      VIEWPORT_BASELINE_BY_TAB.set(selected.tabId, beforeViewport);
+      // #336: mirror -- if device emulation currently holds the shared device-metrics
+      // override, beforeViewport is device's EMULATED size, so take the override-free
+      // metrics from device's own baseline instead.
+      const deviceBaseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
+      const viewportBaseline = ledgerHasEmulationOverride("deviceOverrides", selected.tabId) && deviceBaseline?.viewport
+        ? deviceBaseline.viewport
+        : beforeViewport;
+      VIEWPORT_BASELINE_BY_TAB.set(selected.tabId, viewportBaseline);
     }
     try {
       dispatch = await dispatchViewportEmulationSet(selected.tabId, requested);
@@ -8692,7 +8699,15 @@ async function handleDeviceEmulation(params) {
   if (operation === "set") {
     descriptor = normalizeDeviceDescriptor(params);
     if (!DEVICE_BASELINE_BY_TAB.has(selected.tabId)) {
-      DEVICE_BASELINE_BY_TAB.set(selected.tabId, beforeDevice);
+      // #336: a baseline is the override-free tab, never a sibling domain's emulated
+      // state. If viewport emulation currently holds the shared device-metrics
+      // override, beforeDevice.viewport is viewport's EMULATED size, so take the
+      // metric fields from viewport's own override-free baseline; the user agent and
+      // touch fields (which viewport does not emulate) stay from beforeDevice.
+      const deviceBaseline = ledgerHasEmulationOverride("viewportOverrides", selected.tabId) && VIEWPORT_BASELINE_BY_TAB.has(selected.tabId)
+        ? { ...beforeDevice, viewport: VIEWPORT_BASELINE_BY_TAB.get(selected.tabId) }
+        : beforeDevice;
+      DEVICE_BASELINE_BY_TAB.set(selected.tabId, deviceBaseline);
     }
     try {
       dispatch = await dispatchDeviceEmulationSet(selected.tabId, descriptor);

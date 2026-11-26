@@ -23,11 +23,11 @@ use windows::{
             KEYEVENTF_KEYUP, LASTINPUTINFO, SendInput, VIRTUAL_KEY, VK_MENU,
         },
         UI::WindowsAndMessaging::{
-            BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow, GetPropW,
-            GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-            IsWindowVisible, PostMessageW, RemovePropW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetPropW, SetWindowPos,
-            ShowWindow, SwitchToThisWindow, WM_CLOSE,
+            BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetDesktopWindow,
+            GetForegroundWindow, GetPropW, GetShellWindow, GetWindowRect, GetWindowTextW,
+            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
+            RemovePropW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+            SetForegroundWindow, SetPropW, SetWindowPos, ShowWindow, SwitchToThisWindow, WM_CLOSE,
         },
     },
     core::{BOOL, PWSTR, w},
@@ -260,6 +260,13 @@ pub fn millis_since_last_input() -> A11yResult<u64> {
 
 pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
     let hwnd = valid_hwnd(hwnd)?;
+    // Desktop and shell roots are live HWNDs, but are not application targets.
+    if [unsafe { GetDesktopWindow() }, unsafe { GetShellWindow() }]
+        .iter()
+        .any(|root| native_hwnds_equal(root.0 as isize, hwnd.0 as isize))
+    {
+        return Ok(false);
+    }
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
     Ok(native_hwnds_equal(root.0 as isize, hwnd.0 as isize))
 }
@@ -346,6 +353,7 @@ pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
 pub fn visible_top_level_window_contexts() -> A11yResult<Vec<ForegroundContext>> {
     Ok(visible_top_level_hwnds()?
         .into_iter()
+        .filter(|hwnd| is_top_level_window(hwnd_to_wire(hwnd.0 as isize)).unwrap_or(false))
         .filter_map(|hwnd| foreground_context(hwnd_to_wire(hwnd.0 as isize)).ok())
         .filter(|context| !context.window_title.is_empty())
         .collect())
@@ -604,4 +612,21 @@ fn hwnd_from_wire_value(hwnd: i64) -> A11yResult<HWND> {
         ),
     })?;
     Ok(HWND(native as *mut c_void))
+}
+
+#[cfg(test)]
+mod application_window_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_and_shell_are_not_application_targets() {
+        for hwnd in [unsafe { GetDesktopWindow() }, unsafe { GetShellWindow() }] {
+            if !hwnd.0.is_null() {
+                assert_eq!(
+                    is_top_level_window(hwnd_to_wire(hwnd.0 as isize)).ok(),
+                    Some(false)
+                );
+            }
+        }
+    }
 }

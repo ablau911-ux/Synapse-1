@@ -145,7 +145,8 @@ pub fn is_window_visible(hwnd: i64) -> A11yResult<bool> {
     platform::is_window_visible(hwnd)
 }
 
-/// Returns whether a native HWND is its own top-level root window.
+/// Returns whether a native HWND is its own top-level application root window,
+/// excluding the desktop and shell windows.
 ///
 /// # Errors
 ///

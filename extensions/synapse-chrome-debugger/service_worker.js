@@ -9544,6 +9544,7 @@ function rejectNetworkConditionsResetField(value, fieldName) {
 // #336: device emulation (user agent, device metrics, touch) is held on the
 // shared per-tab emulation session so the overrides survive until reset.
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
+  const wasRegistered = emulationDomainCurrentlyRegistered(tabId, "device");
   let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
@@ -9575,7 +9576,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw await failEmulationSetDispatch(tabId, "device", "deviceEmulation", applied, error);
+    throw await failEmulationSetDispatch(tabId, "device", "deviceEmulation", applied, wasRegistered, error);
   }
 }
 
@@ -9634,6 +9635,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
 async function dispatchGeolocationEmulationSet(tabId, origin, requested, permissionSetting) {
   let permissionMethod = `Browser.setPermission(${permissionSetting})`;
   let applied = false;
+  const wasRegistered = emulationDomainCurrentlyRegistered(tabId, "geolocation");
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "geolocation");
     try {
@@ -9642,6 +9644,10 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
         setting: permissionSetting,
         origin
       });
+      // #336/item3: the permission changed, so the set has applied state; a later
+      // failure of setGeolocationOverride must undo it (the reset path reverts the
+      // permission to prompt).
+      applied = true;
     } catch (error) {
       permissionMethod = `Browser.setPermission(${permissionSetting}) best_effort_failed=${errorMessage(error)}`;
     }
@@ -9669,7 +9675,7 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw await failEmulationSetDispatch(tabId, "geolocation", "geolocationEmulation", applied, error);
+    throw await failEmulationSetDispatch(tabId, "geolocation", "geolocationEmulation", applied, wasRegistered, error);
   }
 }
 
@@ -9704,6 +9710,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
 // #336: the locale/timezone overrides are held on the shared emulation session
 // so they survive until reset.
 async function dispatchLocaleEmulationSet(tabId, requested) {
+  const wasRegistered = emulationDomainCurrentlyRegistered(tabId, "locale");
   const methods = [];
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "locale");
@@ -9725,7 +9732,7 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
     };
   } catch (error) {
     // #339/A: a command of this set applied only if it was pushed to `methods`.
-    throw await failEmulationSetDispatch(tabId, "locale", "localeEmulation", methods.length > 0, error);
+    throw await failEmulationSetDispatch(tabId, "locale", "localeEmulation", methods.length > 0, wasRegistered, error);
   }
 }
 
@@ -9753,6 +9760,7 @@ async function dispatchLocaleEmulationReset(tabId) {
 // #336: the emulated-media override is held on the shared emulation session so it
 // survives until reset.
 async function dispatchMediaEmulationSet(tabId, requested) {
+  const wasRegistered = emulationDomainCurrentlyRegistered(tabId, "media");
   let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "media");
@@ -9773,7 +9781,7 @@ async function dispatchMediaEmulationSet(tabId, requested) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw await failEmulationSetDispatch(tabId, "media", "mediaEmulation", applied, error);
+    throw await failEmulationSetDispatch(tabId, "media", "mediaEmulation", applied, wasRegistered, error);
   }
 }
 
@@ -9802,6 +9810,7 @@ async function dispatchMediaEmulationReset(tabId) {
 // so it survives until reset. Network.enable stays enabled while the session is
 // held, as the override requires.
 async function dispatchNetworkConditionsSet(tabId, requested) {
+  const wasRegistered = emulationDomainCurrentlyRegistered(tabId, "network");
   let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "network");
@@ -9822,7 +9831,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw await failEmulationSetDispatch(tabId, "network", "networkConditions", applied, error);
+    throw await failEmulationSetDispatch(tabId, "network", "networkConditions", applied, wasRegistered, error);
   }
 }
 
@@ -9855,6 +9864,7 @@ async function dispatchNetworkConditionsReset(tabId) {
 // runs next is therefore taken while the override is still live. The handler
 // releases the "viewport" domain if the set could not be verified.
 async function dispatchViewportEmulationSet(tabId, requested) {
+  const wasRegistered = emulationDomainCurrentlyRegistered(tabId, "viewport");
   let applied = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
@@ -9872,7 +9882,7 @@ async function dispatchViewportEmulationSet(tabId, requested) {
       protocol_version: attachment.protocolVersion
     };
   } catch (error) {
-    throw await failEmulationSetDispatch(tabId, "viewport", "viewportEmulation", applied, error);
+    throw await failEmulationSetDispatch(tabId, "viewport", "viewportEmulation", applied, wasRegistered, error);
   }
 }
 
@@ -13158,6 +13168,13 @@ function emulationSessionHasActiveDomains(tabId) {
   return Boolean(session?.domains?.size);
 }
 
+// #336: is this domain already registered on the tab's emulation session before the
+// current set runs? A repeat set that applies nothing must not unregister a domain
+// that already holds a live override.
+function emulationDomainCurrentlyRegistered(tabId, domain) {
+  return Boolean(EMULATION_DEBUGGER_SESSIONS.get(tabId)?.domains?.has(domain));
+}
+
 // #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
 // stale cleanup) so each enumerates the same ledger field, baseline map and page
 // shim for every emulation domain in one place.
@@ -13362,27 +13379,38 @@ async function releaseEmulationDebuggerSessionDomain(tabId, domain) {
 // one live -- and the shim teardown removes the page-side shim; then forget the
 // baseline and ledger entry. If the undo itself fails, the ledger entry is kept so
 // operator-panic cleanup can retry, and the original error is surfaced with a note.
-// #339/A: build the set-failed error, and when no command of the set applied
-// anything, release the domain (so nothing stays registered or holds the debugger)
-// and mark the error so the handler's cleanup does not try to undo a no-op. "Undo
-// failed, kept registered" is reserved for a command that did succeed.
-async function failEmulationSetDispatch(tabId, domain, label, applied, cause) {
+// #339/A, #336: build the set-failed error. When no command of THIS set applied
+// anything, mark the error so the handler cleanup does not undo a no-op, and record
+// whether the domain was already registered before this set. Only a FIRST set that
+// applied nothing releases the domain (registering nothing); a REPEAT set that
+// applied nothing leaves the earlier override's registration, ledger and shim
+// exactly as they were. "Undo failed, kept registered" stays for a command that did
+// succeed.
+async function failEmulationSetDispatch(tabId, domain, label, applied, wasRegistered, cause) {
   const wrapped = bridgeError(
     ERROR_ATTACH_FAILED,
     `chrome.debugger ${label} set failed for tab ${tabId}: ${errorMessage(cause)}`
   );
   if (!applied) {
-    await releaseEmulationDebuggerSessionDomain(tabId, domain);
     wrapped.emulationNothingApplied = true;
+    wrapped.emulationDomainWasRegistered = Boolean(wasRegistered);
+    if (!wasRegistered) {
+      await releaseEmulationDebuggerSessionDomain(tabId, domain);
+    }
   }
   return wrapped;
 }
 
 async function cleanupFailedEmulationSet(tabId, domain, wiring, cause) {
   if (cause && cause.emulationNothingApplied) {
-    // #339/A: the set applied nothing (its first command was refused) and the
-    // dispatch already released the domain, so there is nothing to undo. Forget the
-    // baseline and ledger entry and let the original error stand.
+    if (cause.emulationDomainWasRegistered) {
+      // #336: this set applied nothing, but the domain already held a live override
+      // from an earlier set; leave it exactly as it was (registered, same baseline,
+      // ledger and shim) and let the original error stand.
+      return;
+    }
+    // #339/A: a first set applied nothing and the dispatch released the domain, so
+    // there is nothing to undo. Forget the baseline and ledger entry.
     wiring.baselineMap.delete(tabId);
     removeLedgerOverride(wiring.ledgerField, tabId);
     return;

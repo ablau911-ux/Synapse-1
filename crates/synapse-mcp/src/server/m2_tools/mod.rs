@@ -177,11 +177,14 @@ impl SynapseService {
             &request_context,
         )?;
         let claim_check = match &params.target {
-            crate::m2::ActClickTarget::Element(element) => self.ensure_element_action_target(
-                "act_click",
-                &element.element_id,
-                &request_context,
-            ),
+            crate::m2::ActClickTarget::Element(element) => {
+                self.ensure_element_action_target(
+                    "act_click",
+                    &element.element_id,
+                    &request_context,
+                )
+                .await
+            }
             crate::m2::ActClickTarget::Point(_) => self.ensure_target_claim_allows_action(
                 "act_click",
                 click_claim_target(&params),
@@ -686,11 +689,10 @@ impl SynapseService {
             }),
             &request_context,
         )?;
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_set_value",
-            element_claim_target(&params.element_id),
-            &request_context,
-        ) {
+        if let Err(error) = self
+            .ensure_element_action_target("act_set_value", &params.element_id, &request_context)
+            .await
+        {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
         }
         let foreground_guard =
@@ -813,8 +815,9 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        if let Err(error) =
-            self.ensure_element_action_target("act_set_field_text", &element_id, &request_context)
+        if let Err(error) = self
+            .ensure_element_action_target("act_set_field_text", &element_id, &request_context)
+            .await
         {
             return audit_target_claim_denial(self, "act_set_field_text", error, &request_context);
         }
@@ -846,11 +849,14 @@ impl SynapseService {
                             )
                         })?
                         .clone();
-                    if let Err(error) = self.ensure_element_action_target(
-                        "act_set_field_text",
-                        &retry_element_id,
-                        &request_context,
-                    ) {
+                    if let Err(error) = self
+                        .ensure_element_action_target(
+                            "act_set_field_text",
+                            &retry_element_id,
+                            &request_context,
+                        )
+                        .await
+                    {
                         Err(error)
                     } else {
                         self.act_set_field_text_execute_resolved(
@@ -874,7 +880,7 @@ impl SynapseService {
         result.map(Json)
     }
 
-    fn ensure_element_action_target(
+    async fn ensure_element_action_target(
         &self,
         tool: &'static str,
         element_id: &ElementId,
@@ -906,19 +912,46 @@ impl SynapseService {
             Some(SessionTarget::Window { hwnd: root_hwnd }),
             request_context,
         )?;
+        if matches!(target, Some(SessionTarget::Cdp { .. }))
+            && synapse_a11y::cdp_backend_from_element_id(element_id).is_none()
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} native UIA elements cannot prove membership in the bound CDP tab; re-resolve the element through that tab's DOM"
+                ),
+            ));
+        }
         #[cfg(windows)]
         if synapse_a11y::cdp_backend_from_element_id(element_id).is_some() {
+            if matches!(target, Some(SessionTarget::Window { .. })) {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "{tool} CDP elements require a bound tab to verify frame ownership and its parent-tab claim; bind the observed tab first"
+                    ),
+                ));
+            }
             let element_target_id = synapse_a11y::cdp_target_from_element_id(element_id)
                 .ok_or_else(|| mcp_error(error_codes::ACTION_TARGET_INVALID,
                     format!("{tool} CDP element must include its target id; re-resolve it against the session target")))?;
-            if let Some(bound) = target.as_ref()
-                && !matches!(bound, SessionTarget::Cdp { cdp_target_id, .. }
-                    if cdp_target_id.eq_ignore_ascii_case(&element_target_id))
-            {
-                return Err(mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!("{tool} CDP element does not match the session tab target"),
-                ));
+            if let Some(SessionTarget::Cdp { cdp_target_id, .. }) = target.as_ref() {
+                if !cdp_target_id.eq_ignore_ascii_case(&element_target_id) {
+                    let endpoint = synapse_a11y::endpoint_for_window(root_hwnd).ok_or_else(|| {
+                        mcp_error(error_codes::A11Y_CDP_UNREACHABLE,
+                            format!("{tool} requires a raw-CDP endpoint to verify descendant-frame ownership"))
+                    })?;
+                    super::background_router::target_act_validate_observed_cdp_element_target(
+                        &endpoint,
+                        root_hwnd,
+                        cdp_target_id,
+                        &element_target_id,
+                        tool,
+                    )
+                    .await?;
+                }
+                // A descendant frame must also respect its owning tab's claim.
+                self.ensure_target_claim_allows_action(tool, target.clone(), request_context)?;
             }
             self.ensure_target_claim_allows_action(
                 tool,

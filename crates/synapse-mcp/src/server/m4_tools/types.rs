@@ -38,7 +38,10 @@ pub struct ShellParams {
     #[schemars(description = "Executable path/name only for run/start operations.")]
     pub command: Option<String>,
     #[serde(default)]
-    #[schemars(default, description = "Literal executable arguments for run/start.")]
+    #[schemars(
+        default,
+        description = "Executable arguments for run/start. Explicit shells parse their args; cmd.exe operators and environment expansion are refused."
+    )]
     pub args: Option<Vec<String>>,
     #[serde(default)]
     pub working_dir: Option<String>,
@@ -81,7 +84,7 @@ pub(crate) fn shell_input_schema() -> Arc<Map<String, Value>> {
             "args": {
                 "type": ["array", "null"],
                 "items": { "type": "string" },
-                "description": "Literal executable arguments. Accepted by run/start."
+                "description": "Executable arguments for run/start. Explicit shells parse their args; cmd.exe operators and environment expansion are refused."
             },
             "working_dir": {
                 "type": ["string", "null"],

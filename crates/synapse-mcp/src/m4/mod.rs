@@ -7950,6 +7950,29 @@ fn validate_run_shell_params(params: &ActRunShellParams) -> Result<(), ErrorData
     }
     validate_run_shell_environment(&params.env)?;
     validate_run_shell_command_shape(params, command)?;
+    // cmd.exe reparses argv and expands environment references before execution.
+    // Refuse syntax that cannot satisfy the literal-argument contract, even
+    // when quoted: expansion can introduce operators from inherited variables.
+    if matches!(
+        executable_leaf(command)
+            .trim_end_matches(['.', ' '])
+            .to_ascii_lowercase()
+            .as_str(),
+        "cmd" | "cmd.exe"
+    ) && params
+        .args
+        .iter()
+        .any(|arg| arg.contains(['&', '|', '<', '>', '^', '(', ')', '%', '!', '\r', '\n']))
+    {
+        return Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_run_shell cmd.exe arguments must not contain command operators or environment expansion; invoke the intended executable directly with literal args",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "cmd_arguments_not_literal",
+            }),
+        ));
+    }
     validate_run_shell_chromium_debug_policy(params)?;
     let command_line = shell_command_line(params);
     if let Some(marker) = detect_shell_global_input(&command_line) {

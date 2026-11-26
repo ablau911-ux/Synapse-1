@@ -728,6 +728,7 @@ impl SynapseService {
             kind = "capture_screenshot",
             "tool.invocation kind=capture_screenshot"
         );
+        screenshot_output_path(&params.0.path)?;
         self.require_m3_permissions(
             "capture_screenshot",
             &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
@@ -17356,6 +17357,7 @@ fn validate_screenshot_file_facade_params(params: &ScreenshotParams) -> Result<(
             "path",
         ));
     }
+    screenshot_output_path(&params.path)?;
     Ok(())
 }
 
@@ -17425,6 +17427,7 @@ fn validate_screenshot_record_facade_params(
     let Some(folder) = record.folder.as_deref().map(Path::new) else {
         return Ok(record);
     };
+    validate_screenshot_output_path(folder)?;
     if !folder.is_absolute() || folder.parent().is_none() {
         return Err(invalid(
             format!(
@@ -19039,7 +19042,40 @@ fn validate_screenshot_region(region: Rect) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Validate caller-supplied names without filesystem access or echoing the path.
+fn validate_screenshot_output_path(path: &Path) -> Result<(), ErrorData> {
+    // Windows limits count UTF-16 code units; the full path includes a NUL.
+    if path.as_os_str().to_string_lossy().encode_utf16().count() >= 32_767 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "screenshot output path must be shorter than 32767 UTF-16 code units",
+        ));
+    }
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if name.encode_utf16().count() > 255 {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "screenshot output path components must not exceed 255 UTF-16 code units",
+            ));
+        }
+        if name.chars().any(|character| {
+            character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        }) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "screenshot output path contains an invalid Windows filename character",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn screenshot_output_path(raw_path: &str) -> Result<PathBuf, ErrorData> {
+    validate_screenshot_output_path(Path::new(raw_path))?;
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err(mcp_error(
@@ -19051,10 +19087,7 @@ fn screenshot_output_path(raw_path: &str) -> Result<PathBuf, ErrorData> {
     if !path.is_absolute() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "capture_screenshot path must be absolute: {}",
-                path.display()
-            ),
+            "capture_screenshot path must be absolute",
         ));
     }
     Ok(path)

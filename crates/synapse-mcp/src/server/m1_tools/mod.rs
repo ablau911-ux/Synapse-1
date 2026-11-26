@@ -728,6 +728,10 @@ impl SynapseService {
             kind = "capture_screenshot",
             "tool.invocation kind=capture_screenshot"
         );
+        self.require_m3_permissions(
+            "capture_screenshot",
+            &crate::m3::permissions::required([crate::m3::permissions::Permission::WriteStorage]),
+        )?;
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
         if params.0.window_hwnd.is_none()

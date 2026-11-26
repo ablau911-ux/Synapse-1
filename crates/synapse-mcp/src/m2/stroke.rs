@@ -44,6 +44,9 @@ const STROKE_DETAIL_TARGET_MISSING: &str = "STROKE_TARGET_MISSING";
 const STROKE_DETAIL_TARGET_CONFLICT: &str = "STROKE_TARGET_CONFLICT";
 const STROKE_DETAIL_TARGET_UNRESOLVED: &str = "STROKE_TARGET_UNRESOLVED";
 #[cfg(windows)]
+const STROKE_DETAIL_CDP_VERIFY_DELTA_UNSUPPORTED: &str = "STROKE_CDP_VERIFY_DELTA_UNSUPPORTED";
+const STROKE_DETAIL_CDP_ELEMENT_AIM_ONLY: &str = "STROKE_CDP_ELEMENT_AIM_ONLY";
+#[cfg(windows)]
 const CDP_STROKE_MIN_DISPATCH_INTERVAL_MS: f64 = 8.0;
 #[cfg(windows)]
 const CDP_STROKE_MAX_DISPATCH_POINTS: usize = 256;
@@ -264,7 +267,7 @@ pub(crate) async fn act_stroke_cdp_target(
         }
         if params.verify_delta {
             return Err(params_invalid_detail(
-                STROKE_DETAIL_TARGET_UNRESOLVED,
+                STROKE_DETAIL_CDP_VERIFY_DELTA_UNSUPPORTED,
                 "act_stroke verify_delta is not available for CDP mouse strokes because the expected DOM/canvas delta is app-specific; read the target DOM SoT separately after the tool call",
             ));
         }
@@ -299,7 +302,12 @@ pub(crate) async fn act_stroke_cdp_target(
                     ),
                 ),
                 &error,
-            )
+            );
+            if matches!(error, synapse_a11y::A11yError::CdpInputBusy { .. }) {
+                crate::m2::error_before_delivery(mapped)
+            } else {
+                mapped
+            }
         })?;
         // The stroke was delivered before this check.
         boundary
@@ -591,7 +599,7 @@ fn target_to_path_point(
         ActStrokeTarget::Element(element) => {
             if synapse_a11y::cdp_backend_from_element_id(&element.element_id).is_some() {
                 return Err(params_invalid_detail(
-                    STROKE_DETAIL_TARGET_UNRESOLVED,
+                    STROKE_DETAIL_CDP_ELEMENT_AIM_ONLY,
                     format!(
                         "act_stroke {role} CDP element {} can only be used as a pointer aim target with no button and no from point",
                         element.element_id

@@ -19523,11 +19523,67 @@ fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
     Ok((total, hex))
 }
 
+#[cfg(windows)]
+fn publish_screenshot_no_replace(temp_path: &Path, output_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        core::PCWSTR,
+    };
+    let source: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = output_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Unlike std::fs::rename, omitting MOVEFILE_REPLACE_EXISTING preserves an
+    // existing destination. Rename also works on filesystems without hard links.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
+}
+
+#[cfg(not(windows))]
+fn publish_screenshot_no_replace(temp_path: &Path, output_path: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(temp_path, output_path)
+}
+
 fn install_screenshot_file(
     temp_path: &Path,
     output_path: &Path,
     overwrite: bool,
 ) -> Result<(), ErrorData> {
+    if !overwrite {
+        // Publish the complete sibling temp file without replacing a winner
+        // from another capture. An existence check followed by rename races.
+        let result = publish_screenshot_no_replace(temp_path, output_path);
+        let _ = std::fs::remove_file(temp_path);
+        return result.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "capture_screenshot output file already exists and overwrite=false: {}",
+                        output_path.display()
+                    ),
+                )
+            } else {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "capture_screenshot failed to publish {} to {}: {error}",
+                        temp_path.display(),
+                        output_path.display()
+                    ),
+                )
+            }
+        });
+    }
     if overwrite && output_path.exists() {
         std::fs::remove_file(output_path).map_err(|error| {
             let _ = std::fs::remove_file(temp_path);
@@ -21316,4 +21372,52 @@ fn record_hud_error(
             detail: detail.into(),
         },
     );
+}
+
+#[cfg(test)]
+mod screenshot_publication_checks {
+    use super::*;
+
+    #[test]
+    fn concurrent_no_overwrite_publication_has_exactly_one_winner() {
+        let folder = std::env::temp_dir().join(format!(
+            "synapse-screenshot-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&folder).expect("create scratch directory");
+        let output = folder.join("once.png");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
+        let jobs: Vec<_> = (0..20_u8)
+            .map(|index| {
+                let temp = folder.join(format!("{index}.tmp"));
+                std::fs::write(&temp, [index]).expect("write candidate");
+                let output = output.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = install_screenshot_file(&temp, &output, false);
+                    assert!(!temp.exists(), "candidate must be cleaned up");
+                    match result {
+                        Ok(()) => Some(index),
+                        Err(error) => {
+                            assert!(error.message.contains("already exists and overwrite=false"));
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+        let winners: Vec<_> = jobs
+            .into_iter()
+            .filter_map(|job| job.join().expect("publication thread"))
+            .collect();
+        let bytes = std::fs::read(&output).expect("read winner");
+        std::fs::remove_dir_all(&folder).expect("clean scratch directory");
+        assert_eq!(winners.len(), 1);
+        assert_eq!(bytes, winners);
+    }
 }

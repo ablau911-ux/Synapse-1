@@ -26,7 +26,7 @@ use crate::m1::{
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
-    ActSetFieldTextLocator, ActSetFieldTextParams, ActStrokeParams, ActTypeParams,
+    ActSetFieldTextLocator, ActSetFieldTextParams, ActStrokeParams, ActStrokeTarget, ActTypeParams,
     act_press_normalized_labels, default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
 use crate::m4::{
@@ -2604,15 +2604,15 @@ impl SynapseService {
                     )
                 })?;
                 let session_id = target_act_session_id(&request_context, "stroke")?;
-                let response = if self.session_target(Some(&session_id))?.is_none() {
-                    Err(mcp_error(
+                let response = async {
+                    let target = self.session_target(Some(&session_id))?.ok_or_else(|| mcp_error(
                         error_codes::TARGET_NOT_SET,
                         "target_act verb=stroke requires a bound session target; refusing implicit human OS foreground fallback",
-                    ))
-                } else {
+                    ))?;
+                    target_act_validate_stroke_targets(self, &stroke, &session_id, &target).await?;
                     ensure_target_act_operator_panic_boundary("stroke_before_delegation")?;
                     self.act_stroke(Parameters(*stroke), request_context).await
-                };
+                }.await;
                 target_act_delegate_response("act_stroke", response)?
             }
             "hover" => target_act_hover(self, &params, &request_context).await?,
@@ -5226,6 +5226,95 @@ fn send_notepad_save_command(
         error_codes::ACTION_TARGET_INVALID,
         "target_act verb=save Notepad WM_COMMAND route is only available on Windows",
     ))
+}
+
+async fn target_act_validate_stroke_targets(
+    service: &SynapseService,
+    stroke: &ActStrokeParams,
+    session_id: &str,
+    bound_target: &SessionTarget,
+) -> Result<(), ErrorData> {
+    for target in [&stroke.target, &stroke.from, &stroke.to]
+        .into_iter()
+        .flatten()
+    {
+        let ActStrokeTarget::Element(element) = target else {
+            continue;
+        };
+        let destination = if synapse_a11y::cdp_backend_from_element_id(&element.element_id)
+            .is_some()
+        {
+            #[cfg(windows)]
+            {
+                let SessionTarget::Cdp {
+                    window_hwnd,
+                    cdp_target_id,
+                } = bound_target
+                else {
+                    return Err(mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        "target_act stroke CDP elements require a bound CDP target",
+                    ));
+                };
+                let element_hwnd = element
+                    .element_id
+                    .parts()
+                    .map_err(|error| {
+                        mcp_error(error_codes::TOOL_PARAMS_INVALID, error.to_string())
+                    })?
+                    .hwnd;
+                if element_hwnd != *window_hwnd {
+                    return Err(mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        "target_act stroke element HWND does not match the bound target",
+                    ));
+                }
+                // Do not allow execute_cdp_aim's legacy title-based resolution:
+                // the claim must cover the exact destination named by the id.
+                let element_target_id = synapse_a11y::cdp_target_from_element_id(&element.element_id)
+                    .ok_or_else(|| mcp_error(error_codes::ACTION_TARGET_INVALID,
+                        "target_act stroke CDP element must include its target id; re-resolve it against the bound target"))?;
+                let endpoint =
+                    synapse_a11y::endpoint_for_window(*window_hwnd).ok_or_else(|| {
+                        mcp_error(
+                            error_codes::A11Y_CDP_UNREACHABLE,
+                            "target_act stroke element requires a reachable raw-CDP endpoint",
+                        )
+                    })?;
+                target_act_validate_observed_cdp_element_target(
+                    &endpoint,
+                    *window_hwnd,
+                    cdp_target_id,
+                    &element_target_id,
+                    "stroke",
+                )
+                .await?;
+                SessionTarget::Cdp {
+                    window_hwnd: *window_hwnd,
+                    cdp_target_id: element_target_id,
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    "target_act stroke CDP element validation requires Windows",
+                ));
+            }
+        } else {
+            let (_, _, destination) =
+                target_act_native_element_target(&element.element_id, "stroke")?;
+            if &destination != bound_target {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    "target_act stroke element root window does not match the bound target",
+                ));
+            }
+            destination
+        };
+        service.ensure_target_claim_allows_session("act_stroke", session_id, &destination)?;
+    }
+    Ok(())
 }
 
 fn target_act_session_id(

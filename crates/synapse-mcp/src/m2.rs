@@ -89,7 +89,7 @@ pub use stroke::{
     act_stroke_validation_failure_details, validate_act_stroke_params,
 };
 pub(crate) use stroke::{
-    ActStrokePlan, act_stroke_cdp_target, act_stroke_with_handle_and_boundary,
+    ActStrokePlan, ActStrokeTarget, act_stroke_cdp_target, act_stroke_with_handle_and_boundary,
 };
 pub use type_text::action_from_type_params;
 pub use type_text::{ActTypeParams, ActTypeResponse, TypeBackend};

@@ -1248,7 +1248,8 @@ fn close_empty_emulation_slot(endpoint: &str, target_id: &str) {
 enum EmulationContext {
     Slot(Arc<EmulationSlot>),
     Fresh {
-        browser: chromiumoxide::Browser,
+        /// Boxed: a `Browser` is far larger than the slot variant's `Arc`.
+        browser: Box<chromiumoxide::Browser>,
         page: chromiumoxide::Page,
         handler_task: tokio::task::JoinHandle<()>,
     },
@@ -1287,7 +1288,7 @@ impl EmulationContext {
                 }
             };
         Ok(Self::Fresh {
-            browser,
+            browser: Box::new(browser),
             page,
             handler_task,
         })
@@ -1303,7 +1304,7 @@ impl EmulationContext {
     fn browser(&self) -> &chromiumoxide::Browser {
         match self {
             Self::Slot(slot) => &slot.browser,
-            Self::Fresh { browser, .. } => browser,
+            Self::Fresh { browser, .. } => browser.as_ref(),
         }
     }
 

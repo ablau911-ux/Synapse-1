@@ -1213,6 +1213,9 @@ fn validate_foreground_input_lease_ttl_ms(
 
 pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
     match error {
+        ActionError::AfterInput { error, .. } => {
+            error_after_earlier_steps(action_error_to_mcp(error), 1)
+        }
         ActionError::ForegroundLeaseBusy {
             detail,
             holder_session_id,

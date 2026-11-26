@@ -193,7 +193,7 @@ pub(super) fn mouse_stroke(
     if let Some(button) = button
         && let Err(error) = mouse_button(button, ButtonAction::Down, 0, state)
     {
-        let error = annotate_stroke_emit_error(error, "button_down", Some(0));
+        let error = annotate_stroke_emit_error(error, "button_down", Some(0)).after_input();
         log_stroke_emit_error(&context, Some(0), Some(first.point), "button_down", &error);
         return Err(error);
     }
@@ -216,9 +216,9 @@ pub(super) fn mouse_stroke(
                 &error,
                 &release_error,
             );
-            return Err(release_error);
+            return Err(release_error.after_input());
         }
-        return Err(error);
+        return Err(error.after_input());
     }
 
     if let Some(button) = button
@@ -227,7 +227,7 @@ pub(super) fn mouse_stroke(
         let sample_index = plan.samples.len().checked_sub(1);
         let requested_path_point =
             sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
-        let error = annotate_stroke_emit_error(error, "button_up", sample_index);
+        let error = annotate_stroke_emit_error(error, "button_up", sample_index).after_input();
         log_stroke_emit_error(
             &context,
             sample_index,
@@ -504,11 +504,26 @@ fn stroke_delay_ms(
     Ok(delay.round() as u32)
 }
 
+fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
+    let mut delivered = false;
+    send_absolute_mouse_move_tracked(point, detail, &mut delivered).map_err(|error| {
+        if delivered {
+            error.after_input()
+        } else {
+            error
+        }
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "cursor readback and DPI compensation are intentionally kept together to preserve fallback ordering"
 )]
-fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
+fn send_absolute_mouse_move_tracked(
+    point: Point,
+    detail: &'static str,
+    delivered: &mut bool,
+) -> Result<(), ActionError> {
     activate_thread_dpi_awareness();
     let desktop = virtual_desktop()?;
     if !desktop.contains(point) {
@@ -526,6 +541,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     // surface and move the cursor away from the physical UIA point.
     let compensation = dpi_compensation_for_point(point);
     if set_physical_cursor_pos(point, detail)? {
+        *delivered = true;
         let first_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, first_actual) {
             return Ok(());
@@ -546,6 +562,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
                 "physical cursor move read back a scaled coordinate; retrying with monitor-DPI compensation"
             );
             if set_physical_cursor_pos(compensation.adjusted, detail)? {
+                *delivered = true;
                 let compensated_actual = read_physical_cursor_position(detail)?;
                 if cursor_readback_matches(point, compensated_actual) {
                     return Ok(());
@@ -582,6 +599,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     if let Some(compensation) = compensation
         && set_physical_cursor_pos(compensation.adjusted, detail)?
     {
+        *delivered = true;
         let compensated_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, compensated_actual) {
             return Ok(());
@@ -589,6 +607,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     }
 
     send_input_batch(&[absolute_mouse_input_for_desktop(point, desktop)], detail)?;
+    *delivered = true;
     let send_input_actual = read_physical_cursor_position(detail)?;
     if cursor_readback_matches(point, send_input_actual) {
         Ok(())

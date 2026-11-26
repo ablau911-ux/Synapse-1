@@ -1702,6 +1702,13 @@ async function reconcileDurableOwners(trigger, options = {}) {
     }
     const liveTarget = live.get(tabId) || null;
     if (!continuity) {
+      // #339/B: a prior instance's CDP emulation overrides cannot have survived the
+      // extension reload / browser restart that broke continuity (its debugger is
+      // gone), but their MAIN-world shims persist on this live tab; tear them down
+      // out of band before the rows below are pruned, so the page stops reporting
+      // emulated values. Where continuity holds instead, the attachment survived and
+      // item-4 adoption keeps the overrides -- so this runs only when they are gone.
+      enqueueEmulationShimTeardown(tabId, emulationDomainsHeldInLedger(tabId), false);
       // Continuity is unproven (no fingerprinted row matched a live target), so
       // every fingerprinted row here refers to a target that no longer exists.
       // CDP-session state (debugger sessions, init scripts, bindings, emulation,
@@ -2653,7 +2660,11 @@ if (chrome.debugger?.onDetach?.addListener) {
       markBindingDebuggerDetached(source.tabId);
       markDialogDebuggerDetached(source.tabId);
       markFileChooserDebuggerDetached(source.tabId);
+      // #339/B: the overrides are gone with the attachment; tear their page shims
+      // down out of band and drop the ledger entries on success (kept on failure).
+      const staleEmulationDomains = emulationDomainsHeldInLedger(source.tabId);
       forgetEmulationOverridesForTab(source.tabId);
+      enqueueEmulationShimTeardown(source.tabId, staleEmulationDomains, true);
       console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
       if (DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
         .some((entry) => entry.tabId === source.tabId)) {
@@ -13154,6 +13165,47 @@ function emulationDomainsHeldInLedger(tabId) {
 // device-metrics ownership check below is still correct after a worker restart.
 function ledgerHasEmulationOverride(field, tabId) {
   return DURABLE_OWNER_LEDGER[field].some((entry) => entry.tabId === tabId);
+}
+
+// #339/B: when a tab's emulation debugger attachment is lost from outside (a human
+// Cancel on the debugging bar, an extension reload, or Chrome), the CDP overrides
+// die at once but the MAIN-world shims keep answering the page. Tear those shims
+// down out of band: the sync onDetach listener and the durable reconcile cannot run
+// page mutations inline, but the persisted background queue carries a command
+// admission context and shim teardown needs only chrome.scripting.executeScript, not
+// the debugger. `clearLedger` is true for the detach path (this owns the ledger
+// cleanup: drop on success, keep on failure so panic cleanup / the next op retry);
+// false for the startup reconcile, which prunes the ledger itself. `domains` is
+// captured by the caller because the reconcile prunes the ledger right after.
+function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
+  if (!domains || !domains.length) {
+    return;
+  }
+  enqueuePersistedBackgroundMutation("emulationShimTeardown", async () => {
+    let changed = false;
+    for (const domain of domains) {
+      const wiring = EMULATION_DOMAIN_WIRING[domain];
+      if (!wiring) {
+        continue;
+      }
+      try {
+        await wiring.clearShim(tabId);
+      } catch (error) {
+        console.warn(`Synapse emulation shim teardown failed for ${domain} tab ${tabId}: ${errorMessage(error)}`);
+        continue;
+      }
+      if (clearLedger) {
+        wiring.baselineMap.delete(tabId);
+        removeLedgerOverride(wiring.ledgerField, tabId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    }
+  }).catch((error) => {
+    console.warn(`Synapse emulation shim teardown could not run for tab ${tabId}: ${errorMessage(error)}`);
+  });
 }
 
 // #336: a Chrome-attached session survived only when the attachment persisted AND no

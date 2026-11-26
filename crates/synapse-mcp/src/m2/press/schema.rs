@@ -116,9 +116,11 @@ pub struct ActPressResponse {
     pub backend_tier_used: String,
     pub required_foreground: bool,
     pub postcondition: ActPostcondition,
-    /// Set when a WM_KEYUP was not posted because the matching WM_KEYDOWN closed
-    /// its window (e.g. Enter in an address bar navigated the page). The press
-    /// was delivered; a key-up in a window that no longer exists is unnecessary,
+    /// Set when a key-up was not sent because the matching key-down closed its
+    /// target: on the PostMessage tier a WM_KEYUP whose WM_KEYDOWN closed the
+    /// window (e.g. Enter in an address bar navigated the page), or on the
+    /// raw-CDP tier a key-up whose key-down closed the target (#329). The press
+    /// was delivered; a key-up in a target that no longer exists is unnecessary,
     /// so this is not a backend failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_up_not_posted_window_closed: Option<String>,

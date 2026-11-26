@@ -1527,8 +1527,29 @@ async fn set_node_text_after_click(
     })
 }
 
+/// Outcome of a raw-CDP key sequence dispatched to one page target (#329).
+///
+/// A key-up that fails because its own key-down closed the target is a
+/// delivered press, not a held key: Chrome confirms the target is gone, the
+/// persisted owner is resolved, and the caller reports the closed target
+/// instead of a dispatch failure. Mirrors `PostKeySequenceOutcome` on the
+/// PostMessage tier.
+#[derive(Clone, Debug)]
+pub enum CdpKeySequenceOutcome {
+    /// Every key event was delivered and acknowledged; the target stayed live.
+    Delivered,
+    /// A delivered key-down closed the target and the matching key-up then
+    /// failed; Chrome confirms the target is absent. `detail` names the target
+    /// and the key-up error.
+    TargetClosed { detail: String },
+}
+
 /// Dispatches a key sequence to a specific CDP page target without activating
 /// the browser window.
+///
+/// Returns [`CdpKeySequenceOutcome`]: `Delivered` for a live target, or
+/// `TargetClosed` when a delivered key-down closed the target and the key-up
+/// was therefore unnecessary (#329).
 ///
 /// # Errors
 ///
@@ -1539,7 +1560,7 @@ pub async fn cdp_press_key_sequence(
     target_id: &str,
     keys: Vec<CdpKeyStroke>,
     hold_ms: u32,
-) -> A11yResult<()> {
+) -> A11yResult<CdpKeySequenceOutcome> {
     if keys.is_empty() {
         return Err(A11yError::CdpAxtreeFailed {
             detail: "cdp_press_key_sequence requires at least one key".to_owned(),
@@ -6435,7 +6456,7 @@ async fn dispatch_key_sequence_on_page(
     page: &chromiumoxide::Page,
     keys: &[CdpKeyStroke],
     hold_ms: u32,
-) -> A11yResult<()> {
+) -> A11yResult<CdpKeySequenceOutcome> {
     // Refuse before any dispatch when the page is hidden (#334).
     ensure_cdp_page_visible(page).await?;
     for key in keys {
@@ -6500,13 +6521,36 @@ async fn dispatch_key_sequence_on_page(
             Err(error) => release_failures.push(error.to_string()),
         }
     }
-    let settled = if release_failures.is_empty() {
-        resolve_persisted_cdp_mutation_owner(&owner)
-            .and_then(|()| primary_error.map_or(Ok(()), Err))
+    if release_failures.is_empty() {
+        let settled = resolve_persisted_cdp_mutation_owner(&owner)
+            .and_then(|()| primary_error.map_or(Ok(CdpKeySequenceOutcome::Delivered), Err));
+        return after_input_if(settled, delivered);
+    }
+    let release_detail = release_failures.join(" | ");
+    // #329: a key-up that failed because its own key-down closed the target is
+    // a delivered press, not a held key. Ask Chrome whether the target is gone;
+    // only a sure absence (a delivered key-down with no key-down dispatch
+    // error) converts the failure into a closed-target outcome and resolves the
+    // persisted owner. A live target, an inconclusive inventory, or a key-down
+    // that never arrived keeps today's fail-closed owner exactly as before, so
+    // a really held key is never reported as released.
+    let target_id = page.target_id().inner();
+    let target_absent = delivered
+        && primary_error.is_none()
+        && matches!(
+            cdp_target_present_inventory(endpoint, target_id).await,
+            Ok(false)
+        );
+    let settled = if target_absent {
+        resolve_persisted_cdp_mutation_owner(&owner).map(|()| CdpKeySequenceOutcome::TargetClosed {
+            detail: format!(
+                "raw-CDP target {target_id:?} closed by its own key-down; key-up not sent: {release_detail}"
+            ),
+        })
     } else {
         Err(record_unresolved_input_release_detail(
             primary_error,
-            release_failures.join(" | "),
+            release_detail,
             "one or more keyUp acknowledgements were not proven",
         ))
     };

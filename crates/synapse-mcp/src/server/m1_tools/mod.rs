@@ -18939,30 +18939,21 @@ fn write_screenshot_bitmap_with_quality(
     jpeg_quality: Option<u8>,
     capture_retry_evidence: Option<CaptureRetryEvidence>,
 ) -> Result<CaptureScreenshotResponse, ErrorData> {
-    let temp_path = screenshot_temp_path(&output_path);
-    if temp_path.try_exists().map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "capture_screenshot temp path existence check failed for {}: {error}",
-                temp_path.display()
-            ),
-        )
-    })? {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "capture_screenshot temp path already exists: {}",
-                temp_path.display()
-            ),
-        ));
-    }
     let source_region = captured.region;
     let native_width = captured.width;
     let native_height = captured.height;
     let (captured, scale) =
         downscale_captured_bitmap(captured, params.max_pixels, params.max_long_edge)?;
-    save_screenshot_bitmap_with_quality(&captured, &temp_path, format, jpeg_quality)?;
+    let (temp_path, mut temp_file) =
+        create_screenshot_temp_file("capture_screenshot", &output_path)?;
+    save_screenshot_bitmap_with_quality(
+        &captured,
+        &temp_path,
+        &mut temp_file,
+        format,
+        jpeg_quality,
+    )?;
+    drop(temp_file);
     install_screenshot_file(&temp_path, &output_path, params.overwrite)?;
     let metadata = std::fs::metadata(&output_path).map_err(|error| {
         mcp_error(
@@ -19357,6 +19348,7 @@ fn ensure_output_path_available(tool: &str, path: &Path, overwrite: bool) -> Res
 fn save_screenshot_bitmap_with_quality(
     captured: &synapse_capture::CapturedBgraBitmap,
     path: &Path,
+    file: &mut std::fs::File,
     format: CaptureScreenshotFormat,
     jpeg_quality: Option<u8>,
 ) -> Result<(), ErrorData> {
@@ -19400,18 +19392,9 @@ fn save_screenshot_bitmap_with_quality(
         )
     })?;
     let result = match format {
-        CaptureScreenshotFormat::Png => image.save_with_format(path, ImageFormat::Png),
+        CaptureScreenshotFormat::Png => image.write_to(&mut *file, ImageFormat::Png),
         CaptureScreenshotFormat::Jpeg => {
             let rgb = DynamicImage::ImageRgba8(image).to_rgb8();
-            let file = std::fs::File::create(path).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_WRITE_FAILED,
-                    format!(
-                        "capture_screenshot failed to create {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
             let quality = jpeg_quality.unwrap_or(90);
             let mut encoder = JpegEncoder::new_with_quality(file, quality);
             return encoder.encode_image(&rgb).map_err(|error| {
@@ -19495,34 +19478,20 @@ fn copy_or_move_download_file(
         ));
     }
     ensure_output_path_available("browser_downloads", output_path, overwrite)?;
-    let temp_path = screenshot_temp_path(output_path);
-    if temp_path.try_exists().map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "browser_downloads temp path existence check failed for {}: {error}",
-                temp_path.display()
-            ),
-        )
-    })? {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "browser_downloads temp path already exists: {}",
-                temp_path.display()
-            ),
-        ));
-    }
-    std::fs::copy(source_path, &temp_path).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "browser_downloads failed to copy {} to {}: {error}",
-                source_path.display(),
-                temp_path.display()
-            ),
-        )
-    })?;
+    let (temp_path, mut temp_file) = create_screenshot_temp_file("browser_downloads", output_path)?;
+    std::fs::File::open(source_path)
+        .and_then(|mut source_file| std::io::copy(&mut source_file, &mut temp_file))
+        .map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "browser_downloads failed to copy {} to {}: {error}",
+                    source_path.display(),
+                    temp_path.display()
+                ),
+            )
+        })?;
+    drop(temp_file);
     install_download_file(&temp_path, output_path, overwrite)?;
     let (saved_bytes, saved_sha256) = sha256_file(output_path)?;
     if saved_bytes != source_metadata.len() {
@@ -19718,25 +19687,8 @@ fn write_pdf_bytes(
             ),
         ));
     }
-    let temp_path = screenshot_temp_path(output_path);
-    if temp_path.try_exists().map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "browser_pdf temp path existence check failed for {}: {error}",
-                temp_path.display()
-            ),
-        )
-    })? {
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "browser_pdf temp path already exists: {}",
-                temp_path.display()
-            ),
-        ));
-    }
-    std::fs::write(&temp_path, pdf_bytes).map_err(|error| {
+    let (temp_path, mut temp_file) = create_screenshot_temp_file("browser_pdf", output_path)?;
+    std::io::Write::write_all(&mut temp_file, pdf_bytes).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
@@ -19745,6 +19697,7 @@ fn write_pdf_bytes(
             ),
         )
     })?;
+    drop(temp_file);
     install_screenshot_file(&temp_path, output_path, overwrite)?;
     let metadata = std::fs::metadata(output_path).map_err(|error| {
         mcp_error(
@@ -19762,6 +19715,36 @@ fn write_pdf_bytes(
         ));
     }
     Ok(metadata.len())
+}
+
+fn create_screenshot_temp_file(
+    tool: &str,
+    output_path: &Path,
+) -> Result<(PathBuf, std::fs::File), ErrorData> {
+    for _ in 0..8 {
+        let temp_path = screenshot_temp_path(output_path);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!("{tool} failed to create {}: {error}", temp_path.display()),
+                ));
+            }
+        }
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "{tool} could not create a unique temp file for {} after 8 attempts",
+            output_path.display()
+        ),
+    ))
 }
 
 fn screenshot_temp_path(output_path: &Path) -> PathBuf {

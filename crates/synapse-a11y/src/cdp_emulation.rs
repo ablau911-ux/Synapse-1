@@ -414,7 +414,7 @@ pub async fn cdp_apply_device_descriptor(
     let original_readback = device_readback(endpoint, target_id).await?;
     if let Ok(mut originals) = original_user_agents().lock() {
         originals
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| original_readback.metrics.user_agent.clone());
     }
     run_device_descriptor_command(
@@ -428,7 +428,7 @@ pub async fn cdp_apply_device_descriptor(
         let original_user_agent = original_user_agents()
             .lock()
             .ok()
-            .and_then(|mut originals| originals.remove(&device_registry_key(endpoint, target_id)));
+            .and_then(|originals| originals.get(&key).cloned());
         let cleanup = run_device_descriptor_command(
             endpoint,
             target_id,
@@ -437,6 +437,11 @@ pub async fn cdp_apply_device_descriptor(
             },
         )
         .await;
+        if cleanup.is_ok()
+            && let Ok(mut originals) = original_user_agents().lock()
+        {
+            originals.remove(&key);
+        }
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
                 "emulate set device did not take effect: {detail}; {}",
@@ -470,7 +475,7 @@ pub async fn cdp_reset_device_descriptor(
     let original_user_agent = original_user_agents()
         .lock()
         .ok()
-        .and_then(|mut originals| originals.remove(&key));
+        .and_then(|originals| originals.get(&key).cloned());
     run_device_descriptor_command(
         endpoint,
         target_id,
@@ -479,6 +484,9 @@ pub async fn cdp_reset_device_descriptor(
         },
     )
     .await?;
+    if let Ok(mut originals) = original_user_agents().lock() {
+        originals.remove(&key);
+    }
     let readback = device_readback(endpoint, target_id).await?;
     Ok(CdpDeviceResult {
         endpoint: endpoint.to_owned(),

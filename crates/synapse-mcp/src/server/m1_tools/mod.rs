@@ -19765,6 +19765,11 @@ fn write_pdf_bytes(
 }
 
 fn screenshot_temp_path(output_path: &Path) -> PathBuf {
+    // A process-local monotonic sequence makes the sibling name unique even when
+    // two concurrent captures read the same clock value (#352): the clock and pid
+    // alone are not unique across simultaneous requests.
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
@@ -19773,9 +19778,10 @@ fn screenshot_temp_path(output_path: &Path) -> PathBuf {
         .map(|value| value.to_string_lossy())
         .unwrap_or_else(|| "capture".into());
     output_path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
+        ".{file_name}.{}.{}.{}.tmp",
         std::process::id(),
-        now_ns
+        now_ns,
+        seq
     ))
 }
 

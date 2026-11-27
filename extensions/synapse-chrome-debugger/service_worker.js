@@ -2032,6 +2032,17 @@ function mergeLiveOwnersIntoDurableLedger() {
   };
   mergeOverrideMap("viewportOverrides", VIEWPORT_BASELINE_BY_TAB);
   mergeOverrideMap("deviceOverrides", DEVICE_BASELINE_BY_TAB);
+  // #350: keep requested metrics separate from the override-free baselines.
+  // Both rows carry the last owner so adoption can reject inconsistent recovery.
+  for (const [domain, field] of [["viewport", "viewportOverrides"], ["device", "deviceOverrides"]]) {
+    for (const entry of DURABLE_OWNER_LEDGER[field]) {
+      const record = EMULATION_DEVICE_METRICS_BY_TAB.get(entry.tabId);
+      if (record) {
+        entry.requestedMetrics = record[domain];
+        entry.metricsLastOwner = record.lastOwner;
+      }
+    }
+  }
   mergeOverrideMap("geolocationOverrides", GEOLOCATION_OVERRIDE_BY_TAB, "origin");
   mergeOverrideMap("localeOverrides", LOCALE_BASELINE_BY_TAB);
   mergeOverrideMap("mediaOverrides", MEDIA_BASELINE_BY_TAB);
@@ -9859,7 +9870,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", metricsParams);
     // #336: remember device's metrics so a later viewport reset can hand the shared
     // override back to device while it still holds.
-    rememberDeviceMetrics(tabId, "device", metricsParams);
+    await rememberDeviceMetrics(tabId, "device", metricsParams);
     // #338: Emulation.setTouchEmulationEnabled rejects maxTouchPoints outside
     // 1..16 even when enabling=false, so send the count only when touch is on
     // (the descriptor defaults it to a valid 5); leave the field out when off.
@@ -9881,6 +9892,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
 }
 
 async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
+  let resetSucceeded = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
     const methods = [];
@@ -9890,15 +9902,17 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       // re-applying viewport's own last metrics; if viewport set last, its metrics
       // are already live. (The device-only user agent and touch are restored below.)
       const record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
-      if (record && record.lastOwner === "device" && record.viewport) {
+      if (!deviceMetricsParamsAreValid(record?.viewport) ||
+          (record.lastOwner !== "viewport" && record.lastOwner !== "device")) {
+        throw new Error("surviving viewport requested metrics or ownership could not be recovered");
+      }
+      if (record.lastOwner === "device") {
         await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", record.viewport);
         record.lastOwner = "viewport";
         record.device = null;
         methods.push("Emulation.setDeviceMetricsOverride(restore viewport metrics)");
       } else {
-        if (record) {
-          record.device = null;
-        }
+        record.device = null;
         methods.push("skip-device-metrics(viewport emulation owns device metrics)");
       }
     } else {
@@ -9928,6 +9942,8 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
       });
       methods.push("Emulation.setUserAgentOverride(original)");
     }
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    resetSucceeded = true;
     return {
       method: methods.join("+"),
       protocol_version: attachment.protocolVersion
@@ -9935,10 +9951,12 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
-      `chrome.debugger deviceEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
+      `chrome.debugger deviceEmulation reset failed for tab ${tabId}; cleanup-unverified: the override may still be active: ${errorMessage(error)}`
     );
   } finally {
-    await releaseEmulationDebuggerSessionDomain(tabId, "device");
+    if (resetSucceeded) {
+      await releaseEmulationDebuggerSessionDomain(tabId, "device");
+    }
   }
 }
 
@@ -10203,7 +10221,7 @@ async function dispatchViewportEmulationSet(tabId, requested) {
     bumpEmulationDomainSetSeq(tabId, "viewport");
     // #336: remember viewport's metrics so a later device reset can hand the shared
     // override back to viewport while it still holds.
-    rememberDeviceMetrics(tabId, "viewport", metricsParams);
+    await rememberDeviceMetrics(tabId, "viewport", metricsParams);
     return {
       method: `Emulation.setDeviceMetricsOverride(width,height,deviceScaleFactor,mobile=${String(Boolean(requested.mobile))})`,
       protocol_version: attachment.protocolVersion
@@ -10217,6 +10235,7 @@ async function dispatchViewportEmulationSet(tabId, requested) {
 // back (which detaches when no other emulation domain or persistent reason holds
 // the session).
 async function dispatchViewportEmulationReset(tabId) {
+  let resetSucceeded = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
     let method;
@@ -10227,15 +10246,17 @@ async function dispatchViewportEmulationReset(tabId) {
       // override back by re-applying device's own last metrics; if device set last,
       // its metrics are already live and there is nothing to do.
       const record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
-      if (record && record.lastOwner === "viewport" && record.device) {
+      if (!deviceMetricsParamsAreValid(record?.device) ||
+          (record.lastOwner !== "viewport" && record.lastOwner !== "device")) {
+        throw new Error("surviving device requested metrics or ownership could not be recovered");
+      }
+      if (record.lastOwner === "viewport") {
         await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", record.device);
         record.lastOwner = "device";
         record.viewport = null;
         method = "Emulation.setDeviceMetricsOverride(restore device metrics)";
       } else {
-        if (record) {
-          record.viewport = null;
-        }
+        record.viewport = null;
         method = "skip-device-metrics(device emulation owns device metrics)";
       }
     } else {
@@ -10251,6 +10272,8 @@ async function dispatchViewportEmulationReset(tabId) {
       EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
       method = "Emulation.clearDeviceMetricsOverride+Emulation.setDeviceMetricsOverride(width=0,height=0,deviceScaleFactor=0,mobile=false)";
     }
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    resetSucceeded = true;
     return {
       method,
       protocol_version: attachment.protocolVersion
@@ -10258,10 +10281,12 @@ async function dispatchViewportEmulationReset(tabId) {
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
-      `chrome.debugger viewportEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
+      `chrome.debugger viewportEmulation reset failed for tab ${tabId}; cleanup-unverified: the override may still be active: ${errorMessage(error)}`
     );
   } finally {
-    await releaseEmulationDebuggerSessionDomain(tabId, "viewport");
+    if (resetSucceeded) {
+      await releaseEmulationDebuggerSessionDomain(tabId, "viewport");
+    }
   }
 }
 
@@ -13546,7 +13571,7 @@ function forgetEmulationDomainSetSeq(tabId) {
 
 // #336: record the device-metrics params a successful viewport/device set applied,
 // and that this domain set them last.
-function rememberDeviceMetrics(tabId, owner, params) {
+async function rememberDeviceMetrics(tabId, owner, params) {
   let record = EMULATION_DEVICE_METRICS_BY_TAB.get(tabId);
   if (!record) {
     record = { viewport: null, device: null, lastOwner: null };
@@ -13554,6 +13579,36 @@ function rememberDeviceMetrics(tabId, owner, params) {
   }
   record[owner] = params;
   record.lastOwner = owner;
+  await persistDurableOwnerLedger({ mergeLiveOwners: true });
+}
+
+// #350: only requested CDP params can restore a survivor; baselines describe the
+// natural tab and must never stand in for a missing request.
+function deviceMetricsParamsAreValid(params) {
+  return Boolean(params && typeof params === "object" && !Array.isArray(params) &&
+    Number.isInteger(params.width) && params.width > 0 &&
+    Number.isInteger(params.height) && params.height > 0 &&
+    Number.isFinite(params.deviceScaleFactor) && params.deviceScaleFactor >= 0 &&
+    typeof params.mobile === "boolean" &&
+    params.screenWidth === params.width && params.screenHeight === params.height);
+}
+
+function restoreDeviceMetricsFromLedger(tabId) {
+  const viewport = DURABLE_OWNER_LEDGER.viewportOverrides.find((entry) => entry.tabId === tabId);
+  const device = DURABLE_OWNER_LEDGER.deviceOverrides.find((entry) => entry.tabId === tabId);
+  const rows = [viewport, device].filter(Boolean);
+  if (!rows.length) {
+    return;
+  }
+  const lastOwner = rows[0].metricsLastOwner;
+  EMULATION_DEVICE_METRICS_BY_TAB.set(tabId, {
+    viewport: deviceMetricsParamsAreValid(viewport?.requestedMetrics) ? viewport.requestedMetrics : null,
+    device: deviceMetricsParamsAreValid(device?.requestedMetrics) ? device.requestedMetrics : null,
+    lastOwner: (lastOwner === "viewport" || lastOwner === "device") &&
+      rows.every((entry) => entry.metricsLastOwner === lastOwner)
+      ? lastOwner
+      : null
+  });
 }
 
 // #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
@@ -13702,6 +13757,7 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
       for (const held of emulationDomainsHeldInLedger(tabId)) {
         session.domains.add(held);
       }
+      restoreDeviceMetricsFromLedger(tabId);
     } else {
       await forgetStaleEmulationOverridesOnFreshAttach(tabId, domain);
     }

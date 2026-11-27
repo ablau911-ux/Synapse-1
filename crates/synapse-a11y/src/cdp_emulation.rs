@@ -345,10 +345,12 @@ pub async fn cdp_set_viewport_size_with_mobile(
     .await?;
     let readback = viewport_readback(endpoint, target_id).await?;
     if let Some(detail) = viewport_override_mismatch(&requested, &readback.metrics) {
-        let _ = run_device_metrics_command(endpoint, target_id, DeviceMetricsCommand::Reset).await;
+        let cleanup =
+            run_device_metrics_command(endpoint, target_id, DeviceMetricsCommand::Reset).await;
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
-                "emulate set viewport did not take effect: {detail}; the override was cleared"
+                "emulate set viewport did not take effect: {detail}; {}",
+                cleanup_outcome_detail(&cleanup)
             ),
         });
     }
@@ -362,6 +364,18 @@ pub async fn cdp_set_viewport_size_with_mobile(
         ready_state: readback.ready_state,
         readback: readback.metrics,
     })
+}
+
+/// Describe whether a best-effort emulation rollback actually cleared the
+/// override. The mismatch branches must not claim "the override was cleared"
+/// when their reset call failed — that was a silent lie on the error path (#351).
+fn cleanup_outcome_detail<T>(result: &A11yResult<T>) -> String {
+    match result {
+        Ok(_) => "the override was cleared".to_owned(),
+        Err(error) => {
+            format!("the override may still be active (cleanup unverified: {error})")
+        }
+    }
 }
 
 /// Clears `Emulation.setDeviceMetricsOverride` for one CDP page target, then
@@ -415,7 +429,7 @@ pub async fn cdp_apply_device_descriptor(
             .lock()
             .ok()
             .and_then(|mut originals| originals.remove(&device_registry_key(endpoint, target_id)));
-        let _ = run_device_descriptor_command(
+        let cleanup = run_device_descriptor_command(
             endpoint,
             target_id,
             DeviceDescriptorCommand::Reset {
@@ -425,7 +439,8 @@ pub async fn cdp_apply_device_descriptor(
         .await;
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
-                "emulate set device did not take effect: {detail}; the override was cleared"
+                "emulate set device did not take effect: {detail}; {}",
+                cleanup_outcome_detail(&cleanup)
             ),
         });
     }
@@ -570,11 +585,12 @@ pub async fn cdp_set_locale_timezone_override(
     .await?;
     let readback = locale_timezone_readback(endpoint, target_id).await?;
     if let Some(detail) = locale_timezone_override_mismatch(&requested, &readback.metrics) {
-        let _ =
+        let cleanup =
             run_locale_timezone_command(endpoint, target_id, LocaleTimezoneCommand::Reset).await;
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
-                "emulate set locale/timezone did not take effect: {detail}; the override was cleared"
+                "emulate set locale/timezone did not take effect: {detail}; {}",
+                cleanup_outcome_detail(&cleanup)
             ),
         });
     }
@@ -625,10 +641,11 @@ pub async fn cdp_set_media_override(
     run_media_command(endpoint, target_id, MediaCommand::Set(requested.clone())).await?;
     let readback = media_readback(endpoint, target_id).await?;
     if let Some(detail) = media_override_mismatch(&requested, &readback.metrics) {
-        let _ = run_media_command(endpoint, target_id, MediaCommand::Reset).await;
+        let cleanup = run_media_command(endpoint, target_id, MediaCommand::Reset).await;
         return Err(A11yError::CdpAxtreeFailed {
             detail: format!(
-                "emulate set media did not take effect: {detail}; the override was cleared"
+                "emulate set media did not take effect: {detail}; {}",
+                cleanup_outcome_detail(&cleanup)
             ),
         });
     }

@@ -3,12 +3,13 @@
 **Source files covered:**
 - `Cargo.toml` (workspace root), `clippy.toml`, `deny.toml`
 - `README.md`
-- `crates/synapse-mcp/src/main.rs`, `server.rs`, `m1.rs`, `m2.rs`, `m3.rs`, `m4.rs`, `single_instance.rs`, `daemon_lifecycle.rs`
+- `crates/synapse-mcp/src/main.rs`, `server.rs`, `m1.rs`, `m2.rs`, `m3.rs`, `m4/mod.rs`, `single_instance.rs`, `daemon_lifecycle.rs`
 - `crates/synapse-core/src/lib.rs`, `defaults.rs`, `error_codes.rs`
-- The 14 workspace crates' `lib.rs` / `main.rs` module declarations
-- Synthesized from companion documents 02–17 in this series
+- The 13 workspace crates' `lib.rs` / `main.rs` module declarations
+- `crates/synapse-mcp/src/server/tool_profiles.rs` (`PUBLIC_TOOL_NAMES`, `FACADE_TOOL_CONTRACTS`)
+- Synthesized from companion documents 02–16 in this series
 
-> Scope note: every claim below is derived from source in the `C:\code\synapse` workspace. Where a fact is documented in detail elsewhere in this series it is cross-referenced rather than repeated.
+> Scope note: claims below are derived from source in this repository. Where a fact is documented in detail elsewhere in this series it is cross-referenced rather than repeated. Counts re-checked against the code on 2026-11-27 (#288).
 
 ---
 
@@ -16,7 +17,7 @@
 
 Synapse is a local **Model Context Protocol (MCP) server**, written in Rust (edition 2024, `rust-version = 1.95`), that gives an LLM agent a structured interface to a **Windows** PC: it perceives the screen (capture + OCR + object detection + accessibility tree), emits human-like mouse/keyboard/gamepad input, runs sub-millisecond reflex loops, drives the browser over the Chrome DevTools Protocol, and orchestrates a fleet of agents that share one machine. It speaks MCP over stdio and over HTTP/SSE, and is designed to plug into Claude Code, Codex, and the Claude Desktop app (`README.md`).
 
-The system is structured as a Cargo workspace of **14 crates** (`Cargo.toml`). `synapse-mcp` is the server/daemon and the sink of the dependency graph; `synapse-core` is the shared-vocabulary root with no internal dependencies. See [02_source_code_map.md](02_source_code_map.md) for the full crate tree and dependency graph.
+The system is structured as a Cargo workspace of **13 crates** (`Cargo.toml` `members`). `synapse-mcp` is the server/daemon and the sink of the dependency graph; `synapse-core` is the shared-vocabulary root with no internal dependencies. See [02_source_code_map.md](02_source_code_map.md) for the full crate tree and dependency graph.
 
 ---
 
@@ -27,7 +28,7 @@ The product runs as a single canonical daemon plus subordinate processes spawned
 | Process / role | How launched | Transport / port | Technology | Purpose |
 |---|---|---|---|---|
 | MCP daemon (stdio) | `--mode stdio` (default) | stdio JSON-RPC | `rmcp` 1.7.0 | Primary MCP server for a directly-attached client |
-| MCP daemon (HTTP) | `--mode http` | `127.0.0.1:7700` (`DEFAULT_BIND`) | axum 0.8 + `rmcp` StreamableHttpService at `/mcp`; SSE at `/events` | Shared daemon for multiple agents; bearer-token auth |
+| MCP daemon (HTTP) | `--mode http` | `127.0.0.1:7700` (`DEFAULT_BIND`) | axum 0.8 + `rmcp` StreamableHttpService at `/mcp`; SSE at `/events` | Shared daemon for multiple agents; loopback bind trusts the bind + `Host`/`Origin` guard and does not check the bearer token; a non-loopback bind (`--allow-non-loopback`) requires it (`crates/synapse-mcp/src/http/auth.rs`) |
 | Connect shim | `--mode connect` | → 7700 | — | Bridges a stdio client into the already-running shared daemon |
 | Desktop worker | `--mode desktop-worker` | IPC to daemon | Win32 | Runs in an interactive desktop session for input/capture |
 | Local agent | `--mode local-agent` | IPC | — | Hosts a locally-spawned sub-agent |
@@ -58,13 +59,13 @@ Default `--mode` is `Stdio` (env `SYNAPSE_MODE`). See [15_mcp_server_architectur
 | Concurrency | crossbeam, arc-swap | 0.8.4 / 1.9.1 |
 | Clipboard | arboard | 3.6.1 |
 
-Lint posture: `clippy::unwrap_used` / `clippy::expect_used` are **denied workspace-wide** in production paths, allowed only in test code (`clippy.toml`, `[workspace.lints.clippy]`). Dependency/license gating via `cargo-deny` (`deny.toml`).
+Lint posture: `clippy::unwrap_used` / `clippy::expect_used` are **denied workspace-wide** (`[workspace.lints.clippy]`); `clippy.toml` still allows them in tests, but the tree carries no test code. Dependency/license gating via `cargo-deny` (`deny.toml`).
 
 ---
 
 ## 4. Milestone layering (tool families)
 
-Tools and subsystems are organized into milestones (`crates/synapse-mcp/src/m1.rs`–`m4.rs`):
+Tools and subsystems are organized into milestones (`crates/synapse-mcp/src/m1.rs`–`m3.rs`, `m4/mod.rs`):
 
 | Milestone | Theme | Representative capability |
 |---|---|---|
@@ -79,25 +80,23 @@ See [16_api_tools_reference.md](16_api_tools_reference.md) for every tool groupe
 
 ## 5. Public surface (MCP tools)
 
-The server registers MCP tools as `rmcp` `#[tool(...)]` functions on `SynapseService`, summed across per-module `#[tool_router]` impls in `tool_router()` (`crates/synapse-mcp/src/server.rs`). Client-visible names are `mcp__synapse__<fn_name>`. Domain groups (full reference in [16_api_tools_reference.md](16_api_tools_reference.md)):
+The server registers MCP tools as `rmcp` `#[tool(...)]` functions on `SynapseService`, summed across per-module `#[tool_router]` impls in `tool_router()` (`crates/synapse-mcp/src/server.rs`, `fn tool_router`). Client-visible names are `mcp__synapse__<fn_name>`.
 
-| Domain | Examples |
+**Default public surface: 40 facade tools.** `PUBLIC_TOOL_NAMES` in `crates/synapse-mcp/src/server/tool_profiles.rs` lists them (`PUBLIC_TOOL_LIMIT = 40`); `FACADE_TOOL_CONTRACTS` in the same file lists each facade's operations. 35 facades take an `operation` enum; five (`health`, `subscribe`, `observe`, `find`, `read_text`) are single-purpose and take none. Scoped HTTP profiles hide the raw implementation tools. Four debug-only routes (`DEBUG_ONLY_TOOL_ROUTES` in `server.rs`) are removed from the router unless `SYNAPSE_DEBUG_TOOLS` is `1`/`true`.
+
+| Domain | Facade tools |
 |---|---|
-| Perception / M1 | `observe`, `observe_delta`, `read_text`, `find`, `capture_screenshot`, `set_target`, `set_perception_mode` |
-| Action / M2 | `target_act` (verb router for click/type/scroll/press/drag), set-field/value |
-| Action / M4 | `act_run_shell` (+ start/status/cancel), `act_launch`, `act_spawn_agent` |
-| Reflex / M3 + audio | reflex install/list/stop, `read_text`, audio capture/STT |
-| Profiles / registry / authoring | `profile_list`, registry & quality tools |
-| Hygiene / local models | `hygiene_scan_text`/`scan_storage`/`flags`, `local_model_*` |
-| Storage | `storage_inspect`, debug probe tools (gated) |
-| Approvals / escalation | `approval_request`/`decide`/`gate`/`list`, `escalation_*` |
-| Agents & orchestration | `agent_spawn`/`kill`/`pause`/`resume`/`steer`/`send`/`wait`, cost/stats/query/templates/tasks/sessions/leases/claims, `fleet_stop` |
-| Browser / CDP | `browser_*` (navigate, evaluate, snapshot, network, emulation, dialog, drag/drop, storage, frames, …) |
-| Intent / plans / routines | `intent_*`, `plan_*`, `armed_routine_*`, `suggestion_*` |
-| Reality / timeline | `reality_audit`/`baseline`, `timeline_get`/`search`/`digest`/`stats` |
-| Workspace blackboard | `workspace_get`/`put`/`list`/`subscribe` |
+| Daemon / session | `health`, `profile`, `session`, `subscribe`, `telemetry`, `setup` |
+| Perception | `observe`, `find`, `read_text`, `screenshot`, `target` |
+| Action / effectors | `act`, `shell`, `process` |
+| Browser | `browser_tabs`, `browser_nav`, `browser_dom`, `browser_form`, `browser_wait`, `browser_capture`, `browser_storage`, `browser_debugger` |
+| Agents & coordination | `workspace`, `agent`, `task`, `approval`, `escalation` |
+| Memory & learning | `timeline`, `episode`, `routine`, `assist`, `reality`, `verification` |
+| Operations | `storage`, `model`, `cost`, `hygiene`, `audit`, `replay`, `privacy` |
 
-Total registered tool macros: **238** `#[tool(` occurrences (the reference doc enumerates **206** distinct client-exposed tools after accounting for feature-gated/debug tools; the README badge value of 81 is stale). See [18_verification_report.md](18_verification_report.md).
+Behind the facades sit the older flat implementation tools (`act_run_shell`, `act_launch`, `act_spawn_agent`, `capture_screenshot`, `storage_put_probe_rows`, …); `PUBLIC_TOOL_IMPLEMENTATION_DENYLIST` names them. The full per-facade operation list is in [16_api_tools_reference.md](16_api_tools_reference.md) and [SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
+
+Total `#[tool(` attribute occurrences in `crates/`: **245** (`git grep '#\[tool('`, 2026-11-27). That count includes the 40 facades and every hidden implementation tool.
 
 ---
 
@@ -159,7 +158,7 @@ See [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) for the full co
 | **Profiles** (`synapse-profiles`) | Per-app/game profile matching | TOML profiles, `deny_unknown_fields`; foreground-window match ranked exe > title_regex > steam_appid > window_class, tie-break newest mtime; 200 ms debounced hot-reload, fail-open. | [11](11_profiles_subsystem.md) |
 | **Models** (`synapse-models`) | ONNX model registry/verify/session | 1 registered model (RT-DETRv2-S COCO); SHA-256 streaming verify (64 KiB chunks); EP order CUDA→DirectML→CPU; downloads disabled in M1 (manual side-load to `%LOCALAPPDATA%\synapse\models`). | [13](13_models_subsystem.md) |
 | **Core/Telemetry/Overlay** (`synapse-core`, `-telemetry`, `-overlay`) | Shared types, metrics, tray UI | ~120 error codes; 19 Prometheus metrics (12 counters/5 gauges/2 histograms); overlay = Win32 tray polling daemon every 2 s. | [14](14_core_telemetry_overlay.md) |
-| **MCP server** (`synapse-mcp`) | Daemon, transports, orchestration | stdio + HTTP/SSE (rmcp 1.7.0, axum); single-instance fs2 lock on port 7700; permission gate + target claims + approvals; `target_act` verb router; agent fleet lifecycle. | [15](15_mcp_server_architecture.md) |
+| **MCP server** (`synapse-mcp`) | Daemon, transports, orchestration | stdio + HTTP/SSE (rmcp 1.7.0, axum); single-instance fs2 lock on port 7700; permission gate + target claims + approvals; 40-tool facade surface (`act` facade verb router in `server/background_router/mod.rs`); agent fleet lifecycle. | [15](15_mcp_server_architecture.md) |
 
 ---
 
@@ -167,5 +166,5 @@ See [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) for the full co
 
 - **Non-Windows runtime.** Real capture, action, accessibility, and audio are Windows-only; non-Windows builds compile but the corresponding subsystems fail loud (`CAPTURE_GRAPHICS_API_UNSUPPORTED`, `A11Y_NOT_AVAILABLE`). See [05](05_capture_subsystem.md), [06](06_accessibility_and_cdp_subsystem.md).
 - **Automated model download.** Disabled in the current milestone; models must be side-loaded manually. See [13](13_models_subsystem.md).
-- **CI test execution.** No GitHub Actions/Makefile/justfile/nextest; the only automated gate is a `.githooks/pre-push` clippy run, and the shipping gate ("FSV" = manual Full State Verification) is performed by the agent on the configured Windows host and is never automated. See [17_test_suite.md](17_test_suite.md).
+- **Automated tests and CI.** The tree carries no automated tests and no GitHub Actions/Makefile/justfile/nextest. The only automated gate is `.githooks/pre-push`: "Gate 0" (rejects any test surface), then `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` when Rust/Cargo files changed. The shipping gate ("FSV" = manual Full State Verification) is performed by the agent on the configured Windows host and is never automated. See [17_test_suite.md](17_test_suite.md).
 - **Multi-language OCR confidence.** Per-word OCR confidence is hardcoded to 1.0. See [07](07_perception_subsystem.md).

@@ -143,10 +143,12 @@ and local process control.
 
 ## What you can do with it
 
-Synapse exposes **40 focused MCP tools** — a small, clean facade surface where every tool
-takes an explicit `operation`, and every mutating action names the source of truth it
-reads back from. (One tool, the raw browser debugger, is break-glass–gated behind an
-explicit profile switch.) Here's what those 40 tools unlock.
+Synapse exposes **40 focused MCP tools** — a small, clean facade surface where 35 tools
+take an explicit `operation`, five single-purpose tools (`health`, `subscribe`, `observe`,
+`find`, `read_text`) take none, and every mutating action names the source of truth it
+reads back from. (Most operations of one tool, the raw `browser_debugger`, are gated behind
+an explicit profile switch; only `evaluate`, `console_messages` and `network` on a tab the
+session owns work under every profile.) Here's what those 40 tools unlock.
 
 ### 👁️ It can see — structured perception
 
@@ -382,8 +384,10 @@ better profile distributed → more evidence.*
 
 <img src="docs/assets/local-private.png" alt="Everything runs locally and privately" align="left" width="42%">
 
-- Runs entirely on your machine over **stdio** or **loopback HTTP** (bearer-auth,
-  loopback-only by default).
+- Runs entirely on your machine over **stdio** or **loopback HTTP** (loopback-only by
+  default). On a loopback bind the daemon trusts the bind plus a `Host`/`Origin` guard and
+  does **not** check the bearer token; the token is enforced only on an explicit
+  non-loopback bind (`--allow-non-loopback`). See [SECURITY.md](SECURITY.md).
 - The **`privacy`** facade pauses/resumes capture, manages exclusions, and redacts or purges
   history on demand; **`hygiene`** scans stored text for anything sensitive.
 - Sensitive fields are **hash-redacted** before they're ever persisted — raw clipboard text,
@@ -477,6 +481,11 @@ Install Synapse for me and wire it into my AI tools.
 I'm on Windows. Use the real absolute Cargo bin path, don't invent one, and tell
 me anything that needs my approval (e.g. installing the Rust toolchain).
 ```
+
+On the default loopback bind (`127.0.0.1:7700`) the daemon does not check the bearer token,
+so the `Authorization` header and `SYNAPSE_BEARER_TOKEN` above are not enforced there. The
+token is checked only when the daemon runs on a non-loopback bind with
+`--allow-non-loopback`; the `--mode connect` bridge also sends it.
 
 You'll need a stable **Rust toolchain** (`rustup` / `cargo`). If `cargo` is missing, grab
 it from <https://rustup.rs> first, or let the agent install it.
@@ -667,49 +676,51 @@ reusable, human-approved automation.
 
 ## The full tool surface
 
-The default production surface is **facade-first**: 40 tools, each with a strict `operation`
-enum. Call `tools/list` on the running `synapse-mcp` server for the live registry. At a
-glance:
+The default production surface is **facade-first**: 40 tools. 35 of them take a strict
+`operation` enum; five single-purpose tools (`health`, `subscribe`, `observe`, `find`,
+`read_text`) have no `operation` parameter. Call `tools/list` on the running `synapse-mcp`
+server for the live registry. The operation lists below match `FACADE_TOOL_CONTRACTS` in
+`crates/synapse-mcp/src/server/tool_profiles.rs`:
 
-| Facade | Key operations |
+| Facade | Operations |
 |---|---|
-| `health` | daemon + subsystem status |
-| `profile` | `status` · `set` |
+| `health` | single-purpose, no `operation` (daemon + subsystem status) |
+| `profile` | `status` · `set` · `grant_reality_write` · `revoke_reality_write` |
 | `session` | `list` |
-| `subscribe` | `events` |
-| `observe` | `current` |
-| `find` | `elements` |
-| `read_text` | `text` |
-| `screenshot` | `capture` · `gif` · `record` · `clip_overview` · `clip_frames` · `clip_frame` · `clip_diff` |
+| `subscribe` | single-purpose, no `operation` (event stream) |
+| `observe` | single-purpose, no `operation` (current perception) |
+| `find` | single-purpose, no `operation` (element search) |
+| `read_text` | single-purpose, no `operation` (text read) |
+| `screenshot` | `capture` · `gif` · `record` · `record_status` · `record_stop` · `record_extend` · `clip_overview` · `clip_frames` · `clip_frame` · `clip_diff` |
 | `target` | `get` · `list` · `set` · `clear` · `claim` · `status` · `adopt` · `release` |
-| `act` | `invoke` · `foreground` |
+| `act` | `invoke` · `foreground` · `lease_acquire` · `lease_status` · `lease_release` |
 | `shell` | `run` · `start` · `status` · `cancel` |
 | `process` | `list` · `launch` · `history` |
-| `browser_tabs` | `list` · `select` · `new` · `close` |
+| `browser_tabs` | `list` · `select` · `activate` · `new` · `close` |
 | `browser_nav` | `navigate` · `reload` · `back` · `forward` |
 | `browser_dom` | `content` · `locate` · `inspect` · `aria_snapshot` |
 | `browser_form` | `set_value` · `fill` |
 | `browser_wait` | `for_condition` |
 | `browser_capture` | `screenshot` · `downloads` |
-| `browser_storage` | `read` · `write` |
-| `browser_debugger` 🔒 | raw CDP: `evaluate` · `console_messages` · `network` · `route` · … (break-glass) |
-| `workspace` | `get` · `put` · `list` · `subscribe` · `exists` · `delete` |
-| `agent` | `spawn` · `send` · `inbox` · `wait` · `broadcast` · `steer` · `pause` · `resume` · `kill` · templates |
+| `browser_storage` | `get` · `set` · `clear` · `save_state` · `load_state` |
+| `browser_debugger` 🔒 | raw CDP; `evaluate`, `console_messages`, `network` work under every profile on a session-owned tab, all others need profile `browser_debugger`, `break_glass` or `full_capability`: `evaluate` · `console_messages` · `reload_bridge` · `pdf` · `file_upload` · `dialog` · `add_init_script` · `add_script_tag` · `add_style_tag` · `network` · `network_har` · `network_overrides` · `route` · `emulate` · `expose_binding` · `drag` · `drop` |
+| `workspace` | `get` · `put` · `list` · `subscribe` · `exists` · `delete` · `wait` |
+| `agent` | `spawn` · `query` · `send` · `inbox` · `wait` · `broadcast` · `receipts` · `stats` · `template_put` · `template_get` · `template_list` · `template_delete` · `task_started` · `interrupt` · `kill` · `steer` · `pause` · `resume` · `respawn` |
 | `task` | `create` · `get` · `update` · `claim` · `cancel` · `list` · `next` · `reconcile` · `dispatch_once` |
 | `approval` | `request` · `list` · `decide` · `gate` · `ask_operator` |
 | `escalation` | `config_get` · `config_set` · `list` · `ack` |
 | `timeline` | `get` · `search` · `stats` |
 | `episode` | `list` · `get` |
-| `routine` | `mine` · `list` · `inspect` · `update` · `feedback` · `label` · `automate` |
-| `assist` | `intent` · `detect` · `suggestion_list` · `suggestion_accept` |
+| `routine` | `mine` · `list` · `inspect` · `update` · `feedback` · `label` · `automate` · `armed_tick` |
+| `assist` | `intent` · `detect` · `suggestion_tick` · `suggestion_list` · `suggestion_accept` |
 | `reality` | `baseline` · `delta` · `audit` |
 | `verification` | `inbox` · `poll` · `audit` · `bind` · `sources` |
 | `storage` | `inspect` · `summary` · `gc_once` |
 | `model` | `list` · `status` · `probe` · `register` · `update` · `remove` |
 | `cost` | `summarize` · `price_list` · `price_put` · `price_delete` |
 | `hygiene` | `scan_text` · `scan_storage` · `flags` · `report` |
-| `audit` | `command_query` · `lifecycle_events` · `profile_intelligence` · `export_bundle` |
-| `replay` | `record` · `demo_start` · `demo_stop` · `artifact_inspect` |
+| `audit` | `command_query` · `lifecycle_events` · `lifecycle_exits` · `profile_intelligence` · `export_bundle` |
+| `replay` | `record` · `demo_status` · `demo_start` · `demo_stop` · `artifact_inspect` |
 | `privacy` | `pause` · `resume` · `exclusions` · `redact` · `purge` |
 | `setup` | `status` · `doctor` · `repair` |
 | `telemetry` | `status` |

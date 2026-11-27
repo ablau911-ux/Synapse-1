@@ -1,6 +1,6 @@
 # Synapse 40-Tool Surface Migration
 
-Updated: 2026-06-30
+Updated: 2026-11-27 (operation lists re-synced with `FACADE_TOOL_CONTRACTS`, #288)
 
 Parent issue: #1374
 Task issue: #1394
@@ -29,11 +29,11 @@ Public facade with profile-gated operations:
 
 Normal agents use facade tools only. Old implementation names are not default public tools.
 
-Every facade call uses a strict `operation` enum. Unknown operations fail closed with structured errors. There is no alias fallback from an old tool name to a new facade operation.
+35 facades take a strict `operation` enum. Five single-purpose facades — `health`, `subscribe`, `observe`, `find`, `read_text` — have no `operation` parameter at all; their contract carries the `FLAT_FACADE_OPERATION_ENUM` sentinel. Unknown operations fail closed with structured errors. There is no alias fallback from an old tool name to a new facade operation.
 
 Mutating operations must name the physical readback source of truth: file path, RocksDB CF/key, process id, tab id, target id, event cursor, or profile row.
 
-Raw browser debugger capability is explicit: switch to `browser_debugger` before using raw CDP/chrome.debugger operations.
+Raw browser debugger capability is explicit: switch to `browser_debugger` (or hold `break_glass`/`full_capability`) before using raw CDP/chrome.debugger operations. Only `evaluate`, `console_messages` and `network` are admitted under every profile, because they act only on a tab the session owns or has bound (`browser_debugger_operation_admissible_on_owned_target` in `crates/synapse-mcp/src/server/browser_facades.rs`).
 
 Raw human OS foreground capability is explicit: acquire the needed foreground/control lease, switch to `break_glass`, give a non-empty reason, and read the post-action source of truth. Normal-agent routes must prefer target-scoped action through `act` and target/session state through `target`.
 
@@ -41,28 +41,31 @@ Removed status means removed from the normal public surface. It does not always 
 
 ## Facade Operation Index
 
+Source: `FACADE_TOOL_CONTRACTS` in `crates/synapse-mcp/src/server/tool_profiles.rs`. Nothing checks this table against the code automatically; update it by hand when the contracts change.
+
 | Facade | Operations |
 | --- | --- |
-| `profile` | `status`, `set` |
+| `health` | none (single-purpose, no `operation` parameter) |
+| `profile` | `status`, `set`, `grant_reality_write`, `revoke_reality_write` |
 | `session` | `list` |
-| `subscribe` | `events` |
-| `observe` | `current` |
-| `find` | `elements` |
-| `read_text` | `text` |
-| `screenshot` | `capture`, `gif`, `record`, `clip_overview`, `clip_frames`, `clip_frame`, `clip_diff` |
+| `subscribe` | none (single-purpose, no `operation` parameter) |
+| `observe` | none (single-purpose, no `operation` parameter) |
+| `find` | none (single-purpose, no `operation` parameter) |
+| `read_text` | none (single-purpose, no `operation` parameter) |
+| `screenshot` | `capture`, `gif`, `record`, `record_status`, `record_stop`, `record_extend`, `clip_overview`, `clip_frames`, `clip_frame`, `clip_diff` |
 | `target` | `get`, `list`, `set`, `clear`, `claim`, `status`, `adopt`, `release` |
 | `act` | `invoke`, `foreground`, `lease_acquire`, `lease_status`, `lease_release` |
 | `shell` | `run`, `start`, `status`, `cancel` |
 | `process` | `list`, `launch`, `history` |
-| `browser_tabs` | `list`, `select`, `new`, `close` |
+| `browser_tabs` | `list`, `select`, `activate`, `new`, `close` |
 | `browser_nav` | `navigate`, `reload`, `back`, `forward` |
 | `browser_dom` | `content`, `locate`, `inspect`, `aria_snapshot` |
 | `browser_form` | `set_value`, `fill` |
 | `browser_wait` | `for_condition` |
 | `browser_capture` | `screenshot`, `downloads` |
-| `browser_storage` | `read`, `write` |
-| `browser_debugger` | `evaluate`, `console_messages`, `pdf`, `file_upload`, `dialog`, `add_init_script`, `add_script_tag`, `add_style_tag`, `network`, `network_har`, `network_overrides`, `route`, `emulate`, `expose_binding`, `drag`, `drop` |
-| `workspace` | `get`, `put`, `list`, `subscribe`, `exists`, `delete` |
+| `browser_storage` | `get`, `set`, `clear`, `save_state`, `load_state` |
+| `browser_debugger` | `evaluate`, `console_messages`, `reload_bridge`, `pdf`, `file_upload`, `dialog`, `add_init_script`, `add_script_tag`, `add_style_tag`, `network`, `network_har`, `network_overrides`, `route`, `emulate`, `expose_binding`, `drag`, `drop` |
+| `workspace` | `get`, `put`, `list`, `subscribe`, `exists`, `delete`, `wait` |
 | `agent` | `spawn`, `query`, `send`, `inbox`, `wait`, `broadcast`, `receipts`, `stats`, `template_put`, `template_get`, `template_list`, `template_delete`, `task_started`, `interrupt`, `kill`, `steer`, `pause`, `resume`, `respawn` |
 | `task` | `create`, `get`, `update`, `claim`, `cancel`, `list`, `next`, `reconcile`, `dispatch_once` |
 | `approval` | `request`, `list`, `decide`, `gate`, `ask_operator` |
@@ -73,7 +76,7 @@ Removed status means removed from the normal public surface. It does not always 
 | `assist` | `intent`, `detect`, `suggestion_tick`, `suggestion_list`, `suggestion_accept` |
 | `reality` | `baseline`, `delta`, `audit` |
 | `verification` | `inbox`, `poll`, `audit`, `bind`, `sources` |
-| `storage` | `inspect`, `summary`, `put_probe_rows`, `gc_once` |
+| `storage` | `inspect`, `summary`, `gc_once` |
 | `model` | `list`, `status`, `probe`, `register`, `update`, `remove` |
 | `cost` | `summarize`, `price_list`, `price_put`, `price_delete` |
 | `hygiene` | `scan_text`, `scan_storage`, `flags`, `report` |
@@ -209,12 +212,12 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `session_list`, `session_status` | `session operation=list` | Condensed readback. |
 | `session_end` | Advanced maintenance/session lifecycle route | Removed from normal public surface. |
 | `profile_list`, `profile_authoring_generate`, `profile_authoring_inspect`, `profile_authoring_list` | Advanced profile-maintenance route | Removed from normal public surface. |
-| `subscribe` | `subscribe operation=events` | Kept as public facade. |
+| `subscribe` | `subscribe` (no `operation` parameter) | Kept as public facade. |
 | `subscribe_cancel` | Client/session subscription lifecycle | Removed from normal public surface. |
-| `observe` | `observe operation=current` | Kept as public facade. |
+| `observe` | `observe` (no `operation` parameter) | Kept as public facade. |
 | `observe_delta` | `reality operation=delta` | Condensed into reality facade. |
-| `find` | `find operation=elements` | Kept as public facade. |
-| `read_text` | `read_text operation=text` | Kept as public facade. |
+| `find` | `find` (no `operation` parameter) | Kept as public facade. |
+| `read_text` | `read_text` (no `operation` parameter) | Kept as public facade. |
 | `capture_screenshot` | `screenshot operation=capture` | Condensed. |
 | `capture_gif` | `screenshot operation=gif` | Condensed. |
 | `window_list`, `get_target`, `set_target`, `clear_target` | `target operation=list/get/set/clear` | Condensed. |
@@ -222,15 +225,16 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `target_claim`, `target_claim_status`, `target_claim_adopt`, `target_release` | `target operation=claim/status/adopt/release` | Condensed. |
 | `target_act` | `act operation=invoke` | Condensed through action facade. |
 | `act_foreground` | `act operation=foreground` | Condensed; explicit reason required; the whole keyed authority transaction remains supervised through exact profile/lease cleanup and final audit after caller cancellation, and the dedicated physical operator-panic epoch supersedes stored agent lease snapshots. |
-| `control_lease_acquire`, `control_lease_handoff`, `control_lease_release`, `control_lease_status` | `act operation=foreground`, `target operation=claim/status/release`, or explicit `break_glass` profile | Removed from normal public surface as standalone lease tools. |
+| `control_lease_acquire`, `control_lease_release`, `control_lease_status` | `act operation=lease_acquire/lease_release/lease_status` (foreground input lease), or `act operation=foreground` for one audited foreground action | Condensed into the action facade; no longer standalone tools. |
+| `control_lease_handoff` | `target operation=claim/status/release`, or explicit `break_glass` profile | Removed from normal public surface. |
 | `act_run_shell`, `act_run_shell_start`, `act_run_shell_status`, `act_run_shell_cancel` | `shell operation=run/start/status/cancel` | Condensed. |
 | `act_launch` | `process operation=launch` | Condensed. |
 | `act_spawn_agent` | `agent operation=spawn` | Condensed. |
 | `browser_tabs`, `browser_adopt_active_tab`, `cdp_open_tab`, `cdp_close_tab` | `browser_tabs operation=list/select/new/close` | Condensed. |
 | `cdp_navigate_tab` | `browser_nav operation=navigate/reload/back/forward` | Condensed. |
-| `cdp_activate_tab` | `browser_tabs operation=select`; explicit foreground activation requires advanced routing | Removed as direct normal public route. |
+| `cdp_activate_tab` | `browser_tabs operation=activate` (Chrome bridge `tabs.update(active=true)` + `tabs.query` readback) | Condensed. |
 | `cdp_target_info` | `browser_tabs operation=list` and `target operation=status` | Condensed. |
-| `cdp_bridge_reload` | `setup operation=doctor/repair` or advanced browser maintenance profile | Removed from normal public surface. |
+| `cdp_bridge_reload` | Switch to `browser_debugger`, then `browser_debugger operation=reload_bridge` | Profile-gated advanced route. |
 | `browser_content`, `browser_locate`, `browser_inspect`, `browser_aria_snapshot` | `browser_dom operation=content/locate/inspect/aria_snapshot` | Condensed. |
 | `browser_frames`, `browser_scroll_into_view`, `browser_set_content` | `browser_dom`, `browser_wait`, or advanced browser-control profile route | Removed from normal public surface as direct implementation seams. |
 | `browser_wait_for`, `browser_assert` | `browser_wait operation=for_condition` | Condensed. |
@@ -239,7 +243,7 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `browser_set_value`, `browser_fill_form` | `browser_form operation=set_value/fill` | Condensed. |
 | `browser_screenshot` | `browser_capture operation=screenshot` | Condensed. |
 | `browser_downloads` | `browser_capture operation=downloads` | Condensed. |
-| `browser_storage`, `browser_cookies` | `browser_storage operation=read/write` | Condensed. |
+| `browser_storage`, `browser_cookies` | `browser_storage operation=get/set/clear/save_state/load_state` | Condensed. |
 | `browser_file_upload` | Switch to `browser_debugger`, then `browser_debugger operation=file_upload` | Profile-gated advanced route. |
 | `workspace_get`, `workspace_put`, `workspace_list`, `workspace_subscribe` | `workspace operation=get/put/list/subscribe`; new `exists/delete` also live | Condensed. |
 | `agent_query`, `agent_inbox`, `agent_wait`, `agent_send`, `agent_send_broadcast`, `agent_receipts`, `agent_stats` | `agent operation=query/inbox/wait/send/broadcast/receipts/stats` | Condensed. |
@@ -264,7 +268,8 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `reality_baseline`, `reality_audit` | `reality operation=baseline/audit` | Condensed. |
 | `verification_inbox`, `verification_poll`, `verification_audit`, `verification_bind`, `verification_sources` | `verification operation=inbox/poll/audit/bind/sources` | Condensed. |
 | `storage_inspect` | `storage operation=inspect` | Condensed. |
-| `storage_gc_once`, `storage_put_probe_rows` | `storage operation=gc_once/put_probe_rows` only under maintenance/debug policy | Removed from normal public surface as mutating maintenance/debug routes. |
+| `storage_gc_once` | `storage operation=gc_once` | Condensed; mutating maintenance route. |
+| `storage_put_probe_rows` | No facade operation; hidden implementation tool only | Removed from the public surface. |
 | `local_model_list`, `local_model_probe` | `model operation=list/probe` and `model operation=status` | Condensed. |
 | `local_model_register`, `local_model_update`, `local_model_remove` | `model operation=register/update/remove` under explicit maintenance policy | Removed from normal public surface as registry mutators. |
 | `hygiene_flags`, `hygiene_report`, `hygiene_scan_storage`, `hygiene_scan_text` | `hygiene operation=flags/report/scan_storage/scan_text` | Condensed. |

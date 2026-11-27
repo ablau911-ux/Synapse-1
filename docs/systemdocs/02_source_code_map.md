@@ -1,6 +1,6 @@
 # 02. Source Code Map
 
-**Source files covered:** entire workspace tree across 14 crates plus top-level non-Rust components; key `lib.rs`/`main.rs`/`server.rs` and module-root files of each crate read in detail; one-line descriptions for remaining files derived from module names, doc-comments, and key declarations.
+**Source files covered:** entire workspace tree across 13 crates plus top-level non-Rust components; key `lib.rs`/`main.rs`/`server.rs` and module-root files of each crate read in detail; one-line descriptions for remaining files derived from module names, doc-comments, and key declarations.
 
 See [01_system_overview.md](01_system_overview.md) for the architectural narrative this map indexes.
 
@@ -8,9 +8,9 @@ See [01_system_overview.md](01_system_overview.md) for the architectural narrati
 
 ## 1. Workspace Layout
 
-Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, `license-file = "LICENSE.md"`.
+Root: `Cargo.toml` (repository root) — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, `license-file = "LICENSE.md"`. The toolchain is pinned to `1.96.1` in `rust-toolchain.toml`.
 
-**`[workspace] members`** (14 crates):
+**`[workspace] members`** (13 crates):
 `synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-overlay`.
 
 **`default-members`:** `synapse-mcp`, `synapse-overlay` (the two shipped binaries).
@@ -29,8 +29,9 @@ Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `ru
 | ML / audio | `ort` 2.0-rc (ONNX Runtime), `wasapi` |
 | Telemetry | `tracing`, `tracing-subscriber`, `tracing-appender`, `metrics`, `metrics-exporter-prometheus`, `opentelemetry`, `opentelemetry-otlp` |
 | Crypto | `ed25519-dalek`, `sha2`, `subtle` |
-| CLI / util | `clap`, `chrono`, `uuid`, `regex`, `sysinfo`, `notify`, `image` |
-| Test/bench | `proptest`, `criterion`, `insta`, `tempfile`, `mockall` |
+| CLI / util | `clap`, `chrono`, `uuid`, `regex`, `sysinfo`, `notify`, `image`, `tempfile` |
+
+There are no test or bench dependencies (no `[dev-dependencies]`); the repository carries no automated tests.
 
 **Lints:** `unsafe_code = "forbid"` workspace-wide; clippy `all = "deny"`, `pedantic`/`nursery` warn, `unwrap_used`/`expect_used` deny. (Crates needing FFI opt in with `#![allow(unsafe_code)]`: `synapse-a11y`, `synapse-capture`, `synapse-action`, `synapse-overlay`.)
 
@@ -89,10 +90,9 @@ crates/synapse-storage/src/routines.rs       # routine CF read/write helpers
 crates/synapse-storage/src/agent_events.rs   # agent-event CF read/write helpers
 crates/synapse-storage/src/agent_transcripts.rs # agent-transcript CF read/write helpers
 crates/synapse-storage/src/error.rs          # StorageError / StorageResult
-crates/synapse-storage/src/{batch,compaction,gc,open,pressure}_tests.rs # in-crate unit tests
 crates/synapse-storage/build.rs              # build script (rocksdb link config)
 ```
-`examples/dump_cf.rs` dumps a column family; `benches/batch_throughput.rs` write-throughput bench.
+`examples/dump_cf.rs` dumps a column family.
 
 ### crates/synapse-a11y
 Windows UI Automation + Chrome DevTools Protocol (CDP) accessibility. `#![allow(unsafe_code)]`. Depends on `synapse-core`.
@@ -126,7 +126,7 @@ crates/synapse-a11y/src/platform/windows/resolve.rs  # element resolution from p
 crates/synapse-a11y/src/platform/windows/snapshot.rs # UIA subtree walk -> snapshot
 crates/synapse-a11y/src/platform/windows/window.rs   # HWND enumeration / foreground
 ```
-`examples/cdp_*_probe.rs` (7) manual CDP probes; `benches/uia_snapshot_depth2_60elem.rs`; `tests/uwp_snapshot_regression.rs`.
+`examples/cdp_*_probe.rs` (6) manual CDP probes plus `examples/focus_probe.rs`.
 
 ### crates/synapse-capture
 Screen/window capture (Windows Graphics Capture + DXGI fallback), DPI, coordinate mapping. `#![allow(unsafe_code)]`. Depends on `synapse-core`, `synapse-telemetry`.
@@ -151,7 +151,6 @@ crates/synapse-capture/src/platform/windows/coords.rs   # window-to-screen coord
 crates/synapse-capture/src/platform/windows/dpi.rs      # per-monitor DPI
 crates/synapse-capture/src/platform/windows/target.rs   # HWND/monitor capture target
 ```
-`benches/capture_loop.rs`.
 
 ### crates/synapse-perception
 Assembles observations from capture + a11y + OCR + object detection + HUD/template reads. Depends on `synapse-a11y`, `synapse-capture`, `synapse-core`.
@@ -167,7 +166,7 @@ crates/synapse-perception/src/hud/mod.rs         # HUD parsing module root
 crates/synapse-perception/src/hud/anchor.rs      # HUD anchor-region resolution
 crates/synapse-perception/src/hud/extractor.rs   # HUD field extraction from regions
 ```
-Tests + benches cover hud_anchor, hud_extractor, template_match, event_extensions, perception/CDP regression.
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-audio
 WASAPI loopback capture, ring buffer, direction estimation, Whisper STT (ONNX). Depends on `synapse-core`, `synapse-models`.
@@ -236,7 +235,7 @@ crates/synapse-action/src/rate_limit.rs     # TokenBucket primitive
 crates/synapse-action/src/validation.rs     # validate_action (drag distance, bounds)
 crates/synapse-action/src/error.rs          # ActionError / ActionResult
 ```
-Extensive `tests/*.rs` (curve, dynamics, path, stroke, velocity, lease/handle, safety, vigem) + 5 benches.
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-reflex
 Low-latency reactive automations (combos, hold, aim-track, path-follow) driven by an event bus + scheduler. Depends on `synapse-action`, `synapse-core`, `synapse-storage`.
@@ -271,7 +270,7 @@ crates/synapse-reflex/src/kinds/on_event.rs     # on-event firing (debounce, rec
 crates/synapse-reflex/src/kinds/path_follow.rs  # path-follow controller
 crates/synapse-reflex/src/error.rs          # reflex errors
 ```
-6 behavior `tests/*.rs` + 4 benches (tick jitter, combo interval, event-to-subscriber).
+Automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md).
 
 ### crates/synapse-profiles
 Per-application profile parsing (TOML), matching/resolution, hot-reload watcher, signed profile packages. Depends on `synapse-core`.
@@ -321,7 +320,7 @@ crates/synapse-overlay/src/main.rs   # Win32 system-tray icon + popup menu (daem
 ```
 
 ### crates/synapse-mcp
-The daemon: MCP server binding all subsystems, organized M1 (perception) → M2 (action) → M3 (background/agents) → M4 (orchestration/shell). Depends on the runtime crates except `test-utils`/`overlay`. ~202 source files.
+The daemon: MCP server binding all subsystems, organized M1 (perception) → M2 (action) → M3 (background/agents) → M4 (orchestration/shell). Depends on every other workspace crate except `synapse-overlay`. 214 `.rs` files under `src/` (2026-11-27).
 
 **Crate root / lifecycle / transports:**
 ```
@@ -348,7 +347,7 @@ crates/synapse-mcp/src/bin/synapse-chrome-native-host.rs # standalone Chrome nat
 **`src/http/` (HTTP transport + SSE):**
 ```
 crates/synapse-mcp/src/http/mod.rs        # axum HTTP serve(), /mcp + /dashboard routes
-crates/synapse-mcp/src/http/auth.rs        # bearer-token auth, loopback gate
+crates/synapse-mcp/src/http/auth.rs        # Host/Origin guard; bearer token checked only on non-loopback binds
 crates/synapse-mcp/src/http/session.rs     # per-connection MCP session
 crates/synapse-mcp/src/http/transport.rs   # streamable-HTTP transport glue
 crates/synapse-mcp/src/http/sse.rs         # SSE module root + SseState
@@ -442,19 +441,22 @@ crates/synapse-mcp/src/m3/storage.rs        # storage inspect tool
 crates/synapse-mcp/src/m3/config.rs (in m3.rs) # M3ServiceConfig (from CLI/env)
 ```
 
-**`src/m4.rs` + `src/server/` — orchestration, multi-agent, and browser tools:**
+**`src/m4/` + `src/server/` — orchestration, multi-agent, and browser tools:**
 ```
-crates/synapse-mcp/src/m4.rs               # M4 service: act_run_shell / act_launch allow-list config
-crates/synapse-mcp/src/server.rs           # (see lifecycle) ServerHandler + tool_router aggregation
+crates/synapse-mcp/src/m4/mod.rs           # M4 service: act_run_shell / act_launch allow-list config
+crates/synapse-mcp/src/server.rs           # (see lifecycle) ServerHandler + tool_router() aggregation + DEBUG_ONLY_TOOL_ROUTES
 crates/synapse-mcp/src/server/handler.rs    # ServerHandler impl / tool dispatch
 crates/synapse-mcp/src/server/context.rs    # shared server context/state
-crates/synapse-mcp/src/server/m1_tools.rs   # M1 perception tool registrations
-crates/synapse-mcp/src/server/m2_tools.rs   # M2 action tool registrations
-crates/synapse-mcp/src/server/m3_tools.rs   # M3 background tool registrations
-crates/synapse-mcp/src/server/m4_tools.rs   # M4 shell/launch/agent tool registrations
-crates/synapse-mcp/src/server/health.rs     # health tool
+crates/synapse-mcp/src/server/m1_tools/mod.rs # M1 perception tools + facades health/observe/find/read_text/screenshot/target/browser_tabs/browser_nav/browser_wait
+crates/synapse-mcp/src/server/m2_tools/mod.rs # M2 action tool registrations
+crates/synapse-mcp/src/server/m3_tools.rs   # M3 background tool registrations + subscribe facade
+crates/synapse-mcp/src/server/m4_tools/mod.rs # M4 shell/launch tools + shell/process facades
+crates/synapse-mcp/src/server/m4_tools/agent_spawn.rs # act_spawn_agent implementation
+crates/synapse-mcp/src/server/m4_tools/facade.rs # shell/process facade helpers
+crates/synapse-mcp/src/server/m4_tools/types.rs  # M4 tool param/response types
+crates/synapse-mcp/src/server/health.rs     # health payload
 crates/synapse-mcp/src/server/drain.rs      # graceful drain on shutdown
-crates/synapse-mcp/src/server/background_router.rs # background task routing
+crates/synapse-mcp/src/server/background_router/mod.rs # act facade verb router (background/foreground delivery)
 crates/synapse-mcp/src/server/schema_sanitize.rs   # JSON-schema sanitization for tool params
 crates/synapse-mcp/src/server/session_lifecycle.rs # MCP session lifecycle
 crates/synapse-mcp/src/server/session_registry.rs  # per-session registry
@@ -480,7 +482,7 @@ crates/synapse-mcp/src/server/suggestions.rs        # suggestion tool impls
 crates/synapse-mcp/src/server/routine_feedback.rs   # routine feedback
 crates/synapse-mcp/src/server/routine_labeling.rs   # routine labeling
 crates/synapse-mcp/src/server/notify_tools.rs       # notify-human toast tools
-crates/synapse-mcp/src/server/tool_profiles.rs      # tool-profile (enabled-tool set) management
+crates/synapse-mcp/src/server/tool_profiles.rs      # tool profiles, PUBLIC_TOOL_NAMES (40), FACADE_TOOL_CONTRACTS, profile facade
 crates/synapse-mcp/src/server/escalation/mod.rs     # escalation list/ack
 crates/synapse-mcp/src/server/workspace_blackboard.rs # workspace blackboard (shared KV for agents)
 crates/synapse-mcp/src/server/codex_app_server_bridge.rs # Codex app-server bridge
@@ -516,9 +518,35 @@ crates/synapse-mcp/src/server/browser_emulate.rs      # unified emulation tool s
 crates/synapse-mcp/src/server/browser_field.rs        # form-field fill/set
 crates/synapse-mcp/src/server/browser_frames.rs       # frame enumeration
 crates/synapse-mcp/src/server/browser_network.rs      # network requests/HAR/websockets/overrides
-crates/synapse-mcp/src/server/browser_storage.rs      # cookies/storage tool
+crates/synapse-mcp/src/server/browser_storage.rs      # cookies/storage tool + browser_storage facade
+crates/synapse-mcp/src/server/browser_storage/load_state_validation.rs # load_state input validation
 ```
 M4 cdp tools (`cdp_open_tab`, etc.) live in m1/server modules above.
+
+**`src/server/` — the 40 public facade tools.** Each facade is a `#[tool]` fn on `SynapseService`; its operations are listed in `FACADE_TOOL_CONTRACTS` (`tool_profiles.rs`). Where each facade is defined:
+```
+crates/synapse-mcp/src/server/m1_tools/mod.rs        # health, observe, find, read_text, screenshot, target, browser_tabs, browser_nav, browser_wait
+crates/synapse-mcp/src/server/tool_profiles.rs       # profile
+crates/synapse-mcp/src/server/session_tools.rs       # session
+crates/synapse-mcp/src/server/m3_tools.rs            # subscribe
+crates/synapse-mcp/src/server/background_router/mod.rs # act
+crates/synapse-mcp/src/server/m4_tools/mod.rs        # shell, process
+crates/synapse-mcp/src/server/browser_assert.rs      # browser_dom
+crates/synapse-mcp/src/server/browser_field.rs       # browser_form
+crates/synapse-mcp/src/server/browser_facades.rs     # browser_capture, browser_debugger
+crates/synapse-mcp/src/server/browser_storage.rs     # browser_storage
+crates/synapse-mcp/src/server/workspace_blackboard.rs # workspace
+crates/synapse-mcp/src/server/agent_facades.rs       # agent, task
+crates/synapse-mcp/src/server/approval_facades.rs    # approval, escalation
+crates/synapse-mcp/src/server/timeline_facades.rs    # timeline, episode, privacy
+crates/synapse-mcp/src/server/routine_assist_facades/routing.rs # routine, assist, reality, verification
+crates/synapse-mcp/src/server/operational_facades/routing.rs    # storage, model, hygiene, setup, telemetry
+crates/synapse-mcp/src/server/agent_cost.rs          # cost
+crates/synapse-mcp/src/server/audit_replay_facades/routing.rs   # audit, replay
+```
+Supporting files of the facade module directories: `audit_replay_facades.rs` + `audit_replay_facades/{artifact,command_query,errors,lifecycle,response,types,util,validation}.rs`; `operational_facades.rs` + `operational_facades/{errors,hygiene,model,policy,response,setup,storage,telemetry,types,validation}.rs`; `routine_assist_facades/{mod,assist,common,reality,routine,verification}.rs`.
+
+Other `src/server/` files not described above: `browser_batch.rs`, `browser_files.rs`, `capture_clip.rs`, `capture_gif.rs`, `clip_decoder.rs`, `clip_encoder.rs`, `clip_folder.rs`, `clip_recovery.rs`, `clip_stream.rs`, `clip_viewer.rs`, `delegate_errors.rs`, `operator_panic_boundary.rs`, `param_hints.rs`, `url_redaction.rs`, `verification.rs`, and the PowerShell helpers `codex_app_server_{runner,interrupt,steer}.ps1`.
 
 Examples: `examples/dump_action_log.rs`, `dump_agent_events.rs`, `dump_agent_transcripts.rs`. Automated integration tests were removed by policy; manual FSV is the behavioral gate.
 
@@ -617,8 +645,8 @@ manual_mcp_stdio_probe.py            # manual MCP-over-stdio probe (launches syn
 swarm.py                             # run a local-model agent swarm against a live daemon (operational probe)
 ```
 
-### `tests/` (workspace-level)
-Only `tests/fixtures/` (e.g. `fixtures/audio/`) — shared test fixture assets consumed by crate integration tests. No workspace-level `.rs` integration suites; integration tests live per-crate under `crates/*/tests/`.
+### No test directories
+There is no workspace-level `tests/` directory and no `crates/*/tests/` or `crates/*/benches/` directory. The `.githooks/pre-push` "Gate 0" rejects any push that adds them.
 
 ---
 

@@ -43,10 +43,32 @@ allowlists or safety gates, privilege escalation, authentication bypass on the
 HTTP transport, leaking secrets/credentials into logs or stored rows, or remote
 code execution beyond the operator's configured surface.
 
+### HTTP authentication model
+
+- The HTTP daemon binds `127.0.0.1:7700` by default and refuses a non-loopback
+  bind unless the operator passes `--allow-non-loopback`
+  (`SYNAPSE_ALLOW_NON_LOOPBACK`).
+- **A loopback bind does not check the bearer token.** On a loopback bind the
+  daemon relies on the bind itself plus a `Host`/`Origin` guard (only
+  `127.0.0.1`, `localhost` and `::1` are accepted). Any local process that can
+  reach the loopback port can call every tool, with or without an
+  `Authorization` header. Setting `SYNAPSE_BEARER_TOKEN` does not change this.
+- **A non-loopback bind requires the bearer token** on every MCP request. It
+  also requires an `Origin` header, and the same `Host`/`Origin` allowlist
+  still applies.
+- The daemon still loads a token at startup: `%APPDATA%\synapse\token.txt` if
+  that file exists, otherwise `SYNAPSE_BEARER_TOKEN`. It is used for
+  non-loopback binds, by the `--mode connect` bridge, and to derive the Chrome
+  extension bridge registration token.
+
 ### Hardening recommendations
 
-- Run the HTTP transport bound to loopback (`127.0.0.1`) only, and set
-  `SYNAPSE_BEARER_TOKEN` to a strong value.
+- Keep the HTTP transport on loopback. Treat every local process running as
+  your user as able to drive Synapse; there is no per-client authentication on
+  loopback.
+- Use a non-loopback bind only on a trusted network, and only with a strong
+  token in `%APPDATA%\synapse\token.txt` or `SYNAPSE_BEARER_TOKEN`.
 - Run under a least-privilege user account dedicated to automation.
-- Keep allowlists for `act_run_shell` / `act_launch` as narrow as possible.
+- Keep the shell and launch policies (the `shell` and `process operation=launch`
+  facades, internally `act_run_shell` / `act_launch`) as narrow as possible.
 - Do not expose the server to untrusted networks.

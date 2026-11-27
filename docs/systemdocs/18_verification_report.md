@@ -7,7 +7,7 @@
 - `.githooks/pre-push`, `README.md`
 - Reconciled against companion documents 02, 04, 16, 17
 
-> This document is a measured snapshot. Counts were produced by scanning the source tree on the documentation date (workspace version `0.1.0`). They are reproducible with the commands listed in §6.
+> This document is a measured snapshot. Codebase counts in §1–§2 were re-measured on 2026-11-27 (#288) from tracked files (`git ls-files` / `git grep`, workspace version `0.1.0`). They are reproducible with the commands listed in §6.
 
 ---
 
@@ -15,49 +15,46 @@
 
 | Metric | Value | How measured |
 |---|---|---|
-| Workspace crates | 14 | `Cargo.toml` `[workspace].members` |
-| Rust source files (`crates/**/*.rs`) | 586 | `find crates -name '*.rs' | wc -l` |
-| Lines of Rust (approx, `crates/**/*.rs`) | ~47,805 | `wc -l` total |
-| MCP tool macros (`#[tool(` occurrences) | 238 | grep over `crates/synapse-mcp/src` |
-| Distinct client-exposed MCP tools | 206 | enumerated in [16_api_tools_reference.md](16_api_tools_reference.md) (after gating/dedup) |
-| RocksDB column families (named) | 17 (+ implicit `default`) | [04_storage_and_persistence.md](04_storage_and_persistence.md) |
+| Workspace crates | 13 | `Cargo.toml` `[workspace].members` |
+| Rust source files (`crates/**/*.rs`) | 429 | `git ls-files 'crates/*.rs' \| wc -l` |
+| Lines of Rust (`crates/**/*.rs`) | 339,050 | `git ls-files -z 'crates/*.rs' \| xargs -0 cat \| wc -l` |
+| MCP tool attributes (`#[tool(` occurrences) | 245 | `git grep '#\[tool('` over `crates/` (all in `synapse-mcp`) |
+| Default public MCP tools | 40 facades | `PUBLIC_TOOL_NAMES` in `crates/synapse-mcp/src/server/tool_profiles.rs`; see [16_api_tools_reference.md](16_api_tools_reference.md) §16.0 |
+| Debug-only MCP routes | 4 | `DEBUG_ONLY_TOOL_ROUTES` in `crates/synapse-mcp/src/server.rs` |
+| RocksDB column families (named) | 17 (+ implicit `default`) | [04_storage_and_persistence.md](04_storage_and_persistence.md) (not re-checked 2026-11-27) |
 | Storage `SCHEMA_VERSION` | 1 | `crates/synapse-core/src/defaults.rs` |
-| Error codes (catalog) | ~120 across 9 groups | `crates/synapse-core/src/error_codes.rs` |
-| Telemetry metrics | 19 (12 counter / 5 gauge / 2 histogram) | [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) |
-| Test functions (`#[test]`) | 1,922 | grep over `crates` |
-| Async test functions (`#[tokio::test]`) | 241 | grep over `crates` |
-| Total test functions | 2,163 | sum of the above |
-| Test files (`tests/*.rs` + `tests.rs`) | 160 | `find` over `crates` |
+| Error codes (catalog) | ~120 across 9 groups | `crates/synapse-core/src/error_codes.rs` (not re-checked 2026-11-27) |
+| Telemetry metrics | 19 (12 counter / 5 gauge / 2 histogram) | [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) (not re-checked 2026-11-27) |
+| Automated tests | 0 | `git grep -E '#\[(tokio::)?test'` over `crates/` finds none; no `tests/` or `benches/` directories |
 | Binaries / entry points | 3 | `synapse-mcp`, `synapse-overlay`, `synapse-chrome-native-host` |
 
 ### 1.1 Source files per crate
 
 | Crate | `.rs` files |
 |---|---|
-| synapse-mcp | 252 |
-| synapse-action | 86 |
-| synapse-core | 51 |
-| synapse-reflex | 39 |
-| synapse-a11y | 37 |
-| synapse-storage | 30 |
-| synapse-capture | 21 |
-| synapse-perception | 19 |
-| synapse-profiles | 13 |
-| synapse-audio | 12 |
-| synapse-models | 8 |
-| synapse-telemetry | 5 |
-| synapse-test-utils | 3 |
+| synapse-mcp | 217 (214 under `src/`, 3 under `examples/`) |
+| synapse-action | 49 |
+| synapse-a11y | 37 (incl. 7 under `examples/`) |
+| synapse-reflex | 28 |
+| synapse-core | 26 |
+| synapse-capture | 20 |
+| synapse-storage | 15 (incl. 1 under `examples/`) |
+| synapse-profiles | 10 |
+| synapse-perception | 9 |
+| synapse-audio | 8 |
+| synapse-models | 7 |
+| synapse-telemetry | 2 |
 | synapse-overlay | 1 |
 
 ---
 
-## 2. Count reconciliations (discrepancies noted)
+## 2. Count reconciliations
 
 | Item | Raw signal | Documented figure | Explanation |
 |---|---|---|---|
-| MCP tools | 238 `#[tool(` macros | 206 distinct tools (doc 16) | Some tools are feature-gated (`storage_*` debug tools behind `SYNAPSE_DEBUG_TOOLS`); macro count also includes router plumbing. |
-| MCP tools (README) | 81 (badge) | 206 | The README badge is **stale**. |
-| Test functions | 2,163 (`#[test]`+`#[tokio::test]`) | "~1,590" estimate in an earlier draft of doc 17 | The grep-measured **2,163** is authoritative; doc 17's prose figure was a conservative estimate. |
+| MCP tools | 245 `#[tool(` attributes | 40 default public facades | The 40 facades are the default public surface; the other attributes are hidden implementation tools behind them, including the 4 debug-only routes. |
+| Workspace crates | 13 | earlier drafts said 14 | `synapse-test-utils` was removed with the test suite. |
+| Test functions | 0 | earlier drafts said 2,163 | All automated tests were removed by policy; see [17_test_suite.md](17_test_suite.md). |
 
 ---
 
@@ -65,8 +62,8 @@
 
 | Control | Status |
 |---|---|
-| Clippy | `clippy::unwrap_used` / `clippy::expect_used` **denied** workspace-wide in production code; allowed in tests via `clippy.toml` (`allow-unwrap-in-tests = true`, `allow-expect-in-tests = true`). |
-| Pre-push gate | `.githooks/pre-push` runs `cargo clippy --workspace --all-targets`. |
+| Clippy | `clippy::unwrap_used` / `clippy::expect_used` **denied** workspace-wide (`[workspace.lints.clippy]`). `clippy.toml` still sets `allow-unwrap-in-tests = true` / `allow-expect-in-tests = true`, but there is no test code. |
+| Pre-push gate | `.githooks/pre-push`: Gate 0 (rejects any test surface) on every push; `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` when Rust/Cargo files change. |
 | Dependency/license gate | `cargo-deny` (`deny.toml`): targets x86_64 linux-gnu + windows-msvc; allowed licenses MIT, Apache-2.0 (+LLVM-exception), BSD-2/3-Clause, MPL-2.0; advisories version 2. |
 | CI | None (no `.github/` workflows, Makefile, justfile, or nextest config). |
 | Lint status at snapshot | Not executed in this pass (`cargo clippy` not run here) — "Not determined from source". |
@@ -77,12 +74,10 @@
 
 | Item | Result |
 |---|---|
-| Test run executed in this pass | No — tests were not executed (building requires `libclang.dll` on PATH per project memory; Windows-gated tests require an interactive desktop). |
-| Pass/fail | Not determined from source. |
-| Run command | `cargo test --workspace` (Windows-only tests are `#[ignore]`d; run with `-- --ignored`). |
+| Automated tests | None exist; there is nothing to run. |
 | Shipping gate | Manual Full State Verification ("FSV") performed by the agent on the configured Windows host; surfaces in code only as `minimum_manual_fsv` manifest metadata. It is never automated. |
 
-See [17_test_suite.md](17_test_suite.md) for the test inventory and categories.
+See [17_test_suite.md](17_test_suite.md) for the gate and the FSV process.
 
 ---
 
@@ -113,13 +108,12 @@ See [17_test_suite.md](17_test_suite.md) for the test inventory and categories.
 ## 6. Reproducing these counts
 
 ```bash
-# from repo root C:\code\synapse (Git Bash)
-find crates -name '*.rs' | wc -l                              # source files (586)
-find crates -name '*.rs' | xargs wc -l | tail -1              # LOC (~47,805)
-grep -rE '#\[test\]' crates --include='*.rs' | wc -l          # 1922
-grep -rE '#\[tokio::test' crates --include='*.rs' | wc -l     # 241
-grep -rE '#\[tool\(' crates/synapse-mcp/src --include='*.rs' | wc -l   # 238
-find crates -path '*/tests/*.rs' -o -name 'tests.rs' | wc -l  # 160
+# from the repository root (Git Bash), tracked files only
+git ls-files 'crates/*.rs' | wc -l                                  # source files (429)
+git ls-files -z 'crates/*.rs' | xargs -0 cat | wc -l               # LOC (339,050)
+git ls-files 'crates/*.rs' | awk -F/ '{print $2}' | sort | uniq -c # files per crate
+git grep -h '#\[tool(' -- 'crates/*.rs' | wc -l                     # tool attributes (245)
+git grep -h -E '#\[(tokio::)?test' -- 'crates/*.rs' | wc -l          # automated tests (0)
 ```
 
 ---

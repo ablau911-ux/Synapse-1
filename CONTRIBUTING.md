@@ -33,7 +33,7 @@ contribute under these terms before doing so.
 
 For anything larger than a small fix, **open an issue first** to discuss the
 approach. This avoids wasted work on changes that don't fit the architecture or
-the roadmap (see the README "What's left on the docket" section).
+the roadmap.
 
 ## Development workflow
 
@@ -44,19 +44,26 @@ the roadmap (see the README "What's left on the docket" section).
    ```bash
    cargo build --workspace
    cargo fmt --all
-   cargo clippy --workspace --all-targets
-   cargo test --workspace
+   cargo clippy --workspace --all-targets -- -D warnings
    ```
+   The repository carries **no automated tests** by rule: there are no
+   `tests/` or `benches/` directories, no `#[test]`/`#[tokio::test]`/
+   `#[cfg(test)]` code, and no `[dev-dependencies]`. Do not add any; the
+   pre-push gate below rejects them.
 3. **Enable the local pre-push gate (once per clone):**
    ```bash
    git config core.hooksPath .githooks
    ```
    This repo uses no CI (GitHub Actions are forbidden), so `.githooks/pre-push`
-   is the automated backstop: it runs `cargo clippy --workspace --all-targets`
-   before any push that touches `.rs`/`Cargo.*` and blocks the push on failure
-   (it skips docs-only pushes). It is a fast compile+lint gate, not a substitute
-   for `cargo test --workspace` or manual verification. Bypass only for a genuine
-   non-compiling emergency with `git push --no-verify`.
+   is the automated backstop. On every push it runs "Gate 0", which blocks any
+   commit whose tree carries an automated test surface (test/bench paths, test
+   attributes, or `[dev-dependencies]`/`[[test]]`/`[[bench]]` manifest
+   sections). When the push touches `.rs`/`Cargo.*` files it also runs
+   `cargo fmt --all --check` and
+   `cargo clippy --workspace --all-targets -- -D warnings` and blocks the push on
+   failure (docs-only pushes skip those two). It is a compile+lint gate, not a
+   substitute for manual verification. Bypass only for a genuine non-compiling
+   emergency with `git push --no-verify`.
 4. **Iterate with fast builds.** Use `cargo check` (~15 s) or `cargo build`
    (dev, ~45 s incremental) for the edit loop. Run `cargo build --release` ONLY
    to ship/run the real `synapse-mcp.exe` daemon — never as compile feedback.
@@ -65,28 +72,23 @@ the roadmap (see the README "What's left on the docket" section).
    max-runtime binary) and the worktree/`target` disk-hygiene tooling
    (`scripts/repo-maintenance.ps1`) — don't leave throwaway worktrees with their
    own multi-GB `target/` lying around.
-4. Synapse is **Windows-native** for its real perception/action paths (Win32
+5. Synapse is **Windows-native** for its real perception/action paths (Win32
    `SendInput`, UI Automation, WGC/DXGI). Behavior that touches those
-   surfaces should be verified on Windows — the project uses manual Full State
-   Verification (FSV) on the configured Windows host as the shipping gate (see the
-   README "Agent Doctrine" section). Automated tests are supporting evidence, not a
-   substitute for verifying real behavior.
-5. Keep commits focused and write clear messages. Reference the issue number
+   surfaces must be verified on Windows — the project uses manual Full State
+   Verification (FSV) on the configured Windows host as the shipping gate: run
+   the change through the real Synapse daemon and read back the physical source
+   of truth.
+6. Keep commits focused and write clear messages. Reference the issue number
    where applicable.
 
 ## Pull requests
 
 - Keep PRs scoped to one logical change.
 - Include the reasoning and any verification you performed.
-- Make sure `cargo fmt --check` and the build pass locally before requesting
-  review.
+- Make sure `cargo fmt --all --check`, the clippy gate, and the build pass
+  locally before requesting review.
 - Sign off your commits (`git commit -s`) to assert the DCO and the contribution
   terms above.
-
-## Code of conduct
-
-This project follows the [Code of Conduct](CODE_OF_CONDUCT.md). By participating,
-you agree to uphold it.
 
 ## Reporting security issues
 

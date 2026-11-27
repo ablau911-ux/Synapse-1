@@ -1,15 +1,17 @@
 # 16. API / Tools Reference
 
-> Current production note, 2026-06-30: the default `normal_agent` MCP surface is now facade-first and capped under the 40-tool contract tracked by #1374. This older reference still documents implementation and advanced/profile-gated routes. For the old-to-new public migration table and deprecation policy, see [../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
+> Current production note (re-checked 2026-11-27, #288): the default `normal_agent` MCP surface is facade-first and capped at 40 tools (`PUBLIC_TOOL_LIMIT = 40`). §16.0 lists those 40 facades. §16.2–§16.17 document the hidden implementation tools and advanced/profile-gated routes behind them; those are not on the default public surface. For the old-to-new migration table and deprecation policy, see [../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](../SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
 
 **Source files covered:**
 
-- `crates/synapse-mcp/src/server.rs` (tool-router composition / registration)
-- `crates/synapse-mcp/src/server/m1_tools.rs` (perception + browser/CDP)
-- `crates/synapse-mcp/src/server/m2_tools.rs` (foreground/background action primitives)
+- `crates/synapse-mcp/src/server.rs` (tool-router composition / registration, `DEBUG_ONLY_TOOL_ROUTES`)
+- `crates/synapse-mcp/src/server/tool_profiles.rs` (`PUBLIC_TOOL_NAMES`, `FACADE_TOOL_CONTRACTS`, profiles)
+- `crates/synapse-mcp/src/server/m1_tools/mod.rs` (perception + browser/CDP)
+- `crates/synapse-mcp/src/server/m2_tools/mod.rs` (foreground/background action primitives)
 - `crates/synapse-mcp/src/server/m3_tools.rs` (reflex, profiles, timeline, hygiene, approvals, local models, storage)
-- `crates/synapse-mcp/src/server/m4_tools.rs` (combo, shell, launch, spawn)
-- `crates/synapse-mcp/src/server/background_router.rs` (`target_act`)
+- `crates/synapse-mcp/src/server/m4_tools/mod.rs` (combo, shell, launch, spawn); low-level param structs and defaults in `crates/synapse-mcp/src/m4/mod.rs`
+- `crates/synapse-mcp/src/server/background_router/mod.rs` (`target_act`, `act` facade)
+- Facade modules: `agent_facades.rs`, `approval_facades.rs`, `browser_facades.rs`, `timeline_facades.rs`, `audit_replay_facades/routing.rs`, `operational_facades/routing.rs`, `routine_assist_facades/routing.rs`
 - `crates/synapse-mcp/src/server/agent_control.rs`, `agent_cost.rs`, `agent_stats.rs`, `agent_query.rs`, `agent_mailbox.rs`, `agent_templates.rs`, `agent_tasks.rs`
 - `crates/synapse-mcp/src/server/session_tools.rs`, `lease_tools.rs`, `target_claims.rs`
 - `crates/synapse-mcp/src/server/browser_assert.rs`, `browser_clock_events.rs`, `browser_dialog.rs`, `browser_dnd.rs`, `browser_emulate.rs`, `browser_field.rs`, `browser_files.rs`, `browser_frames.rs`, `browser_network.rs`, `browser_storage.rs`
@@ -21,16 +23,64 @@
 
 ---
 
+## 16.0 Default public surface: the 40 facades
+
+Source of truth: `PUBLIC_TOOL_NAMES` and `FACADE_TOOL_CONTRACTS` in `crates/synapse-mcp/src/server/tool_profiles.rs`. 35 facades take an `operation` enum; five (`health`, `subscribe`, `observe`, `find`, `read_text`) take no `operation` parameter. Most `browser_debugger` operations need profile `browser_debugger`, `break_glass` or `full_capability`; only `evaluate`, `console_messages` and `network` are admitted under every profile (`browser_debugger_operation_admissible_on_owned_target`, `browser_facades.rs`).
+
+| Facade | Defined in (`crates/synapse-mcp/src/server/`) | Operations |
+|---|---|---|
+| `health` | `m1_tools/mod.rs` | none |
+| `profile` | `tool_profiles.rs` | `status`, `set`, `grant_reality_write`, `revoke_reality_write` |
+| `session` | `session_tools.rs` | `list` |
+| `subscribe` | `m3_tools.rs` | none |
+| `observe` | `m1_tools/mod.rs` | none |
+| `find` | `m1_tools/mod.rs` | none |
+| `read_text` | `m1_tools/mod.rs` | none |
+| `screenshot` | `m1_tools/mod.rs` | `capture`, `gif`, `record`, `record_status`, `record_stop`, `record_extend`, `clip_overview`, `clip_frames`, `clip_frame`, `clip_diff` |
+| `target` | `m1_tools/mod.rs` | `get`, `list`, `set`, `clear`, `claim`, `status`, `adopt`, `release` |
+| `act` | `background_router/mod.rs` | `invoke`, `foreground`, `lease_acquire`, `lease_status`, `lease_release` |
+| `shell` | `m4_tools/mod.rs` | `run`, `start`, `status`, `cancel` |
+| `process` | `m4_tools/mod.rs` | `list`, `launch`, `history` |
+| `browser_tabs` | `m1_tools/mod.rs` | `list`, `select`, `activate`, `new`, `close` |
+| `browser_nav` | `m1_tools/mod.rs` | `navigate`, `reload`, `back`, `forward` |
+| `browser_dom` | `browser_assert.rs` | `content`, `locate`, `inspect`, `aria_snapshot` |
+| `browser_form` | `browser_field.rs` | `set_value`, `fill` |
+| `browser_wait` | `m1_tools/mod.rs` | `for_condition` |
+| `browser_capture` | `browser_facades.rs` | `screenshot`, `downloads` |
+| `browser_storage` | `browser_storage.rs` | `get`, `set`, `clear`, `save_state`, `load_state` |
+| `browser_debugger` | `browser_facades.rs` | `evaluate`, `console_messages`, `reload_bridge`, `pdf`, `file_upload`, `dialog`, `add_init_script`, `add_script_tag`, `add_style_tag`, `network`, `network_har`, `network_overrides`, `route`, `emulate`, `expose_binding`, `drag`, `drop` |
+| `workspace` | `workspace_blackboard.rs` | `get`, `put`, `list`, `subscribe`, `exists`, `delete`, `wait` |
+| `agent` | `agent_facades.rs` | `spawn`, `query`, `send`, `inbox`, `wait`, `broadcast`, `receipts`, `stats`, `template_put`, `template_get`, `template_list`, `template_delete`, `task_started`, `interrupt`, `kill`, `steer`, `pause`, `resume`, `respawn` |
+| `task` | `agent_facades.rs` | `create`, `get`, `update`, `claim`, `cancel`, `list`, `next`, `reconcile`, `dispatch_once` |
+| `approval` | `approval_facades.rs` | `request`, `list`, `decide`, `gate`, `ask_operator` |
+| `escalation` | `approval_facades.rs` | `config_get`, `config_set`, `list`, `ack` |
+| `timeline` | `timeline_facades.rs` | `get`, `search`, `stats` |
+| `episode` | `timeline_facades.rs` | `list`, `get` |
+| `routine` | `routine_assist_facades/routing.rs` | `mine`, `list`, `inspect`, `update`, `feedback`, `label`, `automate`, `armed_tick` |
+| `assist` | `routine_assist_facades/routing.rs` | `intent`, `detect`, `suggestion_tick`, `suggestion_list`, `suggestion_accept` |
+| `reality` | `routine_assist_facades/routing.rs` | `baseline`, `delta`, `audit` |
+| `verification` | `routine_assist_facades/routing.rs` | `inbox`, `poll`, `audit`, `bind`, `sources` |
+| `storage` | `operational_facades/routing.rs` | `inspect`, `summary`, `gc_once` |
+| `model` | `operational_facades/routing.rs` | `list`, `status`, `probe`, `register`, `update`, `remove` |
+| `cost` | `agent_cost.rs` | `summarize`, `price_list`, `price_put`, `price_delete` |
+| `hygiene` | `operational_facades/routing.rs` | `scan_text`, `scan_storage`, `flags`, `report` |
+| `audit` | `audit_replay_facades/routing.rs` | `command_query`, `lifecycle_events`, `lifecycle_exits`, `profile_intelligence`, `export_bundle` |
+| `replay` | `audit_replay_facades/routing.rs` | `record`, `demo_status`, `demo_start`, `demo_stop`, `artifact_inspect` |
+| `privacy` | `timeline_facades.rs` | `pause`, `resume`, `exclusions`, `redact`, `purge` |
+| `setup` | `operational_facades/routing.rs` | `status`, `doctor`, `repair` |
+| `telemetry` | `operational_facades/routing.rs` | `status` |
+
+Facade defaults follow the implementation tool each operation delegates to (for example `shell operation=run` delegates to `act_run_shell`, `process operation=launch` to `act_launch`, `agent operation=spawn` to `act_spawn_agent`; see §16.4).
+
 ## 16.1 Registration, naming, and counts
 
 Tools are registered through the **`rmcp`** crate's attribute macros. Each tool is a `pub async fn` on `SynapseService` annotated with `#[tool(description = "...")]` (sometimes `input_schema = ...` for hand-rolled schemas). Each source module groups its tools under a per-module `#[tool_router(router = <name>_tool_router, vis = "pub(super)")] impl SynapseService { ... }` block. Parameter structs are passed as `Parameters<XxxParams>` and derive `Deserialize` + `schemars::JsonSchema`; most use `#[serde(deny_unknown_fields)]`. Field-level defaults come from `#[serde(default = "...")]` and ranges/defaults are surfaced to the schema via `#[schemars(...)]`.
 
-The full surface is assembled in `SynapseService::tool_router()` (`server.rs:603`) by summing every module router with `+`. Tool **names** are the function names verbatim (e.g. `fn observe` -> tool `observe`). Over MCP they appear to clients as `mcp__synapse__<name>`.
+The full surface is assembled in `SynapseService::tool_router()` (`crates/synapse-mcp/src/server.rs`, `fn tool_router`), which calls `build_tool_router(debug_tools_enabled())`; that sums every module router with `+`. Tool **names** are the function names verbatim (e.g. `fn observe` -> tool `observe`). Over MCP they appear to clients as `mcp__synapse__<name>`. Which registered tools a session can see is decided per profile in `tool_profiles.rs`; scoped HTTP profiles see the 40 facades of §16.0.
 
-**Total tools documented: 182.**
+**Registered tool attributes:** 245 `#[tool(` occurrences under `crates/` (`git grep '#\[tool('`, 2026-11-27): the 40 facades plus the implementation tools. This document does not list every implementation tool.
 
-- **Core surface (always registered): ~182 tools.**
-- **Debug-only:** `storage_put_probe_rows` and `storage_pressure_sample` are removed from the default surface and remain callable only when `SYNAPSE_DEBUG_TOOLS` is set (`server.rs:671`).
+- **Debug-only:** the four routes in `DEBUG_ONLY_TOOL_ROUTES` (`server.rs`) — `storage_put_probe_rows`, `storage_pressure_sample`, `action_diagnostic_rate_limit_override`, `action_diagnostic_queue_full_setup` — are removed from the router unless `SYNAPSE_DEBUG_TOOLS` is `1` or `true`.
 
 Conventions seen throughout:
 - Browser/CDP tools accept `cdp_target_id` + `window_hwnd` to address a session-owned tab, defaulting to the active session target; they are background-safe (no tab activation, no OS foreground, no human-foreground fallback).
@@ -41,7 +91,7 @@ Conventions seen throughout:
 
 ---
 
-## 16.2 Perception / M1 — `m1_tools.rs`
+## 16.2 Perception / M1 — `m1_tools/mod.rs`
 
 Source-of-truth observation, OCR, screenshots, window enumeration, and the CDP/Chrome-bridge browser surface. See [07_perception_subsystem.md](07_perception_subsystem.md), [06_accessibility_and_cdp_subsystem.md](06_accessibility_and_cdp_subsystem.md), [05_capture_subsystem.md](05_capture_subsystem.md).
 
@@ -84,7 +134,7 @@ Source-of-truth observation, OCR, screenshots, window enumeration, and the CDP/C
 | `browser_scroll_into_view` | Scroll element into view | `element_id` (req), target params | scrolls page |
 | `browser_locate` | Resolve element ids via locator engine | `query` (req), `engine` (Css), locator filters, `limit=50` (summarized) | read-only |
 
-## 16.3 Action / M2 — `m2_tools.rs`
+## 16.3 Action / M2 — `m2_tools/mod.rs`
 
 Click/type/value/key/stroke/scroll/pad/clipboard primitives. Foreground tiers require the input lease; background tiers (CDP/UIA/PostMessage) do not. See [09_action_subsystem.md](09_action_subsystem.md) and §16.10.5 (leases). All take `verify_delta`/`verify_timeout_ms` (default 2000ms, 50–5000).
 
@@ -101,13 +151,13 @@ Click/type/value/key/stroke/scroll/pad/clipboard primitives. Foreground tiers re
 | `act_scroll` | Scroll at pointer/point | `dy=0`, `dx=0`, `at?`, `target?`, `smooth=false` | emits scroll |
 | `act_pad` | Apply virtual gamepad report | `report` (req), `pad_id=0`, `controller=X360`, `backend=Vigem`, `hold_ms?` | virtual gamepad |
 | `act_clipboard` | Read/write/clear session virtual clipboard | `verb` (req), `text?`, `format=Text` | virtual clipboard (no OS clipboard by default) |
-| `action_diagnostic_rate_limit_override` | Supporting diagnostic: force rate limiter empty; its return is not an FSV verdict | `confirm`, `ttl_ms=5000` | mutates rate limiter (test) |
-| `action_diagnostic_queue_full_setup` | Supporting diagnostic: saturate action queue; its return is not an FSV verdict | `confirm`, `blocker_duration_ms=5000` | blocks action queue (test) |
+| `action_diagnostic_rate_limit_override` | Supporting diagnostic **(debug-gated)**: force rate limiter empty; its return is not an FSV verdict | `confirm`, `ttl_ms=5000` | mutates rate limiter |
+| `action_diagnostic_queue_full_setup` | Supporting diagnostic **(debug-gated)**: saturate action queue; its return is not an FSV verdict | `confirm`, `blocker_duration_ms=5000` | blocks action queue |
 | `release_all` | Release all held input state | none | resets input |
 
-## 16.4 Action / M4 — `m4_tools.rs`
+## 16.4 Action / M4 — `m4_tools/mod.rs`
 
-Higher-level action and process/agent launch.
+Higher-level action and process/agent launch. Defaults come from `crates/synapse-mcp/src/m4/mod.rs`: `DEFAULT_SHELL_TIMEOUT_MS = 30_000`, `DEFAULT_LAUNCH_TIMEOUT_MS = 10_000`, `DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS = 120_000`.
 
 | Tool | Description | Key params | Side effects |
 |------|-------------|------------|--------------|
@@ -116,8 +166,8 @@ Higher-level action and process/agent launch.
 | `act_run_shell_start` | Start durable background shell job | `command` (req), `args`, `working_dir?`, `env`, `timeout_ms?`, `job_id?` | spawns durable job |
 | `act_run_shell_status` | Read durable job status/logs | `job_id` (req), `tail_bytes=8192` | read-only |
 | `act_run_shell_cancel` | Cancel only the recorded durable job (+remote SSH cleanup when that job owns it) | `job_id` (req) | terminates job-owned process tree with readback |
-| `act_launch` | Launch allowlisted process (optional hidden desktop) | `target` (req), `args`, `working_dir?`, `env`, `wait_for_window_title_regex?`, `timeout_ms=30000`, `cdp_debug?`, `desktop?`, `windows_console_window_state?` | spawns process |
-| `act_spawn_agent` | Spawn durable child agent (Claude/Codex/local) | `template_id?`, `cli?`/`kind?`, `model?`, `model_ref?`, `prompt?`, `target?`, `working_dir?`, `mcp_url=127.0.0.1:7700/mcp`, `wait_timeout_ms=30000`, `require_approval_gate=true` | spawns agent process; waits for readiness |
+| `act_launch` | Launch allowlisted process (optional hidden desktop) | `target` (req), `args`, `working_dir?`, `env`, `wait_for_window_title_regex?`, `timeout_ms=10000`, `cdp_debug?`, `desktop?`, `windows_console_window_state?` | spawns process |
+| `act_spawn_agent` | Spawn durable child agent (Claude/Codex/local) | `template_id?`, `cli?`/`kind?`, `model?`, `model_ref?`, `prompt?`, `target?`, `working_dir?`, `mcp_url=127.0.0.1:7700/mcp`, `wait_timeout_ms=120000`, `require_approval_gate=true` | spawns agent process; waits for readiness |
 | `agent_spawn_task_started` | Legacy implementation route for spawned-agent cooperative readiness; normal public profile uses `agent operation=task_started` | `spawn_id` (req) | writes task-started.json |
 
 ## 16.5 Reflex / M3 (reflexes, subscriptions, replay, audio) — `m3_tools.rs`
@@ -185,7 +235,7 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 |------|-------------|------------|--------------|
 | `storage_inspect` | Inspect CF sizes/row counts/pressure | (minimal/none) | read-only |
 | `storage_gc_once` | One row-cap GC pass (diagnostic) | `cf_name`, `soft_cap_rows`, `hard_cap_rows` (req) | deletes rows |
-| `storage_put_probe_rows` | Write synthetic probe rows **(debug-gated)** | `cf_name`, `rows`, `value_bytes` (req) | writes rows |
+| `storage_put_probe_rows` | Write synthetic probe rows **(debug-gated)**; no facade operation | `cf_name`, `rows`, `value_bytes` (req) | writes rows |
 | `storage_pressure_sample` | Apply synthetic free-byte sample **(debug-gated)** | `free_bytes` (req) | mutates pressure state |
 
 ## 16.9 Approvals & escalation — `m3_tools.rs`, `permission_gate.rs`, `escalation/mod.rs`
@@ -274,7 +324,9 @@ Public <=40-tool clients use the `approval` facade for Claude permission prompts
 | `target_release` | Release this session's claim | active or explicit target | releases claim |
 | `target_claim_status` | Read live claims | `target?` | read-only |
 
-## 16.11 Capability-preserving router — `background_router.rs`
+## 16.11 Capability-preserving router — `background_router/mod.rs`
+
+The same file defines the public `act` facade (§16.0); `act operation=invoke` routes an `action.verb` through this layer.
 
 | Tool | Description | Params | Side effects |
 |------|-------------|--------|--------------|
@@ -376,4 +428,4 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 
 - **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
 - **Empty-schema tools** (`input_schema = empty_input_schema()`): `health`, `get_target`, `clear_target`, `control_lease_release`, `control_lease_status`, `tool_profile_status`, `escalation_config_get`.
-- Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`.
+- Counts: 245 `#[tool(` occurrences under `crates/` (2026-11-27); §16.2–§16.17 cover a subset of the implementation tools. The 40 facades in §16.0 are the default public surface.

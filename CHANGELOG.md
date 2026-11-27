@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## Fork state (2026-11-27)
+
+This repository is a fork. The entries below this section are upstream history
+up to #661 and were not kept current after that; read them as history, not as a
+description of the present tree. Where the tree differs today:
+
+- The workspace has 13 crates (`synapse-mcp`, `synapse-core`,
+  `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`,
+  `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`,
+  `synapse-models`, `synapse-telemetry`, `synapse-overlay`). The
+  `synapse-test-utils` crate named in the M0 entry no longer exists.
+- The tree carries no automated tests: no `tests/`/`benches/` directories, no
+  `#[test]`/`#[cfg(test)]` code, no `[dev-dependencies]`. The
+  `.githooks/pre-push` "Gate 0" blocks any push that adds them.
+- There is no CI workflow (no `.github/` directory); the local
+  `.githooks/pre-push` gate (Gate 0, `cargo fmt --all --check`, clippy with
+  `-D warnings`) replaces it.
+- The default public MCP surface is the 40-tool facade surface listed in
+  `PUBLIC_TOOL_NAMES` / `FACADE_TOOL_CONTRACTS`
+  (`crates/synapse-mcp/src/server/tool_profiles.rs`); see
+  [docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](docs/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
+  The flat tool names in the older entries are now hidden implementation
+  tools behind those facades.
+- `docs/shared-daemon.md` no longer exists. The shared-daemon modes
+  (`--mode http`, `--mode connect`, `--mode doctor`) are still in the code; the
+  README "Install" section describes how clients connect.
+- A loopback HTTP bind does not check the bearer token (see
+  [SECURITY.md](SECURITY.md)).
+
+## Unreleased (upstream, through #661)
 
 - Added the shared-daemon architecture so many agents can use Synapse at once
   against one RocksDB without leaked/duplicate instances: a single `--mode http`
@@ -10,11 +39,13 @@
   storage opens eagerly at startup (fail-fast `STORAGE_LOCK_CONTENDED`/
   `STORAGE_OPEN_FAILED`, exit 4); `/health` reports `pid`; and a new
   `--mode doctor [--kill-stray]` enumerates/classifies synapse-mcp processes and
-  cleans matching strays only after identifying the live lock-holder daemon. See
-  `docs/shared-daemon.md`. (#661)
+  cleans matching strays only after identifying the live lock-holder daemon.
+  (#661; the `docs/shared-daemon.md` page this entry cited has since been
+  removed.)
 - Added the repository agent doctrine: manual FSV must be performed by the
   agent with direct source-of-truth readback; automated tests, scripts,
-  benchmarks, GitHub Actions, and CI are supporting evidence only.
+  benchmarks, GitHub Actions, and CI are supporting evidence only. (The fork
+  later removed all automated tests and the CI workflow.)
 - Retired the physical hardware-HID path after the software-only input decision
   in #588. The active documented action backend is now `software`; the legacy
   `hardware` token remains only as a fail-closed compatibility value that
@@ -90,5 +121,5 @@ M0 bootstraps Synapse as a Rust MCP server with a single `health` tool over stdi
 - Implemented `synapse-core` shared types, schema version, and M0 error-code constants.
 - Implemented `synapse-telemetry` JSON file logging, console logging, and log-dir validation.
 - Implemented `synapse-mcp` stdio startup, CLI flags, graceful shutdown logging, and the `health` MCP tool.
-- Implemented `synapse-test-utils` raw stdio JSON-RPC client and M0 end-to-end health demo tests.
+- Implemented `synapse-test-utils` raw stdio JSON-RPC client and M0 end-to-end health demo tests. (Both the crate and the CI workflow have since been removed.)
 - Added root README quick start, current Rust/dependency ADR, documentation link checking, and WSL-global Codex/Claude Code MCP configuration guidance.

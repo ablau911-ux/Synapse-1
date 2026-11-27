@@ -12,18 +12,18 @@ Status values:
 - `foreground-lease`: current implementation intentionally uses the shared foreground resource and must be lease-gated.
 - `gap-linked`: current implementation has a known multi-agent/background gap, and the follow-up issue is named here.
 - `control`: session, lease, reflex, or target control surface with no direct foreground action.
-- `diagnostic`: test-only operational diagnostic surface, not a user workflow primitive.
+- `diagnostic`: operational diagnostic surface, not a user workflow primitive (the action/storage diagnostics are debug-only routes registered only when `SYNAPSE_DEBUG_TOOLS` is set).
 - `sessionless`: no window or cursor state is used, but the resource is not session-owned.
 
 Model-selection exposure values:
 
 - `normal_agent`: the literal tool name/schema is visible in the default HTTP MCP profile.
 - `facade_only`: the raw implementation tool name/schema is hidden from the default profile, but the capability is reachable through a named public facade in the 40-tool surface.
-- `browser_debugger`: the stable `browser_debugger` facade is visible in the default profile so static MCP clients keep one callable route; its raw-CDP and `chrome.debugger` operations fail closed until an explicit `tool_profile_set browser_debugger` transition with confirm + reason.
+- `browser_debugger`: the stable `browser_debugger` facade is visible in the default profile so static MCP clients keep one callable route; its raw-CDP and `chrome.debugger` operations fail closed until an explicit `tool_profile_set browser_debugger` transition with confirm + reason (or a `break_glass`/`full_capability` profile), except `evaluate`, `console_messages` and `network`, which are admitted under every profile on a session-owned tab.
 - `break_glass`: legacy classification for a raw OS/global implementation primitive. Scoped production HTTP profiles never advertise raw implementation tools, including after a break-glass/admin transition; `tool_profile_status.hidden_tool_routes` names the stable public facade route.
 - `debug_only`: hidden from normal agent profiles and reserved for diagnostic/debug tool surfaces.
 
-The model-selection overlay is a checked extension of the capability matrix. It captures the affordance risk of exposing a tool name/schema to models, not only the technical implementation risk. `Default exposure` is literal tool-name/schema visibility; normal-profile capability that moved behind a facade is marked `facade_only` and the public route is named under `Safe replacement tool`. The `Default exposure` and `Break-glass only` columns are kept in sync with `crates/synapse-mcp/src/server/tool_profiles.rs` by `crates/synapse-mcp/tests/multi_agent_capability_matrix.rs`.
+The model-selection overlay is a checked extension of the capability matrix. It captures the affordance risk of exposing a tool name/schema to models, not only the technical implementation risk. `Default exposure` is literal tool-name/schema visibility; normal-profile capability that moved behind a facade is marked `facade_only` and the public route is named under `Safe replacement tool`. The `Default exposure` and `Break-glass only` columns describe `crates/synapse-mcp/src/server/tool_profiles.rs`. Nothing checks them automatically: the test that once compared them (`crates/synapse-mcp/tests/multi_agent_capability_matrix.rs`) was removed with the rest of the automated test suite, so re-check these columns by hand against `tool_profiles.rs` when profiles change.
 
 | Tool | Default exposure | Break-glass only | Hidden/internal | Deprecated alias | Foreground-prone wording | Safe replacement tool |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -83,7 +83,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | browser_capture | normal_agent | no | no | no | no | none - default-safe |
 | browser_clock | facade_only | no | yes | no | no | browser_debugger operation=add_init_script/evaluate after profile=browser_debugger |
 | browser_console_messages | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events, browser_downloads |
-| browser_cookies | facade_only | no | yes | no | no | browser_storage operation=read/write |
+| browser_cookies | facade_only | no | yes | no | no | browser_storage operation=get/set/clear |
 | browser_content | facade_only | no | yes | no | no | browser_dom operation=content |
 | browser_debugger | normal_agent | no | no | no | no | profile operation=set profile=browser_debugger with reason before advanced operations; raw debugger tools stay hidden |
 | browser_dom | normal_agent | no | no | no | no | none - default-safe |
@@ -147,10 +147,10 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | session_list | facade_only | no | yes | no | no | session operation=list |
 | session_status | facade_only | no | yes | no | no | session operation=list/status readback |
 | set_capture_target | facade_only | no | yes | no | no | observe/screenshot with explicit target, setup facade for capture config |
-| set_perception_mode | facade_only | no | yes | no | no | observe operation=current, setup facade for perception config |
+| set_perception_mode | facade_only | no | yes | no | no | observe (no `operation` parameter), setup facade for perception config |
 | set_target | facade_only | no | yes | no | no | target operation=set |
 | subscribe | normal_agent | no | no | no | no | observe_delta |
-| subscribe_cancel | facade_only | no | yes | no | no | subscribe operation=events cancellation route |
+| subscribe_cancel | facade_only | no | yes | no | no | subscribe facade (no `operation` parameter) cancellation route |
 | target_act | facade_only | no | yes | no | no | act operation=invoke |
 | target_claim | facade_only | no | yes | no | no | target operation=claim |
 | target_claim_adopt | facade_only | no | yes | no | no | target operation=adopt |

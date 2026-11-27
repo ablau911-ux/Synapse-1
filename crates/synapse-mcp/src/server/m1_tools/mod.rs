@@ -1939,132 +1939,39 @@ impl SynapseService {
         window_hwnd: i64,
         cdp_target_id: &str,
     ) -> Result<CaptureScreenshotResponse, ErrorData> {
-        validate_cdp_target_id(cdp_target_id)?;
+        let tab = self.resolve_cdp_tab_capture(
+            "capture_screenshot",
+            session_id,
+            window_hwnd,
+            cdp_target_id,
+        )?;
         if let Some(region) = params.region {
             validate_screenshot_region(region)?;
         }
-        let owner =
-            self.cdp_target_owner_for_readback("capture_screenshot", session_id, cdp_target_id)?;
-        if let Some(owner) = owner.as_ref()
-            && owner.window_hwnd != window_hwnd
-        {
-            return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "capture_screenshot refused target {cdp_target_id:?}: owner window {:#x} does not match bound window {:#x}",
-                    owner.window_hwnd, window_hwnd
-                ),
-            ));
-        }
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
-            .or_else(|| owner.as_ref().map(|owner| owner.endpoint.clone()))
-            .ok_or_else(|| {
-                mcp_error(
-                    error_codes::ACTION_TARGET_INVALID,
-                    format!(
-                        "capture_screenshot refused CDP target {cdp_target_id:?}: no raw CDP endpoint and no session-owned Chrome bridge owner row"
-                    ),
-                )
-            })?;
         let output_path = screenshot_output_path(&params.path)?;
         let format = screenshot_format_from_path(&output_path)?;
         ensure_output_path_available("capture_screenshot", &output_path, params.overwrite)?;
-        let target_context = resolve_capture_target_window_context(window_hwnd).ok();
-        if is_chrome_debugger_endpoint(&endpoint) {
-            let captured = crate::chrome_debugger_bridge::capture_visible_tab(
-                window_hwnd,
-                cdp_target_id,
-                owner.as_ref().and_then(|owner| owner.chrome_window_id),
-            )
-            .await
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "capture_screenshot popup-free Chrome bridge refused debugger screenshot/readback: {}",
-                        error.detail()
-                    ),
-                )
-            })?;
-            if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
-                return Err(mcp_error(
-                    error_codes::ACTION_POSTCONDITION_FAILED,
-                    format!(
-                        "capture_screenshot Chrome bridge returned target {:?} for requested target {:?}",
-                        captured.target_id, cdp_target_id
-                    ),
-                ));
-            }
-            if let Some(expected_window_id) =
-                owner.as_ref().and_then(|owner| owner.chrome_window_id)
-                && captured.chrome_window_id != Some(expected_window_id)
-            {
-                return Err(mcp_error(
-                    error_codes::ACTION_POSTCONDITION_FAILED,
-                    format!(
-                        "capture_screenshot Chrome bridge captured Chrome window {:?} for requested target {:?}, expected Chrome window {}",
-                        captured.chrome_window_id, cdp_target_id, expected_window_id
-                    ),
-                ));
-            }
-            let bitmap = chrome_capture_visible_tab_data_url_to_bgra(
-                &captured.image_data_url,
-                params.region,
-            )?;
-            tracing::info!(
-                code = "CDP_TARGET_SCREENSHOT_CAPTURED",
-                session_id = %session_id,
-                hwnd = window_hwnd,
-                endpoint = %endpoint,
-                cdp_target_id = %captured.target_id,
-                tab_id = captured.tab_id,
-                chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
-                before_active = captured.before_active,
-                active_for_capture = captured.active_for_capture,
-                restored_previous_active = captured.restored_previous_active,
-                image_data_url_len = captured.image_data_url_len,
-                capture_attempt_count = captured.capture_attempt_count,
-                capture_attempts = ?captured.capture_attempts,
-                output_path = %output_path.display(),
-                "readback=chrome.debugger.Page.captureScreenshot outcome=screenshot_bitmap_decoded"
-            );
-            return write_screenshot_bitmap(
-                params,
-                output_path,
-                format,
-                bitmap,
-                "chrome_debugger_page_capture_screenshot_bgra",
-                None,
-                None,
-            );
-        }
-        let page_bitmap =
-            synapse_a11y::cdp_capture_page_bgra(&endpoint, cdp_target_id, params.region)
-                .await
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "capture_screenshot raw CDP Page.captureScreenshot failed: {error}"
-                        ),
-                    )
-                })?;
-        let captured = cdp_page_bitmap_to_captured_bgra(page_bitmap, params.region)?;
+        let target_context = if tab.uses_chrome_bridge() {
+            None
+        } else {
+            resolve_capture_target_window_context(window_hwnd).ok()
+        };
+        let (bitmap, capture_backend) = tab.grab_frame(params.region).await?;
         tracing::info!(
-            code = "CDP_TARGET_SCREENSHOT_CAPTURED",
+            code = "CDP_TARGET_SCREENSHOT_WRITING",
             session_id = %session_id,
             hwnd = window_hwnd,
-            endpoint = %endpoint,
             cdp_target_id = %cdp_target_id,
+            capture_backend,
             output_path = %output_path.display(),
-            "readback=Page.captureScreenshot outcome=screenshot_bitmap_decoded"
+            "capture_screenshot writing exact-tab bitmap"
         );
         write_screenshot_bitmap(
             params,
             output_path,
             format,
-            captured,
-            "raw_cdp_page_capture_screenshot_bgra",
+            bitmap,
+            capture_backend,
             target_context,
             None,
         )
@@ -2081,6 +1988,67 @@ impl SynapseService {
         Err(mcp_error(
             error_codes::A11Y_NOT_AVAILABLE,
             "capture_screenshot CDP target screenshots are only available on Windows in this build",
+        ))
+    }
+
+    /// Resolves a session CDP tab target for exact-tab capture: checks the
+    /// target id, that the tab's owner row matches the bound browser window,
+    /// and that a raw CDP endpoint or a session-owned Chrome bridge owner row
+    /// exists. Refuses otherwise; it never downgrades the tab to the browser
+    /// window, because the window can show the human's foreground tab (#1508).
+    /// Shared by `screenshot capture` and `screenshot gif` (#286).
+    #[cfg(windows)]
+    pub(super) fn resolve_cdp_tab_capture(
+        &self,
+        tool: &'static str,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+    ) -> Result<CdpTabCapture, ErrorData> {
+        validate_cdp_target_id(cdp_target_id)?;
+        let owner = self.cdp_target_owner_for_readback(tool, session_id, cdp_target_id)?;
+        if let Some(owner) = owner.as_ref()
+            && owner.window_hwnd != window_hwnd
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} refused target {cdp_target_id:?}: owner window {:#x} does not match bound window {:#x}",
+                    owner.window_hwnd, window_hwnd
+                ),
+            ));
+        }
+        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
+            .or_else(|| owner.as_ref().map(|owner| owner.endpoint.clone()))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "{tool} refused CDP target {cdp_target_id:?}: no raw CDP endpoint and no session-owned Chrome bridge owner row"
+                    ),
+                )
+            })?;
+        Ok(CdpTabCapture {
+            tool,
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            cdp_target_id: cdp_target_id.to_owned(),
+            endpoint,
+            chrome_window_id: owner.as_ref().and_then(|owner| owner.chrome_window_id),
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn resolve_cdp_tab_capture(
+        &self,
+        tool: &'static str,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+    ) -> Result<CdpTabCapture, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            format!("{tool} CDP tab capture is only available on Windows in this build"),
         ))
     }
 
@@ -17935,6 +17903,133 @@ async fn browser_screenshot_retry_after_bridge_disconnect(
                 ),
             )
         })
+}
+
+/// One session CDP tab, resolved once by
+/// `SynapseService::resolve_cdp_tab_capture`. `grab_frame` reads that exact
+/// tab (raw CDP `Page.captureScreenshot`, or the Chrome bridge visible-tab
+/// capture) and never the browser window, so a still or a GIF frame cannot
+/// show whichever tab the human has in front (#286, #1508).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) struct CdpTabCapture {
+    tool: &'static str,
+    session_id: String,
+    window_hwnd: i64,
+    cdp_target_id: String,
+    endpoint: String,
+    chrome_window_id: Option<i64>,
+}
+
+impl CdpTabCapture {
+    pub(super) fn window_hwnd(&self) -> i64 {
+        self.window_hwnd
+    }
+
+    #[cfg(windows)]
+    fn uses_chrome_bridge(&self) -> bool {
+        is_chrome_debugger_endpoint(&self.endpoint)
+    }
+
+    /// Captures the tab once and returns its pixels with the backend name.
+    #[cfg(windows)]
+    pub(super) async fn grab_frame(
+        &self,
+        region: Option<Rect>,
+    ) -> Result<(synapse_capture::CapturedBgraBitmap, &'static str), ErrorData> {
+        let tool = self.tool;
+        let cdp_target_id = self.cdp_target_id.as_str();
+        if self.uses_chrome_bridge() {
+            let captured = crate::chrome_debugger_bridge::capture_visible_tab(
+                self.window_hwnd,
+                cdp_target_id,
+                self.chrome_window_id,
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "{tool} popup-free Chrome bridge refused debugger screenshot/readback: {}",
+                        error.detail()
+                    ),
+                )
+            })?;
+            if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "{tool} Chrome bridge returned target {:?} for requested target {:?}",
+                        captured.target_id, cdp_target_id
+                    ),
+                ));
+            }
+            if let Some(expected_window_id) = self.chrome_window_id
+                && captured.chrome_window_id != Some(expected_window_id)
+            {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "{tool} Chrome bridge captured Chrome window {:?} for requested target {:?}, expected Chrome window {}",
+                        captured.chrome_window_id, cdp_target_id, expected_window_id
+                    ),
+                ));
+            }
+            let bitmap =
+                chrome_capture_visible_tab_data_url_to_bgra(&captured.image_data_url, region)?;
+            tracing::info!(
+                code = "CDP_TARGET_SCREENSHOT_CAPTURED",
+                tool,
+                session_id = %self.session_id,
+                hwnd = self.window_hwnd,
+                endpoint = %self.endpoint,
+                cdp_target_id = %captured.target_id,
+                tab_id = captured.tab_id,
+                chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
+                before_active = captured.before_active,
+                active_for_capture = captured.active_for_capture,
+                restored_previous_active = captured.restored_previous_active,
+                image_data_url_len = captured.image_data_url_len,
+                capture_attempt_count = captured.capture_attempt_count,
+                capture_attempts = ?captured.capture_attempts,
+                "readback=chrome.debugger.Page.captureScreenshot outcome=screenshot_bitmap_decoded"
+            );
+            return Ok((bitmap, "chrome_debugger_page_capture_screenshot_bgra"));
+        }
+        let page_bitmap =
+            synapse_a11y::cdp_capture_page_bgra(&self.endpoint, cdp_target_id, region)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("{tool} raw CDP Page.captureScreenshot failed: {error}"),
+                    )
+                })?;
+        let captured = cdp_page_bitmap_to_captured_bgra(page_bitmap, region)?;
+        tracing::info!(
+            code = "CDP_TARGET_SCREENSHOT_CAPTURED",
+            tool,
+            session_id = %self.session_id,
+            hwnd = self.window_hwnd,
+            endpoint = %self.endpoint,
+            cdp_target_id = %cdp_target_id,
+            "readback=Page.captureScreenshot outcome=screenshot_bitmap_decoded"
+        );
+        Ok((captured, "raw_cdp_page_capture_screenshot_bgra"))
+    }
+
+    #[cfg(not(windows))]
+    pub(super) async fn grab_frame(
+        &self,
+        _region: Option<Rect>,
+    ) -> Result<(synapse_capture::CapturedBgraBitmap, &'static str), ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            format!(
+                "{} CDP tab capture is only available on Windows in this build",
+                self.tool
+            ),
+        ))
+    }
 }
 
 #[cfg(windows)]

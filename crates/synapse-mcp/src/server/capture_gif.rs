@@ -4,9 +4,12 @@
 //! GIFs. Synapse had `demo_record_*` (UIA JSONL for profile authoring) and
 //! terminal asciicast, but no VISUAL screen/browser GIF recorder.
 //!
-//! `capture_gif` records the bound window (or an explicit HWND, or the browser
-//! window behind a CDP target) by capturing periodic passive per-window WGC
-//! frames over a recording window, then encodes an animated GIF. It is a single
+//! `capture_gif` records the bound window (or an explicit HWND) by capturing
+//! periodic passive per-window WGC frames over a recording window, then
+//! encodes an animated GIF. A browser-tab (CDP) target records that exact tab
+//! through the same route `screenshot capture` uses (raw CDP
+//! `Page.captureScreenshot`), never the browser window, which can show the
+//! human's foreground tab (#286, #1508). It is a single
 //! synchronous call — no dangling recording state machine — and reports captured
 //! vs requested frame counts so there are never silent frame drops. WGC captures
 //! occluded/background windows, so recording does not require foreground.
@@ -36,7 +39,7 @@ const FRAME_TIMEOUT_MS: u64 = 1_500;
 #[tool_router(router = capture_gif_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Record the bound window as an animated GIF (Claude gif_creator parity, #1339). Captures periodic passive per-window WGC frames of the session's bound target window — or an explicit window_hwnd, or the browser window behind a CDP tab target — over duration_ms at interval_ms, then encodes an animated GIF to an absolute .gif path. WGC captures occluded/background windows, so recording needs no foreground. Frames are downscaled aspect-preserving to max_long_edge (default 800). Single synchronous call (no recording state machine); reports frames_captured vs frames_requested so frame drops are never silent, and fails loud on zero frames or encode failure. Use capture_screenshot for a single still."
+        description = "Record the bound window as an animated GIF (Claude gif_creator parity, #1339). Captures periodic passive per-window WGC frames of the session's bound target window — or an explicit window_hwnd — over duration_ms at interval_ms, then encodes an animated GIF to an absolute .gif path. WGC captures occluded/background windows, so recording needs no foreground. With a session browser-tab (CDP) target and no window_hwnd it records that exact tab through the same route as capture_screenshot (raw CDP Page.captureScreenshot), never the browser window, and refuses when that tab has no raw CDP endpoint and no session-owned Chrome bridge owner row. Frames are downscaled aspect-preserving to max_long_edge (default 800). Single synchronous call (no recording state machine); reports frames_captured vs frames_requested so frame drops are never silent, and fails loud on zero frames or encode failure. Use capture_screenshot for a single still."
     )]
     pub async fn capture_gif(
         &self,
@@ -57,7 +60,7 @@ impl SynapseService {
         let (duration_ms, interval_ms) = capture_gif_timing(&params)?;
         let max_long_edge = params.max_long_edge.unwrap_or(DEFAULT_MAX_LONG_EDGE);
 
-        let window_hwnd = self.capture_gif_resolve_window(params.window_hwnd, &request_context)?;
+        let source = self.capture_gif_resolve_source(params.window_hwnd, &request_context)?;
 
         let output_path = std::path::PathBuf::from(&params.path);
         if !output_path.is_absolute() {
@@ -76,10 +79,12 @@ impl SynapseService {
             ));
         }
 
+        let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             capture_gif_blocking(
                 params,
-                window_hwnd,
+                source,
+                &runtime,
                 output_path,
                 duration_ms,
                 interval_ms,
@@ -95,38 +100,108 @@ impl SynapseService {
         })?
     }
 
-    fn capture_gif_resolve_window(
+    /// An explicit window_hwnd or a window target records that window; a
+    /// browser-tab (CDP) target records the exact tab through the same route
+    /// `screenshot capture` uses, never the browser window (#286).
+    fn capture_gif_resolve_source(
         &self,
         explicit: Option<i64>,
         request_context: &RequestContext<RoleServer>,
-    ) -> Result<i64, ErrorData> {
+    ) -> Result<GifSource, ErrorData> {
         if let Some(hwnd) = explicit {
-            return validate_window_hwnd_shape("capture_gif", hwnd);
+            return validate_window_hwnd_shape("capture_gif", hwnd).map(GifSource::Window);
         }
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
-        let target = self.session_target(session_id.as_deref())?;
-        let hwnd = match target {
-            Some(SessionTarget::Window { hwnd }) => hwnd,
-            Some(SessionTarget::Cdp { window_hwnd, .. }) => window_hwnd,
+        match self.session_target(session_id.as_deref())? {
+            Some(SessionTarget::Window { hwnd }) => {
+                validate_window_hwnd_shape("capture_gif", hwnd).map(GifSource::Window)
+            }
+            Some(SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            }) => {
+                let window_hwnd = validate_window_hwnd_shape("capture_gif", window_hwnd)?;
+                let session_id = session_id.as_deref().ok_or_else(|| {
+                    mcp_error(
+                        synapse_core::error_codes::HTTP_SESSION_INVALID,
+                        "capture_gif requires an MCP session id for a CDP session target",
+                    )
+                })?;
+                self.resolve_cdp_tab_capture("capture_gif", session_id, window_hwnd, &cdp_target_id)
+                    .map(GifSource::Tab)
+            }
             None => Err(mcp_error(
                 synapse_core::error_codes::TARGET_NOT_SET,
                 "capture_gif requires a window_hwnd or a bound session target (set_target)",
-            ))?,
-        };
-        validate_window_hwnd_shape("capture_gif", hwnd)
+            )),
+        }
+    }
+}
+
+/// One captured frame with its backend name, or the reason it was dropped.
+type GifFrame = Result<(synapse_capture::CapturedBgraBitmap, &'static str), String>;
+
+/// What one GIF records: a window through passive per-window WGC, or one
+/// browser tab through the exact-tab capture route (#286).
+enum GifSource {
+    Window(i64),
+    Tab(super::m1_tools::CdpTabCapture),
+}
+
+impl GifSource {
+    fn window_hwnd(&self) -> i64 {
+        match self {
+            Self::Window(hwnd) => *hwnd,
+            Self::Tab(tab) => tab.window_hwnd(),
+        }
+    }
+
+    /// Captures one frame. `Ok(Err(..))` is a dropped frame that the loop
+    /// counts and keeps going; `Err(..)` ends the recording with that error.
+    fn grab_frame(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        frames_so_far: usize,
+    ) -> Result<GifFrame, ErrorData> {
+        match self {
+            Self::Window(hwnd) => {
+                match synapse_capture::window_full_frame_to_bgra_bitmap(*hwnd, FRAME_TIMEOUT_MS) {
+                    Ok(captured) => Ok(Ok((captured.bitmap, captured.capture_backend))),
+                    // An invalid target (for example a minimized window) stays
+                    // invalid for the whole recording: fail now with its own code.
+                    Err(error @ synapse_capture::CaptureError::TargetInvalid { .. }) => {
+                        Err(mcp_error(
+                            error.code(),
+                            format!("capture_gif cannot record hwnd {hwnd:#x}: {error}"),
+                        ))
+                    }
+                    Err(error) => Ok(Err(error.to_string())),
+                }
+            }
+            Self::Tab(tab) => match runtime.block_on(tab.grab_frame(None)) {
+                Ok(frame) => Ok(Ok(frame)),
+                // No frame yet: the tab route itself is refusing or broken,
+                // so report its own error instead of recording nothing.
+                Err(error) if frames_so_far == 0 => Err(error),
+                Err(error) => Ok(Err(error.message.to_string())),
+            },
+        }
     }
 }
 
 // Capture, pixel conversion, resizing, encoding and file I/O all block.
-// Keep the whole recording on the blocking pool, including interval pacing.
+// Keep the whole recording on the blocking pool, including interval pacing;
+// a tab frame's async CDP read is driven from here with `runtime.block_on`.
 fn capture_gif_blocking(
     params: CaptureGifParams,
-    window_hwnd: i64,
+    source: GifSource,
+    runtime: &tokio::runtime::Handle,
     output_path: std::path::PathBuf,
     duration_ms: u64,
     interval_ms: u64,
     max_long_edge: u32,
 ) -> Result<Json<CaptureGifResponse>, ErrorData> {
+    let window_hwnd = source.window_hwnd();
     let frames_requested = usize::try_from(duration_ms / interval_ms)
         .unwrap_or(1)
         .max(1);
@@ -139,10 +214,9 @@ fn capture_gif_blocking(
 
     while started.elapsed().as_millis() < u128::from(duration_ms) {
         let frame_started = Instant::now();
-        match synapse_capture::window_full_frame_to_bgra_bitmap(window_hwnd, FRAME_TIMEOUT_MS) {
-            Ok(captured) => {
-                capture_backend = captured.capture_backend.to_owned();
-                let bitmap = captured.bitmap;
+        match source.grab_frame(runtime, frames.len())? {
+            Ok((bitmap, backend)) => {
+                capture_backend = backend.to_owned();
                 if native_dims.is_none() {
                     native_dims = Some((bitmap.width, bitmap.height));
                     target_dims = Some(capture_gif_target_dims(
@@ -160,16 +234,8 @@ fn capture_gif_blocking(
                 };
                 frames.push(frame);
             }
-            // An invalid target (for example a minimized window) stays
-            // invalid for the whole recording: fail now with its own code.
-            Err(error @ synapse_capture::CaptureError::TargetInvalid { .. }) => {
-                return Err(mcp_error(
-                    error.code(),
-                    format!("capture_gif cannot record hwnd {window_hwnd:#x}: {error}"),
-                ));
-            }
             Err(error) => {
-                last_error = Some(error.to_string());
+                last_error = Some(error);
             }
         }
         // Pace to interval_ms, accounting for capture time, but never sleep

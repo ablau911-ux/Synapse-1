@@ -675,7 +675,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for process capability. operation=list reads the live OS process table; launch delegates to the audited process launcher and records CF_PROCESS_HISTORY; history reads decoded CF_PROCESS_HISTORY rows for launch readback."
+        description = "Facade for process capability. operation=list reads the live OS process table; launch delegates to the audited process launcher and records CF_PROCESS_HISTORY; history reads decoded CF_PROCESS_HISTORY rows for launch readback; terminate closes a process THIS MCP session started with launch (pid required; any other pid is refused with SAFETY_PERMISSION_DENIED): WM_CLOSE to its visible windows, a bounded wait (timeout_ms, default 5000), then a forced tree kill only if it did not exit, with a process-table exit readback."
     )]
     pub async fn process(
         &self,
@@ -699,6 +699,7 @@ impl SynapseService {
                     launch: None,
                     processes: Some(response),
                     history: None,
+                    terminate: None,
                 }))
             }
             ProcessOperation::Launch => {
@@ -722,6 +723,7 @@ impl SynapseService {
                     launch: Some(response),
                     processes: None,
                     history: None,
+                    terminate: None,
                 }))
             }
             ProcessOperation::History => {
@@ -732,6 +734,45 @@ impl SynapseService {
                     launch: None,
                     processes: None,
                     history: Some(response),
+                    terminate: None,
+                }))
+            }
+            ProcessOperation::Terminate => {
+                let (pid, grace_ms) = validate_process_terminate_params(&params)?;
+                // Same process-lifecycle authority as launch: the profile and
+                // operator-panic gates that allow a launch allow closing it.
+                let preflight = match self.ensure_supported_use_allows_action("act_launch") {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        self.audit_action_denied_for_request(
+                            "process_terminate",
+                            &error,
+                            &request_context,
+                        );
+                        return Err(error);
+                    }
+                };
+                self.audit_action_started_with_details_for_request(
+                    "process_terminate",
+                    &json!({ "pid": pid, "grace_ms": grace_ms, "preflight": preflight }),
+                    &request_context,
+                )?;
+                let session_id =
+                    super::context::mcp_session_id_from_request_context(&request_context)?;
+                let result =
+                    process_terminate_response(self, session_id, pid, grace_ms, &preflight).await;
+                self.audit_action_result_for_request(
+                    "process_terminate",
+                    &result,
+                    &request_context,
+                )?;
+                Ok(Json(ProcessFacadeResponse {
+                    operation,
+                    source_of_truth: PROCESS_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    launch: None,
+                    processes: None,
+                    history: None,
+                    terminate: Some(result?),
                 }))
             }
         }

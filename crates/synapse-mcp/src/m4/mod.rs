@@ -19287,6 +19287,301 @@ impl OwnedProcessJob {
     }
 }
 
+/// One process proven to be a member of an owned Windows job (#333-J). The
+/// open process handle pins its pid: Windows never reuses a pid while a handle
+/// to that process object is open, so every pid comparison made while this
+/// value lives refers to the proven job member and never to a reused pid.
+#[cfg(windows)]
+pub(crate) struct OwnedJobMemberProcess {
+    pid: u32,
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(not(windows))]
+pub(crate) struct OwnedJobMemberProcess {
+    pid: u32,
+}
+
+impl OwnedJobMemberProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedJobMemberProcess {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+#[cfg(windows)]
+impl OwnedJobMemberProcess {
+    /// Posts `WM_CLOSE` to `hwnd` only when the window is still owned by this
+    /// pinned job member at post time. Returns `Ok(false)` when the window
+    /// now belongs to another process (or is gone) and nothing was posted.
+    pub(crate) fn post_close_to_own_window(&self, hwnd: i64) -> Result<bool, String> {
+        use windows::Win32::{
+            Foundation::HWND,
+            UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
+        };
+
+        let Some(native_hwnd) = synapse_core::win32_hwnd::hwnd_from_wire(hwnd) else {
+            return Err(format!("hwnd 0x{hwnd:x} is not a canonical window handle"));
+        };
+        let window = HWND(native_hwnd as *mut core::ffi::c_void);
+        if !unsafe { IsWindow(Some(window)) }.as_bool() {
+            return Ok(false);
+        }
+        let mut owner_pid = 0_u32;
+        unsafe { GetWindowThreadProcessId(window, Some(&raw mut owner_pid)) };
+        if owner_pid != self.pid {
+            return Ok(false);
+        }
+        synapse_a11y::close_window(hwnd)
+            .map(|()| true)
+            .map_err(|error| format!("hwnd 0x{hwnd:x}: {error}"))
+    }
+}
+
+#[cfg(not(windows))]
+impl OwnedJobMemberProcess {
+    pub(crate) fn post_close_to_own_window(&self, _hwnd: i64) -> Result<bool, String> {
+        Err("window close requires Windows".to_owned())
+    }
+}
+
+/// Launch-ownership operations for `process terminate` (#333-J). Every
+/// destructive step is bound to the job object created at launch, never to a
+/// numeric pid read later: job membership is the proof of ownership.
+#[cfg(windows)]
+impl OwnedProcessJob {
+    /// A second handle to the same job object, for a worker that must keep
+    /// the launch ownership proof while the session ledger stays the owner of
+    /// the original handle. The job is not closed (and kill-on-close does not
+    /// fire) until both handles are closed.
+    pub(crate) fn duplicate(&self, tool_name: &'static str, pid: u32) -> Result<Self, ErrorData> {
+        use windows::Win32::{
+            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE},
+            System::Threading::GetCurrentProcess,
+        };
+
+        let source = self.handle(tool_name, pid)?;
+        let mut duplicate = HANDLE::default();
+        unsafe {
+            let current = GetCurrentProcess();
+            DuplicateHandle(
+                current,
+                source,
+                current,
+                &raw mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "{tool_name} failed to duplicate the launch job handle for pid {pid}: {error}"
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "reason": "job_object_duplicate_failed",
+                }),
+            )
+        })?;
+        Ok(Self {
+            handle: Some(duplicate),
+        })
+    }
+
+    fn open_handle(&self) -> Result<windows::Win32::Foundation::HANDLE, String> {
+        self.handle
+            .ok_or_else(|| "owned process job handle was already closed".to_owned())
+    }
+
+    /// Number of live processes in the job, read from the job itself.
+    pub(crate) fn active_process_count(&self) -> Result<u32, String> {
+        use windows::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let handle = self.open_handle()?;
+        let size = u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+            .map_err(|error| format!("job accounting size conversion failed: {error}"))?;
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        unsafe {
+            QueryInformationJobObject(
+                Some(handle),
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                size,
+                None,
+            )
+        }
+        .map_err(|error| {
+            format!("QueryInformationJobObject accounting readback failed: {error}")
+        })?;
+        Ok(info.ActiveProcesses)
+    }
+
+    /// Process ids currently in the job, read from the job itself (includes
+    /// children whose launch root has already exited).
+    pub(crate) fn member_process_ids(&self) -> Result<Vec<u32>, String> {
+        use windows::Win32::{
+            Foundation::ERROR_MORE_DATA,
+            System::JobObjects::{
+                JOBOBJECT_BASIC_PROCESS_ID_LIST, JobObjectBasicProcessIdList,
+                QueryInformationJobObject,
+            },
+        };
+
+        let handle = self.open_handle()?;
+        let word = std::mem::size_of::<usize>();
+        let header_words =
+            std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / word;
+        let mut capacity = 64_usize;
+        for _ in 0..4 {
+            let mut buffer = vec![0_usize; header_words + capacity];
+            let bytes = u32::try_from(buffer.len() * word)
+                .map_err(|error| format!("job process-id list size conversion failed: {error}"))?;
+            let result = unsafe {
+                QueryInformationJobObject(
+                    Some(handle),
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    bytes,
+                    None,
+                )
+            };
+            let header = buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+            let (assigned, listed) = unsafe {
+                (
+                    (*header).NumberOfAssignedProcesses,
+                    (*header).NumberOfProcessIdsInList,
+                )
+            };
+            let assigned = usize::try_from(assigned).unwrap_or(usize::MAX);
+            let listed = usize::try_from(listed).unwrap_or(usize::MAX);
+            match result {
+                Ok(()) if listed >= assigned && listed <= capacity => {
+                    return Ok(buffer[header_words..header_words + listed]
+                        .iter()
+                        .filter_map(|id| u32::try_from(*id).ok())
+                        .collect());
+                }
+                Ok(()) => {}
+                Err(error) if error.code() == ERROR_MORE_DATA.to_hresult() => {}
+                Err(error) => {
+                    return Err(format!(
+                        "QueryInformationJobObject process-id list readback failed: {error}"
+                    ));
+                }
+            }
+            capacity = assigned.max(capacity).saturating_mul(2);
+        }
+        Err("job process-id list kept growing past the readback buffer".to_owned())
+    }
+
+    /// Opens each listed pid and keeps only processes that are live members
+    /// of this job, proven with `IsProcessInJob` while their handle pins the
+    /// pid. A pid that left the job (or was reused by a non-member) between
+    /// the job readback and the open is skipped. Returns the members and the
+    /// pids that could not be proven.
+    pub(crate) fn pin_live_members(
+        &self,
+        process_ids: &[u32],
+    ) -> Result<(Vec<OwnedJobMemberProcess>, Vec<String>), String> {
+        use windows::Win32::{
+            Foundation::WAIT_TIMEOUT,
+            System::{
+                JobObjects::IsProcessInJob,
+                Threading::{
+                    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                    WaitForSingleObject,
+                },
+            },
+        };
+        use windows::core::BOOL;
+
+        let job = self.open_handle()?;
+        let mut members = Vec::new();
+        let mut unproven = Vec::new();
+        for &pid in process_ids {
+            let handle = match unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    false,
+                    pid,
+                )
+            } {
+                Ok(handle) => handle,
+                Err(error) => {
+                    unproven.push(format!("pid {pid}: process open failed: {error}"));
+                    continue;
+                }
+            };
+            let member = OwnedJobMemberProcess { pid, handle };
+            let mut in_job = BOOL::default();
+            match unsafe { IsProcessInJob(handle, Some(job), &raw mut in_job) } {
+                Ok(()) if in_job.as_bool() => {}
+                Ok(()) => continue,
+                Err(error) => {
+                    unproven.push(format!(
+                        "pid {pid}: job membership readback failed: {error}"
+                    ));
+                    continue;
+                }
+            }
+            if unsafe { WaitForSingleObject(handle, 0) } != WAIT_TIMEOUT {
+                continue;
+            }
+            members.push(member);
+        }
+        Ok((members, unproven))
+    }
+
+    /// Ends every process in the job at once (`TerminateJobObject`). Only
+    /// job members are affected; no pid is resolved.
+    pub(crate) fn terminate_all(&self, exit_code: u32) -> Result<(), String> {
+        use windows::Win32::System::JobObjects::TerminateJobObject;
+
+        let handle = self.open_handle()?;
+        unsafe { TerminateJobObject(handle, exit_code) }
+            .map_err(|error| format!("TerminateJobObject failed: {error}"))
+    }
+}
+
+#[cfg(not(windows))]
+impl OwnedProcessJob {
+    pub(crate) fn duplicate(&self, _tool_name: &'static str, _pid: u32) -> Result<Self, ErrorData> {
+        Ok(Self)
+    }
+
+    pub(crate) fn active_process_count(&self) -> Result<u32, String> {
+        Err("process job readback requires Windows".to_owned())
+    }
+
+    pub(crate) fn member_process_ids(&self) -> Result<Vec<u32>, String> {
+        Err("process job readback requires Windows".to_owned())
+    }
+
+    pub(crate) fn pin_live_members(
+        &self,
+        _process_ids: &[u32],
+    ) -> Result<(Vec<OwnedJobMemberProcess>, Vec<String>), String> {
+        Err("process job readback requires Windows".to_owned())
+    }
+
+    pub(crate) fn terminate_all(&self, _exit_code: u32) -> Result<(), String> {
+        Err("process job termination requires Windows".to_owned())
+    }
+}
+
 #[cfg(windows)]
 fn query_owned_process_job_kill_on_close(
     handle: windows::Win32::Foundation::HANDLE,

@@ -89,6 +89,17 @@ pub(crate) struct SessionProcessResource {
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
 }
 
+/// Ownership readback for one pid this session launched (#333-J).
+#[derive(Debug)]
+pub(crate) struct SessionLaunchedProcess {
+    pub launch_target: String,
+    pub registered_at_unix_ms: u64,
+    /// A duplicate of the launch-time job handle: the ownership proof every
+    /// destructive terminate step is bound to. `None` when the ledger entry
+    /// holds no job (terminate then refuses).
+    pub process_job: Option<OwnedProcessJob>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionHiddenDesktopReadback {
@@ -792,6 +803,90 @@ impl SynapseService {
             "readback=session_process_ledger after=registered"
         );
         Ok(())
+    }
+
+    /// #333-J ownership authority for `process terminate`: the ledger entry of
+    /// a pid that THIS session launched through `act_launch`. Any other pid
+    /// (another session's, an agent spawn, or one never launched by Synapse)
+    /// reads as `None`, so the caller refuses it. The readback carries a
+    /// duplicate of the launch job handle, so the caller acts on the launched
+    /// job and never on a pid it re-reads later.
+    pub(crate) fn session_launched_process(
+        &self,
+        session_id: &str,
+        pid: u32,
+    ) -> Result<Option<SessionLaunchedProcess>, ErrorData> {
+        let guard = self.session_processes.lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session process resource lock poisoned while reading launch ownership",
+            )
+        })?;
+        let Some(resource) = guard
+            .get(session_id)
+            .and_then(|resources| resources.get(&pid))
+            .filter(|resource| resource.tool == "act_launch")
+        else {
+            return Ok(None);
+        };
+        // Duplicate while the ledger lock is held, so session teardown cannot
+        // close the original handle between the lookup and the duplicate.
+        let process_job = resource
+            .process_job
+            .as_ref()
+            .map(|job| job.duplicate("process_terminate", pid))
+            .transpose()?;
+        Ok(Some(SessionLaunchedProcess {
+            launch_target: resource.launch_target.clone(),
+            registered_at_unix_ms: resource.registered_at_unix_ms,
+            process_job,
+        }))
+    }
+
+    /// Drops this session's ledger entry for a launched pid whose launch job
+    /// has been read back empty, closing its process-job handle. An entry that
+    /// holds a hidden-desktop lease is kept so session teardown closes the
+    /// desktop the same way it always does. Returns whether it was released.
+    pub(crate) fn release_session_launched_process(
+        &self,
+        session_id: &str,
+        pid: u32,
+    ) -> Result<bool, ErrorData> {
+        let released = {
+            let mut guard = self.session_processes.lock().map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "session process resource lock poisoned while releasing a terminated launch",
+                )
+            })?;
+            let Some(resources) = guard.get_mut(session_id) else {
+                return Ok(false);
+            };
+            let releasable = resources.get(&pid).is_some_and(|resource| {
+                resource.tool == "act_launch" && resource.desktop_lease.is_none()
+            });
+            let released = if releasable {
+                resources.remove(&pid)
+            } else {
+                None
+            };
+            if resources.is_empty() {
+                guard.remove(session_id);
+            }
+            released
+        };
+        let Some(resource) = released else {
+            return Ok(false);
+        };
+        tracing::info!(
+            code = "MCP_SESSION_PROCESS_RESOURCE_RELEASED",
+            session_id,
+            pid,
+            launch_target = %resource.launch_target,
+            "readback=session_process_ledger after=released reason=process_terminate_confirmed_exit"
+        );
+        drop(resource);
+        Ok(true)
     }
 
     pub(crate) fn session_hidden_desktop_readback(

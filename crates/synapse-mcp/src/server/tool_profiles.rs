@@ -226,15 +226,14 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
 
 /// Sentinel `operation_enum` for flat, single-purpose facades that expose NO
 /// `operation` discriminator in their input schema (e.g. `health`, `observe`,
-/// `find`, `read_text`, `subscribe`). The schema-parity gate
-/// `facade_contract_operations_match_live_schema` treats a contract carrying
-/// this sentinel as "the built tool must have no `operation` property", and any
-/// other `operation_enum` value as "the tool's serialized `operation` enum must
-/// exactly equal the contract's declared operation list". Naming a real
-/// `*Operation` enum here for a flat tool (as the contracts historically did,
-/// with fabricated enum names like `HealthOperation` that never existed) is
-/// therefore rejected by the gate. Keep the single operation entry as the
-/// documented source-of-truth/error/remediation for the flat call.
+/// `find`, `read_text`, `subscribe`). A contract carrying this sentinel
+/// documents that the built tool has no `operation` property; any other
+/// `operation_enum` value names the tool's real `*Operation` enum. Nothing
+/// checks this against the live input schema: `inspect_facade_contracts` only
+/// requires `operation_enum` to be non-empty, so keep it accurate by hand. Do
+/// not name a fabricated enum for a flat tool (the contracts historically used
+/// names like `HealthOperation` that never existed). Keep the single operation
+/// entry as the documented source-of-truth/error/remediation for the flat call.
 pub(crate) const FLAT_FACADE_OPERATION_ENUM: &str =
     "(none: single-purpose tool, no operation param)";
 
@@ -676,6 +675,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 None,
                 error_codes::TOOL_PARAMS_INVALID,
                 "read the launch pid/target from CF_PROCESS_HISTORY or filter by a known pid",
+            ),
+            op(
+                "terminate",
+                true,
+                true,
+                "session process-resource ledger (ownership) + live process table",
+                Some("live process-table exit readback of the launched process tree"),
+                error_codes::SAFETY_PERMISSION_DENIED,
+                "pass a pid this MCP session started with process launch; any other pid is refused",
             ),
         ],
     ),

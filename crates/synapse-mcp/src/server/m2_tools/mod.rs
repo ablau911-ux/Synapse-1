@@ -3416,6 +3416,7 @@ impl SynapseService {
             "readback=target_window_delta tool=act_click outcome=reconciled_postdispatch_error"
         );
         Ok(ActClickResponse {
+            foreground_note: None,
             ok: true,
             used_invoke_pattern: tier == "uia",
             backend_used: tier.clone(),
@@ -6740,6 +6741,7 @@ fn set_field_text_password_response(
     }
     let changed = before.password_len != after.password_len;
     Ok(crate::m2::ActSetFieldTextResponse {
+        foreground_note: None,
         ok: true,
         method: method.to_owned(),
         backend_tier_used: crate::m2::TIER_FOREGROUND_KEYS.to_owned(),
@@ -7789,7 +7791,7 @@ fn background_error_source_of_truth(error: &ErrorData) -> Option<String> {
     None
 }
 
-fn background_result_with_foreground_guard<T>(
+fn background_result_with_foreground_guard<T: BackgroundReadbackOutcome>(
     tool: &'static str,
     action_source_of_truth: &str,
     target: BackgroundTargetForegroundGuard,
@@ -7806,7 +7808,24 @@ fn background_result_with_foreground_guard<T>(
     ) {
         Ok(()) => result,
         Err(foreground_error) => match result {
-            // The background action succeeded, so its input was delivered.
+            // #161: the input was delivered AND the action's own post-action
+            // readback verified the effect. The foreground change is a side
+            // effect to report, not a failure of the action.
+            Ok(mut response) if response.verified_by_readback() => {
+                let note = background_verified_foreground_note(tool, &foreground_error);
+                tracing::warn!(
+                    code = "BACKGROUND_ACTION_VERIFIED_DESPITE_FOREGROUND_CHANGE",
+                    tool,
+                    source_of_truth = BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+                    action_source_of_truth,
+                    note = %note,
+                    "background action changed the OS foreground, but its post-action readback verified the effect; returning ok with a foreground note"
+                );
+                response.attach_foreground_note(note);
+                Ok(response)
+            }
+            // Delivered but not verified by readback: the foreground change
+            // stays a failure the caller must check.
             Ok(_) => Err(crate::m2::error_after_earlier_steps(foreground_error, 1)),
             Err(error) => Err(attach_background_foreground_guard_error(
                 error,
@@ -7814,6 +7833,77 @@ fn background_result_with_foreground_guard<T>(
             )),
         },
     }
+}
+
+/// A background action response that can say whether its own post-action
+/// readback verified the effect, and can carry the #161 foreground note.
+trait BackgroundReadbackOutcome {
+    fn verified_by_readback(&self) -> bool;
+    fn attach_foreground_note(&mut self, note: Value);
+}
+
+/// `observed_delta` (a Source-of-Truth change was read back) and
+/// `verified_state` (the readback equals the requested state) are the only
+/// postcondition statuses that verify an effect; `delivered`, `not_requested`,
+/// and `failed` do not.
+fn postcondition_verified_by_readback(postcondition: &ActPostcondition) -> bool {
+    matches!(
+        postcondition.status.as_str(),
+        "observed_delta" | "verified_state"
+    )
+}
+
+impl BackgroundReadbackOutcome for ActClickResponse {
+    fn verified_by_readback(&self) -> bool {
+        self.ok && postcondition_verified_by_readback(&self.postcondition)
+    }
+
+    fn attach_foreground_note(&mut self, note: Value) {
+        self.foreground_note = Some(note);
+    }
+}
+
+impl BackgroundReadbackOutcome for crate::m2::ActSetFieldTextResponse {
+    fn verified_by_readback(&self) -> bool {
+        self.ok && postcondition_verified_by_readback(&self.postcondition)
+    }
+
+    fn attach_foreground_note(&mut self, note: Value) {
+        self.foreground_note = Some(note);
+    }
+}
+
+impl BackgroundReadbackOutcome for ActSetValueResponse {
+    fn verified_by_readback(&self) -> bool {
+        self.ok && postcondition_verified_by_readback(&self.postcondition)
+    }
+
+    fn attach_foreground_note(&mut self, note: Value) {
+        self.foreground_note = Some(note);
+    }
+}
+
+/// Builds the #161 note from the foreground-lost error the guard raised:
+/// `foreground_restore_failed` unless the restore readback proved the
+/// pre-action window is foreground again (`foreground_restored`).
+fn background_verified_foreground_note(tool: &'static str, foreground_error: &ErrorData) -> Value {
+    let data = foreground_error.data.as_ref();
+    let field = |name: &str| data.and_then(|data| data.get(name)).cloned();
+    let foreground_restore = field("foreground_restore").unwrap_or(Value::Null);
+    let restored = foreground_restore
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "restored");
+    json!({
+        "code": if restored { "foreground_restored" } else { "foreground_restore_failed" },
+        "tool": tool,
+        "reason": "background_action_changed_foreground",
+        "detail": foreground_error.message.to_string(),
+        "source_of_truth": BACKGROUND_FOREGROUND_SOURCE_OF_TRUTH,
+        "foreground_before": field("foreground_before"),
+        "foreground_after": field("foreground_after"),
+        "foreground_restore": foreground_restore,
+    })
 }
 
 fn background_result_with_foreground_read_error<T>(

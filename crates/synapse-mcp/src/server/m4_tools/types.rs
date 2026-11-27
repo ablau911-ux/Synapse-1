@@ -228,6 +228,7 @@ pub enum ProcessOperation {
     List,
     Launch,
     History,
+    Terminate,
 }
 
 impl ProcessOperation {
@@ -237,6 +238,7 @@ impl ProcessOperation {
             Self::List => "list",
             Self::Launch => "launch",
             Self::History => "history",
+            Self::Terminate => "terminate",
         }
     }
 }
@@ -261,7 +263,10 @@ pub struct ProcessParams {
     #[serde(default)]
     pub wait_for_window_title_regex: Option<String>,
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(
+        range(min = 1),
+        description = "launch: window/readiness wait budget. terminate: graceful-exit wait after WM_CLOSE before a forced kill (default 5000, max 30000)."
+    )]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -274,6 +279,9 @@ pub struct ProcessParams {
     #[serde(default)]
     pub desktop: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Exact pid filter for list/history. Required for terminate: the pid must be one this MCP session launched through process launch; any other pid is refused."
+    )]
     pub pid: Option<u32>,
     #[serde(default)]
     pub process_name_contains: Option<String>,
@@ -301,6 +309,50 @@ pub struct ProcessFacadeResponse {
     pub processes: Option<ProcessListResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<ProcessHistoryResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminate: Option<ProcessTerminateResponse>,
+}
+
+/// `process terminate` readback (#333-J). Only a pid this MCP session launched
+/// through `process launch` is ever terminated; the session process-resource
+/// ledger is the ownership authority and the launch-time Windows job object is
+/// the ownership proof every destructive step is bound to.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTerminateResponse {
+    pub pid: u32,
+    pub source_of_truth: String,
+    pub ownership: String,
+    pub launch_target: String,
+    pub registered_at_unix_ms: u64,
+    /// Process ids in the launch's Windows job object, read from the job
+    /// before any close request (includes children whose root has exited).
+    pub process_ids_before: Vec<u32>,
+    /// Job members proven live and pinned by an open process handle before
+    /// any close request.
+    pub live_process_ids_before: Vec<u32>,
+    /// Visible top-level windows of pinned job members that were sent
+    /// `WM_CLOSE`.
+    pub close_requested_hwnds: Vec<i64>,
+    pub close_request_errors: Vec<String>,
+    pub graceful_wait_ms: u64,
+    pub exited_gracefully: bool,
+    /// Present only when the job was not empty after the graceful step; the
+    /// force step is `TerminateJobObject` on the launch job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_termination: Option<crate::m4::OwnedProcessTerminationReadback>,
+    /// Process ids still in the launch job after the last step.
+    pub remaining_process_ids: Vec<u32>,
+    /// Live process count read from the launch job after the last step; the
+    /// Source of Truth for `terminated` (`None` when it could not be read).
+    pub job_active_processes_after: Option<u32>,
+    /// Job readback failures (membership list or active count).
+    pub job_readback_errors: Vec<String>,
+    pub terminated: bool,
+    /// True when the session ledger entry was released after the job was
+    /// read back empty (an entry holding a hidden-desktop lease stays for
+    /// session teardown).
+    pub ledger_released: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

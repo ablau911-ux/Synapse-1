@@ -260,6 +260,15 @@ impl McpOperatorPanicBoundary {
 }
 
 impl McpOperatorPanicBoundarySnapshot {
+    /// Recheck this request's admission epoch from a thread that has no
+    /// task-local boundary (a `spawn_blocking` worker). It only reads the
+    /// epoch: the routed request must already own its mutation reservation,
+    /// which [`reserve_and_snapshot_current_mcp_boundary`] takes and the
+    /// awaiting request keeps until it completes.
+    pub(crate) fn ensure_admission_epoch(&self, stage: &'static str) -> Result<(), ErrorData> {
+        self.clone().into_boundary().ensure(stage)
+    }
+
     fn into_boundary(self) -> McpOperatorPanicBoundary {
         McpOperatorPanicBoundary {
             tool: self.tool,

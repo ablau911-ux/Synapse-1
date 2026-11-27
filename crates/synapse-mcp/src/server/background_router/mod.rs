@@ -171,6 +171,15 @@ pub struct TargetActParams {
     /// `key` / `press`: explicit raw key list, e.g. `["ctrl", "end"]`.
     #[serde(default)]
     pub keys: Vec<String>,
+    /// `key` / `key_chord` / `press` with key(s) only: require an observed
+    /// Source-of-Truth delta after delivery (CDP targets: active-element
+    /// value/selection; native windows: target text/selection, then target
+    /// window UI/pixels). Defaults to true; a key with no observed effect fails
+    /// with ACTION_NO_OBSERVED_DELTA. `false` returns delivery-only and is
+    /// reported as `verify_needed` / `delivered_unverified` unless a readback
+    /// still observed a delta. Rejected for every other verb.
+    #[serde(default)]
+    pub verify_delta: Option<bool>,
     /// `set_selection`: zero-based selection start offset.
     #[serde(default, alias = "start")]
     pub selection_start: Option<u32>,
@@ -2279,6 +2288,7 @@ impl SynapseService {
     ) -> Result<Json<TargetActResponse>, ErrorData> {
         let params = params.0;
         let verb = params.verb.as_str().to_owned();
+        target_act_validate_verify_delta(&params)?;
         if !matches!(verb.as_str(), "read" | "screenshot")
             && let Some(element_id) = params.element_id.as_deref()
         {
@@ -8855,13 +8865,100 @@ async fn target_act_key_press(
     }
     let verb = params.verb.as_str();
     let keys = target_act_key_chord_keys(params, verb)?;
-    let press_params = target_act_press_params(keys, params.wait_timeout_ms, verb)?;
+    let verify_delta = params.verify_delta.unwrap_or(true);
+    let press_params = target_act_press_params(keys, params.wait_timeout_ms, verb, verify_delta)?;
     ensure_target_act_key_press_has_input_target(service, request_context, verb)?;
     ensure_target_act_operator_panic_boundary("key_before_input_delivery")?;
     let response = service
         .act_press(Parameters(press_params), request_context.clone())
         .await;
-    target_act_delegate_response("act_press", response)
+    let delegated = target_act_delegate_response("act_press", response)?;
+    let delegated = target_act_key_press_reject_pixel_only_verification(delegated);
+    Ok(target_act_key_press_unverified_when_not_requested(
+        delegated,
+        verify_delta,
+    ))
+}
+
+/// #333-H: a key press verified only by a target-window pixel change is not
+/// proof the key did anything. The pixel fallback hashes the whole window, so
+/// a blinking caret or any concurrent repaint satisfies it while the native
+/// text/selection readback saw no change. On the key/press facade, refuse that
+/// verification: report `ACTION_NO_OBSERVED_DELTA` marked as already delivered
+/// (`ok=false`, `verify_needed`, `delivered_unverified`) and keep the delegated
+/// readback as diagnostic evidence. `append_text` calls `act_press` directly
+/// for its Ctrl+End step and does not pass through this helper.
+fn target_act_key_press_reject_pixel_only_verification(
+    delegated: (&'static str, bool, &'static str, Value),
+) -> (&'static str, bool, &'static str, Value) {
+    let (tool, ok, status, result) = delegated;
+    if !ok
+        || status != TARGET_ACT_STATUS_OK
+        || !target_act_result_has_visual_pixel_verification(&result)
+    {
+        return (tool, ok, status, result);
+    }
+    let mut error = crate::m2::error_after_earlier_steps(
+        mcp_error(
+            error_codes::ACTION_NO_OBSERVED_DELTA,
+            format!(
+                "target_act key/press: {tool} delivered the key, but the only observed change was a target-window pixel signature (a caret blink or concurrent repaint can cause it); the native text/selection readback showed no delta, so the effect is unverified"
+            ),
+        ),
+        1,
+    );
+    if let Some(Value::Object(data)) = error.data.as_mut() {
+        data.insert(
+            "pixel_only_verification_rejected".to_owned(),
+            Value::Bool(true),
+        );
+        data.insert("delegated_readback".to_owned(), result);
+    }
+    let status = target_act_error_status(&error);
+    (tool, false, status, target_act_error_result(tool, error))
+}
+
+/// `verify_delta=false` asks for delivery only. A delivered press whose
+/// postcondition was not observed must not surface as `delivered_and_verified`:
+/// report it as `verify_needed` so the caller reads the effect itself.
+fn target_act_key_press_unverified_when_not_requested(
+    delegated: (&'static str, bool, &'static str, Value),
+    verify_delta: bool,
+) -> (&'static str, bool, &'static str, Value) {
+    let (tool, ok, status, result) = delegated;
+    if verify_delta || !ok {
+        return (tool, ok, status, result);
+    }
+    let observed = result
+        .pointer("/postcondition/observed_delta")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if observed {
+        (tool, ok, status, result)
+    } else {
+        (tool, false, TARGET_ACT_STATUS_VERIFY_NEEDED, result)
+    }
+}
+
+/// `verify_delta` is a keyboard postcondition switch on the facade: accept it
+/// only where it is wired (key, key_chord, and press with key(s)), so a caller
+/// never believes it requested a readback that a different verb ignores.
+fn target_act_validate_verify_delta(params: &TargetActParams) -> Result<(), ErrorData> {
+    if params.verify_delta.is_none() {
+        return Ok(());
+    }
+    let verb = params.verb.as_str();
+    let wired = matches!(verb, "key" | "key_chord")
+        || (verb == "press" && target_act_has_key_chord(params));
+    if wired {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!(
+            "target_act verify_delta is accepted only for verb=key, verb=key_chord, or verb=press with key/keys; verb={verb} does not use it (stroke: set stroke.verify_delta)"
+        ),
+    ))
 }
 
 /// OS-input safety: a raw key chord has no locator, so it may only be
@@ -8988,7 +9085,7 @@ async fn target_act_insert_or_append_text(
 
     if append {
         let press_params =
-            target_act_press_params(vec!["ctrl".to_owned(), "end".to_owned()], None, verb)?;
+            target_act_press_params(vec!["ctrl".to_owned(), "end".to_owned()], None, verb, true)?;
         ensure_target_act_operator_panic_boundary("append_text_before_move_caret_to_end")?;
         let key_response =
             match ensure_target_act_text_target_is_foreground(service, request_context) {
@@ -9840,11 +9937,12 @@ fn target_act_press_params(
     keys: Vec<String>,
     wait_timeout_ms: Option<u64>,
     verb: &str,
+    verify_delta: bool,
 ) -> Result<ActPressParams, ErrorData> {
     let verify_timeout_ms = target_act_verify_timeout(wait_timeout_ms, verb)?;
     let params: ActPressParams = serde_json::from_value(json!({
         "keys": keys,
-        "verify_delta": true,
+        "verify_delta": verify_delta,
         "verify_timeout_ms": verify_timeout_ms
     }))
     .map_err(|error| {
@@ -10229,11 +10327,16 @@ fn target_act_delivery_state_from_result(
 }
 
 /// True when a target_act result reports that the action's target closed on the
-/// press (`release_not_sent_target_closed`), meaning no readback ran (#341).
+/// press, meaning no live post-delivery readback ran: mouse/touch answers carry
+/// `release_not_sent_target_closed` (#341), key answers carry
+/// `key_up_not_posted_window_closed` (#329).
 fn target_act_result_reports_target_closed(value: &Value) -> bool {
-    value
-        .get("release_not_sent_target_closed")
-        .is_some_and(|closed| !closed.is_null())
+    [
+        "release_not_sent_target_closed",
+        "key_up_not_posted_window_closed",
+    ]
+    .iter()
+    .any(|field| value.get(*field).is_some_and(|closed| !closed.is_null()))
 }
 
 fn target_act_delivery_state(ok: bool, status: &str) -> &'static str {

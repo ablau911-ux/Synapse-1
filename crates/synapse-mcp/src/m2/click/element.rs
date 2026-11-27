@@ -406,6 +406,7 @@ pub(super) async fn execute_element_click(
         ),
     )];
     Ok(ActClickResponse {
+        foreground_note: None,
         ok: true,
         used_invoke_pattern,
         backend_used: backend_used.to_owned(),
@@ -592,6 +593,7 @@ async fn execute_coordinate_element_click(
     let backend_tier_used = click_backend_tier_used(&tier_attempts);
     let required_foreground = click_required_foreground(&tier_attempts);
     Ok(ActClickResponse {
+        foreground_note: None,
         ok: true,
         used_invoke_pattern: false,
         backend_used,
@@ -776,6 +778,7 @@ pub(super) async fn execute_element_postmessage_click(
         };
 
     Ok(ActClickResponse {
+        foreground_note: None,
         ok: true,
         used_invoke_pattern: false,
         backend_used,

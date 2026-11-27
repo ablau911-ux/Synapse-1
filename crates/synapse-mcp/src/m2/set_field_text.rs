@@ -106,6 +106,12 @@ pub struct ActSetFieldTextResponse {
     pub after_sha256: String,
     pub changed: bool,
     pub postcondition: ActPostcondition,
+    /// Present only when a background tier activated its target window but
+    /// the post-action readback still verified the text (#161): the call
+    /// succeeded, and this note carries the foreground change and the
+    /// foreground-restore attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_note: Option<serde_json::Value>,
     pub elapsed_ms: u32,
 }
 
@@ -402,6 +408,7 @@ pub(crate) async fn act_set_field_text_native(
         ..response.postcondition
     };
     Ok(ActSetFieldTextResponse {
+        foreground_note: None,
         ok: response.ok,
         method: response.method,
         backend_tier_used: response.backend_tier_used,
@@ -502,6 +509,7 @@ pub(crate) fn finish_replace_response(
         "readback=act_set_field_text method={method} before_len={before_len} after_len={after_len} requested_len={requested_len} changed={changed}"
     );
     Ok(ActSetFieldTextResponse {
+        foreground_note: None,
         ok: true,
         method: method.to_owned(),
         backend_tier_used: backend_tier_used.to_owned(),

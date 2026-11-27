@@ -234,6 +234,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
     let required_foreground = click_required_foreground(&tier_attempts);
 
     Ok(ActClickResponse {
+        foreground_note: None,
         ok: true,
         used_invoke_pattern: false,
         backend_used: backend_used_name(params.backend).to_owned(),
@@ -413,6 +414,7 @@ async fn execute_cdp_click(
     }
 
     Ok(ActClickResponse {
+        foreground_note: None,
         ok: true,
         used_invoke_pattern: false,
         backend_used: "cdp".to_owned(),

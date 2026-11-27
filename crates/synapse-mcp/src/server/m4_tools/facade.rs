@@ -440,12 +440,16 @@ pub(super) fn validate_process_query_params(
     let limit = params.limit.unwrap_or(match operation {
         ProcessOperation::List => PROCESS_LIST_DEFAULT_LIMIT,
         ProcessOperation::History => PROCESS_HISTORY_DEFAULT_LIMIT,
-        ProcessOperation::Launch => unreachable!("launch is not a query operation"),
+        ProcessOperation::Launch | ProcessOperation::Terminate => {
+            unreachable!("launch/terminate are not query operations")
+        }
     });
     let max_limit = match operation {
         ProcessOperation::List => PROCESS_LIST_MAX_LIMIT,
         ProcessOperation::History => PROCESS_HISTORY_MAX_LIMIT,
-        ProcessOperation::Launch => unreachable!("launch is not a query operation"),
+        ProcessOperation::Launch | ProcessOperation::Terminate => {
+            unreachable!("launch/terminate are not query operations")
+        }
     };
     if limit == 0 || limit > max_limit {
         return Err(process_facade_error(
@@ -644,6 +648,458 @@ pub(super) fn process_history_response(
         filters,
         rows: decoded_rows,
     })
+}
+
+const PROCESS_TERMINATE_DEFAULT_GRACE_MS: u64 = 5_000;
+const PROCESS_TERMINATE_MAX_GRACE_MS: u64 = 30_000;
+const PROCESS_TERMINATE_SOURCE_OF_TRUTH: &str = "session process-resource ledger (ownership) + launch-time Windows job object (ownership proof, membership and exit readback)";
+/// Poll interval of the job-empty readback during the graceful and forced waits.
+const PROCESS_TERMINATE_JOB_POLL_MS: u64 = 50;
+/// Bounded wait for the job to read back empty after `TerminateJobObject`.
+const PROCESS_TERMINATE_FORCED_EXIT_WAIT_MS: u64 = 5_000;
+/// Exit code given to job members ended by the forced step.
+const PROCESS_TERMINATE_FORCED_EXIT_CODE: u32 = 1;
+
+fn process_terminate_refused(
+    pid: u32,
+    message: impl Into<String>,
+    reason: &'static str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.into(),
+        Some(json!({
+            "code": error_codes::SAFETY_PERMISSION_DENIED,
+            "operation": ProcessOperation::Terminate.as_str(),
+            "source_of_truth": PROCESS_TERMINATE_SOURCE_OF_TRUTH,
+            "source_id": pid.to_string(),
+            "reason": reason,
+            "remediation": "process terminate only closes a process this MCP session started with process launch; use process history to read the launch pid",
+        })),
+    )
+}
+
+/// Validates `process terminate` input and returns `(pid, grace_ms)`.
+pub(super) fn validate_process_terminate_params(
+    params: &ProcessParams,
+) -> Result<(u32, u64), ErrorData> {
+    let operation = ProcessOperation::Terminate;
+    let mut unexpected = Vec::new();
+    for (field, present) in [
+        ("target", params.target.is_some()),
+        ("args", params.args.is_some()),
+        ("working_dir", params.working_dir.is_some()),
+        ("env", params.env.is_some()),
+        (
+            "wait_for_window_title_regex",
+            params.wait_for_window_title_regex.is_some(),
+        ),
+        ("idempotency_key", params.idempotency_key.is_some()),
+        ("cdp_debug", params.cdp_debug.is_some()),
+        (
+            "force_renderer_accessibility",
+            params.force_renderer_accessibility.is_some(),
+        ),
+        (
+            "windows_console_window_state",
+            params.windows_console_window_state.is_some(),
+        ),
+        ("desktop", params.desktop.is_some()),
+        (
+            "process_name_contains",
+            params.process_name_contains.is_some(),
+        ),
+        (
+            "command_line_contains",
+            params.command_line_contains.is_some(),
+        ),
+        ("limit", params.limit.is_some()),
+        (
+            "include_command_line",
+            params.include_command_line.is_some(),
+        ),
+    ] {
+        if present {
+            unexpected.push(field);
+        }
+    }
+    process_unexpected_fields(operation, params, &unexpected)?;
+    let pid = params.pid.filter(|pid| *pid != 0).ok_or_else(|| {
+        process_facade_error(
+            operation,
+            operation.as_str(),
+            "process operation=terminate requires a non-zero pid",
+            "pass the pid returned by process launch (or read it from process history)",
+        )
+    })?;
+    let grace_ms = params
+        .timeout_ms
+        .unwrap_or(PROCESS_TERMINATE_DEFAULT_GRACE_MS);
+    if grace_ms == 0 || grace_ms > PROCESS_TERMINATE_MAX_GRACE_MS {
+        return Err(process_facade_error(
+            operation,
+            grace_ms.to_string(),
+            format!(
+                "process operation=terminate timeout_ms must be between 1 and {PROCESS_TERMINATE_MAX_GRACE_MS}"
+            ),
+            "use a bounded graceful-exit wait",
+        ));
+    }
+    Ok((pid, grace_ms))
+}
+
+/// #333-J: closes a process this MCP session launched. The session
+/// process-resource ledger is the ownership authority: a pid this session did
+/// not launch through `process launch` is refused before any signal is sent.
+/// Every destructive step is bound to the Windows job object created at launch,
+/// never to a pid read later, so a pid the OS reused for another process is
+/// never closed or killed: the worker pins live job members with open process
+/// handles before `WM_CLOSE`, forces with `TerminateJobObject`, and reads the
+/// job itself back empty (children whose root already exited included) before
+/// it reports `terminated` or releases the ledger. The request's operator-panic
+/// epoch is rechecked immediately before every `WM_CLOSE` and before the force.
+pub(super) async fn process_terminate_response(
+    service: &SynapseService,
+    session_id: Option<String>,
+    pid: u32,
+    grace_ms: u64,
+    preflight: &crate::server::action_preflight::ActionPreflightReadback,
+) -> Result<ProcessTerminateResponse, ErrorData> {
+    let Some(session_id) = session_id else {
+        return Err(process_terminate_refused(
+            pid,
+            "process terminate requires an MCP session: only a process the calling session launched can be closed",
+            "no_mcp_session",
+        ));
+    };
+    let Some(owned) = service.session_launched_process(&session_id, pid)? else {
+        return Err(process_terminate_refused(
+            pid,
+            format!(
+                "process terminate refused pid {pid}: it was not launched by this MCP session through process launch"
+            ),
+            "pid_not_launched_by_this_session",
+        ));
+    };
+    let Some(process_job) = owned.process_job else {
+        return Err(process_terminate_refused(
+            pid,
+            format!(
+                "process terminate refused pid {pid}: its launch holds no Windows job object, so ownership of a live process cannot be proven"
+            ),
+            "launch_job_unavailable",
+        ));
+    };
+
+    let boundary =
+        ProcessTerminateMutationBoundary::capture(preflight, "process_terminate_before_worker")?;
+    let mut readback = tokio::task::spawn_blocking(move || {
+        process_terminate_job(pid, &process_job, grace_ms, &boundary)
+    })
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("process terminate worker failed for pid {pid}: {error}"),
+        )
+    })?;
+    let operator_panic_stop = readback.operator_panic_stop.take();
+    let terminated =
+        operator_panic_stop.is_none() && readback.job_active_processes_after == Some(0);
+    let ledger_released = if terminated {
+        service.release_session_launched_process(&session_id, pid)?
+    } else {
+        false
+    };
+    tracing::info!(
+        code = "PROCESS_TERMINATE_READBACK",
+        session_id,
+        pid,
+        terminated,
+        exited_gracefully = readback.exited_gracefully,
+        forced = readback.forced_termination.is_some(),
+        job_active_after = ?readback.job_active_processes_after,
+        remaining = ?readback.remaining_process_ids,
+        operator_panic_stop = ?operator_panic_stop.as_ref().map(|(stage, _)| *stage),
+        ledger_released,
+        "readback=process_terminate"
+    );
+    let response = ProcessTerminateResponse {
+        pid,
+        source_of_truth: PROCESS_TERMINATE_SOURCE_OF_TRUTH.to_owned(),
+        ownership: "launched_by_this_mcp_session".to_owned(),
+        launch_target: owned.launch_target,
+        registered_at_unix_ms: owned.registered_at_unix_ms,
+        process_ids_before: readback.process_ids_before,
+        live_process_ids_before: readback.live_process_ids_before,
+        close_requested_hwnds: readback.close_requested_hwnds,
+        close_request_errors: readback.close_request_errors,
+        graceful_wait_ms: readback.graceful_wait_ms,
+        exited_gracefully: readback.exited_gracefully,
+        forced_termination: readback.forced_termination,
+        remaining_process_ids: readback.remaining_process_ids,
+        job_active_processes_after: readback.job_active_processes_after,
+        job_readback_errors: readback.job_readback_errors,
+        terminated,
+        ledger_released,
+    };
+    if let Some((stage, error)) = operator_panic_stop {
+        // Any WM_CLOSE already sent stays in the evidence.
+        return Err(super::action_preflight_cleanup_error(
+            error,
+            stage,
+            json!({
+                "source_of_truth": PROCESS_TERMINATE_SOURCE_OF_TRUTH,
+                "readback": response,
+            }),
+        ));
+    }
+    if terminated {
+        return Ok(response);
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "process terminate could not empty the launch job of pid {pid}: job members {:?} (active count {:?}) remain after the graceful close and a forced TerminateJobObject",
+            response.remaining_process_ids, response.job_active_processes_after
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_POSTCONDITION_FAILED,
+            "operation": ProcessOperation::Terminate.as_str(),
+            "source_of_truth": PROCESS_TERMINATE_SOURCE_OF_TRUTH,
+            "readback": response,
+            "remediation": "read process list for the remaining pids; session teardown also closes this session's launched processes",
+        })),
+    ))
+}
+
+/// Operator-panic admission of one terminate request (#333-J). The routed
+/// request reserves its mutation ownership and snapshots its admission epoch
+/// before the blocking worker starts; the worker has no task-local boundary,
+/// so it rechecks both armed epochs through this value immediately before each
+/// physical mutation.
+struct ProcessTerminateMutationBoundary {
+    preflight: crate::server::action_preflight::ActionPreflightReadback,
+    mcp: crate::server::operator_panic_boundary::McpOperatorPanicBoundarySnapshot,
+}
+
+impl ProcessTerminateMutationBoundary {
+    fn capture(
+        preflight: &crate::server::action_preflight::ActionPreflightReadback,
+        stage: &'static str,
+    ) -> Result<Self, ErrorData> {
+        super::ensure_m4_physical_mutation_boundary(preflight, stage)?;
+        let mcp =
+            crate::server::operator_panic_boundary::reserve_and_snapshot_current_mcp_boundary(
+                stage,
+            )?;
+        Ok(Self {
+            preflight: preflight.clone(),
+            mcp,
+        })
+    }
+
+    fn ensure(&self, stage: &'static str) -> Result<(), ErrorData> {
+        self.mcp.ensure_admission_epoch(stage)?;
+        crate::m2::ensure_operator_panic_action_admission(
+            self.preflight.tool,
+            stage,
+            self.preflight.operator_panic_epoch_at_arm,
+        )
+    }
+}
+
+#[derive(Default)]
+struct ProcessTerminateJobReadback {
+    process_ids_before: Vec<u32>,
+    live_process_ids_before: Vec<u32>,
+    close_requested_hwnds: Vec<i64>,
+    close_request_errors: Vec<String>,
+    graceful_wait_ms: u64,
+    exited_gracefully: bool,
+    forced_termination: Option<crate::m4::OwnedProcessTerminationReadback>,
+    remaining_process_ids: Vec<u32>,
+    job_active_processes_after: Option<u32>,
+    job_readback_errors: Vec<String>,
+    /// The mutation boundary that refused after the operator panic, with its error.
+    operator_panic_stop: Option<(&'static str, ErrorData)>,
+}
+
+/// Blocking graceful-then-forced close of one launch job. Nothing here
+/// resolves a pid into a process to act on: windows are matched only to
+/// pinned job members, and the force ends the job itself.
+fn process_terminate_job(
+    pid: u32,
+    job: &crate::m4::OwnedProcessJob,
+    grace_ms: u64,
+    boundary: &ProcessTerminateMutationBoundary,
+) -> ProcessTerminateJobReadback {
+    let mut readback = ProcessTerminateJobReadback::default();
+    match job.member_process_ids() {
+        Ok(process_ids) => readback.process_ids_before = process_ids,
+        Err(error) => readback
+            .job_readback_errors
+            .push(format!("job membership before close: {error}")),
+    }
+    let members = match job.pin_live_members(&readback.process_ids_before) {
+        Ok((members, unproven)) => {
+            readback.close_request_errors.extend(unproven);
+            members
+        }
+        Err(error) => {
+            readback
+                .job_readback_errors
+                .push(format!("job member pinning before close: {error}"));
+            Vec::new()
+        }
+    };
+    readback.live_process_ids_before = members
+        .iter()
+        .map(crate::m4::OwnedJobMemberProcess::pid)
+        .collect();
+    process_terminate_request_close(&members, boundary, &mut readback);
+    // The pins are needed only while windows are matched to members.
+    drop(members);
+
+    if readback.operator_panic_stop.is_none() && !readback.close_requested_hwnds.is_empty() {
+        let (active, waited_ms) = wait_for_owned_job_empty(job, Duration::from_millis(grace_ms));
+        readback.graceful_wait_ms = waited_ms;
+        readback.exited_gracefully = matches!(active, Ok(0));
+        if let Err(error) = active {
+            readback
+                .job_readback_errors
+                .push(format!("job active count during graceful wait: {error}"));
+        }
+    }
+    if readback.operator_panic_stop.is_none()
+        && !readback.exited_gracefully
+        && !matches!(job.active_process_count(), Ok(0))
+    {
+        let stage = "process_terminate_before_force";
+        match boundary.ensure(stage) {
+            Ok(()) => readback.forced_termination = Some(process_terminate_force_job(pid, job)),
+            Err(error) => readback.operator_panic_stop = Some((stage, error)),
+        }
+    }
+    process_terminate_final_job_readback(job, &mut readback);
+    readback
+}
+
+/// Sends `WM_CLOSE` to the visible top-level windows of pinned job members,
+/// rechecking the operator-panic epoch immediately before each one.
+fn process_terminate_request_close(
+    members: &[crate::m4::OwnedJobMemberProcess],
+    boundary: &ProcessTerminateMutationBoundary,
+    readback: &mut ProcessTerminateJobReadback,
+) {
+    if members.is_empty() {
+        return;
+    }
+    let windows = match synapse_a11y::visible_top_level_window_contexts() {
+        Ok(windows) => windows,
+        Err(error) => {
+            readback
+                .close_request_errors
+                .push(format!("visible window enumeration failed: {error}"));
+            return;
+        }
+    };
+    for window in &windows {
+        let Some(member) = members.iter().find(|member| member.pid() == window.pid) else {
+            continue;
+        };
+        let stage = "process_terminate_before_wm_close";
+        if let Err(error) = boundary.ensure(stage) {
+            readback.operator_panic_stop = Some((stage, error));
+            return;
+        }
+        match member.post_close_to_own_window(window.hwnd) {
+            Ok(true) => readback.close_requested_hwnds.push(window.hwnd),
+            Ok(false) => {}
+            Err(error) => readback.close_request_errors.push(error),
+        }
+    }
+}
+
+/// Ends every process in the launch job with `TerminateJobObject` and waits
+/// for the job to read back empty.
+fn process_terminate_force_job(
+    pid: u32,
+    job: &crate::m4::OwnedProcessJob,
+) -> crate::m4::OwnedProcessTerminationReadback {
+    let process_ids = job.member_process_ids().unwrap_or_default();
+    let terminate = job.terminate_all(PROCESS_TERMINATE_FORCED_EXIT_CODE);
+    let active = if terminate.is_ok() {
+        wait_for_owned_job_empty(
+            job,
+            Duration::from_millis(PROCESS_TERMINATE_FORCED_EXIT_WAIT_MS),
+        )
+        .0
+    } else {
+        job.active_process_count()
+    };
+    let status = match (&terminate, &active) {
+        (Err(error), _) => format!("terminate_job_object_failed:{error}"),
+        (Ok(()), Ok(0)) => "terminate_job_object_job_empty".to_owned(),
+        (Ok(()), Ok(count)) => format!("terminate_job_object_job_not_empty:active={count}"),
+        (Ok(()), Err(error)) => format!("terminate_job_object_readback_failed:{error}"),
+    };
+    let remaining_process_ids = if matches!(active, Ok(0)) {
+        Vec::new()
+    } else {
+        job.member_process_ids()
+            .unwrap_or_else(|_| process_ids.clone())
+    };
+    crate::m4::OwnedProcessTerminationReadback {
+        pid,
+        process_ids: process_ids.clone(),
+        live_process_ids_before: process_ids,
+        attempted: true,
+        status,
+        remaining_process_ids,
+    }
+}
+
+/// The exit readback: the job's own live process count and member list.
+fn process_terminate_final_job_readback(
+    job: &crate::m4::OwnedProcessJob,
+    readback: &mut ProcessTerminateJobReadback,
+) {
+    match job.active_process_count() {
+        Ok(0) => {
+            readback.job_active_processes_after = Some(0);
+            readback.remaining_process_ids = Vec::new();
+        }
+        Ok(count) => {
+            readback.job_active_processes_after = Some(count);
+            match job.member_process_ids() {
+                Ok(process_ids) => readback.remaining_process_ids = process_ids,
+                Err(error) => readback
+                    .job_readback_errors
+                    .push(format!("job membership after close: {error}")),
+            }
+        }
+        Err(error) => readback
+            .job_readback_errors
+            .push(format!("job active count after close: {error}")),
+    }
+}
+
+/// Polls the job's live process count until it reads zero, the readback
+/// fails, or `timeout` elapses. Returns the last readback and the waited ms.
+fn wait_for_owned_job_empty(
+    job: &crate::m4::OwnedProcessJob,
+    timeout: Duration,
+) -> (Result<u32, String>, u64) {
+    let started = std::time::Instant::now();
+    loop {
+        let active = job.active_process_count();
+        if matches!(active, Ok(0) | Err(_)) || started.elapsed() >= timeout {
+            let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return (active, waited_ms);
+        }
+        std::thread::sleep(Duration::from_millis(PROCESS_TERMINATE_JOB_POLL_MS));
+    }
 }
 
 pub(super) fn json_u32_field(value: &Value, field: &str) -> Option<u32> {

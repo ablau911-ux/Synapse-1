@@ -50,6 +50,12 @@ pub struct ActSetValueResponse {
     pub target_text_integrity: String,
     pub target_readback_required: bool,
     pub postcondition: ActPostcondition,
+    /// Present only when the background set activated its target window but
+    /// the separate readback still verified the text (#161): the call
+    /// succeeded, and this note carries the foreground change and the
+    /// foreground-restore attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_note: Option<serde_json::Value>,
     pub elapsed_ms: u32,
 }
 
@@ -153,6 +159,7 @@ pub(crate) async fn act_set_value_with_boundary(
     );
 
     Ok(ActSetValueResponse {
+        foreground_note: None,
         ok: true,
         backend_tier_used: set_backend_tier(&set_readback).to_owned(),
         required_foreground: false,

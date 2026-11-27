@@ -116,6 +116,12 @@ pub struct ActClickResponse {
     pub required_foreground: bool,
     pub tier_attempts: Vec<ActClickTierAttempt>,
     pub postcondition: ActClickPostcondition,
+    /// Present only when a background click activated its target window but
+    /// the post-action readback still verified the effect (#161): the click
+    /// succeeded, and this note carries the foreground change and the
+    /// foreground-restore attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_note: Option<serde_json::Value>,
     pub press_hold_ms: u32,
     pub double_click_window_ms: u32,
     pub inter_click_delay_ms: u32,

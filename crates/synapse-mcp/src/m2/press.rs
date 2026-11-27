@@ -150,6 +150,91 @@ pub(crate) async fn act_press_cdp_target(
     })
 }
 
+/// Presses keys on a normal Chrome bridge tab, one with no raw-CDP endpoint
+/// (#328). The keys go through the bridge `cdpInput action=key` lane with the
+/// same key table as the raw-CDP tier: the extension activates the tab inside
+/// its Chrome window, presses the chord with `Input.dispatchKeyEvent`, and
+/// reads the focused element before and `settle_ms` after the last key-up.
+pub(crate) async fn act_press_chrome_bridge_target(
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    params: ActPressParams,
+    settle_ms: u32,
+    boundary: super::OperatorPanicActionBoundary,
+) -> Result<
+    (
+        ActPressResponse,
+        crate::chrome_debugger_bridge::ChromeDebuggerCdpKeyInputResult,
+    ),
+    ErrorData,
+> {
+    let started = Instant::now();
+    let keys = keys::normalized_keys(&params.keys)?;
+    let key_count = u32::try_from(keys.len()).map_err(|_err| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_press keys length exceeds u32::MAX",
+        )
+    })?;
+    validate_hold_ms(params.hold_ms)?;
+    let strokes = cdp_key_strokes(&keys)?
+        .iter()
+        .map(cdp_bridge_key_stroke)
+        .collect::<Vec<_>>();
+    boundary.ensure("immediately_before_chrome_bridge_press_key_sequence")?;
+    let readback = crate::chrome_debugger_bridge::cdp_input_key(
+        crate::chrome_debugger_bridge::ChromeDebuggerCdpKeyInputRequest {
+            hwnd: window_hwnd,
+            target_id: cdp_target_id,
+            keys: &strokes,
+            hold_ms: params.hold_ms,
+            settle_ms,
+        },
+    )
+    .await
+    .map_err(|error| {
+        crate::m2::error_after_bridge_input(
+            mcp_error(
+                error.code(),
+                format!(
+                    "act_press Chrome bridge Input.dispatchKeyEvent failed for target {cdp_target_id:?}: {}",
+                    error.detail()
+                ),
+            ),
+            &error,
+        )
+    })?;
+    Ok((
+        ActPressResponse {
+            ok: true,
+            keys_pressed: key_count,
+            elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
+            backend_tier_used: "chrome_bridge_cdp".to_owned(),
+            required_foreground: false,
+            postcondition: press_postcondition_not_requested(),
+            key_up_not_posted_window_closed: None,
+        },
+        readback,
+    ))
+}
+
+/// One raw-CDP key stroke as the `Input.dispatchKeyEvent` field object the
+/// bridge extension dispatches.
+fn cdp_bridge_key_stroke(stroke: &synapse_a11y::CdpKeyStroke) -> serde_json::Value {
+    serde_json::json!({
+        "key": stroke.key,
+        "code": stroke.code,
+        "windowsVirtualKeyCode": stroke.windows_virtual_key_code,
+        "nativeVirtualKeyCode": stroke.native_virtual_key_code,
+        "keyIdentifier": stroke.key_identifier,
+        "text": stroke.text,
+        "unmodifiedText": stroke.unmodified_text,
+        "location": stroke.location,
+        "modifierBit": stroke.modifier_bit,
+    })
+}
+
 /// How the caller of a PostMessage key press finishes building the answer.
 pub(crate) enum PostKeyDelivery {
     /// The target window is live; verify the delta by reading it back.

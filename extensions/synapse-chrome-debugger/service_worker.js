@@ -2,6 +2,11 @@ const PROTOCOL_VERSION = 1;
 const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-09-16-pre-calyx-preserve-extensions-v1";
 const BRIDGE_DECLARED_BUILD_SHA256 = "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
+// cdpInput action=key bounds (#328). Hold mirrors the daemon's act_press
+// MAX_HOLD_MS; settle is the post-dispatch wait before the active-element readback.
+const CDP_KEY_STROKES_MAX = 32;
+const CDP_KEY_HOLD_MS_MAX = 30000;
+const CDP_KEY_SETTLE_MS_MAX = 30000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
 // EVALUATE_TIMEOUT_MAX_MS for legitimately slow expressions.
@@ -7683,6 +7688,16 @@ async function handleCdpInput(params) {
       suppressPageText
     );
   }
+  if (action === "key") {
+    return await handleCdpInputKey(
+      selected,
+      params,
+      before,
+      beforePageText,
+      waitTimeoutMs,
+      suppressPageText
+    );
+  }
   let point;
   let frameId = 0;
   let resolved = {
@@ -8593,6 +8608,149 @@ async function dispatchCdpTextInput(tabId, action, text) {
   }
 }
 
+// #328: real key presses (Enter, Tab, arrows, chords) on a normal Chrome bridge
+// tab through chrome.debugger Input.dispatchKeyEvent. Key events are delivered
+// only to the ACTIVE tab (the tap/drag lanes share this constraint), so the
+// owned tab is activated inside its Chrome window first; this is not OS
+// foreground theft. The focused element is read before and after so the
+// daemon can verify the keyboard delta.
+async function handleCdpInputKey(
+  selected,
+  params,
+  before,
+  beforePageText,
+  waitTimeoutMs,
+  suppressPageText = false
+) {
+  const strokes = normalizeCdpKeyStrokes(params.keys);
+  const baseModifiers = cdpModifierBitmask(params.modifiers);
+  const holdMs = normalizeCdpKeyDelayMs(params.holdMs, CDP_KEY_HOLD_MS_MAX, "holdMs");
+  const settleMs = normalizeCdpKeyDelayMs(params.settleMs, CDP_KEY_SETTLE_MS_MAX, "settleMs");
+  const tabActivation = await activateTabForCdpTouch(selected.tabId, before, "key");
+  const beforeActiveElement = await tabActiveElementState(selected.tabId);
+  const dispatch = await dispatchCdpKeyStrokes(selected.tabId, strokes, baseModifiers, holdMs);
+  // The key events were acknowledged: every failure below is after delivered input.
+  if (settleMs > 0) {
+    await sleep(settleMs);
+  }
+  const afterActiveElement = await afterInput(tabActiveElementState(selected.tabId));
+  const after = await afterInput(waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs));
+  const afterPageText = await afterInput(tabPageTextState(selected.tabId, suppressPageText));
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.chrome_window_id,
+    action: "key",
+    before_page: before,
+    after_page: after,
+    before_page_text: beforePageText,
+    after_page_text: afterPageText,
+    readback_backend: "chrome.debugger.Input.dispatchKeyEvent+chrome.scripting.executeScript(active-element readback)",
+    required_foreground: false,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason,
+    method: dispatch.method,
+    dispatched_events: dispatch.dispatched_events,
+    debugger_protocol_version: dispatch.protocol_version,
+    debugger_attachment: dispatch.debugger_attachment,
+    tab_activation_for_input: tabActivation,
+    keys_dispatched: strokes.length,
+    hold_ms: holdMs,
+    settle_ms: settleMs,
+    before_active_element: beforeActiveElement,
+    after_active_element: afterActiveElement
+  };
+}
+
+// Presses the strokes as one chord, exactly like the raw-CDP press path: each
+// key goes down in order with the modifiers held so far, the chord is held for
+// holdMs, then every key that may be down is released in reverse order. A key
+// whose keyDown was sent is always released, even after a failure, so no key
+// stays held in the renderer.
+async function dispatchCdpKeyStrokes(tabId, strokes, baseModifiers, holdMs) {
+  let attachment;
+  try {
+    attachment = await attachDebuggerForCommand(tabId);
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger key dispatch could not attach to tab ${tabId}: ${errorMessage(error)}`
+    );
+  }
+  const { debuggee, protocolVersion } = attachment;
+  const dispatched = [];
+  const possiblyHeld = [];
+  let modifiers = baseModifiers;
+  let primaryError = null;
+  // True once a key event of this dispatch was acknowledged.
+  let delivered = false;
+  try {
+    for (const stroke of strokes) {
+      const type = stroke.text !== null ? "keyDown" : "rawKeyDown";
+      const eventModifiers = modifiers | stroke.modifierBit;
+      // Delivery is ambiguous until acknowledged: release it either way.
+      possiblyHeld.push(stroke);
+      modifiers = eventModifiers;
+      try {
+        await sendDebuggerCommand(
+          debuggee,
+          "Input.dispatchKeyEvent",
+          cdpKeyEventParams(stroke, type, eventModifiers)
+        );
+        delivered = true;
+        dispatched.push(`${type}(${stroke.key})`);
+      } catch (error) {
+        primaryError = error;
+        break;
+      }
+    }
+    if (primaryError === null && holdMs > 0) {
+      await sleep(holdMs);
+    }
+    const releaseFailures = [];
+    for (const stroke of possiblyHeld.reverse()) {
+      if (stroke.modifierBit !== 0) {
+        modifiers &= ~stroke.modifierBit;
+      }
+      try {
+        await sendDebuggerCommand(
+          debuggee,
+          "Input.dispatchKeyEvent",
+          cdpKeyEventParams(stroke, "keyUp", modifiers)
+        );
+        delivered = true;
+        dispatched.push(`keyUp(${stroke.key})`);
+      } catch (error) {
+        releaseFailures.push(errorMessage(error));
+      }
+    }
+    if (primaryError !== null || releaseFailures.length > 0) {
+      const failure = bridgeError(
+        ERROR_ATTACH_FAILED,
+        `chrome.debugger key dispatch failed for tab ${tabId}: ` +
+          `key_down_error=${primaryError === null ? "none" : JSON.stringify(errorMessage(primaryError))} ` +
+          `key_up_errors=${JSON.stringify(releaseFailures)} dispatched=${JSON.stringify(dispatched)}`
+      );
+      throw delivered ? errorAfterInput(failure) : failure;
+    }
+    return {
+      method: "Input.dispatchKeyEvent",
+      dispatched_events: dispatched,
+      protocol_version: protocolVersion,
+      debugger_attachment: attachment.persistent ? "persistent_session" : "transient_attach"
+    };
+  } finally {
+    if (attachment.shouldDetach) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for key input tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
 async function handleViewportEmulation(params) {
   requireDebuggerApiAvailable("viewportEmulation", params);
   const selected = await selectTabTarget(params, { requireTargetId: true });
@@ -9113,14 +9271,99 @@ function normalizeCdpInputAction(value) {
     action === "type_text" ||
     action === "drag" ||
     action === "html5_drag" ||
-    action === "html5_real_drag"
+    action === "html5_real_drag" ||
+    action === "key"
   ) {
     return action;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `cdpInput action must be hover, tap, click, dblclick, set_text, type_text, drag, html5_drag, or html5_real_drag; got ${JSON.stringify(value)}`
+    `cdpInput action must be hover, tap, click, dblclick, set_text, type_text, drag, html5_drag, html5_real_drag, or key; got ${JSON.stringify(value)}`
   );
+}
+
+// #328: cdpInput action=key receives ready-made Input.dispatchKeyEvent strokes.
+// The daemon maps key names to strokes with the same table its raw-CDP press
+// path uses, so this side only validates the shape and dispatches them.
+function normalizeCdpKeyStrokes(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > CDP_KEY_STROKES_MAX) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `cdpInput key requires 1..=${CDP_KEY_STROKES_MAX} key strokes; got ` +
+        `${Array.isArray(value) ? value.length : typeof value}`
+    );
+  }
+  return value.map((item, index) => {
+    const key = typeof item?.key === "string" ? item.key : "";
+    const code = typeof item?.code === "string" ? item.code : "";
+    const vk = Number(item?.windowsVirtualKeyCode);
+    const nativeVk = item?.nativeVirtualKeyCode == null ? vk : Number(item.nativeVirtualKeyCode);
+    const modifierBit = Number(item?.modifierBit ?? 0);
+    if (
+      key.length === 0 ||
+      code.length === 0 ||
+      !Number.isSafeInteger(vk) || vk < 0 || vk > 255 ||
+      !Number.isSafeInteger(nativeVk) || nativeVk < 0 || nativeVk > 255 ||
+      ![0, 1, 2, 4, 8].includes(modifierBit)
+    ) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `cdpInput key stroke ${index} is invalid: ${JSON.stringify(item)}`
+      );
+    }
+    const optionalText = (field) =>
+      typeof field === "string" && field.length > 0 ? field : null;
+    return {
+      key,
+      code,
+      windowsVirtualKeyCode: vk,
+      nativeVirtualKeyCode: nativeVk,
+      keyIdentifier: optionalText(item.keyIdentifier),
+      text: optionalText(item.text),
+      unmodifiedText: optionalText(item.unmodifiedText),
+      location: Number.isSafeInteger(item.location) ? item.location : null,
+      modifierBit
+    };
+  });
+}
+
+function normalizeCdpKeyDelayMs(value, max, field) {
+  if (value === undefined || value === null) {
+    return 0;
+  }
+  const ms = Number(value);
+  if (!Number.isSafeInteger(ms) || ms < 0 || ms > max) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `cdpInput key ${field} must be an integer 0..=${max}; got ${JSON.stringify(value)}`
+    );
+  }
+  return ms;
+}
+
+// Same field set the raw-CDP press path sends (synapse-a11y cdp_key_event).
+function cdpKeyEventParams(stroke, type, modifiers) {
+  const params = {
+    type,
+    modifiers,
+    key: stroke.key,
+    code: stroke.code,
+    windowsVirtualKeyCode: stroke.windowsVirtualKeyCode,
+    nativeVirtualKeyCode: stroke.nativeVirtualKeyCode
+  };
+  if (stroke.keyIdentifier !== null) {
+    params.keyIdentifier = stroke.keyIdentifier;
+  }
+  if (stroke.text !== null) {
+    params.text = stroke.text;
+  }
+  if (stroke.unmodifiedText !== null) {
+    params.unmodifiedText = stroke.unmodifiedText;
+  }
+  if (stroke.location !== null) {
+    params.location = stroke.location;
+  }
+  return params;
 }
 
 // CDP Input.dispatchMouseEvent modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
@@ -20761,7 +21004,9 @@ function readActiveElementInPage() {
       id: "",
       name: "",
       value: null,
-      selected_text: null
+      selected_text: null,
+      selection_start: null,
+      selection_end: null
     };
   }
   const tagName = String(element.tagName || "");
@@ -20770,6 +21015,31 @@ function readActiveElementInPage() {
     element.isContentEditable ||
     String(element.getAttribute?.("contenteditable") || "").toLowerCase() === "true";
   const valueCapable = "value" in element;
+  // Caret/selection offsets let a key-press readback see caret moves (arrows,
+  // Home/End) that leave the value unchanged (#328).
+  let selectionStart = null;
+  let selectionEnd = null;
+  try {
+    if (typeof element.selectionStart === "number" && typeof element.selectionEnd === "number") {
+      selectionStart = element.selectionStart;
+      selectionEnd = element.selectionEnd;
+    } else if (contentEditable) {
+      const selection = document.getSelection?.();
+      if (selection && selection.rangeCount > 0) {
+        const range = selection.getRangeAt(0);
+        if (element.contains(range.startContainer) && element.contains(range.endContainer)) {
+          const prefix = document.createRange();
+          prefix.selectNodeContents(element);
+          prefix.setEnd(range.startContainer, range.startOffset);
+          selectionStart = prefix.toString().length;
+          selectionEnd = selectionStart + range.toString().length;
+        }
+      }
+    }
+  } catch (_) {
+    selectionStart = null;
+    selectionEnd = null;
+  }
   const isEditable =
     contentEditable ||
     lowerTag === "textarea" ||
@@ -20801,7 +21071,9 @@ function readActiveElementInPage() {
     id: String(element.id || ""),
     name: String(element.getAttribute?.("name") || ""),
     value,
-    selected_text: selectedText
+    selected_text: selectedText,
+    selection_start: selectionStart,
+    selection_end: selectionEnd
   };
 
   function readContentEditableValue(el) {

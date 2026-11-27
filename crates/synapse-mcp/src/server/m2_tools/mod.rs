@@ -23,9 +23,10 @@ use crate::m2::{
     OperatorPanicActionBoundary, PostKeyDelivery, PressBackend, ResolvedKeymapPress, TypeBackend,
     act_click_postmessage_with_params, act_focus_window_with_boundary,
     act_keymap_response_from_press, act_pad_with_handle_and_boundary, act_press_cdp_target,
-    act_press_normalized_labels, act_press_postmessage_target, act_press_with_handle_and_boundary,
-    act_scroll_with_handle_and_boundary, act_set_value_with_boundary, act_stroke_cdp_target,
-    act_stroke_error_details, act_stroke_request_details, act_stroke_with_handle_and_boundary,
+    act_press_chrome_bridge_target, act_press_normalized_labels, act_press_postmessage_target,
+    act_press_with_handle_and_boundary, act_scroll_with_handle_and_boundary,
+    act_set_value_with_boundary, act_stroke_cdp_target, act_stroke_error_details,
+    act_stroke_request_details, act_stroke_with_handle_and_boundary,
     act_type_with_handle_and_boundary, action_from_press_params, action_from_type_params,
     attach_click_tier_attempts, click_params_can_route_background_first,
     click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
@@ -4603,14 +4604,26 @@ impl SynapseService {
         params: ActPressParams,
         boundary: OperatorPanicActionBoundary,
     ) -> Result<ActPressResponse, ErrorData> {
-        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
-            mcp_error(
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            // #328: a normal Chrome bridge tab has no raw-CDP endpoint; its keys
+            // go through the bridge cdpInput lane instead.
+            if is_chrome_bridge_target_id(&cdp_target_id) {
+                return self
+                    .act_press_chrome_bridge_background_target(
+                        window_hwnd,
+                        &cdp_target_id,
+                        params,
+                        boundary,
+                    )
+                    .await;
+            }
+            return Err(mcp_error(
                 error_codes::A11Y_CDP_UNREACHABLE,
                 format!(
                     "act_press background CDP target requires a reachable CDP endpoint for window_hwnd {window_hwnd:#x}"
                 ),
-            )
-        })?;
+            ));
+        };
         let before = if params.verify_delta {
             Some(
                 self.capture_cdp_keyboard_delta_signature(&endpoint, &cdp_target_id)
@@ -4671,6 +4684,49 @@ impl SynapseService {
                     }
                 }
             }
+        }
+        Ok(response)
+    }
+
+    /// `act_press` on a normal Chrome bridge tab (#328). The extension reads the
+    /// focused element before the chord and `verify_timeout_ms` after it; the
+    /// same keyboard delta check as the raw-CDP tier judges the two readings.
+    async fn act_press_chrome_bridge_background_target(
+        &self,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        params: ActPressParams,
+        boundary: OperatorPanicActionBoundary,
+    ) -> Result<ActPressResponse, ErrorData> {
+        let verify_delta = params.verify_delta;
+        let verify_timeout_ms = params.verify_timeout_ms;
+        let settle_ms = if verify_delta { verify_timeout_ms } else { 0 };
+        let (mut response, readback) =
+            act_press_chrome_bridge_target(window_hwnd, cdp_target_id, params, settle_ms, boundary)
+                .await?;
+        if verify_delta {
+            // The key events were dispatched before both readings were compared.
+            response.postcondition = chrome_bridge_keyboard_delta_signature(
+                cdp_target_id,
+                "before",
+                &readback.before_active_element,
+            )
+            .and_then(|before| {
+                let after = chrome_bridge_keyboard_delta_signature(
+                    cdp_target_id,
+                    "after",
+                    &readback.after_active_element,
+                )?;
+                verify_keyboard_delta_signature(
+                    "act_press",
+                    "chrome_bridge_active_element_value_or_selection",
+                    verify_timeout_ms,
+                    before,
+                    after,
+                    "observed Chrome bridge tab active-element value/selection change after Input.dispatchKeyEvent delivery",
+                )
+            })
+            .map_err(|error| crate::m2::error_after_earlier_steps(error, 1))?;
         }
         Ok(response)
     }
@@ -5248,6 +5304,38 @@ fn cdp_keyboard_delta_signature(
         selection_start: state.selection_start,
         selection_end: state.selection_end,
     }
+}
+
+/// Keyboard delta signature from a normal Chrome bridge active-element reading
+/// (#328). Same fields as the raw-CDP signature, so one check judges both tiers.
+fn chrome_bridge_keyboard_delta_signature(
+    cdp_target_id: &str,
+    phase: &str,
+    element: &crate::chrome_debugger_bridge::ChromeDebuggerActiveElement,
+) -> Result<CdpKeyboardDeltaSignature, ErrorData> {
+    if !element.available {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "act_press Chrome bridge {phase} active-element readback unavailable for target {cdp_target_id:?}: error_code={} error_detail={}",
+                element.error_code.as_deref().unwrap_or("none"),
+                element.error_detail.as_deref().unwrap_or("none"),
+            ),
+        ));
+    }
+    Ok(cdp_keyboard_delta_signature(
+        synapse_a11y::CdpActiveElementState {
+            target_id: cdp_target_id.to_owned(),
+            has_active_element: element.has_active_element.unwrap_or(false),
+            is_editable: element.is_editable.unwrap_or(false),
+            tag_name: element.tag_name.clone().unwrap_or_default(),
+            id: element.id.clone().unwrap_or_default(),
+            name: element.name.clone().unwrap_or_default(),
+            value: element.value.clone().unwrap_or_default(),
+            selection_start: element.selection_start,
+            selection_end: element.selection_end,
+        },
+    ))
 }
 
 fn press_background_target_candidate(params: &ActPressParams, recording_active: bool) -> bool {

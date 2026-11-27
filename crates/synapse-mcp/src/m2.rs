@@ -63,9 +63,9 @@ pub use press::{
 };
 pub(crate) use press::{
     HwndKeyboardTargetState, PostKeyDelivery, ResolvedKeymapPress, act_keymap_response_from_press,
-    act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
-    act_press_with_handle_and_boundary, delete_key_action, hwnd_keyboard_target_state,
-    resolve_keymap_press, select_all_chord_action,
+    act_press_cdp_target, act_press_chrome_bridge_target, act_press_normalized_labels,
+    act_press_postmessage_target, act_press_with_handle_and_boundary, delete_key_action,
+    hwnd_keyboard_target_state, resolve_keymap_press, select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub(crate) use scroll::act_scroll_with_handle_and_boundary;

@@ -3930,6 +3930,13 @@ pub struct ChromeDebuggerActiveElement {
     pub value: Option<String>,
     #[serde(default)]
     pub selected_text: Option<String>,
+    /// Caret/selection offsets of the focused element (value offsets for
+    /// inputs/textareas, text offsets for contenteditable); lets a key-press
+    /// readback see caret moves that leave the value unchanged (#328).
+    #[serde(default)]
+    pub selection_start: Option<u32>,
+    #[serde(default)]
+    pub selection_end: Option<u32>,
     #[serde(default)]
     pub error_code: Option<String>,
     #[serde(default)]
@@ -8910,6 +8917,69 @@ pub async fn cdp_input(
             }),
         )
         .await
+}
+
+/// `cdpInput action=key` on a normal Chrome bridge tab (#328). `keys` are
+/// ready-made `Input.dispatchKeyEvent` stroke objects (`key`, `code`,
+/// `windowsVirtualKeyCode`, `nativeVirtualKeyCode`, `keyIdentifier`, `text`,
+/// `unmodifiedText`, `location`, `modifierBit`) built by the `act_press` key
+/// table, so the bridge and raw-CDP tiers press identical events.
+pub struct ChromeDebuggerCdpKeyInputRequest<'a> {
+    pub hwnd: i64,
+    pub target_id: &'a str,
+    pub keys: &'a [Value],
+    /// How long the whole chord stays down before the reverse-order key-ups.
+    pub hold_ms: u32,
+    /// Wait after the last key-up before the after active-element readback.
+    pub settle_ms: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChromeDebuggerCdpKeyInputResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub dispatched_events: Vec<String>,
+    #[serde(default)]
+    pub keys_dispatched: u32,
+    #[serde(default)]
+    pub debugger_attachment: String,
+    pub before_active_element: ChromeDebuggerActiveElement,
+    pub after_active_element: ChromeDebuggerActiveElement,
+    #[serde(default)]
+    pub tab_activation_for_input: Value,
+}
+
+pub async fn cdp_input_key(
+    request: ChromeDebuggerCdpKeyInputRequest<'_>,
+) -> Result<ChromeDebuggerCdpKeyInputResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "cdpInput")?;
+    // The hold and settle waits run inside the extension command, so the
+    // daemon budget (and the extension watchdog deadline derived from it)
+    // must outlive them.
+    let command_timeout = COMMAND_TIMEOUT
+        + Duration::from_millis(u64::from(request.hold_ms) + u64::from(request.settle_ms));
+    let result = bridge()
+        .send_command_with_timeout(
+            "cdpInput",
+            json!({
+                "hwnd": request.hwnd,
+                "targetIdHint": request.target_id,
+                "action": "key",
+                "keys": request.keys,
+                "holdMs": request.hold_ms,
+                "settleMs": request.settle_ms,
+            }),
+            command_timeout,
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerCdpKeyInputResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger cdpInput key response: {error}"
+        ))
+    })
 }
 
 pub struct ChromeDebuggerCoordinateClickRequest<'a> {

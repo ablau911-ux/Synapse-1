@@ -1740,15 +1740,16 @@ async function reconcileDurableOwners(trigger, options = {}) {
       // effect, so those rows resolve. Only page-world residue (clock shim,
       // executed init-script effects) on a live tab is quarantined, and only
       // until that tab loads a new document.
+      // #355: queued emulation teardown retains its rows until cleanup verifies.
       const residue = ownerRowsForTab(DURABLE_OWNER_LEDGER, tabId)
         .filter((row) => row.field === "clockTabs" || row.field === "executedInitScriptEffects");
-      const resolvedRows = ownerRowsForTab(DURABLE_OWNER_LEDGER, tabId).length - residue.length;
+      const resolvedRows = ownerRowsForTab(DURABLE_OWNER_LEDGER, tabId).length - residue.length - staleEmulationDomains.length;
       if (resolvedRows > 0) {
         resolved.push({ kind: "prior_instance_session_state_resolved", tab_id: tabId, rows: resolvedRows });
       }
       const ambiguous = residue;
       if (!ambiguous.length) {
-        pruneDurableOwnerLedgerForClosedTab(tabId);
+        pruneDurableOwnerLedgerForClosedTab(tabId, staleEmulationDomains.length > 0);
         continue;
       }
       const entry = {
@@ -1764,7 +1765,7 @@ async function reconcileDurableOwners(trigger, options = {}) {
       DURABLE_OWNER_LEDGER.quarantinedTabs.push(entry);
       // The rows move into the quarantine record (kept as evidence) so they stop
       // counting as live owners of the current browser instance.
-      pruneOwnerRowsKeepingQuarantine(tabId);
+      pruneOwnerRowsKeepingQuarantine(tabId, staleEmulationDomains.length > 0);
       quarantinedNow.push({ tab_id: tabId, rows: ambiguous.length });
       continue;
     }
@@ -1880,9 +1881,9 @@ async function confirmTabAbsentTwice(tabId) {
   }
 }
 
-function pruneOwnerRowsKeepingQuarantine(tabId) {
+function pruneOwnerRowsKeepingQuarantine(tabId, preserveEmulation = false) {
   const quarantine = DURABLE_OWNER_LEDGER.quarantinedTabs;
-  pruneDurableOwnerLedgerForClosedTab(tabId);
+  pruneDurableOwnerLedgerForClosedTab(tabId, preserveEmulation);
   DURABLE_OWNER_LEDGER.quarantinedTabs = quarantine;
 }
 
@@ -2123,21 +2124,24 @@ function removeLedgerBinding(tabId, name) {
   );
 }
 
-function pruneDurableOwnerLedgerForClosedTab(tabId) {
+function pruneDurableOwnerLedgerForClosedTab(tabId, preserveEmulation = false) {
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   EMULATION_DEBUGGER_SESSIONS.delete(tabId);
-  forgetEmulationDomainSetSeq(tabId);
-  EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
-  VIEWPORT_BASELINE_BY_TAB.delete(tabId);
-  DEVICE_BASELINE_BY_TAB.delete(tabId);
-  GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
-  LOCALE_BASELINE_BY_TAB.delete(tabId);
-  MEDIA_BASELINE_BY_TAB.delete(tabId);
-  NETWORK_BASELINE_BY_TAB.delete(tabId);
+  // #355: queued teardown owns these rows and baselines until cleanup verifies.
+  if (!preserveEmulation) {
+    forgetEmulationDomainSetSeq(tabId);
+    EMULATION_DEVICE_METRICS_BY_TAB.delete(tabId);
+    VIEWPORT_BASELINE_BY_TAB.delete(tabId);
+    DEVICE_BASELINE_BY_TAB.delete(tabId);
+    GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
+    LOCALE_BASELINE_BY_TAB.delete(tabId);
+    MEDIA_BASELINE_BY_TAB.delete(tabId);
+    NETWORK_BASELINE_BY_TAB.delete(tabId);
+  }
   removeLedgerOpenedTab(tabId);
   DURABLE_OWNER_LEDGER.initScripts = DURABLE_OWNER_LEDGER.initScripts
     .filter((entry) => entry.tabId !== tabId);
@@ -2169,7 +2173,9 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
     "mediaOverrides",
     "networkOverrides"
   ]) {
-    removeLedgerOverride(field, tabId);
+    if (!preserveEmulation) {
+      removeLedgerOverride(field, tabId);
+    }
   }
 }
 
@@ -8810,10 +8816,13 @@ async function handleViewportEmulation(params) {
     rejectViewportResetField(params.deviceScaleFactor, "deviceScaleFactor");
     rejectViewportResetField(params.isMobile, "isMobile");
     dispatch = await dispatchViewportEmulationReset(selected.tabId);
+    if (!ledgerHasEmulationOverride("deviceOverrides", selected.tabId)) {
+      await clearDeviceEmulationShim(selected.tabId);
+    }
     await clearViewportDprShim(selected.tabId);
     after = await waitForViewportResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeViewport);
   }
-  let resetFallback = null;
+  let resetFallback = dispatch.cleanup_reload || null;
   if (!requested) {
     if (ledgerHasEmulationOverride("deviceOverrides", selected.tabId)) {
       // #336: the reset skipped the shared device-metrics override because device
@@ -8824,24 +8833,15 @@ async function handleViewportEmulation(params) {
       VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
       removeLedgerOverride("viewportOverrides", selected.tabId);
     } else {
-      const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId);
-      // #336: the override is gone when the tab is back at its pre-override
-      // width/devicePixelRatio/screen. inner_height is not compared: a held
-      // debugger session shows Chrome's "started debugging this browser" bar,
-      // which shortens the height, so the natural height legitimately differs
-      // between "a session is attached" and "none is". With no stored baseline
-      // there is nothing to clear -- the tab is already natural and the reset
-      // answers ok.
-      if (baseline && !viewportOverrideCleared(after.viewport, baseline)) {
-        // Those bar-independent fields did not return to baseline, so a CDP
-        // override is lingering; reload the document (which drops it) and confirm.
-        resetFallback = await reloadViewportTabAfterReset(
-          selected.tabId,
-          selected.target,
-          waitTimeoutMs
-        );
-        after = await waitForViewportOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
-      }
+      const baseline = VIEWPORT_BASELINE_BY_TAB.get(selected.tabId) ||
+        DURABLE_OWNER_LEDGER.viewportOverrides.find((entry) => entry.tabId === selected.tabId)?.baseline;
+      // #355: the shared verifier owns baseline checks and the single reload.
+      const verified = await verifyMetricsCleanupWithReload(
+        selected.tabId, selected.target, waitTimeoutMs, "viewportEmulation", baseline, resetFallback
+      );
+      resetFallback = verified.resetFallback;
+      after.page = verified.page;
+      after.viewport = verified.device.viewport;
       VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
       removeLedgerOverride("viewportOverrides", selected.tabId);
     }
@@ -8922,9 +8922,12 @@ async function handleDeviceEmulation(params) {
     dispatch = await dispatchDeviceEmulationReset(selected.tabId);
     restoredUserAgent = dispatch.restored_user_agent;
     await clearDeviceEmulationShim(selected.tabId);
+    if (!ledgerHasEmulationOverride("viewportOverrides", selected.tabId)) {
+      await clearViewportDprShim(selected.tabId);
+    }
     after = await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   }
-  let resetFallback = null;
+  let resetFallback = dispatch.cleanup_reload || null;
   if (!descriptor) {
     if (ledgerHasEmulationOverride("viewportOverrides", selected.tabId)) {
       // #336: the device reset left the shared device-metrics override to viewport
@@ -8936,19 +8939,15 @@ async function handleDeviceEmulation(params) {
       DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
       removeLedgerOverride("deviceOverrides", selected.tabId);
     } else {
-      const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
-      // #336: same bar-independent rule as the viewport reset -- the override is
-      // gone when the user agent, touch, and the viewport's width/dpr/screen are
-      // back to baseline. inner_height is not compared because the debugging bar
-      // shortens it while a session is held.
-      if (baseline?.viewport && !deviceOverrideCleared(after.device, baseline)) {
-        resetFallback = await reloadViewportTabAfterReset(
-          selected.tabId,
-          selected.target,
-          waitTimeoutMs
-        );
-        after = await waitForDeviceOverrideCleared(selected.tabId, selected.target, waitTimeoutMs, baseline);
-      }
+      const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId) ||
+        DURABLE_OWNER_LEDGER.deviceOverrides.find((entry) => entry.tabId === selected.tabId)?.baseline;
+      // #355: the shared verifier owns baseline checks and the single reload.
+      const verified = await verifyMetricsCleanupWithReload(
+        selected.tabId, selected.target, waitTimeoutMs, "deviceEmulation", baseline, resetFallback
+      );
+      resetFallback = verified.resetFallback;
+      after.page = verified.page;
+      after.device = verified.device;
       DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
       removeLedgerOverride("deviceOverrides", selected.tabId);
     }
@@ -9893,7 +9892,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
     EMULATION_DEBUGGER_SESSIONS.get(tabId)?.domains.has("device");
   let resetSucceeded = false;
   try {
-    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
+    const { debuggee, attachment, cleanupReload } = await ensureEmulationDebuggerSession(tabId, "device");
     // #350: adoption restores the durable baseline before the original UA is read.
     if (typeof restoredUserAgent !== "string" || !restoredUserAgent) {
       const baseline = DEVICE_BASELINE_BY_TAB.get(tabId);
@@ -9956,7 +9955,8 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
     return {
       method: methods.join("+"),
       protocol_version: attachment.protocolVersion,
-      restored_user_agent: restoredUserAgent
+      restored_user_agent: restoredUserAgent,
+      cleanup_reload: cleanupReload
     };
   } catch (error) {
     throw bridgeError(
@@ -10247,7 +10247,7 @@ async function dispatchViewportEmulationSet(tabId, requested) {
 async function dispatchViewportEmulationReset(tabId) {
   let resetSucceeded = false;
   try {
-    const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "viewport");
+    const { debuggee, attachment, cleanupReload } = await ensureEmulationDebuggerSession(tabId, "viewport");
     let method;
     if (ledgerHasEmulationOverride("deviceOverrides", tabId)) {
       // #336: viewport and device share Emulation.setDeviceMetricsOverride and the
@@ -10286,7 +10286,8 @@ async function dispatchViewportEmulationReset(tabId) {
     resetSucceeded = true;
     return {
       method,
-      protocol_version: attachment.protocolVersion
+      protocol_version: attachment.protocolVersion,
+      cleanup_reload: cleanupReload
     };
   } catch (error) {
     throw bridgeError(
@@ -10441,63 +10442,6 @@ async function waitForDeviceResetReadback(tabId, fallbackTarget, waitTimeoutMs, 
     ? `last readback error=${JSON.stringify(lastError)}`
     : "no device readback";
   throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset readback unavailable within ${timeoutMs} ms; ${detail}`);
-}
-
-// #336: poll until the viewport override is gone by the bar-independent rule
-// (viewportOverrideCleared): width/devicePixelRatio/screen back to the
-// pre-override baseline, height left to whatever the bar does now.
-async function waitForViewportOverrideCleared(tabId, fallbackTarget, waitTimeoutMs, baseline) {
-  const started = Date.now();
-  let last = null;
-  let lastError = null;
-  while (Date.now() - started <= waitTimeoutMs) {
-    try {
-      const page = await tabPageState(tabId, fallbackTarget);
-      const viewport = await tabViewportMetricsState(tabId);
-      last = { page, viewport };
-      lastError = null;
-      if (viewportOverrideCleared(viewport, baseline)) {
-        return last;
-      }
-    } catch (error) {
-      lastError = error?.message ? String(error.message) : String(error);
-    }
-    await sleep(100);
-  }
-  const detail = last
-    ? `last viewport=${JSON.stringify(last.viewport)} baseline width/dpr/screen=${JSON.stringify({ inner_width: baseline?.inner_width, device_pixel_ratio: baseline?.device_pixel_ratio, screen_width: baseline?.screen_width, screen_height: baseline?.screen_height })}`
-    : lastError
-      ? `last readback error=${JSON.stringify(lastError)}`
-      : "no viewport readback";
-  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `viewportEmulation reset did not return to the pre-override width/devicePixelRatio/screen within ${waitTimeoutMs} ms; ${detail}`);
-}
-
-// #336: the device equivalent -- user agent and touch back to baseline, viewport
-// cleared by the same bar-independent rule.
-async function waitForDeviceOverrideCleared(tabId, fallbackTarget, waitTimeoutMs, baseline) {
-  const started = Date.now();
-  let last = null;
-  let lastError = null;
-  while (Date.now() - started <= waitTimeoutMs) {
-    try {
-      const page = await tabPageState(tabId, fallbackTarget);
-      const device = await tabDeviceMetricsState(tabId);
-      last = { page, device };
-      lastError = null;
-      if (deviceOverrideCleared(device, baseline)) {
-        return last;
-      }
-    } catch (error) {
-      lastError = error?.message ? String(error.message) : String(error);
-    }
-    await sleep(100);
-  }
-  const detail = last
-    ? `last device=${JSON.stringify(summarizeDeviceReadback(last.device))} baseline=${JSON.stringify(summarizeDeviceReadback(baseline))}`
-    : lastError
-      ? `last readback error=${JSON.stringify(lastError)}`
-      : "no device readback";
-  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `deviceEmulation reset did not return to the pre-override user agent/width/devicePixelRatio/screen within ${waitTimeoutMs} ms; ${detail}`);
 }
 
 async function waitForGeolocationReadback(tabId, fallbackTarget, waitTimeoutMs, requested, permissionSetting) {
@@ -11138,6 +11082,106 @@ async function clearViewportDprShim(tabId) {
   }
 }
 
+// #355: MAIN-world readback can be a getter left by a previous worker. Compare
+// it with Chrome's isolated world in the same document. Without a baseline,
+// require the native width to fit the browser-owned tab width at its zoom.
+async function verifyMetricsEmulationCleanup(tabId, label, baseline = null, requireNatural = true) {
+  try {
+    const [mainResults, nativeResults] = await Promise.all(["MAIN", "ISOLATED"].map((world) =>
+      quarantineGuardedExecuteScript({
+        target: { tabId, allFrames: false },
+        world,
+        func: readDeviceMetricsInPage
+      })
+    ));
+    const main = mainResults?.[0];
+    const native = nativeResults?.[0];
+    const device = main?.result;
+    const nativeDevice = native?.result;
+    const viewport = nativeDevice?.viewport;
+    if (!main?.documentId || main.documentId !== native?.documentId ||
+        !sameDeviceMetrics(device, nativeDevice) ||
+        !viewportOverrideCleared(device?.viewport, viewport) ||
+        !(viewport?.inner_width > 0 && viewport.inner_height > 0 &&
+          Number.isFinite(viewport.device_pixel_ratio) && viewport.device_pixel_ratio > 0) ||
+        device.viewport.outer_width !== viewport.outer_width ||
+        device.viewport.outer_height !== viewport.outer_height) {
+      throw new Error("page metrics do not match independent isolated-world readback in the same document");
+    }
+    if (requireNatural) {
+      if (baseline) {
+        const cleared = baseline.viewport
+          ? deviceOverrideCleared(nativeDevice, baseline)
+          : viewportOverrideCleared(viewport, baseline);
+        if (!cleared) {
+          throw new Error("native metrics have not returned to their pre-override baseline");
+        }
+      } else {
+        const [tab, zoom] = await Promise.all([chrome.tabs.get(tabId), chrome.tabs.getZoom(tabId)]);
+        // #355: the debugging bar changes height; innerWidth includes scrollbars.
+        // Allow one CSS pixel (or one tab pixel) for rounding at non-default zoom.
+        if (!(Number.isFinite(tab.width) && tab.width > 0 &&
+              Number.isFinite(zoom) && zoom > 0) ||
+            Math.abs(viewport.inner_width * zoom - tab.width) > Math.max(1, zoom)) {
+          throw new Error("no natural baseline; native viewport does not match browser tab width at the current zoom");
+        }
+      }
+    }
+    return device;
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger ${label} reset failed for tab ${tabId}; cleanup-unverified: the override may still be active: ${errorMessage(error)}`
+    );
+  }
+}
+
+// #355: without a baseline, width alone cannot prove height/DPR cleanup. Reload
+// once in that case, or after a failed baseline check, then verify independently.
+async function verifyMetricsCleanupWithReload(tabId, target, waitTimeoutMs, label, baseline, resetFallback) {
+  let device;
+  if (baseline || resetFallback) {
+    try {
+      device = await verifyMetricsEmulationCleanup(tabId, label, baseline);
+    } catch (error) {
+      if (resetFallback) {
+        throw error;
+      }
+    }
+  }
+  if (!device) {
+    try {
+      resetFallback = await reloadViewportTabAfterReset(tabId, target, waitTimeoutMs);
+      device = await verifyMetricsEmulationCleanup(tabId, label, baseline);
+    } catch (error) {
+      throw bridgeError(ERROR_ATTACH_FAILED,
+        `chrome.debugger ${label} reset failed for tab ${tabId}; cleanup-unverified after reload: ${errorMessage(error)}`);
+    }
+  }
+  return { device, page: await tabPageState(tabId, target), resetFallback };
+}
+
+// #355: both shims share DPR. Clear them as a pair before forgetting either
+// ledger row, including orphan markers absent from this worker's registries.
+async function clearOrphanedMetricsEmulationShims(tabId) {
+  await clearDeviceEmulationShim(tabId);
+  await clearViewportDprShim(tabId);
+  try {
+    await verifyMetricsEmulationCleanup(tabId, "metricsEmulation", null, false);
+    return null;
+  } catch (_) {
+    // #355: legacy saved descriptors can point at a sibling getter already gone.
+    try {
+      const reloaded = await reloadViewportTabAfterReset(tabId, null, normalizeWaitTimeout(undefined));
+      await verifyMetricsEmulationCleanup(tabId, "metricsEmulation", null, false);
+      return reloaded;
+    } catch (error) {
+      throw bridgeError(ERROR_ATTACH_FAILED,
+        `chrome.debugger metricsEmulation cleanup-unverified after reload for tab ${tabId}: ${errorMessage(error)}`);
+    }
+  }
+}
+
 async function reloadViewportTabAfterReset(tabId, fallbackTarget, waitTimeoutMs) {
   try {
     await chrome.tabs.reload(tabId, { bypassCache: true });
@@ -11482,9 +11526,15 @@ function installViewportDprShimInPage(deviceScaleFactor) {
   const stateKey = "__synapseViewportDprOverride";
   let state = globalThis[stateKey];
   if (!state || typeof state !== "object") {
+    const deviceState = globalThis.__synapseDeviceEmulationOverride;
     state = {
-      original_had_own_descriptor: Object.prototype.hasOwnProperty.call(globalThis, "devicePixelRatio"),
-      original_own_descriptor: Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio") || null,
+      // #355: save the original descriptor, never the sibling shim getter.
+      original_had_own_descriptor: deviceState
+        ? deviceState.original_global_device_pixel_ratio_had_own_descriptor
+        : Object.prototype.hasOwnProperty.call(globalThis, "devicePixelRatio"),
+      original_own_descriptor: deviceState
+        ? deviceState.original_global_device_pixel_ratio_descriptor
+        : Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio") || null,
       original_device_pixel_ratio: Number(globalThis.devicePixelRatio) || 1,
       value: requested
     };
@@ -11509,6 +11559,7 @@ function installViewportDprShimInPage(deviceScaleFactor) {
       return Number.isFinite(original) && original > 0 ? original : 1;
     }
   });
+  state.device_pixel_ratio_descriptor = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
   globalThis.dispatchEvent(new Event("resize"));
   return {
     applied: true,
@@ -11521,7 +11572,18 @@ function clearViewportDprShimInPage() {
   const stateKey = "__synapseViewportDprOverride";
   const state = globalThis[stateKey];
   if (state && typeof state === "object") {
-    if (state.original_had_own_descriptor && state.original_own_descriptor) {
+    const deviceState = globalThis.__synapseDeviceEmulationOverride;
+    if (deviceState && typeof deviceState === "object") {
+      // #355: older workers did not save the sibling getter descriptor.
+      Object.defineProperty(globalThis, "devicePixelRatio", deviceState.device_pixel_ratio_descriptor || {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const value = Number(globalThis.__synapseDeviceEmulationOverride?.value?.device_pixel_ratio);
+          return Number.isFinite(value) && value > 0 ? value : 1;
+        }
+      });
+    } else if (state.original_had_own_descriptor && state.original_own_descriptor) {
       Object.defineProperty(globalThis, "devicePixelRatio", state.original_own_descriptor);
     } else {
       delete globalThis.devicePixelRatio;
@@ -11538,11 +11600,17 @@ function clearViewportDprShimInPage() {
 function installDeviceEmulationShimInPage(descriptor) {
   const stateKey = "__synapseDeviceEmulationOverride";
   const requested = descriptor && typeof descriptor === "object" ? descriptor : {};
+  const viewportState = globalThis.__synapseViewportDprOverride;
   const state = globalThis[stateKey] && typeof globalThis[stateKey] === "object"
     ? globalThis[stateKey]
     : {
-      original_global_device_pixel_ratio_had_own_descriptor: Object.prototype.hasOwnProperty.call(globalThis, "devicePixelRatio"),
-      original_global_device_pixel_ratio_descriptor: Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio") || null,
+      // #355: either shim must restore the native descriptor after both end.
+      original_global_device_pixel_ratio_had_own_descriptor: viewportState
+        ? viewportState.original_had_own_descriptor
+        : Object.prototype.hasOwnProperty.call(globalThis, "devicePixelRatio"),
+      original_global_device_pixel_ratio_descriptor: viewportState
+        ? viewportState.original_own_descriptor
+        : Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio") || null,
       original_navigator_user_agent_descriptor: Object.getOwnPropertyDescriptor(Navigator.prototype, "userAgent") || null,
       original_navigator_max_touch_points_descriptor: Object.getOwnPropertyDescriptor(Navigator.prototype, "maxTouchPoints") || null,
       original_global_ontouchstart_had_own_descriptor: Object.prototype.hasOwnProperty.call(globalThis, "ontouchstart"),
@@ -11573,6 +11641,7 @@ function installDeviceEmulationShimInPage(descriptor) {
       return Number.isFinite(value) && value > 0 ? value : 1;
     }
   });
+  state.device_pixel_ratio_descriptor = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
   Object.defineProperty(Navigator.prototype, "userAgent", {
     configurable: true,
     enumerable: true,
@@ -11650,7 +11719,17 @@ function clearDeviceEmulationShimInPage() {
   const stateKey = "__synapseDeviceEmulationOverride";
   const state = globalThis[stateKey];
   if (state && typeof state === "object") {
-    if (state.original_global_device_pixel_ratio_had_own_descriptor && state.original_global_device_pixel_ratio_descriptor) {
+    const viewportState = globalThis.__synapseViewportDprOverride;
+    if (viewportState && typeof viewportState === "object") {
+      Object.defineProperty(globalThis, "devicePixelRatio", viewportState.device_pixel_ratio_descriptor || {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const value = Number(globalThis.__synapseViewportDprOverride?.value);
+          return Number.isFinite(value) && value > 0 ? value : 1;
+        }
+      });
+    } else if (state.original_global_device_pixel_ratio_had_own_descriptor && state.original_global_device_pixel_ratio_descriptor) {
       Object.defineProperty(globalThis, "devicePixelRatio", state.original_global_device_pixel_ratio_descriptor);
     } else {
       delete globalThis.devicePixelRatio;
@@ -13684,10 +13763,9 @@ function ledgerHasEmulationOverride(field, tabId) {
 // down out of band: the sync onDetach listener and the durable reconcile cannot run
 // page mutations inline, but the persisted background queue carries a command
 // admission context and shim teardown needs only chrome.scripting.executeScript, not
-// the debugger. `clearLedger` is true for the detach path (this owns the ledger
-// cleanup: drop on success, keep on failure so panic cleanup / the next op retry);
-// false for the startup reconcile, which prunes the ledger itself. `domains` is
-// captured by the caller because the reconcile prunes the ledger right after.
+// the debugger. `clearLedger` keeps rows on failure so panic cleanup / the next op
+// can retry; detach and startup reconcile both drop them only after verification.
+// `domains` is captured by the caller before the queued mutation runs.
 function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
   if (!domains || !domains.length) {
     return;
@@ -13699,8 +13777,20 @@ function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
   // the question, so this never skips because of an unrelated owner, nor tears down a
   // domain a newer set re-applied.
   const captured = domains.map((domain) => ({ domain, setSeq: emulationDomainSetSeq(tabId, domain) }));
+  const metricsSeq = ["viewport", "device"].map((domain) => emulationDomainSetSeq(tabId, domain));
   enqueuePersistedBackgroundMutation("emulationShimTeardown", async () => {
     let changed = false;
+    let metricsCleared = false;
+    if (domains.some((domain) => domain === "viewport" || domain === "device") &&
+        ["viewport", "device"].every((domain, index) =>
+          emulationDomainSetSeq(tabId, domain) === metricsSeq[index])) {
+      try {
+        await clearOrphanedMetricsEmulationShims(tabId);
+        metricsCleared = true;
+      } catch (error) {
+        console.warn(`Synapse metrics shim teardown unverified for tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
     for (const { domain, setSeq } of captured) {
       if (emulationDomainSetSeq(tabId, domain) !== setSeq) {
         continue;
@@ -13709,8 +13799,15 @@ function enqueueEmulationShimTeardown(tabId, domains, clearLedger) {
       if (!wiring) {
         continue;
       }
+      if (domain === "viewport" || domain === "device") {
+        if (!metricsCleared) {
+          continue;
+        }
+      }
       try {
-        await wiring.clearShim(tabId);
+        if (domain !== "viewport" && domain !== "device") {
+          await wiring.clearShim(tabId);
+        }
       } catch (error) {
         console.warn(`Synapse emulation shim teardown failed for ${domain} tab ${tabId}: ${errorMessage(error)}`);
         continue;
@@ -13750,10 +13847,10 @@ function emulationAttachmentSurvivedRestart(tabId, attachment) {
 
 // #336: a fresh (or borrowed-but-not-survived) attachment means any emulation
 // override the ledger still records for this tab is gone; its page shim is stale.
-// Tear those shims down best-effort and clear their ledger/baseline so a later reset,
-// restart adopt, or operator-panic cleanup does not act on a ghost. The domain being
-// set now is left alone -- its own set is about to apply.
+// Verify metrics shim teardown before clearing their rows. The domain being set
+// keeps its baseline; its old page shim must still go, even with no ledger row.
 async function forgetStaleEmulationOverridesOnFreshAttach(tabId, settingDomain) {
+  const cleanupReload = await clearOrphanedMetricsEmulationShims(tabId);
   for (const held of emulationDomainsHeldInLedger(tabId)) {
     if (held === settingDomain) {
       continue;
@@ -13762,11 +13859,13 @@ async function forgetStaleEmulationOverridesOnFreshAttach(tabId, settingDomain) 
     try {
       await wiring.clearShim(tabId);
     } catch (error) {
-      console.warn(`Synapse stale ${held} emulation shim teardown failed for tab ${tabId}: ${errorMessage(error)}`);
+      throw bridgeError(ERROR_ATTACH_FAILED,
+        `Synapse stale ${held} emulation shim teardown failed for tab ${tabId}; cleanup-unverified: the override may still be active: ${errorMessage(error)}`);
     }
     wiring.baselineMap.delete(tabId);
     removeLedgerOverride(wiring.ledgerField, tabId);
   }
+  return cleanupReload;
 }
 
 // #336: hold the debugger attached for an emulation override. Borrows an
@@ -13778,12 +13877,14 @@ async function forgetStaleEmulationOverridesOnFreshAttach(tabId, settingDomain) 
 async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "1.3") {
   const attachment = await attachDebuggerForCommand(tabId, protocolVersion);
   let session = EMULATION_DEBUGGER_SESSIONS.get(tabId);
+  let cleanupReload = null;
   if (!session) {
     const survivedRestart = emulationAttachmentSurvivedRestart(tabId, attachment);
     session = {
       protocolVersion,
       domains: new Set(),
       attached: true,
+      staleCleanupPending: !survivedRestart,
       attachedAtUnixMs: Date.now()
     };
     EMULATION_DEBUGGER_SESSIONS.set(tabId, session);
@@ -13796,12 +13897,15 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
       }
       restoreDeviceMetricsFromLedger(tabId);
       restoreEmulationBaselinesFromLedger(tabId);
-    } else {
-      await forgetStaleEmulationOverridesOnFreshAttach(tabId, domain);
     }
   }
+  // #355: failed teardown must be retried before this session can accept an op.
+  if (session.staleCleanupPending) {
+    cleanupReload = await forgetStaleEmulationOverridesOnFreshAttach(tabId, domain);
+    session.staleCleanupPending = false;
+  }
   session.domains.add(domain);
-  return { debuggee: attachment.debuggee, session, attachment };
+  return { debuggee: attachment.debuggee, session, attachment, cleanupReload };
 }
 
 // #336: the single source of truth for whether any owner still needs this tab's

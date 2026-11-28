@@ -8919,11 +8919,8 @@ async function handleDeviceEmulation(params) {
     rejectDeviceResetField(params.isMobile, "isMobile");
     rejectDeviceResetField(params.hasTouch, "hasTouch");
     rejectDeviceResetField(params.maxTouchPoints, "maxTouchPoints");
-    const baseline = DEVICE_BASELINE_BY_TAB.get(selected.tabId);
-    restoredUserAgent = typeof baseline?.user_agent === "string" && baseline.user_agent
-      ? baseline.user_agent
-      : null;
-    dispatch = await dispatchDeviceEmulationReset(selected.tabId, restoredUserAgent);
+    dispatch = await dispatchDeviceEmulationReset(selected.tabId);
+    restoredUserAgent = dispatch.restored_user_agent;
     await clearDeviceEmulationShim(selected.tabId);
     after = await waitForDeviceResetReadback(selected.tabId, selected.target, waitTimeoutMs, beforeDevice);
   }
@@ -9892,9 +9889,21 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
 }
 
 async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
+  const wasHeld = emulationDomainWasHeld(tabId, "device") ||
+    EMULATION_DEBUGGER_SESSIONS.get(tabId)?.domains.has("device");
   let resetSucceeded = false;
   try {
     const { debuggee, attachment } = await ensureEmulationDebuggerSession(tabId, "device");
+    // #350: adoption restores the durable baseline before the original UA is read.
+    if (typeof restoredUserAgent !== "string" || !restoredUserAgent) {
+      const baseline = DEVICE_BASELINE_BY_TAB.get(tabId);
+      restoredUserAgent = typeof baseline?.user_agent === "string" && baseline.user_agent
+        ? baseline.user_agent
+        : null;
+    }
+    if (wasHeld && !restoredUserAgent) {
+      throw new Error("original device user agent could not be recovered");
+    }
     const methods = [];
     if (ledgerHasEmulationOverride("viewportOverrides", tabId)) {
       // #336: viewport survives this device reset and the shared metrics belong to
@@ -9946,7 +9955,8 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
     resetSucceeded = true;
     return {
       method: methods.join("+"),
-      protocol_version: attachment.protocolVersion
+      protocol_version: attachment.protocolVersion,
+      restored_user_agent: restoredUserAgent
     };
   } catch (error) {
     throw bridgeError(
@@ -13611,6 +13621,33 @@ function restoreDeviceMetricsFromLedger(tabId) {
   });
 }
 
+// #350: recover only persisted, well-formed baselines; the live page may still be
+// emulated after a worker restart and must never supply an invented original.
+function restoreEmulationBaselinesFromLedger(tabId) {
+  const validViewport = (value) => Boolean(
+    value && typeof value === "object" && !Array.isArray(value) &&
+    Number.isSafeInteger(value.inner_width) && value.inner_width > 0 &&
+    Number.isSafeInteger(value.inner_height) && value.inner_height > 0 &&
+    Number.isFinite(value.device_pixel_ratio) && value.device_pixel_ratio > 0 &&
+    Number.isSafeInteger(value.screen_width) && value.screen_width >= 0 &&
+    Number.isSafeInteger(value.screen_height) && value.screen_height >= 0
+  );
+  const viewport = DURABLE_OWNER_LEDGER.viewportOverrides.find((entry) => entry.tabId === tabId)?.baseline;
+  if (!VIEWPORT_BASELINE_BY_TAB.has(tabId) && validViewport(viewport)) {
+    VIEWPORT_BASELINE_BY_TAB.set(tabId, viewport);
+  }
+  const device = DURABLE_OWNER_LEDGER.deviceOverrides.find((entry) => entry.tabId === tabId)?.baseline;
+  if (!DEVICE_BASELINE_BY_TAB.has(tabId) &&
+      device && typeof device === "object" && !Array.isArray(device) &&
+      validViewport(device.viewport) &&
+      typeof device.user_agent === "string" && device.user_agent &&
+      Number.isSafeInteger(device.max_touch_points) && device.max_touch_points >= 0 &&
+      ["ontouchstart_available", "pointer_coarse", "any_pointer_coarse", "hover_none", "any_hover_none"]
+        .every((field) => typeof device[field] === "boolean")) {
+    DEVICE_BASELINE_BY_TAB.set(tabId, device);
+  }
+}
+
 // #336: per-domain wiring for the reconcile paths (restart adopt, fresh-attach
 // stale cleanup) so each enumerates the same ledger field, baseline map and page
 // shim for every emulation domain in one place.
@@ -13758,6 +13795,7 @@ async function ensureEmulationDebuggerSession(tabId, domain, protocolVersion = "
         session.domains.add(held);
       }
       restoreDeviceMetricsFromLedger(tabId);
+      restoreEmulationBaselinesFromLedger(tabId);
     } else {
       await forgetStaleEmulationOverridesOnFreshAttach(tabId, domain);
     }

@@ -67,7 +67,10 @@ impl ClipRecovery {
                 }
                 return ClipJson::update(folder, |clip| clip.add_lost(lost)).map(|_| true);
             }
-            ClipState::Ready => return Ok(true),
+            ClipState::Ready => {
+                super::clip_playable::ClipPlayableVideo::start(folder);
+                return Ok(true);
+            }
         }
         // Instant k is recorded when k / f < end: ceil(end * f / 1000) instants.
         // The recorder makes no clip longer than MAX_DURATION_MS at RECORD_FPS,
@@ -115,8 +118,9 @@ impl ClipRecovery {
             clip.add_lost(lost);
             clip.set_total_bytes(folder)
         })
-        .and_then(|(_, result)| result)
-        .map(|()| true)
+        .and_then(|(_, result)| result)?;
+        super::clip_playable::ClipPlayableVideo::start(folder);
+        Ok(true)
     }
 
     /// Makes the index of a recording that failed (its encoder stopped)

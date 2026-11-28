@@ -779,6 +779,9 @@ pub struct ClipStatusResponse {
     /// Bytes held in exact frame groups.
     pub exact_bytes: u64,
     pub segments: Vec<ClipSegmentInfo>,
+    /// Automatic clip.mp4 conversion; persisted independently of the recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playable_video: Option<serde_json::Value>,
     /// The `conditions` block of `clip.json` so far (`capture`, `geometry`,
     /// `quality`, `totals`).
     pub conditions: serde_json::Value,

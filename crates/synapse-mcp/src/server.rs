@@ -248,6 +248,7 @@ mod clip_decoder;
 #[cfg(windows)]
 mod clip_encoder;
 mod clip_folder;
+mod clip_playable;
 mod clip_recovery;
 #[cfg(windows)]
 mod clip_stream;

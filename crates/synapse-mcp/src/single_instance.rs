@@ -336,7 +336,7 @@ impl ShellJobStoreLockGuard {
     }
 }
 
-fn file_lock_error_is_contention(error: &std::io::Error) -> bool {
+pub(crate) fn file_lock_error_is_contention(error: &std::io::Error) -> bool {
     let contention = fs2::lock_contended_error();
     error.kind() == std::io::ErrorKind::WouldBlock
         || error

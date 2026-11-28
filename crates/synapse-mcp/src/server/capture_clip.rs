@@ -410,6 +410,7 @@ fn status_of(
                 frames: part.pictures,
             })
             .collect(),
+        playable_video: super::clip_playable::ClipPlayableVideo::status(folder),
         conditions: serde_json::to_value(&clip.conditions).unwrap_or_default(),
     })
 }
@@ -1408,6 +1409,8 @@ mod live {
                         clip.failure = Some(error);
                     })
                 });
+            } else {
+                crate::server::clip_playable::ClipPlayableVideo::start(folder);
             }
             self.times
                 .log(&self.plan.clip_id, &stats, instants, &stream_times);

@@ -263,8 +263,7 @@ impl ClipPlayableVideo {
             command
                 .args(["-bf", "0", "-bsf:v"])
                 .arg(format!(
-                    "setts=time_base=1/1000:prescale=1:duration='min(DURATION,{}-PTS)'",
-                    duration_ms
+                    "setts=time_base=1/1000:prescale=1:duration='min(DURATION,{duration_ms}-PTS)'"
                 ))
                 .args(["-video_track_timescale", "1000"]);
         }
